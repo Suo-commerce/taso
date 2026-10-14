@@ -1,0 +1,12 @@
+[package]
+name = "taso-core"
+description = "Taso core: chronicle, seals, groups, effect ledger, navigator. Pure, no I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
