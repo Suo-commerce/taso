@@ -13,3 +13,4 @@
 
 pub mod canon;
 pub mod envelope;
+pub mod record;
