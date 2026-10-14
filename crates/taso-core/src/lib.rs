@@ -10,3 +10,5 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+pub mod canon;
