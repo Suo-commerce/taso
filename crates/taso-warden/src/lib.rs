@@ -13,6 +13,7 @@ pub mod chronicle;
 pub mod coordinator;
 pub mod effects;
 pub mod field;
+pub mod quiesce;
 pub mod segment;
 pub mod vessel;
 pub mod zfs;
