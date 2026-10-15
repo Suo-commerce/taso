@@ -15,6 +15,13 @@
 //! Snapshots Taso did not make are ignored, never parsed as Seals.  Taking
 //! a Seal that already exists is an error ([`ZfsError::AlreadyExists`]),
 //! never an overwrite.
+//!
+//! A Vessel is a dataset.  [`Zfs::create`] makes an empty one;
+//! [`Zfs::clone`] is fork: a new dataset from a Seal snapshot, carrying
+//! `taso:parent=<Seal record hash>` from birth, set in the same command.
+//! The clone is refused unless the snapshot is bound to exactly the Seal
+//! the caller names.  ZFS keeps a snapshot alive while a clone of it
+//! exists, so purge (later) must account for clones.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -24,6 +31,9 @@ use taso_core::envelope::{HashVal, Lsn};
 
 /// User property binding a snapshot to its Seal record.
 pub const SEAL_PROPERTY: &str = "taso:seal";
+
+/// User property binding a forked dataset to the Seal it was cloned from.
+pub const PARENT_PROPERTY: &str = "taso:parent";
 
 /// Prefix of every snapshot name Taso makes.
 pub const SNAP_PREFIX: &str = "taso-seal-";
@@ -39,6 +49,9 @@ pub const MAX_DATASET_NAME: usize = MAX_FULL_NAME - 1 - SNAP_PREFIX.len() - LSN_
 
 /// Columns requested from `zfs list`, in order.
 const LIST_COLUMNS: &str = "name,createtxg,guid,taso:seal";
+
+/// Columns requested by [`Zfs::dataset_info`], in order.
+const INFO_COLUMNS: &str = "name,mountpoint,origin,taso:parent";
 
 // ── Errors ─────────────────────────────────────────────────────────
 
@@ -63,8 +76,13 @@ pub enum ZfsError {
         /// What it printed on stderr.
         stderr: String,
     },
-    /// A snapshot for this Seal already exists.
+    /// A snapshot for this Seal, or a dataset, already exists.
     AlreadyExists(String),
+    /// The Seal snapshot to clone from does not exist.
+    NotFound(String),
+    /// The snapshot exists but is not bound to the Seal the caller named
+    /// (its `taso:seal` is another hash, or unset).
+    SealMismatch(String),
     /// A line of `zfs list` output could not be read.
     Parse {
         /// The line.
@@ -86,7 +104,11 @@ impl fmt::Display for ZfsError {
                 code.map_or("signal".to_string(), |c| format!("exit {c}")),
                 stderr.trim(),
             ),
-            Self::AlreadyExists(name) => write!(f, "snapshot {name} already exists"),
+            Self::AlreadyExists(name) => write!(f, "{name} already exists"),
+            Self::NotFound(name) => write!(f, "{name} does not exist"),
+            Self::SealMismatch(name) => {
+                write!(f, "{name} is not bound to the requested Seal")
+            }
             Self::Parse { line, why } => write!(f, "cannot parse zfs output {line:?}: {why}"),
         }
     }
@@ -200,6 +222,51 @@ impl Snapshot {
     pub fn name(&self) -> String {
         self.dataset.seal_snapshot(self.seal)
     }
+}
+
+/// A dataset as ZFS reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatasetInfo {
+    /// The dataset.
+    pub dataset: Dataset,
+    /// Where it is mounted; `None` for `none`, `legacy` or `-`.
+    pub mountpoint: Option<PathBuf>,
+    /// The snapshot it was cloned from (full name), if it is a clone.
+    pub origin: Option<String>,
+    /// The `taso:parent` property: the Seal record it was forked from.
+    pub parent: Option<HashVal>,
+}
+
+impl DatasetInfo {
+    /// The origin as a Taso Seal snapshot, `(dataset, seal lsn)`, if it is
+    /// one.
+    pub fn origin_seal(&self) -> Option<(Dataset, Lsn)> {
+        let (ds, snap) = self.origin.as_deref()?.split_once('@')?;
+        Some((Dataset::new(ds).ok()?, parse_snap_name(snap)?))
+    }
+}
+
+/// Parse the single `zfs list` line of [`Zfs::dataset_info`].
+fn parse_info_line(dataset: &Dataset, line: &str) -> Result<DatasetInfo, ZfsError> {
+    let bad = |why| ZfsError::Parse { line: line.to_string(), why };
+    let fields: Vec<&str> = line.split('\t').collect();
+    let [name, mountpoint, origin, prop] = fields[..] else {
+        return Err(bad("expected 4 tab-separated fields"));
+    };
+    if name != dataset.as_str() {
+        return Err(bad("not the requested dataset"));
+    }
+    let mountpoint = mountpoint.starts_with('/').then(|| PathBuf::from(mountpoint));
+    let origin = match origin {
+        "-" | "" => None,
+        o if o.contains('@') => Some(o.to_string()),
+        _ => return Err(bad("origin is not a snapshot name")),
+    };
+    let parent = match prop {
+        "-" => None,
+        hex => Some(parse_hash(hex).ok_or_else(|| bad("taso:parent is not a 64-digit hex hash"))?),
+    };
+    Ok(DatasetInfo { dataset: dataset.clone(), mountpoint, origin, parent })
 }
 
 /// Parse one tab-separated `zfs list` line.  `Ok(None)` for snapshots
@@ -363,6 +430,84 @@ impl<R: Runner> Zfs<R> {
         let mut snaps = parse_list(dataset, &stdout)?;
         snaps.sort_by_key(|s| s.seal);
         Ok(snaps)
+    }
+
+    /// Create an empty dataset (the root of a lineage, or a test).  An
+    /// existing dataset is [`ZfsError::AlreadyExists`].
+    pub fn create(&self, dataset: &Dataset) -> Result<DatasetInfo, ZfsError> {
+        match self.run(vec!["create".to_string(), dataset.to_string()]) {
+            Ok(_) => {}
+            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("dataset already exists") => {
+                return Err(ZfsError::AlreadyExists(dataset.to_string()));
+            }
+            Err(e) => return Err(e),
+        }
+        self.created(dataset)
+    }
+
+    /// Fork: clone the Seal snapshot `source@taso-seal-<seal>` into
+    /// `target`, setting `taso:parent=<seal_hash>` in the same command.
+    ///
+    /// Refused before anything is created if the snapshot does not exist
+    /// ([`ZfsError::NotFound`]) or is not bound to `seal_hash`
+    /// ([`ZfsError::SealMismatch`]).  An existing `target` is
+    /// [`ZfsError::AlreadyExists`].
+    pub fn clone(
+        &self,
+        source: &Dataset,
+        seal: Lsn,
+        seal_hash: HashVal,
+        target: &Dataset,
+    ) -> Result<DatasetInfo, ZfsError> {
+        let origin = source.seal_snapshot(seal);
+        let snap = self.get(source, seal)?.ok_or_else(|| ZfsError::NotFound(origin.clone()))?;
+        if snap.seal_hash != Some(seal_hash) {
+            return Err(ZfsError::SealMismatch(origin));
+        }
+        let args = vec![
+            "clone".to_string(),
+            "-o".to_string(),
+            format!("{PARENT_PROPERTY}={seal_hash}"),
+            origin,
+            target.to_string(),
+        ];
+        match self.run(args) {
+            Ok(_) => {}
+            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("dataset already exists") => {
+                return Err(ZfsError::AlreadyExists(target.to_string()));
+            }
+            Err(e) => return Err(e),
+        }
+        self.created(target)
+    }
+
+    /// What ZFS reports for `dataset`, or `None` if it does not exist.
+    pub fn dataset_info(&self, dataset: &Dataset) -> Result<Option<DatasetInfo>, ZfsError> {
+        let args: Vec<String> = ["list", "-H", "-p", "-t", "filesystem", "-o", INFO_COLUMNS]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([dataset.to_string()])
+            .collect();
+        match self.run(args) {
+            Ok(stdout) => {
+                let mut lines = stdout.lines().filter(|l| !l.trim().is_empty());
+                let line = lines.next().ok_or(ZfsError::Parse {
+                    line: String::new(),
+                    why: "zfs list printed nothing for an existing dataset",
+                })?;
+                parse_info_line(dataset, line).map(Some)
+            }
+            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("does not exist") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Info for a dataset that was just created.
+    fn created(&self, dataset: &Dataset) -> Result<DatasetInfo, ZfsError> {
+        self.dataset_info(dataset)?.ok_or(ZfsError::Parse {
+            line: dataset.to_string(),
+            why: "dataset was created but zfs list does not show it",
+        })
     }
 
     /// Destroy one Seal snapshot.  For test cleanup only: purge rules
@@ -626,6 +771,145 @@ mod tests {
         assert!(matches!(zfs.list(&ds()), Err(ZfsError::Spawn(_))));
     }
 
+    // ── Datasets ───────────────────────────────────────────────────
+
+    fn info_line(name: &str, mount: &str, origin: &str, parent: &str) -> String {
+        format!("{name}\t{mount}\t{origin}\t{parent}\n")
+    }
+
+    const LIST_FS: [&str; 7] = ["list", "-H", "-p", "-t", "filesystem", "-o", "name,mountpoint,origin,taso:parent"];
+
+    #[test]
+    fn create_builds_exact_arguments() {
+        let line = info_line("tasotest/vessel", "/tasotest/vessel", "-", "-");
+        let zfs = Zfs::with_runner(Fake::default().reply(true, "", "").reply(true, &line, ""));
+        let info = zfs.create(&ds()).unwrap();
+        let calls = zfs.runner.calls.borrow();
+        assert_eq!(calls[0], strs(&["create", "tasotest/vessel"]));
+        let mut list = strs(&LIST_FS);
+        list.push("tasotest/vessel".into());
+        assert_eq!(calls[1], list);
+        assert_eq!(info.mountpoint, Some(PathBuf::from("/tasotest/vessel")));
+        assert_eq!((info.origin, info.parent), (None, None));
+    }
+
+    #[test]
+    fn create_existing_is_already_exists() {
+        let stderr = "cannot create 'tasotest/vessel': dataset already exists\n";
+        let zfs = Zfs::with_runner(Fake::default().reply(false, "", stderr));
+        assert_eq!(zfs.create(&ds()), Err(ZfsError::AlreadyExists("tasotest/vessel".into())));
+    }
+
+    fn fork_target() -> Dataset {
+        Dataset::new("tasotest/fork").unwrap()
+    }
+
+    fn seal_line(lsn: Lsn, prop: &str) -> String {
+        format!("{}\t845\t1\t{prop}\n", ds().seal_snapshot(lsn))
+    }
+
+    #[test]
+    fn clone_builds_exact_arguments() {
+        let origin = ds().seal_snapshot(Lsn::new(7));
+        let info = info_line("tasotest/fork", "/tasotest/fork", &origin, &hash(3).to_string());
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(true, &seal_line(Lsn::new(7), &hash(3).to_string()), "")
+                .reply(true, "", "")
+                .reply(true, &info, ""),
+        );
+        let got = zfs.clone(&ds(), Lsn::new(7), hash(3), &fork_target()).unwrap();
+        let calls = zfs.runner.calls.borrow();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0][0], "list", "the binding is checked first");
+        assert_eq!(
+            calls[1],
+            strs(&["clone", "-o", &format!("taso:parent={}", hash(3)), &origin, "tasotest/fork"]),
+        );
+        assert_eq!(got.parent, Some(hash(3)));
+        assert_eq!(got.origin.as_deref(), Some(origin.as_str()));
+        assert_eq!(got.origin_seal(), Some((ds(), Lsn::new(7))));
+    }
+
+    #[test]
+    fn clone_refuses_wrong_or_unbound_seal_before_cloning() {
+        for prop in [hash(4).to_string(), "-".to_string()] {
+            let zfs = Zfs::with_runner(Fake::default().reply(true, &seal_line(Lsn::new(7), &prop), ""));
+            assert_eq!(
+                zfs.clone(&ds(), Lsn::new(7), hash(3), &fork_target()),
+                Err(ZfsError::SealMismatch(ds().seal_snapshot(Lsn::new(7)))),
+            );
+            assert_eq!(zfs.runner.calls.borrow().len(), 1, "no clone was attempted");
+        }
+    }
+
+    #[test]
+    fn clone_from_missing_seal_is_not_found() {
+        let stderr = "cannot open 'tasotest/vessel@taso-seal-00000000000000000007': \
+                      dataset does not exist\n";
+        let zfs = Zfs::with_runner(Fake::default().reply(false, "", stderr));
+        assert_eq!(
+            zfs.clone(&ds(), Lsn::new(7), hash(3), &fork_target()),
+            Err(ZfsError::NotFound(ds().seal_snapshot(Lsn::new(7)))),
+        );
+        assert_eq!(zfs.runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn clone_onto_existing_target_is_already_exists() {
+        let stderr = "cannot create 'tasotest/fork': dataset already exists\n";
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(true, &seal_line(Lsn::new(7), &hash(3).to_string()), "")
+                .reply(false, "", stderr),
+        );
+        assert_eq!(
+            zfs.clone(&ds(), Lsn::new(7), hash(3), &fork_target()),
+            Err(ZfsError::AlreadyExists("tasotest/fork".into())),
+        );
+    }
+
+    #[test]
+    fn dataset_info_parses_and_reports_missing() {
+        for (mount, want) in [("/m/x", Some(PathBuf::from("/m/x"))), ("none", None), ("legacy", None), ("-", None)] {
+            let zfs = Zfs::with_runner(
+                Fake::default().reply(true, &info_line("tasotest/vessel", mount, "-", "-"), ""),
+            );
+            assert_eq!(zfs.dataset_info(&ds()).unwrap().unwrap().mountpoint, want, "{mount}");
+        }
+        let stderr = "cannot open 'tasotest/vessel': dataset does not exist\n";
+        let zfs = Zfs::with_runner(Fake::default().reply(false, "", stderr));
+        assert_eq!(zfs.dataset_info(&ds()), Ok(None));
+    }
+
+    #[test]
+    fn dataset_info_origin_that_is_not_a_seal() {
+        let zfs = Zfs::with_runner(Fake::default().reply(
+            true,
+            &info_line("tasotest/vessel", "/x", "tasotest/other@manual", "-"),
+            "",
+        ));
+        let info = zfs.dataset_info(&ds()).unwrap().unwrap();
+        assert_eq!(info.origin.as_deref(), Some("tasotest/other@manual"));
+        assert_eq!(info.origin_seal(), None);
+    }
+
+    #[test]
+    fn malformed_info_lines_are_errors() {
+        for line in [
+            "tasotest/vessel\t/x\t-",
+            "tasotest/other\t/x\t-\t-",
+            "tasotest/vessel\t/x\tnot-a-snapshot\t-",
+            "tasotest/vessel\t/x\t-\tabc123",
+        ] {
+            let zfs = Zfs::with_runner(Fake::default().reply(true, line, ""));
+            assert!(
+                matches!(zfs.dataset_info(&ds()), Err(ZfsError::Parse { .. })),
+                "{line:?} should not parse",
+            );
+        }
+    }
+
     // ── On-node tests: need a real pool ────────────────────────────
     //
     //   TASO_ZFS_DATASET=tasotest/vessel cargo test -p taso-warden -- --ignored --nocapture
@@ -669,7 +953,8 @@ mod tests {
 
         impl Drop for Scratch {
             fn drop(&mut self) {
-                let _ = Command::new("zfs").args(["destroy", "-r", self.ds.as_str()]).status();
+                // -R: also the clones made from its snapshots.
+                let _ = Command::new("zfs").args(["destroy", "-R", self.ds.as_str()]).status();
             }
         }
 
@@ -743,6 +1028,39 @@ mod tests {
                 pct(0.95),
                 ms[ms.len() - 1],
             );
+        }
+
+        #[test]
+        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
+        fn create_seal_clone_round_trip() {
+            let s = Scratch::new("fork");
+            let zfs = Zfs::cli();
+            let src = Dataset::new(&format!("{}/src", s.ds)).unwrap();
+            let fork = Dataset::new(&format!("{}/fork", s.ds)).unwrap();
+
+            let info = zfs.create(&src).unwrap();
+            assert_eq!(zfs.create(&src), Err(ZfsError::AlreadyExists(src.to_string())));
+            let mount = info.mountpoint.expect("created dataset is mounted");
+            std::fs::write(mount.join("state.txt"), b"at the seal").unwrap();
+            zfs.snapshot(&src, Lsn::new(4), hash(4)).unwrap();
+            std::fs::write(mount.join("state.txt"), b"after the seal").unwrap();
+
+            // Wrong hash and missing Seal are refused, and nothing is made.
+            assert!(matches!(zfs.clone(&src, Lsn::new(4), hash(5), &fork), Err(ZfsError::SealMismatch(_))));
+            assert!(matches!(zfs.clone(&src, Lsn::new(9), hash(4), &fork), Err(ZfsError::NotFound(_))));
+            assert_eq!(zfs.dataset_info(&fork).unwrap(), None);
+
+            let forked = zfs.clone(&src, Lsn::new(4), hash(4), &fork).unwrap();
+            assert_eq!(forked.parent, Some(hash(4)));
+            assert_eq!(forked.origin_seal(), Some((src.clone(), Lsn::new(4))));
+            let fmount = forked.mountpoint.clone().expect("clone is mounted");
+            assert_eq!(std::fs::read(fmount.join("state.txt")).unwrap(), b"at the seal");
+            assert_eq!(std::fs::read(mount.join("state.txt")).unwrap(), b"after the seal");
+            assert!(matches!(
+                zfs.clone(&src, Lsn::new(4), hash(4), &fork),
+                Err(ZfsError::AlreadyExists(_))
+            ));
+            println!("forked: {forked:?}");
         }
     }
 }
