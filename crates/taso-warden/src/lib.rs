@@ -9,4 +9,5 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod coordinator;
 pub mod zfs;

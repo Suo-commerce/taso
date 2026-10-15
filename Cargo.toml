@@ -10,3 +10,5 @@ license = "Apache-2.0"
 [workspace.dependencies]
 blake3 = "1.8"
 proptest = "1.12"
+redb = "4.4"
+tempfile = "3.27"

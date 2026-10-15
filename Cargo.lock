@@ -316,6 +316,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "4.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -405,7 +414,10 @@ dependencies = [
 name = "taso-warden"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "redb",
  "taso-core",
+ "tempfile",
 ]
 
 [[package]]
