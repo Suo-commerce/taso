@@ -665,6 +665,8 @@ mod tests {
     fn intent(op: u64, consequence: Consequence, barrier: Option<u64>) -> Payload {
         Payload::Intent(IntentRecord {
             op: OpId::new(op),
+            request: Vec::new(),
+            provider: String::new(),
             footprint: b"pay:bob".to_vec(),
             dispatch: Dispatch::Immediate,
             retry: RetryPolicy::UnsafeToRetry,

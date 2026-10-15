@@ -378,6 +378,14 @@ impl Canonical for GroupRecord {
 pub struct IntentRecord {
     /// Stable logical identity; survives rebirth.
     pub op: OpId,
+    /// The provider whose adapter planned it, and re-issues or probes it
+    /// on reconciliation.
+    pub provider: String,
+    /// The exact request the adapter will send (opaque, adapter-normalised).
+    /// Durable with the intent, so a `ProviderDeduplicated` effect can be
+    /// re-issued after a crash with the same bytes (v0.4 §7.2).  It may
+    /// carry user data and lives in the retention-locked ledger.
+    pub request: Vec<u8>,
     /// Canonical resource set (opaque; Field-assigned).
     pub footprint: Vec<u8>,
     /// Immediate or deferrable.
@@ -395,6 +403,8 @@ pub struct IntentRecord {
 impl Canonical for IntentRecord {
     fn canon(&self, out: &mut Canon) {
         self.op.canon(out);
+        out.str(&self.provider);
+        out.bytes(&self.request);
         out.bytes(&self.footprint);
         self.dispatch.canon(out);
         self.retry.canon(out);
@@ -714,6 +724,8 @@ mod tests {
     fn intent_payload() -> Payload {
         Payload::Intent(IntentRecord {
             op: OpId::new(1),
+            request: Vec::new(),
+            provider: String::new(),
             footprint: b"resource:mail:send".to_vec(),
             dispatch: Dispatch::Immediate,
             retry: RetryPolicy::ProviderDeduplicated {
@@ -886,22 +898,23 @@ mod tests {
         assert_eq!(cut.transcript, Lsn::new(0));
     }
 
-    /// The encodings of tags 0–4 must never change: these are the record
-    /// hashes before Lineage and Succession were added.
+    /// Record hashes under payload domain v2 (v1 had no `provider` or
+    /// `request` in `IntentRecord`).  A change here is a format change:
+    /// bump the domain.
     #[test]
     fn existing_record_hashes_are_pinned() {
         let pins = [
-            "3f0c684f41eac33a18ed8439ba75da6ac0a9e7690a88e37347b8075a9faf1ad6",
-            "78914766f0a526df3bff07898ec3341081334227ff403551323c36e0da43ed8d",
-            "95966ed96bc203955b447f0c794ab9d0f1b4916dd3d0b94d370d238a5a511e30",
-            "021b4004c756a7c9992e2e5c448be8aa40ab8b471665966813b7dcd93bfed56f",
-            "cec8339c7e4e07e42e0e03cca86dd39e3349f6fed5f99eeaa311bda819b06c5d",
+            "09bda33c6470f8a91d4fe4517473c16b443e294f3dbcded1f8209f799ee6e6f3",
+            "48cc01a42756f90bf98eacbdca8a9bfcdee76948ae835a1693f40010f49ff52a",
+            "5a5028714f892e8233b9114a5d539b3037a4c81a9c044f958a453adaa46f8f2c",
+            "ac080516e89c43165f8ac222bc801ef16cac440f376eb498fb40c4ef5a1e9a4f",
+            "bddb5d242e86cf985daac1bc2525b6a951c3a7a116cf35d24adb7cca17ac2dba",
         ];
         let payloads =
             [seal_payload(), group_payload(), intent_payload(), outcome_payload(), raw_payload()];
-        for (p, pin) in payloads.into_iter().zip(pins) {
-            assert_eq!(make_record(p).envelope.hash.to_string(), pin);
-        }
+        let got: Vec<String> =
+            payloads.into_iter().map(|p| make_record(p).envelope.hash.to_string()).collect();
+        assert_eq!(got, pins);
     }
 
     // ── Lineage and succession ──────────────────────────────────────
