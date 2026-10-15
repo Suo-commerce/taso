@@ -426,6 +426,7 @@ dependencies = [
  "proptest",
  "redb",
  "taso-core",
+ "taso-field",
  "tempfile",
 ]
 

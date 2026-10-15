@@ -159,6 +159,9 @@ pub enum ChronicleError {
     Fenced,
     /// An earlier append's outcome is unknown; reopen to recover.
     Poisoned,
+    /// A Seal's check failed after the layer was frozen; the layer was
+    /// destroyed and no Seal record was written.
+    CheckFailed(String),
 }
 
 impl fmt::Display for ChronicleError {
@@ -176,6 +179,7 @@ impl fmt::Display for ChronicleError {
             ),
             Self::Fenced => write!(f, "chronicle is fenced: ownership was lost"),
             Self::Poisoned => write!(f, "chronicle is poisoned: reopen to recover"),
+            Self::CheckFailed(why) => write!(f, "seal check failed: {why}"),
         }
     }
 }
@@ -347,6 +351,22 @@ impl<L: Layers> Chronicle<L> {
         ledger_pos: Lsn,
         turn: TurnId,
     ) -> Result<Sealed, ChronicleError> {
+        self.seal_checked(cut, verdict, ledger_pos, turn, || Ok(()))
+    }
+
+    /// Like [`Chronicle::seal`], with `check` run after the layer is frozen
+    /// and before the Seal record is written.  If it fails, the layer is
+    /// destroyed and there is no Seal — a frozen layer is a Seal only once
+    /// its record is accepted.  Phase 1 uses this to refuse a Seal whose
+    /// database moved after the harness said it was quiescent.
+    pub fn seal_checked(
+        &mut self,
+        cut: StreamCut,
+        verdict: Verdict,
+        ledger_pos: Lsn,
+        turn: TurnId,
+        check: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Sealed, ChronicleError> {
         self.ready()?;
         let lsn = self.segment.tail().lsn.next();
         let rec = self.next_record(
@@ -362,6 +382,12 @@ impl<L: Layers> Chronicle<L> {
         );
         let hash = rec.envelope.hash;
         self.layers.snapshot(lsn, hash).map_err(ChronicleError::Layer)?;
+        if let Err(why) = check() {
+            // Best effort: if this fails, the next recovery destroys the
+            // orphan, whose record does not exist.
+            let _ = self.layers.destroy(lsn);
+            return Err(ChronicleError::CheckFailed(why));
+        }
         match self.commit(&rec) {
             Ok(head) => {
                 let seal = Position { lsn, hash };
@@ -751,6 +777,27 @@ mod tests {
         assert!(r.orphan_layers.is_empty());
         assert_eq!(r.last_seal, Some(s.seal));
         assert_eq!(e.layers.snaps(), vec![(s.seal.lsn, s.seal.hash)]);
+    }
+
+    /// A failed check after the snapshot leaves neither a layer nor a
+    /// record, and the Chronicle stays live.
+    #[test]
+    fn failed_seal_check_leaves_nothing() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        let tail = c.tail();
+        let layers = e.layers.clone();
+        let r = c.seal_checked(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(1), || {
+            // The check runs with the layer already frozen.
+            assert_eq!(layers.snaps().len(), 1);
+            Err("wal moved".into())
+        });
+        assert!(matches!(r, Err(ChronicleError::CheckFailed(ref w)) if w == "wal moved"));
+        assert!(e.layers.snaps().is_empty());
+        assert_eq!(c.tail(), tail);
+        assert!(!c.is_fenced());
+        seal(&mut c, 2).unwrap();
     }
 
     /// A layer whose lsn is accepted but holds another record (a refused
