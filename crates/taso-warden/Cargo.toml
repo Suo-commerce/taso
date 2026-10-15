@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 taso-core = { path = "../taso-core" }
 redb = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
