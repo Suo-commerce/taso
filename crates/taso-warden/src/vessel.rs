@@ -613,6 +613,20 @@ impl<L: Layers> Vessel<L> {
         Ok(self.chronicle.seal(cut, verdict, ledger_pos, turn)?)
     }
 
+    /// Take a Seal, refused if `check` fails once the layer is frozen (see
+    /// [`Chronicle::seal_checked`]).
+    pub fn seal_checked(
+        &mut self,
+        cut: StreamCut,
+        verdict: Verdict,
+        ledger_pos: Lsn,
+        turn: TurnId,
+        check: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Sealed, VesselError> {
+        self.writable()?;
+        Ok(self.chronicle.seal_checked(cut, verdict, ledger_pos, turn, check)?)
+    }
+
     fn writable(&self) -> Result<(), VesselError> {
         match &self.successor {
             Some(s) => Err(VesselError::Closed { successor: s.successor }),

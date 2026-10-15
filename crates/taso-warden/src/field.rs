@@ -19,9 +19,15 @@
 //!   `Transcript` lsn and its `ledger_pos` the highest `Effect` lsn.
 //!   Trusting the harness's quiescence flag is Phase 1's contract; the
 //!   `-wal` check that verifies it is a separate step.
-//! - **Effect** requests are refused before dispatch with "no adapter":
-//!   adapters come next, and an effect with no adapter is refused, never
-//!   guessed at (v0.4 §7.1).
+//! - **Effect** requests go through the effect engine
+//!   ([`Session::with_effects`]): intent before dispatch, outcomes
+//!   recorded, authority withheld while anything is unresolved.  Without
+//!   an engine they are refused before dispatch — an effect with no
+//!   adapter is refused, never guessed at (v0.4 §7.1).
+//! - **Quiescence is verified** when a [`Watch`] is given
+//!   ([`Session::with_watch`]): sampled at `TurnEnd`, sampled again once
+//!   the layer is frozen; if a database moved in between, the layer is
+//!   destroyed, no Seal exists, and the reply is `sealed: None`.
 //! - A malformed body is answered with `Malformed` and the connection
 //!   continues (the frame boundary is intact); a broken frame or a socket
 //!   error ends the connection.
@@ -41,7 +47,10 @@ use taso_field::protocol::{
 };
 
 use crate::chronicle::{ChronicleError, Layers};
+use crate::effects::Effects;
+use crate::quiesce::{verify, Watch};
 use crate::vessel::{Vessel, VesselError};
+use taso_field::adapter::Call;
 
 // ── Session ─────────────────────────────────────────────────────────
 
@@ -56,6 +65,10 @@ pub struct Session<'v, L: Layers> {
     ledger: Lsn,
     /// Verdict for the next Seal; `Clean` after the first.
     next_verdict: Verdict,
+    /// The effect engine, if effects may be dispatched.
+    effects: Option<&'v mut Effects>,
+    /// The databases whose quiescence is verified at each Seal.
+    watch: Option<Watch>,
 }
 
 impl<'v, L: Layers> Session<'v, L> {
@@ -92,7 +105,21 @@ impl<'v, L: Layers> Session<'v, L> {
             transcript,
             ledger,
             next_verdict: first_verdict,
+            effects: None,
+            watch: None,
         })
+    }
+
+    /// Dispatch effects through `effects` (reconciled when it was opened).
+    pub fn with_effects(mut self, effects: &'v mut Effects) -> Self {
+        self.effects = Some(effects);
+        self
+    }
+
+    /// Verify quiescence of `watch`'s databases at every Seal.
+    pub fn with_watch(mut self, watch: Watch) -> Self {
+        self.watch = Some(watch);
+        self
     }
 
     /// The last turn sealed, if any.
@@ -122,10 +149,26 @@ impl<'v, L: Layers> Session<'v, L> {
                     Err(e) => vessel_error(e),
                 }
             }
-            (true, Request::Effect { call, provider, .. }) => Reply::Effect {
-                call,
-                result: EffectResult::Refused { reason: format!("no adapter for provider {provider:?}") },
-            },
+            (true, Request::Effect { call, provider, operation, args }) => {
+                let Some(fx) = self.effects.as_deref_mut() else {
+                    return Reply::Effect {
+                        call,
+                        result: EffectResult::Refused {
+                            reason: format!("no adapter for provider {provider:?}"),
+                        },
+                    };
+                };
+                let before = self.vessel.tail();
+                match fx.dispatch(self.vessel, &provider, Call { operation, args }) {
+                    Ok(result) => {
+                        if self.vessel.tail() != before {
+                            self.ledger = self.vessel.tail().lsn;
+                        }
+                        Reply::Effect { call, result }
+                    }
+                    Err(e) => vessel_error(e),
+                }
+            }
             (true, Request::TurnEnd { turn, quiescent }) => self.turn_end(turn, quiescent),
         }
     }
@@ -140,12 +183,31 @@ impl<'v, L: Layers> Session<'v, L> {
         if !quiescent {
             return Reply::TurnEnd { turn, sealed: None };
         }
+        let before = match self.watch.as_ref().map(Watch::sample).transpose() {
+            Ok(b) => b,
+            Err(e) => return error(ErrorCode::Internal, format!("quiescence sample: {e}")),
+        };
+        let watch = &self.watch;
+        let check = move || -> Result<(), String> {
+            match (watch, before) {
+                (Some(w), Some(b)) => {
+                    let after = w.sample().map_err(|e| format!("quiescence sample: {e}"))?;
+                    verify(&b, &after).map_err(|e| e.to_string())
+                }
+                _ => Ok(()),
+            }
+        };
         let cut = StreamCut { fs: Lsn::new(0), db: Lsn::new(0), transcript: self.transcript };
         let verdict = std::mem::replace(&mut self.next_verdict, Verdict::Clean);
-        match self.vessel.seal(cut, verdict.clone(), self.ledger, TurnId::new(turn)) {
+        match self.vessel.seal_checked(cut, verdict.clone(), self.ledger, TurnId::new(turn), check) {
             Ok(sealed) => {
                 self.last_sealed_turn = Some(turn);
                 Reply::TurnEnd { turn, sealed: Some(sealed.seal.lsn.get()) }
+            }
+            Err(VesselError::Chronicle(ChronicleError::CheckFailed(_))) => {
+                // Not actually quiescent: no Seal, try again next turn.
+                self.next_verdict = verdict;
+                Reply::TurnEnd { turn, sealed: None }
             }
             Err(e) => {
                 self.next_verdict = verdict;
@@ -235,11 +297,17 @@ impl FieldSocket {
         vessel: &mut Vessel<L>,
         first_verdict: Verdict,
     ) -> io::Result<(Ended, Option<u64>)> {
-        let (mut stream, _) = self.listener.accept()?;
         let mut session = Session::new(vessel, first_verdict)
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let ended = serve(&mut stream, &mut session);
+        let ended = self.serve_session(&mut session)?;
         Ok((ended, session.last_sealed_turn()))
+    }
+
+    /// Accept one connection and serve it with a prepared session (with
+    /// its effect engine and quiescence watch).
+    pub fn serve_session<L: Layers>(&self, session: &mut Session<'_, L>) -> io::Result<Ended> {
+        let (mut stream, _) = self.listener.accept()?;
+        Ok(serve(&mut stream, session))
     }
 }
 
@@ -256,6 +324,7 @@ mod tests {
     use super::*;
     use crate::vessel::tests::{env, ns};
     use std::os::unix::net::UnixStream;
+    use taso_field::adapter::{FakeProvider, Registry};
     use taso_field::protocol::{recv_reply, send_request, write_frame};
 
     fn hello() -> Request {
@@ -367,6 +436,66 @@ mod tests {
         assert!(matches!(r, Reply::Effect { call: 3, result: EffectResult::Refused { .. } }));
         drop(s);
         assert_eq!(v.tail(), tail);
+    }
+
+    #[test]
+    fn effects_dispatch_through_the_engine() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut reg = Registry::new();
+        reg.register(Box::new(FakeProvider::new("mail")));
+        let (mut fx, _) = Effects::open(reg, &mut v).unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_effects(&mut fx);
+        s.handle(hello());
+        let r = s.handle(Request::Effect {
+            call: 1,
+            provider: "mail".into(),
+            operation: "send".into(),
+            args: b"bob".to_vec(),
+        });
+        assert!(matches!(r, Reply::Effect { call: 1, result: EffectResult::Applied { .. } }));
+        let r = s.handle(Request::Effect {
+            call: 2,
+            provider: "http".into(),
+            operation: "get".into(),
+            args: b"x".to_vec(),
+        });
+        assert!(matches!(r, Reply::Effect { call: 2, result: EffectResult::Refused { .. } }));
+        // The Seal's ledger_pos covers the effect records.
+        s.handle(Request::TurnEnd { turn: 1, quiescent: true });
+        drop(s);
+        let frames = v.chronicle().segment().frames().unwrap();
+        let last_effect = frames.iter().rfind(|f| f.envelope.stream == Stream::Effect).unwrap();
+        let seal = frames.last().unwrap();
+        let Payload::Seal(rec) = Payload::decode(&seal.payload).unwrap() else { panic!() };
+        assert_eq!(rec.ledger_pos, last_effect.envelope.lsn);
+    }
+
+    #[test]
+    fn a_turn_that_is_not_really_quiescent_is_not_sealed() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mount = tempfile::tempdir().unwrap();
+        std::fs::write(mount.path().join("state.db-journal"), [0u8; 512]).unwrap();
+        let watch = Watch::new(mount.path(), &["state.db"]).unwrap();
+        let tail = v.tail();
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_watch(watch);
+        s.handle(hello());
+        // The harness says quiescent; the journal says otherwise.
+        assert_eq!(
+            s.handle(Request::TurnEnd { turn: 1, quiescent: true }),
+            Reply::TurnEnd { turn: 1, sealed: None }
+        );
+        assert_eq!(s.last_sealed_turn(), None);
+        // Once the transaction is done, the same turn seals.
+        std::fs::remove_file(mount.path().join("state.db-journal")).unwrap();
+        assert!(matches!(
+            s.handle(Request::TurnEnd { turn: 1, quiescent: true }),
+            Reply::TurnEnd { turn: 1, sealed: Some(_) }
+        ));
+        drop(s);
+        assert_eq!(v.tail().lsn, tail.lsn.next(), "exactly one Seal record");
+        assert_eq!(v.chronicle().layers().list().unwrap().len(), 1, "one layer");
     }
 
     #[test]
