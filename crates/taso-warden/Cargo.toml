@@ -1,0 +1,9 @@
+[package]
+name = "taso-warden"
+description = "Taso Warden: the daemon side. Phase 1 starts with the ZFS driver (a Seal is a snapshot)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+taso-core = { path = "../taso-core" }
