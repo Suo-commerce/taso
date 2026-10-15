@@ -415,6 +415,7 @@ name = "taso-field"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "taso-core",
 ]
 
 [[package]]
