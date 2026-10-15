@@ -411,6 +411,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "taso-field"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "taso-warden"
 version = "0.1.0"
 dependencies = [
