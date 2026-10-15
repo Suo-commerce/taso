@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 003ec12e74115b17401ffd756ef8eb8746d9374ecfefe94b0f6a59103c202986 # shrinks to steps = [Effect { retry: 0, compensatable: false, crash: Some(DuringDispatchReceived) }, Seal]
