@@ -10,4 +10,5 @@
 #![warn(missing_docs)]
 
 pub mod coordinator;
+pub mod segment;
 pub mod zfs;
