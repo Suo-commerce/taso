@@ -11,5 +11,6 @@
 
 pub mod chronicle;
 pub mod coordinator;
+pub mod quiesce;
 pub mod segment;
 pub mod zfs;
