@@ -11,6 +11,7 @@
 
 pub mod chronicle;
 pub mod coordinator;
+pub mod field;
 pub mod segment;
 pub mod vessel;
 pub mod zfs;

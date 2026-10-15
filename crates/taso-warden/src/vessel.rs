@@ -704,7 +704,7 @@ fn hex(id: &ChronicleId) -> String {
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -722,9 +722,9 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct FakePool(Rc<RefCell<BTreeMap<String, FakeDs>>>);
+    pub(crate) struct FakePool(Rc<RefCell<BTreeMap<String, FakeDs>>>);
 
-    struct FakeLayers {
+    pub(crate) struct FakeLayers {
         pool: FakePool,
         ds: String,
     }
@@ -808,12 +808,12 @@ mod tests {
 
     // ── fixtures ────────────────────────────────────────────────────
 
-    struct Env {
+    pub(crate) struct Env {
         _tmp: tempfile::TempDir,
-        host: Host<FakePool>,
+        pub(crate) host: Host<FakePool>,
     }
 
-    fn env() -> Env {
+    pub(crate) fn env() -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
         let host = Host {
@@ -826,7 +826,7 @@ mod tests {
         Env { _tmp: tmp, host }
     }
 
-    fn ns(b: u8) -> Namespace {
+    pub(crate) fn ns(b: u8) -> Namespace {
         Namespace::from_bytes([b; 16])
     }
 

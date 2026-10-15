@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 taso-core = { path = "../taso-core" }
+taso-field = { path = "../taso-field" }
 redb = { workspace = true }
 
 [dev-dependencies]
