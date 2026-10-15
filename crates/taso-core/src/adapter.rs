@@ -218,6 +218,7 @@ impl AdapterModel {
         // Step 1: write Intent.
         let intent = IntentRecord {
             op,
+            request: Vec::new(),
             footprint: footprint.to_vec(),
             dispatch: Dispatch::Immediate,
             retry: retry.clone(),

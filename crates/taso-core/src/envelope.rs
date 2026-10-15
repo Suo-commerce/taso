@@ -242,7 +242,7 @@ impl Canonical for ChronicleHead {
 // ── Domain strings ──────────────────────────────────────────────────
 
 /// Domain string for payload hashing.
-const PAYLOAD_DOMAIN: &str = "taso.chronicle.payload.v1";
+const PAYLOAD_DOMAIN: &str = "taso.chronicle.payload.v2";
 
 /// Domain string for record hashing.
 const RECORD_DOMAIN: &str = "taso.chronicle.record.v1";

@@ -236,6 +236,7 @@ impl<'a> Reader<'a> {
 
     fn intent(&mut self) -> R<IntentRecord> {
         let op = OpId::new(self.u64()?);
+        let request = self.bytes()?;
         let footprint = self.bytes()?;
         let dispatch = match self.tag()? {
             (_, 0) => Dispatch::Immediate,
@@ -256,6 +257,7 @@ impl<'a> Reader<'a> {
         };
         Ok(IntentRecord {
             op,
+            request,
             footprint,
             dispatch,
             retry,
@@ -423,10 +425,11 @@ mod tests {
             any::<u64>().prop_map(|b| Consequence::Compensatable { by: OpId::new(b) }),
             Just(Consequence::NoExternalMutation),
         ];
-        (any::<u64>(), blob(), dispatch, retry, consequence, blob(), proptest::option::of(any::<u64>()))
-            .prop_map(|(op, footprint, dispatch, retry, consequence, authority, barrier)| {
+        (any::<u64>(), blob(), blob(), dispatch, retry, consequence, blob(), proptest::option::of(any::<u64>()))
+            .prop_map(|(op, request, footprint, dispatch, retry, consequence, authority, barrier)| {
                 Payload::Intent(IntentRecord {
                     op: OpId::new(op),
+                    request,
                     footprint,
                     dispatch,
                     retry,
