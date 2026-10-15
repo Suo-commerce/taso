@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3233e1d89af76ad476d94f85fae6a894e8fbd8c7e1f9038062a0a079d31afc73 # shrinks to p = Group(GroupRecord { gid: GroupId(0), members: [], depends_on: [], commit: true }), pick = Index(17737253917028415016), flip = 2
