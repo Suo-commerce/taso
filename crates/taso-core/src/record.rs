@@ -378,6 +378,9 @@ impl Canonical for GroupRecord {
 pub struct IntentRecord {
     /// Stable logical identity; survives rebirth.
     pub op: OpId,
+    /// The provider whose adapter planned it, and re-issues or probes it
+    /// on reconciliation.
+    pub provider: String,
     /// The exact request the adapter will send (opaque, adapter-normalised).
     /// Durable with the intent, so a `ProviderDeduplicated` effect can be
     /// re-issued after a crash with the same bytes (v0.4 §7.2).  It may
@@ -400,6 +403,7 @@ pub struct IntentRecord {
 impl Canonical for IntentRecord {
     fn canon(&self, out: &mut Canon) {
         self.op.canon(out);
+        out.str(&self.provider);
         out.bytes(&self.request);
         out.bytes(&self.footprint);
         self.dispatch.canon(out);
@@ -721,6 +725,7 @@ mod tests {
         Payload::Intent(IntentRecord {
             op: OpId::new(1),
             request: Vec::new(),
+            provider: String::new(),
             footprint: b"resource:mail:send".to_vec(),
             dispatch: Dispatch::Immediate,
             retry: RetryPolicy::ProviderDeduplicated {
@@ -893,14 +898,15 @@ mod tests {
         assert_eq!(cut.transcript, Lsn::new(0));
     }
 
-    /// Record hashes under payload domain v2 (v1 had no `request` in
-    /// `IntentRecord`).  A change here is a format change: bump the domain.
+    /// Record hashes under payload domain v2 (v1 had no `provider` or
+    /// `request` in `IntentRecord`).  A change here is a format change:
+    /// bump the domain.
     #[test]
     fn existing_record_hashes_are_pinned() {
         let pins = [
             "09bda33c6470f8a91d4fe4517473c16b443e294f3dbcded1f8209f799ee6e6f3",
             "48cc01a42756f90bf98eacbdca8a9bfcdee76948ae835a1693f40010f49ff52a",
-            "59d611ee9b7ffa617aacdbfce0f9e5b579d0e86a5bd79a8923af2ddad24eb8dd",
+            "5a5028714f892e8233b9114a5d539b3037a4c81a9c044f958a453adaa46f8f2c",
             "ac080516e89c43165f8ac222bc801ef16cac440f376eb498fb40c4ef5a1e9a4f",
             "bddb5d242e86cf985daac1bc2525b6a951c3a7a116cf35d24adb7cca17ac2dba",
         ];
