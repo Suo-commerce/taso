@@ -1036,6 +1036,8 @@ pub(crate) mod tests {
         let intent = |op: u64| {
             Payload::Intent(IntentRecord {
                 op: OpId::new(op),
+                provider: String::new(),
+                request: Vec::new(),
                 footprint: vec![],
                 dispatch: Dispatch::Immediate,
                 retry: RetryPolicy::UnsafeToRetry,
