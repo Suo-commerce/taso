@@ -3,10 +3,26 @@
 //! A Chronicle record is an [`Envelope`] (position in the hash chain)
 //! plus a [`Payload`].  Taso parses envelopes on every record; it parses
 //! payloads only for its own types — [`SealRecord`], [`GroupRecord`],
-//! [`IntentRecord`], [`OutcomeRecord`] — and treats everything else as
-//! opaque bytes ([`Payload::Raw`]).
+//! [`IntentRecord`], [`OutcomeRecord`], [`LineageRecord`],
+//! [`SuccessionRecord`] — and treats everything else as opaque bytes
+//! ([`Payload::Raw`]).
 //!
-//! Normative references: v0.4 §§3–7.
+//! # Birth, lineage and succession
+//!
+//! Every Vessel's Chronicle opens with a [`LineageRecord`] at lsn 1 on
+//! `Ctl`.  The default birth is from the void ([`Origin::Void`]): an empty
+//! dataset, no parent.  [`Origin::Fork`] starts from a parent's Seal.
+//! [`Origin::Succession`] is the deliberate, operator-authorised move of a
+//! Vessel's state to another identity; the old Chronicle then ends with a
+//! [`SuccessionRecord`] naming its successor, so the coupling is visible
+//! from both sides.
+//!
+//! A Vessel's id is derived, not assigned: [`vessel_id`]`(namespace,
+//! subject)`.  `subject` is the platform's stable key for the owner (an
+//! opaque user id), never a display name, so renaming a user changes
+//! nothing here.
+//!
+//! Normative references: v0.4 §§3–7 (Lineage: §3, §4).
 
 use crate::canon::{Canon, Canonical};
 use crate::envelope::{
@@ -407,6 +423,175 @@ impl Canonical for OutcomeRecord {
     }
 }
 
+// ── Lineage ─────────────────────────────────────────────────────────
+
+/// An isolation domain: a tenant, an organisation, a deployment.  Opaque
+/// to Taso; forks and successions record it so policy can check it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Namespace([u8; 16]);
+
+impl Namespace {
+    /// Wrap raw bytes.
+    pub const fn from_bytes(b: [u8; 16]) -> Self { Self(b) }
+    /// The raw bytes.
+    pub const fn as_bytes(&self) -> &[u8; 16] { &self.0 }
+}
+
+impl Canonical for Namespace {
+    fn canon(&self, out: &mut Canon) { out.fixed(&self.0); }
+}
+
+/// A Seal in another Chronicle: the point a Vessel was born from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParentSeal {
+    /// The parent Chronicle.
+    pub chronicle: ChronicleId,
+    /// The Seal record's lsn there.
+    pub seal: Lsn,
+    /// The Seal record's hash there.
+    pub seal_hash: HashVal,
+}
+
+impl Canonical for ParentSeal {
+    fn canon(&self, out: &mut Canon) {
+        self.chronicle.canon(out);
+        self.seal.canon(out);
+        self.seal_hash.canon(out);
+    }
+}
+
+/// Who authorised an operation that only a human or operator may do, and
+/// why.  Never a Vessel.  Emptiness is refused at the point of use, not
+/// here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Authority {
+    /// A named human or operator identity.
+    pub actor: String,
+    /// Why, in their words.
+    pub reason: String,
+}
+
+impl Canonical for Authority {
+    fn canon(&self, out: &mut Canon) {
+        out.str(&self.actor);
+        out.str(&self.reason);
+    }
+}
+
+/// How a Vessel came to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// Born from the void: empty state, no parent (tag 0).
+    Void,
+    /// Forked from a parent's Seal (tag 1).
+    Fork {
+        /// The Seal it was forked from.
+        parent: ParentSeal,
+    },
+    /// Took over another Vessel's state by operator decision (tag 2).
+    /// The parent Chronicle ends with a matching [`SuccessionRecord`].
+    Succession {
+        /// The predecessor's last Seal.
+        parent: ParentSeal,
+        /// Who authorised it, and why.
+        authority: Authority,
+    },
+}
+
+impl Origin {
+    /// The parent Seal, unless born from the void.
+    pub fn parent(&self) -> Option<&ParentSeal> {
+        match self {
+            Self::Void => None,
+            Self::Fork { parent } | Self::Succession { parent, .. } => Some(parent),
+        }
+    }
+}
+
+impl Canonical for Origin {
+    fn canon(&self, out: &mut Canon) {
+        match self {
+            Self::Void => { out.tag(0); }
+            Self::Fork { parent } => {
+                out.tag(1);
+                parent.canon(out);
+            }
+            Self::Succession { parent, authority } => {
+                out.tag(2);
+                parent.canon(out);
+                authority.canon(out);
+            }
+        }
+    }
+}
+
+/// The first record of every Chronicle (lsn 1, `Ctl`): where the Vessel
+/// came from (v0.4 §3, Lineage).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineageRecord {
+    /// How it was born.
+    pub origin: Origin,
+    /// Its namespace.
+    pub namespace: Namespace,
+    /// The parent's highest ledger lsn at the parent Seal; `0` for the
+    /// void.  Barriers after it in the parent are this Vessel's concern
+    /// too (v0.4 §7.4).
+    pub ledger_pos: Lsn,
+}
+
+impl Canonical for LineageRecord {
+    fn canon(&self, out: &mut Canon) {
+        self.origin.canon(out);
+        self.namespace.canon(out);
+        self.ledger_pos.canon(out);
+    }
+}
+
+/// The last record of a Chronicle whose state moved to another identity.
+/// Nothing may follow it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuccessionRecord {
+    /// The successor Chronicle.
+    pub successor: ChronicleId,
+    /// The successor's namespace.
+    pub namespace: Namespace,
+    /// The Seal the successor is born from (this Chronicle's last).
+    pub seal: Lsn,
+    /// That Seal's record hash.
+    pub seal_hash: HashVal,
+    /// Who authorised it, and why.  Must equal the successor's.
+    pub authority: Authority,
+}
+
+impl Canonical for SuccessionRecord {
+    fn canon(&self, out: &mut Canon) {
+        self.successor.canon(out);
+        self.namespace.canon(out);
+        self.seal.canon(out);
+        self.seal_hash.canon(out);
+        self.authority.canon(out);
+    }
+}
+
+/// Domain string for deriving a Vessel's id.
+const VESSEL_ID_DOMAIN: &str = "taso.vessel.id.v1";
+
+/// The Chronicle id of the Vessel owned by `subject` in `namespace`.
+///
+/// Deterministic, so the same owner always finds the same Vessel; the
+/// namespace is part of the input, so two namespaces never share an id.
+/// `subject` must be the platform's stable key for the owner (an opaque
+/// user id), never a display name.
+pub fn vessel_id(namespace: Namespace, subject: &[u8]) -> ChronicleId {
+    let mut c = Canon::new();
+    namespace.canon(&mut c);
+    c.bytes(subject);
+    let h = blake3::derive_key(VESSEL_ID_DOMAIN, c.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h[..16]);
+    ChronicleId::from_bytes(id)
+}
+
 // ── Payload ─────────────────────────────────────────────────────────
 
 /// The payload of a Chronicle record.
@@ -425,6 +610,10 @@ pub enum Payload {
     Outcome(OutcomeRecord),
     /// Opaque bytes: `fs`, `db`, `transcript`, or `ctl` data (tag 4).
     Raw(Vec<u8>),
+    /// A Lineage record: the first record of every Chronicle (tag 5).
+    Lineage(LineageRecord),
+    /// A Succession record: the last record of a Chronicle (tag 6).
+    Succession(SuccessionRecord),
 }
 
 impl Canonical for Payload {
@@ -435,6 +624,8 @@ impl Canonical for Payload {
             Self::Intent(r)  => { out.tag(2); r.canon(out); }
             Self::Outcome(r) => { out.tag(3); r.canon(out); }
             Self::Raw(b)     => { out.tag(4); out.bytes(b); }
+            Self::Lineage(r) => { out.tag(5); r.canon(out); }
+            Self::Succession(r) => { out.tag(6); r.canon(out); }
         }
     }
 }
@@ -693,5 +884,156 @@ mod tests {
         assert_eq!(cut.fs, Lsn::new(0));
         assert_eq!(cut.db, Lsn::new(0));
         assert_eq!(cut.transcript, Lsn::new(0));
+    }
+
+    /// The encodings of tags 0–4 must never change: these are the record
+    /// hashes before Lineage and Succession were added.
+    #[test]
+    fn existing_record_hashes_are_pinned() {
+        let pins = [
+            "3f0c684f41eac33a18ed8439ba75da6ac0a9e7690a88e37347b8075a9faf1ad6",
+            "78914766f0a526df3bff07898ec3341081334227ff403551323c36e0da43ed8d",
+            "95966ed96bc203955b447f0c794ab9d0f1b4916dd3d0b94d370d238a5a511e30",
+            "021b4004c756a7c9992e2e5c448be8aa40ab8b471665966813b7dcd93bfed56f",
+            "cec8339c7e4e07e42e0e03cca86dd39e3349f6fed5f99eeaa311bda819b06c5d",
+        ];
+        let payloads =
+            [seal_payload(), group_payload(), intent_payload(), outcome_payload(), raw_payload()];
+        for (p, pin) in payloads.into_iter().zip(pins) {
+            assert_eq!(make_record(p).envelope.hash.to_string(), pin);
+        }
+    }
+
+    // ── Lineage and succession ──────────────────────────────────────
+
+    fn ns(b: u8) -> Namespace {
+        Namespace::from_bytes([b; 16])
+    }
+
+    fn parent() -> ParentSeal {
+        ParentSeal {
+            chronicle: ChronicleId::from_bytes([7; 16]),
+            seal: Lsn::new(9),
+            seal_hash: HashVal::from_bytes([9; 32]),
+        }
+    }
+
+    fn authority() -> Authority {
+        Authority { actor: "jarmo".into(), reason: "account merge".into() }
+    }
+
+    fn lineage(origin: Origin, namespace: Namespace) -> Payload {
+        Payload::Lineage(LineageRecord { origin, namespace, ledger_pos: Lsn::new(0) })
+    }
+
+    fn succession_payload() -> Payload {
+        Payload::Succession(SuccessionRecord {
+            successor: ChronicleId::from_bytes([8; 16]),
+            namespace: ns(1),
+            seal: Lsn::new(9),
+            seal_hash: HashVal::from_bytes([9; 32]),
+            authority: authority(),
+        })
+    }
+
+    #[test]
+    fn lineage_and_succession_records_verify() {
+        for p in [
+            lineage(Origin::Void, ns(1)),
+            lineage(Origin::Fork { parent: parent() }, ns(1)),
+            lineage(Origin::Succession { parent: parent(), authority: authority() }, ns(1)),
+            succession_payload(),
+        ] {
+            assert!(make_record(p).verify());
+        }
+    }
+
+    #[test]
+    fn all_payload_kinds_and_origins_encode_distinctly() {
+        let payloads = [
+            seal_payload(),
+            group_payload(),
+            intent_payload(),
+            outcome_payload(),
+            raw_payload(),
+            lineage(Origin::Void, ns(1)),
+            lineage(Origin::Fork { parent: parent() }, ns(1)),
+            lineage(Origin::Succession { parent: parent(), authority: authority() }, ns(1)),
+            succession_payload(),
+        ];
+        let enc: Vec<Vec<u8>> = payloads.iter().map(|p| p.canon_bytes()).collect();
+        for i in 0..enc.len() {
+            for j in (i + 1)..enc.len() {
+                assert_ne!(enc[i], enc[j], "payloads {i} and {j} collide");
+            }
+        }
+    }
+
+    #[test]
+    fn every_lineage_field_is_bound_by_the_hash() {
+        let base = LineageRecord {
+            origin: Origin::Succession { parent: parent(), authority: authority() },
+            namespace: ns(1),
+            ledger_pos: Lsn::new(4),
+        };
+        let h = |r: &LineageRecord| make_record(Payload::Lineage(r.clone())).envelope.hash;
+        let h0 = h(&base);
+        let mut changed = Vec::new();
+        let mut r = base.clone();
+        r.namespace = ns(2);
+        changed.push(r);
+        let mut r = base.clone();
+        r.ledger_pos = Lsn::new(5);
+        changed.push(r);
+        for f in 0..5 {
+            let mut p = parent();
+            let mut a = authority();
+            match f {
+                0 => p.chronicle = ChronicleId::from_bytes([6; 16]),
+                1 => p.seal = Lsn::new(10),
+                2 => p.seal_hash = HashVal::from_bytes([1; 32]),
+                3 => a.actor = "someone-else".into(),
+                _ => a.reason = "another reason".into(),
+            }
+            let mut r = base.clone();
+            r.origin = Origin::Succession { parent: p, authority: a };
+            changed.push(r);
+        }
+        for r in &changed {
+            assert_ne!(h(r), h0, "{r:?} hashes like the original");
+        }
+    }
+
+    #[test]
+    fn authority_strings_are_length_prefixed() {
+        // ("ab", "c") and ("a", "bc") must not collide.
+        let a = Authority { actor: "ab".into(), reason: "c".into() };
+        let b = Authority { actor: "a".into(), reason: "bc".into() };
+        assert_ne!(a.canon_bytes(), b.canon_bytes());
+    }
+
+    #[test]
+    fn origin_parent() {
+        assert_eq!(Origin::Void.parent(), None);
+        assert_eq!(Origin::Fork { parent: parent() }.parent(), Some(&parent()));
+        let s = Origin::Succession { parent: parent(), authority: authority() };
+        assert_eq!(s.parent(), Some(&parent()));
+    }
+
+    #[test]
+    fn vessel_id_is_deterministic_and_namespaced() {
+        let a = vessel_id(ns(1), b"user-0001");
+        assert_eq!(a, vessel_id(ns(1), b"user-0001"));
+        assert_ne!(a, vessel_id(ns(2), b"user-0001"), "namespaces must not share ids");
+        assert_ne!(a, vessel_id(ns(1), b"user-0002"));
+        // Subject bytes are length-prefixed: no boundary ambiguity with the
+        // namespace.
+        assert_ne!(vessel_id(ns(1), b""), vessel_id(ns(1), &[0]));
+        // Pinned, so the derivation cannot drift.
+        assert_eq!(
+            a.as_bytes(),
+            &[250, 160, 64, 131, 137, 178, 98, 44, 52, 130, 138, 243, 169, 140, 233, 171],
+            "vessel_id derivation changed",
+        );
     }
 }
