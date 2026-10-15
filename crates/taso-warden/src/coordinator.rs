@@ -24,6 +24,21 @@
 //! The database file is locked by `redb` while open, so a second process
 //! cannot open the same coordinator.
 //!
+//! # The `Coord` trait
+//!
+//! Everything a Warden asks of a coordinator is the [`Coord`] trait.
+//! [`Coordinator`] (redb, in-process) is one implementation; a coordinator
+//! behind a socket, so that a Warden on another node can be reborn against
+//! it (v1.0 §1 P2), is another.  Both must pass the same differential test
+//! against the model ([`conformance`]).
+//!
+//! A failure whose outcome is unknown — storage, a corrupt row, a lost
+//! connection — is told apart from a refusal by
+//! [`CoordError::outcome_unknown`].  The difference matters: after a
+//! refusal the Warden cuts its frame and is fenced; after an unknown
+//! outcome it must not cut anything, because the CAS may have landed, and
+//! only recovery against the anchored head can settle it.
+//!
 //! Normative references: v0.4 §4 (`Ownership`, `ChronicleHead`), §8.1–8.3,
 //! §8.7; v1.0 §1 (P1), §3.
 
@@ -55,8 +70,9 @@ const ROW_LEN: usize = 1 + 8 + 8 + HEAD_LEN + HEAD_LEN;
 /// Why the coordinator refused an operation.
 ///
 /// The first group are decisions: the request was well-formed and the
-/// answer is no.  [`CoordError::Corrupt`] and [`CoordError::Storage`] are
-/// failures; nothing was changed.
+/// answer is no; nothing was changed.  [`CoordError::Corrupt`],
+/// [`CoordError::Storage`] and [`CoordError::Unavailable`] are failures
+/// whose outcome is unknown ([`CoordError::outcome_unknown`]).
 #[derive(Debug)]
 pub enum CoordError {
     /// No such Chronicle is registered.
@@ -105,6 +121,33 @@ pub enum CoordError {
     },
     /// The storage layer failed.
     Storage(redb::Error),
+    /// The coordinator could not be reached, or the connection broke before
+    /// an answer arrived.  The request may or may not have been applied.
+    Unavailable(std::io::Error),
+}
+
+impl CoordError {
+    /// True if it is unknown whether the request was applied.
+    ///
+    /// For an append this means the CAS may have landed: the Warden must
+    /// not cut its frame, and must reopen to let recovery decide.  False
+    /// means the coordinator answered and the answer was no: nothing
+    /// changed.
+    ///
+    /// The match is exhaustive on purpose: a new variant does not compile
+    /// until it is classified.
+    pub fn outcome_unknown(&self) -> bool {
+        match self {
+            Self::Corrupt { .. } | Self::Storage(_) | Self::Unavailable(_) => true,
+            Self::UnknownChronicle(_)
+            | Self::AlreadyRegistered(_)
+            | Self::BadHash { .. }
+            | Self::NotHolder { .. }
+            | Self::EpochMismatch { .. }
+            | Self::HeadMismatch { .. }
+            | Self::LsnNotNext { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for CoordError {
@@ -136,6 +179,7 @@ impl fmt::Display for CoordError {
                 write!(f, "corrupt row for chronicle {chronicle:?}: {reason}")
             }
             Self::Storage(e) => write!(f, "storage: {e}"),
+            Self::Unavailable(e) => write!(f, "coordinator unavailable: {e}"),
         }
     }
 }
@@ -144,9 +188,38 @@ impl std::error::Error for CoordError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Storage(e) => Some(e),
+            Self::Unavailable(e) => Some(e),
             _ => None,
         }
     }
+}
+
+// ── The trait ───────────────────────────────────────────────────────
+
+/// What a Warden asks of a coordinator (v0.4 §8.1–8.3, §8.7).
+///
+/// Semantics are those of [`taso_core::model::Coordinator`]; every
+/// implementation must pass [`conformance`].  Each method is one atomic,
+/// durable step: on `Ok` it happened, on a refusal nothing changed, and on
+/// an error with [`CoordError::outcome_unknown`] either may be true.
+pub trait Coord: Send + Sync {
+    /// Register a fresh Chronicle with its first holder; returns the
+    /// genesis head (lsn 0, [`HashVal::GENESIS`], [`Epoch::FIRST`]).
+    fn register(&self, chronicle: ChronicleId, holder: WardenId) -> Result<ChronicleHead, CoordError>;
+
+    /// CAS append: accept `envelope` as the next record of its Chronicle,
+    /// or refuse it.  On success returns the new anchored head.
+    fn append(&self, warden: WardenId, envelope: &Envelope) -> Result<ChronicleHead, CoordError>;
+
+    /// Atomic ownership transfer: `sealed_prefix = head`, `epoch += 1`,
+    /// `holder = new_holder`.  Returns the new epoch.
+    fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError>;
+
+    /// Current ownership of a Chronicle.
+    fn ownership(&self, chronicle: ChronicleId) -> Result<Ownership, CoordError>;
+
+    /// The anchored head of a Chronicle (the authority, not a cache).
+    fn head(&self, chronicle: ChronicleId) -> Result<ChronicleHead, CoordError>;
 }
 
 /// Wrap any `redb` error.
@@ -416,6 +489,27 @@ impl Coordinator {
     }
 }
 
+/// The inherent methods stay for now, so existing callers holding
+/// `Arc<Coordinator>` compile without importing the trait; they go once
+/// those callers hold `Arc<dyn Coord>`.
+impl Coord for Coordinator {
+    fn register(&self, chronicle: ChronicleId, holder: WardenId) -> Result<ChronicleHead, CoordError> {
+        Coordinator::register(self, chronicle, holder)
+    }
+    fn append(&self, warden: WardenId, envelope: &Envelope) -> Result<ChronicleHead, CoordError> {
+        Coordinator::append(self, warden, envelope)
+    }
+    fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
+        Coordinator::transfer(self, chronicle, new_holder)
+    }
+    fn ownership(&self, chronicle: ChronicleId) -> Result<Ownership, CoordError> {
+        Coordinator::ownership(self, chronicle)
+    }
+    fn head(&self, chronicle: ChronicleId) -> Result<ChronicleHead, CoordError> {
+        Coordinator::head(self, chronicle)
+    }
+}
+
 fn load(rows: &Rows<'_>, chronicle: ChronicleId) -> Result<Option<State>, CoordError> {
     match rows.get(*chronicle.as_bytes()).map_err(storage)? {
         Some(guard) => State::decode(chronicle, guard.value()).map(Some),
@@ -436,7 +530,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use taso_core::envelope::{BranchId, Stream};
-    use taso_core::model::{AppendError as ModelError, Coordinator as Model, WardenModel};
+    use taso_core::model::WardenModel;
     use taso_core::record::{Payload, Record};
 
     const A: WardenId = WardenId::new(1);
@@ -699,17 +793,77 @@ mod tests {
         assert_eq!(submit(&coord, &mut b, chron(1), 2).unwrap().lsn, Lsn::new(2));
     }
 
+    // ── classification of failures ──────────────────────────────────
+
+    /// Every variant, classified: refusals are certain, failures are not.
+    #[test]
+    fn outcome_unknown_classifies_every_variant() {
+        let h = HashVal::from_bytes([1; 32]);
+        let refusals = [
+            CoordError::UnknownChronicle(chron(1)),
+            CoordError::AlreadyRegistered(chron(1)),
+            CoordError::BadHash { lsn: Lsn::new(1) },
+            CoordError::NotHolder { warden: A, holder: B },
+            CoordError::EpochMismatch { record_epoch: Epoch::FIRST, current: Epoch::new(2) },
+            CoordError::HeadMismatch { prev: h, anchored: HashVal::GENESIS },
+            CoordError::LsnNotNext { lsn: Lsn::new(5), expected: Lsn::new(1) },
+        ];
+        for e in &refusals {
+            assert!(!e.outcome_unknown(), "{e:?} is a refusal");
+        }
+        let failures = [
+            CoordError::Corrupt { chronicle: chron(1), reason: "x" },
+            CoordError::Storage(redb::Error::Corrupted("x".into())),
+            CoordError::Unavailable(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ];
+        for e in &failures {
+            assert!(e.outcome_unknown(), "{e:?} has an unknown outcome");
+        }
+    }
+
     // ── differential: redb coordinator == model coordinator ─────────
 
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn redb_coordinator_matches_model(ops in conformance::ops()) {
+            let (_d, path, coord) = fresh();
+            let mut first = Some(coord);
+            conformance::run(ops, &mut || match first.take() {
+                Some(c) => Box::new(c),
+                None => Box::new(Coordinator::open(&path).unwrap()),
+            })?;
+        }
+    }
+}
+
+/// The differential test every [`Coord`] implementation must pass: a
+/// random sequence of appends, transfers, resumes and reopens, run against
+/// the implementation and against [`taso_core::model::Coordinator`] side
+/// by side.  Every accept/refuse decision, every head and every ownership
+/// state must match.
+#[cfg(test)]
+pub(crate) mod conformance {
+    use super::*;
+    use proptest::prelude::*;
+    use taso_core::envelope::Stream;
+    use taso_core::model::{AppendError as ModelError, Coordinator as Model, WardenModel};
+    use taso_core::record::Payload;
+
+    const IDS: [WardenId; 2] = [WardenId::new(1), WardenId::new(2)];
+
+    /// One step of the test.
     #[derive(Clone, Debug)]
-    enum Op {
+    pub(crate) enum Op {
         /// Warden `i` builds a record from its own view and submits it.
         Append(usize),
         /// Ownership moves to Warden `i`.
         Transfer(usize),
         /// Warden `i` re-reads epoch and head from the coordinator.
         Resume(usize),
-        /// Close and reopen the database file.
+        /// Drop the coordinator and open it again (reopen the file,
+        /// restart the server, reconnect).
         Reopen,
     }
 
@@ -720,6 +874,11 @@ mod tests {
             2 => (0..2usize).prop_map(Op::Resume),
             1 => Just(Op::Reopen),
         ]
+    }
+
+    /// Up to 60 steps.
+    pub(crate) fn ops() -> impl Strategy<Value = Vec<Op>> {
+        proptest::collection::vec(op(), 1..60)
     }
 
     fn same_refusal(m: &ModelError, r: &CoordError) -> bool {
@@ -740,63 +899,61 @@ mod tests {
         }
     }
 
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+    fn resumed(id: WardenId, c: ChronicleId, coord: &dyn Coord) -> WardenModel {
+        let o = coord.ownership(c).unwrap();
+        let h = coord.head(c).unwrap();
+        WardenModel::resume(id, c, o.epoch, h, h.lsn.next())
+    }
 
-        #[test]
-        fn redb_coordinator_matches_model(ops in proptest::collection::vec(op(), 1..60)) {
-            let c = chron(1);
-            let ids = [A, B];
-            let (_d, path, coord) = fresh();
-            let mut coord = Some(coord);
-            coord.as_ref().unwrap().register(c, A).unwrap();
-            let mut model = Model::new(c, A);
-            // Both start at genesis believing they hold epoch 1.
-            let mut wardens = [
-                WardenModel::new(A, c, Epoch::FIRST),
-                WardenModel::new(B, c, Epoch::FIRST),
-            ];
+    /// Run `ops`.  `open` returns the coordinator under test: the first
+    /// call a fresh, empty one; every later call the same coordinator
+    /// opened again (the previous handle is dropped before the call).
+    pub(crate) fn run(ops: Vec<Op>, open: &mut dyn FnMut() -> Box<dyn Coord>) -> Result<(), TestCaseError> {
+        let c = ChronicleId::from_bytes([1; 16]);
+        let mut coord = Some(open());
+        coord.as_ref().unwrap().register(c, IDS[0]).unwrap();
+        let mut model = Model::new(c, IDS[0]);
+        // Both start at genesis believing they hold epoch 1.
+        let mut wardens = [WardenModel::new(IDS[0], c, Epoch::FIRST), WardenModel::new(IDS[1], c, Epoch::FIRST)];
 
-            for (n, op) in ops.into_iter().enumerate() {
-                match op {
-                    Op::Append(i) => {
-                        let rec = wardens[i].build_record(Stream::Fs, raw(n as u64));
-                        let m = model.append(ids[i], rec.clone());
-                        let r = coord.as_ref().unwrap().append(ids[i], &rec.envelope);
-                        match (m, r) {
-                            (Ok(hm), Ok(hr)) => {
-                                prop_assert_eq!(hm, hr);
-                                wardens[i] = WardenModel::resume(
-                                    ids[i], c, wardens[i].epoch(), hr, hr.lsn.next(),
-                                );
-                            }
-                            (Err(em), Err(er)) => prop_assert!(
-                                same_refusal(&em, &er),
-                                "model {:?} vs redb {:?}", em, er
-                            ),
-                            (m, r) => prop_assert!(false, "model {:?} vs redb {:?}", m, r),
+        for (n, op) in ops.into_iter().enumerate() {
+            match op {
+                Op::Append(i) => {
+                    let rec = wardens[i].build_record(Stream::Fs, Payload::Raw((n as u64).to_be_bytes().to_vec()));
+                    let m = model.append(IDS[i], rec.clone());
+                    let r = coord.as_ref().unwrap().append(IDS[i], &rec.envelope);
+                    match (m, r) {
+                        (Ok(hm), Ok(hr)) => {
+                            prop_assert_eq!(hm, hr);
+                            wardens[i] = WardenModel::resume(IDS[i], c, wardens[i].epoch(), hr, hr.lsn.next());
                         }
-                    }
-                    Op::Transfer(i) => {
-                        let em = model.transfer(ids[i]);
-                        let er = coord.as_ref().unwrap().transfer(c, ids[i]).unwrap();
-                        prop_assert_eq!(em, er);
-                    }
-                    Op::Resume(i) => {
-                        wardens[i] = resumed(ids[i], c, coord.as_ref().unwrap());
-                    }
-                    Op::Reopen => {
-                        drop(coord.take());
-                        coord = Some(Coordinator::open(&path).unwrap());
+                        (Err(em), Err(er)) => {
+                            prop_assert!(!er.outcome_unknown(), "a failure, not a decision: {:?}", er);
+                            prop_assert!(same_refusal(&em, &er), "model {:?} vs coordinator {:?}", em, er);
+                        }
+                        (m, r) => prop_assert!(false, "model {:?} vs coordinator {:?}", m, r),
                     }
                 }
-                let co = coord.as_ref().unwrap();
-                let (mo, ro) = (model.ownership(), co.ownership(c).unwrap());
-                prop_assert_eq!(model.head(), co.head(c).unwrap());
-                prop_assert_eq!(mo.epoch, ro.epoch);
-                prop_assert_eq!(mo.holder, ro.holder);
-                prop_assert_eq!(mo.sealed_prefix, ro.sealed_prefix);
+                Op::Transfer(i) => {
+                    let em = model.transfer(IDS[i]);
+                    let er = coord.as_ref().unwrap().transfer(c, IDS[i]).unwrap();
+                    prop_assert_eq!(em, er);
+                }
+                Op::Resume(i) => {
+                    wardens[i] = resumed(IDS[i], c, coord.as_deref().unwrap());
+                }
+                Op::Reopen => {
+                    drop(coord.take());
+                    coord = Some(open());
+                }
             }
+            let co = coord.as_deref().unwrap();
+            let (mo, ro) = (model.ownership(), co.ownership(c).unwrap());
+            prop_assert_eq!(model.head(), co.head(c).unwrap());
+            prop_assert_eq!(mo.epoch, ro.epoch);
+            prop_assert_eq!(mo.holder, ro.holder);
+            prop_assert_eq!(mo.sealed_prefix, ro.sealed_prefix);
         }
+        Ok(())
     }
 }
