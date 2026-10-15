@@ -335,7 +335,18 @@ impl RuncCli {
 
 impl RuncRunner for RuncCli {
     fn run(&self, args: &[String]) -> io::Result<(bool, String, String)> {
-        let out = Command::new(&self.program).arg("--root").arg(&self.root).args(args).output()?;
+        let out = Command::new(&self.program)
+            .arg("--root")
+            .arg(&self.root)
+            .args(args)
+            .output()
+            .map_err(|e| match e.kind() {
+                io::ErrorKind::NotFound => io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{} not found: is runc installed?", self.program.display()),
+                ),
+                _ => e,
+            })?;
         Ok((
             out.status.success(),
             String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -602,6 +613,14 @@ mod tests {
         assert_eq!(r.state("v1").unwrap(), Some(Status::Running));
         assert_eq!(r.state("v1").unwrap(), None);
         assert!(r.state("v1").is_err());
+    }
+
+    #[test]
+    fn missing_runc_says_so() {
+        let cli = RuncCli { program: "/nonexistent/runc".into(), root: "/tmp".into() };
+        let e = Runc::new(cli).start("v1").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(e.to_string().contains("is runc installed?"), "{e}");
     }
 
     #[test]
