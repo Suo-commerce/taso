@@ -616,6 +616,86 @@ impl Canonical for GapRecord {
     }
 }
 
+// ── Checkpoint ──────────────────────────────────────────────────────
+
+/// The last Seal before a Checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointSeal {
+    /// The Seal record's lsn.
+    pub lsn: Lsn,
+    /// Its hash.
+    pub hash: HashVal,
+    /// The turn it sealed.
+    pub turn: TurnId,
+    /// Its `ledger_pos`.
+    pub ledger_pos: Lsn,
+}
+
+impl Canonical for CheckpointSeal {
+    fn canon(&self, out: &mut Canon) {
+        self.lsn.canon(out);
+        self.hash.canon(out);
+        self.turn.canon(out);
+        self.ledger_pos.canon(out);
+    }
+}
+
+/// An effect not settled before a Checkpoint: its intent and the latest
+/// outcome recorded for it (`None`: none yet).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenEffect {
+    /// The Intent record's lsn.
+    pub lsn: Lsn,
+    /// The intent.
+    pub intent: IntentRecord,
+    /// Its latest outcome, never terminal here.
+    pub state: Option<OutcomeState>,
+}
+
+impl Canonical for OpenEffect {
+    fn canon(&self, out: &mut Canon) {
+        self.lsn.canon(out);
+        self.intent.canon(out);
+        out.option(self.state.as_ref());
+    }
+}
+
+/// What the readers of a Chronicle need from every record before this
+/// one, so that a node may remove its oldest local segments
+/// (decision 1, 2026-10-16).  It is computed from the records it replaces
+/// (by the Warden, from its local log) and is a record like any other:
+/// hash-chained and accepted by the coordinator.  The records it
+/// summarises stay in the store; only local copies are removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointRecord {
+    /// The Chronicle's Lineage record (lsn 1).
+    pub lineage: LineageRecord,
+    /// The last Transcript record's lsn (0: none).
+    pub transcript: Lsn,
+    /// The last Effect record's lsn (0: none).
+    pub effect: Lsn,
+    /// The last accepted Seal, if any.
+    pub seal: Option<CheckpointSeal>,
+    /// The last FsShipped record, if any.
+    pub fs_shipped: Option<FsShippedRecord>,
+    /// Every effect whose latest outcome is not terminal, in op order.
+    pub open: Vec<OpenEffect>,
+    /// The next unused effect op id.
+    pub next_op: u64,
+}
+
+impl Canonical for CheckpointRecord {
+    fn canon(&self, out: &mut Canon) {
+        self.lineage.canon(out);
+        self.transcript.canon(out);
+        self.effect.canon(out);
+        out.option(self.seal.as_ref());
+        out.option(self.fs_shipped.as_ref());
+        out.seq(self.open.iter());
+        out.u64(self.next_op);
+    }
+}
+
 // ── FsShipped ───────────────────────────────────────────────────────
 
 /// What a shipped `fs` stream starts from.
@@ -744,6 +824,9 @@ pub enum Payload {
     Gap(GapRecord),
     /// An FsShipped record: a Seal's `fs` stream is shipped (tag 8).
     FsShipped(FsShippedRecord),
+    /// A Checkpoint record: what readers need from the records before it,
+    /// so older local segments can be removed (tag 9).
+    Checkpoint(Box<CheckpointRecord>),
 }
 
 impl Canonical for Payload {
@@ -758,6 +841,7 @@ impl Canonical for Payload {
             Self::Succession(r) => { out.tag(6); r.canon(out); }
             Self::Gap(r) => { out.tag(7); r.canon(out); }
             Self::FsShipped(r) => { out.tag(8); r.canon(out); }
+            Self::Checkpoint(r) => { out.tag(9); r.canon(out); }
         }
     }
 }
@@ -1076,6 +1160,36 @@ mod tests {
             payloads.into_iter().map(|p| make_record(p).envelope.hash.to_string()).collect();
         assert_eq!(got, PINS_NEW);
     }
+
+    /// The Checkpoint payload (tag 9) is pinned too: a change to its
+    /// encoding changes every hash after the first checkpoint.
+    #[test]
+    fn checkpoint_hash_is_pinned() {
+        let lineage = LineageRecord { origin: Origin::Void, namespace: Namespace::from_bytes([1; 16]), ledger_pos: Lsn::new(0) };
+        let intent = IntentRecord {
+            op: OpId::new(4),
+            provider: "mail".into(),
+            request: b"to: a".to_vec(),
+            footprint: b"mailbox".to_vec(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::UnsafeToRetry,
+            consequence: Consequence::Irreversible,
+            authority: b"jarmo".to_vec(),
+            barrier: Some(BarrierId::new(30)),
+        };
+        let cp = Payload::Checkpoint(Box::new(CheckpointRecord {
+            lineage,
+            transcript: Lsn::new(41),
+            effect: Lsn::new(31),
+            seal: Some(CheckpointSeal { lsn: Lsn::new(40), hash: HashVal::from_bytes([40; 32]), turn: TurnId::new(9), ledger_pos: Lsn::new(31) }),
+            fs_shipped: None,
+            open: vec![OpenEffect { lsn: Lsn::new(30), intent, state: Some(OutcomeState::OutcomeUnknown) }],
+            next_op: 5,
+        }));
+        assert_eq!(make_record(cp).envelope.hash.to_string(), PIN_CHECKPOINT);
+    }
+
+    const PIN_CHECKPOINT: &str = "4e5931bb34a14d59173bc42ff795ac5131ddd98973ffa317b63763a7dc827748";
 
     const PINS_NEW: [&str; 4] = [
         "7c4f392fd70a68dcfbb1b8296cbb5da3391d1763687717f48d66dbdb19132b8a",

@@ -98,7 +98,7 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     println!("A, first: {r:?}\n{}", stats(&a));
     assert_eq!(r.start, Start::Birth);
     assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
-    assert_eq!((r.published, r.publish_failures), (5, 0));
+    assert_eq!((r.published, r.publish_failures, r.prune_failures.0), (5, 0, 0));
     let s = stats(&a);
     assert_eq!((s["turns"].clone(), s["sealed"].clone(), s["rows_in_db"].clone()), (json!([1, 5]), json!(5), json!(30)));
 

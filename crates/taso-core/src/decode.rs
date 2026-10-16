@@ -21,7 +21,7 @@ use crate::record::{
     Authority, BarrierId, Consequence, Dispatch, GroupId, GroupRecord, IntentRecord, LayerRef,
     LineageRecord, Member, Namespace, OpId, Origin, OutcomeRecord, OutcomeState, ParentSeal,
     Payload, RetryPolicy, SealRecord, StreamCut, SuccessionRecord, TaintKind, TurnId, Verdict,
-    FsShippedRecord, GapRecord, StreamBase,
+    FsShippedRecord, GapRecord, StreamBase, CheckpointRecord, CheckpointSeal, OpenEffect,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -270,18 +270,38 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn outcome_state(&mut self) -> R<OutcomeState> {
+        Ok(match self.tag()? {
+            (_, 0) => OutcomeState::Prepared,
+            (_, 1) => OutcomeState::DispatchAuthorized,
+            (_, 2) => OutcomeState::OutcomeUnknown,
+            (_, 3) => OutcomeState::ConfirmedApplied,
+            (_, 4) => OutcomeState::ConfirmedNotApplied,
+            (at, tag) => return Err(DecodeError::BadTag { at, what: "outcome state", tag }),
+        })
+    }
+
     fn outcome(&mut self) -> R<OutcomeRecord> {
         Ok(OutcomeRecord {
             op: OpId::new(self.u64()?),
-            state: match self.tag()? {
-                (_, 0) => OutcomeState::Prepared,
-                (_, 1) => OutcomeState::DispatchAuthorized,
-                (_, 2) => OutcomeState::OutcomeUnknown,
-                (_, 3) => OutcomeState::ConfirmedApplied,
-                (_, 4) => OutcomeState::ConfirmedNotApplied,
-                (at, tag) => return Err(DecodeError::BadTag { at, what: "outcome state", tag }),
-            },
+            state: self.outcome_state()?,
             evidence: self.option(Self::bytes)?,
+        })
+    }
+
+    fn checkpoint(&mut self) -> R<CheckpointRecord> {
+        Ok(CheckpointRecord {
+            lineage: self.lineage()?,
+            transcript: self.lsn()?,
+            effect: self.lsn()?,
+            seal: self.option(|r| {
+                Ok(CheckpointSeal { lsn: r.lsn()?, hash: r.hash()?, turn: TurnId::new(r.u64()?), ledger_pos: r.lsn()? })
+            })?,
+            fs_shipped: self.option(Self::fs_shipped)?,
+            open: self.seq(|r| {
+                Ok(OpenEffect { lsn: r.lsn()?, intent: r.intent()?, state: r.option(Self::outcome_state)? })
+            })?,
+            next_op: self.u64()?,
         })
     }
 
@@ -352,6 +372,7 @@ impl<'a> Reader<'a> {
             (_, 6) => Payload::Succession(self.succession()?),
             (_, 7) => Payload::Gap(self.gap()?),
             (_, 8) => Payload::FsShipped(self.fs_shipped()?),
+            (_, 9) => Payload::Checkpoint(Box::new(self.checkpoint()?)),
             (at, tag) => return Err(DecodeError::BadTag { at, what: "payload", tag }),
         })
     }
@@ -532,6 +553,31 @@ mod tests {
             },
         )
     }
+    fn checkpoint() -> impl Strategy<Value = Payload> {
+        let lineage = lineage().prop_map(|p| match p {
+            Payload::Lineage(l) => l,
+            _ => unreachable!(),
+        });
+        let cseal = (lsn(), hash(), any::<u64>(), lsn())
+            .prop_map(|(lsn, hash, turn, ledger_pos)| CheckpointSeal { lsn, hash, turn: TurnId::new(turn), ledger_pos });
+        let fs = fs_shipped().prop_map(|p| match p {
+            Payload::FsShipped(f) => f,
+            _ => unreachable!(),
+        });
+        let state = prop_oneof![
+            Just(OutcomeState::Prepared),
+            Just(OutcomeState::DispatchAuthorized),
+            Just(OutcomeState::OutcomeUnknown),
+        ];
+        let open = (lsn(), intent(), proptest::option::of(state)).prop_map(|(lsn, i, state)| match i {
+            Payload::Intent(intent) => OpenEffect { lsn, intent, state },
+            _ => unreachable!(),
+        });
+        (lineage, lsn(), lsn(), proptest::option::of(cseal), proptest::option::of(fs), proptest::collection::vec(open, 0..3), any::<u64>())
+            .prop_map(|(lineage, transcript, effect, seal, fs_shipped, open, next_op)| {
+                Payload::Checkpoint(Box::new(CheckpointRecord { lineage, transcript, effect, seal, fs_shipped, open, next_op }))
+            })
+    }
     fn payload() -> impl Strategy<Value = Payload> {
         prop_oneof![
             seal(),
@@ -542,7 +588,8 @@ mod tests {
             lineage(),
             succession(),
             gap(),
-            fs_shipped()
+            fs_shipped(),
+            checkpoint()
         ]
     }
 
@@ -608,8 +655,8 @@ mod tests {
     #[test]
     fn unknown_payload_tag() {
         assert_eq!(
-            Payload::decode(&[9]),
-            Err(DecodeError::BadTag { at: 0, what: "payload", tag: 9 })
+            Payload::decode(&[10]),
+            Err(DecodeError::BadTag { at: 0, what: "payload", tag: 10 })
         );
         assert_eq!(Payload::decode(&[]), Err(DecodeError::Truncated { at: 0, need: 1 }));
     }
