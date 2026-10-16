@@ -642,6 +642,18 @@ impl<L: Layers> Vessel<L> {
         Ok(self.chronicle.append(stream, payload)?)
     }
 
+    /// Append records together: one write, one fsync, one CAS; all or
+    /// none.  The same records are refused as by [`Vessel::append`].
+    pub fn append_batch(&mut self, records: Vec<(Stream, Payload)>) -> Result<ChronicleHead, VesselError> {
+        self.writable()?;
+        if records.iter().any(|(_, p)| {
+            matches!(p, Payload::Lineage(_) | Payload::Succession(_) | Payload::Gap(_) | Payload::FsShipped(_))
+        }) {
+            return Err(VesselError::ReservedPayload);
+        }
+        Ok(self.chronicle.append_batch(records)?)
+    }
+
     /// Take a Seal.
     pub fn seal(
         &mut self,
@@ -680,21 +692,24 @@ impl<L: Layers> Vessel<L> {
         snapshot: &Snapshot,
         origin: Option<&Snapshot>,
     ) -> Result<SealPublished, VesselError> {
+        let _total = crate::timing::span("publish.total");
         self.writable()?;
         if snapshot.dataset != self.dataset {
             return Err(VesselError::NotThisSeal(format!("{} is not this Vessel's dataset", snapshot.dataset)));
         }
         let hash = snapshot.seal_hash.ok_or_else(|| VesselError::NotThisSeal("the snapshot is not bound".into()))?;
-        let is_seal = self.frames()?.iter().any(|f| {
-            f.envelope.lsn == snapshot.seal
-                && f.envelope.hash == hash
-                && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_)))
+        let t = crate::timing::span("publish.check");
+        let is_seal = self.chronicle.frame(snapshot.seal).map_err(ChronicleError::Segment)?.is_some_and(|f| {
+            f.envelope.hash == hash && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_)))
         });
         if !is_seal {
             return Err(VesselError::NotThisSeal(format!("lsn {} is not a Seal record with this hash", snapshot.seal.get())));
         }
         self.layer_present(Position { lsn: snapshot.seal, hash })?;
+        drop(t);
+        let t = crate::timing::span("publish.seal_pack");
         let shipped = packs.ship_seal(&self.chronicle.segments(), snapshot, origin).map_err(VesselError::Pack)?;
+        drop(t);
         let record = match shipped {
             Some(s) => {
                 self.chronicle.append(Stream::Ctl, Payload::FsShipped(s.record.clone()))?;
@@ -703,7 +718,10 @@ impl<L: Layers> Vessel<L> {
             None => None,
         };
         let tail = self.chronicle.tail();
+        let t = crate::timing::span("publish.log");
         packs.ship_log(&self.chronicle.segments(), tail).map_err(VesselError::Pack)?;
+        drop(t);
+        let _t = crate::timing::span("publish.advance");
         let anchor = self
             .chronicle
             .coord()
@@ -1022,7 +1040,13 @@ pub(crate) mod tests {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
         let l = v.lineage().clone();
-        assert!(matches!(v.append(Stream::Ctl, Payload::Lineage(l)), Err(VesselError::ReservedPayload)));
+        assert!(matches!(v.append(Stream::Ctl, Payload::Lineage(l.clone())), Err(VesselError::ReservedPayload)));
+        let tail = v.tail();
+        assert!(matches!(
+            v.append_batch(vec![(Stream::Fs, raw(1)), (Stream::Ctl, Payload::Lineage(l))]),
+            Err(VesselError::ReservedPayload)
+        ));
+        assert_eq!(v.tail(), tail, "nothing of a refused batch is written");
     }
 
     // ── publishing a Seal ───────────────────────────────────────────
@@ -1050,6 +1074,9 @@ pub(crate) mod tests {
             }
             fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
                 self.inner.append(w, e)
+            }
+            fn append_batch(&self, w: WardenId, es: &[Envelope]) -> Result<ChronicleHead, CoordError> {
+                self.inner.append_batch(w, es)
             }
             fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
                 self.inner.transfer(c, h)

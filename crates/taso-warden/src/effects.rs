@@ -206,21 +206,35 @@ impl Effects {
         }
         self.next_op += 1;
 
-        // 1. Intent, durable.  Its barrier is its own lsn.
+        let _total = crate::timing::span("effect.total");
+        // 1–2. Intent and dispatch authorized, durable together: one write,
+        // one fsync, one CAS.  A crash during it leaves both or neither
+        // accepted (an intent alone is not, and recovery cuts it).  The
+        // barrier is the intent's own lsn.
         let lsn = vessel.tail().lsn.next();
         let barrier = (plan.consequence != Consequence::NoExternalMutation)
             .then(|| BarrierId::new(lsn.get()));
-        vessel.append(Stream::Effect, Payload::Intent(intent(op, provider, &plan, barrier)))?;
+        let intent = Payload::Intent(intent(op, provider, &plan, barrier));
         if stop == Some(CrashAfter::Intent) {
+            // Tests only: an intent accepted alone, as an older Warden that
+            // wrote them apart could leave it.  Recovery must still handle it.
+            vessel.append(Stream::Effect, intent)?;
             return Ok(None);
         }
-        // 2. Dispatch authorized, durable.
-        vessel.append(Stream::Effect, outcome(op, OutcomeState::DispatchAuthorized, None))?;
+        let t = crate::timing::span("effect.authorize");
+        vessel.append_batch(vec![
+            (Stream::Effect, intent),
+            (Stream::Effect, outcome(op, OutcomeState::DispatchAuthorized, None)),
+        ])?;
+        drop(t);
         if stop == Some(CrashAfter::Authorized) {
             return Ok(None);
         }
         // 3. The authorization goes off the node before the request does.
-        if let Err(e) = self.publish(vessel) {
+        let t = crate::timing::span("effect.publish");
+        let published = self.publish(vessel);
+        drop(t);
+        if let Err(e) = published {
             let reason = format!("ledger not shipped: {e}");
             vessel.append(
                 Stream::Effect,
@@ -233,11 +247,14 @@ impl Effects {
         }
         // 4. Send exactly the recorded request.
         let adapter = self.registry.get_mut(provider).expect("looked up above");
+        let t = crate::timing::span("effect.send");
         let sent = adapter.send(op, &plan);
+        drop(t);
         if stop == Some(CrashAfter::Send) {
             return Ok(None);
         }
         // 5. Record what the provider said.
+        let _t = crate::timing::span("effect.outcome");
         Ok(Some(self.record_sent(vessel, op, barrier, sent)?))
     }
 

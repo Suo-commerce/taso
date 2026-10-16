@@ -60,7 +60,14 @@ to the decision lists in the session handoffs.
    refused if the WAL or journal moved during it (v1.0 §3's `-wal` rule,
    checked by `lstat` only).
 
+9. **Intent and DispatchAuthorized are written together** (2026-10-16).
+   v0.4 §7.2 lists them as two durable steps. The Warden writes both in
+   one segment write and one coordinator CAS (`Coord::append_batch`, all
+   or none): nothing happens between them, and a crash leaves both
+   accepted or neither, never a sendable state without its intent.
+   Recovery still handles an intent accepted alone.
+
 ### Amendments already applied from the Phase 4 plan
 
-9. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
+10. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
    unavailable, Phase 4 is brought forward.

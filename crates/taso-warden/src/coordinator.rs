@@ -121,6 +121,12 @@ pub enum CoordError {
         /// What the coordinator expected.
         expected: Lsn,
     },
+    /// A batch append that is empty, or holds an envelope of another
+    /// Chronicle than its first.
+    BadBatch {
+        /// The lsn of the offending envelope (0 for an empty batch).
+        lsn: Lsn,
+    },
     /// A stored row could not be decoded.
     Corrupt {
         /// Which Chronicle's row.
@@ -168,6 +174,7 @@ impl CoordError {
             | Self::EpochMismatch { .. }
             | Self::HeadMismatch { .. }
             | Self::LsnNotNext { .. }
+            | Self::BadBatch { .. }
             | Self::ShippedAhead { .. }
             | Self::ShippedConflict { .. } => false,
         }
@@ -193,6 +200,7 @@ impl fmt::Display for CoordError {
                 current.get()
             ),
             Self::HeadMismatch { .. } => write!(f, "prev does not match the anchored head"),
+            Self::BadBatch { lsn } => write!(f, "bad batch at lsn {}: empty, or another chronicle", lsn.get()),
             Self::LsnNotNext { lsn, expected } => write!(
                 f,
                 "lsn {} is not the next lsn {}",
@@ -238,6 +246,12 @@ pub trait Coord: Send + Sync {
     /// CAS append: accept `envelope` as the next record of its Chronicle,
     /// or refuse it.  On success returns the new anchored head.
     fn append(&self, warden: WardenId, envelope: &Envelope) -> Result<ChronicleHead, CoordError>;
+
+    /// CAS append of consecutive records of one Chronicle, all or none, in
+    /// one durable transaction: each must pass [`Coord::append`]'s checks
+    /// against the head the one before it leaves.  On success returns the
+    /// new anchored head.
+    fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError>;
 
     /// Atomic ownership transfer: `sealed_prefix = head`, `epoch += 1`,
     /// `holder = new_holder`.  Returns the new epoch.
@@ -482,37 +496,48 @@ impl Coord for Coordinator {
         warden: WardenId,
         envelope: &Envelope,
     ) -> Result<ChronicleHead, CoordError> {
-        let chronicle = envelope.chronicle;
+        self.append_batch(warden, std::slice::from_ref(envelope))
+    }
+
+    fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError> {
+        let chronicle = envelopes.first().ok_or(CoordError::BadBatch { lsn: Lsn::new(0) })?.chronicle;
         self.write(|rows| {
             let mut state =
                 load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
-            if !envelope.verify() {
-                return Err(CoordError::BadHash { lsn: envelope.lsn });
+            // Checked against a running head; stored once, or not at all
+            // (an error drops the transaction).
+            for envelope in envelopes {
+                if envelope.chronicle != chronicle {
+                    return Err(CoordError::BadBatch { lsn: envelope.lsn });
+                }
+                if !envelope.verify() {
+                    return Err(CoordError::BadHash { lsn: envelope.lsn });
+                }
+                if warden != state.holder {
+                    return Err(CoordError::NotHolder { warden, holder: state.holder });
+                }
+                if envelope.epoch != state.epoch {
+                    return Err(CoordError::EpochMismatch {
+                        record_epoch: envelope.epoch,
+                        current: state.epoch,
+                    });
+                }
+                if envelope.prev != state.head.hash {
+                    return Err(CoordError::HeadMismatch {
+                        prev: envelope.prev,
+                        anchored: state.head.hash,
+                    });
+                }
+                let expected = state.head.lsn.next();
+                if envelope.lsn != expected {
+                    return Err(CoordError::LsnNotNext { lsn: envelope.lsn, expected });
+                }
+                state.head = ChronicleHead {
+                    lsn: envelope.lsn,
+                    hash: envelope.hash,
+                    epoch: state.epoch,
+                };
             }
-            if warden != state.holder {
-                return Err(CoordError::NotHolder { warden, holder: state.holder });
-            }
-            if envelope.epoch != state.epoch {
-                return Err(CoordError::EpochMismatch {
-                    record_epoch: envelope.epoch,
-                    current: state.epoch,
-                });
-            }
-            if envelope.prev != state.head.hash {
-                return Err(CoordError::HeadMismatch {
-                    prev: envelope.prev,
-                    anchored: state.head.hash,
-                });
-            }
-            let expected = state.head.lsn.next();
-            if envelope.lsn != expected {
-                return Err(CoordError::LsnNotNext { lsn: envelope.lsn, expected });
-            }
-            state.head = ChronicleHead {
-                lsn: envelope.lsn,
-                hash: envelope.hash,
-                epoch: state.epoch,
-            };
             store(rows, chronicle, &state)?;
             Ok(state.head)
         })
@@ -730,6 +755,45 @@ mod tests {
             coord.append(A, &rec.envelope),
             Err(CoordError::LsnNotNext { .. })
         ));
+    }
+
+    /// `n` records chained after `from`, in its epoch.
+    fn chain_after(c: ChronicleId, from: ChronicleHead, n: u64) -> Vec<Envelope> {
+        let mut prev = (from.lsn, from.hash);
+        (0..n)
+            .map(|i| {
+                let rec = Record::new(c, BranchId::TRUNK, from.epoch, Stream::Fs, prev.0.next(), prev.1, raw(100 + i));
+                prev = (rec.envelope.lsn, rec.envelope.hash);
+                rec.envelope
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_batch_is_all_or_none() {
+        let (_d, _p, coord) = fresh();
+        let g = coord.register(chron(1), A).unwrap();
+        let three = chain_after(chron(1), g, 3);
+        let h = coord.append_batch(A, &three).unwrap();
+        assert_eq!((h.lsn, h.hash), (Lsn::new(3), three[2].hash));
+        assert_eq!(coord.head(chron(1)).unwrap(), h);
+        // One bad envelope anywhere: nothing of the batch is accepted.
+        let mut more = chain_after(chron(1), h, 3);
+        more[2].hash = HashVal::from_bytes([9; 32]);
+        assert!(matches!(coord.append_batch(A, &more), Err(CoordError::BadHash { lsn }) if lsn == Lsn::new(6)));
+        assert_eq!(coord.head(chron(1)).unwrap(), h);
+        let next = chain_after(chron(1), h, 1)[0];
+        assert!(matches!(coord.append_batch(A, &[next, next]), Err(CoordError::HeadMismatch { .. })), "not chained");
+        assert!(matches!(coord.append_batch(B, &chain_after(chron(1), h, 2)), Err(CoordError::NotHolder { .. })));
+        assert_eq!(coord.head(chron(1)).unwrap(), h);
+        // Empty, or another Chronicle in it.
+        assert!(matches!(coord.append_batch(A, &[]), Err(CoordError::BadBatch { lsn }) if lsn == Lsn::new(0)));
+        let g2 = coord.register(chron(2), A).unwrap();
+        let mixed = [chain_after(chron(1), h, 1)[0], chain_after(chron(2), g2, 1)[0]];
+        assert!(matches!(coord.append_batch(A, &mixed), Err(CoordError::BadBatch { .. })));
+        assert_eq!(coord.head(chron(1)).unwrap(), h);
+        assert_eq!(coord.head(chron(2)).unwrap(), g2);
+        assert!(!CoordError::BadBatch { lsn: Lsn::new(0) }.outcome_unknown());
     }
 
     #[test]

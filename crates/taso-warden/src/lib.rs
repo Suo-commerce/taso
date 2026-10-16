@@ -19,5 +19,7 @@ pub mod quiesce;
 pub mod runtime;
 pub mod segment;
 pub mod ship;
+pub mod timing;
+mod bench;
 pub mod vessel;
 pub mod zfs;

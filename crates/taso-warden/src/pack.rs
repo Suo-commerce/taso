@@ -803,9 +803,9 @@ fn locate(segments: &[&Segment], lsn: Lsn) -> Spot {
     Spot::Beyond
 }
 
-/// The local frame at `lsn`, if segment `i` holds it.
+/// The local frame at `lsn`, if segment `i` holds it (one read).
 fn local_frame(segments: &[&Segment], i: usize, lsn: Lsn) -> Result<Option<Frame>, PackError> {
-    Ok(segments[i].frames()?.into_iter().find(|f| f.envelope.lsn == lsn))
+    Ok(segments[i].frame(lsn)?)
 }
 
 // ── Packs ───────────────────────────────────────────────────────────
@@ -816,6 +816,26 @@ pub struct Packs<S: ObjectStore, X: Sender> {
     sender: X,
     chronicle: ChronicleId,
     dir: String,
+    cache: Mutex<Cache>,
+}
+
+/// What this `Packs` learned from its own puts, so the hot path does not
+/// list the store.  Only ever behind the store: another writer may have
+/// shipped more, and a pack built from a stale end only overlaps packs
+/// already there, which [`Packs::chain`] merges.  A fresh `Packs` reads
+/// the store once.
+#[derive(Default)]
+struct Cache {
+    /// Where the store's log ends, as far as this `Packs` knows.
+    log_end: Option<Position>,
+    /// The last `fs` section this `Packs` put, and the record that names it.
+    named: Option<(FsShippedRecord, FsRef)>,
+    /// Seal packs this `Packs` put, by Seal lsn (a retry reuses the header).
+    seals_put: BTreeMap<Lsn, PackHeader>,
+    /// The local tail when this `Packs` listed the store for Seal packs.
+    /// A pack left unnamed by an earlier process can only be for a Seal
+    /// already in the log then; Seals after it need no listing.
+    seals_listed_to: Option<Lsn>,
 }
 
 impl<S: ObjectStore, X: Sender> Packs<S, X> {
@@ -827,7 +847,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         if !valid_key(&dir) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid object key {dir:?}")));
         }
-        Ok(Self { store, sender, chronicle: id, dir })
+        Ok(Self { store, sender, chronicle: id, dir, cache: Mutex::default() })
     }
 
     fn key(&self, h: &PackHeader) -> String {
@@ -942,8 +962,8 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             ))
         };
         let mut frames = Vec::new();
-        for s in segments.iter().filter(|s| s.tail().lsn > after.lsn) {
-            frames.extend(s.frames()?.into_iter().filter(|f| f.envelope.lsn > after.lsn && f.envelope.lsn <= upto.lsn));
+        for s in segments.iter().filter(|s| s.tail().lsn > after.lsn && s.base().lsn < upto.lsn) {
+            frames.extend(s.frames_after(after.lsn)?.into_iter().filter(|f| f.envelope.lsn <= upto.lsn));
         }
         let mut tail = after;
         for f in &frames {
@@ -967,10 +987,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         let conflict = PackError::Conflict { lsn: end.lsn };
         match locate(segments, end.lsn) {
             Spot::Genesis => (end.hash == HashVal::GENESIS).then_some(end).ok_or(conflict),
-            Spot::Frame(i) => match local_frame(segments, i, end.lsn)? {
-                Some(f) if f.envelope.hash == end.hash => Ok(end),
-                _ => Err(conflict),
-            },
+            Spot::Frame(i) => (segments[i].hash_at(end.lsn) == Some(end.hash)).then_some(end).ok_or(conflict),
             Spot::Base(i) => (segments[i].base() == end).then_some(end).ok_or(conflict),
             Spot::Lost { kept } => Ok(kept),
             Spot::Before => Err(PackError::Refused(format!(
@@ -984,12 +1001,17 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         }
     }
 
-    /// The newest `FsShipped` record in the local log, if any.  Reads the
-    /// segments newest first and stops at the first it finds.
+    /// The newest `FsShipped` record in the local log, if any.  Reads
+    /// frame by frame back from the tail and stops at the first: it sits
+    /// after the last published Seal, a turn or two back.
     fn newest_named(segments: &[&Segment]) -> Result<Option<FsShippedRecord>, PackError> {
         for seg in segments.iter().rev() {
-            if let Some(r) = seg.frames()?.iter().rev().find_map(fs_shipped_of) {
-                return Ok(Some(r));
+            let mut lsn = seg.tail().lsn;
+            while lsn > seg.base().lsn {
+                if let Some(r) = seg.frame(lsn)?.as_ref().and_then(fs_shipped_of) {
+                    return Ok(Some(r));
+                }
+                lsn = Lsn::new(lsn.get() - 1);
             }
         }
         Ok(None)
@@ -1013,12 +1035,50 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     /// anchored, and this node has no snapshot of it).
     fn fs_base(&self, segments: &[&Segment]) -> Result<Option<FsRef>, PackError> {
         let Some(r) = Self::newest_named(segments)? else { return Ok(None) };
+        if let Some((cr, fs)) = &self.cache().named {
+            if *cr == r {
+                return Ok(Some(*fs));
+            }
+        }
         self.fs_packs(r.seal)?
             .into_iter()
             .filter_map(|(_, _, h)| h.fs)
             .find(|fs| names(&r, fs))
             .map(Some)
             .ok_or(PackError::FsMissing { seal: r.seal })
+    }
+
+    /// The header of a Seal pack already in the store for the Seal at
+    /// `seal` but not named (a crash after its put): this `Packs`' own, or
+    /// one an earlier process left, found by listing the store once.
+    fn unnamed_seal_pack(&self, segments: &[&Segment], seal: Lsn) -> Result<Option<PackHeader>, PackError> {
+        if let Some(h) = self.cache().seals_put.get(&seal) {
+            return Ok(Some(*h));
+        }
+        let listed = self.cache().seals_listed_to;
+        if listed.is_some_and(|to| seal > to) {
+            return Ok(None);
+        }
+        let tail = segments.last().map_or(Lsn::new(0), |s| s.tail().lsn);
+        let found = self.fs_packs(seal)?.first().map(|(_, _, h)| *h);
+        let mut c = self.cache();
+        c.seals_listed_to = Some(c.seals_listed_to.map_or(tail, |t| t.max(tail)));
+        Ok(found)
+    }
+
+    fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Where the store's log ends: from this `Packs`' own puts, or read
+    /// from the store once ([`Packs::shipped`]).
+    fn log_end(&self) -> Result<Position, PackError> {
+        if let Some(end) = self.cache().log_end {
+            return Ok(end);
+        }
+        let end = self.shipped()?.log;
+        self.cache().log_end = Some(end);
+        Ok(end)
     }
 
     /// Write one pack; returns its header.
@@ -1029,6 +1089,10 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         prefix.extend_from_slice(digest.as_bytes());
         let mut stream = PackStream::new(prefix, fs);
         self.store.put(&self.key(&h), &mut stream)?;
+        let mut c = self.cache();
+        if c.log_end.is_some_and(|e| e.lsn < h.end.lsn) {
+            c.log_end = Some(h.end);
+        }
         Ok(h)
     }
 
@@ -1037,15 +1101,20 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     /// `segments` are the Chronicle's local segments, oldest first.
     /// `None` if there is nothing new.
     pub fn ship_log(&self, segments: &[&Segment], upto: Position) -> Result<Option<PackHeader>, PackError> {
-        let s = self.shipped()?;
-        if upto.lsn <= s.log.lsn {
-            if upto.lsn == s.log.lsn && upto.hash != s.log.hash {
+        let t = crate::timing::span("pack.shipped");
+        let end = self.log_end()?;
+        drop(t);
+        if upto.lsn <= end.lsn {
+            if upto.lsn == end.lsn && upto.hash != end.hash {
                 return Err(PackError::Conflict { lsn: upto.lsn });
             }
             return Ok(None);
         }
-        let base = self.log_base(segments, s.log)?;
+        let t = crate::timing::span("pack.local");
+        let base = self.log_base(segments, end)?;
         let frames = self.frames_after(segments, base, upto)?;
+        drop(t);
+        let _t = crate::timing::span("pack.put");
         self.put_pack(PackHeader { chronicle: self.chronicle, base, end: upto, fs: None }, &frames, None).map(Some)
     }
 
@@ -1074,7 +1143,9 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     ) -> Result<Option<SealShipped>, PackError> {
         let hash = snapshot.seal_hash.ok_or_else(|| PackError::Refused("the snapshot is not bound to a Seal".into()))?;
         let seal = Position { lsn: snapshot.seal, hash };
+        let t = crate::timing::span("pack.fs_base");
         let named = self.fs_base(segments)?;
+        drop(t);
         if let Some(f) = named {
             if f.to == seal && f.guid == snapshot.guid {
                 return Ok(None);
@@ -1146,10 +1217,11 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         let fs = FsRef { base, to: seal, guid: snapshot.guid };
         // The log section: the same as an unnamed pack for this Seal (so
         // the put replaces it), else from where the store's packs end.
-        let (log_base, end) = match self.fs_packs(seal.lsn)?.first() {
-            Some((_, _, h)) => (h.base, h.end),
+        let unnamed = self.unnamed_seal_pack(segments, seal.lsn)?;
+        let (log_base, end) = match unnamed {
+            Some(h) => (h.base, h.end),
             None => {
-                let b = self.log_base(segments, self.shipped()?.log)?;
+                let b = self.log_base(segments, self.log_end()?)?;
                 (b, if seal.lsn > b.lsn { seal } else { b })
             }
         };
@@ -1157,7 +1229,10 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         let state = Arc::new(Mutex::new((0u64, blake3::Hasher::new_derive_key(FS_STREAM_DOMAIN))));
         let stream = self.sender.send(&snapshot.dataset, from_snapshot.as_deref(), seal.lsn)?;
         let stream: ByteStream = Box::new(Digesting { inner: stream, state: state.clone() });
+        let t = crate::timing::span("pack.put_seal");
         let header = self.put_pack(PackHeader { chronicle: self.chronicle, base: log_base, end, fs: Some(fs) }, &frames, Some(stream))?;
+        drop(t);
+        self.cache().seals_put.insert(seal.lsn, header);
         let (bytes, digest) = {
             let st = state.lock().expect("not poisoned");
             (st.0, HashVal::from_bytes(*st.1.finalize().as_bytes()))
@@ -1170,6 +1245,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             bytes,
             digest,
         };
+        self.cache().named = Some((record.clone(), fs));
         Ok(Some(SealShipped { header, record }))
     }
 
@@ -1375,6 +1451,7 @@ impl<S: ObjectStore, X: Sender> Publish for PackPublisher<S, X> {
             return Err(PublishError("the packs belong to another Chronicle".into()));
         }
         self.packs.ship_log(segments, upto).map_err(|e| PublishError(format!("pack: {e}")))?;
+        let _t = crate::timing::span("pack.advance");
         self.coord
             .advance_shipped(self.warden, chronicle, epoch, upto)
             .map_err(|e| PublishError(format!("coordinator: {e}")))?;
@@ -1601,6 +1678,7 @@ mod tests {
         inner: LocalStore,
         opened: Arc<AtomicU64>,
         bytes: Arc<AtomicU64>,
+        lists: Arc<AtomicU64>,
     }
 
     struct CountRead {
@@ -1627,6 +1705,7 @@ mod tests {
             self.inner.exists(key)
         }
         fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+            self.lists.fetch_add(1, Ordering::Relaxed);
             self.inner.list(prefix)
         }
     }
@@ -1637,15 +1716,16 @@ mod tests {
         packs: Packs<Counting, FakeSend>,
         opened: Arc<AtomicU64>,
         bytes: Arc<AtomicU64>,
+        lists: Arc<AtomicU64>,
     }
 
     fn env() -> Env {
         let dir = tempfile::tempdir().unwrap();
-        let (opened, bytes) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-        let store = Counting { inner: LocalStore::new(dir.path()), opened: opened.clone(), bytes: bytes.clone() };
+        let (opened, bytes, lists) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let store = Counting { inner: LocalStore::new(dir.path()), opened: opened.clone(), bytes: bytes.clone(), lists: lists.clone() };
         let send = FakeSend::default();
         let packs = Packs::new(store, send.clone(), "vessels", ID).unwrap();
-        Env { dir, send, packs, opened, bytes }
+        Env { dir, send, packs, opened, bytes, lists }
     }
 
     impl Env {
@@ -2030,6 +2110,40 @@ mod tests {
         assert!(matches!(e.packs.chain(None), Err(PackError::Corrupt { .. })));
     }
 
+    // ── the cache ───────────────────────────────────────────────────
+
+    /// A `Packs` reads where the store ends once, then knows it from its
+    /// own puts: shipping the log lists nothing.
+    #[test]
+    fn shipping_lists_the_store_once() {
+        let e = env();
+        let mut log = Log::new();
+        for n in [3, 5, 8, 9] {
+            log.fill(n, &[]);
+            e.packs.ship_log(&log.segs(), log.at(n)).unwrap().unwrap();
+        }
+        assert_eq!(e.lists.load(Ordering::Relaxed), 1);
+        assert_eq!(e.packs.chain(Some(log.at(9))).unwrap().frames, log.frames());
+    }
+
+    /// Two `Packs` over one store each know only their own puts.  A stale
+    /// end only makes a pack overlap one already there, and the chain
+    /// merges them.
+    #[test]
+    fn a_stale_cache_only_overlaps() {
+        let e = env();
+        let other = Packs::new(LocalStore::new(e.dir.path()), FakeSend::default(), "vessels", ID).unwrap();
+        let mut log = Log::new();
+        log.fill(3, &[]);
+        e.packs.ship_log(&log.segs(), log.at(3)).unwrap();
+        log.fill(5, &[]);
+        other.ship_log(&log.segs(), log.at(5)).unwrap(); // read the store: from 3
+        log.fill(7, &[]);
+        let h = e.packs.ship_log(&log.segs(), log.at(7)).unwrap().unwrap();
+        assert_eq!(h.base, log.at(3), "stale: overlaps (3..5]");
+        assert_eq!(e.packs.chain(Some(log.at(7))).unwrap().frames, log.frames());
+    }
+
     // ── FsShipped ───────────────────────────────────────────────────
 
     /// A crash after the Seal pack's put, before its record: the section
@@ -2058,6 +2172,34 @@ mod tests {
         // A crash after the record, before the log was shipped: nothing to
         // ship again; the next log ship carries the record.
         assert_eq!(e.packs.ship_seal(&log.segs(), &log.snap(6, 60), None).unwrap(), None);
+    }
+
+    /// After a restart (a fresh `Packs`), a Seal pack the old process put
+    /// but never named is found by listing once, and replaced under the
+    /// same key; later Seals list nothing.
+    #[test]
+    fn a_restarted_writer_finds_the_unnamed_pack() {
+        let e = env();
+        let mut log = Log::new();
+        log.fill(3, &[3]);
+        log.publish(&e, 3, 30, None).unwrap();
+        log.fill(6, &[3, 6]);
+        let lost = e.packs.ship_seal(&log.segs(), &log.snap(6, 60), None).unwrap().unwrap();
+        // The process dies; a new one opens the same store.
+        let lists = Arc::new(AtomicU64::new(0));
+        let store = Counting { inner: LocalStore::new(e.dir.path()), opened: Arc::default(), bytes: Arc::default(), lists: lists.clone() };
+        let fresh = Packs::new(store, FakeSend::default(), "vessels", ID).unwrap();
+        let keys = e.keys().len();
+        let again = fresh.ship_seal(&log.segs(), &log.snap(6, 60), None).unwrap().unwrap();
+        assert_eq!(again.header, lost.header);
+        assert_eq!(e.keys().len(), keys, "replaced, not added");
+        let at = log.push_payload(Stream::Ctl, Payload::FsShipped(again.record));
+        fresh.ship_log(&log.segs(), at).unwrap();
+        let before = lists.load(Ordering::Relaxed);
+        log.fill(10, &[3, 6, 10]);
+        let next = fresh.ship_seal(&log.segs(), &log.snap(10, 100), None).unwrap().unwrap();
+        assert_eq!(next.header.fs.unwrap().base, FsBase::Seal(log.at(6)));
+        assert_eq!(lists.load(Ordering::Relaxed), before, "a Seal after the listing lists nothing");
     }
 
     #[test]

@@ -66,7 +66,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use taso_core::canon::Canonical;
-use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, Lsn, Stream};
+use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, Lsn, Stream, Envelope};
 use taso_core::model::WardenId;
 use taso_core::record::{GapRecord, LayerRef, Payload, Record, SealRecord, StreamCut, TurnId, Verdict};
 
@@ -484,6 +484,26 @@ impl<L: Layers> Chronicle<L> {
         self.commit(&rec)
     }
 
+    /// Append consecutive records together: one segment write and fsync,
+    /// one CAS ([`Coord::append_batch`]).  All are accepted or none: a
+    /// refusal cuts them all and fences, an unknown outcome poisons.
+    pub fn append_batch(&mut self, records: Vec<(Stream, Payload)>) -> Result<ChronicleHead, ChronicleError> {
+        self.ready()?;
+        let mut tail = self.segment.tail();
+        let recs: Vec<Record> = records
+            .into_iter()
+            .map(|(stream, payload)| {
+                let r = Record::new(self.id, BranchId::TRUNK, self.epoch, stream, tail.lsn.next(), tail.hash, payload);
+                tail = Position { lsn: r.envelope.lsn, hash: r.envelope.hash };
+                r
+            })
+            .collect();
+        if recs.is_empty() {
+            return self.coord.head(self.id).map_err(ChronicleError::Coord);
+        }
+        self.commit_all(&recs)
+    }
+
     /// Take a Seal: snapshot the layer bound to the Seal record's hash,
     /// then append and CAS the record.  On failure the snapshot is
     /// destroyed, unless the outcome is unknown (poisoned), in which case
@@ -512,6 +532,7 @@ impl<L: Layers> Chronicle<L> {
         check: impl FnOnce() -> Result<(), String>,
     ) -> Result<Sealed, ChronicleError> {
         self.ready()?;
+        let _total = crate::timing::span("seal.total");
         let lsn = self.segment.tail().lsn.next();
         let rec = self.next_record(
             Stream::Ctl,
@@ -525,7 +546,9 @@ impl<L: Layers> Chronicle<L> {
             }),
         );
         let hash = rec.envelope.hash;
+        let snap = crate::timing::span("seal.snapshot");
         self.layers.snapshot(lsn, hash).map_err(ChronicleError::Layer)?;
+        drop(snap);
         if let Err(why) = check() {
             // Best effort: if this fails, the next recovery destroys the
             // orphan, whose record does not exist.
@@ -590,6 +613,14 @@ impl<L: Layers> Chronicle<L> {
         self.warden
     }
 
+    /// The local frame at `lsn`, if a local segment holds it (one read).
+    pub fn frame(&self, lsn: Lsn) -> Result<Option<Frame>, SegmentError> {
+        match self.segments().into_iter().rev().find(|s| s.base().lsn < lsn && lsn <= s.tail().lsn) {
+            Some(s) => s.frame(lsn),
+            None => Ok(None),
+        }
+    }
+
     /// Every local segment, oldest first; the last is the one written.
     pub fn segments(&self) -> Vec<&Segment> {
         self.closed.iter().chain(std::iter::once(&self.segment)).collect()
@@ -633,9 +664,27 @@ impl<L: Layers> Chronicle<L> {
     /// Segment append (fsync), then CAS; on refusal cut the frame off and
     /// fence; on coordinator failure poison.
     fn commit(&mut self, rec: &Record) -> Result<ChronicleHead, ChronicleError> {
+        self.commit_all(std::slice::from_ref(rec))
+    }
+
+    /// [`Chronicle::commit`] for consecutive records: one segment write and
+    /// fsync, one CAS for all of them.  On refusal every one is cut.
+    fn commit_all(&mut self, recs: &[Record]) -> Result<ChronicleHead, ChronicleError> {
+        let _t = crate::timing::span("append.total");
         let before = self.segment.tail();
-        self.segment.append(&rec.envelope, &rec.payload.canon_bytes())?;
-        match self.coord.append(self.warden, &rec.envelope) {
+        let payloads: Vec<Vec<u8>> = recs.iter().map(|r| r.payload.canon_bytes()).collect();
+        let frames: Vec<(&Envelope, &[u8])> =
+            recs.iter().zip(&payloads).map(|(r, p)| (&r.envelope, p.as_slice())).collect();
+        self.segment.append_batch(&frames)?;
+        let envelopes: Vec<Envelope> = recs.iter().map(|r| r.envelope).collect();
+        let cas = crate::timing::span("append.cas");
+        let accepted = if envelopes.len() == 1 {
+            self.coord.append(self.warden, &envelopes[0])
+        } else {
+            self.coord.append_batch(self.warden, &envelopes)
+        };
+        drop(cas);
+        match accepted {
             Ok(head) => Ok(head),
             // The CAS may have landed: keep the frame, let reopen decide.
             Err(e) if e.outcome_unknown() => {
@@ -843,6 +892,38 @@ mod tests {
 
     fn seal<L: Layers>(c: &mut Chronicle<L>, turn: u64) -> Result<Sealed, ChronicleError> {
         c.seal(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(turn))
+    }
+
+    // ── batches ─────────────────────────────────────────────────────
+
+    #[test]
+    fn a_batch_is_accepted_whole() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        let h = c.append_batch(vec![(Stream::Effect, raw(2)), (Stream::Effect, raw(3)), (Stream::Fs, raw(4))]).unwrap();
+        assert_eq!(h.lsn, Lsn::new(4));
+        assert_eq!(e.coord.head(cid()).unwrap(), h);
+        assert_eq!(Position::from(h), c.tail());
+        drop(c);
+        let (c, r) = e.open(A);
+        assert_eq!(r.segment, segment::Recovery::default());
+        assert_eq!(c.frames().unwrap().len(), 4);
+    }
+
+    /// A fenced Warden's batch is refused whole and cut whole.
+    #[test]
+    fn a_refused_batch_is_cut_whole() {
+        let e = env();
+        let mut a = e.create();
+        a.append(Stream::Fs, raw(1)).unwrap();
+        let len = std::fs::metadata(a.segment().path()).unwrap().len();
+        e.coord.transfer(cid(), B).unwrap();
+        let r = a.append_batch(vec![(Stream::Effect, raw(2)), (Stream::Effect, raw(3))]);
+        assert!(matches!(r, Err(ChronicleError::Refused(_))), "{r:?}");
+        assert!(a.is_fenced());
+        assert_eq!(std::fs::metadata(a.segment().path()).unwrap().len(), len);
+        assert_eq!(e.coord.head(cid()).unwrap().lsn, Lsn::new(1));
     }
 
     // ── layers that are not there ───────────────────────────────────
@@ -1422,6 +1503,13 @@ mod tests {
         }
         fn append(&self, w: WardenId, e: &taso_core::envelope::Envelope) -> Result<ChronicleHead, CoordError> {
             let r = self.inner.append(w, e);
+            if self.lose_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(CoordError::Unavailable(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            r
+        }
+        fn append_batch(&self, w: WardenId, es: &[taso_core::envelope::Envelope]) -> Result<ChronicleHead, CoordError> {
+            let r = self.inner.append_batch(w, es);
             if self.lose_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 return Err(CoordError::Unavailable(std::io::ErrorKind::ConnectionReset.into()));
             }

@@ -388,17 +388,35 @@ impl Segment {
     /// If the write or fsync fails, the frame is cut off again; if even
     /// that fails, the segment is poisoned and refuses further writes.
     pub fn append(&mut self, envelope: &Envelope, payload: &[u8]) -> Result<Position, SegmentError> {
+        self.append_batch(&[(envelope, payload)])
+    }
+
+    /// Append consecutive frames in one write and one fsync: each must
+    /// follow the one before it as [`Segment::append`] requires.  Nothing
+    /// is written unless all of them pass.  A crash during the write
+    /// leaves a prefix of them, the last possibly torn; recovery treats
+    /// them like any unaccepted tail.
+    pub fn append_batch(&mut self, frames: &[(&Envelope, &[u8])]) -> Result<Position, SegmentError> {
         if self.poisoned {
             return Err(SegmentError::Poisoned);
         }
-        check_frame(self.chronicle, self.tail(), envelope, payload)?;
-
-        let mut buf = Vec::with_capacity(FRAME_PREFIX + payload.len());
-        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        encode_envelope(envelope, &mut buf);
-        buf.extend_from_slice(payload);
-
+        let mut tail = self.tail();
+        let mut buf = Vec::new();
+        let mut ends = Vec::with_capacity(frames.len());
         let start = self.end_of_index(self.hashes.len());
+        for (envelope, payload) in frames {
+            check_frame(self.chronicle, tail, envelope, payload)?;
+            buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            encode_envelope(envelope, &mut buf);
+            buf.extend_from_slice(payload);
+            ends.push(start + buf.len() as u64);
+            tail = Position { lsn: envelope.lsn, hash: envelope.hash };
+        }
+        if frames.is_empty() {
+            return Ok(tail);
+        }
+
+        let _t = crate::timing::span("append.fsync");
         let written = self
             .file
             .write_all_at(&buf, start)
@@ -409,8 +427,8 @@ impl Segment {
             }
             return Err(SegmentError::Io(e));
         }
-        self.hashes.push(envelope.hash);
-        self.ends.push(start + buf.len() as u64);
+        self.hashes.extend(frames.iter().map(|(e, _)| e.hash));
+        self.ends.extend(ends);
         Ok(self.tail())
     }
 
@@ -465,15 +483,30 @@ impl Segment {
 
     /// Read every frame back, in order.
     pub fn frames(&self) -> Result<Vec<Frame>, SegmentError> {
-        let mut out = Vec::with_capacity(self.hashes.len());
-        for i in 0..self.hashes.len() {
-            let start = self.end_of_index(i);
-            let mut buf = vec![0u8; (self.ends[i] - start) as usize];
-            self.file.read_exact_at(&mut buf, start)?;
-            let envelope = decode_envelope(&buf[4..FRAME_PREFIX]);
-            out.push(Frame { envelope, payload: buf[FRAME_PREFIX..].to_vec() });
+        self.read_from(0)
+    }
+
+    /// The frames after `lsn`, in order, read from their offset in one
+    /// read: none of the file before them is touched.
+    pub fn frames_after(&self, lsn: Lsn) -> Result<Vec<Frame>, SegmentError> {
+        let first = lsn.get().saturating_sub(self.base.lsn.get()) as usize;
+        self.read_from(first.min(self.hashes.len()))
+    }
+
+    /// The frame at `lsn`, read from its offset; `None` if this segment
+    /// does not hold it.
+    pub fn frame(&self, lsn: Lsn) -> Result<Option<Frame>, SegmentError> {
+        let Some(i) = self.index_of(lsn) else { return Ok(None) };
+        Ok(self.read_range(i, i + 1)?.pop())
+    }
+
+    /// The hash at `lsn`, from the in-memory index (no read): a frame's,
+    /// or the base's at the base lsn.  `None` if this segment knows neither.
+    pub fn hash_at(&self, lsn: Lsn) -> Option<HashVal> {
+        if lsn == self.base.lsn {
+            return Some(self.base.hash);
         }
-        Ok(out)
+        self.index_of(lsn).map(|i| self.hashes[i])
     }
 
     // ── internals ───────────────────────────────────────────────────
@@ -483,12 +516,34 @@ impl Segment {
         if i == 0 { HEADER_LEN } else { self.ends[i - 1] }
     }
 
-    fn hash_at(&self, lsn: Lsn) -> Option<HashVal> {
-        if lsn == self.base.lsn {
-            return Some(self.base.hash);
-        }
+    /// The index of the frame at `lsn`, if this segment holds it.
+    fn index_of(&self, lsn: Lsn) -> Option<usize> {
         let i = lsn.get().checked_sub(self.base.lsn.get() + 1)? as usize;
-        self.hashes.get(i).copied()
+        (i < self.hashes.len()).then_some(i)
+    }
+
+    /// Frames `first ..` to the end, in one read.
+    fn read_from(&self, first: usize) -> Result<Vec<Frame>, SegmentError> {
+        self.read_range(first, self.hashes.len())
+    }
+
+    /// Frames `first .. last` (indexes), in one read of their bytes.
+    fn read_range(&self, first: usize, last: usize) -> Result<Vec<Frame>, SegmentError> {
+        if first >= last {
+            return Ok(Vec::new());
+        }
+        let start = self.end_of_index(first);
+        let mut buf = vec![0u8; (self.ends[last - 1] - start) as usize];
+        self.file.read_exact_at(&mut buf, start)?;
+        let mut out = Vec::with_capacity(last - first);
+        let mut at = start;
+        for i in first..last {
+            let frame = &buf[(at - start) as usize..(self.ends[i] - start) as usize];
+            let envelope = decode_envelope(&frame[4..FRAME_PREFIX]);
+            out.push(Frame { envelope, payload: frame[FRAME_PREFIX..].to_vec() });
+            at = self.ends[i];
+        }
+        Ok(out)
     }
 
     /// Keep the first `keep` frames; truncate the file after them; fsync.
@@ -694,6 +749,56 @@ mod tests {
     }
 
     // ── append and read back ────────────────────────────────────────
+
+    /// A batch is written whole, after every frame passes; one bad frame
+    /// writes nothing.
+    #[test]
+    fn batches_are_checked_whole() {
+        let (_d, path, mut seg) = fresh(Position::GENESIS);
+        let recs = chain(chron(1), Position::GENESIS, &[1, 2, 3, 4]);
+        let all: Vec<(&Envelope, &[u8])> = recs.iter().map(|(e, p)| (e, p.as_slice())).collect();
+        let len = file_len(&path);
+        // The third does not follow the second.
+        let bad = [all[0], all[1], all[3]];
+        assert!(seg.append_batch(&bad).is_err());
+        assert_eq!((seg.tail(), file_len(&path)), (Position::GENESIS, len));
+        assert_eq!(seg.append_batch(&[]).unwrap(), Position::GENESIS);
+        seg.append_batch(&all[..3]).unwrap();
+        seg.append_batch(&all[3..]).unwrap();
+        assert_eq!(seg.tail().lsn, Lsn::new(4));
+        drop(seg);
+        let (seg, _) = Segment::open(&path, head(Position { lsn: Lsn::new(4), hash: recs[3].0.hash })).unwrap();
+        let frames = seg.frames().unwrap();
+        assert_eq!(frames.iter().map(|f| (&f.envelope, f.payload.as_slice())).collect::<Vec<_>>(), all);
+    }
+
+    /// Reads by lsn match the full read, from a segment based past
+    /// genesis too, and touch nothing they do not hold.
+    #[test]
+    fn reads_by_lsn() {
+        for base in [Position::GENESIS, Position { lsn: Lsn::new(7), hash: HashVal::from_bytes([7; 32]) }] {
+            let (_d, _p, mut seg) = fresh(base);
+            for (e, p) in &chain(chron(1), base, &[0, 1, 100, 4096, 3]) {
+                seg.append(e, p).unwrap();
+            }
+            let all = seg.frames().unwrap();
+            let b = base.lsn.get();
+            for k in 0..=5u64 {
+                assert_eq!(seg.frames_after(Lsn::new(b + k)).unwrap(), all[k as usize..], "after {k}");
+            }
+            assert_eq!(seg.frames_after(Lsn::new(b + 9)).unwrap(), vec![]);
+            assert_eq!(seg.frames_after(Lsn::new(0)).unwrap(), all, "before the base: everything");
+            for (i, f) in all.iter().enumerate() {
+                let lsn = Lsn::new(b + 1 + i as u64);
+                assert_eq!(seg.frame(lsn).unwrap().as_ref(), Some(f));
+                assert_eq!(seg.hash_at(lsn), Some(f.envelope.hash));
+            }
+            assert_eq!(seg.frame(base.lsn).unwrap(), None, "the base is no frame");
+            assert_eq!(seg.hash_at(base.lsn), Some(base.hash));
+            assert_eq!(seg.frame(Lsn::new(b + 6)).unwrap(), None);
+            assert_eq!(seg.hash_at(Lsn::new(b + 6)), None);
+        }
+    }
 
     #[test]
     fn round_trip_and_reopen() {
