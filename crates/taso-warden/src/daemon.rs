@@ -103,6 +103,8 @@ pub enum StoreConf {
         access_key_id: String,
         /// A file holding the secret key (mode 0600 is the operator's job).
         secret_key_file: PathBuf,
+        /// For an `https://` endpoint: trust only this CA (PEM).
+        ca_file: Option<PathBuf>,
     },
 }
 
@@ -111,7 +113,7 @@ impl StoreConf {
     pub fn open(&self) -> std::io::Result<SharedStore> {
         Ok(match self {
             Self::Local(dir) => Arc::new(LocalStore::new(dir)),
-            Self::S3 { endpoint, region, bucket, access_key_id, secret_key_file } => {
+            Self::S3 { endpoint, region, bucket, access_key_id, secret_key_file, ca_file } => {
                 let secret = std::fs::read_to_string(secret_key_file)
                     .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", secret_key_file.display())))?;
                 Arc::new(S3Store::new(
@@ -121,6 +123,7 @@ impl StoreConf {
                         bucket: bucket.clone(),
                         access_key_id: access_key_id.clone(),
                         secret_key: secret.trim().to_string(),
+                        ca_file: ca_file.clone(),
                     },
                     Duration::from_secs(30),
                 )?)
@@ -336,6 +339,7 @@ impl Config {
                         bucket: string(s, "bucket")?,
                         access_key_id: string(s, "access_key_id")?,
                         secret_key_file: abs_path(s, "secret_key_file")?,
+                        ca_file: if s.get("ca_file").is_some() { Some(abs_path(s, "ca_file")?) } else { None },
                     }
                 }
                 _ => return Err(bad("\"store\" must be a directory or {\"s3\": {...}}")),
@@ -790,6 +794,7 @@ mod tests {
                 bucket: "taso".into(),
                 access_key_id: "GK1".into(),
                 secret_key_file: "/etc/taso/s3.secret".into(),
+                ca_file: None,
             }
         );
     }
@@ -804,6 +809,7 @@ mod tests {
             bucket: "taso".into(),
             access_key_id: "GK1".into(),
             secret_key_file: file,
+            ca_file: None,
         };
         assert!(s3(dir.path().join("missing")).open().is_err(), "no secret file, no store");
         std::fs::write(dir.path().join("secret"), "s3cr3t\n").unwrap();
