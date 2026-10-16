@@ -119,8 +119,8 @@ json.dump({
 PY
 }
 
-vessel_ds() {   # $1 node, $2 subject -> dataset name
-    zfs list -H -o name -d 1 "$BASE/$1" | grep '/v-' | while read -r ds; do echo "$ds"; done | head -1
+vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset, as the daemon logged it
+    grep -o ': dataset [^ ]*$' "$1" | head -1 | sed 's/: dataset //'
 }
 
 snap_hash() {   # $1 snapshot name -> hash of every file's path and bytes
@@ -162,7 +162,7 @@ for k in $(seq 1 "$N"); do
     grep -q "Fenced" "$OUT/a-$k.err" && refused=1
 
     # The last Seal both nodes have: same guid, same bytes.
-    dsa=$(vessel_ds a "$subject"); dsb=$(vessel_ds b "$subject")
+    dsa=$(vessel_ds "$OUT/a-$k.err"); dsb=$(vessel_ds "$OUT/b-$k.err")
     last=$(comm -12 <(zfs list -H -t snapshot -o name -d 1 "$dsa" | sed 's/.*@//' | grep '^taso-seal-' | sort) \
                     <(zfs list -H -t snapshot -o name -d 1 "$dsb" | sed 's/.*@//' | grep '^taso-seal-' | sort) | tail -1)
     same=0
@@ -175,6 +175,9 @@ for k in $(seq 1 "$N"); do
     how=$(grep -o 'reborn at epoch.*' "$OUT/b-$k.err" | tail -1 || true)
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$secs" "$refused" "$same" "${last:-none}" "$resumed" | tee -a "$OUT/rounds.tsv"
     echo "  $how"
+    if [ "$resumed" = none ] || [ "$resumed" = None ]; then
+        echo "  B did not resume; its log:"; sed 's/^/    /' "$OUT/b-$k.err" | tail -8; sed 's/^/    /' "$OUT/b-$k.out"
+    fi
     # Leave the next round a clean slate on both nodes.
     zfs destroy -R "$dsa" 2>/dev/null || true
     zfs destroy -R "$dsb" 2>/dev/null || true
