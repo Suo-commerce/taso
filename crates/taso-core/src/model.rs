@@ -69,6 +69,55 @@ pub enum AppendError {
     },
 }
 
+// ── Shipped anchor ──────────────────────────────────────────────────
+
+/// A position in the chain: an lsn and the hash of the record at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    /// The lsn.
+    pub lsn: Lsn,
+    /// The record hash at it.
+    pub hash: HashVal,
+}
+
+impl Anchor {
+    /// Before the first record.
+    pub const GENESIS: Self = Self { lsn: Lsn::new(0), hash: HashVal::GENESIS };
+}
+
+/// Why the coordinator refused to advance the shipped anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShipError {
+    /// The Warden is not the current holder.
+    NotHolder {
+        /// Who tried.
+        warden: WardenId,
+        /// Who actually holds it.
+        holder: WardenId,
+    },
+    /// The Warden's epoch is not the current epoch.
+    EpochMismatch {
+        /// What the Warden said.
+        epoch: Epoch,
+        /// What the coordinator has.
+        current: Epoch,
+    },
+    /// The position is past the anchored head: only accepted records can
+    /// have been shipped.
+    Ahead {
+        /// What was reported.
+        to: Lsn,
+        /// The anchored head.
+        head: Lsn,
+    },
+    /// The position names a record the coordinator knows to be another:
+    /// at the head, or at the current shipped anchor.
+    Conflict {
+        /// Where.
+        lsn: Lsn,
+    },
+}
+
 // ── Coordinator ─────────────────────────────────────────────────────
 
 /// In-memory coordinator: ownership + anchored head + accepted log.
@@ -83,6 +132,8 @@ pub struct Coordinator {
     head: ChronicleHead,
     /// Every accepted record, in order.
     log: Vec<Record>,
+    /// How far the log is known to be shipped off the node.
+    shipped: Anchor,
 }
 
 impl Coordinator {
@@ -102,6 +153,7 @@ impl Coordinator {
             },
             head: genesis_head,
             log: Vec::new(),
+            shipped: Anchor::GENESIS,
         }
     }
 
@@ -183,6 +235,39 @@ impl Coordinator {
             epoch: self.ownership.epoch,
         };
         self.ownership.epoch
+    }
+
+    /// How far the log is known to be shipped.
+    pub fn shipped(&self) -> Anchor { self.shipped }
+
+    /// The holder reports that the log up to `to` is durable in the
+    /// object store.  The anchor only moves forward; a report at or below
+    /// it changes nothing.
+    ///
+    /// Checks, in order: holder; epoch; `to` not past the head; at the
+    /// head, `to` has the head's hash; at the current anchor, the anchor's
+    /// hash.  Below the head the coordinator holds no record bodies, so
+    /// it cannot check other hashes; the real one cannot either, and the
+    /// model must not be stricter than the system it describes.
+    pub fn advance_shipped(&mut self, warden: WardenId, epoch: Epoch, to: Anchor) -> Result<Anchor, ShipError> {
+        if warden != self.ownership.holder {
+            return Err(ShipError::NotHolder { warden, holder: self.ownership.holder });
+        }
+        if epoch != self.ownership.epoch {
+            return Err(ShipError::EpochMismatch { epoch, current: self.ownership.epoch });
+        }
+        if to.lsn > self.head.lsn {
+            return Err(ShipError::Ahead { to: to.lsn, head: self.head.lsn });
+        }
+        if (to.lsn == self.head.lsn && to.hash != self.head.hash)
+            || (to.lsn == self.shipped.lsn && to.hash != self.shipped.hash)
+        {
+            return Err(ShipError::Conflict { lsn: to.lsn });
+        }
+        if to.lsn > self.shipped.lsn {
+            self.shipped = to;
+        }
+        Ok(self.shipped)
     }
 
     /// Records that a rebirth would use: everything up to and including

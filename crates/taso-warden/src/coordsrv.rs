@@ -5,7 +5,7 @@
 //! [`Coord`] (in practice the redb [`Coordinator`](crate::coordinator::Coordinator),
 //! the only process holding its file) and serves it over a Unix socket;
 //! [`RemoteCoord`] is a [`Coord`] that forwards every call there.  It must
-//! pass the same [`conformance`](crate::coordinator::conformance) test as
+//! pass the same `conformance` test (in `coordinator`'s tests) as
 //! the in-process coordinator.
 //!
 //! # Unknown outcomes
@@ -37,15 +37,22 @@
 //!   3 transfer   chronicle (16) · new_holder (8)
 //!   4 ownership  chronicle (16)
 //!   5 head       chronicle (16)
+//!   6 advance_shipped  warden (8) · chronicle (16) · epoch (8) · position (40)
+//!   7 shipped    chronicle (16)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
+//!                | position (40)
 //!   1 refused    reason (1) · fields          (every refusal of CoordError)
 //!   2 failed     utf-8 message                (outcome unknown on the server)
 //!   3 bad        utf-8 message                (malformed request; nothing done)
 //!
 //! head     lsn (8) · hash (32) · epoch (8)
+//! position lsn (8) · hash (32)
 //! ```
+//!
+//! Operations 6 and 7 were added to version 1 before any server ran
+//! outside a test.
 //!
 //! A malformed request gets status 3 and the server closes the connection,
 //! since it can no longer trust the framing.  The version byte lets a
@@ -78,6 +85,7 @@ use taso_core::model::{Ownership, WardenId};
 use taso_field::protocol::{read_frame, write_frame, ProtocolError};
 
 use crate::coordinator::{Coord, CoordError};
+use crate::segment::Position;
 
 const WIRE_V1: u8 = 1;
 
@@ -86,6 +94,8 @@ const OP_APPEND: u8 = 2;
 const OP_TRANSFER: u8 = 3;
 const OP_OWNERSHIP: u8 = 4;
 const OP_HEAD: u8 = 5;
+const OP_ADVANCE_SHIPPED: u8 = 6;
+const OP_SHIPPED: u8 = 7;
 
 const ST_OK: u8 = 0;
 const ST_REFUSED: u8 = 1;
@@ -99,6 +109,8 @@ const R_NOT_HOLDER: u8 = 4;
 const R_EPOCH_MISMATCH: u8 = 5;
 const R_HEAD_MISMATCH: u8 = 6;
 const R_LSN_NOT_NEXT: u8 = 7;
+const R_SHIPPED_AHEAD: u8 = 8;
+const R_SHIPPED_CONFLICT: u8 = 9;
 
 /// How often the accept loop checks whether it should stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
@@ -115,6 +127,8 @@ enum Request {
     Transfer { chronicle: ChronicleId, new_holder: WardenId },
     Ownership { chronicle: ChronicleId },
     Head { chronicle: ChronicleId },
+    AdvanceShipped { warden: WardenId, chronicle: ChronicleId, epoch: Epoch, to: Position },
+    Shipped { chronicle: ChronicleId },
 }
 
 #[derive(Debug)]
@@ -122,6 +136,7 @@ enum Reply {
     Head(ChronicleHead),
     Epoch(Epoch),
     Ownership(Ownership),
+    Position(Position),
     /// A refusal, or a server-side failure (always `outcome_unknown`).
     Err(CoordError),
     /// The server could not parse the request.
@@ -157,6 +172,9 @@ impl Out {
     }
     fn head(&mut self, h: &ChronicleHead) -> &mut Self {
         self.u64(h.lsn.get()).bytes(h.hash.as_bytes()).u64(h.epoch.get())
+    }
+    fn pos(&mut self, p: &Position) -> &mut Self {
+        self.u64(p.lsn.get()).bytes(p.hash.as_bytes())
     }
     fn envelope(&mut self, e: &Envelope) -> &mut Self {
         self.bytes(e.chronicle.as_bytes())
@@ -201,6 +219,9 @@ impl<'a> In<'a> {
     }
     fn head(&mut self) -> Result<ChronicleHead, Malformed> {
         Ok(ChronicleHead { lsn: Lsn::new(self.u64()?), hash: self.hash()?, epoch: Epoch::new(self.u64()?) })
+    }
+    fn pos(&mut self) -> Result<Position, Malformed> {
+        Ok(Position { lsn: Lsn::new(self.u64()?), hash: self.hash()? })
     }
     fn envelope(&mut self) -> Result<Envelope, Malformed> {
         let chronicle = self.chronicle()?;
@@ -252,6 +273,13 @@ impl Request {
             }
             Self::Ownership { chronicle } => o.u8(OP_OWNERSHIP).bytes(chronicle.as_bytes()),
             Self::Head { chronicle } => o.u8(OP_HEAD).bytes(chronicle.as_bytes()),
+            Self::AdvanceShipped { warden, chronicle, epoch, to } => o
+                .u8(OP_ADVANCE_SHIPPED)
+                .u64(warden.get())
+                .bytes(chronicle.as_bytes())
+                .u64(epoch.get())
+                .pos(to),
+            Self::Shipped { chronicle } => o.u8(OP_SHIPPED).bytes(chronicle.as_bytes()),
         };
         o.0
     }
@@ -267,6 +295,13 @@ impl Request {
             OP_TRANSFER => Self::Transfer { chronicle: i.chronicle()?, new_holder: i.warden()? },
             OP_OWNERSHIP => Self::Ownership { chronicle: i.chronicle()? },
             OP_HEAD => Self::Head { chronicle: i.chronicle()? },
+            OP_ADVANCE_SHIPPED => Self::AdvanceShipped {
+                warden: i.warden()?,
+                chronicle: i.chronicle()?,
+                epoch: Epoch::new(i.u64()?),
+                to: i.pos()?,
+            },
+            OP_SHIPPED => Self::Shipped { chronicle: i.chronicle()? },
             _ => return Err(Malformed("unknown operation")),
         };
         i.end()?;
@@ -279,6 +314,7 @@ impl Request {
             Self::Register { .. } | Self::Append { .. } | Self::Head { .. } => OkKind::Head,
             Self::Transfer { .. } => OkKind::Epoch,
             Self::Ownership { .. } => OkKind::Ownership,
+            Self::AdvanceShipped { .. } | Self::Shipped { .. } => OkKind::Position,
         }
     }
 }
@@ -288,6 +324,7 @@ enum OkKind {
     Head,
     Epoch,
     Ownership,
+    Position,
 }
 
 impl Reply {
@@ -302,6 +339,9 @@ impl Reply {
             }
             Self::Ownership(w) => {
                 o.u8(ST_OK).u64(w.epoch.get()).u64(w.holder.get()).head(&w.sealed_prefix);
+            }
+            Self::Position(p) => {
+                o.u8(ST_OK).pos(p);
             }
             Self::Err(e) => match encode_refusal(e) {
                 Some(body) => {
@@ -329,6 +369,7 @@ impl Reply {
                     holder: i.warden()?,
                     sealed_prefix: i.head()?,
                 }),
+                OkKind::Position => Self::Position(i.pos()?),
             },
             ST_REFUSED => Self::Err(decode_refusal(&mut i)?),
             ST_FAILED => Self::Err(CoordError::Unavailable(io::Error::other(format!(
@@ -359,6 +400,8 @@ fn encode_refusal(e: &CoordError) -> Option<Vec<u8>> {
             o.u8(R_HEAD_MISMATCH).bytes(prev.as_bytes()).bytes(anchored.as_bytes())
         }
         CoordError::LsnNotNext { lsn, expected } => o.u8(R_LSN_NOT_NEXT).u64(lsn.get()).u64(expected.get()),
+        CoordError::ShippedAhead { to, head } => o.u8(R_SHIPPED_AHEAD).u64(to.get()).u64(head.get()),
+        CoordError::ShippedConflict { lsn } => o.u8(R_SHIPPED_CONFLICT).u64(lsn.get()),
         CoordError::Corrupt { .. } | CoordError::Storage(_) | CoordError::Unavailable(_) => return None,
     };
     Some(o.0)
@@ -375,6 +418,8 @@ fn decode_refusal(i: &mut In<'_>) -> Result<CoordError, Malformed> {
         }
         R_HEAD_MISMATCH => CoordError::HeadMismatch { prev: i.hash()?, anchored: i.hash()? },
         R_LSN_NOT_NEXT => CoordError::LsnNotNext { lsn: Lsn::new(i.u64()?), expected: Lsn::new(i.u64()?) },
+        R_SHIPPED_AHEAD => CoordError::ShippedAhead { to: Lsn::new(i.u64()?), head: Lsn::new(i.u64()?) },
+        R_SHIPPED_CONFLICT => CoordError::ShippedConflict { lsn: Lsn::new(i.u64()?) },
         _ => return Err(Malformed("unknown refusal")),
     })
 }
@@ -389,6 +434,10 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
         Request::Transfer { chronicle, new_holder } => coord.transfer(chronicle, new_holder).map(Reply::Epoch),
         Request::Ownership { chronicle } => coord.ownership(chronicle).map(Reply::Ownership),
         Request::Head { chronicle } => coord.head(chronicle).map(Reply::Head),
+        Request::AdvanceShipped { warden, chronicle, epoch, to } => {
+            coord.advance_shipped(warden, chronicle, epoch, to).map(Reply::Position)
+        }
+        Request::Shipped { chronicle } => coord.shipped(chronicle).map(Reply::Position),
     };
     r.unwrap_or_else(Reply::Err)
 }
@@ -644,6 +693,28 @@ impl Coord for RemoteCoord {
             r => Err(unexpected(r)),
         }
     }
+
+    fn advance_shipped(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        to: Position,
+    ) -> Result<Position, CoordError> {
+        match self.call(Request::AdvanceShipped { warden, chronicle, epoch, to })? {
+            Reply::Position(p) => Ok(p),
+            Reply::Err(e) => Err(e),
+            r => Err(unexpected(r)),
+        }
+    }
+
+    fn shipped(&self, chronicle: ChronicleId) -> Result<Position, CoordError> {
+        match self.call(Request::Shipped { chronicle })? {
+            Reply::Position(p) => Ok(p),
+            Reply::Err(e) => Err(e),
+            r => Err(unexpected(r)),
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -746,6 +817,8 @@ mod tests {
             CoordError::EpochMismatch { record_epoch: Epoch::new(1), current: Epoch::new(4) },
             CoordError::HeadMismatch { prev: h, anchored: HashVal::GENESIS },
             CoordError::LsnNotNext { lsn: Lsn::new(9), expected: Lsn::new(2) },
+            CoordError::ShippedAhead { to: Lsn::new(6), head: Lsn::new(5) },
+            CoordError::ShippedConflict { lsn: Lsn::new(5) },
         ];
         for e in refusals {
             let body = Reply::Err(e).encode();
@@ -774,6 +847,13 @@ mod tests {
             Request::Transfer { chronicle: chron(1), new_holder: B },
             Request::Ownership { chronicle: chron(1) },
             Request::Head { chronicle: chron(1) },
+            Request::AdvanceShipped {
+                warden: A,
+                chronicle: chron(1),
+                epoch: Epoch::new(3),
+                to: Position { lsn: Lsn::new(4), hash: HashVal::from_bytes([4; 32]) },
+            },
+            Request::Shipped { chronicle: chron(1) },
         ];
         for r in reqs {
             let b = r.encode();

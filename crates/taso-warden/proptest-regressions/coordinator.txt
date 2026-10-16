@@ -5,3 +5,6 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 34e46e6ebb4318fe4e00a2b65c95dec0092541a011e38f9965647c10724cfabe # shrinks to ops = [Transfer(0)]
+cc d0dddd96633300a7e87483cf87316b27b069883d15a760adf3b3df15378bd42d # shrinks to ops = [Ship(0, 10)]
+cc 0c619f0e5158875582837da99e0b6135d1700c6020c7ecebf3e737ffaae22be8 # shrinks to ops = [Append(0), Append(0), Transfer(1), Resume(1), Ship(1, 11)]
+cc d06519459879feb0d5b04a226768a0b6b3b7e0a001945a977368a058b141bd4f # shrinks to ops = [Append(0), Append(0), Append(0), Append(0), Append(0), Resume(0), Append(0), Ship(0, 1), Ship(0, 7)]

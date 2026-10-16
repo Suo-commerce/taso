@@ -30,7 +30,7 @@
 //! [`Coordinator`] (redb, in-process) is one implementation; a coordinator
 //! behind a socket, so that a Warden on another node can be reborn against
 //! it (v1.0 §1 P2), is another.  Both must pass the same differential test
-//! against the model ([`conformance`]).
+//! against the model (`conformance`, in the tests).
 //!
 //! A failure whose outcome is unknown — storage, a corrupt row, a lost
 //! connection — is told apart from a refusal by
@@ -49,6 +49,8 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDe
 use taso_core::envelope::{ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn};
 use taso_core::model::{Ownership, WardenId};
 
+use crate::segment::Position;
+
 // ── Storage layout ──────────────────────────────────────────────────
 
 /// One row per Chronicle: key = `ChronicleId` bytes, value = [`State`]
@@ -58,12 +60,19 @@ const CHRONICLES: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("taso.
 /// Layout version byte at the start of every row.
 const LAYOUT_V1: u8 = 1;
 
+/// Layout version with the shipped anchor.  Rows written before it read
+/// as shipped = genesis.
+const LAYOUT_V2: u8 = 2;
+
 /// Encoded size of a [`ChronicleHead`]: lsn (8) + hash (32) + epoch (8).
 const HEAD_LEN: usize = 8 + 32 + 8;
 
 /// Encoded size of a row: version (1) + holder (8) + epoch (8)
 /// + sealed_prefix + head.
-const ROW_LEN: usize = 1 + 8 + 8 + HEAD_LEN + HEAD_LEN;
+const ROW_LEN_V1: usize = 1 + 8 + 8 + HEAD_LEN + HEAD_LEN;
+
+/// Encoded size of a v2 row: v1, then shipped lsn (8) + hash (32).
+const ROW_LEN: usize = ROW_LEN_V1 + 8 + 32;
 
 // ── Errors ──────────────────────────────────────────────────────────
 
@@ -121,6 +130,19 @@ pub enum CoordError {
     },
     /// The storage layer failed.
     Storage(redb::Error),
+    /// A shipped position past the anchored head.
+    ShippedAhead {
+        /// What was reported.
+        to: Lsn,
+        /// The anchored head.
+        head: Lsn,
+    },
+    /// A shipped position that names another record than the coordinator
+    /// knows at that lsn (the head, or the current shipped anchor).
+    ShippedConflict {
+        /// Where.
+        lsn: Lsn,
+    },
     /// The coordinator could not be reached, or the connection broke before
     /// an answer arrived.  The request may or may not have been applied.
     Unavailable(std::io::Error),
@@ -145,7 +167,9 @@ impl CoordError {
             | Self::NotHolder { .. }
             | Self::EpochMismatch { .. }
             | Self::HeadMismatch { .. }
-            | Self::LsnNotNext { .. } => false,
+            | Self::LsnNotNext { .. }
+            | Self::ShippedAhead { .. }
+            | Self::ShippedConflict { .. } => false,
         }
     }
 }
@@ -179,6 +203,10 @@ impl fmt::Display for CoordError {
                 write!(f, "corrupt row for chronicle {chronicle:?}: {reason}")
             }
             Self::Storage(e) => write!(f, "storage: {e}"),
+            Self::ShippedAhead { to, head } => {
+                write!(f, "shipped lsn {} is past the anchored head {}", to.get(), head.get())
+            }
+            Self::ShippedConflict { lsn } => write!(f, "shipped position at lsn {} names another record", lsn.get()),
             Self::Unavailable(e) => write!(f, "coordinator unavailable: {e}"),
         }
     }
@@ -199,7 +227,7 @@ impl std::error::Error for CoordError {
 /// What a Warden asks of a coordinator (v0.4 §8.1–8.3, §8.7).
 ///
 /// Semantics are those of [`taso_core::model::Coordinator`]; every
-/// implementation must pass [`conformance`].  Each method is one atomic,
+/// implementation must pass `conformance` (in the tests).  Each method is one atomic,
 /// durable step: on `Ok` it happened, on a refusal nothing changed, and on
 /// an error with [`CoordError::outcome_unknown`] either may be true.
 pub trait Coord: Send + Sync {
@@ -220,6 +248,25 @@ pub trait Coord: Send + Sync {
 
     /// The anchored head of a Chronicle (the authority, not a cache).
     fn head(&self, chronicle: ChronicleId) -> Result<ChronicleHead, CoordError>;
+
+    /// The holder reports that its log up to `to` is durable in the object
+    /// store (a pack put returned).  Same holder and epoch checks as an
+    /// append; `to` may not be past the head, nor name another record at
+    /// the head or at the current anchor.  The anchor only moves forward:
+    /// a report at or below it changes nothing.  Returns the anchor after.
+    ///
+    /// Rebirth verifies the shipped chain against this anchor: a store
+    /// holding a forged history, or missing packs, cannot pass.
+    fn advance_shipped(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        to: Position,
+    ) -> Result<Position, CoordError>;
+
+    /// How far the Chronicle is known to be shipped (genesis if never).
+    fn shipped(&self, chronicle: ChronicleId) -> Result<Position, CoordError>;
 }
 
 /// Wrap any `redb` error.
@@ -236,33 +283,44 @@ struct State {
     epoch: Epoch,
     sealed_prefix: ChronicleHead,
     head: ChronicleHead,
+    shipped: Position,
 }
 
 impl State {
-    /// Fixed big-endian layout: version, holder, epoch, sealed_prefix, head.
+    /// Fixed big-endian layout v2: version, holder, epoch, sealed_prefix,
+    /// head, shipped lsn, shipped hash.
     fn encode(&self) -> [u8; ROW_LEN] {
         let mut out = [0u8; ROW_LEN];
-        out[0] = LAYOUT_V1;
+        out[0] = LAYOUT_V2;
         out[1..9].copy_from_slice(&self.holder.get().to_be_bytes());
         out[9..17].copy_from_slice(&self.epoch.get().to_be_bytes());
         encode_head(&self.sealed_prefix, &mut out[17..17 + HEAD_LEN]);
-        encode_head(&self.head, &mut out[17 + HEAD_LEN..]);
+        encode_head(&self.head, &mut out[17 + HEAD_LEN..ROW_LEN_V1]);
+        out[ROW_LEN_V1..ROW_LEN_V1 + 8].copy_from_slice(&self.shipped.lsn.get().to_be_bytes());
+        out[ROW_LEN_V1 + 8..].copy_from_slice(self.shipped.hash.as_bytes());
         out
     }
 
+    /// Reads v2 rows, and v1 rows (written before the shipped anchor
+    /// existed) as shipped = genesis.
     fn decode(chronicle: ChronicleId, b: &[u8]) -> Result<Self, CoordError> {
         let corrupt = |reason| CoordError::Corrupt { chronicle, reason };
-        if b.len() != ROW_LEN {
-            return Err(corrupt("wrong row length"));
-        }
-        if b[0] != LAYOUT_V1 {
-            return Err(corrupt("unknown layout version"));
-        }
+        let shipped = match (b.first(), b.len()) {
+            (Some(&LAYOUT_V1), ROW_LEN_V1) => Position::GENESIS,
+            (Some(&LAYOUT_V2), ROW_LEN) => {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&b[ROW_LEN_V1 + 8..]);
+                Position { lsn: Lsn::new(be_u64(&b[ROW_LEN_V1..ROW_LEN_V1 + 8])), hash: HashVal::from_bytes(h) }
+            }
+            (Some(&LAYOUT_V1 | &LAYOUT_V2), _) => return Err(corrupt("wrong row length")),
+            _ => return Err(corrupt("unknown layout version")),
+        };
         let state = Self {
             holder: WardenId::new(be_u64(&b[1..9])),
             epoch: Epoch::new(be_u64(&b[9..17])),
             sealed_prefix: decode_head(&b[17..17 + HEAD_LEN]),
-            head: decode_head(&b[17 + HEAD_LEN..]),
+            head: decode_head(&b[17 + HEAD_LEN..ROW_LEN_V1]),
+            shipped,
         };
         // The anchored head always carries the current epoch (see
         // `transfer`); anything else was not written by this module.
@@ -271,6 +329,9 @@ impl State {
         }
         if state.sealed_prefix.lsn > state.head.lsn {
             return Err(corrupt("sealed prefix is ahead of the head"));
+        }
+        if state.shipped.lsn > state.head.lsn {
+            return Err(corrupt("shipped anchor is ahead of the head"));
         }
         Ok(state)
     }
@@ -394,6 +455,7 @@ impl Coord for Coordinator {
                 epoch: Epoch::FIRST,
                 sealed_prefix: genesis,
                 head: genesis,
+                shipped: Position::GENESIS,
             };
             store(rows, chronicle, &state)?;
             Ok(genesis)
@@ -490,6 +552,43 @@ impl Coord for Coordinator {
     /// The anchored head of a Chronicle (the authority, not a cache).
     fn head(&self, chronicle: ChronicleId) -> Result<ChronicleHead, CoordError> {
         Ok(self.read(chronicle)?.head)
+    }
+
+    /// The model's rule exactly ([`taso_core::model::Coordinator::advance_shipped`]),
+    /// in one fsynced transaction when it changes.
+    fn advance_shipped(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        to: Position,
+    ) -> Result<Position, CoordError> {
+        self.write(|rows| {
+            let mut state = load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+            if warden != state.holder {
+                return Err(CoordError::NotHolder { warden, holder: state.holder });
+            }
+            if epoch != state.epoch {
+                return Err(CoordError::EpochMismatch { record_epoch: epoch, current: state.epoch });
+            }
+            if to.lsn > state.head.lsn {
+                return Err(CoordError::ShippedAhead { to: to.lsn, head: state.head.lsn });
+            }
+            if (to.lsn == state.head.lsn && to.hash != state.head.hash)
+                || (to.lsn == state.shipped.lsn && to.hash != state.shipped.hash)
+            {
+                return Err(CoordError::ShippedConflict { lsn: to.lsn });
+            }
+            if to.lsn > state.shipped.lsn {
+                state.shipped = to;
+                store(rows, chronicle, &state)?;
+            }
+            Ok(state.shipped)
+        })
+    }
+
+    fn shipped(&self, chronicle: ChronicleId) -> Result<Position, CoordError> {
+        Ok(self.read(chronicle)?.shipped)
     }
 }
 
@@ -707,8 +806,57 @@ mod tests {
                 hash: HashVal::from_bytes([2; 32]),
                 epoch: Epoch::new(7),
             },
+            shipped: Position { lsn: Lsn::new(8), hash: HashVal::from_bytes([3; 32]) },
         };
         assert_eq!(State::decode(chron(1), &s.encode()).unwrap(), s);
+        // A v1 row (written before the shipped anchor) reads as shipped = genesis.
+        let mut v1 = s.encode()[..ROW_LEN_V1].to_vec();
+        v1[0] = LAYOUT_V1;
+        assert_eq!(State::decode(chron(1), &v1).unwrap(), State { shipped: Position::GENESIS, ..s });
+        // Wrong lengths for either version, and a shipped anchor past the head.
+        assert!(State::decode(chron(1), &s.encode()[..ROW_LEN_V1]).is_err());
+        let mut long_v1 = s.encode().to_vec();
+        long_v1[0] = LAYOUT_V1;
+        assert!(State::decode(chron(1), &long_v1).is_err());
+        let ahead = State { shipped: Position { lsn: Lsn::new(10), hash: HashVal::GENESIS }, ..s };
+        assert!(State::decode(chron(1), &ahead.encode()).is_err());
+    }
+
+    #[test]
+    fn shipped_anchor_rules() {
+        let (_d, path, coord) = fresh();
+        coord.register(chron(1), A).unwrap();
+        let mut w = resumed(A, chron(1), &coord);
+        let mut heads = vec![Position::GENESIS];
+        for n in 1..=5 {
+            heads.push(submit(&coord, &mut w, chron(1), n).unwrap().into());
+        }
+        let e = Epoch::FIRST;
+        assert_eq!(coord.shipped(chron(1)).unwrap(), Position::GENESIS);
+        assert_eq!(coord.advance_shipped(A, chron(1), e, heads[3]).unwrap(), heads[3]);
+        // Lower or equal: no change.
+        assert_eq!(coord.advance_shipped(A, chron(1), e, heads[2]).unwrap(), heads[3]);
+        assert_eq!(coord.advance_shipped(A, chron(1), e, heads[3]).unwrap(), heads[3]);
+        // Refusals: not the holder, a stale epoch, past the head, another
+        // record at the head or at the anchor; nothing changes.
+        assert!(matches!(coord.advance_shipped(B, chron(1), e, heads[4]), Err(CoordError::NotHolder { .. })));
+        assert!(matches!(coord.advance_shipped(A, chron(1), Epoch::new(9), heads[4]), Err(CoordError::EpochMismatch { .. })));
+        let ahead = Position { lsn: Lsn::new(6), hash: heads[5].hash };
+        assert!(matches!(coord.advance_shipped(A, chron(1), e, ahead), Err(CoordError::ShippedAhead { .. })));
+        let bad_head = Position { lsn: Lsn::new(5), hash: heads[4].hash };
+        assert!(matches!(coord.advance_shipped(A, chron(1), e, bad_head), Err(CoordError::ShippedConflict { .. })));
+        let bad_anchor = Position { lsn: Lsn::new(3), hash: heads[4].hash };
+        assert!(matches!(coord.advance_shipped(A, chron(1), e, bad_anchor), Err(CoordError::ShippedConflict { .. })));
+        assert!(matches!(coord.advance_shipped(A, chron(9), e, heads[4]), Err(CoordError::UnknownChronicle(_))));
+        assert_eq!(coord.shipped(chron(1)).unwrap(), heads[3]);
+        // Transfer keeps it; the old holder can no longer move it; it survives a reopen.
+        coord.transfer(chron(1), B).unwrap();
+        assert_eq!(coord.shipped(chron(1)).unwrap(), heads[3]);
+        assert!(matches!(coord.advance_shipped(A, chron(1), e, heads[5]), Err(CoordError::NotHolder { .. })));
+        assert_eq!(coord.advance_shipped(B, chron(1), Epoch::new(2), heads[5]).unwrap(), heads[5]);
+        drop(coord);
+        let coord = Coordinator::open(&path).unwrap();
+        assert_eq!(coord.shipped(chron(1)).unwrap(), heads[5]);
     }
 
     // ── the reviewer interleavings (v0.4 §12 P0) ────────────────────
@@ -790,6 +938,8 @@ mod tests {
             CoordError::EpochMismatch { record_epoch: Epoch::FIRST, current: Epoch::new(2) },
             CoordError::HeadMismatch { prev: h, anchored: HashVal::GENESIS },
             CoordError::LsnNotNext { lsn: Lsn::new(5), expected: Lsn::new(1) },
+            CoordError::ShippedAhead { to: Lsn::new(5), head: Lsn::new(4) },
+            CoordError::ShippedConflict { lsn: Lsn::new(4) },
         ];
         for e in &refusals {
             assert!(!e.outcome_unknown(), "{e:?} is a refusal");
@@ -831,7 +981,7 @@ pub(crate) mod conformance {
     use super::*;
     use proptest::prelude::*;
     use taso_core::envelope::Stream;
-    use taso_core::model::{AppendError as ModelError, Coordinator as Model, WardenModel};
+    use taso_core::model::{AppendError as ModelError, Anchor, Coordinator as Model, ShipError, WardenModel};
     use taso_core::record::Payload;
 
     const IDS: [WardenId; 2] = [WardenId::new(1), WardenId::new(2)];
@@ -848,6 +998,11 @@ pub(crate) mod conformance {
         /// Drop the coordinator and open it again (reopen the file,
         /// restart the server, reconnect).
         Reopen,
+        /// Warden `i` reports a shipped position under its own epoch:
+        /// `pick` 0..=7 an accepted one (or genesis), 8..=9 the head's lsn
+        /// with another hash, 10 one past the head, 11 the current
+        /// anchor's lsn with another hash.
+        Ship(usize, u8),
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -856,6 +1011,7 @@ pub(crate) mod conformance {
             1 => (0..2usize).prop_map(Op::Transfer),
             2 => (0..2usize).prop_map(Op::Resume),
             1 => Just(Op::Reopen),
+            3 => (0..2usize, 0..12u8).prop_map(|(i, p)| Op::Ship(i, p)),
         ]
     }
 
@@ -879,6 +1035,48 @@ pub(crate) mod conformance {
                 CoordError::HeadMismatch { prev: p2, anchored: a2 },
             ) => p1 == p2 && a1 == a2,
             _ => false,
+        }
+    }
+
+    fn same_ship_refusal(m: &ShipError, r: &CoordError) -> bool {
+        match (m, r) {
+            (ShipError::NotHolder { warden: w1, holder: h1 }, CoordError::NotHolder { warden: w2, holder: h2 }) => {
+                w1 == w2 && h1 == h2
+            }
+            (
+                ShipError::EpochMismatch { epoch: e1, current: c1 },
+                CoordError::EpochMismatch { record_epoch: e2, current: c2 },
+            ) => e1 == e2 && c1 == c2,
+            (ShipError::Ahead { to: t1, head: h1 }, CoordError::ShippedAhead { to: t2, head: h2 }) => t1 == t2 && h1 == h2,
+            (ShipError::Conflict { lsn: l1 }, CoordError::ShippedConflict { lsn: l2 }) => l1 == l2,
+            _ => false,
+        }
+    }
+
+    fn pos(a: Anchor) -> Position {
+        Position { lsn: a.lsn, hash: a.hash }
+    }
+
+    fn other(h: HashVal) -> HashVal {
+        let mut b = *h.as_bytes();
+        b[0] ^= 0xFF;
+        HashVal::from_bytes(b)
+    }
+
+    /// The position Warden reports for `pick` (see [`Op::Ship`]).
+    fn report(model: &Model, pick: u8) -> Anchor {
+        let head = model.head();
+        match pick {
+            0..=7 => {
+                let log = model.log();
+                match (pick as usize) % (log.len() + 1) {
+                    0 => Anchor::GENESIS,
+                    k => Anchor { lsn: log[k - 1].envelope.lsn, hash: log[k - 1].envelope.hash },
+                }
+            }
+            8 | 9 => Anchor { lsn: head.lsn, hash: other(head.hash) },
+            10 => Anchor { lsn: head.lsn.next(), hash: head.hash },
+            _ => Anchor { lsn: model.shipped().lsn, hash: other(model.shipped().hash) },
         }
     }
 
@@ -929,6 +1127,20 @@ pub(crate) mod conformance {
                     drop(coord.take());
                     coord = Some(open());
                 }
+                Op::Ship(i, pick) => {
+                    let to = report(&model, pick);
+                    let epoch = wardens[i].epoch();
+                    let m = model.advance_shipped(IDS[i], epoch, to);
+                    let r = coord.as_ref().unwrap().advance_shipped(IDS[i], c, epoch, pos(to));
+                    match (m, r) {
+                        (Ok(am), Ok(ar)) => prop_assert_eq!(pos(am), ar),
+                        (Err(em), Err(er)) => {
+                            prop_assert!(!er.outcome_unknown(), "a failure, not a decision: {:?}", er);
+                            prop_assert!(same_ship_refusal(&em, &er), "model {:?} vs coordinator {:?}", em, er);
+                        }
+                        (m, r) => prop_assert!(false, "model {:?} vs coordinator {:?}", m, r),
+                    }
+                }
             }
             let co = coord.as_deref().unwrap();
             let (mo, ro) = (model.ownership(), co.ownership(c).unwrap());
@@ -936,6 +1148,7 @@ pub(crate) mod conformance {
             prop_assert_eq!(mo.epoch, ro.epoch);
             prop_assert_eq!(mo.holder, ro.holder);
             prop_assert_eq!(mo.sealed_prefix, ro.sealed_prefix);
+            prop_assert_eq!(pos(model.shipped()), co.shipped(c).unwrap());
         }
         Ok(())
     }
