@@ -136,7 +136,7 @@ run_warden() {   # $1 = run number
     python3 - "$cfg" "$r" <<PY
 import json, sys
 cfg, r = sys.argv[1], sys.argv[2]
-args = ["/usr/bin/taso-sim"] + "${SIM_ARGS[*]}".split() + ["--samples", "/work/samples", "--stats", "/work/sim-stats.json"]
+args = ["/usr/bin/taso-sim"] + "${SIM_ARGS[*]}".split() + ["--samples", "/work/samples", "--turn-samples", "/work/turn-samples", "--stats", "/work/sim-stats.json"]
 json.dump({
     "warden": 1,
     "coordinator": json.loads('$COORD_JSON'),
@@ -163,6 +163,7 @@ PY
     for ds in $(zfs list -H -o name -d 1 "$root" | tail -n +2); do
         local m; m=$(mount_of "$ds")
         [ -f "$m/samples" ] && cat "$m/samples" >> "$OUT/warden.samples"
+        [ -f "$m/turn-samples" ] && cat "$m/turn-samples" >> "$OUT/turn.samples"
         [ -f "$m/sim-stats.json" ] && cp "$m/sim-stats.json" "$OUT/warden-$r-${ds##*/}.json"
     done
     # One line per Vessel; ok means agent ok and every Seal published.
@@ -173,6 +174,7 @@ PY
 
 : > "$OUT/bare.samples"
 : > "$OUT/warden.samples"
+: > "$OUT/turn.samples"
 for r in $(seq 1 "$RUNS"); do
     run_bare "$r"
     run_warden "$r"
@@ -190,10 +192,15 @@ def q(v, x):
 def load(name):
     return [int(l) / 1000 for l in open(os.path.join(out, name)) if l.strip()]
 
-bare, warden = load("bare.samples"), load("warden.samples")
-seals = []
+bare, warden, turn = load("bare.samples"), load("warden.samples"), load("turn.samples")
+seals, publish = [], []
 for f in glob.glob(os.path.join(out, "warden-*.spans")):
-    seals += [int(l.split()[1]) / 1000 for l in open(f) if l.startswith("seal.total ")]
+    for l in open(f):
+        name, us = l.split()
+        if name == "seal.total":
+            seals.append(int(us) / 1000)
+        elif name == "publish.total":
+            publish.append(int(us) / 1000)
 failed = sigbus = 0
 for f in glob.glob(os.path.join(out, "warden-*.out")):
     lines = [l for l in open(f) if l.startswith("gate-p1-")]
@@ -207,8 +214,9 @@ print(f"P1 gate, agent taso-sim (stand-in for Hermes state.db): {runs} runs x p{
       f"{txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}, batched={batched}")
 print(f"commits: bare {len(bare)}, warden {len(warden)} (expected {expected} each)")
 print(f"{'':10} {'p50 ms':>9} {'p95 ms':>9} {'p99 ms':>9} {'max ms':>9}")
-for name, v in [("bare", bare), ("warden", warden), ("seal", seals)]:
+for name, v in [("bare", bare), ("warden", warden), ("seal", seals), ("publish", publish), ("turn pause", turn)]:
     print(f"{name:10} {q(v, .5):9.3f} {q(v, .95):9.3f} {q(v, .99):9.3f} {q(v, 1):9.3f}")
+print("(seal: snapshot + record; publish: ship + anchor; turn pause: the agent's TurnEnd round trip, both and the socket)")
 ratio = q(warden, .95) / q(bare, .95) if bare and warden else float("nan")
 ok1 = sigbus == 0 and failed == 0
 ok2 = ratio <= 1.5 and len(warden) == expected
