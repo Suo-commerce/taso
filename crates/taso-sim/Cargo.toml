@@ -1,0 +1,15 @@
+[package]
+name = "taso-sim"
+description = "Taso agent stand-in: SQLite turns over the Field protocol, with write-latency stats (the P1 gate's workload until the Hermes image)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+taso-field = { path = "../taso-field" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+taso-warden = { path = "../taso-warden" }

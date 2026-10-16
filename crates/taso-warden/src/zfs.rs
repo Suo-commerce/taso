@@ -658,6 +658,16 @@ impl<R: Runner> Zfs<R> {
         self.created(dataset)
     }
 
+    /// Mount `dataset` if it is not mounted (a received one is not:
+    /// `zfs receive -u`).  Mounting a mounted dataset is not an error.
+    pub fn ensure_mounted(&self, dataset: &Dataset) -> Result<(), ZfsError> {
+        match self.run(vec!["mount".to_string(), dataset.to_string()]) {
+            Ok(_) => Ok(()),
+            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("already mounted") => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Fork: clone the Seal snapshot `source@taso-seal-<seal>` into
     /// `target`, setting `taso:parent=<seal_hash>` in the same command.
     ///
@@ -1149,6 +1159,20 @@ mod tests {
         assert_eq!(calls[1], list);
         assert_eq!(info.mountpoint, Some(PathBuf::from("/tasotest/vessel")));
         assert_eq!((info.origin, info.parent), (None, None));
+    }
+
+    #[test]
+    fn ensure_mounted_mounts_and_accepts_mounted() {
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(true, "", "")
+                .reply(false, "", "cannot mount 'tasotest/vessel': filesystem already mounted\n")
+                .reply(false, "", "cannot mount 'tasotest/vessel': no such pool\n"),
+        );
+        zfs.ensure_mounted(&ds()).unwrap();
+        zfs.ensure_mounted(&ds()).unwrap();
+        assert!(matches!(zfs.ensure_mounted(&ds()), Err(ZfsError::Exit { .. })));
+        assert_eq!(zfs.runner.calls.borrow()[0], strs(&["mount", "tasotest/vessel"]));
     }
 
     #[test]

@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# P1 exit gate (v1.0 §1): Phase 1 runtime, runc + ZFS, at p64.
+#
+#   1. 0 SIGBUS over $RUNS runs
+#   2. p95 write latency <= 1.5 x bare (same disk, same concurrency, no Warden)
+#   3. Seal p95 < 50 ms at p64
+#
+# The gate names Hermes's state.db.  Until the Hermes image exists the agent
+# is taso-sim: SQLite in WAL mode on the Vessel's dataset, $TXNS transactions
+# of $ROWS rows per turn, a transcript entry and a quiescent TurnEnd per turn
+# (the Warden seals and publishes there).  The result says which agent ran.
+#
+# What it does, for each run:
+#   bare    $P taso-sim --bare at once, each on its own ZFS dataset, as root
+#           on the host: the same writes with no Warden, no container.
+#   warden  taso-wardend with $P Vessels (fresh subjects each run), each
+#           running taso-sim under runc (+ the Landlock shim if LANDLOCK=1);
+#           every Seal is published to a local store.
+# Then it pools every commit latency (bare and warden separately) and every
+# seal.total sample across runs, and prints the three gate lines.
+#
+# A SIGBUS kills the agent; the daemon reports that Vessel's agent as
+# failed.  Every failed agent is counted and its stderr kept, so a failure
+# for another reason is visible, not hidden in the SIGBUS count.
+#
+# Usage (root, on the gate machine; needs runc, ZFS, cargo):
+#   TASO_ZFS_DATASET=tank/taso scripts/gate-p1.sh
+#
+# Environment:
+#   RUNS (10)  P (64)  TURNS (20)  TXNS (4)  ROWS (8)  ROW_BYTES (512)
+#   SYNC (normal)       SQLite synchronous= for both bare and warden
+#   LANDLOCK (1)        run the agent through taso-landlock
+#   BATCHED (1)         batched Seal snapshots
+#   OUT (/root/taso-gate-p1-<time>)   results directory (kept)
+#   KEEP (0)            keep the datasets and work dir for inspection
+
+set -euo pipefail
+
+: "${TASO_ZFS_DATASET:?set TASO_ZFS_DATASET to a dataset the gate may use}"
+RUNS=${RUNS:-10}
+P=${P:-64}
+TURNS=${TURNS:-20}
+TXNS=${TXNS:-4}
+ROWS=${ROWS:-8}
+ROW_BYTES=${ROW_BYTES:-512}
+SYNC=${SYNC:-normal}
+LANDLOCK=${LANDLOCK:-1}
+BATCHED=${BATCHED:-1}
+KEEP=${KEEP:-0}
+OUT=${OUT:-/root/taso-gate-p1-$(date +%Y%m%d-%H%M%S)}
+
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
+for t in zfs runc ldd python3 cargo; do
+    command -v "$t" >/dev/null || { echo "$t is missing" >&2; exit 2; }
+done
+
+cd "$(dirname "$0")/.."
+echo "== building (release)"
+cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock
+BIN=$PWD/target/release
+
+mkdir -p "$OUT"
+WORK=$(mktemp -d /var/tmp/taso-p1.XXXXXX)
+chmod 755 "$WORK"
+BASE="$TASO_ZFS_DATASET/gate-p1-$$"
+zfs create "$BASE"
+cleanup() {
+    if [ "$KEEP" = 1 ]; then
+        echo "kept: dataset $BASE, work dir $WORK"
+    else
+        zfs destroy -R "$BASE" 2>/dev/null || true
+        rm -rf "$WORK"
+    fi
+}
+trap cleanup EXIT
+
+SIM_ARGS=(--turns "$TURNS" --txns "$TXNS" --rows "$ROWS" --row-bytes "$ROW_BYTES" --synchronous "$SYNC")
+
+# ── rootfs: taso-sim, taso-landlock and their libraries ───────────────
+ROOTFS=$WORK/rootfs
+copy_with_libs() {   # $1 = binary on the host, $2 = path in the rootfs
+    install -D -m 755 "$1" "$ROOTFS$2"
+    ldd "$1" | grep -o '/[^ ]*' | while read -r lib; do
+        install -D -m 755 "$lib" "$ROOTFS$lib"
+    done
+}
+copy_with_libs "$BIN/taso-sim" /usr/bin/taso-sim
+copy_with_libs "$BIN/taso-landlock" /usr/lib/taso/landlock
+mkdir -p "$ROOTFS"/{proc,dev,sys,tmp,work,run/taso}
+: > "$ROOTFS/run/taso/field.sock"
+
+mount_of() { zfs get -H -o value mountpoint "$1"; }
+
+# ── bare ──────────────────────────────────────────────────────────────
+run_bare() {   # $1 = run number
+    local r=$1 ds pids=()
+    ds="$BASE/bare-$r"
+    zfs create "$ds"
+    local m; m=$(mount_of "$ds")
+    for i in $(seq 1 "$P"); do
+        "$BIN/taso-sim" --bare "${SIM_ARGS[@]}" --db "$m/v$i.db" \
+            --stats "$m/v$i.json" --samples "$m/v$i.samples" >/dev/null 2>"$OUT/bare-$r-v$i.err" &
+        pids+=($!)
+    done
+    local failed=0
+    for p in "${pids[@]}"; do wait "$p" || failed=$((failed + 1)); done
+    cat "$m"/v*.samples >> "$OUT/bare.samples"
+    echo "bare run $r: $failed failed"
+    zfs destroy -r "$ds"
+}
+
+# ── warden ────────────────────────────────────────────────────────────
+run_warden() {   # $1 = run number
+    local r=$1 root="$BASE/w-$r" cfg="$WORK/w-$r.json"
+    zfs create "$root"
+    python3 - "$cfg" "$r" <<PY
+import json, sys
+cfg, r = sys.argv[1], sys.argv[2]
+args = ["/usr/bin/taso-sim"] + "${SIM_ARGS[*]}".split() + ["--samples", "/work/samples", "--stats", "/work/sim-stats.json"]
+json.dump({
+    "warden": 1,
+    "coordinator": {"local": "$WORK/coord.redb"},
+    "root": "$root",
+    "state_dir": "$WORK/w-$r/state",
+    "store": "$WORK/store",
+    "run_dir": "$WORK/w-$r/run",
+    "batched_snapshots": "$BATCHED" == "1",
+    "runtime": {
+        "rootfs": "$ROOTFS",
+        "host_uid_base": 200000,
+        "landlock_shim": "/usr/lib/taso/landlock" if "$LANDLOCK" == "1" else None,
+        "args": args,
+        "memory_bytes": 268435456,
+        "pids": 64,
+    },
+    "vessels": [{"namespace": "70" * 16, "subject": f"gate-p1-r{r}-v{i}"} for i in range($P)],
+}, open(cfg, "w"), indent=1)
+PY
+    local rc=0
+    TASO_TIMING_RAW="$OUT/warden-$r.spans" "$BIN/taso-wardend" "$cfg" \
+        >"$OUT/warden-$r.out" 2>"$OUT/warden-$r.err" || rc=$?
+    for ds in $(zfs list -H -o name -d 1 "$root" | tail -n +2); do
+        local m; m=$(mount_of "$ds")
+        [ -f "$m/samples" ] && cat "$m/samples" >> "$OUT/warden.samples"
+        [ -f "$m/sim-stats.json" ] && cp "$m/sim-stats.json" "$OUT/warden-$r-${ds##*/}.json"
+    done
+    # One line per Vessel; ok means agent ok and every Seal published.
+    local ok; ok=$(grep -c " 0 publish failures, agent ok$" "$OUT/warden-$r.out" || true)
+    echo "warden run $r: exit $rc, $ok of $P Vessels ok"
+    grep -v " 0 publish failures, agent ok$" "$OUT/warden-$r.out" | grep -E "^gate-p1-" | head -5 || true
+}
+
+: > "$OUT/bare.samples"
+: > "$OUT/warden.samples"
+for r in $(seq 1 "$RUNS"); do
+    run_bare "$r"
+    run_warden "$r"
+done
+
+# ── the gate ──────────────────────────────────────────────────────────
+python3 - "$OUT" "$RUNS" "$P" "$TURNS" "$TXNS" "$ROWS" "$ROW_BYTES" "$SYNC" "$LANDLOCK" "$BATCHED" <<'PY' | tee "$OUT/summary.txt"
+import glob, json, os, re, sys
+out, runs, p, turns, txns, rows, row_bytes, sync, landlock, batched = sys.argv[1:]
+
+def q(v, x):
+    v = sorted(v)
+    return v[min(len(v) - 1, max(0, int(-(-len(v) * x // 1)) - 1))] if v else float("nan")
+
+def load(name):
+    return [int(l) / 1000 for l in open(os.path.join(out, name)) if l.strip()]
+
+bare, warden = load("bare.samples"), load("warden.samples")
+seals = []
+for f in glob.glob(os.path.join(out, "warden-*.spans")):
+    seals += [int(l.split()[1]) / 1000 for l in open(f) if l.startswith("seal.total ")]
+failed = sigbus = 0
+for f in glob.glob(os.path.join(out, "warden-*.out")):
+    lines = [l for l in open(f) if l.startswith("gate-p1-")]
+    failed += int(p) - sum(1 for l in lines if l.rstrip().endswith(" 0 publish failures, agent ok"))
+for f in glob.glob(os.path.join(out, "warden-*.err")) + glob.glob(os.path.join(out, "bare-*.err")):
+    text = open(f, errors="replace").read()
+    sigbus += len(re.findall(r"SIGBUS|signal: 7|Bus error", text))
+expected = int(runs) * int(p) * int(turns) * int(txns)
+
+print(f"P1 gate, agent taso-sim (stand-in for Hermes state.db): {runs} runs x p{p}, {turns} turns of "
+      f"{txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}, batched={batched}")
+print(f"commits: bare {len(bare)}, warden {len(warden)} (expected {expected} each)")
+print(f"{'':10} {'p50 ms':>9} {'p95 ms':>9} {'p99 ms':>9} {'max ms':>9}")
+for name, v in [("bare", bare), ("warden", warden), ("seal", seals)]:
+    print(f"{name:10} {q(v, .5):9.3f} {q(v, .95):9.3f} {q(v, .99):9.3f} {q(v, 1):9.3f}")
+ratio = q(warden, .95) / q(bare, .95) if bare and warden else float("nan")
+ok1 = sigbus == 0 and failed == 0
+ok2 = ratio <= 1.5 and len(warden) == expected
+ok3 = q(seals, .95) < 50
+print(f"1. SIGBUS: {sigbus} (failed agents: {failed}) -> {'PASS' if ok1 else 'FAIL'}")
+print(f"2. write p95 warden/bare: {ratio:.2f} (<= 1.5) -> {'PASS' if ok2 else 'FAIL'}")
+print(f"3. Seal p95: {q(seals, .95):.1f} ms (< 50) -> {'PASS' if ok3 else 'FAIL'}")
+PY
+echo "results in $OUT"

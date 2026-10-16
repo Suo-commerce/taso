@@ -12,6 +12,7 @@
 pub mod chronicle;
 pub mod coordinator;
 pub mod coordsrv;
+pub mod daemon;
 pub mod effects;
 pub mod field;
 pub mod pack;
