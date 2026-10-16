@@ -553,6 +553,16 @@ impl<L: Layers> Chronicle<L> {
         &self.segment
     }
 
+    /// The coordinator this Chronicle commits through.
+    pub(crate) fn coord(&self) -> &Arc<dyn Coord> {
+        &self.coord
+    }
+
+    /// The Warden holding it.
+    pub(crate) fn warden(&self) -> WardenId {
+        self.warden
+    }
+
     /// Every local segment, oldest first; the last is the one written.
     pub fn segments(&self) -> Vec<&Segment> {
         self.closed.iter().chain(std::iter::once(&self.segment)).collect()

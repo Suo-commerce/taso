@@ -40,6 +40,22 @@
 //! Succession record, if present, is the last record.  A Vessel with a
 //! successor opens closed: readable, never writable.
 //!
+//! # Publishing a Seal
+//!
+//! A Seal is something rebirth can rebuild only once it is off the node
+//! and anchored.  [`Vessel::publish_seal`] does it in an order that a
+//! retry of the same call finishes from any crash:
+//!
+//! 1. ship the Seal's pack (its log section and `fs` stream);
+//! 2. append the `FsShipped` record that names the section;
+//! 3. ship the log up to the tail, the record included;
+//! 4. advance the coordinator's shipped anchor to the tail.
+//!
+//! A crash after 1 leaves the section unnamed: nothing uses it, and the
+//! retry ships it again under the same key.  A crash after 2 or 3 leaves
+//! the record local or shipped but not anchored: the retry finds the
+//! section named, and only ships the log and advances.
+//!
 //! Normative references: v0.4 §3 (Lineage), §7.4 (barriers), §8; v1.0 §3.
 
 use std::collections::BTreeMap;
@@ -57,8 +73,11 @@ use taso_core::record::{
 
 use crate::chronicle::{Chronicle, ChronicleError, LayerError, Layers, Recovery, Sealed, ZfsLayers};
 use crate::coordinator::{Coord, CoordError};
+use crate::pack::{PackError, Packs};
 use crate::segment::{Frame, Position};
-use crate::zfs::{Dataset, DatasetInfo, Runner, Zfs};
+use crate::ship::{ObjectStore, Sender};
+use crate::zfs::{Dataset, DatasetInfo, Runner, Snapshot, Zfs};
+use taso_core::record::FsShippedRecord;
 
 // ── Pool ────────────────────────────────────────────────────────────
 
@@ -118,6 +137,8 @@ pub enum VesselError {
     Chronicle(ChronicleError),
     /// The coordinator failed.
     Coord(CoordError),
+    /// Shipping to the store failed.
+    Pack(PackError),
     /// The pool failed.
     Pool(LayerError),
     /// A Taso record could not be decoded.
@@ -171,8 +192,11 @@ pub enum VesselError {
     EmptyAuthority,
     /// A Vessel cannot succeed itself.
     SelfSuccession,
-    /// Lineage and Succession records are written by this module only.
+    /// Lineage, Succession, Gap and FsShipped records are written by the
+    /// Warden only.
     ReservedPayload,
+    /// The snapshot is not a Seal layer of this Vessel.
+    NotThisSeal(String),
 }
 
 impl fmt::Display for VesselError {
@@ -180,6 +204,7 @@ impl fmt::Display for VesselError {
         match self {
             Self::Chronicle(e) => write!(f, "chronicle: {e}"),
             Self::Coord(e) => write!(f, "coordinator: {e}"),
+            Self::Pack(e) => write!(f, "pack: {e}"),
             Self::Pool(e) => write!(f, "pool: {e}"),
             Self::Decode { lsn, error } => write!(f, "record at lsn {}: {error}", lsn.get()),
             Self::NotAVessel(why) => write!(f, "not a Vessel chronicle: {why}"),
@@ -204,7 +229,8 @@ impl fmt::Display for VesselError {
             Self::CrossNamespace => write!(f, "succession across namespaces was not allowed"),
             Self::EmptyAuthority => write!(f, "succession needs an actor and a reason"),
             Self::SelfSuccession => write!(f, "a vessel cannot succeed itself"),
-            Self::ReservedPayload => write!(f, "Lineage and Succession records are reserved"),
+            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap and FsShipped records are reserved"),
+            Self::NotThisSeal(why) => write!(f, "not a Seal of this vessel: {why}"),
         }
     }
 }
@@ -541,6 +567,16 @@ type Partial<L> = (Option<Vessel<L>>, Vessel<L>);
 
 // ── Vessel ──────────────────────────────────────────────────────────
 
+/// What [`Vessel::publish_seal`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealPublished {
+    /// The `FsShipped` record it appended; `None` if an earlier call had
+    /// (a retry after a crash).
+    pub record: Option<FsShippedRecord>,
+    /// The coordinator's shipped anchor afterwards: the tail.
+    pub anchor: Position,
+}
+
 /// One open Vessel.
 pub struct Vessel<L: Layers> {
     id: ChronicleId,
@@ -591,11 +627,11 @@ impl<L: Layers> Vessel<L> {
         &self.chronicle
     }
 
-    /// Append a record.  Lineage and Succession records are refused: only
-    /// this module writes them.
+    /// Append a record.  Lineage, Succession, Gap and FsShipped records
+    /// are refused: only the Warden writes them, each at its own step.
     pub fn append(&mut self, stream: Stream, payload: Payload) -> Result<ChronicleHead, VesselError> {
         self.writable()?;
-        if matches!(payload, Payload::Lineage(_) | Payload::Succession(_)) {
+        if matches!(payload, Payload::Lineage(_) | Payload::Succession(_) | Payload::Gap(_) | Payload::FsShipped(_)) {
             return Err(VesselError::ReservedPayload);
         }
         Ok(self.chronicle.append(stream, payload)?)
@@ -625,6 +661,49 @@ impl<L: Layers> Vessel<L> {
     ) -> Result<Sealed, VesselError> {
         self.writable()?;
         Ok(self.chronicle.seal_checked(cut, verdict, ledger_pos, turn, check)?)
+    }
+
+    /// Publish the Seal whose layer is `snapshot` (see the module docs):
+    /// its pack, the `FsShipped` record naming its section, the log up to
+    /// the tail, and the coordinator's shipped anchor there.  `origin` is
+    /// the parent's Seal snapshot, for a forked or succeeded Vessel's first
+    /// Seal only.  Calling it again for the same Seal finishes an
+    /// interrupted publish; on success the Seal is anchored.
+    pub fn publish_seal<S: ObjectStore, X: Sender>(
+        &mut self,
+        packs: &Packs<S, X>,
+        snapshot: &Snapshot,
+        origin: Option<&Snapshot>,
+    ) -> Result<SealPublished, VesselError> {
+        self.writable()?;
+        if snapshot.dataset != self.dataset {
+            return Err(VesselError::NotThisSeal(format!("{} is not this Vessel's dataset", snapshot.dataset)));
+        }
+        let hash = snapshot.seal_hash.ok_or_else(|| VesselError::NotThisSeal("the snapshot is not bound".into()))?;
+        let is_seal = self.frames()?.iter().any(|f| {
+            f.envelope.lsn == snapshot.seal
+                && f.envelope.hash == hash
+                && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_)))
+        });
+        if !is_seal {
+            return Err(VesselError::NotThisSeal(format!("lsn {} is not a Seal record with this hash", snapshot.seal.get())));
+        }
+        let shipped = packs.ship_seal(&self.chronicle.segments(), snapshot, origin).map_err(VesselError::Pack)?;
+        let record = match shipped {
+            Some(s) => {
+                self.chronicle.append(Stream::Ctl, Payload::FsShipped(s.record.clone()))?;
+                Some(s.record)
+            }
+            None => None,
+        };
+        let tail = self.chronicle.tail();
+        packs.ship_log(&self.chronicle.segments(), tail).map_err(VesselError::Pack)?;
+        let anchor = self
+            .chronicle
+            .coord()
+            .advance_shipped(self.chronicle.warden(), self.id, self.chronicle.epoch(), tail)
+            .map_err(VesselError::Coord)?;
+        Ok(SealPublished { record, anchor })
     }
 
     fn writable(&self) -> Result<(), VesselError> {
@@ -930,6 +1009,288 @@ pub(crate) mod tests {
         let (mut v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
         let l = v.lineage().clone();
         assert!(matches!(v.append(Stream::Ctl, Payload::Lineage(l)), Err(VesselError::ReservedPayload)));
+    }
+
+    // ── publishing a Seal ───────────────────────────────────────────
+
+    mod publish {
+        use super::*;
+        use crate::pack::{FsBase, Packs, ShippedFs};
+        use crate::ship::{ByteStream, LocalStore, ObjectStore, Sender};
+        use crate::zfs::Snapshot;
+        use std::io::{self, Read};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use taso_core::envelope::{Envelope, Epoch};
+        use taso_core::model::Ownership;
+        use taso_core::record::{GapRecord, StreamBase};
+
+        /// The coordinator, with `advance_shipped` failing on demand.
+        struct Flaky {
+            inner: Coordinator,
+            fail_advance: AtomicBool,
+        }
+
+        impl Coord for Flaky {
+            fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+                self.inner.register(c, h)
+            }
+            fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
+                self.inner.append(w, e)
+            }
+            fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+                self.inner.transfer(c, h)
+            }
+            fn ownership(&self, c: ChronicleId) -> Result<Ownership, CoordError> {
+                self.inner.ownership(c)
+            }
+            fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
+                self.inner.head(c)
+            }
+            fn advance_shipped(&self, w: WardenId, c: ChronicleId, e: Epoch, to: Position) -> Result<Position, CoordError> {
+                if self.fail_advance.load(Ordering::Relaxed) {
+                    return Err(CoordError::Unavailable(io::Error::other("coordinator down")));
+                }
+                self.inner.advance_shipped(w, c, e, to)
+            }
+            fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+                self.inner.shipped(c)
+            }
+        }
+
+        /// A store whose puts fail on demand.
+        struct FlakyStore {
+            inner: LocalStore,
+            fail_put: Arc<AtomicBool>,
+        }
+
+        impl ObjectStore for FlakyStore {
+            fn put(&self, key: &str, data: &mut dyn Read) -> io::Result<u64> {
+                if self.fail_put.load(Ordering::Relaxed) {
+                    return Err(io::Error::other("store down"));
+                }
+                self.inner.put(key, data)
+            }
+            fn get(&self, key: &str) -> io::Result<Option<ByteStream>> {
+                self.inner.get(key)
+            }
+            fn exists(&self, key: &str) -> io::Result<bool> {
+                self.inner.exists(key)
+            }
+            fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+                self.inner.list(prefix)
+            }
+        }
+
+        /// Streams that say what they are.
+        struct Fake;
+        impl Sender for Fake {
+            fn send(&self, d: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream> {
+                Ok(Box::new(io::Cursor::new(stream(d, from, to))))
+            }
+        }
+
+        fn stream(d: &Dataset, from: Option<&str>, to: Lsn) -> Vec<u8> {
+            format!("{d} from {from:?} to {} ", to.get()).repeat(1000).into_bytes()
+        }
+
+        struct P {
+            _tmp: tempfile::TempDir,
+            host: Host<FakePool>,
+            coord: Arc<Flaky>,
+            fail_put: Arc<AtomicBool>,
+            packs: Packs<FlakyStore, Fake>,
+        }
+
+        fn penv(id: ChronicleId) -> P {
+            let tmp = tempfile::tempdir().unwrap();
+            let coord = Arc::new(Flaky {
+                inner: Coordinator::open(tmp.path().join("coord.redb")).unwrap(),
+                fail_advance: AtomicBool::new(false),
+            });
+            let host = Host {
+                coord: coord.clone(),
+                pool: FakePool::default(),
+                root: Dataset::new("tank/vessels").unwrap(),
+                state_dir: tmp.path().join("state"),
+                warden: WardenId::new(1),
+            };
+            let fail_put = Arc::new(AtomicBool::new(false));
+            let store = FlakyStore { inner: LocalStore::new(tmp.path().join("store")), fail_put: fail_put.clone() };
+            let packs = Packs::new(store, Fake, "vessels", id).unwrap();
+            P { _tmp: tmp, host, coord, fail_put, packs }
+        }
+
+        fn snap<L: Layers>(v: &Vessel<L>, seal: Position) -> Snapshot {
+            Snapshot { dataset: v.dataset().clone(), seal: seal.lsn, createtxg: 1, guid: 1000 + seal.lsn.get(), seal_hash: Some(seal.hash) }
+        }
+
+        fn sealed(p: &P) -> (Vessel<FakeLayers>, Position) {
+            let (mut v, _) = p.host.ensure(ns(1), b"user-1").unwrap();
+            v.append(Stream::Fs, raw(1)).unwrap();
+            let s = seal(&mut v);
+            (v, s)
+        }
+
+        /// The Seal packs that hold an fs section for `seal`.
+        fn seal_packs(p: &P, seal: Position) -> usize {
+            let dir = format!("vessels/{}/pack", hex(&p.packs_id()));
+            p.packs_store().list(&dir).unwrap().iter().filter(|k| k.ends_with(&format!("-{:020}", seal.lsn.get()))).count()
+        }
+
+        impl P {
+            fn packs_id(&self) -> ChronicleId {
+                vessel_id(ns(1), b"user-1")
+            }
+            fn packs_store(&self) -> LocalStore {
+                LocalStore::new(self._tmp.path().join("store"))
+            }
+            fn read(&self, s: &ShippedFs) -> Vec<u8> {
+                let mut out = Vec::new();
+                self.packs.open_fs(s).unwrap().unwrap().read_to_end(&mut out).unwrap();
+                out
+            }
+        }
+
+        /// The end state every publish must reach: the anchor is the tail,
+        /// the anchored chain is the local log, and every Seal is named by
+        /// exactly one pack.
+        fn assert_published<L: Layers>(p: &P, v: &Vessel<L>, seals: &[Position]) {
+            let anchor = p.coord.shipped(v.id()).unwrap();
+            assert_eq!(anchor, v.tail());
+            let c = p.packs.chain(Some(anchor)).unwrap();
+            assert_eq!(c.frames, v.chronicle().frames().unwrap());
+            assert_eq!(c.seals.iter().map(|s| s.fs.to).collect::<Vec<_>>(), seals);
+            for s in seals {
+                assert_eq!(seal_packs(p, *s), 1, "one pack per Seal");
+            }
+        }
+
+        #[test]
+        fn publish_ships_names_and_anchors() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (mut v, s1) = sealed(&p);
+            let r = v.publish_seal(&p.packs, &snap(&v, s1), None).unwrap();
+            let rec = r.record.unwrap();
+            assert_eq!((rec.seal, rec.seal_hash, rec.base.clone()), (s1.lsn, s1.hash, StreamBase::Full));
+            assert_eq!(r.anchor, v.tail());
+            assert_published(&p, &v, &[s1]);
+            let c = p.packs.chain(Some(r.anchor)).unwrap();
+            assert_eq!(p.read(&c.seals[0]), stream(v.dataset(), None, s1.lsn));
+            // A second Seal is incremental from the first.
+            v.append(Stream::Fs, raw(2)).unwrap();
+            let s2 = seal(&mut v);
+            let r2 = v.publish_seal(&p.packs, &snap(&v, s2), None).unwrap();
+            assert_eq!(r2.record.unwrap().base, StreamBase::Seal { lsn: s1.lsn, hash: s1.hash });
+            assert_published(&p, &v, &[s1, s2]);
+            let c = p.packs.chain(Some(r2.anchor)).unwrap();
+            assert_eq!(p.read(&c.seals[1]), stream(v.dataset(), Some(v.dataset().seal_snapshot(s1.lsn).as_str()), s2.lsn));
+            // Again: nothing new.
+            let tail = v.tail();
+            let again = v.publish_seal(&p.packs, &snap(&v, s2), None).unwrap();
+            assert_eq!((again.record, again.anchor, v.tail()), (None, tail, tail));
+        }
+
+        /// Crash after the Seal pack's put, before its record.
+        #[test]
+        fn a_retry_after_the_put_names_the_same_pack() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (mut v, s1) = sealed(&p);
+            let first = p.packs.ship_seal(&v.chronicle().segments(), &snap(&v, s1), None).unwrap().unwrap();
+            let tail = v.tail();
+            let r = v.publish_seal(&p.packs, &snap(&v, s1), None).unwrap();
+            assert_eq!(r.record.unwrap(), first.record);
+            assert_eq!(v.tail().lsn, tail.lsn.next(), "one record");
+            assert_published(&p, &v, &[s1]);
+        }
+
+        /// Crash after the record, before the log is shipped.
+        #[test]
+        fn a_retry_after_the_record_only_ships_and_anchors() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (mut v, s1) = sealed(&p);
+            let s = p.packs.ship_seal(&v.chronicle().segments(), &snap(&v, s1), None).unwrap().unwrap();
+            v.chronicle.append(Stream::Ctl, Payload::FsShipped(s.record)).unwrap();
+            let tail = v.tail();
+            let r = v.publish_seal(&p.packs, &snap(&v, s1), None).unwrap();
+            assert_eq!((r.record, v.tail()), (None, tail));
+            assert_published(&p, &v, &[s1]);
+        }
+
+        /// The store or the coordinator fails at each step; a retry
+        /// finishes.
+        #[test]
+        fn failures_at_each_step_are_finished_by_a_retry() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (mut v, s1) = sealed(&p);
+            // The Seal pack's put fails: nothing is appended.
+            p.fail_put.store(true, Ordering::Relaxed);
+            let tail = v.tail();
+            assert!(matches!(v.publish_seal(&p.packs, &snap(&v, s1), None), Err(VesselError::Pack(_))));
+            assert_eq!(v.tail(), tail);
+            // The anchor cannot move: the Seal is not published yet.
+            p.fail_put.store(false, Ordering::Relaxed);
+            p.coord.fail_advance.store(true, Ordering::Relaxed);
+            assert!(matches!(v.publish_seal(&p.packs, &snap(&v, s1), None), Err(VesselError::Coord(_))));
+            assert_eq!(p.coord.shipped(v.id()).unwrap(), Position::GENESIS);
+            p.coord.fail_advance.store(false, Ordering::Relaxed);
+            let r = v.publish_seal(&p.packs, &snap(&v, s1), None).unwrap();
+            assert_eq!(r.record, None, "named by the first try");
+            assert_published(&p, &v, &[s1]);
+        }
+
+        #[test]
+        fn publish_refuses_what_is_not_this_vessels_seal() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (mut v, s1) = sealed(&p);
+            let mut other = snap(&v, s1);
+            other.dataset = Dataset::new("tank/vessels/elsewhere").unwrap();
+            assert!(matches!(v.publish_seal(&p.packs, &other, None), Err(VesselError::NotThisSeal(_))));
+            let mut unbound = snap(&v, s1);
+            unbound.seal_hash = None;
+            assert!(matches!(v.publish_seal(&p.packs, &unbound, None), Err(VesselError::NotThisSeal(why)) if why.contains("not bound")));
+            let mut wrong = snap(&v, s1);
+            wrong.seal_hash = Some(HashVal::from_bytes([9; 32]));
+            assert!(matches!(v.publish_seal(&p.packs, &wrong, None), Err(VesselError::NotThisSeal(_))));
+            let not_a_seal = v.chronicle().frames().unwrap()[1].envelope; // the Raw record
+            let raw_pos = Position { lsn: not_a_seal.lsn, hash: not_a_seal.hash };
+            assert!(matches!(v.publish_seal(&p.packs, &snap(&v, raw_pos), None), Err(VesselError::NotThisSeal(_))));
+            assert!(p.packs_store().list("vessels").unwrap().is_empty());
+            // FsShipped and Gap records are the Warden's.
+            let r = p.packs.ship_seal(&v.chronicle().segments(), &snap(&v, s1), None).unwrap().unwrap();
+            assert!(matches!(v.append(Stream::Ctl, Payload::FsShipped(r.record)), Err(VesselError::ReservedPayload)));
+            let gap = GapRecord { kept: Lsn::new(1), kept_hash: s1.hash, resumes: s1.lsn, resumes_hash: s1.hash };
+            assert!(matches!(v.append(Stream::Ctl, Payload::Gap(gap)), Err(VesselError::ReservedPayload)));
+        }
+
+        /// A closed Vessel (its state moved on) publishes nothing.
+        #[test]
+        fn a_closed_vessel_does_not_publish() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (v, s1) = sealed(&p);
+            let Succeeded { predecessor: mut old, .. } = p.host.succeed(v, ns(1), b"user-new", auth(), false).unwrap();
+            assert!(matches!(old.publish_seal(&p.packs, &snap(&old, s1), None), Err(VesselError::Closed { .. })));
+            assert!(p.packs_store().list("vessels").unwrap().is_empty());
+        }
+
+        /// A forked Vessel's first Seal is incremental from its parent's
+        /// Seal snapshot.
+        #[test]
+        fn a_fork_publishes_from_its_origin() {
+            let child_id = vessel_id(ns(1), b"user-2");
+            let p = penv(child_id);
+            let (parent, ps) = sealed(&p);
+            let mut child = p.host.fork(&parent, ps, b"user-2").unwrap();
+            child.append(Stream::Fs, raw(3)).unwrap();
+            let cs = seal(&mut child);
+            let origin = snap(&parent, ps);
+            assert!(matches!(child.publish_seal(&p.packs, &snap(&child, cs), None), Err(VesselError::Pack(_))));
+            let r = child.publish_seal(&p.packs, &snap(&child, cs), Some(&origin)).unwrap();
+            let want = ParentSeal { chronicle: parent.id(), seal: ps.lsn, seal_hash: ps.hash };
+            assert_eq!(r.record.unwrap().base, StreamBase::Origin { parent: want, guid: origin.guid });
+            let c = p.packs.chain(Some(r.anchor)).unwrap();
+            assert!(matches!(c.seals[0].fs.base, FsBase::Origin { .. }));
+            assert_eq!(p.read(&c.seals[0]), stream(child.dataset(), Some(parent.dataset().seal_snapshot(ps.lsn).as_str()), cs.lsn));
+        }
     }
 
     // ── fork ────────────────────────────────────────────────────────
