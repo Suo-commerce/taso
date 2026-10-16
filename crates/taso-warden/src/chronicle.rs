@@ -43,7 +43,10 @@
 //! On one node, a lock file in the Chronicle's directory keeps two
 //! processes off the same segment: without it, a fenced writer's frame
 //! (and its truncation) could land on top of the new holder's accepted
-//! frames before the CAS refuses it.
+//! frames before the CAS refuses it.  A lock that looks held is retried
+//! briefly before it counts, because a process spawned at the moment the
+//! previous holder closed may still hold a copy of its file (see
+//! `lock_dir`).
 //!
 //! Known gap: an accepted Seal whose snapshot is missing is not detected
 //! yet.  That needs the record kind, i.e. the payload decoder; with
@@ -57,6 +60,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use taso_core::canon::Canonical;
 use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, Lsn, Stream};
@@ -481,7 +485,20 @@ impl<L: Layers> Chronicle<L> {
     }
 }
 
+/// How long [`lock_dir`] keeps retrying a lock that looks held.
+const LOCK_WAIT: Duration = Duration::from_millis(500);
+
 /// Take an exclusive lock on `dir/LOCK`, held for the Chronicle's life.
+///
+/// The lock (`flock`) belongs to the open file, not the process.  When
+/// any thread spawns a process (`zfs`, `runc`), the child holds copies of
+/// every open file from the fork until it execs; all of them are
+/// close-on-exec, so that hold ends within microseconds to milliseconds.
+/// A lock dropped in that window still looks held, and a Vessel reopened
+/// right after closing would be refused although nobody owns it.  So a
+/// held lock is retried with short sleeps for up to [`LOCK_WAIT`] before
+/// it counts as [`ChronicleError::Locked`].  A real second holder is
+/// still refused, only not at once.
 fn lock_dir(dir: &Path) -> Result<File, ChronicleError> {
     let path = dir.join(LOCK_FILE);
     let file = OpenOptions::new()
@@ -490,10 +507,20 @@ fn lock_dir(dir: &Path) -> Result<File, ChronicleError> {
         .write(true)
         .open(&path)
         .map_err(|e| ChronicleError::Segment(SegmentError::Io(e)))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(ChronicleError::Locked(path)),
-        Err(std::fs::TryLockError::Error(e)) => Err(ChronicleError::Segment(SegmentError::Io(e))),
+    let start = Instant::now();
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Err(ChronicleError::Locked(path)),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(ChronicleError::Segment(SegmentError::Io(e)))
+            }
+        }
     }
 }
 
@@ -663,6 +690,43 @@ mod tests {
             Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
             Err(ChronicleError::Locked(_))
         ));
+    }
+
+    /// A lock dropped while another thread spawns processes may still be
+    /// held for a moment by a child between fork and exec.  Reopening must
+    /// not be refused for that.  (Without the retry about 1 in 20 relocks
+    /// failed here.)
+    #[test]
+    fn relock_while_processes_spawn_is_not_refused() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawned = Arc::new(AtomicU64::new(0));
+        let spawner = {
+            let (stop, spawned) = (stop.clone(), spawned.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        // Relock for as long as it takes the spawner to start 300
+        // processes, so the two really overlap.
+        let (mut relocks, mut refused) = (0u64, 0u64);
+        let t = Instant::now();
+        while spawned.load(Ordering::Relaxed) < 300 && t.elapsed() < Duration::from_secs(10) {
+            match lock_dir(dir.path()) {
+                Ok(lock) => drop(lock),
+                Err(_) => refused += 1,
+            }
+            relocks += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+        let n = spawned.load(Ordering::Relaxed);
+        assert!(n >= 300, "the spawner only started {n} processes");
+        assert_eq!(refused, 0, "{refused} of {relocks} relocks refused while {n} processes were spawned");
     }
 
     /// A second incarnation elsewhere (a copy of the segment, as rebirth
