@@ -2,7 +2,9 @@
 //!
 //! Exit status: 0 if every Vessel ran and its agent exited successfully,
 //! 1 if any did not, 2 for a bad command line or configuration.
-//! `TASO_TIMING=1` prints the timing spans at exit.
+//! `TASO_TIMING=1` prints the timing spans at exit; `TASO_TIMING_RAW=<file>`
+//! also writes every sample, `<span> <microseconds>` per line (for
+//! quantiles across runs).
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -25,7 +27,8 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let timing = std::env::var("TASO_TIMING").is_ok_and(|v| v == "1");
+    let raw = std::env::var_os("TASO_TIMING_RAW");
+    let timing = std::env::var("TASO_TIMING").is_ok_and(|v| v == "1") || raw.is_some();
     taso_warden::timing::enable(timing);
 
     let mut _server = None;
@@ -91,7 +94,20 @@ fn main() -> ExitCode {
         }
     }
     if timing {
-        print!("{}", taso_warden::timing::report(&taso_warden::timing::take()));
+        let spans = taso_warden::timing::take();
+        print!("{}", taso_warden::timing::report(&spans));
+        if let Some(path) = raw {
+            let mut text = String::new();
+            for (name, samples) in &spans {
+                for us in samples {
+                    text.push_str(&format!("{name} {us}\n"));
+                }
+            }
+            if let Err(e) = std::fs::write(&path, text) {
+                eprintln!("taso-wardend: writing {}: {e}", std::path::Path::new(&path).display());
+                ok = false;
+            }
+        }
     }
     if ok {
         ExitCode::SUCCESS

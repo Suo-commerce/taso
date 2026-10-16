@@ -18,7 +18,9 @@
 //! `--bare` runs the same writes with no Field at all: the baseline the
 //! gate compares against ("p95 write latency ≤ 1.5× bare local NVMe").
 //!
-//! At the end it writes `--stats` (JSON) and exits 0; any protocol or
+//! At the end it writes `--stats` (JSON), and with `--samples` every
+//! commit's latency in microseconds (for quantiles across Vessels), and
+//! exits 0; any protocol or
 //! database error exits 1.  A SIGBUS kills it, which the runtime reports
 //! as a failed agent: the gate counts those.
 
@@ -42,6 +44,8 @@ struct Opts {
     stats: PathBuf,
     bare: bool,
     synchronous: String,
+    /// Write every commit's latency here, in microseconds, one per line.
+    samples: Option<PathBuf>,
 }
 
 impl Default for Opts {
@@ -55,6 +59,7 @@ impl Default for Opts {
             stats: "/work/sim-stats.json".into(),
             bare: false,
             synchronous: "normal".into(),
+            samples: None,
         }
     }
 }
@@ -73,6 +78,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--db" => o.db = val()?.into(),
             "--stats" => o.stats = val()?.into(),
             "--bare" => o.bare = true,
+            "--samples" => o.samples = Some(val()?.into()),
             "--synchronous" => {
                 o.synchronous = val()?;
                 if !["off", "normal", "full", "extra"].contains(&o.synchronous.as_str()) {
@@ -164,6 +170,10 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
             turn_ends.push(t.elapsed());
         }
     }
+    if let Some(path) = &o.samples {
+        let text: String = writes.iter().map(|d| format!("{}\n", d.as_micros())).collect();
+        std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    }
     let rows: i64 = db.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).map_err(|e| e.to_string())?;
     Ok(json!({
         "bare": o.bare,
@@ -246,8 +256,12 @@ mod tests {
             stats: dir.path().join("stats.json"),
             bare: true,
             synchronous: "normal".into(),
+            samples: Some(dir.path().join("samples")),
         };
         let st = run(&o, None).unwrap();
+        let samples = std::fs::read_to_string(dir.path().join("samples")).unwrap();
+        assert_eq!(samples.lines().count(), 6);
+        assert!(samples.lines().all(|l| l.parse::<u64>().is_ok()));
         assert_eq!(st["rows_in_db"], 24);
         assert_eq!(st["write"]["n"], 6);
         assert_eq!(st["turns"], json!([1, 3]));
@@ -279,7 +293,7 @@ mod tests {
             }
             seen
         });
-        let o = Opts { turns: 3, txns: 1, rows: 1, row_bytes: 8, db: dir.path().join("s.db"), stats: dir.path().join("x"), bare: false, synchronous: "normal".into() };
+        let o = Opts { turns: 3, txns: 1, rows: 1, row_bytes: 8, db: dir.path().join("s.db"), stats: dir.path().join("x"), bare: false, synchronous: "normal".into(), samples: None };
         let st = run(&o, Some(&sock)).unwrap();
         let seen = warden.join().unwrap();
         assert_eq!(st["resumed_after"], 5);
