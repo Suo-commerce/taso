@@ -2,7 +2,7 @@
 //! (v1.0 §1 P1, v0.4 §8.3).
 //!
 //! The append path is: write the record here and fsync, *then*
-//! [`Coordinator::append`](crate::coordinator::Coordinator::append).
+//! [`Coord::append`](crate::coordinator::Coord::append).
 //! Because of that order, the coordinator can never have accepted a record
 //! that is not on local disk, and anything on local disk past the
 //! coordinator's anchored head was never accepted and must not be
