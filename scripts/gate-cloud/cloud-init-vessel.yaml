@@ -1,0 +1,8 @@
+#cloud-config
+# taso-a and taso-b (CPX62): keep the root partition small, so that
+# node-setup.sh can give the rest of the local NVMe to ZFS.
+growpart:
+  mode: "off"
+resize_rootfs: false
+package_update: true
+packages: [git]
