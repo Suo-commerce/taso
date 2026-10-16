@@ -88,10 +88,8 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
-    let node = |name: &str, warden: u64, takeover: bool| Node {
-        config: config(tmp.path(), &base, name, warden, takeover),
-        coord: coord.clone(),
-        zfs: Zfs::cli().batched(),
+    let node = |name: &str, warden: u64, takeover: bool| {
+        Node::new(config(tmp.path(), &base, name, warden, takeover), coord.clone(), Zfs::cli().batched()).unwrap()
     };
 
     // 1. Born on A.

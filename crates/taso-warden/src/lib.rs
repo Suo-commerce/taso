@@ -19,6 +19,7 @@ pub mod pack;
 pub mod quiesce;
 pub mod rebirth;
 pub mod runtime;
+pub mod s3;
 pub mod segment;
 pub mod snapbatch;
 pub mod ship;

@@ -55,7 +55,13 @@ fn main() -> ExitCode {
         CoordConf::Remote { socket } => Arc::new(RemoteCoord::new(socket)),
     };
     let zfs = if config.batched_snapshots { Zfs::cli().batched() } else { Zfs::cli() };
-    let node = Arc::new(Node { config, coord, zfs });
+    let node = match Node::new(config, coord, zfs) {
+        Ok(n) => Arc::new(n),
+        Err(e) => {
+            eprintln!("taso-wardend: opening the store: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let handles: Vec<_> = node
         .config

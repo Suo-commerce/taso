@@ -43,6 +43,24 @@ pub trait ObjectStore {
     fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
 
+/// A store shared by a node's Vessels (any [`ObjectStore`]).
+pub type SharedStore = std::sync::Arc<dyn ObjectStore + Send + Sync>;
+
+impl<T: ObjectStore + ?Sized> ObjectStore for std::sync::Arc<T> {
+    fn put(&self, key: &str, data: &mut dyn Read) -> io::Result<u64> {
+        (**self).put(key, data)
+    }
+    fn get(&self, key: &str) -> io::Result<Option<ByteStream>> {
+        (**self).get(key)
+    }
+    fn exists(&self, key: &str) -> io::Result<bool> {
+        (**self).exists(key)
+    }
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        (**self).list(prefix)
+    }
+}
+
 /// Keys are `/`-separated components of `[A-Za-z0-9._-]`, none of them
 /// `.` or `..`, no leading or trailing `/`.
 pub fn valid_key(key: &str) -> bool {

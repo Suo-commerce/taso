@@ -36,7 +36,6 @@
 //!
 //! # Not yet
 //!
-//! - Garage: the store is a local directory ([`LocalStore`]).
 //! - A coordinator on another node: `remote` is a Unix socket, so across
 //!   nodes it is forwarded (e.g. `ssh -L local.sock:remote.sock`).
 
@@ -61,7 +60,8 @@ use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
 use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, VesselSpec};
 use crate::segment::Position;
-use crate::ship::{LocalStore, ZfsSend};
+use crate::s3::{S3Config, S3Store};
+use crate::ship::{LocalStore, SharedStore, ZfsSend};
 use crate::vessel::{Ensured, Host, Vessel, VesselError};
 use crate::zfs::{Cli, Dataset, Snapshot, Zfs};
 
@@ -83,6 +83,50 @@ pub enum CoordConf {
         /// The socket.
         socket: PathBuf,
     },
+}
+
+/// Where packs are kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreConf {
+    /// A local directory (one node, or a test).
+    Local(PathBuf),
+    /// An S3 bucket: Garage.  The secret is read from a file at start, so
+    /// it is never in the config.
+    S3 {
+        /// `http://host:port`.
+        endpoint: String,
+        /// Signature region (`garage` by default).
+        region: String,
+        /// The bucket.
+        bucket: String,
+        /// The access key id.
+        access_key_id: String,
+        /// A file holding the secret key (mode 0600 is the operator's job).
+        secret_key_file: PathBuf,
+    },
+}
+
+impl StoreConf {
+    /// Open the store.
+    pub fn open(&self) -> std::io::Result<SharedStore> {
+        Ok(match self {
+            Self::Local(dir) => Arc::new(LocalStore::new(dir)),
+            Self::S3 { endpoint, region, bucket, access_key_id, secret_key_file } => {
+                let secret = std::fs::read_to_string(secret_key_file)
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", secret_key_file.display())))?;
+                Arc::new(S3Store::new(
+                    S3Config {
+                        endpoint: endpoint.clone(),
+                        region: region.clone(),
+                        bucket: bucket.clone(),
+                        access_key_id: access_key_id.clone(),
+                        secret_key: secret.trim().to_string(),
+                    },
+                    Duration::from_secs(30),
+                )?)
+            }
+        })
+    }
 }
 
 /// How Vessels run.
@@ -135,8 +179,9 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Batch Seal snapshots ([`crate::snapbatch`]).
     pub batched_snapshots: bool,
-    /// The object store directory.
-    pub store: PathBuf,
+    /// Where packs are kept: a directory (`"store": "/path"`) or Garage
+    /// (`"store": {"s3": {...}}`).
+    pub store: StoreConf,
     /// Key prefix in the store.
     pub prefix: String,
     /// Sockets, bundles and runc state.
@@ -281,7 +326,20 @@ impl Config {
             root,
             state_dir: abs_path(&v, "state_dir")?,
             batched_snapshots: bool_or(&v, "batched_snapshots", true)?,
-            store: abs_path(&v, "store")?,
+            store: match field(&v, "store")? {
+                Value::String(_) => StoreConf::Local(abs_path(&v, "store")?),
+                Value::Object(o) if o.contains_key("s3") => {
+                    let s = &o["s3"];
+                    StoreConf::S3 {
+                        endpoint: string(s, "endpoint")?,
+                        region: s.get("region").and_then(Value::as_str).unwrap_or("garage").to_string(),
+                        bucket: string(s, "bucket")?,
+                        access_key_id: string(s, "access_key_id")?,
+                        secret_key_file: abs_path(s, "secret_key_file")?,
+                    }
+                }
+                _ => return Err(bad("\"store\" must be a directory or {\"s3\": {...}}")),
+            },
             prefix: v.get("prefix").and_then(Value::as_str).unwrap_or("vessels").to_string(),
             run_dir: abs_path(&v, "run_dir")?,
             runtime,
@@ -393,7 +451,7 @@ fn id_hex(id: ChronicleId) -> String {
 /// never the whole list) and runs [`Vessel::publish_seal`].
 pub struct SealPublisher {
     zfs: Zfs<Cli>,
-    packs: Packs<LocalStore, ZfsSend>,
+    packs: Packs<SharedStore, ZfsSend>,
     /// The parent's Seal snapshot, for a Vessel forked from one whose
     /// first `fs` section is not shipped yet: that section is incremental
     /// from it.  Cleared once a section is shipped (later Seals are
@@ -497,9 +555,17 @@ pub struct Node {
     pub coord: Arc<dyn Coord>,
     /// The ZFS driver (batched or not; clones share the batch).
     pub zfs: Zfs<Cli>,
+    /// The store (opened from `config.store`).
+    pub store: SharedStore,
 }
 
 impl Node {
+    /// A node: opens the store.
+    pub fn new(config: Config, coord: Arc<dyn Coord>, zfs: Zfs<Cli>) -> std::io::Result<Self> {
+        let store = config.store.open()?;
+        Ok(Self { config, coord, zfs, store })
+    }
+
     fn host(&self) -> Host<Zfs<Cli>> {
         Host {
             coord: self.coord.clone(),
@@ -510,8 +576,8 @@ impl Node {
         }
     }
 
-    fn packs(&self, id: ChronicleId) -> Result<Packs<LocalStore, ZfsSend>, DaemonError> {
-        Packs::new(LocalStore::new(&self.config.store), ZfsSend::default(), &self.config.prefix, id).map_err(io("packs"))
+    fn packs(&self, id: ChronicleId) -> Result<Packs<SharedStore, ZfsSend>, DaemonError> {
+        Packs::new(self.store.clone(), ZfsSend::default(), &self.config.prefix, id).map_err(io("packs"))
     }
 
     fn log(&self, vc: &VesselConf, msg: impl fmt::Display) {
@@ -709,6 +775,39 @@ mod tests {
         assert_eq!(c.vessels[0].namespace, Namespace::from_bytes([1; 16]));
         assert!(!c.vessels[0].takeover && c.vessels[1].takeover);
         assert_eq!(c.quiescence, vec!["state.db".to_string()]);
+        assert_eq!(c.store, StoreConf::Local("/srv/taso/store".into()));
+        let s3 = with(|v| {
+            v["store"] = serde_json::json!({ "s3": {
+                "endpoint": "http://10.0.0.2:3900", "bucket": "taso",
+                "access_key_id": "GK1", "secret_key_file": "/etc/taso/s3.secret" } })
+        })
+        .unwrap();
+        assert_eq!(
+            s3.store,
+            StoreConf::S3 {
+                endpoint: "http://10.0.0.2:3900".into(),
+                region: "garage".into(),
+                bucket: "taso".into(),
+                access_key_id: "GK1".into(),
+                secret_key_file: "/etc/taso/s3.secret".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn stores_open_and_secrets_come_from_their_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(StoreConf::Local(dir.path().into()).open().is_ok());
+        let s3 = |file: PathBuf| StoreConf::S3 {
+            endpoint: "http://127.0.0.1:1".into(),
+            region: "garage".into(),
+            bucket: "taso".into(),
+            access_key_id: "GK1".into(),
+            secret_key_file: file,
+        };
+        assert!(s3(dir.path().join("missing")).open().is_err(), "no secret file, no store");
+        std::fs::write(dir.path().join("secret"), "s3cr3t\n").unwrap();
+        assert!(s3(dir.path().join("secret")).open().is_ok());
     }
 
     fn with(edit: impl FnOnce(&mut Value)) -> Result<Config, ConfigError> {
@@ -725,6 +824,9 @@ mod tests {
             ("both coordinators", Box::new(|v| v["coordinator"]["remote"] = "/x.sock".into())),
             ("no coordinator", Box::new(|v| v["coordinator"] = serde_json::json!({}))),
             ("relative store", Box::new(|v| v["store"] = "store".into())),
+            ("s3 without bucket", Box::new(|v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "access_key_id": "a", "secret_key_file": "/s"}}))),
+            ("s3 relative secret", Box::new(|v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "bucket": "b", "access_key_id": "a", "secret_key_file": "s"}}))),
+            ("store number", Box::new(|v| v["store"] = 3.into())),
             ("bad dataset", Box::new(|v| v["root"] = "tank//v".into())),
             ("no agent", Box::new(|v| v["runtime"]["args"] = serde_json::json!([]))),
             ("short namespace", Box::new(|v| v["vessels"][0]["namespace"] = "0101".into())),
