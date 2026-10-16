@@ -713,6 +713,15 @@ impl<L: Layers> Vessel<L> {
         self.chronicle.tail()
     }
 
+    /// Judge resuming from the Seal at `seal` against this Vessel's log
+    /// and the coordinator's anchor
+    /// ([`crate::navigate::navigate_frames`]).  Reads the local segments,
+    /// so the log here must start at genesis.
+    pub fn navigate(&self, seal: Lsn) -> Result<taso_core::navigator::Navigation, VesselError> {
+        crate::navigate::navigate_frames(self.chronicle.coord().as_ref(), self.id(), &self.frames()?, seal)
+            .map_err(VesselError::Coord)
+    }
+
     /// The last accepted Seal.
     pub fn last_seal(&self) -> Option<Position> {
         self.chronicle.last_seal()
