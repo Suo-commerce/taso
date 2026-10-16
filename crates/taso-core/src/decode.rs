@@ -21,6 +21,7 @@ use crate::record::{
     Authority, BarrierId, Consequence, Dispatch, GroupId, GroupRecord, IntentRecord, LayerRef,
     LineageRecord, Member, Namespace, OpId, Origin, OutcomeRecord, OutcomeState, ParentSeal,
     Payload, RetryPolicy, SealRecord, StreamCut, SuccessionRecord, TaintKind, TurnId, Verdict,
+    FsShippedRecord, GapRecord, StreamBase,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -316,6 +317,30 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn gap(&mut self) -> R<GapRecord> {
+        Ok(GapRecord { kept: self.lsn()?, kept_hash: self.hash()?, resumes: self.lsn()?, resumes_hash: self.hash()? })
+    }
+
+    fn stream_base(&mut self) -> R<StreamBase> {
+        Ok(match self.tag()? {
+            (_, 0) => StreamBase::Full,
+            (_, 1) => StreamBase::Seal { lsn: self.lsn()?, hash: self.hash()? },
+            (_, 2) => StreamBase::Origin { parent: self.parent_seal()?, guid: self.u64()? },
+            (at, tag) => return Err(DecodeError::BadTag { at, what: "stream base", tag }),
+        })
+    }
+
+    fn fs_shipped(&mut self) -> R<FsShippedRecord> {
+        Ok(FsShippedRecord {
+            seal: self.lsn()?,
+            seal_hash: self.hash()?,
+            base: self.stream_base()?,
+            guid: self.u64()?,
+            bytes: self.u64()?,
+            digest: self.hash()?,
+        })
+    }
+
     fn payload(&mut self) -> R<Payload> {
         Ok(match self.tag()? {
             (_, 0) => Payload::Seal(self.seal()?),
@@ -325,6 +350,8 @@ impl<'a> Reader<'a> {
             (_, 4) => Payload::Raw(self.bytes()?),
             (_, 5) => Payload::Lineage(self.lineage()?),
             (_, 6) => Payload::Succession(self.succession()?),
+            (_, 7) => Payload::Gap(self.gap()?),
+            (_, 8) => Payload::FsShipped(self.fs_shipped()?),
             (at, tag) => return Err(DecodeError::BadTag { at, what: "payload", tag }),
         })
     }
@@ -488,8 +515,35 @@ mod tests {
             },
         )
     }
+    fn gap() -> impl Strategy<Value = Payload> {
+        (lsn(), hash(), lsn(), hash()).prop_map(|(kept, kept_hash, resumes, resumes_hash)| {
+            Payload::Gap(GapRecord { kept, kept_hash, resumes, resumes_hash })
+        })
+    }
+    fn fs_shipped() -> impl Strategy<Value = Payload> {
+        let base = prop_oneof![
+            Just(StreamBase::Full),
+            (lsn(), hash()).prop_map(|(lsn, hash)| StreamBase::Seal { lsn, hash }),
+            (parent_seal(), any::<u64>()).prop_map(|(parent, guid)| StreamBase::Origin { parent, guid }),
+        ];
+        (lsn(), hash(), base, any::<u64>(), any::<u64>(), hash()).prop_map(
+            |(seal, seal_hash, base, guid, bytes, digest)| {
+                Payload::FsShipped(FsShippedRecord { seal, seal_hash, base, guid, bytes, digest })
+            },
+        )
+    }
     fn payload() -> impl Strategy<Value = Payload> {
-        prop_oneof![seal(), group(), intent(), outcome(), blob().prop_map(Payload::Raw), lineage(), succession()]
+        prop_oneof![
+            seal(),
+            group(),
+            intent(),
+            outcome(),
+            blob().prop_map(Payload::Raw),
+            lineage(),
+            succession(),
+            gap(),
+            fs_shipped()
+        ]
     }
 
     // ── properties ──────────────────────────────────────────────────
@@ -554,8 +608,8 @@ mod tests {
     #[test]
     fn unknown_payload_tag() {
         assert_eq!(
-            Payload::decode(&[7]),
-            Err(DecodeError::BadTag { at: 0, what: "payload", tag: 7 })
+            Payload::decode(&[9]),
+            Err(DecodeError::BadTag { at: 0, what: "payload", tag: 9 })
         );
         assert_eq!(Payload::decode(&[]), Err(DecodeError::Truncated { at: 0, need: 1 }));
     }

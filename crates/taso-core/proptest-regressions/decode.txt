@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 3233e1d89af76ad476d94f85fae6a894e8fbd8c7e1f9038062a0a079d31afc73 # shrinks to p = Group(GroupRecord { gid: GroupId(0), members: [], depends_on: [], commit: true }), pick = Index(17737253917028415016), flip = 2
+cc 0003cef721cadeaadaa47e72c18d648b86d4a9adb564f5d3ddf12640c044c5f5 # shrinks to p = Gap(GapRecord { kept: Lsn(0), kept_hash: Hash(0000000000000000000000000000000000000000000000000000000000000000), resumes: Lsn(0), resumes_hash: Hash(0000000000000000000000000000000000000000000000000000000000000001) })
+cc 36640be8760899dc99db55ba18e8106ccda6f793e94ded2a883c774adccae1b6 # shrinks to p = FsShipped(FsShippedRecord { seal: Lsn(0), seal_hash: Hash(0000000000000000000000000000000000000000000000000000000000000000), base: Origin { parent: ParentSeal { chronicle: ChronicleId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), seal: Lsn(0), seal_hash: Hash(0000000000000000000000000000000000000000000000000000000000000000) }, guid: 0 }, guid: 0, bytes: 0, digest: Hash(0000000000000000000000000000000000000000000000000000000000000000) })
