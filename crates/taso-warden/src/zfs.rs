@@ -59,6 +59,8 @@ use std::process::{Command, Stdio};
 
 use taso_core::envelope::{HashVal, Lsn};
 
+use crate::snapbatch::SnapBatch;
+
 /// User property binding a snapshot to its Seal record.
 pub const SEAL_PROPERTY: &str = "taso:seal";
 
@@ -78,7 +80,7 @@ const MAX_FULL_NAME: usize = 255;
 pub const MAX_DATASET_NAME: usize = MAX_FULL_NAME - 1 - SNAP_PREFIX.len() - LSN_DIGITS;
 
 /// Columns requested from `zfs list`, in order.
-const LIST_COLUMNS: &str = "name,createtxg,guid,taso:seal";
+pub(crate) const LIST_COLUMNS: &str = "name,createtxg,guid,taso:seal";
 
 /// Columns requested by [`Zfs::dataset_info`], in order.
 const INFO_COLUMNS: &str = "name,mountpoint,origin,taso:parent";
@@ -119,6 +121,14 @@ pub enum ZfsError {
     /// The input being received failed to read (for a shipped stream: it
     /// is not what its metadata says).  Nothing was received.
     Input(String),
+    /// A batched snapshot's channel program reported an errno for it
+    /// (1000 + errno: the binding failed and the snapshot was destroyed).
+    Channel {
+        /// The snapshot.
+        name: String,
+        /// The errno.
+        errno: i64,
+    },
     /// A line of `zfs list` output could not be read.
     Parse {
         /// The line.
@@ -147,6 +157,7 @@ impl fmt::Display for ZfsError {
             }
             Self::NotLatest(name) => write!(f, "{name} is not the dataset's last Seal snapshot"),
             Self::Input(e) => write!(f, "the stream being received could not be read: {e}"),
+            Self::Channel { name, errno } => write!(f, "zfs program could not snapshot {name}: errno {errno}"),
             Self::Parse { line, why } => write!(f, "cannot parse zfs output {line:?}: {why}"),
         }
     }
@@ -198,6 +209,11 @@ impl Dataset {
     /// The name.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The pool: the first component.
+    pub fn pool(&self) -> &str {
+        self.0.split('/').next().unwrap_or(&self.0)
     }
 
     /// The full snapshot name for the Seal at `seal`.
@@ -305,6 +321,11 @@ fn parse_info_line(dataset: &Dataset, line: &str) -> Result<DatasetInfo, ZfsErro
         hex => Some(parse_hash(hex).ok_or_else(|| bad("taso:parent is not a 64-digit hex hash"))?),
     };
     Ok(DatasetInfo { dataset: dataset.clone(), mountpoint, origin, parent })
+}
+
+/// [`parse_line`] for the batch.
+pub(crate) fn parse_line_for(dataset: &Dataset, line: &str) -> Result<Option<Snapshot>, ZfsError> {
+    parse_line(dataset, line)
 }
 
 /// Parse one tab-separated `zfs list` line.  `Ok(None)` for snapshots
@@ -524,22 +545,40 @@ pub struct CloneBase {
 }
 
 /// The ZFS driver.
+///
+/// Clones share a batch queue if the driver is [`Zfs::batched`].
 #[derive(Clone, Debug, Default)]
 pub struct Zfs<R: Runner = Cli> {
     runner: R,
+    batch: Option<std::sync::Arc<SnapBatch>>,
 }
 
 impl Zfs<Cli> {
     /// The driver over the `zfs` on `PATH`.
     pub fn cli() -> Self {
-        Self { runner: Cli::default() }
+        Self { runner: Cli::default(), batch: None }
     }
 }
 
 impl<R: Runner> Zfs<R> {
     /// The driver over any runner.
     pub fn with_runner(runner: R) -> Self {
-        Self { runner }
+        Self { runner, batch: None }
+    }
+
+    /// This driver, with Seal snapshots batched: concurrent
+    /// [`Zfs::snapshot`] calls of this driver and its clones share one
+    /// channel program and one transaction group per pool
+    /// ([`crate::snapbatch`]).  Needs `zfs program` (OpenZFS 2.0+, root).
+    pub fn batched(mut self) -> Self {
+        self.batch = Some(std::sync::Arc::default());
+        self
+    }
+
+    /// The batch queue, if batched.
+    #[cfg(test)]
+    pub(crate) fn batch(&self) -> Option<&SnapBatch> {
+        self.batch.as_deref()
     }
 
     /// Run, turning a non-zero exit into [`ZfsError::Exit`].
@@ -564,6 +603,9 @@ impl<R: Runner> Zfs<R> {
         seal: Lsn,
         seal_hash: HashVal,
     ) -> Result<Snapshot, ZfsError> {
+        if let Some(batch) = &self.batch {
+            return batch.snapshot(&self.runner, dataset, seal, seal_hash);
+        }
         let name = dataset.seal_snapshot(seal);
         let args = vec![
             "snapshot".to_string(),
@@ -1696,6 +1738,63 @@ mod tests {
             assert_eq!(zfs.list(&s.ds).unwrap(), vec![a.clone(), b]);
             assert_eq!(zfs.get(&s.ds, Lsn::new(3)).unwrap(), Some(a));
             assert_eq!(zfs.get(&s.ds, Lsn::new(4)).unwrap(), None);
+        }
+
+        /// Batched snapshots on a real pool: the channel program runs, every
+        /// snapshot is bound in the same program, the plain driver sees
+        /// exactly what the batch reported, a duplicate is refused without
+        /// touching the binding, and a batched Seal can be forked.
+        #[test]
+        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
+        fn batched_snapshots_on_zfs() {
+            let s = Scratch::new("batched");
+            let plain = Zfs::cli();
+            let batched = Zfs::cli().batched();
+            let vessels: Vec<Dataset> = (0..8)
+                .map(|i| {
+                    let d = Dataset::new(&format!("{}/v{i}", s.ds)).unwrap();
+                    plain.create(&d).unwrap();
+                    d
+                })
+                .collect();
+            let start = std::sync::Barrier::new(vessels.len());
+            let got: Vec<Vec<Snapshot>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = vessels
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| {
+                        let (zfs, start) = (Clone::clone(&batched), &start);
+                        scope.spawn(move || {
+                            start.wait();
+                            (1..=5u64)
+                                .map(|l| zfs.snapshot(d, Lsn::new(l), hash((i as u8) * 10 + l as u8)).unwrap())
+                                .collect()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (i, (d, snaps)) in vessels.iter().zip(&got).enumerate() {
+                assert_eq!(&plain.list(d).unwrap(), snaps, "the plain driver sees what the batch reported");
+                for (l, snap) in (1..=5u64).zip(snaps) {
+                    assert_eq!(snap.seal_hash, Some(hash((i as u8) * 10 + l as u8)));
+                    let prop = zfs_cmd(&["get", "-H", "-o", "value", SEAL_PROPERTY, &snap.name()]);
+                    assert_eq!(prop.trim(), hash((i as u8) * 10 + l as u8).to_string());
+                }
+            }
+            // Snapshots of different Vessels shared transaction groups.
+            let txgs: std::collections::BTreeSet<u64> = got.iter().flatten().map(|s| s.createtxg).collect();
+            println!("{} batched snapshots in {} txgs", got.len() * 5, txgs.len());
+            assert!(txgs.len() < got.len() * 5, "no two snapshots shared a txg");
+
+            let first = got[0][0].clone();
+            assert_eq!(
+                batched.snapshot(&vessels[0], Lsn::new(1), hash(99)),
+                Err(ZfsError::AlreadyExists(first.name())),
+            );
+            assert_eq!(plain.get(&vessels[0], Lsn::new(1)).unwrap(), Some(first.clone()));
+            let fork = Dataset::new(&format!("{}/fork", s.ds)).unwrap();
+            plain.clone(&vessels[0], Lsn::new(1), first.seal_hash.unwrap(), &fork).unwrap();
         }
 
         #[test]

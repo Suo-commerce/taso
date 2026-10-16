@@ -163,6 +163,18 @@ mod tests {
         #[test]
         #[ignore = "benchmark on a ZFS pool: set TASO_ZFS_DATASET; run alone, in release"]
         fn seals_at_p64_on_zfs() {
+            p64(false);
+        }
+
+        /// As `seals_at_p64_on_zfs`, with Seal snapshots batched: one
+        /// channel program and one txg per batch ([`crate::snapbatch`]).
+        #[test]
+        #[ignore = "benchmark on a ZFS pool: set TASO_ZFS_DATASET; run alone, in release"]
+        fn seals_at_p64_batched_on_zfs() {
+            p64(true);
+        }
+
+        fn p64(batched: bool) {
             let turns = n(20);
             let vessels: usize =
                 std::env::var("TASO_BENCH_VESSELS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
@@ -170,8 +182,8 @@ mod tests {
                 println!("\n=== seals at p{vessels} on ZFS: skipped, TASO_ZFS_DATASET is not set ===");
                 return;
             };
-            let root = format!("{base}/p64-{}", std::process::id());
-            let zfs = Zfs::<Cli>::cli();
+            let root = format!("{base}/p64{}-{}", if batched { "b" } else { "" }, std::process::id());
+            let zfs = if batched { Zfs::<Cli>::cli().batched() } else { Zfs::<Cli>::cli() };
             Zfs::create(&zfs, &Dataset::new(&root).unwrap()).unwrap();
             struct Cleanup(String);
             impl Drop for Cleanup {
@@ -215,7 +227,8 @@ mod tests {
             let wall = start.elapsed().as_secs_f64();
             timing::enable(false);
             let spans = timing::take();
-            let title = format!("seals at p{vessels} on ZFS: {turns} turns each, dataset {root}");
+            let how = if batched { "batched snapshots" } else { "one zfs snapshot per Seal" };
+            let title = format!("seals at p{vessels} on ZFS, {how}: {turns} turns each, dataset {root}");
             print(&title, &spans, "seal.total", (vessels * turns / 4).max(1), wall);
             let mut seal = spans["seal.total"].clone();
             seal.sort_unstable();
