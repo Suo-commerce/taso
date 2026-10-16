@@ -306,7 +306,6 @@ impl Effects {
     fn reconcile<L: Layers>(&mut self, vessel: &mut Vessel<L>) -> Result<Reconciled, VesselError> {
         let frames = vessel
             .chronicle()
-            .segment()
             .frames()
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
         let mut intents: BTreeMap<OpId, IntentRecord> = BTreeMap::new();
@@ -545,7 +544,6 @@ mod tests {
     /// Effect records, decoded, in order.
     fn ledger(v: &Vessel<FakeLayers>) -> Vec<Payload> {
         v.chronicle()
-            .segment()
             .frames()
             .unwrap()
             .iter()
@@ -573,7 +571,7 @@ mod tests {
     fn sent_only_after_publish(v: &Vessel<FakeLayers>, p: &Shared) -> Result<(), String> {
         let mut op_of: BTreeMap<Vec<u8>, OpId> = BTreeMap::new();
         let mut authorized_at: BTreeMap<OpId, u64> = BTreeMap::new();
-        for f in v.chronicle().segment().frames().unwrap() {
+        for f in v.chronicle().frames().unwrap() {
             if f.envelope.stream != Stream::Effect {
                 continue;
             }

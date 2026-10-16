@@ -65,14 +65,22 @@ use std::time::{Duration, Instant};
 use taso_core::canon::Canonical;
 use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
-use taso_core::record::{LayerRef, Payload, Record, SealRecord, StreamCut, TurnId, Verdict};
+use taso_core::record::{GapRecord, LayerRef, Payload, Record, SealRecord, StreamCut, TurnId, Verdict};
 
 use crate::coordinator::{Coord, CoordError};
-use crate::segment::{self, Position, Segment, SegmentError};
+use crate::segment::{self, Frame, Position, Segment, SegmentError};
 use crate::zfs::{Cli, Dataset, Runner, Zfs};
 
-/// File name of the (only, for now) segment in a Chronicle directory.
+/// File name of the first segment of a Chronicle (base lsn 0).
 const SEGMENT_FILE: &str = "seg-00000000000000000000";
+
+/// Prefix of every segment file name: `seg-<base lsn, 20 digits>`.
+const SEGMENT_PREFIX: &str = "seg-";
+
+/// The file name of the segment whose first frame follows `base`.
+fn segment_name(base: Lsn) -> String {
+    format!("{SEGMENT_PREFIX}{:020}", base.get())
+}
 
 /// File name of the lock that keeps a second process out.
 const LOCK_FILE: &str = "LOCK";
@@ -168,6 +176,27 @@ pub enum ChronicleError {
     /// A Seal's check failed after the layer was frozen; the layer was
     /// destroyed and no Seal record was written.
     CheckFailed(String),
+    /// A file in the Chronicle directory is named like a segment but is not
+    /// `seg-<20 digits>`.
+    BadSegmentName(String),
+    /// Two segment files do not join: the later one neither starts where
+    /// the earlier one ends nor opens with a Gap record naming exactly the
+    /// lost span; or the first one does not start at genesis.
+    SegmentsDisagree {
+        /// The later segment's base.
+        at: Lsn,
+        /// What is wrong.
+        why: &'static str,
+    },
+    /// A continuation segment exists but its Gap record was never accepted
+    /// (a takeover was interrupted).  [`Chronicle::open_after_gap`]
+    /// finishes it; a plain open does not.
+    GapPending {
+        /// The last record kept before the gap.
+        kept: Lsn,
+        /// The anchored head the continuation starts at.
+        head: Lsn,
+    },
 }
 
 impl fmt::Display for ChronicleError {
@@ -186,6 +215,16 @@ impl fmt::Display for ChronicleError {
             Self::Fenced => write!(f, "chronicle is fenced: ownership was lost"),
             Self::Poisoned => write!(f, "chronicle is poisoned: reopen to recover"),
             Self::CheckFailed(why) => write!(f, "seal check failed: {why}"),
+            Self::BadSegmentName(n) => write!(f, "{n} is not a segment file name"),
+            Self::SegmentsDisagree { at, why } => {
+                write!(f, "the segment at lsn {} does not join the one before: {why}", at.get())
+            }
+            Self::GapPending { kept, head } => write!(
+                f,
+                "a takeover after a gap ({}..={}) was interrupted; open_after_gap finishes it",
+                kept.get() + 1,
+                head.get()
+            ),
         }
     }
 }
@@ -220,6 +259,9 @@ pub struct Recovery {
     pub orphan_layers: Vec<Lsn>,
     /// The last accepted Seal, if any.
     pub last_seal: Option<Position>,
+    /// If this open continued past a gap: the last record kept and the
+    /// head the Chronicle continued from (records in between are lost).
+    pub gap: Option<(Position, Position)>,
 }
 
 /// A Seal that was taken and accepted.
@@ -246,6 +288,9 @@ pub struct Chronicle<L: Layers> {
     warden: WardenId,
     epoch: Epoch,
     coord: Arc<dyn Coord>,
+    /// Older segment files, in order; read-only.
+    closed: Vec<Segment>,
+    /// The newest segment: the only one written.
     segment: Segment,
     layers: L,
     last_seal: Option<Position>,
@@ -270,72 +315,144 @@ impl<L: Layers> Chronicle<L> {
     /// Take ownership of an existing Chronicle and recover it.
     ///
     /// In order: lock `dir`; transfer ownership to `warden` (new epoch,
-    /// fences any previous holder); open the segment against the anchored
-    /// head (creating it if the Chronicle has no records yet); destroy
-    /// orphan layers.
+    /// fences any previous holder); open the segment files, the newest one
+    /// recovered against the anchored head and every older one read whole
+    /// and verified (creating the first if the Chronicle has no records
+    /// yet); check that the files join; destroy orphan layers.
+    ///
+    /// A takeover after a gap that was interrupted is refused
+    /// ([`ChronicleError::GapPending`]); [`Chronicle::open_after_gap`]
+    /// finishes it.
     pub fn open(
         dir: impl AsRef<Path>,
         coord: Arc<dyn Coord>,
         id: ChronicleId,
         warden: WardenId,
-        mut layers: L,
+        layers: L,
     ) -> Result<(Self, Recovery), ChronicleError> {
-        let dir = dir.as_ref();
+        Self::open_inner(dir.as_ref(), coord, id, warden, layers, false)
+    }
+
+    /// Take ownership of a Chronicle whose local log may end before the
+    /// anchored head (rebirth on another node: the log was rebuilt from the
+    /// shipped packs up to the shipped anchor, and the records after it
+    /// are lost).
+    ///
+    /// If the newest local segment ends at the head, this is [`Chronicle::open`].
+    /// If it ends before, a new segment is started at the head and a
+    /// [`GapRecord`] is appended as its first
+    /// record, accepted by the coordinator like any record: the lost
+    /// records keep their place in the chain, and history continues from
+    /// the head.  Crash-resumable: an interrupted takeover is finished.
+    pub fn open_after_gap(
+        dir: impl AsRef<Path>,
+        coord: Arc<dyn Coord>,
+        id: ChronicleId,
+        warden: WardenId,
+        layers: L,
+    ) -> Result<(Self, Recovery), ChronicleError> {
+        Self::open_inner(dir.as_ref(), coord, id, warden, layers, true)
+    }
+
+    fn open_inner(
+        dir: &Path,
+        coord: Arc<dyn Coord>,
+        id: ChronicleId,
+        warden: WardenId,
+        layers: L,
+        continue_gap: bool,
+    ) -> Result<(Self, Recovery), ChronicleError> {
         let lock = lock_dir(dir)?;
 
         let epoch = coord.transfer(id, warden).map_err(ChronicleError::Coord)?;
         let head = coord.head(id).map_err(ChronicleError::Coord)?;
 
-        let seg_path = dir.join(SEGMENT_FILE);
-        let (segment, seg_recovery) = if seg_path.exists() {
-            Segment::open(&seg_path, head)?
-        } else if head.lsn == Lsn::new(0) {
-            (Segment::create(&seg_path, id, Position::GENESIS)?, segment::Recovery::default())
-        } else {
-            return Err(ChronicleError::MissingSegment { anchored: head.lsn });
+        let files = list_segments(dir)?;
+        let (closed, segment, seg_recovery) = match files.split_last() {
+            None if head.lsn == Lsn::new(0) => {
+                let seg = Segment::create(dir.join(SEGMENT_FILE), id, Position::GENESIS)?;
+                (Vec::new(), seg, segment::Recovery::default())
+            }
+            None => return Err(ChronicleError::MissingSegment { anchored: head.lsn }),
+            Some((last, older)) => {
+                let mut closed = older.iter().map(Segment::open_closed).collect::<Result<Vec<_>, _>>()?;
+                let local = Segment::peek_tail(last)?;
+                if continue_gap && local.lsn < head.lsn {
+                    // The head's records are not here.  Cut any torn tail,
+                    // close this file, and start the continuation at the head.
+                    let at = ChronicleHead { lsn: local.lsn, hash: local.hash, epoch };
+                    let (_, rec) = Segment::open(last, at)?;
+                    closed.push(Segment::open_closed(last)?);
+                    let seg = Segment::create(dir.join(segment_name(head.lsn)), id, Position::from(head))?;
+                    (closed, seg, rec)
+                } else {
+                    let (seg, rec) = Segment::open(last, head)?;
+                    (closed, seg, rec)
+                }
+            }
         };
+        for seg in closed.iter().chain(std::iter::once(&segment)) {
+            if seg.chronicle() != id {
+                return Err(ChronicleError::SegmentsDisagree { at: seg.base().lsn, why: "another Chronicle's segment" });
+            }
+        }
+        let pending = check_joints(&closed, &segment)?;
 
-        // Accepted record hashes, by lsn, as the segment now holds them.
-        let mut accepted: HashMap<Lsn, HashVal> =
-            segment.frames()?.into_iter().map(|f| (f.envelope.lsn, f.envelope.hash)).collect();
-        accepted.insert(segment.base().lsn, segment.base().hash);
+        let mut chronicle = Self {
+            id,
+            warden,
+            epoch,
+            coord,
+            closed,
+            segment,
+            layers,
+            last_seal: None,
+            health: Health::Live,
+            _lock: lock,
+        };
+        let mut gap = None;
+        if let Some(kept) = pending {
+            let resumes = chronicle.segment.base();
+            if !continue_gap {
+                return Err(ChronicleError::GapPending { kept: kept.lsn, head: resumes.lsn });
+            }
+            // Only what was shipped may be kept: rebirth rebuilds the log
+            // from the packs up to the shipped anchor, which the fenced
+            // previous holder can no longer move.
+            if chronicle.coord.shipped(id).map_err(ChronicleError::Coord)? != kept {
+                return Err(ChronicleError::SegmentsDisagree {
+                    at: resumes.lsn,
+                    why: "the log kept before the gap does not end at the shipped anchor",
+                });
+            }
+            chronicle.append(
+                Stream::Ctl,
+                Payload::Gap(GapRecord { kept: kept.lsn, kept_hash: kept.hash, resumes: resumes.lsn, resumes_hash: resumes.hash }),
+            )?;
+            gap = Some((kept, resumes));
+        }
+
+        // Accepted record hashes, by lsn, across every segment (which
+        // together start at genesis: check_joints).
+        let accepted: HashMap<Lsn, HashVal> =
+            chronicle.frames()?.into_iter().map(|f| (f.envelope.lsn, f.envelope.hash)).collect();
 
         let mut orphan_layers = Vec::new();
         let mut last_seal = None;
         // A layer is a Seal iff the accepted record at its lsn has its hash.
         // Past the head there is no accepted record, so that case is
-        // covered too.  Layers before the segment's base cannot be checked
-        // here and are left alone.
-        for (lsn, hash) in layers.list().map_err(ChronicleError::Layer)? {
-            if lsn < segment.base().lsn {
-                continue;
-            }
+        // covered too.
+        for (lsn, hash) in chronicle.layers.list().map_err(ChronicleError::Layer)? {
             if accepted.get(&lsn) == Some(&hash) {
                 last_seal = Some(Position { lsn, hash });
             } else {
-                layers.destroy(lsn).map_err(ChronicleError::Layer)?;
+                chronicle.layers.destroy(lsn).map_err(ChronicleError::Layer)?;
                 orphan_layers.push(lsn);
             }
         }
-
-        let recovery = Recovery {
-            epoch,
-            head,
-            segment: seg_recovery,
-            orphan_layers,
-            last_seal,
-        };
-        let chronicle = Self {
-            id,
-            warden,
-            epoch,
-            coord,
-            segment,
-            layers,
-            last_seal,
-            health: Health::Live,
-            _lock: lock,
-        };
+        chronicle.last_seal = last_seal;
+        let head = chronicle.coord.head(id).map_err(ChronicleError::Coord)?;
+        let recovery = Recovery { epoch, head, segment: seg_recovery, orphan_layers, last_seal, gap };
         Ok((chronicle, recovery))
     }
 
@@ -431,9 +548,19 @@ impl<L: Layers> Chronicle<L> {
         self.last_seal
     }
 
-    /// The local segment, for reading.
+    /// The newest local segment: the one being written.
     pub fn segment(&self) -> &Segment {
         &self.segment
+    }
+
+    /// Every local record, oldest first, across all segment files.  After
+    /// a gap the records jump from the kept lsn to the Gap record.
+    pub fn frames(&self) -> Result<Vec<Frame>, SegmentError> {
+        let mut out = Vec::new();
+        for seg in self.closed.iter().chain(std::iter::once(&self.segment)) {
+            out.extend(seg.frames()?);
+        }
+        Ok(out)
     }
 
     /// The layer store.
@@ -524,6 +651,69 @@ fn lock_dir(dir: &Path) -> Result<File, ChronicleError> {
     }
 }
 
+/// The segment files in `dir`, ordered by base lsn.  Any other file whose
+/// name starts with `seg-` is refused rather than skipped.
+fn list_segments(dir: &Path) -> Result<Vec<PathBuf>, ChronicleError> {
+    let io = |e| ChronicleError::Segment(SegmentError::Io(e));
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(io)? {
+        let name = entry.map_err(io)?.file_name();
+        let Some(name) = name.to_str().map(str::to_owned) else { continue };
+        let Some(digits) = name.strip_prefix(SEGMENT_PREFIX) else { continue };
+        let base = (digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+            .ok_or_else(|| ChronicleError::BadSegmentName(name.clone()))?;
+        found.push((base, dir.join(&name)));
+    }
+    found.sort();
+    Ok(found.into_iter().map(|(_, p)| p).collect())
+}
+
+/// Check that the segments form one chain.  The first starts at genesis;
+/// each later one either starts where the one before ends, or starts
+/// further on (at the anchored head of a takeover after a gap) and opens
+/// with a Gap record naming exactly both ends.
+///
+/// Returns the kept position if the newest segment is such a continuation
+/// whose Gap record is not written yet.
+fn check_joints(closed: &[Segment], newest: &Segment) -> Result<Option<Position>, ChronicleError> {
+    let disagree = |at: Lsn, why| ChronicleError::SegmentsDisagree { at, why };
+    let first = closed.first().unwrap_or(newest);
+    if first.base() != Position::GENESIS {
+        return Err(disagree(first.base().lsn, "the first segment does not start at genesis"));
+    }
+    let mut pending = None;
+    let all: Vec<&Segment> = closed.iter().chain(std::iter::once(newest)).collect();
+    for pair in all.windows(2) {
+        let (prev, next) = (pair[0], pair[1]);
+        let (kept, resumes) = (prev.tail(), next.base());
+        if resumes == kept {
+            continue;
+        }
+        if resumes.lsn <= kept.lsn {
+            return Err(disagree(resumes.lsn, "it starts inside the one before"));
+        }
+        let frames = next.frames()?;
+        let Some(first) = frames.first() else {
+            // Only the newest can be empty: a continuation not yet begun.
+            if std::ptr::eq(next, newest) {
+                pending = Some(kept);
+                continue;
+            }
+            return Err(disagree(resumes.lsn, "an empty segment after a gap"));
+        };
+        let gap = (first.envelope.stream == Stream::Ctl)
+            .then(|| Payload::decode(&first.payload).ok())
+            .flatten();
+        let want = GapRecord { kept: kept.lsn, kept_hash: kept.hash, resumes: resumes.lsn, resumes_hash: resumes.hash };
+        if gap != Some(Payload::Gap(want)) {
+            return Err(disagree(resumes.lsn, "it skips records without a Gap record"));
+        }
+    }
+    Ok(pending)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -532,6 +722,7 @@ mod tests {
     use crate::coordinator::Coordinator;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
+    use std::io::Write;
     use std::rc::Rc;
 
     /// In-memory layers; clones share the same "dataset".
@@ -896,6 +1087,237 @@ mod tests {
             Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
             Err(ChronicleError::MissingSegment { .. })
         ));
+    }
+
+    // ── several segments; takeover after a gap ──────────────────────
+
+    /// Node A writes `n` records and ships the first `shipped` of them;
+    /// node B's directory gets a log with exactly those (as rebirth
+    /// rebuilds it from the packs).  Returns (A's chronicle, B's dir).
+    fn shipped_elsewhere(e: &Env, n: u8, shipped: u64) -> (Chronicle<FakeLayers>, PathBuf) {
+        let mut a = e.create();
+        for k in 1..=n {
+            a.append(Stream::Fs, raw(k)).unwrap();
+        }
+        let frames = a.frames().unwrap();
+        let to = Position { lsn: Lsn::new(shipped), hash: frames[shipped as usize - 1].envelope.hash };
+        e.coord.advance_shipped(A, cid(), a.epoch(), to).unwrap();
+        let b_dir = e.dir.parent().unwrap().join("node-b");
+        std::fs::create_dir(&b_dir).unwrap();
+        let mut seg = Segment::create(b_dir.join(SEGMENT_FILE), cid(), Position::GENESIS).unwrap();
+        for f in &frames[..shipped as usize] {
+            seg.append(&f.envelope, &f.payload).unwrap();
+        }
+        (a, b_dir)
+    }
+
+    fn open_b(e: &Env, dir: &Path, layers: FakeLayers) -> Result<(Chronicle<FakeLayers>, Recovery), ChronicleError> {
+        Chronicle::open_after_gap(dir, e.coord.clone(), cid(), B, layers)
+    }
+
+    fn lsns(c: &Chronicle<FakeLayers>) -> Vec<u64> {
+        c.frames().unwrap().iter().map(|f| f.envelope.lsn.get()).collect()
+    }
+
+    #[test]
+    fn takeover_after_a_gap_continues_from_the_head() {
+        let e = env();
+        let (mut a, b_dir) = shipped_elsewhere(&e, 5, 3);
+        let head = e.coord.head(cid()).unwrap();
+        let kept = e.coord.shipped(cid()).unwrap();
+        // A crash on B tore the log's tail; that is cut, not refused.
+        let seg0 = b_dir.join(SEGMENT_FILE);
+        std::fs::OpenOptions::new().append(true).open(&seg0).unwrap().write_all(&[7; 20]).unwrap();
+
+        let (mut b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
+        assert_eq!(r.gap, Some((kept, Position::from(head))));
+        assert_eq!(r.segment.invalid_bytes, 20);
+        assert_eq!(b.segment().path(), b_dir.join(segment_name(Lsn::new(5))));
+        b.append(Stream::Fs, raw(9)).unwrap();
+        assert_eq!(lsns(&b), vec![1, 2, 3, 6, 7]);
+        let gap = &b.frames().unwrap()[3];
+        assert_eq!(gap.envelope.stream, Stream::Ctl);
+        assert_eq!(gap.envelope.prev, head.hash);
+        assert_eq!(
+            Payload::decode(&gap.payload).unwrap(),
+            Payload::Gap(GapRecord { kept: kept.lsn, kept_hash: kept.hash, resumes: head.lsn, resumes_hash: head.hash })
+        );
+        assert_eq!(Position::from(e.coord.head(cid()).unwrap()), b.tail());
+        // The old holder is fenced.
+        assert!(matches!(a.append(Stream::Fs, raw(1)), Err(ChronicleError::Refused(_))));
+
+        // Both opens read the joined files back the same way.
+        drop(b);
+        let (b, r) = Chronicle::open(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default()).unwrap();
+        assert_eq!((lsns(&b), r.gap), (vec![1, 2, 3, 6, 7], None));
+        drop(b);
+        let (b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
+        assert_eq!((lsns(&b), r.gap), (vec![1, 2, 3, 6, 7], None));
+    }
+
+    #[test]
+    fn interrupted_takeover_is_finished_only_by_open_after_gap() {
+        let e = env();
+        let (_a, b_dir) = shipped_elsewhere(&e, 5, 3);
+        let head = e.coord.head(cid()).unwrap();
+        // Crash after the continuation file was created, before its Gap record.
+        Segment::create(b_dir.join(segment_name(head.lsn)), cid(), Position::from(head)).unwrap();
+        assert!(matches!(
+            Chronicle::open(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default()),
+            Err(ChronicleError::GapPending { kept, head: h }) if kept == Lsn::new(3) && h == head.lsn
+        ));
+        let (b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
+        assert_eq!(r.gap.map(|(k, _)| k.lsn), Some(Lsn::new(3)));
+        assert_eq!(lsns(&b), vec![1, 2, 3, 6]);
+    }
+
+    #[test]
+    fn a_gap_must_start_at_the_shipped_anchor() {
+        let e = env();
+        let (a, b_dir) = shipped_elsewhere(&e, 5, 3);
+        // B holds one record less than was shipped.
+        let two = a.frames().unwrap()[1].envelope.hash;
+        let at_two = ChronicleHead { lsn: Lsn::new(2), hash: two, epoch: a.epoch() };
+        Segment::open(b_dir.join(SEGMENT_FILE), at_two).unwrap();
+        let head = e.coord.head(cid()).unwrap();
+        assert!(matches!(
+            open_b(&e, &b_dir, FakeLayers::default()),
+            Err(ChronicleError::SegmentsDisagree { at, .. }) if at == head.lsn
+        ));
+        // Nothing was accepted past the head.
+        assert_eq!(e.coord.head(cid()).unwrap().lsn, head.lsn);
+    }
+
+    #[test]
+    fn open_after_gap_without_a_gap_is_a_plain_open() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        drop(c);
+        let (c, r) = open_b(&e, &e.dir, e.layers.clone()).unwrap();
+        assert_eq!((lsns(&c), r.gap), (vec![1], None));
+        assert_eq!(list_segments(&e.dir).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn last_seal_is_found_in_a_closed_segment() {
+        let e = env();
+        let mut a = e.create();
+        a.append(Stream::Fs, raw(1)).unwrap();
+        let s = seal(&mut a, 1).unwrap();
+        a.append(Stream::Fs, raw(2)).unwrap();
+        a.append(Stream::Fs, raw(3)).unwrap();
+        e.coord.advance_shipped(A, cid(), a.epoch(), s.seal).unwrap();
+        let b_dir = e.dir.parent().unwrap().join("node-b");
+        std::fs::create_dir(&b_dir).unwrap();
+        let mut seg = Segment::create(b_dir.join(SEGMENT_FILE), cid(), Position::GENESIS).unwrap();
+        for f in &a.frames().unwrap()[..2] {
+            seg.append(&f.envelope, &f.payload).unwrap();
+        }
+        drop(seg);
+        // B's layers hold the Seal (rebirth received it) and an orphan.
+        let layers = FakeLayers::default();
+        layers.snaps.borrow_mut().insert(s.seal.lsn, s.seal.hash);
+        layers.snaps.borrow_mut().insert(Lsn::new(3), HashVal::from_bytes([9; 32]));
+        let (b, r) = open_b(&e, &b_dir, layers.clone()).unwrap();
+        assert_eq!(b.last_seal(), Some(s.seal));
+        assert_eq!(r.orphan_layers, vec![Lsn::new(3)]);
+        assert_eq!(layers.snaps(), vec![(s.seal.lsn, s.seal.hash)]);
+    }
+
+    #[test]
+    fn a_torn_closed_segment_is_refused() {
+        let e = env();
+        let (_a, b_dir) = shipped_elsewhere(&e, 5, 3);
+        drop(open_b(&e, &b_dir, FakeLayers::default()).unwrap());
+        let seg0 = b_dir.join(SEGMENT_FILE);
+        std::fs::OpenOptions::new().append(true).open(&seg0).unwrap().write_all(&[7; 20]).unwrap();
+        assert!(matches!(
+            open_b(&e, &b_dir, FakeLayers::default()),
+            Err(ChronicleError::Segment(SegmentError::ClosedTorn { invalid_bytes: 20 }))
+        ));
+    }
+
+    #[test]
+    fn another_chronicles_segment_is_refused() {
+        let e = env();
+        drop(e.create());
+        let seg0 = e.dir.join(SEGMENT_FILE);
+        std::fs::remove_file(&seg0).unwrap();
+        Segment::create(&seg0, ChronicleId::from_bytes([6; 16]), Position::GENESIS).unwrap();
+        assert!(matches!(
+            Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
+            Err(ChronicleError::SegmentsDisagree { why: "another Chronicle's segment", .. })
+        ));
+    }
+
+    #[test]
+    fn a_misnamed_segment_file_is_refused() {
+        let e = env();
+        drop(e.create());
+        std::fs::write(e.dir.join("seg-12"), b"").unwrap();
+        assert!(matches!(
+            Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
+            Err(ChronicleError::BadSegmentName(n)) if n == "seg-12"
+        ));
+    }
+
+    /// Joint checks on segment files built directly.
+    #[test]
+    fn segments_join_only_end_to_start_or_through_a_gap_record() {
+        let root = tempfile::tempdir().unwrap();
+        let rec = |prev: Position, stream, payload| {
+            Record::new(cid(), BranchId::TRUNK, Epoch::new(1), stream, prev.lsn.next(), prev.hash, payload)
+        };
+        let mut n = 0;
+        // A segment from `base` holding `payloads`.
+        let mut seg = |base: Position, payloads: Vec<(Stream, Payload)>| {
+            n += 1;
+            let mut s = Segment::create(root.path().join(format!("s{n}")), cid(), base).unwrap();
+            for (stream, p) in payloads {
+                let r = rec(s.tail(), stream, p);
+                s.append(&r.envelope, &r.payload.canon_bytes()).unwrap();
+            }
+            s
+        };
+        let first = seg(Position::GENESIS, vec![(Stream::Fs, raw(1)), (Stream::Fs, raw(2))]);
+        let kept = first.tail();
+        let far = Position { lsn: Lsn::new(9), hash: HashVal::from_bytes([3; 32]) };
+        let gap = |k: Position, r: Position| {
+            (Stream::Ctl, Payload::Gap(GapRecord { kept: k.lsn, kept_hash: k.hash, resumes: r.lsn, resumes_hash: r.hash }))
+        };
+        let why = |r: Result<Option<Position>, ChronicleError>| match r {
+            Err(ChronicleError::SegmentsDisagree { why, .. }) => why,
+            other => panic!("expected disagreement, got {other:?}"),
+        };
+
+        // End to start; a gap with its record; a continuation not begun.
+        let next = seg(kept, vec![(Stream::Fs, raw(3))]);
+        assert_eq!(check_joints(std::slice::from_ref(&first), &next).unwrap(), None);
+        let cont = seg(far, vec![gap(kept, far), (Stream::Fs, raw(4))]);
+        assert_eq!(check_joints(std::slice::from_ref(&first), &cont).unwrap(), None);
+        let empty = seg(far, vec![]);
+        assert_eq!(check_joints(std::slice::from_ref(&first), &empty).unwrap(), Some(kept));
+
+        // Refusals.
+        let not_genesis = seg(kept, vec![]);
+        assert_eq!(why(check_joints(&[], &not_genesis)), "the first segment does not start at genesis");
+        let inside = seg(Position { lsn: Lsn::new(1), hash: HashVal::from_bytes([1; 32]) }, vec![]);
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &inside)), "it starts inside the one before");
+        let same_lsn = seg(Position { lsn: kept.lsn, hash: HashVal::from_bytes([1; 32]) }, vec![]);
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &same_lsn)), "it starts inside the one before");
+        let no_record = seg(far, vec![(Stream::Fs, raw(4))]);
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &no_record)), "it skips records without a Gap record");
+        let wrong_kept = seg(far, vec![gap(Position { lsn: Lsn::new(1), hash: kept.hash }, far)]);
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_kept)), "it skips records without a Gap record");
+        let wrong_resumes =
+            seg(far, vec![gap(kept, Position { lsn: far.lsn, hash: HashVal::from_bytes([4; 32]) })]);
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_resumes)), "it skips records without a Gap record");
+        let gap_on_fs = seg(far, vec![(Stream::Fs, gap(kept, far).1)]);
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &gap_on_fs)), "it skips records without a Gap record");
+        let empty_middle = seg(far, vec![]);
+        let after = seg(far, vec![(Stream::Fs, raw(5))]);
+        assert_eq!(why(check_joints(&[first, empty_middle], &after)), "an empty segment after a gap");
     }
 
     // ── unknown outcomes (remote coordinator) ───────────────────────
