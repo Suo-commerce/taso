@@ -28,6 +28,12 @@
 //!   ([`Session::with_watch`]): sampled at `TurnEnd`, sampled again once
 //!   the layer is frozen; if a database moved in between, the layer is
 //!   destroyed, no Seal exists, and the reply is `sealed: None`.
+//! - **After each Seal** an [`AfterSeal`] hook runs, if one is given
+//!   ([`Session::with_after_seal`]): the daemon publishes the Seal there
+//!   (ships it and advances the shipped anchor).  Its failure does not
+//!   undo the Seal, which is accepted and stays; it is counted
+//!   ([`Session::after_seal_failures`]) and the next Seal's publish ships
+//!   from the last one that was named, so nothing is skipped for good.
 //! - A malformed body is answered with `Malformed` and the connection
 //!   continues (the frame boundary is intact); a broken frame or a socket
 //!   error ends the connection.
@@ -37,7 +43,8 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::Duration;
 use std::path::{Path, PathBuf};
 
 use taso_core::envelope::{Lsn, Stream};
@@ -49,10 +56,18 @@ use taso_field::protocol::{
 use crate::chronicle::{ChronicleError, Layers};
 use crate::effects::Effects;
 use crate::quiesce::{verify, Watch};
+use crate::segment::Position;
 use crate::vessel::{Vessel, VesselError};
 use taso_field::adapter::Call;
 
 // ── Session ─────────────────────────────────────────────────────────
+
+/// What runs after each Seal a session takes (the daemon: publish it).
+pub trait AfterSeal<L: Layers> {
+    /// `seal` was just accepted on `vessel`.  An error is reported, not
+    /// fatal: the Seal stands.
+    fn after_seal(&mut self, vessel: &mut Vessel<L>, seal: Position) -> Result<(), String>;
+}
 
 /// One conversation with a Vessel's harness.
 pub struct Session<'v, L: Layers> {
@@ -69,6 +84,11 @@ pub struct Session<'v, L: Layers> {
     effects: Option<&'v mut Effects>,
     /// The databases whose quiescence is verified at each Seal.
     watch: Option<Watch>,
+    /// Runs after each Seal.
+    after_seal: Option<&'v mut dyn AfterSeal<L>>,
+    /// How many times it failed, and the last reason.
+    after_seal_failures: u64,
+    last_after_seal_error: Option<String>,
 }
 
 impl<'v, L: Layers> Session<'v, L> {
@@ -106,6 +126,9 @@ impl<'v, L: Layers> Session<'v, L> {
             next_verdict: first_verdict,
             effects: None,
             watch: None,
+            after_seal: None,
+            after_seal_failures: 0,
+            last_after_seal_error: None,
         })
     }
 
@@ -119,6 +142,17 @@ impl<'v, L: Layers> Session<'v, L> {
     pub fn with_watch(mut self, watch: Watch) -> Self {
         self.watch = Some(watch);
         self
+    }
+
+    /// Run `hook` after each Seal.
+    pub fn with_after_seal(mut self, hook: &'v mut dyn AfterSeal<L>) -> Self {
+        self.after_seal = Some(hook);
+        self
+    }
+
+    /// How many times the after-Seal hook failed, and the last reason.
+    pub fn after_seal_failures(&self) -> (u64, Option<&str>) {
+        (self.after_seal_failures, self.last_after_seal_error.as_deref())
     }
 
     /// The last turn sealed, if any.
@@ -201,6 +235,12 @@ impl<'v, L: Layers> Session<'v, L> {
         match self.vessel.seal_checked(cut, verdict.clone(), self.ledger, TurnId::new(turn), check) {
             Ok(sealed) => {
                 self.last_sealed_turn = Some(turn);
+                if let Some(hook) = self.after_seal.as_deref_mut() {
+                    if let Err(e) = hook.after_seal(self.vessel, sealed.seal) {
+                        self.after_seal_failures += 1;
+                        self.last_after_seal_error = Some(e);
+                    }
+                }
                 Reply::TurnEnd { turn, sealed: Some(sealed.seal.lsn.get()) }
             }
             Err(VesselError::Chronicle(ChronicleError::CheckFailed(_))) => {
@@ -307,6 +347,31 @@ impl FieldSocket {
     pub fn serve_session<L: Layers>(&self, session: &mut Session<'_, L>) -> io::Result<Ended> {
         let (mut stream, _) = self.listener.accept()?;
         Ok(serve(&mut stream, session))
+    }
+
+    /// Wait for a connection, checking `stop` every `poll`.  `None` once
+    /// `stop` says so with nobody connecting.  The connection is blocking.
+    pub fn accept_until(&self, stop: &dyn Fn() -> bool, poll: Duration) -> io::Result<Option<UnixStream>> {
+        self.listener.set_nonblocking(true)?;
+        let got = loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => break Ok(Some(stream)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if stop() {
+                        break Ok(None);
+                    }
+                    std::thread::sleep(poll);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => break Err(e),
+            }
+        };
+        self.listener.set_nonblocking(false)?;
+        let stream = got?;
+        if let Some(s) = &stream {
+            s.set_nonblocking(false)?;
+        }
+        Ok(stream)
     }
 }
 
@@ -416,6 +481,72 @@ mod tests {
             })
             .collect();
         assert_eq!(verdicts, vec![Verdict::Unverified("recovered: 1 group dropped".into()), Verdict::Clean]);
+    }
+
+    /// Records the Seals it was called for; fails when told to.
+    struct Hook {
+        seen: Vec<Position>,
+        fail: bool,
+    }
+
+    impl<L: Layers> AfterSeal<L> for Hook {
+        fn after_seal(&mut self, vessel: &mut Vessel<L>, seal: Position) -> Result<(), String> {
+            assert_eq!(vessel.last_seal(), Some(seal), "called with the Seal just taken");
+            self.seen.push(seal);
+            if self.fail {
+                Err("store down".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn the_hook_runs_after_each_seal_and_its_failure_does_not_undo_it() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut hook = Hook { seen: Vec::new(), fail: false };
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_after_seal(&mut hook);
+        s.handle(hello());
+        assert_eq!(s.handle(Request::TurnEnd { turn: 1, quiescent: false }), Reply::TurnEnd { turn: 1, sealed: None });
+        assert_eq!(s.handle(Request::TurnEnd { turn: 1, quiescent: true }), Reply::TurnEnd { turn: 1, sealed: Some(2) });
+        assert_eq!(s.after_seal_failures(), (0, None));
+        drop(s);
+        assert_eq!(hook.seen.iter().map(|p| p.lsn.get()).collect::<Vec<_>>(), vec![2], "not for the unsealed turn");
+
+        hook.fail = true;
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_after_seal(&mut hook);
+        s.handle(hello());
+        assert_eq!(s.handle(Request::TurnEnd { turn: 2, quiescent: true }), Reply::TurnEnd { turn: 2, sealed: Some(3) });
+        assert_eq!(s.after_seal_failures(), (1, Some("store down")));
+        drop(s);
+        assert_eq!(v.last_seal().unwrap().lsn, Lsn::new(3), "the Seal stands");
+    }
+
+    #[test]
+    fn accept_until_stops_and_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = FieldSocket::bind(dir.path().join("f.sock")).unwrap();
+        let polls = std::cell::Cell::new(0);
+        let none = sock
+            .accept_until(&|| { polls.set(polls.get() + 1); polls.get() > 2 }, Duration::from_millis(1))
+            .unwrap();
+        assert!(none.is_none());
+        assert_eq!(polls.get(), 3);
+        let _client = UnixStream::connect(sock.path()).unwrap();
+        let mut got = sock.accept_until(&|| false, Duration::from_millis(1)).unwrap().unwrap();
+        // The connection serves a session as from serve_session.
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        let mut client = _client;
+        taso_field::protocol::send_request(&mut client, &hello()).unwrap();
+        drop(client.shutdown(std::net::Shutdown::Write));
+        assert!(matches!(serve(&mut got, &mut s), Ended::Closed));
+        assert_eq!(
+            recv_reply(&mut client).unwrap(),
+            Some(Reply::Hello { version: VERSION, last_sealed_turn: None })
+        );
     }
 
     #[test]
