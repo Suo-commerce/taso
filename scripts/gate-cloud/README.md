@@ -52,3 +52,28 @@ ls -l /run/taso/coord.sock
 set -a; . /root/taso-s3.env; set +a
 cd /root/taso && cargo test -p taso-warden round_trip_on_garage -- --ignored
 ```
+
+## Running the gates
+
+Node A drives both gates.  For P2 it reaches node B over ssh on the
+private network; give taso-a a key that taso-b accepts:
+
+```
+# on taso-a
+ssh-keygen -t ed25519 -N '' -f /root/.ssh/id_ed25519 && cat /root/.ssh/id_ed25519.pub
+# on taso-b: append that line to /root/.ssh/authorized_keys
+# on taso-a, once, to accept B's host key:
+ssh root@<taso-b private ip> true
+```
+
+Then, on taso-a, each run starting with the branch it tests:
+
+```
+cd /root/taso && git checkout <branch> && git pull
+# P2: SIGSTOP the Warden on A, rebirth on B, 20 rounds
+TASO_ZFS_DATASET=taso/vessel B_HOST=root@<taso-b private ip> N=20 scripts/gate-p2.sh
+# P1: p64 on A's NVMe, 10 runs, publishing to Garage through the hub
+TASO_ZFS_DATASET=taso/vessel HUB=1 RUNS=10 scripts/gate-p1.sh
+```
+
+Results land in `/root/taso-gate-p{1,2}-<time>/summary.txt`.

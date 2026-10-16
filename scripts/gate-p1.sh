@@ -15,7 +15,8 @@
 #           on the host: the same writes with no Warden, no container.
 #   warden  taso-wardend with $P Vessels (fresh subjects each run), each
 #           running taso-sim under runc (+ the Landlock shim if LANDLOCK=1);
-#           every Seal is published to a local store.
+#           every Seal is published (a local store directory, or Garage
+#           with HUB=1).
 # Then it pools every commit latency (bare and warden separately) and every
 # seal.total sample across runs, and prints the three gate lines.
 #
@@ -31,6 +32,10 @@
 #   SYNC (normal)       SQLite synchronous= for both bare and warden
 #   LANDLOCK (1)        run the agent through taso-landlock
 #   BATCHED (1)         batched Seal snapshots
+#   HUB (0)             1: the hub's coordinator (/run/taso/coord.sock) and
+#                       Garage (/root/taso-s3.env), as on the gate machines
+#                       (gate-cloud/node-setup.sh); 0: an in-process
+#                       coordinator and a local store directory
 #   OUT (/root/taso-gate-p1-<time>)   results directory (kept)
 #   KEEP (0)            keep the datasets and work dir for inspection
 
@@ -46,6 +51,7 @@ ROW_BYTES=${ROW_BYTES:-512}
 SYNC=${SYNC:-normal}
 LANDLOCK=${LANDLOCK:-1}
 BATCHED=${BATCHED:-1}
+HUB=${HUB:-0}
 KEEP=${KEEP:-0}
 OUT=${OUT:-/root/taso-gate-p1-$(date +%Y%m%d-%H%M%S)}
 
@@ -75,6 +81,20 @@ cleanup() {
 trap cleanup EXIT
 
 SIM_ARGS=(--turns "$TURNS" --txns "$TXNS" --rows "$ROWS" --row-bytes "$ROW_BYTES" --synchronous "$SYNC")
+
+if [ "$HUB" = 1 ]; then
+    [ -S /run/taso/coord.sock ] && [ -f /root/taso-s3.env ] || { echo "HUB=1 needs /run/taso/coord.sock and /root/taso-s3.env" >&2; exit 2; }
+    # shellcheck disable=SC1091
+    set -a; . /root/taso-s3.env; set +a
+    (umask 077; printf %s "$TASO_S3_SECRET" > "$WORK/s3.secret")
+    COORD_JSON='{"remote": "/run/taso/coord.sock"}'
+    STORE_JSON=$(python3 -c "import json; print(json.dumps({'s3': {'endpoint': '$TASO_S3_ENDPOINT', 'bucket': '$TASO_S3_BUCKET', 'access_key_id': '$TASO_S3_KEY_ID', 'secret_key_file': '$WORK/s3.secret'}}))")
+    PREFIX="gate-p1-$$"
+else
+    COORD_JSON="{\"local\": \"$WORK/coord.redb\"}"
+    STORE_JSON="\"$WORK/store\""
+    PREFIX="vessels"
+fi
 
 # ── rootfs: taso-sim, taso-landlock and their libraries ───────────────
 ROOTFS=$WORK/rootfs
@@ -119,10 +139,11 @@ cfg, r = sys.argv[1], sys.argv[2]
 args = ["/usr/bin/taso-sim"] + "${SIM_ARGS[*]}".split() + ["--samples", "/work/samples", "--stats", "/work/sim-stats.json"]
 json.dump({
     "warden": 1,
-    "coordinator": {"local": "$WORK/coord.redb"},
+    "coordinator": json.loads('$COORD_JSON'),
     "root": "$root",
     "state_dir": "$WORK/w-$r/state",
-    "store": "$WORK/store",
+    "store": json.loads('$STORE_JSON'),
+    "prefix": "$PREFIX",
     "run_dir": "$WORK/w-$r/run",
     "batched_snapshots": "$BATCHED" == "1",
     "runtime": {
@@ -196,4 +217,6 @@ print(f"1. SIGBUS: {sigbus} (failed agents: {failed}) -> {'PASS' if ok1 else 'FA
 print(f"2. write p95 warden/bare: {ratio:.2f} (<= 1.5) -> {'PASS' if ok2 else 'FAIL'}")
 print(f"3. Seal p95: {q(seals, .95):.1f} ms (< 50) -> {'PASS' if ok3 else 'FAIL'}")
 PY
+if [ "$HUB" = 1 ]; then where="hub coordinator over the network, Garage store"; else where="in-process coordinator, local store directory"; fi
+echo "coordinator and store: $where" | tee -a "$OUT/summary.txt"
 echo "results in $OUT"
