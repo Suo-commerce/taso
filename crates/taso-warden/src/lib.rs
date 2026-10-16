@@ -19,6 +19,7 @@ pub mod quiesce;
 pub mod rebirth;
 pub mod runtime;
 pub mod segment;
+pub mod snapbatch;
 pub mod ship;
 pub mod timing;
 mod bench;
