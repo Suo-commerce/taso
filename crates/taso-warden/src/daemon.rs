@@ -371,10 +371,16 @@ pub fn verdict_after_rebirth(r: &Reborn) -> Verdict {
     }
 }
 
-/// The runc container id of a Vessel.
-pub fn container_id(id: ChronicleId) -> String {
+/// The runc container id of a Vessel run by `warden`.  The Warden is in
+/// it because runc derives the container's cgroup from the id: a
+/// Vessel's old container (its Warden frozen or cut off, the agent still
+/// alive) must not share a cgroup with the one its new holder starts.  On
+/// one machine they would collide; across machines it says who ran it.
+/// The Vessel part comes first, so the hostname (the id's first 12
+/// characters) stays the same across holders.
+pub fn container_id(id: ChronicleId, warden: WardenId) -> String {
     let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    format!("taso-{hex}")
+    format!("taso-{hex}-w{}", warden.get())
 }
 
 fn id_hex(id: ChronicleId) -> String {
@@ -595,7 +601,7 @@ impl Node {
             .map_err(io("field socket owner"))?;
 
         let spec = VesselSpec {
-            id: container_id(id),
+            id: container_id(id, self.config.warden),
             rootfs: rt.rootfs.clone(),
             work: mount.clone(),
             socket: socket.path().to_path_buf(),
@@ -798,9 +804,14 @@ mod tests {
     }
 
     #[test]
-    fn container_ids_are_per_vessel_and_valid() {
-        let a = container_id(ChronicleId::from_bytes([0xab; 16]));
-        assert_eq!(a, format!("taso-{}", "ab".repeat(16)));
-        assert_ne!(a, container_id(ChronicleId::from_bytes([0xac; 16])));
+    fn container_ids_are_per_vessel_and_warden() {
+        let (v, w) = (ChronicleId::from_bytes([0xab; 16]), WardenId::new(1));
+        let a = container_id(v, w);
+        assert_eq!(a, format!("taso-{}-w1", "ab".repeat(16)));
+        assert_ne!(a, container_id(ChronicleId::from_bytes([0xac; 16]), w));
+        let b = container_id(v, WardenId::new(2));
+        assert_ne!(a, b, "a new holder never reuses the old holder's container (cgroup)");
+        assert_eq!(a[..12], b[..12], "the hostname part is the Vessel's");
+        assert!(a.len() <= 128 && a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
     }
 }
