@@ -330,11 +330,52 @@ impl Coordinator {
         Ok(coord)
     }
 
+    // ── internals ───────────────────────────────────────────────────
+
+    /// Run `f` in one write transaction, committed with fsync on `Ok` and
+    /// aborted on `Err`.
+    fn write<T>(
+        &self,
+        f: impl FnOnce(&mut Rows<'_>) -> Result<T, CoordError>,
+    ) -> Result<T, CoordError> {
+        let mut txn = self.db.begin_write().map_err(storage)?;
+        // Immediate is redb's default; stated so it cannot drift.
+        txn.set_durability(Durability::Immediate).map_err(storage)?;
+        let out = {
+            let mut rows = txn.open_table(CHRONICLES).map_err(storage)?;
+            f(&mut rows)
+        };
+        match out {
+            Ok(v) => {
+                txn.commit().map_err(storage)?;
+                Ok(v)
+            }
+            Err(e) => {
+                txn.abort().map_err(storage)?;
+                Err(e)
+            }
+        }
+    }
+
+    fn read(&self, chronicle: ChronicleId) -> Result<State, CoordError> {
+        let txn = self.db.begin_read().map_err(storage)?;
+        let rows = txn.open_table(CHRONICLES).map_err(storage)?;
+        let guard = rows
+            .get(*chronicle.as_bytes())
+            .map_err(storage)?
+            .ok_or(CoordError::UnknownChronicle(chronicle))?;
+        State::decode(chronicle, guard.value())
+    }
+}
+
+/// The redb coordinator.  Each method is one `redb` write (or read)
+/// transaction, committed with fsync before it returns.
+impl Coord for Coordinator {
     /// Register a fresh Chronicle with its first holder.
     ///
     /// Epoch is [`Epoch::FIRST`], the head and the sealed prefix are the
     /// genesis head (lsn 0, [`HashVal::GENESIS`]).  Returns that head.
-    pub fn register(
+    fn register(
         &self,
         chronicle: ChronicleId,
         holder: WardenId,
@@ -374,7 +415,7 @@ impl Coordinator {
     ///
     /// The coordinator re-validates ownership on every append; there is no
     /// separate heartbeat (v0.4 §8.7).
-    pub fn append(
+    fn append(
         &self,
         warden: WardenId,
         envelope: &Envelope,
@@ -424,7 +465,7 @@ impl Coordinator {
     /// Transferring to the current holder is allowed: a restarted Warden
     /// takes a new epoch so that anything its previous incarnation still
     /// has in flight is fenced.
-    pub fn transfer(
+    fn transfer(
         &self,
         chronicle: ChronicleId,
         new_holder: WardenId,
@@ -442,71 +483,13 @@ impl Coordinator {
     }
 
     /// Current ownership of a Chronicle.
-    pub fn ownership(&self, chronicle: ChronicleId) -> Result<Ownership, CoordError> {
+    fn ownership(&self, chronicle: ChronicleId) -> Result<Ownership, CoordError> {
         Ok(self.read(chronicle)?.ownership())
     }
 
     /// The anchored head of a Chronicle (the authority, not a cache).
-    pub fn head(&self, chronicle: ChronicleId) -> Result<ChronicleHead, CoordError> {
-        Ok(self.read(chronicle)?.head)
-    }
-
-    // ── internals ───────────────────────────────────────────────────
-
-    /// Run `f` in one write transaction, committed with fsync on `Ok` and
-    /// aborted on `Err`.
-    fn write<T>(
-        &self,
-        f: impl FnOnce(&mut Rows<'_>) -> Result<T, CoordError>,
-    ) -> Result<T, CoordError> {
-        let mut txn = self.db.begin_write().map_err(storage)?;
-        // Immediate is redb's default; stated so it cannot drift.
-        txn.set_durability(Durability::Immediate).map_err(storage)?;
-        let out = {
-            let mut rows = txn.open_table(CHRONICLES).map_err(storage)?;
-            f(&mut rows)
-        };
-        match out {
-            Ok(v) => {
-                txn.commit().map_err(storage)?;
-                Ok(v)
-            }
-            Err(e) => {
-                txn.abort().map_err(storage)?;
-                Err(e)
-            }
-        }
-    }
-
-    fn read(&self, chronicle: ChronicleId) -> Result<State, CoordError> {
-        let txn = self.db.begin_read().map_err(storage)?;
-        let rows = txn.open_table(CHRONICLES).map_err(storage)?;
-        let guard = rows
-            .get(*chronicle.as_bytes())
-            .map_err(storage)?
-            .ok_or(CoordError::UnknownChronicle(chronicle))?;
-        State::decode(chronicle, guard.value())
-    }
-}
-
-/// The inherent methods stay for now, so existing callers holding
-/// `Arc<Coordinator>` compile without importing the trait; they go once
-/// those callers hold `Arc<dyn Coord>`.
-impl Coord for Coordinator {
-    fn register(&self, chronicle: ChronicleId, holder: WardenId) -> Result<ChronicleHead, CoordError> {
-        Coordinator::register(self, chronicle, holder)
-    }
-    fn append(&self, warden: WardenId, envelope: &Envelope) -> Result<ChronicleHead, CoordError> {
-        Coordinator::append(self, warden, envelope)
-    }
-    fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
-        Coordinator::transfer(self, chronicle, new_holder)
-    }
-    fn ownership(&self, chronicle: ChronicleId) -> Result<Ownership, CoordError> {
-        Coordinator::ownership(self, chronicle)
-    }
     fn head(&self, chronicle: ChronicleId) -> Result<ChronicleHead, CoordError> {
-        Coordinator::head(self, chronicle)
+        Ok(self.read(chronicle)?.head)
     }
 }
 

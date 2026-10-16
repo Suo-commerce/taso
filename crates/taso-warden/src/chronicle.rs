@@ -5,12 +5,14 @@
 //! # Append
 //!
 //! Build the record at `tail + 1` under our epoch → [`Segment::append`]
-//! (fsync) → [`Coordinator::append`] (CAS).  A refused CAS cuts the frame
+//! (fsync) → [`Coord::append`] (CAS).  A refused CAS cuts the frame
 //! off again and **fences** the Chronicle: a refusal means our view of the
 //! head is no longer the coordinator's, so this Warden may not write
-//! again.  A coordinator *storage* failure leaves it unknown whether the
-//! CAS landed; the Chronicle is **poisoned** and must be reopened, and
-//! recovery against the anchored head settles it either way.
+//! again.  A failure whose outcome is unknown ([`CoordError::outcome_unknown`]:
+//! storage, a corrupt row, a lost connection to a remote coordinator)
+//! leaves it unknown whether the CAS landed; the frame is kept, the
+//! Chronicle is **poisoned** and must be reopened, and recovery against
+//! the anchored head settles it either way.
 //!
 //! # Seal
 //!
@@ -33,7 +35,7 @@
 //! # Open
 //!
 //! Opening is a claim of ownership.  [`Chronicle::open`] first takes a new
-//! epoch with [`Coordinator::transfer`], so a previous incarnation still
+//! epoch with [`Coord::transfer`], so a previous incarnation still
 //! alive somewhere is fenced *before* anything is read; then recovers the
 //! segment against the anchored head; then destroys orphan snapshots.
 //! Who may call `open` is decided above this module (rebirth, P2).
@@ -61,7 +63,7 @@ use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, 
 use taso_core::model::WardenId;
 use taso_core::record::{LayerRef, Payload, Record, SealRecord, StreamCut, TurnId, Verdict};
 
-use crate::coordinator::{CoordError, Coordinator};
+use crate::coordinator::{Coord, CoordError};
 use crate::segment::{self, Position, Segment, SegmentError};
 use crate::zfs::{Cli, Dataset, Runner, Zfs};
 
@@ -239,7 +241,7 @@ pub struct Chronicle<L: Layers> {
     id: ChronicleId,
     warden: WardenId,
     epoch: Epoch,
-    coord: Arc<Coordinator>,
+    coord: Arc<dyn Coord>,
     segment: Segment,
     layers: L,
     last_seal: Option<Position>,
@@ -252,7 +254,7 @@ impl<L: Layers> Chronicle<L> {
     /// it.  `dir` must exist; it holds the segment and the lock.
     pub fn create(
         dir: impl AsRef<Path>,
-        coord: Arc<Coordinator>,
+        coord: Arc<dyn Coord>,
         id: ChronicleId,
         warden: WardenId,
         layers: L,
@@ -269,7 +271,7 @@ impl<L: Layers> Chronicle<L> {
     /// orphan layers.
     pub fn open(
         dir: impl AsRef<Path>,
-        coord: Arc<Coordinator>,
+        coord: Arc<dyn Coord>,
         id: ChronicleId,
         warden: WardenId,
         mut layers: L,
@@ -462,7 +464,8 @@ impl<L: Layers> Chronicle<L> {
         self.segment.append(&rec.envelope, &rec.payload.canon_bytes())?;
         match self.coord.append(self.warden, &rec.envelope) {
             Ok(head) => Ok(head),
-            Err(e @ (CoordError::Storage(_) | CoordError::Corrupt { .. })) => {
+            // The CAS may have landed: keep the frame, let reopen decide.
+            Err(e) if e.outcome_unknown() => {
                 self.health = Health::Poisoned;
                 Err(ChronicleError::Coord(e))
             }
@@ -499,6 +502,7 @@ fn lock_dir(dir: &Path) -> Result<File, ChronicleError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::Coordinator;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -555,7 +559,7 @@ mod tests {
 
     struct Env {
         _root: tempfile::TempDir,
-        coord: Arc<Coordinator>,
+        coord: Arc<dyn Coord>,
         dir: PathBuf,
         layers: FakeLayers,
     }
@@ -828,6 +832,142 @@ mod tests {
             Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
             Err(ChronicleError::MissingSegment { .. })
         ));
+    }
+
+    // ── unknown outcomes (remote coordinator) ───────────────────────
+
+    /// Applies every request; when armed, reports the next append's
+    /// answer as lost (as a connection dropping after the CAS).
+    struct LoseAnswer {
+        inner: Coordinator,
+        lose_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl Coord for LoseAnswer {
+        fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+            self.inner.register(c, h)
+        }
+        fn append(&self, w: WardenId, e: &taso_core::envelope::Envelope) -> Result<ChronicleHead, CoordError> {
+            let r = self.inner.append(w, e);
+            if self.lose_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(CoordError::Unavailable(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            r
+        }
+        fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+            self.inner.transfer(c, h)
+        }
+        fn ownership(&self, c: ChronicleId) -> Result<taso_core::model::Ownership, CoordError> {
+            self.inner.ownership(c)
+        }
+        fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
+            self.inner.head(c)
+        }
+    }
+
+    /// The CAS landed but the answer was lost.  The Chronicle must keep
+    /// the frame (it is accepted) and be poisoned, not fenced; reopen
+    /// finds it accepted and carries on after it.
+    #[test]
+    fn lost_answer_after_cas_keeps_the_frame() {
+        let root = tempfile::tempdir().unwrap();
+        let coord = Arc::new(LoseAnswer {
+            inner: Coordinator::open(root.path().join("coord.redb")).unwrap(),
+            lose_next: false.into(),
+        });
+        let dir = root.path().join("vessel");
+        std::fs::create_dir(&dir).unwrap();
+        let layers = FakeLayers::default();
+        let (mut c, _) = Chronicle::create(&dir, coord.clone(), cid(), A, layers.clone()).unwrap();
+        c.append(Stream::Fs, raw(1)).unwrap();
+
+        coord.lose_next.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = c.append(Stream::Fs, raw(2)).unwrap_err();
+        assert!(matches!(err, ChronicleError::Coord(CoordError::Unavailable(_))), "{err}");
+        assert!(!c.is_fenced(), "an unknown outcome is not a refusal");
+        assert_eq!(c.tail().lsn, Lsn::new(2), "the frame is kept");
+        assert_eq!(coord.head(cid()).unwrap().lsn, Lsn::new(2), "the CAS did land");
+        assert!(matches!(c.append(Stream::Fs, raw(3)), Err(ChronicleError::Poisoned)));
+        assert!(matches!(seal(&mut c, 1), Err(ChronicleError::Poisoned)));
+        assert!(layers.snaps().is_empty());
+        drop(c);
+
+        let (mut c, r) = Chronicle::open(&dir, coord.clone(), cid(), A, layers).unwrap();
+        assert_eq!(r.segment.unaccepted_frames, 0);
+        assert_eq!(c.tail().lsn, Lsn::new(2));
+        assert_eq!(c.append(Stream::Fs, raw(3)).unwrap().lsn, Lsn::new(3));
+    }
+
+    fn socket_env() -> (tempfile::TempDir, PathBuf, PathBuf, crate::coordsrv::Server) {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("coord.redb");
+        let sock = root.path().join("coord.sock");
+        let server = spawn_server(&sock, &db);
+        (root, db, sock, server)
+    }
+
+    fn spawn_server(sock: &Path, db: &Path) -> crate::coordsrv::Server {
+        crate::coordsrv::Server::spawn(sock, Arc::new(Coordinator::open(db).unwrap())).unwrap()
+    }
+
+    fn remote(sock: &Path) -> Arc<dyn Coord> {
+        Arc::new(crate::coordsrv::RemoteCoord::with_timeout(sock, std::time::Duration::from_secs(5)))
+    }
+
+    /// The coordinator process goes away during an append: the Chronicle
+    /// is poisoned with the frame kept and takes no Seal; after a restart,
+    /// reopen finds the frame unaccepted, cuts it, and carries on.
+    #[test]
+    fn coordinator_gone_mid_append_poisons_then_recovers() {
+        let (root, db, sock, server) = socket_env();
+        let coord = remote(&sock);
+        let dir = root.path().join("vessel");
+        std::fs::create_dir(&dir).unwrap();
+        let layers = FakeLayers::default();
+        let (mut c, _) = Chronicle::create(&dir, coord.clone(), cid(), A, layers.clone()).unwrap();
+        c.append(Stream::Fs, raw(1)).unwrap();
+
+        server.stop();
+        let err = c.append(Stream::Fs, raw(2)).unwrap_err();
+        assert!(matches!(err, ChronicleError::Coord(CoordError::Unavailable(_))), "{err}");
+        assert!(!c.is_fenced());
+        assert_eq!(c.tail().lsn, Lsn::new(2), "the frame is kept until recovery decides");
+        assert!(matches!(seal(&mut c, 1), Err(ChronicleError::Poisoned)));
+        assert!(layers.snaps().is_empty());
+        drop(c);
+
+        let _server = spawn_server(&sock, &db);
+        let (mut c, r) = Chronicle::open(&dir, coord, cid(), A, layers).unwrap();
+        assert_eq!(r.segment.unaccepted_frames, 1);
+        assert_eq!(c.tail().lsn, Lsn::new(1));
+        assert_eq!(c.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
+        seal(&mut c, 1).unwrap();
+    }
+
+    /// Two incarnations, each with its own connection to one coordinator
+    /// process (the P2 topology): the newer one fences the older.
+    #[test]
+    fn new_incarnation_fences_the_old_one_over_the_socket() {
+        let (root, _db, sock, _server) = socket_env();
+        let dir_a = root.path().join("vessel-a");
+        let dir_b = root.path().join("vessel-b");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        let layers_a = FakeLayers::default();
+        let (mut a, _) = Chronicle::create(&dir_a, remote(&sock), cid(), A, layers_a.clone()).unwrap();
+        a.append(Stream::Fs, raw(1)).unwrap();
+        let a_len = std::fs::metadata(a.segment().path()).unwrap().len();
+
+        std::fs::copy(a.segment().path(), dir_b.join(SEGMENT_FILE)).unwrap();
+        let (mut b, rb) = Chronicle::open(&dir_b, remote(&sock), cid(), B, FakeLayers::default()).unwrap();
+        assert_eq!(rb.head.lsn, Lsn::new(1));
+
+        assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
+        assert!(a.is_fenced());
+        assert_eq!(std::fs::metadata(a.segment().path()).unwrap().len(), a_len);
+        assert!(matches!(seal(&mut a, 1), Err(ChronicleError::Fenced)));
+        assert!(layers_a.snaps().is_empty());
+        assert_eq!(b.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
     }
 
     // ── on a real pool ──────────────────────────────────────────────

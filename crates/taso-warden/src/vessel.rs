@@ -56,7 +56,7 @@ use taso_core::record::{
 };
 
 use crate::chronicle::{Chronicle, ChronicleError, LayerError, Layers, Recovery, Sealed, ZfsLayers};
-use crate::coordinator::{CoordError, Coordinator};
+use crate::coordinator::{Coord, CoordError};
 use crate::segment::{Frame, Position};
 use crate::zfs::{Dataset, DatasetInfo, Runner, Zfs};
 
@@ -226,7 +226,7 @@ fn pool_err(e: LayerError) -> VesselError {
 /// Everything a Warden needs to birth and open Vessels on one node.
 pub struct Host<P: Pool> {
     /// The coordinator.
-    pub coord: Arc<Coordinator>,
+    pub coord: Arc<dyn Coord>,
     /// The dataset pool.
     pub pool: P,
     /// Parent dataset of every Vessel dataset.
@@ -720,6 +720,7 @@ fn hex(id: &ChronicleId) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::coordinator::Coordinator;
     use std::cell::RefCell;
     use std::rc::Rc;
     use taso_core::record::{
