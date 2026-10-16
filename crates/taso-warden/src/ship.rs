@@ -156,9 +156,11 @@ impl ObjectStore for LocalStore {
 
 /// Produces send streams.
 pub trait Sender {
-    /// The stream of `dataset@<to>`, incremental from `@<from>` if given.
-    /// The reader fails, rather than ends, if the stream is incomplete.
-    fn send(&self, dataset: &Dataset, from: Option<Lsn>, to: Lsn) -> io::Result<ByteStream>;
+    /// The stream of `dataset@<to>`, incremental from the snapshot `from`
+    /// (a full snapshot name: an earlier Seal of `dataset`, or the parent
+    /// Seal snapshot `dataset` is a clone of) if given, else full.  The
+    /// reader fails, rather than ends, if the stream is incomplete.
+    fn send(&self, dataset: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream>;
 }
 
 /// [`Sender`] running `zfs send`.
@@ -174,11 +176,11 @@ impl Default for ZfsSend {
 }
 
 impl Sender for ZfsSend {
-    fn send(&self, dataset: &Dataset, from: Option<Lsn>, to: Lsn) -> io::Result<ByteStream> {
+    fn send(&self, dataset: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream> {
         let mut cmd = Command::new(&self.program);
         cmd.arg("send");
         if let Some(f) = from {
-            cmd.arg("-i").arg(format!("@{}", crate::zfs::snap_name(f)));
+            cmd.arg("-i").arg(f);
         }
         cmd.arg(dataset.seal_snapshot(to));
         let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
