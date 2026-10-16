@@ -121,6 +121,17 @@ to the decision lists in the session handoffs.
     is off the agent's turn latency. A failed publish is handled as in
     amendment 15.
 
+19. **A Seal before a gap stays navigable** (2026-10-16). The Navigator
+    accepts a jump in lsn only at a Gap record on `ctl` that names the
+    record before it and its own `prev` (the rule of the segment joints).
+    Nothing lost in a gap authorized a sent effect (it is shipped and
+    anchored before the send), so a Seal before the gap is judged as
+    usual: an outcome lost in the gap is `MissingOutcome` until the new
+    holder reconciles it. No new reason is added to v0.4 §6. A cut
+    position or `ledger_pos` inside a gap is not present and is
+    `IncompleteState(CutInvalid)`; the first Seal after a gap is
+    `Unverified`, as before.
+
 ### Amendments already applied from the Phase 4 plan
 
 12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
