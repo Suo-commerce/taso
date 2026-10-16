@@ -111,8 +111,7 @@ impl<P: Pool> Host<P> {
 
         // 3. The dataset.
         let dataset = self.dataset_for(id);
-        let here: Vec<(Lsn, taso_core::envelope::HashVal)> =
-            self.pool.layers(&dataset).list().map_err(VesselError::Pool)?;
+        let here = self.seals_here(&dataset)?;
         let named: Vec<(Lsn, taso_core::envelope::HashVal)> =
             chain.seals.iter().map(|s| (s.fs.to.lsn, s.fs.to.hash)).collect();
         if let Some(stray) = here.iter().find(|s| !named.contains(s)) {
@@ -180,10 +179,18 @@ impl<P: Pool> Host<P> {
         Ok((vessel, reborn))
     }
 
+    /// The Seal snapshots of `dataset` on this node; none if the dataset is
+    /// not here (`zfs list` fails on a dataset that does not exist).
+    fn seals_here(&self, dataset: &crate::zfs::Dataset) -> Result<Vec<(Lsn, taso_core::envelope::HashVal)>, VesselError> {
+        if self.pool.info(dataset).map_err(VesselError::Pool)?.is_none() {
+            return Ok(Vec::new());
+        }
+        self.pool.layers(dataset).list().map_err(VesselError::Pool)
+    }
+
     /// The parent's Seal snapshot must be on this node with its hash.
     fn parent_present(&self, parent: &ParentSeal) -> Result<(), VesselError> {
-        let layers = self.pool.layers(&self.dataset_for(parent.chronicle)).list().map_err(VesselError::Pool)?;
-        if layers.contains(&(parent.seal, parent.seal_hash)) {
+        if self.seals_here(&self.dataset_for(parent.chronicle))?.contains(&(parent.seal, parent.seal_hash)) {
             Ok(())
         } else {
             Err(VesselError::ParentMissing(*parent))

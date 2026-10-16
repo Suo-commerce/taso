@@ -1097,8 +1097,10 @@ pub(crate) mod tests {
             Ok(())
         }
         fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
+            // As `zfs list`: a dataset that does not exist is an error.
             let p = self.pool.0.borrow();
-            Ok(p.get(&self.ds).map(|d| d.snaps.iter().map(|(&l, &h)| (l, h)).collect()).unwrap_or_default())
+            let d = p.get(&self.ds).ok_or_else(|| format!("{}: dataset does not exist", self.ds))?;
+            Ok(d.snaps.iter().map(|(&l, &h)| (l, h)).collect())
         }
         fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
             if let Some(d) = self.pool.0.borrow_mut().get_mut(&self.ds) {
