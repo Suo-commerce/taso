@@ -583,6 +583,122 @@ impl Canonical for SuccessionRecord {
     }
 }
 
+// ── Gap ─────────────────────────────────────────────────────────────
+
+/// Records `(kept, resumes]` were accepted, but are lost: they were never
+/// shipped before the node that held them was lost (v1.0 §1 P2).
+///
+/// Written by the Warden that takes the Chronicle over, at lsn
+/// `resumes + 1`, chained to `resumes_hash` like any record, so history is
+/// never rewritten: the lost records keep their place and their hashes.
+/// `kept` is the last record the new holder has (the shipped anchor);
+/// everything after the gap continues from `resumes`.  Nothing ever
+/// dispatched an effect from inside a gap: the authorization of every
+/// sent effect is shipped and anchored before the send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GapRecord {
+    /// The last record kept.
+    pub kept: Lsn,
+    /// Its hash.
+    pub kept_hash: HashVal,
+    /// The last record lost: the anchored head at takeover.
+    pub resumes: Lsn,
+    /// Its hash; the gap record's `prev`.
+    pub resumes_hash: HashVal,
+}
+
+impl Canonical for GapRecord {
+    fn canon(&self, out: &mut Canon) {
+        self.kept.canon(out);
+        self.kept_hash.canon(out);
+        self.resumes.canon(out);
+        self.resumes_hash.canon(out);
+    }
+}
+
+// ── FsShipped ───────────────────────────────────────────────────────
+
+/// What a shipped `fs` stream starts from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamBase {
+    /// Nothing: a full stream (a Vessel born from the void) (tag 0).
+    Full,
+    /// This Chronicle's previous shipped Seal (tag 1).
+    Seal {
+        /// Its lsn.
+        lsn: Lsn,
+        /// Its record hash.
+        hash: HashVal,
+    },
+    /// The parent's Seal snapshot this Vessel is a clone of (tag 2).
+    Origin {
+        /// The parent Seal.
+        parent: ParentSeal,
+        /// The ZFS guid of its snapshot.
+        guid: u64,
+    },
+}
+
+impl Canonical for StreamBase {
+    fn canon(&self, out: &mut Canon) {
+        match self {
+            Self::Full => {
+                out.tag(0);
+            }
+            Self::Seal { lsn, hash } => {
+                out.tag(1);
+                lsn.canon(out);
+                hash.canon(out);
+            }
+            Self::Origin { parent, guid } => {
+                out.tag(2);
+                parent.canon(out);
+                out.u64(*guid);
+            }
+        }
+    }
+}
+
+/// The `fs` stream of a Seal was shipped: what it is, and the hash of its
+/// plain bytes (v1.0 §1 P2).
+///
+/// A ZFS send stream lives outside the hash chain, and the guid it carries
+/// can be forged.  Recording the stream's digest in the Chronicle binds the
+/// dataset to the chain: once this record is under the coordinator's
+/// shipped anchor, rebirth rebuilds a dataset from a stream only if it has
+/// exactly this length and hash.  Appended by the holder after the Seal's
+/// pack is put.  A Phase 1 bridge: in the block log, records carry chunk
+/// hashes and the chain covers the data by construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FsShippedRecord {
+    /// The Seal the stream brings the dataset to.
+    pub seal: Lsn,
+    /// That Seal record's hash.
+    pub seal_hash: HashVal,
+    /// What it is incremental from.
+    pub base: StreamBase,
+    /// The ZFS guid of the Seal's snapshot.
+    pub guid: u64,
+    /// The stream's length.
+    pub bytes: u64,
+    /// BLAKE3 (derive-key `taso.fs.stream.v1`) of the stream's plain bytes.
+    pub digest: HashVal,
+}
+
+impl Canonical for FsShippedRecord {
+    fn canon(&self, out: &mut Canon) {
+        self.seal.canon(out);
+        self.seal_hash.canon(out);
+        self.base.canon(out);
+        out.u64(self.guid);
+        out.u64(self.bytes);
+        self.digest.canon(out);
+    }
+}
+
+/// Derive-key domain of [`FsShippedRecord::digest`].
+pub const FS_STREAM_DOMAIN: &str = "taso.fs.stream.v1";
+
 /// Domain string for deriving a Vessel's id.
 const VESSEL_ID_DOMAIN: &str = "taso.vessel.id.v1";
 
@@ -624,6 +740,10 @@ pub enum Payload {
     Lineage(LineageRecord),
     /// A Succession record: the last record of a Chronicle (tag 6).
     Succession(SuccessionRecord),
+    /// A Gap record: lost records before it (tag 7).
+    Gap(GapRecord),
+    /// An FsShipped record: a Seal's `fs` stream is shipped (tag 8).
+    FsShipped(FsShippedRecord),
 }
 
 impl Canonical for Payload {
@@ -636,6 +756,8 @@ impl Canonical for Payload {
             Self::Raw(b)     => { out.tag(4); out.bytes(b); }
             Self::Lineage(r) => { out.tag(5); r.canon(out); }
             Self::Succession(r) => { out.tag(6); r.canon(out); }
+            Self::Gap(r) => { out.tag(7); r.canon(out); }
+            Self::FsShipped(r) => { out.tag(8); r.canon(out); }
         }
     }
 }
@@ -916,6 +1038,51 @@ mod tests {
             payloads.into_iter().map(|p| make_record(p).envelope.hash.to_string()).collect();
         assert_eq!(got, pins);
     }
+
+    /// The two record kinds added after v2 are additive: the existing pins
+    /// above are unchanged, and these pin the new encodings.
+    #[test]
+    fn gap_and_fs_shipped_hashes_are_pinned() {
+        let gap = Payload::Gap(GapRecord {
+            kept: Lsn::new(5),
+            kept_hash: HashVal::from_bytes([5; 32]),
+            resumes: Lsn::new(9),
+            resumes_hash: HashVal::from_bytes([9; 32]),
+        });
+        let fs = |base| {
+            Payload::FsShipped(FsShippedRecord {
+                seal: Lsn::new(12),
+                seal_hash: HashVal::from_bytes([12; 32]),
+                base,
+                guid: 0xDEAD_BEEF,
+                bytes: 4096,
+                digest: HashVal::from_bytes([0xD1; 32]),
+            })
+        };
+        let payloads = [
+            gap,
+            fs(StreamBase::Full),
+            fs(StreamBase::Seal { lsn: Lsn::new(7), hash: HashVal::from_bytes([7; 32]) }),
+            fs(StreamBase::Origin {
+                parent: ParentSeal {
+                    chronicle: ChronicleId::from_bytes([3; 16]),
+                    seal: Lsn::new(40),
+                    seal_hash: HashVal::from_bytes([40; 32]),
+                },
+                guid: 77,
+            }),
+        ];
+        let got: Vec<String> =
+            payloads.into_iter().map(|p| make_record(p).envelope.hash.to_string()).collect();
+        assert_eq!(got, PINS_NEW);
+    }
+
+    const PINS_NEW: [&str; 4] = [
+        "7c4f392fd70a68dcfbb1b8296cbb5da3391d1763687717f48d66dbdb19132b8a",
+        "2ad30a34d7be8a1e1f31f13a6674cf947d7f818e06eb125c9972477b39aeeda8",
+        "ca5a2767568910af62db1d19131cb3f9d913cd6f5337c3c86b8d6e15e6cb6251",
+        "b6edec20cef88108e0f09da199de7dc716c1d24832d3009e27633c54dd306f07",
+    ];
 
     // ── Lineage and succession ──────────────────────────────────────
 
