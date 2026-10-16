@@ -62,17 +62,27 @@
 //!   Its identity is `(base, to, guid)`, not its bytes: ZFS does not
 //!   promise byte-identical streams, and the snapshot guid survives send
 //!   and receive.
+//! - A section is **named** by an `FsShipped` record the holder appends
+//!   after the put ([`SealShipped::record`]): the identity, and the length
+//!   and BLAKE3 of the plain stream, hashed while it was shipped.  Only a
+//!   named section is used, by the reader and by the next Seal, which
+//!   builds on the newest one the local log names.  A section put but
+//!   never named (a crash in between) is shipped again under the same key.
 //!
 //! # Reading back
 //!
 //! [`Packs::chain`] verifies every pack's header and log, merges them by
 //! lsn (an lsn held by two packs must hold the same record), checks the
 //! log is continuous from genesis (through Gap records), that every `fs`
-//! section is anchored in the log, that the first one starts from what the
+//! section an `FsShipped` record names is in a pack and anchored in the
+//! log, that the first one starts from what the
 //! lineage says and the rest form one chain, and, given an
 //! anchor from an authority the store cannot write (the coordinator),
 //! that the chain contains it.  Without an anchor a chain only proves it
 //! is self-consistent: anyone who can write the bucket can build one.
+//! [`Packs::open_fs`] checks a stream against its `FsShipped` record,
+//! which is in the hash chain; the pack trailer only shows the pack is
+//! whole.
 //! With an anchor it returns nothing past it: packs beyond it are still
 //! read, and two that disagree are still a conflict, but a missing lsn
 //! beyond the anchor only ends what is read.
@@ -114,9 +124,9 @@ use std::fmt;
 use std::io::{self, Read};
 
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
-use taso_core::record::{GapRecord, Origin, Payload};
+use taso_core::record::{FsShippedRecord, GapRecord, Origin, ParentSeal, Payload, StreamBase, FS_STREAM_DOMAIN};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use taso_core::envelope::Epoch;
 use taso_core::model::WardenId;
@@ -197,6 +207,30 @@ pub struct Shipped {
     pub fs: Option<FsRef>,
 }
 
+/// An `fs` section named by an `FsShipped` record in the chain: what it is,
+/// and the length and digest of its plain stream, which
+/// [`Packs::open_fs`] checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShippedFs {
+    /// The section.
+    pub fs: FsRef,
+    /// The plain stream's length.
+    pub bytes: u64,
+    /// BLAKE3 (derive-key [`FS_STREAM_DOMAIN`]) of the plain stream.
+    pub digest: HashVal,
+}
+
+/// A Seal pack just put, and the `FsShipped` record that names its `fs`
+/// section.  The caller appends the record: until it is in the chain, the
+/// section is not used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealShipped {
+    /// The pack's header.
+    pub header: PackHeader,
+    /// The record to append.
+    pub record: FsShippedRecord,
+}
+
 /// The verified, merged contents of every pack of a Chronicle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chain {
@@ -207,9 +241,10 @@ pub struct Chain {
     /// The last position: the anchor if one was given, else the last
     /// frame's ([`Position::GENESIS`] if none).
     pub end: Position,
-    /// The shipped `fs` sections up to `end`, in Seal order, forming one
-    /// chain; none whose Seal is lost.
-    pub seals: Vec<FsRef>,
+    /// The `fs` sections up to `end` that an `FsShipped` record in the
+    /// chain names, in Seal order, forming one chain; none whose Seal is
+    /// lost.
+    pub seals: Vec<ShippedFs>,
 }
 
 /// Why packing or reading packs failed.
@@ -253,6 +288,11 @@ pub enum PackError {
     },
     /// The log's first record is not a readable `Lineage` record.
     NoLineage,
+    /// An `FsShipped` record names a section no pack holds.
+    FsMissing {
+        /// The Seal it names.
+        seal: Lsn,
+    },
     /// The chain does not contain the anchor.
     NotAnchored {
         /// The anchor.
@@ -276,6 +316,9 @@ impl fmt::Display for PackError {
             }
             Self::BrokenFsChain { at } => write!(f, "the fs section for Seal {} does not start where it must", at.get()),
             Self::NoLineage => write!(f, "lsn 1 is not a Lineage record"),
+            Self::FsMissing { seal } => {
+                write!(f, "an FsShipped record names the fs of Seal {}, which no pack holds", seal.get())
+            }
             Self::NotAnchored { anchor } => {
                 write!(f, "the shipped chain does not contain lsn {} with hash {}", anchor.lsn.get(), anchor.hash)
             }
@@ -567,11 +610,15 @@ impl PackIn {
 }
 
 /// The de-chunked `fs` stream of a pack; fails at the end unless the
-/// trailer matches and nothing follows it.
+/// trailer matches, nothing follows it, and the plain stream has exactly
+/// the length and digest its `FsShipped` record says.
 struct FsOut {
     pin: PackIn,
     chunk: io::Cursor<Vec<u8>>,
     done: bool,
+    plain: blake3::Hasher,
+    count: u64,
+    expect: (u64, HashVal),
 }
 
 fn bad(why: &str) -> io::Error {
@@ -603,11 +650,65 @@ impl Read for FsOut {
                 if self.pin.r.read(&mut extra)? != 0 {
                     return Err(bad("bytes after the pack's trailer"));
                 }
+                let digest = HashVal::from_bytes(*self.plain.finalize().as_bytes());
+                if (self.count, digest) != self.expect {
+                    return Err(bad("the fs stream does not match its FsShipped record"));
+                }
                 self.done = true;
                 return Ok(0);
             }
-            self.chunk = io::Cursor::new(self.pin.take(len as usize)?);
+            let chunk = self.pin.take(len as usize)?;
+            self.plain.update(&chunk);
+            self.count += chunk.len() as u64;
+            self.chunk = io::Cursor::new(chunk);
         }
+    }
+}
+
+// ── FsShipped ───────────────────────────────────────────────────────
+
+/// Counts and hashes the plain `fs` stream as the pack takes it.  The
+/// result is read only after a successful put, which means the stream was
+/// read to its end.
+struct Digesting {
+    inner: ByteStream,
+    state: Arc<Mutex<(u64, blake3::Hasher)>>,
+}
+
+impl Read for Digesting {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        let mut st = self.state.lock().expect("not poisoned");
+        st.0 += n as u64;
+        st.1.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// The record's form of an `fs` base.
+fn stream_base(b: FsBase) -> StreamBase {
+    match b {
+        FsBase::Full => StreamBase::Full,
+        FsBase::Seal(p) => StreamBase::Seal { lsn: p.lsn, hash: p.hash },
+        FsBase::Origin { chronicle, seal, guid } => {
+            StreamBase::Origin { parent: ParentSeal { chronicle, seal: seal.lsn, seal_hash: seal.hash }, guid }
+        }
+    }
+}
+
+/// Whether `r` names the section `fs`: the same Seal, base and guid.
+fn names(r: &FsShippedRecord, fs: &FsRef) -> bool {
+    r.seal == fs.to.lsn && r.seal_hash == fs.to.hash && r.guid == fs.guid && r.base == stream_base(fs.base)
+}
+
+/// The `FsShipped` record a frame holds, if it is one.
+fn fs_shipped_of(f: &Frame) -> Option<FsShippedRecord> {
+    if f.envelope.stream != Stream::Ctl {
+        return None;
+    }
+    match Payload::decode(&f.payload) {
+        Ok(Payload::FsShipped(r)) => Some(r),
+        _ => None,
     }
 }
 
@@ -883,34 +984,41 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         }
     }
 
-    /// The last shipped `fs` section the local log holds: a store section
-    /// whose Seal a gap swallowed is skipped (it was never anchored, and
-    /// this node has no snapshot of it).  Reads one header per section it
-    /// looks at, newest first.
-    fn fs_base(&self, segments: &[&Segment]) -> Result<Option<FsRef>, PackError> {
-        let mut names: Vec<(String, Name)> = self.names()?.into_iter().filter(|(_, n)| n.fs_to.is_some()).collect();
-        names.sort_by_key(|(_, n)| std::cmp::Reverse(n.fs_to));
-        for (key, name) in names {
-            let to = name.fs_to.expect("filtered");
-            match locate(segments, to) {
-                Spot::Lost { .. } => continue,
-                Spot::Base(i) if i > 0 => continue,
-                Spot::Frame(i) => {
-                    let fs = self.read_header(&key, name)?.fs.expect("a name with an fs Seal has an fs section");
-                    return match local_frame(segments, i, to)? {
-                        Some(f) if f.envelope.hash == fs.to.hash && f.envelope.stream == Stream::Ctl => Ok(Some(fs)),
-                        _ => Err(PackError::Conflict { lsn: to }),
-                    };
-                }
-                _ => {
-                    return Err(PackError::Refused(format!(
-                        "the store holds an fs section for Seal {}, which the local log does not",
-                        to.get()
-                    )))
-                }
+    /// The newest `FsShipped` record in the local log, if any.  Reads the
+    /// segments newest first and stops at the first it finds.
+    fn newest_named(segments: &[&Segment]) -> Result<Option<FsShippedRecord>, PackError> {
+        for seg in segments.iter().rev() {
+            if let Some(r) = seg.frames()?.iter().rev().find_map(fs_shipped_of) {
+                return Ok(Some(r));
             }
         }
         Ok(None)
+    }
+
+    /// The packs holding an `fs` section for the Seal at `to`, with their
+    /// headers.  Reads one header per candidate.
+    fn fs_packs(&self, to: Lsn) -> Result<Vec<(String, Name, PackHeader)>, PackError> {
+        let mut out = Vec::new();
+        for (key, name) in self.names()?.into_iter().filter(|(_, n)| n.fs_to == Some(to)) {
+            let h = self.read_header(&key, name)?;
+            out.push((key, name, h));
+        }
+        Ok(out)
+    }
+
+    /// The `fs` section the next one builds on: the one the newest local
+    /// `FsShipped` record names, which a pack must hold.  A section no
+    /// local record names is never built on: a crash after its put and
+    /// before its record, or a Seal a gap swallowed (it was never
+    /// anchored, and this node has no snapshot of it).
+    fn fs_base(&self, segments: &[&Segment]) -> Result<Option<FsRef>, PackError> {
+        let Some(r) = Self::newest_named(segments)? else { return Ok(None) };
+        self.fs_packs(r.seal)?
+            .into_iter()
+            .filter_map(|(_, _, h)| h.fs)
+            .find(|fs| names(&r, fs))
+            .map(Some)
+            .ok_or(PackError::FsMissing { seal: r.seal })
     }
 
     /// Write one pack; returns its header.
@@ -943,25 +1051,31 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
 
     /// Ship the Seal of `snapshot` (an accepted Seal's layer): the log up
     /// to its record if not shipped yet, and its `fs` stream, in one put.
-    /// `None` if this Seal's `fs` is already shipped.
+    /// Returns the header and the `FsShipped` record the caller must
+    /// append to name the section; `None` if a local `FsShipped` record
+    /// already names this Seal's section.
     ///
-    /// The stream is incremental from the last shipped `fs` Seal the local
-    /// log holds ([`Packs::fs_base`]).  For the first one, the `Lineage`
-    /// record decides: born from the void, a full stream (`origin` must be
-    /// `None`); a fork or a succession, an incremental from the parent's
-    /// Seal snapshot, which the caller passes as `origin` and which must be
-    /// bound to exactly the lineage's parent Seal.  `origin` is refused for
-    /// any later Seal.
+    /// The stream is incremental from the section the newest local
+    /// `FsShipped` record names ([`Packs::fs_base`]).  For the first one,
+    /// the `Lineage` record decides: born from the void, a full stream
+    /// (`origin` must be `None`); a fork or a succession, an incremental
+    /// from the parent's Seal snapshot, which the caller passes as `origin`
+    /// and which must be bound to exactly the lineage's parent Seal.
+    /// `origin` is refused for any later Seal.
+    ///
+    /// If the store already holds an unnamed section for this Seal (a
+    /// crash after the put, before the record), it is shipped again under
+    /// the same key, so a Seal never has two packs.
     pub fn ship_seal(
         &self,
         segments: &[&Segment],
         snapshot: &Snapshot,
         origin: Option<&Snapshot>,
-    ) -> Result<Option<PackHeader>, PackError> {
+    ) -> Result<Option<SealShipped>, PackError> {
         let hash = snapshot.seal_hash.ok_or_else(|| PackError::Refused("the snapshot is not bound to a Seal".into()))?;
         let seal = Position { lsn: snapshot.seal, hash };
-        let shipped_fs = self.fs_base(segments)?;
-        if let Some(f) = shipped_fs {
+        let named = self.fs_base(segments)?;
+        if let Some(f) = named {
             if f.to == seal && f.guid == snapshot.guid {
                 return Ok(None);
             }
@@ -985,7 +1099,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                 seal.lsn.get()
             )));
         }
-        let (base, from_snapshot) = match shipped_fs {
+        let (base, from_snapshot) = match named {
             Some(f) => {
                 if origin.is_some() {
                     return Err(PackError::Refused("an origin is only for a Vessel's first Seal".into()));
@@ -1029,16 +1143,34 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                 }
             }
         };
-        let log_base = self.log_base(segments, self.shipped()?.log)?;
-        let (end, frames) = if seal.lsn > log_base.lsn {
-            (seal, self.frames_after(segments, log_base, seal)?)
-        } else {
-            (log_base, Vec::new())
-        };
         let fs = FsRef { base, to: seal, guid: snapshot.guid };
+        // The log section: the same as an unnamed pack for this Seal (so
+        // the put replaces it), else from where the store's packs end.
+        let (log_base, end) = match self.fs_packs(seal.lsn)?.first() {
+            Some((_, _, h)) => (h.base, h.end),
+            None => {
+                let b = self.log_base(segments, self.shipped()?.log)?;
+                (b, if seal.lsn > b.lsn { seal } else { b })
+            }
+        };
+        let frames = if end.lsn > log_base.lsn { self.frames_after(segments, log_base, end)? } else { Vec::new() };
+        let state = Arc::new(Mutex::new((0u64, blake3::Hasher::new_derive_key(FS_STREAM_DOMAIN))));
         let stream = self.sender.send(&snapshot.dataset, from_snapshot.as_deref(), seal.lsn)?;
-        self.put_pack(PackHeader { chronicle: self.chronicle, base: log_base, end, fs: Some(fs) }, &frames, Some(stream))
-            .map(Some)
+        let stream: ByteStream = Box::new(Digesting { inner: stream, state: state.clone() });
+        let header = self.put_pack(PackHeader { chronicle: self.chronicle, base: log_base, end, fs: Some(fs) }, &frames, Some(stream))?;
+        let (bytes, digest) = {
+            let st = state.lock().expect("not poisoned");
+            (st.0, HashVal::from_bytes(*st.1.finalize().as_bytes()))
+        };
+        let record = FsShippedRecord {
+            seal: seal.lsn,
+            seal_hash: seal.hash,
+            base: stream_base(base),
+            guid: snapshot.guid,
+            bytes,
+            digest,
+        };
+        Ok(Some(SealShipped { header, record }))
     }
 
     /// Verify and merge every pack (see the module docs).  With `anchor`,
@@ -1127,19 +1259,34 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         if let Some(b) = bases.iter().find(|b| !(based(**b) || (anchor.is_some() && b.lsn > tail.lsn))) {
             return Err(PackError::Conflict { lsn: b.lsn });
         }
-        // Every fs section up to the end is anchored in the log; the first
-        // starts from what the lineage says, every later one from the one
-        // before.  A section whose Seal a gap swallowed is skipped.
-        let mut seals = Vec::new();
-        let mut prev: Option<Position> = None;
-        for fs in fs_by_to.values() {
-            if anchor.is_some() && fs.to.lsn > end.lsn {
-                break;
-            }
-            if is_lost(&lost, fs.to.lsn) {
+        // The FsShipped records the chain returns, one per Seal, each after
+        // the Seal it names.  Only a section one of them names is used:
+        // the record is in the hash chain, the pack is not.
+        let mut named: BTreeMap<Lsn, FsShippedRecord> = BTreeMap::new();
+        for (lsn, f) in by_lsn.range(..=end.lsn) {
+            if is_lost(&lost, *lsn) {
                 continue;
             }
-            let is_seal = fs.to.lsn <= tail.lsn
+            if let Some(r) = fs_shipped_of(f) {
+                // A record follows the Seal it names: it cannot hold a later
+                // record's hash, so the Seal check below covers that.
+                match named.get(&r.seal) {
+                    Some(o) if *o != r => return Err(PackError::Conflict { lsn: *lsn }),
+                    Some(_) => {}
+                    None => {
+                        named.insert(r.seal, r);
+                    }
+                }
+            }
+        }
+        // Every named section is in a pack and anchored in the log; the
+        // first starts from what the lineage says, every later one from the
+        // one before.
+        let mut seals = Vec::new();
+        let mut prev: Option<Position> = None;
+        for r in named.values() {
+            let fs = fs_by_to.get(&r.seal).filter(|fs| names(r, fs)).ok_or(PackError::FsMissing { seal: r.seal })?;
+            let is_seal = !is_lost(&lost, fs.to.lsn)
                 && by_lsn
                     .get(&fs.to.lsn)
                     .is_some_and(|f| f.envelope.hash == fs.to.hash && f.envelope.stream == Stream::Ctl);
@@ -1170,22 +1317,31 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                 return Err(PackError::BrokenFsChain { at: fs.to.lsn });
             }
             prev = Some(fs.to);
-            seals.push(*fs);
+            seals.push(ShippedFs { fs: *fs, bytes: r.bytes, digest: r.digest });
         }
         let frames = by_lsn.into_values().filter(|f| f.envelope.lsn <= end.lsn && !is_lost(&lost, f.envelope.lsn)).collect();
         Ok(Chain { frames, end, seals })
     }
 
-    /// The `fs` stream that brings a dataset to the Seal at `to`, read
-    /// from a pack and verified as it is read: the reader fails at the end
-    /// unless the pack matches its trailer.  `None` if no pack has it.
-    pub fn open_fs(&self, to: Lsn) -> Result<Option<(FsRef, ByteStream)>, PackError> {
-        let Some((key, name)) = self.names()?.into_iter().find(|(_, n)| n.fs_to == Some(to)) else {
+    /// The `fs` stream of a named section (from [`Packs::chain`]), read
+    /// from its pack and verified as it is read: the reader fails at the
+    /// end unless the pack matches its trailer and the plain stream has
+    /// the record's length and digest.  `None` if no pack has it.
+    pub fn open_fs(&self, shipped: &ShippedFs) -> Result<Option<ByteStream>, PackError> {
+        let Some((key, name, _)) =
+            self.fs_packs(shipped.fs.to.lsn)?.into_iter().find(|(_, _, h)| h.fs == Some(shipped.fs))
+        else {
             return Ok(None);
         };
-        let (h, _, pin) = self.read_log(&key, name)?;
-        let fs = h.fs.expect("a name with an fs Seal has an fs section");
-        Ok(Some((fs, Box::new(FsOut { pin, chunk: io::Cursor::new(Vec::new()), done: false }))))
+        let (_, _, pin) = self.read_log(&key, name)?;
+        Ok(Some(Box::new(FsOut {
+            pin,
+            chunk: io::Cursor::new(Vec::new()),
+            done: false,
+            plain: blake3::Hasher::new_derive_key(FS_STREAM_DOMAIN),
+            count: 0,
+            expect: (shipped.bytes, shipped.digest),
+        })))
     }
 }
 
@@ -1361,6 +1517,22 @@ mod tests {
         fn at(&self, lsn: u64) -> Position {
             self.pos[lsn as usize]
         }
+        fn tail(&self) -> Position {
+            *self.pos.last().unwrap()
+        }
+        /// What the Warden does at a Seal (3c): ship it, append the
+        /// FsShipped record that names its section, ship the log.
+        fn publish(&mut self, e: &Env, lsn: u64, guid: u64, origin: Option<&Snapshot>) -> Option<SealShipped> {
+            let s = e.packs.ship_seal(&self.segs(), &self.snap(lsn, guid), origin).unwrap()?;
+            let at = self.push_payload(Stream::Ctl, Payload::FsShipped(s.record.clone()));
+            e.packs.ship_log(&self.segs(), at).unwrap();
+            Some(s)
+        }
+        /// Append an FsShipped record naming `fs`, whose plain stream is
+        /// `bytes`.
+        fn name(&mut self, fs: FsRef, bytes: &[u8]) -> Position {
+            self.push_payload(Stream::Ctl, Payload::FsShipped(record_for(fs, bytes)))
+        }
         fn snap(&self, lsn: u64, guid: u64) -> Snapshot {
             Snapshot {
                 dataset: Dataset::new("tank/v").unwrap(),
@@ -1369,6 +1541,17 @@ mod tests {
                 guid,
                 seal_hash: Some(self.at(lsn).hash),
             }
+        }
+    }
+
+    fn record_for(fs: FsRef, bytes: &[u8]) -> FsShippedRecord {
+        FsShippedRecord {
+            seal: fs.to.lsn,
+            seal_hash: fs.to.hash,
+            base: stream_base(fs.base),
+            guid: fs.guid,
+            bytes: bytes.len() as u64,
+            digest: HashVal::from_bytes(blake3::derive_key(FS_STREAM_DOMAIN, bytes)),
         }
     }
 
@@ -1472,8 +1655,12 @@ mod tests {
         fn path(&self, key: &str) -> std::path::PathBuf {
             self.dir.path().join(key)
         }
+        /// The named section for Seal `to`, from the chain.
+        fn shipped(&self, to: u64) -> ShippedFs {
+            *self.packs.chain(None).unwrap().seals.iter().find(|s| s.fs.to.lsn == Lsn::new(to)).expect("named")
+        }
         fn read_fs(&self, to: u64) -> io::Result<Vec<u8>> {
-            let (_, mut r) = self.packs.open_fs(Lsn::new(to)).unwrap().unwrap();
+            let mut r = self.packs.open_fs(&self.shipped(to)).unwrap().unwrap();
             let mut v = Vec::new();
             r.read_to_end(&mut v)?;
             Ok(v)
@@ -1566,21 +1753,25 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(6, &[6]);
-        let h = e.packs.ship_seal(&log.segs(), &log.snap(6, 100), None).unwrap().unwrap();
-        assert_eq!((h.base, h.end), (Position::GENESIS, log.at(6)));
-        assert_eq!(h.fs, Some(FsRef { base: FsBase::Full, to: log.at(6), guid: 100 }));
+        let h = log.publish(&e, 6, 100, None).unwrap();
+        assert_eq!((h.header.base, h.header.end), (Position::GENESIS, log.at(6)));
+        let fs = FsRef { base: FsBase::Full, to: log.at(6), guid: 100 };
+        assert_eq!(h.header.fs, Some(fs));
+        // The record names the section, with the plain stream's length and
+        // digest as shipped.
+        assert_eq!(h.record, record_for(fs, &body(None, Lsn::new(6), 0)));
         assert_eq!(e.read_fs(6).unwrap(), body(None, Lsn::new(6), 0));
         // Again: nothing.
         assert_eq!(e.packs.ship_seal(&log.segs(), &log.snap(6, 100), None).unwrap(), None);
         // A second Seal is incremental from the first.
         log.fill(9, &[6, 9]);
-        let h2 = e.packs.ship_seal(&log.segs(), &log.snap(9, 101), None).unwrap().unwrap();
-        assert_eq!(h2.fs.unwrap().base, FsBase::Seal(log.at(6)));
+        let h2 = log.publish(&e, 9, 101, None).unwrap();
+        assert_eq!(h2.header.fs.unwrap().base, FsBase::Seal(log.at(6)));
         let s6 = "tank/v@taso-seal-00000000000000000006";
         assert_eq!(*e.send.calls.borrow(), vec![(None, Lsn::new(6)), (Some(s6.to_string()), Lsn::new(9))]);
         assert_eq!(e.read_fs(9).unwrap(), body(Some(s6), Lsn::new(9), 0));
-        let c = e.packs.chain(Some(log.at(9))).unwrap();
-        assert_eq!(c.seals.iter().map(|f| f.to.lsn.get()).collect::<Vec<_>>(), vec![6, 9]);
+        let c = e.packs.chain(Some(log.tail())).unwrap();
+        assert_eq!(c.seals.iter().map(|f| f.fs.to.lsn.get()).collect::<Vec<_>>(), vec![6, 9]);
     }
 
     /// The log was shipped past the Seal by a dispatch flush: the Seal
@@ -1591,11 +1782,11 @@ mod tests {
         let mut log = Log::new();
         log.fill(8, &[6]);
         e.packs.ship_log(&log.segs(), log.at(8)).unwrap();
-        let h = e.packs.ship_seal(&log.segs(), &log.snap(6, 5), None).unwrap().unwrap();
-        assert_eq!((h.base, h.end), (log.at(8), log.at(8)));
-        assert_eq!(e.keys().len(), 2);
+        let h = log.publish(&e, 6, 5, None).unwrap();
+        assert_eq!((h.header.base, h.header.end), (log.at(8), log.at(8)));
+        assert_eq!(e.keys().len(), 3, "log, Seal, log with the record");
         let c = e.packs.chain(None).unwrap();
-        assert_eq!((c.end, c.seals.len()), (log.at(8), 1));
+        assert_eq!((c.end, c.seals.len()), (log.at(9), 1));
         assert_eq!(e.read_fs(6).unwrap(), body(None, Lsn::new(6), 0));
     }
 
@@ -1615,7 +1806,7 @@ mod tests {
         assert!(e.keys().is_empty());
         // An older Seal after a newer one.
         log.fill(7, &[4, 7]);
-        e.packs.ship_seal(&log.segs(), &log.snap(7, 2), None).unwrap();
+        log.publish(&e, 7, 2, None).unwrap();
         assert!(matches!(e.packs.ship_seal(&log.segs(), &log.snap(4, 1), None), Err(PackError::Refused(_))));
     }
 
@@ -1672,9 +1863,14 @@ mod tests {
         p.put_pack(PackHeader { chronicle: ID, base: log.at(7), end: log.at(7), fs: Some(fs) }, &[], Some(s1)).unwrap();
         p.put_pack(PackHeader { chronicle: ID, base: log.at(5), end: log.at(7), fs: Some(fs) }, &log.seg.frames().unwrap()[5..7], Some(s2))
             .unwrap();
-        let c = p.chain(Some(log.at(7))).unwrap();
-        assert_eq!(c.frames, log.seg.frames().unwrap());
-        assert_eq!(c.seals, vec![fs]);
+        // The record names the section; either pack's bytes are the same
+        // section, the record holds the digest of one.
+        let at = log.name(fs, &body(None, Lsn::new(6), 1));
+        p.ship_log(&log.segs(), at).unwrap();
+        let c = p.chain(Some(at)).unwrap();
+        assert_eq!(c.frames, log.frames());
+        let one = record_for(fs, &body(None, Lsn::new(6), 1));
+        assert_eq!(c.seals, vec![ShippedFs { fs, bytes: one.bytes, digest: one.digest }]);
         // A different guid for the same Seal is another history.
         let s3: ByteStream = Box::new(io::Cursor::new(body(None, Lsn::new(6), 3)));
         p.put_pack(PackHeader { chronicle: ID, base: log.at(6), end: log.at(7), fs: Some(FsRef { guid: 10, ..fs }) }, &log.seg.frames().unwrap()[6..7], Some(s3))
@@ -1711,19 +1907,19 @@ mod tests {
         assert!(matches!(e.packs.chain(None), Err(PackError::Gap { missing }) if missing == Lsn::new(1)));
     }
 
-    /// An fs section that names a Seal the log does not hold as a Ctl
-    /// record with that hash.
+    /// A named fs section whose Seal the log does not hold as a Ctl record
+    /// with that hash.
     #[test]
     fn fs_ahead_of_the_log_is_refused() {
         let e = env();
         let mut log = Log::new();
         log.fill(6, &[]);
-        let frames = log.seg.frames().unwrap();
         // lsn 6 is a Raw Fs record, not a Seal.
+        let fs = FsRef { base: FsBase::Full, to: log.at(6), guid: 1 };
+        log.name(fs, b"x");
+        let frames = log.frames();
         let s: ByteStream = Box::new(io::Cursor::new(b"x".to_vec()));
-        e.packs
-            .put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: log.at(6), fs: Some(FsRef { base: FsBase::Full, to: log.at(6), guid: 1 }) }, &frames, Some(s))
-            .unwrap();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: log.at(7), fs: Some(fs) }, &frames, Some(s)).unwrap();
         assert!(matches!(e.packs.chain(None), Err(PackError::FsAheadOfLog { to }) if to == Lsn::new(6)));
     }
 
@@ -1732,14 +1928,17 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(9, &[3, 6, 9]);
-        let frames = log.seg.frames().unwrap();
         let s = || -> ByteStream { Box::new(io::Cursor::new(b"x".to_vec())) };
         let p = &e.packs;
-        p.put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: log.at(3), fs: Some(FsRef { base: FsBase::Full, to: log.at(3), guid: 1 }) }, &frames[..3], Some(s()))
-            .unwrap();
+        let f3 = FsRef { base: FsBase::Full, to: log.at(3), guid: 1 };
         // Seal 9 claims to follow Seal 6, which was never shipped.
-        p.put_pack(PackHeader { chronicle: ID, base: log.at(3), end: log.at(9), fs: Some(FsRef { base: FsBase::Seal(log.at(6)), to: log.at(9), guid: 3 }) }, &frames[3..9], Some(s()))
-            .unwrap();
+        let f9 = FsRef { base: FsBase::Seal(log.at(6)), to: log.at(9), guid: 3 };
+        let frames = log.frames();
+        p.put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: log.at(3), fs: Some(f3) }, &frames[..3], Some(s())).unwrap();
+        p.put_pack(PackHeader { chronicle: ID, base: log.at(3), end: log.at(9), fs: Some(f9) }, &frames[3..9], Some(s())).unwrap();
+        log.name(f3, b"x");
+        let at = log.name(f9, b"x");
+        p.ship_log(&log.segs(), at).unwrap();
         assert!(matches!(p.chain(None), Err(PackError::BrokenFsChain { at }) if at == Lsn::new(9)));
     }
 
@@ -1764,7 +1963,7 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(4, &[4]);
-        let h = e.packs.ship_seal(&log.segs(), &log.snap(4, 1), None).unwrap().unwrap();
+        let h = log.publish(&e, 4, 1, None).unwrap().header;
         let path = e.path(&e.packs.key(&h));
         let good = std::fs::read(&path).unwrap();
         let write = |b: &[u8]| std::fs::write(&path, b).unwrap();
@@ -1790,6 +1989,14 @@ mod tests {
 
         write(&good);
         assert_eq!(e.read_fs(4).unwrap(), body(None, Lsn::new(4), 0));
+
+        // A whole, well-formed pack of the same section with other bytes:
+        // the trailer matches, the FsShipped record does not.
+        let other: ByteStream = Box::new(io::Cursor::new(body(None, Lsn::new(4), 9)));
+        e.packs.put_pack(h, &log.seg.frames().unwrap()[..4], Some(other)).unwrap();
+        let err = e.read_fs(4).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("FsShipped"), "{err}");
     }
 
     #[test]
@@ -1821,6 +2028,88 @@ mod tests {
         b[9] ^= 1; // the chronicle id
         std::fs::write(e.path(&key), &b).unwrap();
         assert!(matches!(e.packs.chain(None), Err(PackError::Corrupt { .. })));
+    }
+
+    // ── FsShipped ───────────────────────────────────────────────────
+
+    /// A crash after the Seal pack's put, before its record: the section
+    /// is unnamed, so nothing uses it, and the Seal is shipped again under
+    /// the same key (one pack per Seal).  The next Seal builds on the last
+    /// named one.
+    #[test]
+    fn an_unnamed_section_is_shipped_again_under_the_same_key() {
+        let e = env();
+        let mut log = Log::new();
+        log.fill(3, &[3]);
+        log.publish(&e, 3, 30, None).unwrap();
+        log.fill(6, &[3, 6]);
+        let lost = e.packs.ship_seal(&log.segs(), &log.snap(6, 60), None).unwrap().unwrap(); // the record never made it
+        assert_eq!(e.packs.chain(None).unwrap().seals.len(), 1, "unnamed: not used");
+        let keys = e.keys();
+        // A regenerated stream: other bytes, the same section.
+        e.send.variant.set(7);
+        let again = log.publish(&e, 6, 60, None).unwrap();
+        assert_eq!(again.header, lost.header);
+        assert_ne!(again.record.digest, lost.record.digest);
+        assert_eq!(e.keys().len(), keys.len() + 1, "the Seal pack was replaced; only the log pack is new");
+        let s3 = "tank/v@taso-seal-00000000000000000003";
+        assert_eq!(e.read_fs(6).unwrap(), body(Some(s3), Lsn::new(6), 7));
+        assert_eq!(e.packs.chain(None).unwrap().seals.len(), 2);
+        // A crash after the record, before the log was shipped: nothing to
+        // ship again; the next log ship carries the record.
+        assert_eq!(e.packs.ship_seal(&log.segs(), &log.snap(6, 60), None).unwrap(), None);
+    }
+
+    #[test]
+    fn fs_shipped_records_are_checked() {
+        // Two different records for one Seal.
+        let e = env();
+        let mut log = Log::new();
+        log.fill(3, &[3]);
+        log.publish(&e, 3, 30, None).unwrap();
+        let fs = FsRef { base: FsBase::Full, to: log.at(3), guid: 30 };
+        let at = log.name(fs, b"other bytes");
+        e.packs.ship_log(&log.segs(), at).unwrap();
+        assert!(matches!(e.packs.chain(None), Err(PackError::Conflict { lsn }) if lsn == Lsn::new(5)));
+        // A record whose pack is gone.
+        let e = env();
+        let mut log = Log::new();
+        log.fill(3, &[3]);
+        let h = log.publish(&e, 3, 30, None).unwrap();
+        std::fs::remove_file(e.path(&e.packs.key(&h.header))).unwrap();
+        // The pack held lsns 1..3 too; ship them again as a log pack.
+        e.packs.put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: log.at(3), fs: None }, &log.frames()[..3], None).unwrap();
+        assert!(matches!(e.packs.chain(None), Err(PackError::FsMissing { seal }) if seal == Lsn::new(3)));
+        // A record that does not follow the Seal it names.
+        let e = env();
+        let mut log = Log::new();
+        log.fill(3, &[3]);
+        let ahead = FsRef { base: FsBase::Full, to: Position { lsn: Lsn::new(5), hash: log.at(3).hash }, guid: 1 };
+        let at = log.name(ahead, b"x");
+        e.packs.ship_log(&log.segs(), at).unwrap();
+        assert!(matches!(e.packs.chain(None), Err(PackError::FsMissing { seal }) if seal == Lsn::new(5)));
+        // A record that names the Seal with another hash, or another base,
+        // names no pack's section.
+        for wrong in [
+            FsRef { base: FsBase::Full, to: Position { lsn: Lsn::new(3), hash: HashVal::from_bytes([7; 32]) }, guid: 30 },
+            FsRef { base: FsBase::Seal(Position::GENESIS), to: Position { lsn: Lsn::new(3), hash: HashVal::GENESIS }, guid: 30 },
+        ] {
+            let e = env();
+            let mut log = Log::new();
+            log.fill(3, &[3]);
+            let wrong = FsRef { to: Position { hash: if wrong.to.hash == HashVal::GENESIS { log.at(3).hash } else { wrong.to.hash }, ..wrong.to }, ..wrong };
+            e.packs.ship_seal(&log.segs(), &log.snap(3, 30), None).unwrap().unwrap();
+            let at = log.name(wrong, &body(None, Lsn::new(3), 0));
+            e.packs.ship_log(&log.segs(), at).unwrap();
+            assert!(matches!(e.packs.chain(None), Err(PackError::FsMissing { seal }) if seal == Lsn::new(3)), "{wrong:?}");
+        }
+        // Past the anchor a record names nothing yet.
+        let e = env();
+        let mut log = Log::new();
+        log.fill(3, &[3]);
+        log.publish(&e, 3, 30, None).unwrap();
+        assert!(e.packs.chain(Some(log.at(3))).unwrap().seals.is_empty());
+        assert_eq!(e.packs.chain(Some(log.at(4))).unwrap().seals.len(), 1);
     }
 
     // ── several segments, gaps, unanchored packs ────────────────────
@@ -1911,32 +2200,35 @@ mod tests {
         assert_eq!(e.packs.chain(Some(b.at(9))).unwrap().frames, b.frames());
     }
 
-    /// The gap swallows a Seal: the old Warden shipped Seal 4's pack but
-    /// only lsn 3 was anchored.  B never received Seal 4; its next Seal
-    /// ships from the last Seal it holds (2), and the chain skips Seal 4.
+    /// The gap swallows Seals: the old Warden published Seals 4 and 6 but
+    /// only lsn 3 (the FsShipped record of Seal 2) was anchored.  B never
+    /// received them; its next Seal ships from the last Seal it names (2),
+    /// and the chain skips the swallowed ones.
     #[test]
     fn a_gap_that_swallows_a_seal() {
         let e = env();
         let mut old = Log::new();
-        old.fill(5, &[2, 4, 5]);
-        e.packs.ship_seal(&old.segs(), &old.snap(2, 20), None).unwrap().unwrap();
-        e.packs.ship_log(&old.segs(), old.at(3)).unwrap(); // the anchor
-        // Never anchored: Seal 4 inside the gap, Seal 5 at the old head.
-        e.packs.ship_seal(&old.segs(), &old.snap(4, 40), None).unwrap().unwrap();
-        e.packs.ship_seal(&old.segs(), &old.snap(5, 50), None).unwrap().unwrap();
+        old.fill(2, &[2]);
+        old.publish(&e, 2, 20, None).unwrap(); // record at 3: the anchor
+        old.fill(4, &[2, 4]);
+        old.publish(&e, 4, 40, None).unwrap(); // never anchored
+        old.fill(6, &[2, 4, 6]);
+        old.publish(&e, 6, 60, None).unwrap(); // never anchored; head 7
         let mut b = Log::takeover(&old, 3);
-        b.fill(8, &[8]);
-        let h = e.packs.ship_seal(&b.segs(), &b.snap(8, 80), None).unwrap().unwrap();
-        assert_eq!(h.fs.unwrap().base, FsBase::Seal(old.at(2)));
+        b.fill(10, &[10]);
+        let h = b.publish(&e, 10, 100, None).unwrap();
+        assert_eq!(h.header.fs.unwrap().base, FsBase::Seal(old.at(2)));
+        assert_eq!(h.header.base, old.at(7), "the log starts where the store ends, which B knows by hash");
         let s2 = "tank/v@taso-seal-00000000000000000002".to_string();
-        assert_eq!(e.send.calls.borrow().last().unwrap(), &(Some(s2), Lsn::new(8)));
-        for anchor in [None, Some(b.at(8))] {
+        assert_eq!(e.send.calls.borrow().last().unwrap(), &(Some(s2), Lsn::new(10)));
+        for anchor in [None, Some(b.tail())] {
             let c = e.packs.chain(anchor).unwrap();
-            assert_eq!(Log::lsns(&c.frames), vec![1, 2, 3, 6, 7, 8], "{anchor:?}");
-            assert_eq!(c.seals.iter().map(|f| f.to.lsn.get()).collect::<Vec<_>>(), vec![2, 8]);
+            assert_eq!(Log::lsns(&c.frames), vec![1, 2, 3, 8, 9, 10, 11], "{anchor:?}");
+            assert_eq!(c.seals.iter().map(|f| f.fs.to.lsn.get()).collect::<Vec<_>>(), vec![2, 10]);
         }
+        assert_eq!(e.read_fs(10).unwrap(), body(Some("tank/v@taso-seal-00000000000000000002"), Lsn::new(10), 0));
         // Again: nothing.
-        assert_eq!(e.packs.ship_seal(&b.segs(), &b.snap(8, 80), None).unwrap(), None);
+        assert_eq!(e.packs.ship_seal(&b.segs(), &b.snap(10, 100), None).unwrap(), None);
     }
 
     /// What rebirth reads: up to the anchor and no further.  Packs past it
@@ -1946,26 +2238,28 @@ mod tests {
     fn chain_ends_at_the_anchor() {
         let e = env();
         let mut old = Log::new();
-        old.fill(6, &[2, 5]);
-        e.packs.ship_seal(&old.segs(), &old.snap(2, 1), None).unwrap();
-        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
-        e.packs.ship_seal(&old.segs(), &old.snap(5, 2), None).unwrap();
+        old.fill(2, &[2]);
+        let r2 = old.publish(&e, 2, 1, None).unwrap().record; // record at 3
+        old.fill(5, &[2, 5]);
+        old.publish(&e, 5, 2, None).unwrap(); // record at 6
         let c = e.packs.chain(Some(old.at(3))).unwrap();
         assert_eq!(Log::lsns(&c.frames), vec![1, 2, 3]);
         assert_eq!((c.end, c.seals.len()), (old.at(3), 1));
-        // A hole past the anchor: a pack (6..7] with nothing holding 6.
-        old.fill(7, &[2, 5]);
+        assert_eq!(e.packs.chain(None).unwrap().seals.len(), 2);
+        // A hole past the anchor: a pack (7..8] with nothing holding 7.
+        old.fill(8, &[2, 5]);
         let frames = old.seg.frames().unwrap();
-        e.packs.put_pack(PackHeader { chronicle: ID, base: old.at(6), end: old.at(7), fs: None }, &frames[6..7], None).unwrap();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: old.at(7), end: old.at(8), fs: None }, &frames[7..8], None).unwrap();
         assert_eq!(e.packs.chain(Some(old.at(3))).unwrap().end, old.at(3));
-        assert!(matches!(e.packs.chain(None), Err(PackError::Gap { missing }) if missing == Lsn::new(6)));
+        assert!(matches!(e.packs.chain(None), Err(PackError::Gap { missing }) if missing == Lsn::new(7)));
         // Another history past the anchor is still a conflict.
         let mut other = Log::new();
-        other.fill(3, &[2]);
+        other.fill(2, &[2]);
+        other.push_payload(Stream::Ctl, Payload::FsShipped(r2));
+        assert_eq!(other.at(3), old.at(3));
         other.push(false, 99);
-        other.fill(5, &[2]);
         let of = other.seg.frames().unwrap();
-        e.packs.put_pack(PackHeader { chronicle: ID, base: other.at(3), end: other.at(5), fs: None }, &of[3..5], None).unwrap();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: other.at(3), end: other.at(4), fs: None }, &of[3..4], None).unwrap();
         assert!(matches!(e.packs.chain(Some(old.at(3))), Err(PackError::Conflict { lsn }) if lsn == Lsn::new(4)));
     }
 
@@ -2062,21 +2356,21 @@ mod tests {
         assert!(matches!(p.frames_after(&b.segs(), at(2, b.at(1).hash), b.at(7)), Err(PackError::Refused(_))));
         assert!(matches!(p.frames_after(&b.segs(), at(5, b.at(1).hash), b.at(7)), Err(PackError::Refused(_))));
         assert_eq!(Log::lsns(&p.frames_after(&b.segs(), old.at(3), b.at(7)).unwrap()), vec![6, 7]);
-        // An fs section on a local lsn with another record.
+        // A local FsShipped record whose section no pack holds.
         let e = env();
-        let s = || -> ByteStream { Box::new(io::Cursor::new(b"x".to_vec())) };
-        let frames = other.seg.frames().unwrap();
-        e.packs
-            .put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: other.at(2), fs: Some(FsRef { base: FsBase::Full, to: at(2, b.at(1).hash), guid: 1 }) }, &frames[..2], Some(s()))
-            .unwrap();
-        assert!(matches!(e.packs.fs_base(&b.segs()), Err(PackError::Conflict { .. })));
-        assert!(matches!(e.packs.ship_seal(&b.segs(), &b.snap(8, 1), None), Err(PackError::Conflict { .. })));
-        // An fs section past the local log.
-        let e = env();
-        let mut long = Log::new();
-        long.fill(9, &[9]);
-        e.packs.ship_seal(&long.segs(), &long.snap(9, 1), None).unwrap();
-        assert!(matches!(e.packs.fs_base(&b.segs()), Err(PackError::Refused(_))));
+        let mut log = Log::new();
+        log.fill(3, &[3]);
+        log.publish(&e, 3, 1, None).unwrap();
+        log.fill(6, &[3, 6]);
+        assert!(matches!(env().packs.ship_seal(&log.segs(), &log.snap(6, 2), None), Err(PackError::FsMissing { seal }) if seal == Lsn::new(3)));
+        // Or a pack whose section is another one (another guid).
+        let e2 = env();
+        let mut twin = Log::new();
+        twin.fill(3, &[3]);
+        assert_eq!(twin.at(3), log.at(3));
+        e2.packs.ship_seal(&twin.segs(), &twin.snap(3, 9), None).unwrap().unwrap();
+        assert!(matches!(e2.packs.ship_seal(&log.segs(), &log.snap(6, 2), None), Err(PackError::FsMissing { .. })));
+        assert!(e.packs.ship_seal(&log.segs(), &log.snap(6, 2), None).unwrap().is_some());
     }
 
     #[test]
@@ -2203,13 +2497,14 @@ mod tests {
         let e = env();
         let mut log = Log::fork(parent());
         log.fill(3, &[3]);
-        let h = e.packs.ship_seal(&log.segs(), &log.snap(3, 7), Some(&origin_snap(500))).unwrap().unwrap();
+        let h = log.publish(&e, 3, 7, Some(&origin_snap(500))).unwrap();
         let want = FsBase::Origin {
             chronicle: TPL,
             seal: Position { lsn: Lsn::new(40), hash: HashVal::from_bytes([0x40; 32]) },
             guid: 500,
         };
-        assert_eq!(h.fs.unwrap().base, want);
+        assert_eq!(h.header.fs.unwrap().base, want);
+        assert_eq!(h.record.base, StreamBase::Origin { parent: parent(), guid: 500 });
         assert_eq!(e.send.calls.borrow()[0].0.as_deref(), Some("tank/tpl@taso-seal-00000000000000000040"));
         // Later Seals are incremental from the previous one; no origin then.
         log.fill(6, &[3, 6]);
@@ -2217,10 +2512,10 @@ mod tests {
             e.packs.ship_seal(&log.segs(), &log.snap(6, 8), Some(&origin_snap(500))),
             Err(PackError::Refused(_))
         ));
-        let h2 = e.packs.ship_seal(&log.segs(), &log.snap(6, 8), None).unwrap().unwrap();
-        assert_eq!(h2.fs.unwrap().base, FsBase::Seal(log.at(3)));
-        let c = e.packs.chain(Some(log.at(6))).unwrap();
-        assert_eq!(c.seals.iter().map(|f| f.base).collect::<Vec<_>>(), vec![want, FsBase::Seal(log.at(3))]);
+        let h2 = log.publish(&e, 6, 8, None).unwrap();
+        assert_eq!(h2.header.fs.unwrap().base, FsBase::Seal(log.at(3)));
+        let c = e.packs.chain(Some(log.tail())).unwrap();
+        assert_eq!(c.seals.iter().map(|f| f.fs.base).collect::<Vec<_>>(), vec![want, FsBase::Seal(log.at(3))]);
     }
 
     #[test]
@@ -2267,10 +2562,10 @@ mod tests {
         for (mut log, base, ok) in cases {
             let e = env();
             log.fill(3, &[3]);
-            let frames = log.seg.frames().unwrap();
-            e.packs
-                .put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: log.at(3), fs: Some(FsRef { base, to: log.at(3), guid: 2 }) }, &frames, Some(s()))
-                .unwrap();
+            let fs = FsRef { base, to: log.at(3), guid: 2 };
+            log.name(fs, b"x");
+            let frames = log.frames();
+            e.packs.put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: log.at(4), fs: Some(fs) }, &frames, Some(s())).unwrap();
             let r = e.packs.chain(None);
             if ok {
                 assert!(r.is_ok(), "{base:?}: {r:?}");
@@ -2282,10 +2577,10 @@ mod tests {
         let e = env();
         let mut bare = Log::bare();
         bare.fill(3, &[3]);
-        let frames = bare.seg.frames().unwrap();
-        e.packs
-            .put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: bare.at(3), fs: Some(FsRef { base: FsBase::Full, to: bare.at(3), guid: 2 }) }, &frames, Some(s()))
-            .unwrap();
+        let fs = FsRef { base: FsBase::Full, to: bare.at(3), guid: 2 };
+        bare.name(fs, b"x");
+        let frames = bare.frames();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: bare.at(4), fs: Some(fs) }, &frames, Some(s())).unwrap();
         assert!(matches!(e.packs.chain(None), Err(PackError::NoLineage)));
     }
 
@@ -2338,15 +2633,19 @@ mod tests {
             std::fs::write(mount.join("f"), b"one").unwrap();
             log.fill(3, &[3]);
             let s3 = z.snapshot(&src, Lsn::new(3), log.at(3).hash).unwrap();
+            let store_dir = tempfile::tempdir().unwrap();
+            let packs = Packs::new(LocalStore::new(store_dir.path()), ZfsSend::default(), "vessels", ID).unwrap();
+            // Publish Seal 3: its pack, then the record naming it.
+            let h3 = packs.ship_seal(&log.segs(), &s3, Some(&t40)).unwrap().unwrap();
+            log.push_payload(Stream::Ctl, Payload::FsShipped(h3.record.clone()));
             std::fs::write(mount.join("f"), b"two").unwrap();
             log.fill(7, &[3, 7]);
             let s7 = z.snapshot(&src, Lsn::new(7), log.at(7).hash).unwrap();
-
-            let store_dir = tempfile::tempdir().unwrap();
-            let packs = Packs::new(LocalStore::new(store_dir.path()), ZfsSend::default(), "vessels", ID).unwrap();
-            let h3 = packs.ship_seal(&log.segs(), &s3, Some(&t40)).unwrap().unwrap();
-            packs.ship_seal(&log.segs(), &s7, None).unwrap().unwrap();
-            let pack3 = std::fs::metadata(store_dir.path().join(packs.key(&h3))).unwrap().len();
+            let h7 = packs.ship_seal(&log.segs(), &s7, None).unwrap().unwrap();
+            let end = log.push_payload(Stream::Ctl, Payload::FsShipped(h7.record.clone()));
+            packs.ship_log(&log.segs(), end).unwrap();
+            println!("Seal 3 stream {} bytes, Seal 7 stream {} bytes", h3.record.bytes, h7.record.bytes);
+            let pack3 = std::fs::metadata(store_dir.path().join(packs.key(&h3.header))).unwrap().len();
             println!("first Seal pack {pack3} bytes (Template is over 1 MiB)");
             assert!(pack3 < 200_000, "the Template does not travel with the Vessel");
 
@@ -2357,11 +2656,12 @@ mod tests {
             let tb = z.receive(&tpl_b, None, (p.seal, p.seal_hash), &mut &out.stdout[..]).unwrap();
             assert_eq!(tb.guid, t40.guid);
 
-            let chain = packs.chain(Some(log.at(7))).unwrap();
+            let chain = packs.chain(Some(end)).unwrap();
             assert_eq!(chain.frames, log.seg.frames().unwrap());
             let dst = Dataset::new(&format!("{root}/dst")).unwrap();
-            for fs in &chain.seals {
-                let (got, mut stream) = packs.open_fs(fs.to.lsn).unwrap().unwrap();
+            for shipped in &chain.seals {
+                let got = shipped.fs;
+                let mut stream = packs.open_fs(shipped).unwrap().unwrap();
                 let to = (got.to.lsn, got.to.hash);
                 let snap = match got.base {
                     FsBase::Origin { chronicle, seal, guid } => {
@@ -2374,7 +2674,7 @@ mod tests {
                 };
                 assert_eq!(snap.guid, got.guid, "the received snapshot is the one the Seal was taken from");
             }
-            assert_eq!(chain.seals[0].guid, s3.guid);
+            assert_eq!(chain.seals[0].fs.guid, s3.guid);
             zfs(&["mount", dst.as_str()]);
             let dmount = std::path::PathBuf::from(zfs(&["get", "-H", "-o", "value", "mountpoint", dst.as_str()]).trim());
             assert_eq!(std::fs::read(dmount.join("f")).unwrap(), b"two");
