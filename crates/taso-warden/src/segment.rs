@@ -47,7 +47,7 @@ use taso_core::envelope::{
 const MAGIC: [u8; 8] = *b"TASOSEG\0";
 const VERSION: u8 = 1;
 const HEADER_LEN: u64 = 8 + 1 + 16 + 8 + 32;
-const ENVELOPE_LEN: usize = 16 + 8 + 8 + 1 + 8 + 32 + 32 + 32;
+pub(crate) const ENVELOPE_LEN: usize = 16 + 8 + 8 + 1 + 8 + 32 + 32 + 32;
 const FRAME_PREFIX: usize = 4 + ENVELOPE_LEN;
 
 /// Largest payload a frame may carry.  A torn length field larger than
@@ -489,7 +489,7 @@ impl Segment {
 
 // ── Frame checks and envelope codec ─────────────────────────────────
 
-fn check_frame(
+pub(crate) fn check_frame(
     chronicle: ChronicleId,
     tail: Position,
     env: &Envelope,
@@ -517,7 +517,7 @@ fn check_frame(
     Ok(())
 }
 
-fn encode_envelope(e: &Envelope, out: &mut Vec<u8>) {
+pub(crate) fn encode_envelope(e: &Envelope, out: &mut Vec<u8>) {
     out.extend_from_slice(e.chronicle.as_bytes());
     out.extend_from_slice(&e.branch.get().to_be_bytes());
     out.extend_from_slice(&e.epoch.get().to_be_bytes());
@@ -530,7 +530,7 @@ fn encode_envelope(e: &Envelope, out: &mut Vec<u8>) {
 
 /// Decode an envelope; `None` if the stream byte is unknown.  The hash is
 /// taken as stored, not recomputed — callers verify.
-fn try_decode_envelope(b: &[u8]) -> Option<Envelope> {
+pub(crate) fn try_decode_envelope(b: &[u8]) -> Option<Envelope> {
     let stream = match b[32] {
         0 => Stream::Fs,
         1 => Stream::Db,
