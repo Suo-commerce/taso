@@ -43,6 +43,14 @@
 //!
 //! Receive is idempotent: if the Seal snapshot already exists it is bound
 //! (if unbound) and returned, so a crash between receive and bind resumes.
+//!
+//! A Vessel forked from a Seal (a Template, usually) or born by succession
+//! is a clone of its parent's Seal snapshot, so its first stream is
+//! incremental from that snapshot, in another dataset.
+//! [`Zfs::receive_clone`] receives it as a clone of the local copy of the
+//! parent's snapshot (`zfs receive -o origin=`), which must be bound to the
+//! parent Seal and have the guid the stream was made from: rebirth then
+//! moves only what the Vessel changed, not the Template.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -501,6 +509,20 @@ impl<R: Read> Read for HoldBack<R> {
 
 // ── Zfs ────────────────────────────────────────────────────────────
 
+/// The parent Seal snapshot a cloned Vessel's first stream is incremental
+/// from, as the receiving side expects to find it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloneBase {
+    /// The dataset holding the parent's Seal snapshot on this node.
+    pub dataset: Dataset,
+    /// The parent Seal's lsn.
+    pub seal: Lsn,
+    /// The parent Seal record's hash.
+    pub hash: HashVal,
+    /// The snapshot's guid (the same on every node it was received on).
+    pub guid: u64,
+}
+
 /// The ZFS driver.
 #[derive(Clone, Debug, Default)]
 pub struct Zfs<R: Runner = Cli> {
@@ -716,6 +738,66 @@ impl<R: Runner> Zfs<R> {
             why: "the received stream did not create the expected Seal snapshot",
         })?;
         self.bind(snap, to.1)
+    }
+
+    /// Receive the first stream of a cloned Vessel: incremental from the
+    /// parent's Seal snapshot `base`, into `dataset` as a clone of it, and
+    /// bind the Seal snapshot it creates to `to`.  The dataset also gets
+    /// `taso:parent=<base hash>`, as a fork made here would.
+    ///
+    /// Refused before anything is received if `base` is missing
+    /// ([`ZfsError::NotFound`]), is bound to another Seal or has another
+    /// guid ([`ZfsError::SealMismatch`]), or `dataset` exists
+    /// ([`ZfsError::AlreadyExists`]).  ZFS itself also refuses a stream
+    /// that was not made from `base`.  If `@taso-seal-<to>` already exists
+    /// on a clone of `base`, nothing is received and it is bound if needed.
+    pub fn receive_clone(
+        &self,
+        dataset: &Dataset,
+        base: &CloneBase,
+        to: (Lsn, HashVal),
+        stream: &mut dyn Read,
+    ) -> Result<Snapshot, ZfsError> {
+        let base_name = base.dataset.seal_snapshot(base.seal);
+        if let Some(existing) = self.get(dataset, to.0)? {
+            self.check_clone_of(dataset, &base_name, base.hash)?;
+            return self.bind(existing, to.1);
+        }
+        let snap = self.get(&base.dataset, base.seal)?.ok_or_else(|| ZfsError::NotFound(base_name.clone()))?;
+        if snap.seal_hash != Some(base.hash) || snap.guid != base.guid {
+            return Err(ZfsError::SealMismatch(base_name));
+        }
+        if self.dataset_info(dataset)?.is_some() {
+            return Err(ZfsError::AlreadyExists(dataset.to_string()));
+        }
+        let args = vec![
+            "receive".to_string(),
+            "-u".to_string(),
+            "-o".to_string(),
+            format!("origin={base_name}"),
+            "-o".to_string(),
+            format!("{PARENT_PROPERTY}={}", base.hash),
+            dataset.to_string(),
+        ];
+        let out = self.runner.run_input(&args, &mut HoldBack::new(stream))?;
+        if !out.success {
+            return Err(ZfsError::Exit { args, code: out.code, stderr: out.stderr });
+        }
+        self.check_clone_of(dataset, &base_name, base.hash)?;
+        let snap = self.get(dataset, to.0)?.ok_or(ZfsError::Parse {
+            line: dataset.seal_snapshot(to.0),
+            why: "the received stream did not create the expected Seal snapshot",
+        })?;
+        self.bind(snap, to.1)
+    }
+
+    /// `dataset` is a clone of `origin` and carries `taso:parent=<hash>`.
+    fn check_clone_of(&self, dataset: &Dataset, origin: &str, hash: HashVal) -> Result<(), ZfsError> {
+        let info = self.dataset_info(dataset)?.ok_or_else(|| ZfsError::NotFound(dataset.to_string()))?;
+        if info.origin.as_deref() != Some(origin) || info.parent != Some(hash) {
+            return Err(ZfsError::SealMismatch(dataset.to_string()));
+        }
+        Ok(())
     }
 
     /// Bind an existing Seal snapshot to `hash` unless it already is;
@@ -1400,6 +1482,156 @@ mod tests {
         assert!(!out.success);
     }
 
+    // ── Receive as a clone ─────────────────────────────────────────
+
+    fn tpl() -> Dataset {
+        Dataset::new("tasotest/tpl").unwrap()
+    }
+
+    fn base() -> CloneBase {
+        CloneBase { dataset: tpl(), seal: Lsn::new(5), hash: hash(5), guid: 42 }
+    }
+
+    fn tpl_line(prop: &str, guid: u64) -> String {
+        format!("{}\t9\t{guid}\t{prop}\n", tpl().seal_snapshot(Lsn::new(5)))
+    }
+
+    fn clone_info(origin: &str, parent: &str) -> String {
+        info_line("tasotest/vessel", "-", origin, parent)
+    }
+
+    #[test]
+    fn receive_clone_builds_exact_arguments_and_checks_the_result() {
+        let origin = tpl().seal_snapshot(Lsn::new(5));
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(false, "", MISSING) // get vessel@2: not yet
+                .reply(true, &tpl_line(&hash(5).to_string(), 42), "") // the base, bound, right guid
+                .reply(false, "", MISSING) // dataset_info: no vessel yet
+                .reply(true, "", "") // receive
+                .reply(true, &clone_info(&origin, &hash(5).to_string()), "") // a clone of the base
+                .reply(true, &seal_line(Lsn::new(2), "-"), "")
+                .reply(true, "", "") // set
+                .reply(true, &seal_line(Lsn::new(2), &hash(2).to_string()), ""),
+        );
+        let s = zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut &b"INC"[..]).unwrap();
+        assert_eq!(s.seal_hash, Some(hash(2)));
+        let calls = zfs.runner.calls.borrow();
+        assert_eq!(
+            calls[3],
+            strs(&[
+                "receive",
+                "-u",
+                "-o",
+                &format!("origin={origin}"),
+                "-o",
+                &format!("taso:parent={}", hash(5)),
+                "tasotest/vessel",
+            ]),
+        );
+        assert_eq!(calls[6], set_args(Lsn::new(2), hash(2)));
+        assert_eq!(zfs.runner.inputs.borrow()[0], b"INC");
+    }
+
+    #[test]
+    fn receive_clone_refusals_come_before_any_receive() {
+        let cases: Vec<(Fake, ZfsError)> = vec![
+            // No base on this node.
+            (
+                Fake::default().reply(false, "", MISSING).reply(false, "", MISSING),
+                ZfsError::NotFound(tpl().seal_snapshot(Lsn::new(5))),
+            ),
+            // The base is bound to another Seal, unbound, or another snapshot (guid).
+            (
+                Fake::default().reply(false, "", MISSING).reply(true, &tpl_line(&hash(6).to_string(), 42), ""),
+                ZfsError::SealMismatch(tpl().seal_snapshot(Lsn::new(5))),
+            ),
+            (
+                Fake::default().reply(false, "", MISSING).reply(true, &tpl_line("-", 42), ""),
+                ZfsError::SealMismatch(tpl().seal_snapshot(Lsn::new(5))),
+            ),
+            (
+                Fake::default().reply(false, "", MISSING).reply(true, &tpl_line(&hash(5).to_string(), 43), ""),
+                ZfsError::SealMismatch(tpl().seal_snapshot(Lsn::new(5))),
+            ),
+            // The target exists already.
+            (
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(true, &tpl_line(&hash(5).to_string(), 42), "")
+                    .reply(true, &ds_info(), ""),
+                ZfsError::AlreadyExists("tasotest/vessel".into()),
+            ),
+        ];
+        for (fake, want) in cases {
+            let zfs = Zfs::with_runner(fake);
+            assert_eq!(zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut &b"X"[..]), Err(want.clone()));
+            assert!(zfs.runner.calls.borrow().iter().all(|c| c[0] != "receive"), "no receive for {want:?}");
+            assert!(zfs.runner.inputs.borrow().is_empty());
+        }
+    }
+
+    /// Received, but not a clone of the base (or without the parent
+    /// binding): refused, nothing bound.
+    #[test]
+    fn receive_clone_checks_what_was_made() {
+        let origin = tpl().seal_snapshot(Lsn::new(5));
+        for info in [clone_info("-", "-"), clone_info("tasotest/other@taso-seal-00000000000000000005", &hash(5).to_string()), clone_info(&origin, "-")] {
+            let zfs = Zfs::with_runner(
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(true, &tpl_line(&hash(5).to_string(), 42), "")
+                    .reply(false, "", MISSING)
+                    .reply(true, "", "")
+                    .reply(true, &info, ""),
+            );
+            assert_eq!(
+                zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut &b"X"[..]),
+                Err(ZfsError::SealMismatch("tasotest/vessel".into())),
+            );
+            assert!(zfs.runner.calls.borrow().iter().all(|c| c[0] != "set"));
+        }
+    }
+
+    #[test]
+    fn receive_clone_is_idempotent() {
+        let origin = tpl().seal_snapshot(Lsn::new(5));
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(true, &seal_line(Lsn::new(2), &hash(2).to_string()), "")
+                .reply(true, &clone_info(&origin, &hash(5).to_string()), ""),
+        );
+        let s = zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut io::empty()).unwrap();
+        assert_eq!(s.seal_hash, Some(hash(2)));
+        assert_eq!(zfs.runner.calls.borrow().len(), 2);
+        // Already there, but on a dataset that is not a clone of this base.
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(true, &seal_line(Lsn::new(2), &hash(2).to_string()), "")
+                .reply(true, &clone_info("-", "-"), ""),
+        );
+        assert!(matches!(
+            zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut io::empty()),
+            Err(ZfsError::SealMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn receive_clone_of_a_failing_stream_is_input_error() {
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(false, "", MISSING)
+                .reply(true, &tpl_line(&hash(5).to_string(), 42), "")
+                .reply(false, "", MISSING),
+        );
+        let mut bad = source(b"0123456789", 4, true);
+        assert!(matches!(
+            zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut bad),
+            Err(ZfsError::Input(_))
+        ));
+        assert_eq!(zfs.runner.inputs.borrow()[0], b"012345678");
+    }
+
     // ── On-node tests: need a real pool ────────────────────────────
     //
     //   TASO_ZFS_DATASET=tasotest/vessel cargo test -p taso-warden -- --ignored --nocapture
@@ -1645,6 +1877,78 @@ mod tests {
             assert_eq!(std::fs::read(dmount.join("f")).unwrap(), b"two");
             let first = dmount.join(".zfs/snapshot").join(snap_name(Lsn::new(1))).join("f");
             assert_eq!(std::fs::read(first).unwrap(), b"one");
+        }
+
+        /// The Template-based rebirth path.  A Vessel forked from a
+        /// Template Seal is shipped as an incremental from that Seal; on
+        /// "node B" (another place in the pool) the Template arrives first,
+        /// keeping its guid, and the Vessel's stream is received on top as a
+        /// clone.  Only what the Vessel changed travels.
+        #[test]
+        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
+        fn receive_clone_from_a_template_on_zfs() {
+            let s = Scratch::new("rclone");
+            let zfs = Zfs::cli();
+            let tpl = Dataset::new(&format!("{}/tpl", s.ds)).unwrap();
+            let vessel = Dataset::new(&format!("{}/v", s.ds)).unwrap();
+            let tpl_b = Dataset::new(&format!("{}/b-tpl", s.ds)).unwrap();
+            let vessel_b = Dataset::new(&format!("{}/b-v", s.ds)).unwrap();
+
+            // Node A: a Template with a big file, sealed; a Vessel forked from it.
+            let tmount = zfs.create(&tpl).unwrap().mountpoint.unwrap();
+            std::fs::write(tmount.join("base.bin"), vec![7u8; 1 << 20]).unwrap();
+            std::fs::write(tmount.join("note"), b"template").unwrap();
+            let t5 = zfs.snapshot(&tpl, Lsn::new(5), hash(5)).unwrap();
+            let vmount = zfs.clone(&tpl, Lsn::new(5), hash(5), &vessel).unwrap().mountpoint.unwrap();
+            std::fs::write(vmount.join("note"), b"vessel change").unwrap();
+            zfs.snapshot(&vessel, Lsn::new(2), hash(2)).unwrap();
+            let full_tpl = send(&tpl, None, Lsn::new(5));
+            // The Vessel's first stream, incremental from the Template Seal.
+            let out = Command::new("zfs")
+                .args(["send", "-i", &tpl.seal_snapshot(Lsn::new(5)), &vessel.seal_snapshot(Lsn::new(2))])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let inc = out.stdout;
+            println!("template full {} bytes, vessel incremental from template {} bytes", full_tpl.len(), inc.len());
+            assert!(inc.len() < full_tpl.len() / 10, "the Template's bytes do not travel with the Vessel");
+
+            // Node B: the Template arrives first, with its guid.
+            let tb = zfs.receive(&tpl_b, None, (Lsn::new(5), hash(5)), &mut &full_tpl[..]).unwrap();
+            assert_eq!(tb.guid, t5.guid, "guids survive send and receive");
+            let base = CloneBase { dataset: tpl_b.clone(), seal: Lsn::new(5), hash: hash(5), guid: tb.guid };
+
+            // Refused before receiving: wrong Seal hash, wrong guid, no such base.
+            assert!(matches!(
+                zfs.receive_clone(&vessel_b, &CloneBase { hash: hash(9), ..base.clone() }, (Lsn::new(2), hash(2)), &mut &inc[..]),
+                Err(ZfsError::SealMismatch(_))
+            ));
+            assert!(matches!(
+                zfs.receive_clone(&vessel_b, &CloneBase { guid: tb.guid ^ 1, ..base.clone() }, (Lsn::new(2), hash(2)), &mut &inc[..]),
+                Err(ZfsError::SealMismatch(_))
+            ));
+            assert!(matches!(
+                zfs.receive_clone(&vessel_b, &CloneBase { seal: Lsn::new(6), ..base.clone() }, (Lsn::new(2), hash(2)), &mut &inc[..]),
+                Err(ZfsError::NotFound(_))
+            ));
+            // A stream that fails at its very end: nothing is made.
+            let mut bad = source(&inc, 4096, true);
+            assert!(matches!(zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut bad), Err(ZfsError::Input(_))));
+            assert_eq!(zfs.dataset_info(&vessel_b).unwrap(), None);
+
+            // The real thing.
+            let got = zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut &inc[..]).unwrap();
+            assert_eq!(got.seal_hash, Some(hash(2)));
+            let info = zfs.dataset_info(&vessel_b).unwrap().unwrap();
+            assert_eq!(info.origin_seal(), Some((tpl_b.clone(), Lsn::new(5))));
+            assert_eq!(info.parent, Some(hash(5)));
+            // Again: nothing received.
+            assert_eq!(zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut io::empty()).unwrap().guid, got.guid);
+
+            zfs_cmd(&["mount", vessel_b.as_str()]);
+            let bmount = PathBuf::from(zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", vessel_b.as_str()]).trim());
+            assert_eq!(std::fs::read(bmount.join("note")).unwrap(), b"vessel change");
+            assert_eq!(std::fs::read(bmount.join("base.bin")).unwrap(), vec![7u8; 1 << 20]);
         }
     }
 }
