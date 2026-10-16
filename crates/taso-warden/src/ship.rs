@@ -66,6 +66,10 @@ pub trait ObjectStore {
     fn get(&self, key: &str) -> io::Result<Option<ByteStream>>;
     /// Whether `key` exists.
     fn exists(&self, key: &str) -> io::Result<bool>;
+    /// Every key under `prefix` (a valid key, read as a directory: the
+    /// keys that start with `prefix/`), at any depth, in byte order.
+    /// Objects still being written are not listed.
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
 
 /// Keys are `/`-separated components of `[A-Za-z0-9._-]`, none of them
@@ -92,6 +96,9 @@ pub struct LocalStore {
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Name prefix of [`LocalStore`]'s temp files (never a listed key).
+const TMP_PREFIX: &str = ".tmp-";
+
 impl LocalStore {
     /// A store rooted at `root`, which must exist.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -112,7 +119,7 @@ impl ObjectStore for LocalStore {
         let dir = path.parent().expect("a key has a file name").to_path_buf();
         fs::create_dir_all(&dir)?;
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!(".tmp-{}-{n}", std::process::id()));
+        let tmp = dir.join(format!("{TMP_PREFIX}{}-{n}", std::process::id()));
         let result = (|| {
             let mut f = File::create(&tmp)?;
             let written = io::copy(data, &mut f)?;
@@ -138,6 +145,39 @@ impl ObjectStore for LocalStore {
 
     fn exists(&self, key: &str) -> io::Result<bool> {
         Ok(self.path(key)?.is_file())
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let root = self.path(prefix)?;
+        let mut keys = Vec::new();
+        // (directory, its key)
+        let mut todo = vec![(root, prefix.to_string())];
+        while let Some((dir, key)) = todo.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+                if name.starts_with(TMP_PREFIX) {
+                    continue;
+                }
+                let child = format!("{key}/{name}");
+                if !valid_key(&child) {
+                    continue; // not something put() could have made
+                }
+                let ty = entry.file_type()?;
+                if ty.is_dir() {
+                    todo.push((entry.path(), child));
+                } else if ty.is_file() {
+                    keys.push(child);
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
     }
 }
 
@@ -215,18 +255,24 @@ impl Drop for ChildReader {
 
 const STREAM_DOMAIN: &str = "taso.fs.stream.v1";
 
-/// Counts and hashes what passes through.
-struct Hashing<R> {
+/// Counts and hashes (BLAKE3, derive-key mode) what passes through.
+pub(crate) struct Hashing<R> {
     inner: R,
     hasher: blake3::Hasher,
     bytes: u64,
 }
 
 impl<R: Read> Hashing<R> {
+    /// Hash under the `fs` stream domain.
     fn new(inner: R) -> Self {
-        Self { inner, hasher: blake3::Hasher::new_derive_key(STREAM_DOMAIN), bytes: 0 }
+        Self::with_domain(inner, STREAM_DOMAIN)
     }
-    fn finish(&self) -> (u64, HashVal) {
+    /// Hash under `domain`.
+    pub(crate) fn with_domain(inner: R, domain: &str) -> Self {
+        Self { inner, hasher: blake3::Hasher::new_derive_key(domain), bytes: 0 }
+    }
+    /// Bytes read so far and their hash.
+    pub(crate) fn finish(&self) -> (u64, HashVal) {
         (self.bytes, HashVal::from_bytes(*self.hasher.finalize().as_bytes()))
     }
 }
@@ -630,6 +676,56 @@ mod tests {
         let store = LocalStore::new(dir.path());
         assert!(store.put("../escape", &mut &b"x"[..]).is_err());
         assert!(Shipper::new(store, FakeSend::default(), "../x", ChronicleId::from_bytes([0; 16])).is_err());
+    }
+
+    #[test]
+    fn list_returns_every_key_under_a_prefix_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        for k in ["v/ab/pack/00000000000000000010", "v/ab/pack/00000000000000000002", "v/ab/fs/x.meta", "v/abc/pack/1", "w/1"] {
+            store.put(k, &mut &b"x"[..]).unwrap();
+        }
+        assert_eq!(
+            store.list("v/ab").unwrap(),
+            vec!["v/ab/fs/x.meta", "v/ab/pack/00000000000000000002", "v/ab/pack/00000000000000000010"],
+        );
+        // `v/ab` is a directory boundary: `v/abc` is not under it.
+        assert_eq!(store.list("v/ab/pack").unwrap().len(), 2);
+        assert_eq!(store.list("v").unwrap().len(), 4);
+        assert_eq!(store.list("nothing/here").unwrap(), Vec::<String>::new());
+        assert!(store.list("../up").is_err());
+        assert!(store.list("").is_err());
+    }
+
+    #[test]
+    fn list_skips_objects_being_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("v/a/1", &mut &b"x"[..]).unwrap();
+        // A put in progress (or one a crash left behind).
+        fs::write(dir.path().join("v/a").join(format!("{TMP_PREFIX}9-9")), b"partial").unwrap();
+        // A file put() could never have made.
+        fs::write(dir.path().join("v/a/has space"), b"?").unwrap();
+        assert_eq!(store.list("v/a").unwrap(), vec!["v/a/1"]);
+        // A failed put leaves nothing listed.
+        struct Dies;
+        impl Read for Dies {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("died"))
+            }
+        }
+        assert!(store.put("v/a/2", &mut Dies).is_err());
+        assert_eq!(store.list("v/a").unwrap(), vec!["v/a/1"]);
+    }
+
+    #[test]
+    fn hashing_domains_differ() {
+        let mut a = Hashing::with_domain(&b"same bytes"[..], "taso.one");
+        let mut b = Hashing::with_domain(&b"same bytes"[..], "taso.two");
+        io::copy(&mut a, &mut io::sink()).unwrap();
+        io::copy(&mut b, &mut io::sink()).unwrap();
+        assert_eq!(a.finish().0, 10);
+        assert_ne!(a.finish().1, b.finish().1);
     }
 
     // ── on a real pool ──────────────────────────────────────────────
