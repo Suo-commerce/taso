@@ -191,6 +191,8 @@ pub enum ChronicleError {
         /// What is wrong.
         why: &'static str,
     },
+    /// [`restore_log`] found the directory already there.
+    StateExists(PathBuf),
     /// A continuation segment exists but its Gap record was never accepted
     /// (a takeover was interrupted).  [`Chronicle::open_after_gap`]
     /// finishes it; a plain open does not.
@@ -222,6 +224,7 @@ impl fmt::Display for ChronicleError {
             Self::SegmentsDisagree { at, why } => {
                 write!(f, "the segment at lsn {} does not join the one before: {why}", at.get())
             }
+            Self::StateExists(p) => write!(f, "{} already exists", p.display()),
             Self::GapPending { kept, head } => write!(
                 f,
                 "a takeover after a gap ({}..={}) was interrupted; open_after_gap finishes it",
@@ -744,6 +747,62 @@ fn lock_dir(dir: &Path) -> Result<File, ChronicleError> {
 
 /// The segment files in `dir`, ordered by base lsn.  Any other file whose
 /// name starts with `seg-` is refused rather than skipped.
+/// Write a Chronicle's log into the new directory `dir` from `frames`:
+/// oldest first, from genesis, jumping only at Gap records, as
+/// [`crate::pack::Packs::chain`] returns them (rebirth, v1.0 §1 P2).
+///
+/// The files are what a Warden would have written: `seg-0` from genesis,
+/// and at every jump a new file based at the Gap's `resumes` (the lsn
+/// before it and its `prev`), so [`Chronicle::open_after_gap`] checks the
+/// joints exactly as on any node.  Nothing here is trusted: the open
+/// re-verifies every frame and the joints.
+///
+/// Written into `<dir>.restore` first (removed if left from a crash) and
+/// renamed into place, so `dir` either does not exist or is complete.
+/// Refuses if `dir` exists.
+pub fn restore_log(dir: &Path, id: ChronicleId, frames: &[Frame]) -> Result<(), ChronicleError> {
+    let io = |e| ChronicleError::Segment(SegmentError::Io(e));
+    if dir.exists() {
+        return Err(ChronicleError::StateExists(dir.to_path_buf()));
+    }
+    let mut tmp = dir.as_os_str().to_owned();
+    tmp.push(".restore");
+    let tmp = PathBuf::from(tmp);
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp).map_err(io)?;
+    }
+    std::fs::create_dir_all(&tmp).map_err(io)?;
+    let mut seg = Segment::create(tmp.join(SEGMENT_FILE), id, Position::GENESIS)?;
+    let mut run: Vec<&Frame> = Vec::new();
+    let flush = |seg: &mut Segment, run: &mut Vec<&Frame>| -> Result<(), ChronicleError> {
+        for chunk in run.chunks(1024) {
+            let batch: Vec<(&Envelope, &[u8])> = chunk.iter().map(|f| (&f.envelope, f.payload.as_slice())).collect();
+            seg.append_batch(&batch)?;
+        }
+        run.clear();
+        Ok(())
+    };
+    let mut tail = Position::GENESIS;
+    for f in frames {
+        if f.envelope.lsn != tail.lsn.next() {
+            // A Gap record: the next file starts where it resumes.
+            flush(&mut seg, &mut run)?;
+            let base = Position { lsn: Lsn::new(f.envelope.lsn.get().saturating_sub(1)), hash: f.envelope.prev };
+            seg = Segment::create(tmp.join(segment_name(base.lsn)), id, base)?;
+        }
+        run.push(f);
+        tail = Position { lsn: f.envelope.lsn, hash: f.envelope.hash };
+    }
+    flush(&mut seg, &mut run)?;
+    drop(seg);
+    std::fs::File::open(&tmp).and_then(|d| d.sync_all()).map_err(io)?;
+    std::fs::rename(&tmp, dir).map_err(io)?;
+    if let Some(parent) = dir.parent() {
+        std::fs::File::open(parent).and_then(|d| d.sync_all()).map_err(io)?;
+    }
+    Ok(())
+}
+
 fn list_segments(dir: &Path) -> Result<Vec<PathBuf>, ChronicleError> {
     let io = |e| ChronicleError::Segment(SegmentError::Io(e));
     let mut found = Vec::new();
@@ -1321,6 +1380,37 @@ mod tests {
         drop(b);
         let (b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
         assert_eq!((lsns(&b), r.gap), (vec![1, 2, 3, 6, 7], None));
+    }
+
+    /// A log with a gap, restored from its frames into a fresh directory
+    /// (as rebirth does on a third node), opens to the same records, the
+    /// joint in the same place; and a restore never overwrites.
+    #[test]
+    fn a_restored_log_opens_to_the_same_records() {
+        let e = env();
+        let (_a, b_dir) = shipped_elsewhere(&e, 5, 3);
+        let (mut b, _) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
+        b.append(Stream::Fs, raw(9)).unwrap();
+        let frames = b.frames().unwrap();
+        drop(b);
+        let c_dir = e.dir.with_file_name("vessel-c");
+        restore_log(&c_dir, cid(), &frames).unwrap();
+        assert!(c_dir.join(SEGMENT_FILE).exists() && c_dir.join(segment_name(Lsn::new(5))).exists());
+        assert!(!c_dir.with_file_name("vessel-c.restore").exists());
+        let (c, r) = Chronicle::open_after_gap(&c_dir, e.coord.clone(), cid(), WardenId::new(3), FakeLayers::default()).unwrap();
+        assert_eq!((c.frames().unwrap(), r.gap), (frames.clone(), None));
+        drop(c);
+        assert!(matches!(restore_log(&c_dir, cid(), &frames), Err(ChronicleError::StateExists(_))));
+        // A leftover from a crashed restore is replaced.
+        let d_dir = e.dir.with_file_name("vessel-d");
+        std::fs::create_dir_all(d_dir.with_file_name("vessel-d.restore")).unwrap();
+        std::fs::write(d_dir.with_file_name("vessel-d.restore").join("junk"), b"x").unwrap();
+        restore_log(&d_dir, cid(), &frames[..3]).unwrap();
+        assert!(!d_dir.join("junk").exists());
+        // Nothing yet: an empty first segment.
+        let n_dir = e.dir.with_file_name("vessel-n");
+        restore_log(&n_dir, cid(), &[]).unwrap();
+        assert!(n_dir.join(SEGMENT_FILE).exists());
     }
 
     #[test]

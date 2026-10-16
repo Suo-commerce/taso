@@ -155,6 +155,75 @@ mod tests {
         use std::sync::Arc;
         use taso_core::model::WardenId;
 
+        /// The P1 gate's Seal line at its concurrency: `TASO_BENCH_VESSELS`
+        /// Vessels (64) on one pool, each writing a 16 KiB file, appending
+        /// a record and sealing, `TASO_BENCH_N` (20) turns each, all at
+        /// once.  Gate: Seal p95 < 50 ms at p64 (v1.0 §1 P1).  On network
+        /// block storage this is a warning signal, not a gate number.
+        #[test]
+        #[ignore = "benchmark on a ZFS pool: set TASO_ZFS_DATASET; run alone, in release"]
+        fn seals_at_p64_on_zfs() {
+            let turns = n(20);
+            let vessels: usize =
+                std::env::var("TASO_BENCH_VESSELS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+            let Ok(base) = std::env::var("TASO_ZFS_DATASET") else {
+                println!("\n=== seals at p{vessels} on ZFS: skipped, TASO_ZFS_DATASET is not set ===");
+                return;
+            };
+            let root = format!("{base}/p64-{}", std::process::id());
+            let zfs = Zfs::<Cli>::cli();
+            Zfs::create(&zfs, &Dataset::new(&root).unwrap()).unwrap();
+            struct Cleanup(String);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = Command::new("zfs").args(["destroy", "-R", &self.0]).status();
+                }
+            }
+            let _c = Cleanup(root.clone());
+            let tmp = tempfile::tempdir().unwrap();
+            let host = Host {
+                coord: Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap()),
+                pool: Clone::clone(&zfs),
+                root: Dataset::new(&root).unwrap(),
+                state_dir: tmp.path().join("state"),
+                warden: WardenId::new(1),
+            };
+            let mut all = Vec::new();
+            for i in 0..vessels {
+                let (v, _) = host.ensure(ns(1), format!("bench-{i}").as_bytes()).unwrap();
+                let mount = zfs.dataset_info(v.dataset()).unwrap().unwrap().mountpoint.unwrap();
+                all.push((v, mount));
+            }
+
+            timing::take();
+            timing::enable(true);
+            let start = Instant::now();
+            let go = std::sync::Barrier::new(vessels);
+            std::thread::scope(|scope| {
+                for (v, mount) in all.iter_mut() {
+                    let go = &go;
+                    scope.spawn(move || {
+                        go.wait();
+                        for turn in 0..turns {
+                            std::fs::write(mount.join(format!("f{}", turn % 4)), vec![turn as u8; 16 << 10]).unwrap();
+                            v.append(Stream::Fs, Payload::Raw(vec![1; 200])).unwrap();
+                            v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn as u64 + 1)).unwrap();
+                        }
+                    });
+                }
+            });
+            let wall = start.elapsed().as_secs_f64();
+            timing::enable(false);
+            let spans = timing::take();
+            let title = format!("seals at p{vessels} on ZFS: {turns} turns each, dataset {root}");
+            print(&title, &spans, "seal.total", (vessels * turns / 4).max(1), wall);
+            let mut seal = spans["seal.total"].clone();
+            seal.sort_unstable();
+            let p95 = timing::quantile(&seal, 0.95) as f64 / 1000.0;
+            println!("gate (Seal p95 < 50 ms): {p95:.1} ms -> {}", if p95 < 50.0 { "within" } else { "OVER" });
+            assert_eq!(seal.len(), vessels * turns);
+        }
+
         /// As `seal_and_publish`, on a real dataset: a 64 KiB file written
         /// per turn, a ZFS snapshot per Seal, `zfs send -i` into the pack.
         #[test]
@@ -195,8 +264,10 @@ mod tests {
                 v.append(Stream::Fs, Payload::Raw(vec![1; 200])).unwrap();
                 let seal = v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn as u64 + 1)).unwrap().seal;
                 let snap = {
-                    let _t = timing::span("bench.zfs_list");
-                    zfs.list(v.dataset()).unwrap().into_iter().find(|s| s.seal == seal.lsn).expect("the Seal's snapshot")
+                    // One snapshot, not the whole list (which grows with
+                    // every Seal: the 2026-10-16 finding).
+                    let _t = timing::span("bench.zfs_get");
+                    zfs.get(v.dataset(), seal.lsn).unwrap().expect("the Seal's snapshot")
                 };
                 v.publish_seal(&packs, &snap, None).unwrap();
             }
