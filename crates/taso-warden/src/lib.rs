@@ -14,6 +14,7 @@ pub mod coordinator;
 pub mod coordsrv;
 pub mod effects;
 pub mod field;
+pub mod pack;
 pub mod quiesce;
 pub mod runtime;
 pub mod segment;
