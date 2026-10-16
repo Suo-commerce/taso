@@ -37,7 +37,10 @@
 //! Opening is a claim of ownership.  [`Chronicle::open`] first takes a new
 //! epoch with [`Coord::transfer`], so a previous incarnation still
 //! alive somewhere is fenced *before* anything is read; then recovers the
-//! segment against the anchored head; then destroys orphan snapshots.
+//! segment against the anchored head; then destroys orphan snapshots and
+//! reports accepted Seals whose snapshot is missing
+//! ([`Recovery::missing_layers`]).  Those stay in the log, and `last_seal`
+//! still comes from the records, but nothing can build on their layer.
 //! Who may call `open` is decided above this module (rebirth, P2).
 //!
 //! On one node, a lock file in the Chronicle's directory keeps two
@@ -55,7 +58,7 @@
 //!
 //! Normative references: v0.4 §2.1, §5.2, §8.2–8.7; v1.0 §1 (P1), §3.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -257,8 +260,13 @@ pub struct Recovery {
     pub segment: segment::Recovery,
     /// Orphan layers destroyed (their records were never accepted).
     pub orphan_layers: Vec<Lsn>,
-    /// The last accepted Seal, if any.
+    /// The last accepted Seal record, if any.
     pub last_seal: Option<Position>,
+    /// Accepted Seal records whose layer is not there: lost by hand, or
+    /// never received after a rebirth (their `fs` section was not
+    /// shipped).  Such a Seal stays in the log but cannot be forked,
+    /// succeeded from or published.
+    pub missing_layers: Vec<Position>,
     /// If this open continued past a gap: the last record kept and the
     /// head the Chronicle continued from (records in between are lost).
     pub gap: Option<(Position, Position)>,
@@ -294,6 +302,8 @@ pub struct Chronicle<L: Layers> {
     segment: Segment,
     layers: L,
     last_seal: Option<Position>,
+    /// Accepted Seals whose layer was not there at open.
+    missing_layers: HashSet<Lsn>,
     health: Health,
     _lock: File,
 }
@@ -407,6 +417,7 @@ impl<L: Layers> Chronicle<L> {
             segment,
             layers,
             last_seal: None,
+            missing_layers: HashSet::new(),
             health: Health::Live,
             _lock: lock,
         };
@@ -432,27 +443,37 @@ impl<L: Layers> Chronicle<L> {
             gap = Some((kept, resumes));
         }
 
-        // Accepted record hashes, by lsn, across every segment (which
+        // Accepted Seal records, in lsn order, across every segment (which
         // together start at genesis: check_joints).
-        let accepted: HashMap<Lsn, HashVal> =
-            chronicle.frames()?.into_iter().map(|f| (f.envelope.lsn, f.envelope.hash)).collect();
+        let seals: Vec<Position> = chronicle
+            .frames()?
+            .into_iter()
+            .filter(|f| f.envelope.stream == Stream::Ctl && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_))))
+            .map(|f| Position { lsn: f.envelope.lsn, hash: f.envelope.hash })
+            .collect();
+        let by_lsn: HashMap<Lsn, HashVal> = seals.iter().map(|p| (p.lsn, p.hash)).collect();
 
         let mut orphan_layers = Vec::new();
-        let mut last_seal = None;
-        // A layer is a Seal iff the accepted record at its lsn has its hash.
-        // Past the head there is no accepted record, so that case is
-        // covered too.
+        let mut present = HashSet::new();
+        // A layer is a Seal's iff the accepted Seal record at its lsn has
+        // its hash.  Past the head there is no accepted record, so that
+        // case is covered too.
         for (lsn, hash) in chronicle.layers.list().map_err(ChronicleError::Layer)? {
-            if accepted.get(&lsn) == Some(&hash) {
-                last_seal = Some(Position { lsn, hash });
+            if by_lsn.get(&lsn) == Some(&hash) {
+                present.insert(lsn);
             } else {
                 chronicle.layers.destroy(lsn).map_err(ChronicleError::Layer)?;
                 orphan_layers.push(lsn);
             }
         }
+        // The other way round: a Seal record whose layer is not there.
+        let missing_layers: Vec<Position> = seals.iter().filter(|p| !present.contains(&p.lsn)).copied().collect();
+        let last_seal = seals.last().copied();
         chronicle.last_seal = last_seal;
+        chronicle.missing_layers = missing_layers.iter().map(|p| p.lsn).collect();
         let head = chronicle.coord.head(id).map_err(ChronicleError::Coord)?;
-        let recovery = Recovery { epoch, head, segment: seg_recovery, orphan_layers, last_seal, gap };
+        let recovery =
+            Recovery { epoch, head, segment: seg_recovery, orphan_layers, last_seal, missing_layers, gap };
         Ok((chronicle, recovery))
     }
 
@@ -546,6 +567,12 @@ impl<L: Layers> Chronicle<L> {
     /// The last accepted Seal.
     pub fn last_seal(&self) -> Option<Position> {
         self.last_seal
+    }
+
+    /// Whether the accepted Seal at `seal` had no layer when this
+    /// Chronicle was opened (see [`Recovery::missing_layers`]).
+    pub fn layer_missing(&self, seal: Lsn) -> bool {
+        self.missing_layers.contains(&seal)
     }
 
     /// The newest local segment: the one being written.
@@ -816,6 +843,51 @@ mod tests {
 
     fn seal<L: Layers>(c: &mut Chronicle<L>, turn: u64) -> Result<Sealed, ChronicleError> {
         c.seal(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(turn))
+    }
+
+    // ── layers that are not there ───────────────────────────────────
+
+    /// An accepted Seal whose snapshot is gone is reported, stays the last
+    /// Seal (it is in the log), and is marked so nothing builds on it.
+    #[test]
+    fn an_accepted_seal_without_its_layer_is_reported() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut c, 1).unwrap().seal;
+        c.append(Stream::Fs, raw(2)).unwrap();
+        let s2 = seal(&mut c, 2).unwrap().seal;
+        drop(c);
+        e.layers.clone().destroy(s2.lsn).unwrap(); // lost by hand
+        let (c, r) = e.open(A);
+        assert_eq!(r.missing_layers, vec![s2]);
+        assert_eq!(r.last_seal, Some(s2), "the last Seal comes from the records");
+        assert!(r.orphan_layers.is_empty());
+        assert!(c.layer_missing(s2.lsn));
+        assert!(!c.layer_missing(s1.lsn));
+        assert_eq!(e.layers.snaps(), vec![(s1.lsn, s1.hash)]);
+        // Nothing missing: nothing reported.
+        let e = env();
+        let mut c = e.create();
+        let s = seal(&mut c, 1).unwrap().seal;
+        drop(c);
+        let (c, r) = e.open(A);
+        assert!(r.missing_layers.is_empty());
+        assert!(!c.layer_missing(s.lsn));
+    }
+
+    /// A layer is a Seal's only: one bound to an accepted record that is
+    /// not a Seal is an orphan.
+    #[test]
+    fn a_layer_on_a_record_that_is_not_a_seal_is_an_orphan() {
+        let e = env();
+        let mut c = e.create();
+        let h = c.append(Stream::Ctl, raw(1)).unwrap();
+        drop(c);
+        e.layers.clone().snapshot(h.lsn, h.hash).unwrap();
+        let (_c, r) = e.open(A);
+        assert_eq!(r.orphan_layers, vec![h.lsn]);
+        assert!(e.layers.snaps().is_empty());
     }
 
     // ── happy paths ─────────────────────────────────────────────────

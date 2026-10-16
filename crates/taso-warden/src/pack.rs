@@ -1056,7 +1056,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     /// already names this Seal's section.
     ///
     /// The stream is incremental from the section the newest local
-    /// `FsShipped` record names ([`Packs::fs_base`]).  For the first one,
+    /// `FsShipped` record names.  For the first one,
     /// the `Lineage` record decides: born from the void, a full stream
     /// (`origin` must be `None`); a fork or a succession, an incremental
     /// from the parent's Seal snapshot, which the caller passes as `origin`

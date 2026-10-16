@@ -175,6 +175,8 @@ pub enum VesselError {
     },
     /// The position is not an accepted Seal of that Vessel.
     NotASeal(Position),
+    /// The Seal is accepted but its layer is not on this node.
+    LayerMissing(Position),
     /// Succession needs a Seal, and the Vessel has none.
     NoSeal,
     /// Succession needs the tail to be the last Seal.
@@ -218,6 +220,7 @@ impl fmt::Display for VesselError {
                 write!(f, "vessel is closed; its state moved to {}", hex(successor))
             }
             Self::NotASeal(p) => write!(f, "lsn {} is not an accepted Seal", p.lsn.get()),
+            Self::LayerMissing(p) => write!(f, "the layer of Seal {} is not on this node", p.lsn.get()),
             Self::NoSeal => write!(f, "vessel has no Seal"),
             Self::SealNotLast { seal, tail } => write!(
                 f,
@@ -325,6 +328,7 @@ impl<P: Pool> Host<P> {
         subject: &[u8],
     ) -> Result<Vessel<P::Layers>, VesselError> {
         let ledger_pos = seal_ledger_pos(&parent.frames()?, seal)?;
+        parent.layer_present(seal)?;
         let namespace = parent.namespace();
         let id = vessel_id(namespace, subject);
         let ps = ParentSeal { chronicle: parent.id(), seal: seal.lsn, seal_hash: seal.hash };
@@ -508,6 +512,7 @@ impl<P: Pool> Host<P> {
         let seal = old.chronicle.last_seal().ok_or(VesselError::NoSeal)?;
         let frames = old.frames()?;
         let ledger_pos = seal_ledger_pos(&frames, seal)?;
+        old.layer_present(seal)?;
         let record = SuccessionRecord {
             successor: id,
             namespace,
@@ -688,6 +693,7 @@ impl<L: Layers> Vessel<L> {
         if !is_seal {
             return Err(VesselError::NotThisSeal(format!("lsn {} is not a Seal record with this hash", snapshot.seal.get())));
         }
+        self.layer_present(Position { lsn: snapshot.seal, hash })?;
         let shipped = packs.ship_seal(&self.chronicle.segments(), snapshot, origin).map_err(VesselError::Pack)?;
         let record = match shipped {
             Some(s) => {
@@ -704,6 +710,14 @@ impl<L: Layers> Vessel<L> {
             .advance_shipped(self.chronicle.warden(), self.id, self.chronicle.epoch(), tail)
             .map_err(VesselError::Coord)?;
         Ok(SealPublished { record, anchor })
+    }
+
+    /// Refuse a Seal whose layer was missing at open.
+    fn layer_present(&self, seal: Position) -> Result<(), VesselError> {
+        if self.chronicle.layer_missing(seal.lsn) {
+            return Err(VesselError::LayerMissing(seal));
+        }
+        Ok(())
     }
 
     fn writable(&self) -> Result<(), VesselError> {
@@ -1260,6 +1274,26 @@ pub(crate) mod tests {
             assert!(matches!(v.append(Stream::Ctl, Payload::FsShipped(r.record)), Err(VesselError::ReservedPayload)));
             let gap = GapRecord { kept: Lsn::new(1), kept_hash: s1.hash, resumes: s1.lsn, resumes_hash: s1.hash };
             assert!(matches!(v.append(Stream::Ctl, Payload::Gap(gap)), Err(VesselError::ReservedPayload)));
+        }
+
+        /// A Seal whose layer was missing at open cannot be built on: no
+        /// fork, no succession, no publish.
+        #[test]
+        fn a_seal_without_its_layer_is_refused() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (v, s1) = sealed(&p);
+            let id = v.id();
+            drop(v);
+            p.host.pool.layers(&p.host.dataset_for(id)).destroy(s1.lsn).unwrap();
+            let (mut v, r) = p.host.open(id).unwrap();
+            assert_eq!(r.missing_layers, vec![s1]);
+            assert!(matches!(p.host.fork(&v, s1, b"child"), Err(VesselError::LayerMissing(s)) if s == s1));
+            assert!(matches!(v.publish_seal(&p.packs, &snap(&v, s1), None), Err(VesselError::LayerMissing(_))));
+            assert!(p.packs_store().list("vessels").unwrap().is_empty());
+            assert!(matches!(
+                p.host.succeed(v, ns(1), b"user-new", auth(), false),
+                Err(VesselError::LayerMissing(_))
+            ));
         }
 
         /// A closed Vessel (its state moved on) publishes nothing.
