@@ -28,7 +28,8 @@
 //! - **Landlock** is not part of the OCI spec and runc does not apply it.
 //!   If [`VesselSpec::landlock_shim`] is set, the shim (a binary in the
 //!   rootfs) runs first, restricts writes to `/work` and `/tmp`, and execs
-//!   the agent.  The shim itself is a separate step.
+//!   the agent.  The shim is the `taso-landlock` crate; it refuses to run
+//!   the agent on a kernel without Landlock.
 //!
 //! The dataset must be owned by the mapped root so the agent can write it:
 //! [`prepare_work_dir`].
