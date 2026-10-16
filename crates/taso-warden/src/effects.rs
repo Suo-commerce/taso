@@ -13,8 +13,12 @@
 //!    authority, barrier }` is appended and fsynced.  `barrier` is the
 //!    intent's own lsn unless the consequence is `NoExternalMutation`.
 //! 4. `Outcome(DispatchAuthorized)` is appended and fsynced.
-//! 5. The adapter sends exactly `plan.request`.
-//! 6. The answer is recorded: `ConfirmedApplied` (receipt as evidence),
+//! 5. The ledger is **published** up to that record ([`Publish`]): shipped
+//!    off the node and recorded as the coordinator's shipped anchor.  If
+//!    that fails, nothing is sent: `ConfirmedNotApplied` ("ledger not
+//!    shipped") is recorded and returned.
+//! 6. The adapter sends exactly `plan.request`.
+//! 7. The answer is recorded: `ConfirmedApplied` (receipt as evidence),
 //!    `ConfirmedNotApplied` (reason), or `OutcomeUnknown`.  An unknown
 //!    outcome on a barrier intent withdraws effect authority until it is
 //!    reconciled or resolved.
@@ -22,19 +26,27 @@
 //! A crash anywhere leaves at worst an intent that reconciliation
 //! settles.
 //!
+//! Why step 5: an effect whose authorization exists only on this node
+//! cannot be reconciled by another node that takes the Vessel over.  If
+//! this node is lost after sending, the new holder must find
+//! `DispatchAuthorized` in the shipped chain, under the anchor, and
+//! reconcile it, never treat the intent as "never authorized" and lose a
+//! real send.
+//!
 //! # Reconciliation (on open, before any authority)
 //!
 //! Every intent whose latest outcome is not terminal:
 //! - none (crash after the intent) → `ConfirmedNotApplied`: dispatch was
 //!   never authorized, so it never happened;
 //! - `DispatchAuthorized` / `OutcomeUnknown`, by the intent's retry:
-//!   - `ProviderDeduplicated` → re-send the recorded request; record what
-//!     the provider says;
+//!   - `ProviderDeduplicated` → publish, re-send the recorded request;
+//!     record what the provider says;
 //!   - `Queryable` → probe; applied → `ConfirmedApplied`; not applied →
-//!     send, record; unknown → stays open;
+//!     publish, send, record; unknown → stays open;
 //!   - `UnsafeToRetry` → `OutcomeUnknown`, stays open: an operator
 //!     decides.
 //!   - no adapter for its provider any more → stays open.
+//!   - a publish that fails before a send → nothing is sent; stays open.
 //!
 //! An open barrier intent is an obligation; effect authority is granted
 //! only when there are none.  [`Effects::resolve`] is the one place a
@@ -52,7 +64,10 @@ use taso_core::record::{
 use taso_field::adapter::{Call, Plan, Probed, Registry, Sent};
 use taso_field::protocol::EffectResult;
 
+use taso_core::envelope::{ChronicleId, Epoch};
+
 use crate::chronicle::{ChronicleError, Layers};
+use crate::segment::{Position, Segment};
 use crate::vessel::{Vessel, VesselError};
 
 /// What reconciliation did.
@@ -64,9 +79,56 @@ pub struct Reconciled {
     pub open: Vec<OpId>,
 }
 
+// ── Publishing ──────────────────────────────────────────────────────
+
+/// Why the ledger could not be published.  Whatever the cause (the store,
+/// a coordinator refusal, an unknown coordinator outcome), nothing is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishError(pub String);
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PublishError {}
+
+/// Makes the ledger durable off the node before anything is sent.
+///
+/// The real one is [`crate::pack::PackPublisher`].  There is deliberately
+/// no implementation that skips publishing outside tests: a Warden that
+/// cannot ship cannot send.
+pub trait Publish {
+    /// Ship every accepted record of `chronicle` up to `upto` (which is
+    /// accepted: at or below the anchored head), then record `upto` as the
+    /// coordinator's shipped anchor under `epoch`.  `Ok` only when both
+    /// are done.
+    fn publish(
+        &mut self,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        segment: &Segment,
+        upto: Position,
+    ) -> Result<(), PublishError>;
+}
+
+/// Publishes nothing and always succeeds.  Tests only: there is no such
+/// thing outside them.
+#[cfg(test)]
+pub(crate) struct AlwaysPublish;
+
+#[cfg(test)]
+impl Publish for AlwaysPublish {
+    fn publish(&mut self, _: ChronicleId, _: Epoch, _: &Segment, _: Position) -> Result<(), PublishError> {
+        Ok(())
+    }
+}
+
 /// The effect engine of one Vessel.
 pub struct Effects {
     registry: Registry,
+    publisher: Box<dyn Publish>,
     next_op: u64,
     /// Open barrier intents: effect authority is withheld while any exist.
     open: BTreeSet<OpId>,
@@ -79,17 +141,20 @@ pub struct Effects {
 pub(crate) enum CrashAfter {
     Intent,
     Authorized,
+    Published,
     Send,
 }
 
 impl Effects {
     /// Start the engine on an opened Vessel: reconcile its ledger, then
-    /// grant effect authority if nothing is left open.
+    /// grant effect authority if nothing is left open.  `publisher` ships
+    /// the ledger before every send, here and in reconciliation.
     pub fn open<L: Layers>(
         registry: Registry,
+        publisher: Box<dyn Publish>,
         vessel: &mut Vessel<L>,
     ) -> Result<(Self, Reconciled), VesselError> {
-        let mut e = Self { registry, next_op: 1, open: BTreeSet::new() };
+        let mut e = Self { registry, publisher, next_op: 1, open: BTreeSet::new() };
         let r = e.reconcile(vessel)?;
         Ok((e, r))
     }
@@ -153,13 +218,25 @@ impl Effects {
         if stop == Some(CrashAfter::Authorized) {
             return Ok(None);
         }
-        // 3. Send exactly the recorded request.
+        // 3. The authorization goes off the node before the request does.
+        if let Err(e) = self.publish(vessel) {
+            let reason = format!("ledger not shipped: {e}");
+            vessel.append(
+                Stream::Effect,
+                outcome(op, OutcomeState::ConfirmedNotApplied, Some(reason.clone().into_bytes())),
+            )?;
+            return Ok(Some(EffectResult::NotApplied { reason }));
+        }
+        if stop == Some(CrashAfter::Published) {
+            return Ok(None);
+        }
+        // 4. Send exactly the recorded request.
         let adapter = self.registry.get_mut(provider).expect("looked up above");
         let sent = adapter.send(op, &plan);
         if stop == Some(CrashAfter::Send) {
             return Ok(None);
         }
-        // 4. Record what the provider said.
+        // 5. Record what the provider said.
         Ok(Some(self.record_sent(vessel, op, barrier, sent)?))
     }
 
@@ -188,6 +265,12 @@ impl Effects {
     }
 
     // ── internals ───────────────────────────────────────────────────
+
+    /// Publish the ledger up to the Vessel's tail.
+    fn publish<L: Layers>(&mut self, vessel: &Vessel<L>) -> Result<(), PublishError> {
+        let c = vessel.chronicle();
+        self.publisher.publish(c.id(), c.epoch(), c.segment(), c.tail())
+    }
 
     fn record_sent<L: Layers>(
         &mut self,
@@ -291,17 +374,32 @@ impl Effects {
             }
             Ok(false)
         };
-        let Some(adapter) = self.registry.get_mut(&i.provider) else {
+        if self.registry.get_mut(&i.provider).is_none() {
             return mark_unknown(vessel);
-        };
-        let sent = match &i.retry {
-            RetryPolicy::ProviderDeduplicated { .. } => adapter.send(i.op, &plan),
-            RetryPolicy::Queryable { .. } => match adapter.probe(i.op, &plan) {
-                Probed::Applied { receipt } => Sent::Applied { receipt },
-                Probed::NotApplied => adapter.send(i.op, &plan),
-                Probed::Unknown => return mark_unknown(vessel),
-            },
+        }
+        // Whether this ends in a send; a probe decides for Queryable.
+        let must_send = match &i.retry {
+            RetryPolicy::ProviderDeduplicated { .. } => None,
+            RetryPolicy::Queryable { .. } => {
+                let adapter = self.registry.get_mut(&i.provider).expect("checked above");
+                match adapter.probe(i.op, &plan) {
+                    Probed::Applied { receipt } => Some(Sent::Applied { receipt }),
+                    Probed::NotApplied => None,
+                    Probed::Unknown => return mark_unknown(vessel),
+                }
+            }
             RetryPolicy::UnsafeToRetry => return mark_unknown(vessel),
+        };
+        let sent = match must_send {
+            Some(answer) => answer,
+            None => {
+                // Nothing is sent from a ledger that is not off the node.
+                if self.publish(vessel).is_err() {
+                    return mark_unknown(vessel);
+                }
+                let adapter = self.registry.get_mut(&i.provider).expect("checked above");
+                adapter.send(i.op, &plan)
+            }
         };
         if sent == Sent::Unknown {
             return mark_unknown(vessel);
@@ -354,13 +452,54 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use taso_field::adapter::{Adapter, Fault, FakeProvider, Refusal};
 
-    /// A fake provider that survives the Warden "crashing".
+    /// What happened, in order, across the provider and the publisher.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Ev {
+        /// A publish succeeded up to this lsn.
+        Published(taso_core::envelope::Lsn),
+        /// The provider was sent this request.
+        Sent(Vec<u8>),
+    }
+
+    #[derive(Default)]
+    struct World {
+        timeline: Vec<Ev>,
+        /// The next this many publishes fail.
+        publish_fails: u32,
+    }
+
+    /// A fake provider that survives the Warden "crashing", and the world
+    /// it shares with the test publisher.
     #[derive(Clone)]
-    struct Shared(Arc<Mutex<FakeProvider>>);
+    struct Shared(Arc<Mutex<FakeProvider>>, Arc<Mutex<World>>);
+
+    /// A publisher that records into the shared world and fails on demand.
+    struct TestPublish(Arc<Mutex<World>>);
+
+    impl Publish for TestPublish {
+        fn publish(&mut self, _: ChronicleId, _: Epoch, _: &Segment, upto: Position) -> Result<(), PublishError> {
+            let mut w = self.0.lock().unwrap();
+            if w.publish_fails > 0 {
+                w.publish_fails -= 1;
+                return Err(PublishError("store unavailable".into()));
+            }
+            w.timeline.push(Ev::Published(upto.lsn));
+            Ok(())
+        }
+    }
 
     impl Shared {
         fn new(name: &str) -> Self {
-            Self(Arc::new(Mutex::new(FakeProvider::new(name))))
+            Self(Arc::new(Mutex::new(FakeProvider::new(name))), Arc::default())
+        }
+        fn publisher(&self) -> Box<dyn Publish> {
+            Box::new(TestPublish(self.1.clone()))
+        }
+        fn fail_publish(&self, n: u32) {
+            self.1.lock().unwrap().publish_fails = n;
+        }
+        fn timeline(&self) -> Vec<Ev> {
+            self.1.lock().unwrap().timeline.clone()
         }
         fn fail_next(&self, f: Fault) {
             self.0.lock().unwrap().fail_next(f);
@@ -381,6 +520,7 @@ mod tests {
             self.0.lock().unwrap().plan(op, call)
         }
         fn send(&mut self, op: OpId, plan: &Plan) -> Sent {
+            self.1.lock().unwrap().timeline.push(Ev::Sent(plan.request.clone()));
             self.0.lock().unwrap().send(op, plan)
         }
         fn probe(&mut self, op: OpId, plan: &Plan) -> Probed {
@@ -428,6 +568,41 @@ mod tests {
         Authority { actor: "jarmo".into(), reason: "checked the provider by hand".into() }
     }
 
+    /// Every send came after a successful publish that covered the
+    /// `DispatchAuthorized` record of its effect.
+    fn sent_only_after_publish(v: &Vessel<FakeLayers>, p: &Shared) -> Result<(), String> {
+        let mut op_of: BTreeMap<Vec<u8>, OpId> = BTreeMap::new();
+        let mut authorized_at: BTreeMap<OpId, u64> = BTreeMap::new();
+        for f in v.chronicle().segment().frames().unwrap() {
+            if f.envelope.stream != Stream::Effect {
+                continue;
+            }
+            match Payload::decode(&f.payload).unwrap() {
+                Payload::Intent(i) => {
+                    op_of.insert(i.request, i.op);
+                }
+                Payload::Outcome(o) if o.state == OutcomeState::DispatchAuthorized => {
+                    authorized_at.entry(o.op).or_insert(f.envelope.lsn.get());
+                }
+                _ => {}
+            }
+        }
+        let mut published = 0;
+        for ev in p.timeline() {
+            match ev {
+                Ev::Published(l) => published = published.max(l.get()),
+                Ev::Sent(req) => {
+                    let op = op_of.get(&req).ok_or("a send without an intent")?;
+                    let at = authorized_at.get(op).ok_or("a send without an authorization")?;
+                    if published < *at {
+                        return Err(format!("{:?} sent with the ledger shipped to {published}, authorized at {at}", String::from_utf8_lossy(&req)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ── dispatch ────────────────────────────────────────────────────
 
     #[test]
@@ -435,7 +610,7 @@ mod tests {
         let e = env();
         let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, r) = Effects::open(registry(&p), &mut v).unwrap();
+        let (mut fx, r) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         assert_eq!(r, Reconciled::default());
         let intent_lsn = v.tail().lsn.next();
 
@@ -457,7 +632,7 @@ mod tests {
         let e = env();
         let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         let tail = v.tail();
         for (prov, c) in [("http", call("send", "bob")), ("mail", call("format-disk", "x")), ("mail", call("send", ""))] {
             assert!(matches!(fx.dispatch(&mut v, prov, c).unwrap(), EffectResult::Refused { .. }));
@@ -470,7 +645,7 @@ mod tests {
         let e = env();
         let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         fx.dispatch(&mut v, "mail", call("read", "inbox")).unwrap();
         let Payload::Intent(i) = &ledger(&v)[0] else { panic!() };
         assert_eq!(i.barrier, None);
@@ -481,7 +656,7 @@ mod tests {
         let e = env();
         let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         p.fail_next(Fault::ReplyLost);
         assert_eq!(fx.dispatch(&mut v, "mail", call("fire", "moon")).unwrap(), EffectResult::Unknown);
         assert!(!fx.authorized());
@@ -511,11 +686,11 @@ mod tests {
         stop: CrashAfter,
     ) -> (Vessel<FakeLayers>, Effects, Reconciled) {
         let mut v = vessel(e);
-        let (mut fx, _) = Effects::open(registry(p), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(registry(p), p.publisher(), &mut v).unwrap();
         assert!(fx.dispatch_until(&mut v, "mail", call(op, "x"), Some(stop)).unwrap().is_none());
         drop((fx, v));
         let mut v = vessel(e);
-        let (fx, r) = Effects::open(registry(p), &mut v).unwrap();
+        let (fx, r) = Effects::open(registry(p), p.publisher(), &mut v).unwrap();
         (v, fx, r)
     }
 
@@ -571,11 +746,11 @@ mod tests {
         let e = env();
         let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         fx.dispatch_until(&mut v, "mail", call("send", "x"), Some(CrashAfter::Authorized)).unwrap();
         drop((fx, v));
         let mut v = vessel(&e);
-        let (fx, r) = Effects::open(Registry::new(), &mut v).unwrap();
+        let (fx, r) = Effects::open(Registry::new(), p.publisher(), &mut v).unwrap();
         assert_eq!(r.open, vec![OpId::new(1)]);
         assert!(!fx.authorized());
         assert_eq!(p.applied(b"send x"), 0);
@@ -586,12 +761,12 @@ mod tests {
         let e = env();
         let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         fx.dispatch(&mut v, "mail", call("send", "a")).unwrap();
         fx.dispatch(&mut v, "mail", call("send", "b")).unwrap();
         drop((fx, v));
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         fx.dispatch(&mut v, "mail", call("send", "c")).unwrap();
         let ops: Vec<u64> = ledger(&v)
             .into_iter()
@@ -603,6 +778,82 @@ mod tests {
         assert_eq!(ops, vec![1, 2, 3]);
     }
 
+    // ── publishing before every send ────────────────────────────────
+
+    #[test]
+    fn the_authorization_is_published_before_the_request_is_sent() {
+        let e = env();
+        let p = Shared::new("mail");
+        let mut v = vessel(&e);
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
+        fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap();
+        fx.dispatch(&mut v, "mail", call("put", "x")).unwrap();
+        let t = p.timeline();
+        assert!(matches!(t[0], Ev::Published(_)) && t[1] == Ev::Sent(b"send bob".to_vec()), "{t:?}");
+        sent_only_after_publish(&v, &p).unwrap();
+    }
+
+    /// A publish that fails: nothing is sent, and "not applied" is the
+    /// recorded, returned truth.  Authority is unaffected.
+    #[test]
+    fn a_failed_publish_sends_nothing() {
+        let e = env();
+        let p = Shared::new("mail");
+        let mut v = vessel(&e);
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
+        p.fail_publish(1);
+        let r = fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap();
+        assert!(matches!(&r, EffectResult::NotApplied { reason } if reason.contains("ledger not shipped")), "{r:?}");
+        assert_eq!(p.applied(b"send bob"), 0);
+        assert!(p.timeline().is_empty());
+        assert_eq!(states(&v), vec![OutcomeState::DispatchAuthorized, OutcomeState::ConfirmedNotApplied]);
+        assert!(fx.authorized());
+        // The next one goes through.
+        assert!(matches!(fx.dispatch(&mut v, "mail", call("send", "carol")).unwrap(), EffectResult::Applied { .. }));
+        sent_only_after_publish(&v, &p).unwrap();
+    }
+
+    /// Reconciliation re-sends only after publishing; if it cannot, the
+    /// effect stays open and nothing is sent.
+    #[test]
+    fn reconcile_publishes_before_it_sends() {
+        let e = env();
+        let p = Shared::new("mail");
+        let mut v = vessel(&e);
+        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
+        fx.dispatch_until(&mut v, "mail", call("send", "x"), Some(CrashAfter::Authorized)).unwrap();
+        drop((fx, v));
+        // Reopen while the store is down: open, unsent.
+        p.fail_publish(1);
+        let mut v = vessel(&e);
+        let (fx, r) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
+        assert_eq!(r.open, vec![OpId::new(1)]);
+        assert!(!fx.authorized());
+        assert_eq!(p.applied(b"send x"), 0);
+        drop((fx, v));
+        // Reopen with the store back: published, then sent once.
+        let mut v = vessel(&e);
+        let (fx, r) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
+        assert_eq!(r.settled, vec![OpId::new(1)]);
+        assert!(fx.authorized());
+        assert_eq!(p.applied(b"send x"), 1);
+        sent_only_after_publish(&v, &p).unwrap();
+    }
+
+    /// A crash between the publish and the send: reconcile sends it once.
+    #[test]
+    fn crash_after_publish_is_sent_once() {
+        for op in ["send", "put"] {
+            let e = env();
+            let p = Shared::new("mail");
+            let (v, fx, r) = crash_and_reopen(&e, &p, op, CrashAfter::Published);
+            assert_eq!(r.settled, vec![OpId::new(1)], "{op}");
+            assert_eq!(p.applied(format!("{op} x").as_bytes()), 1, "{op}");
+            assert!(fx.authorized());
+            sent_only_after_publish(&v, &p).unwrap();
+        }
+    }
+
     // ── property: never a duplicate, never a silent loss ────────────
 
     #[derive(Clone, Debug)]
@@ -610,6 +861,8 @@ mod tests {
         op: &'static str,
         fault: Fault,
         crash: Option<CrashAfter>,
+        /// The next publish fails (the store or the coordinator is down).
+        publish_fails: bool,
     }
 
     fn step() -> impl Strategy<Value = Step> {
@@ -619,23 +872,27 @@ mod tests {
             3 => Just(None),
             1 => Just(Some(CrashAfter::Intent)),
             1 => Just(Some(CrashAfter::Authorized)),
+            1 => Just(Some(CrashAfter::Published)),
             1 => Just(Some(CrashAfter::Send)),
         ];
-        (op, fault, crash).prop_map(|(op, fault, crash)| Step { op, fault, crash })
+        let publish_fails = prop_oneof![4 => Just(false), 1 => Just(true)];
+        (op, fault, crash, publish_fails).prop_map(|(op, fault, crash, publish_fails)| Step { op, fault, crash, publish_fails })
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(96))]
 
-        /// Any sequence of effects, provider faults and crashes: no request
-        /// is ever applied twice, and after every reconciliation each
-        /// intent is either terminal or an open obligation.
+        /// Any sequence of effects, provider faults, publish failures and
+        /// crashes: no request is ever applied twice, nothing is ever sent
+        /// before its authorization is published, and after every
+        /// reconciliation each intent is either terminal or an open
+        /// obligation.
         #[test]
         fn no_duplicates_and_nothing_silently_lost(steps in proptest::collection::vec(step(), 1..12)) {
             let e = env();
             let p = Shared::new("mail");
             let mut v = vessel(&e);
-            let (mut fx, _) = Effects::open(registry(&p), &mut v).unwrap();
+            let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
             for (n, s) in steps.iter().enumerate() {
                 if !fx.authorized() {
                     // An operator checks the provider and records the truth.
@@ -652,16 +909,19 @@ mod tests {
                     }
                 }
                 p.fail_next(s.fault);
+                p.fail_publish(s.publish_fails as u32);
                 let target = format!("t{n}");
                 let r = fx.dispatch_until(&mut v, "mail", call(s.op, &target), s.crash).unwrap();
                 if r.is_none() {
                     drop((fx, v));
                     v = vessel(&e);
-                    let (f, rec) = Effects::open(registry(&p), &mut v).unwrap();
+                    let (f, rec) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
                     fx = f;
                     prop_assert_eq!(rec.open.clone(), fx.open_obligations());
                 }
                 prop_assert!(p.no_duplicates(), "a request was applied twice");
+                let order = sent_only_after_publish(&v, &p);
+                prop_assert!(order.is_ok(), "{:?}", order);
             }
             // Every intent ends terminal, or is an open barrier obligation.
             let mut latest: BTreeMap<OpId, OutcomeState> = BTreeMap::new();

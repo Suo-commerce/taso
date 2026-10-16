@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 26312c089735f9133387f73edad05aadf2f5aa9f23b145badfc5743f264c16b1 # shrinks to steps = [Step { op: "fire", fault: ReplyLost, crash: Some(AfterSend) }]
+cc f92660492ac7c4b1d06b17d1f29d0e67fe44d27253c0dda7ed4658c79043035b # shrinks to steps = [Step { op: "read", fault: None, crash: Some(Authorized), publish_fails: true }]

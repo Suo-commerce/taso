@@ -88,6 +88,13 @@ use std::io::{self, Read};
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use taso_core::record::{Origin, Payload};
 
+use std::sync::Arc;
+
+use taso_core::envelope::Epoch;
+use taso_core::model::WardenId;
+
+use crate::coordinator::Coord;
+use crate::effects::{Publish, PublishError};
 use crate::segment::{self, Frame, Position, Segment, SegmentError, MAX_PAYLOAD};
 use crate::ship::{valid_key, ByteStream, ObjectStore, Sender};
 use crate::zfs::Snapshot;
@@ -953,6 +960,43 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     }
 }
 
+// ── Publishing before dispatch ──────────────────────────────────────
+
+/// The real [`Publish`]: ship a log pack with everything accepted and not
+/// yet shipped, then advance the coordinator's shipped anchor to it.  The
+/// effect engine sends nothing until both are done.
+pub struct PackPublisher<S: ObjectStore, X: Sender> {
+    packs: Packs<S, X>,
+    coord: Arc<dyn Coord>,
+    warden: WardenId,
+}
+
+impl<S: ObjectStore, X: Sender> PackPublisher<S, X> {
+    /// Publish through `packs` and `coord`, as `warden`.
+    pub fn new(packs: Packs<S, X>, coord: Arc<dyn Coord>, warden: WardenId) -> Self {
+        Self { packs, coord, warden }
+    }
+}
+
+impl<S: ObjectStore, X: Sender> Publish for PackPublisher<S, X> {
+    fn publish(
+        &mut self,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        segment: &Segment,
+        upto: Position,
+    ) -> Result<(), PublishError> {
+        if chronicle != self.packs.chronicle {
+            return Err(PublishError("the packs belong to another Chronicle".into()));
+        }
+        self.packs.ship_log(segment, upto).map_err(|e| PublishError(format!("pack: {e}")))?;
+        self.coord
+            .advance_shipped(self.warden, chronicle, epoch, upto)
+            .map_err(|e| PublishError(format!("coordinator: {e}")))?;
+        Ok(())
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1506,6 +1550,66 @@ mod tests {
         b[9] ^= 1; // the chronicle id
         std::fs::write(e.path(&key), &b).unwrap();
         assert!(matches!(e.packs.chain(None), Err(PackError::Corrupt { .. })));
+    }
+
+    // ── PackPublisher ───────────────────────────────────────────────
+
+    /// A coordinator that has accepted every frame of `log`, held by A.
+    fn coord_for(log: &Log) -> (tempfile::TempDir, Arc<dyn Coord>) {
+        use crate::coordinator::Coordinator;
+        let dir = tempfile::tempdir().unwrap();
+        let c = Coordinator::open(dir.path().join("coord.redb")).unwrap();
+        c.register(ID, WardenId::new(1)).unwrap();
+        for f in log.seg.frames().unwrap() {
+            c.append(WardenId::new(1), &f.envelope).unwrap();
+        }
+        (dir, Arc::new(c))
+    }
+
+    #[test]
+    fn publisher_ships_then_anchors_and_the_chain_verifies_against_the_anchor() {
+        let mut log = Log::new();
+        log.fill(5, &[]);
+        let (_cd, coord) = coord_for(&log);
+        let dir = tempfile::tempdir().unwrap();
+        let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
+        let mut p = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
+        p.publish(ID, Epoch::FIRST, &log.seg, log.at(3)).unwrap();
+        assert_eq!(coord.shipped(ID).unwrap(), log.at(3));
+        p.publish(ID, Epoch::FIRST, &log.seg, log.at(5)).unwrap();
+        assert_eq!(coord.shipped(ID).unwrap(), log.at(5));
+        // Nothing new: still fine, nothing changes.
+        p.publish(ID, Epoch::FIRST, &log.seg, log.at(5)).unwrap();
+        let reader = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
+        assert_eq!(reader.chain(Some(coord.shipped(ID).unwrap())).unwrap().end, log.at(5));
+        assert_eq!(reader.store.list(&reader.dir).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn publisher_fails_on_the_store_or_the_coordinator() {
+        let mut log = Log::new();
+        log.fill(4, &[]);
+        let (_cd, coord) = coord_for(&log);
+        // The store fails: its root is a file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-dir");
+        std::fs::write(&root, b"x").unwrap();
+        let packs = Packs::new(LocalStore::new(&root), FakeSend::default(), "vessels", ID).unwrap();
+        let mut p = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
+        assert!(p.publish(ID, Epoch::FIRST, &log.seg, log.at(4)).is_err());
+        assert_eq!(coord.shipped(ID).unwrap(), Position::GENESIS, "no anchor without the pack");
+        // The coordinator refuses: a stale epoch, another holder.
+        let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
+        let mut p = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
+        assert!(p.publish(ID, Epoch::new(7), &log.seg, log.at(4)).is_err());
+        let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
+        let mut other = PackPublisher::new(packs, coord.clone(), WardenId::new(2));
+        assert!(other.publish(ID, Epoch::FIRST, &log.seg, log.at(4)).is_err());
+        assert_eq!(coord.shipped(ID).unwrap(), Position::GENESIS);
+        // Another Chronicle's packs.
+        let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", TPL).unwrap();
+        let mut wrong = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
+        assert!(wrong.publish(ID, Epoch::FIRST, &log.seg, log.at(4)).is_err());
     }
 
     // ── the first fs section starts where the lineage says ──────────
