@@ -101,6 +101,26 @@ to the decision lists in the session handoffs.
     before it left, so no answer changes; a group that fails to commit
     answers every accepted request "outcome unknown", never a refusal.
 
+17. **Segments roll and shipped ones are pruned behind a Checkpoint**
+    (2026-10-16). A Chronicle rolls to a new segment file at 64 MiB.
+    After a Seal is published, the Warden appends a Checkpoint record
+    (Ctl, tag 9) and removes the oldest closed segment files whose every
+    record is at or below the shipped anchor, keeping the newest two.
+    The Checkpoint carries what readers need from the records before it:
+    lineage, transcript and effect positions, the last Seal (turn and
+    ledger position), the last FsShipped, open effects with their latest
+    state, and the next op id. Readers start from the newest Checkpoint.
+    A log whose first local segment is not genesis opens only if that
+    segment begins at or below the shipped anchor and a Checkpoint is
+    present; the full history stays in the packs. Layers of Seals whose
+    records were pruned are kept, not judged again.
+18. **The TurnEnd reply goes out before the Seal is published**
+    (2026-10-16). The Seal is accepted before the reply, as before; the
+    publish (shipping its packs and advancing the shipped anchor) runs
+    after the reply is sent and before the next request is read, so it
+    is off the agent's turn latency. A failed publish is handled as in
+    amendment 15.
+
 ### Amendments already applied from the Phase 4 plan
 
 12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
