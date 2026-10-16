@@ -19,7 +19,9 @@
 //! accept/refuse decision, every head and every ownership state must
 //! match.  This module adds two checks the model leaves implicit — the
 //! envelope's hash must verify, and its lsn must be exactly one past the
-//! anchored head — and makes every state change one fsynced transaction.
+//! anchored head — and makes every state change durable before it is
+//! answered.  Concurrent writes share a transaction and its fsync (group
+//! commit, see [`Coordinator`]); each is still checked on its own.
 //!
 //! The database file is locked by `redb` while open, so a second process
 //! cannot open the same coordinator.
@@ -44,6 +46,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::{mpsc, Mutex};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
 use taso_core::envelope::{ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn};
@@ -388,10 +391,35 @@ type Rows<'t> = Table<'t, [u8; 16], &'static [u8]>;
 /// The durable single-node coordinator (v1.0 §3: "single-node `redb`,
 /// fsync").
 ///
-/// Methods take `&self`; `redb` serialises write transactions, so one
-/// `Coordinator` can be shared across a Warden's threads.
+/// Methods take `&self`, so one `Coordinator` is shared across a node's
+/// threads.  Writes are **group-committed**: a request joins a queue; if
+/// no commit is in progress its caller leads, running every queued
+/// request in order in one transaction and committing once, and each
+/// caller gets its answer only after that commit.  Every request is
+/// checked on its own against the state the ones before it left, and
+/// writes nothing unless it is accepted, so grouping changes no answer:
+/// only how many fsyncs a busy node pays (the p64 Seal finding,
+/// 2026-10-16).
 pub struct Coordinator {
     db: Database,
+    queue: Mutex<Queue>,
+    /// Transactions led so far (tests check that writes were grouped).
+    #[cfg(test)]
+    groups: std::sync::atomic::AtomicUsize,
+}
+
+/// What a request does once its transaction has committed (`None`) or
+/// failed to: send its answer.
+type Done = Box<dyn FnOnce(Option<&CoordError>) + Send>;
+
+/// A queued write request: run against the group's table (or told why
+/// there is none); returns whether it wrote, and how to answer.
+type Job = Box<dyn for<'a, 't> FnOnce(Result<&'a mut Rows<'t>, &'a CoordError>) -> (bool, Done) + Send>;
+
+#[derive(Default)]
+struct Queue {
+    jobs: Vec<Job>,
+    leading: bool,
 }
 
 impl Coordinator {
@@ -399,7 +427,12 @@ impl Coordinator {
     /// exist.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoordError> {
         let db = Database::create(path).map_err(storage)?;
-        let coord = Self { db };
+        let coord = Self {
+            db,
+            queue: Mutex::default(),
+            #[cfg(test)]
+            groups: std::sync::atomic::AtomicUsize::new(0),
+        };
         // Make sure the table exists so reads never see "no such table".
         coord.write(|_| Ok(()))?;
         Ok(coord)
@@ -407,28 +440,115 @@ impl Coordinator {
 
     // ── internals ───────────────────────────────────────────────────
 
-    /// Run `f` in one write transaction, committed with fsync on `Ok` and
-    /// aborted on `Err`.
-    fn write<T>(
+    /// Run `f` in a write transaction shared with whatever else is queued
+    /// (group commit, see [`Coordinator`]), and return its answer once
+    /// that transaction is committed with fsync.  `f` must write only if
+    /// it returns `Ok`.  If the commit fails, an `Ok` becomes an error
+    /// whose outcome is unknown.
+    fn write<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Rows<'_>) -> Result<T, CoordError>,
+        f: impl FnOnce(&mut Rows<'_>) -> Result<T, CoordError> + Send + 'static,
     ) -> Result<T, CoordError> {
-        let mut txn = self.db.begin_write().map_err(storage)?;
-        // Immediate is redb's default; stated so it cannot drift.
-        txn.set_durability(Durability::Immediate).map_err(storage)?;
-        let out = {
-            let mut rows = txn.open_table(CHRONICLES).map_err(storage)?;
-            f(&mut rows)
+        let (tx, rx) = mpsc::channel::<Result<T, CoordError>>();
+        let job: Job = Box::new(move |rows| {
+            let out = match rows {
+                Ok(rows) => f(rows),
+                Err(e) => Err(group_failed(e)),
+            };
+            let wrote = out.is_ok();
+            let done: Done = Box::new(move |commit| {
+                let answer = match (out, commit) {
+                    (Ok(_), Some(e)) => Err(group_failed(e)),
+                    (out, _) => out,
+                };
+                let _ = tx.send(answer);
+            });
+            (wrote, done)
+        });
+        let lead = {
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.jobs.push(job);
+            !std::mem::replace(&mut q.leading, true)
         };
-        match out {
-            Ok(v) => {
-                txn.commit().map_err(storage)?;
-                Ok(v)
+        if lead {
+            self.lead();
+        }
+        rx.recv().unwrap_or_else(|_| Err(CoordError::Unavailable(std::io::Error::other("the group commit leader is gone"))))
+    }
+
+    /// Commit queued requests, group after group, until the queue is empty.
+    fn lead(&self) {
+        // If a request panics, give up leading and drop what is queued:
+        // dropped requests answer their callers with an error, and the
+        // next caller leads.  Without this every later write would wait.
+        struct Abdicate<'a>(&'a Mutex<Queue>);
+        impl Drop for Abdicate<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                    q.jobs.clear();
+                    q.leading = false;
+                }
             }
+        }
+        let _abdicate = Abdicate(&self.queue);
+        loop {
+            let jobs = {
+                let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if q.jobs.is_empty() {
+                    q.leading = false;
+                    return;
+                }
+                std::mem::take(&mut q.jobs)
+            };
+            self.commit_group(jobs);
+        }
+    }
+
+    /// One transaction for `jobs`, in order; commit if any wrote, else
+    /// abort; then answer each.
+    fn commit_group(&self, jobs: Vec<Job>) {
+        let _t = crate::timing::span("coord.group");
+        #[cfg(test)]
+        self.groups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let begun = self.db.begin_write().map_err(storage).and_then(|mut txn| {
+            // Immediate is redb's default; stated so it cannot drift.
+            txn.set_durability(Durability::Immediate).map_err(storage)?;
+            Ok(txn)
+        });
+        let txn = match begun {
+            Ok(t) => t,
             Err(e) => {
-                txn.abort().map_err(storage)?;
-                Err(e)
+                for job in jobs {
+                    let (_, done) = job(Err(&e));
+                    done(Some(&e));
+                }
+                return;
             }
+        };
+        let mut dones = Vec::with_capacity(jobs.len());
+        let mut any = false;
+        {
+            let mut rows = match txn.open_table(CHRONICLES).map_err(storage) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    for job in jobs {
+                        let (_, done) = job(Err(&e));
+                        done(Some(&e));
+                    }
+                    return;
+                }
+            };
+            for job in jobs {
+                let (wrote, done) = job(Ok(&mut rows));
+                any |= wrote;
+                dones.push(done);
+            }
+        }
+        let ended = if any { txn.commit().map_err(storage) } else { txn.abort().map_err(storage) };
+        let failed = ended.err();
+        for done in dones {
+            done(failed.as_ref());
         }
     }
 
@@ -443,8 +563,10 @@ impl Coordinator {
     }
 }
 
-/// The redb coordinator.  Each method is one `redb` write (or read)
-/// transaction, committed with fsync before it returns.
+/// The redb coordinator.  Each write is checked on its own and committed
+/// with fsync before it returns, in a transaction it may share with
+/// concurrent writes (group commit, see [`Coordinator`]); a refused write
+/// changes nothing.
 impl Coord for Coordinator {
     /// Register a fresh Chronicle with its first holder.
     ///
@@ -455,7 +577,7 @@ impl Coord for Coordinator {
         chronicle: ChronicleId,
         holder: WardenId,
     ) -> Result<ChronicleHead, CoordError> {
-        self.write(|rows| {
+        self.write(move |rows| {
             if load(rows, chronicle)?.is_some() {
                 return Err(CoordError::AlreadyRegistered(chronicle));
             }
@@ -501,12 +623,14 @@ impl Coord for Coordinator {
 
     fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError> {
         let chronicle = envelopes.first().ok_or(CoordError::BadBatch { lsn: Lsn::new(0) })?.chronicle;
-        self.write(|rows| {
+        // Owned: the request may run on the thread leading the group.
+        let envelopes = envelopes.to_vec();
+        self.write(move |rows| {
             let mut state =
                 load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             // Checked against a running head; stored once, or not at all
             // (an error drops the transaction).
-            for envelope in envelopes {
+            for envelope in &envelopes {
                 if envelope.chronicle != chronicle {
                     return Err(CoordError::BadBatch { lsn: envelope.lsn });
                 }
@@ -557,7 +681,7 @@ impl Coord for Coordinator {
         chronicle: ChronicleId,
         new_holder: WardenId,
     ) -> Result<Epoch, CoordError> {
-        self.write(|rows| {
+        self.write(move |rows| {
             let mut state =
                 load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             state.sealed_prefix = state.head;
@@ -588,7 +712,7 @@ impl Coord for Coordinator {
         epoch: Epoch,
         to: Position,
     ) -> Result<Position, CoordError> {
-        self.write(|rows| {
+        self.write(move |rows| {
             let mut state = load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             if warden != state.holder {
                 return Err(CoordError::NotHolder { warden, holder: state.holder });
@@ -615,6 +739,13 @@ impl Coord for Coordinator {
     fn shipped(&self, chronicle: ChronicleId) -> Result<Position, CoordError> {
         Ok(self.read(chronicle)?.shipped)
     }
+}
+
+/// The answer for a request whose group transaction could not begin or
+/// commit: its outcome is unknown (the error is not `Clone`; its text is
+/// kept).
+fn group_failed(e: &CoordError) -> CoordError {
+    CoordError::Unavailable(std::io::Error::other(format!("group commit failed: {e}")))
 }
 
 fn load(rows: &Rows<'_>, chronicle: ChronicleId) -> Result<Option<State>, CoordError> {
@@ -807,6 +938,180 @@ mod tests {
         assert_eq!(coord.head(chron(2)).unwrap().lsn, Lsn::new(0));
         assert_eq!(coord.ownership(chron(2)).unwrap().epoch, Epoch::FIRST);
         assert_eq!(coord.ownership(chron(2)).unwrap().holder, B);
+    }
+
+    // ── group commit ────────────────────────────────────────────────
+
+    /// Many Wardens, each on its own Chronicle, appending at once: every
+    /// append accepted exactly once, every head right, durably, and the
+    /// writes really shared transactions.
+    #[test]
+    fn concurrent_appends_are_grouped_and_exact() {
+        const THREADS: u8 = 16;
+        const EACH: u64 = 40;
+        let (_d, path, coord) = fresh();
+        for t in 0..THREADS {
+            coord.register(chron(t), WardenId::new(u64::from(t) + 1)).unwrap();
+        }
+        let start = std::sync::Barrier::new(usize::from(THREADS));
+        let heads: Vec<ChronicleHead> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let (coord, start) = (&coord, &start);
+                    s.spawn(move || {
+                        let me = WardenId::new(u64::from(t) + 1);
+                        let mut w = resumed(me, chron(t), coord);
+                        start.wait();
+                        let mut last = None;
+                        for n in 1..=EACH {
+                            let h = submit(coord, &mut w, chron(t), n).unwrap();
+                            assert_eq!(h.lsn, Lsn::new(n));
+                            last = Some(h);
+                        }
+                        last.unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let writes = usize::from(THREADS) * EACH as usize + usize::from(THREADS);
+        let groups = coord.groups.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(groups < writes, "{groups} transactions for {writes} writes: nothing was grouped");
+        drop(coord);
+        let coord = Coordinator::open(&path).unwrap();
+        for (t, h) in heads.iter().enumerate() {
+            assert_eq!(coord.head(chron(t as u8)).unwrap(), *h);
+            assert_eq!(h.lsn, Lsn::new(EACH));
+        }
+    }
+
+    /// Two Wardens racing for every position of one Chronicle (a split
+    /// brain inside one epoch): each position is accepted exactly once,
+    /// the loser is refused, and a refusal never fails a request grouped
+    /// with it.
+    #[test]
+    fn racing_appends_one_wins_each_position() {
+        const RACERS: u64 = 8;
+        const ROUNDS: u64 = 30;
+        let (_d, _p, coord) = fresh();
+        coord.register(chron(1), A).unwrap();
+        for t in 0..4u8 {
+            coord.register(chron(10 + t), B).unwrap();
+        }
+        let start = std::sync::Barrier::new(RACERS as usize + 4);
+        let wins: u64 = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..RACERS)
+                .map(|r| {
+                    let (coord, start) = (&coord, &start);
+                    s.spawn(move || {
+                        start.wait();
+                        let mut wins = 0;
+                        for n in 0..ROUNDS {
+                            // Build on whatever is anchored now; others race.
+                            let head = coord.head(chron(1)).unwrap();
+                            let env = Record::new(
+                                chron(1), BranchId::TRUNK, head.epoch, Stream::Fs,
+                                head.lsn.next(), head.hash, raw(r * 1000 + n),
+                            )
+                            .envelope;
+                            match coord.append(A, &env) {
+                                Ok(h) => {
+                                    assert_eq!(h.hash, env.hash);
+                                    wins += 1;
+                                }
+                                Err(e) => assert!(
+                                    matches!(e, CoordError::HeadMismatch { .. } | CoordError::LsnNotNext { .. }),
+                                    "{e}"
+                                ),
+                            }
+                        }
+                        wins
+                    })
+                })
+                .collect();
+            // Bystanders on other Chronicles must never see a refusal.
+            for t in 0..4u8 {
+                let (coord, start) = (&coord, &start);
+                s.spawn(move || {
+                    let mut w = resumed(B, chron(10 + t), coord);
+                    start.wait();
+                    for n in 1..=ROUNDS {
+                        submit(coord, &mut w, chron(10 + t), n).unwrap();
+                    }
+                });
+            }
+            racers.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(coord.head(chron(1)).unwrap().lsn, Lsn::new(wins), "every accepted append advanced the head once");
+        assert!(wins >= ROUNDS, "each round has a winner");
+        for t in 0..4u8 {
+            assert_eq!(coord.head(chron(10 + t)).unwrap().lsn, Lsn::new(ROUNDS));
+        }
+    }
+
+    /// A request that panics while leading a group: its group's callers
+    /// get an error, and the coordinator keeps working.
+    #[test]
+    fn a_panicking_request_does_not_wedge_the_queue() {
+        let (_d, _p, coord) = fresh();
+        coord.register(chron(1), A).unwrap();
+        let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            coord.write(|_rows| -> Result<(), CoordError> { panic!("boom") })
+        }));
+        assert!(hit.is_err());
+        let mut w = resumed(A, chron(1), &coord);
+        assert_eq!(submit(&coord, &mut w, chron(1), 1).unwrap().lsn, Lsn::new(1));
+    }
+
+    /// A caller queued behind a leader that panics is answered (outcome
+    /// unknown), not left waiting for a leader that never comes.
+    #[test]
+    fn callers_queued_behind_a_panic_are_answered() {
+        let (_d, _p, coord) = fresh();
+        coord.register(chron(1), A).unwrap();
+        let mut w = resumed(A, chron(1), &coord);
+        let (leading, go) = (mpsc::channel(), mpsc::channel::<()>());
+        let (answered, got) = mpsc::channel();
+        std::thread::scope(|s| {
+            let coord = &coord;
+            let (leading_tx, go_rx) = (leading.0, go.1);
+            s.spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    coord.write(move |_rows| -> Result<(), CoordError> {
+                        leading_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        panic!("boom")
+                    })
+                }));
+            });
+            leading.1.recv().unwrap();
+            s.spawn(move || {
+                let _ = answered.send(submit(coord, &mut w, chron(1), 1));
+            });
+            // Let the second caller queue behind the stuck leader.
+            while coord.queue.lock().unwrap().jobs.is_empty() {
+                std::thread::yield_now();
+            }
+            go.0.send(()).unwrap();
+            let r = got.recv_timeout(std::time::Duration::from_secs(10));
+            if r.is_err() {
+                // Lead the stranded request ourselves so the scope can end.
+                let _ = coord.write(|_rows| Ok(()));
+                panic!("queued caller never answered");
+            }
+            assert!(r.unwrap().unwrap_err().outcome_unknown());
+        });
+        // The queued append never ran; the next one is lsn 1.
+        assert_eq!(coord.head(chron(1)).unwrap().lsn, Lsn::new(0));
+    }
+
+    /// A group that cannot commit answers every caller "outcome unknown",
+    /// never a refusal: the CAS may have landed.
+    #[test]
+    fn a_failed_group_is_outcome_unknown() {
+        let e = group_failed(&CoordError::Unavailable(std::io::Error::other("disk gone")));
+        assert!(e.outcome_unknown());
+        assert!(e.to_string().contains("group commit failed") && e.to_string().contains("disk gone"), "{e}");
     }
 
     // ── durability ──────────────────────────────────────────────────
