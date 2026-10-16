@@ -67,12 +67,40 @@
 //!
 //! [`Packs::chain`] verifies every pack's header and log, merges them by
 //! lsn (an lsn held by two packs must hold the same record), checks the
-//! log is continuous from genesis, that every `fs` section is anchored in
-//! the log, that the first one starts from what the lineage says and the
-//! rest form one chain, and, given an
+//! log is continuous from genesis (through Gap records), that every `fs`
+//! section is anchored in the log, that the first one starts from what the
+//! lineage says and the rest form one chain, and, given an
 //! anchor from an authority the store cannot write (the coordinator),
 //! that the chain contains it.  Without an anchor a chain only proves it
 //! is self-consistent: anyone who can write the bucket can build one.
+//! With an anchor it returns nothing past it: packs beyond it are still
+//! read, and two that disagree are still a conflict, but a missing lsn
+//! beyond the anchor only ends what is read.
+//!
+//! # Gaps (rebirth)
+//!
+//! A Warden that takes a Chronicle over keeps only what was shipped and
+//! anchored, up to `kept`, and writes a `Gap` record saying records
+//! `(kept, resumes]` are lost to it (v1.0 §1 P2).  Its local log jumps
+//! there, and so may its packs: a frame **follows** the one before it if
+//! it is the next lsn chained to it, or it is a well-formed Gap record
+//! that jumps.  Inside one pack (one writer's log) a Gap must keep exactly
+//! the frame before it.  Across packs it may keep an earlier one: a
+//! Warden SIGKILLed after a put but before the coordinator's shipped
+//! anchor moved leaves a pack past `kept`, which the store still holds.
+//!
+//! Such records are verified and checked for conflicts, but
+//! [`Packs::chain`] does not return them, nor any `fs` section whose Seal
+//! is among them: the chain is exactly what the local logs hold, so a log
+//! rebuilt from it passes the same joint check as on disk.  The `kept`
+//! hash binds the Gap to the kept record even when its `prev` points at
+//! a lost one, and the Gap is chained forward to the anchor.
+//!
+//! For the same reason a writer never starts from something only an
+//! unanchored pack holds: a pack's log starts where the store's packs end
+//! if the local log holds that position, else at the `kept` of the local
+//! gap it falls in; a Seal's `fs` stream starts from the last shipped `fs`
+//! Seal the local log holds, skipping any the gap swallowed.
 //!
 //! Version 1 of this format was first written with a 195-byte header whose
 //! `fs` base could only be this Chronicle's own Seal; it changed to the
@@ -86,7 +114,7 @@ use std::fmt;
 use std::io::{self, Read};
 
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
-use taso_core::record::{Origin, Payload};
+use taso_core::record::{GapRecord, Origin, Payload};
 
 use std::sync::Arc;
 
@@ -172,11 +200,15 @@ pub struct Shipped {
 /// The verified, merged contents of every pack of a Chronicle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chain {
-    /// Frames 1 ..= `end`, in order, chained from genesis.
+    /// Frames 1 ..= `end`, in order, chained from genesis and jumping only
+    /// at Gap records: exactly what the local logs hold.  Records a Gap
+    /// says are lost are not here, even if a pack holds them.
     pub frames: Vec<Frame>,
-    /// The last frame's position ([`Position::GENESIS`] if none).
+    /// The last position: the anchor if one was given, else the last
+    /// frame's ([`Position::GENESIS`] if none).
     pub end: Position,
-    /// The shipped `fs` sections, in Seal order, forming one chain.
+    /// The shipped `fs` sections up to `end`, in Seal order, forming one
+    /// chain; none whose Seal is lost.
     pub seals: Vec<FsRef>,
 }
 
@@ -579,6 +611,102 @@ impl Read for FsOut {
     }
 }
 
+// ── Gaps and the link rule ──────────────────────────────────────────
+
+/// The Gap record a frame holds, if it is one.
+fn gap_of(f: &Frame) -> Option<GapRecord> {
+    if f.envelope.stream != Stream::Ctl {
+        return None;
+    }
+    match Payload::decode(&f.payload) {
+        Ok(Payload::Gap(g)) => Some(g),
+        _ => None,
+    }
+}
+
+fn kept_of(g: &GapRecord) -> Position {
+    Position { lsn: g.kept, hash: g.kept_hash }
+}
+
+fn resumes_of(g: &GapRecord) -> Position {
+    Position { lsn: g.resumes, hash: g.resumes_hash }
+}
+
+/// A Gap record is well-formed where it stands: it resumes right after
+/// the record it chains to, and keeps something before that.
+fn gap_well_formed(f: &Frame, g: &GapRecord) -> bool {
+    g.resumes.next() == f.envelope.lsn && g.resumes_hash == f.envelope.prev && g.kept < g.resumes
+}
+
+/// How `f` follows `tail` in one writer's log: as the next record, or as a
+/// Gap record keeping exactly `tail`.  Returns the position `f` chains
+/// from (its `prev`), which [`segment::check_frame`] then verifies.
+fn link_strict(tail: Position, f: &Frame) -> Result<Position, &'static str> {
+    let gap = gap_of(f);
+    if gap.as_ref().is_some_and(|g| !gap_well_formed(f, g)) {
+        return Err("a malformed Gap record");
+    }
+    let lsn = f.envelope.lsn;
+    if lsn <= tail.lsn {
+        return Err("records out of order");
+    }
+    if lsn == tail.lsn.next() {
+        return Ok(tail);
+    }
+    match gap {
+        Some(g) if kept_of(&g) == tail => Ok(resumes_of(&g)),
+        Some(_) => Err("a Gap record that does not keep the record before it"),
+        None => Err("records are skipped without a Gap record"),
+    }
+}
+
+/// Where an lsn is in the local log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Spot {
+    /// Lsn 0.
+    Genesis,
+    /// A frame in segment `i`.
+    Frame(usize),
+    /// The base of segment `i`, held by no local frame: its hash is the
+    /// segment's base hash.  For `i > 0` it is the last record lost in a
+    /// gap.
+    Base(usize),
+    /// Strictly inside a gap: lost; the gap keeps this.
+    Lost { kept: Position },
+    /// Before the oldest local segment (rolled away).
+    Before,
+    /// After the local log.
+    Beyond,
+}
+
+/// Locate `lsn` among `segments` (oldest first) from their bases and tails
+/// only; reads no file.
+fn locate(segments: &[&Segment], lsn: Lsn) -> Spot {
+    if lsn == Lsn::new(0) {
+        return Spot::Genesis;
+    }
+    for (i, s) in segments.iter().enumerate() {
+        if s.base().lsn < lsn && lsn <= s.tail().lsn {
+            return Spot::Frame(i);
+        }
+        if lsn == s.base().lsn {
+            return Spot::Base(i);
+        }
+        if lsn < s.base().lsn {
+            return match i {
+                0 => Spot::Before,
+                _ => Spot::Lost { kept: segments[i - 1].tail() },
+            };
+        }
+    }
+    Spot::Beyond
+}
+
+/// The local frame at `lsn`, if segment `i` holds it.
+fn local_frame(segments: &[&Segment], i: usize, lsn: Lsn) -> Result<Option<Frame>, PackError> {
+    Ok(segments[i].frames()?.into_iter().find(|f| f.envelope.lsn == lsn))
+}
+
 // ── Packs ───────────────────────────────────────────────────────────
 
 /// One Chronicle's packs in a store.
@@ -665,9 +793,12 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             let env = segment::try_decode_envelope(&pre[4..]).ok_or_else(|| corrupt("bad envelope".into()))?;
             let payload = pin.take(len as usize).map_err(short)?;
             log.update(&payload);
-            segment::check_frame(self.chronicle, tail, &env, &payload).map_err(|e| corrupt(e.to_string()))?;
-            tail = Position { lsn: env.lsn, hash: env.hash };
-            frames.push(Frame { envelope: env, payload });
+            let frame = Frame { envelope: env, payload };
+            let from = link_strict(tail, &frame).map_err(|why| corrupt(why.into()))?;
+            segment::check_frame(self.chronicle, from, &frame.envelope, &frame.payload)
+                .map_err(|e| corrupt(e.to_string()))?;
+            tail = Position { lsn: frame.envelope.lsn, hash: frame.envelope.hash };
+            frames.push(frame);
         }
         if tail != h.end {
             return Err(corrupt("the log does not end at the header's end".into()));
@@ -695,40 +826,91 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         Ok(Shipped { log, fs })
     }
 
-    /// Frames `after+1 ..= upto` from the local segment, chained from
-    /// `after` and ending exactly at `upto`.
-    fn frames_after(&self, segment: &Segment, after: Position, upto: Position) -> Result<Vec<Frame>, PackError> {
-        if segment.chronicle() != self.chronicle {
-            return Err(PackError::Refused("the segment belongs to another Chronicle".into()));
+    /// Frames `after+1 ..= upto` from the local segments (oldest first),
+    /// following `after` by the link rule and ending exactly at `upto`.
+    /// Reads only the segments holding frames past `after`.
+    fn frames_after(&self, segments: &[&Segment], after: Position, upto: Position) -> Result<Vec<Frame>, PackError> {
+        if segments.iter().any(|s| s.chronicle() != self.chronicle) {
+            return Err(PackError::Refused("a segment belongs to another Chronicle".into()));
         }
-        if after.lsn < segment.base().lsn {
-            return Err(PackError::Refused(format!(
-                "frames after lsn {} are not in the local segment, which starts at lsn {}",
-                after.lsn.get(),
-                segment.base().lsn.get()
-            )));
-        }
-        let frames: Vec<Frame> = segment
-            .frames()?
-            .into_iter()
-            .filter(|f| f.envelope.lsn > after.lsn && f.envelope.lsn <= upto.lsn)
-            .collect();
-        let chained_from = if after.lsn == segment.base().lsn {
-            segment.base().hash == after.hash
-        } else {
-            frames.first().is_some_and(|f| f.envelope.prev == after.hash)
-        };
-        let complete = frames.len() as u64 == upto.lsn.get() - after.lsn.get()
-            && frames.first().is_some_and(|f| f.envelope.prev == after.hash)
-            && frames.last().is_some_and(|f| f.envelope.hash == upto.hash);
-        if !chained_from || !complete {
-            return Err(PackError::Refused(format!(
-                "the local segment does not hold lsn {}..={} chained from what is shipped",
+        let refused = || {
+            PackError::Refused(format!(
+                "the local segments do not hold lsn {}..={} chained from what is shipped",
                 after.lsn.get() + 1,
                 upto.lsn.get()
-            )));
+            ))
+        };
+        let mut frames = Vec::new();
+        for s in segments.iter().filter(|s| s.tail().lsn > after.lsn) {
+            frames.extend(s.frames()?.into_iter().filter(|f| f.envelope.lsn > after.lsn && f.envelope.lsn <= upto.lsn));
+        }
+        let mut tail = after;
+        for f in &frames {
+            let from = link_strict(tail, f).map_err(|_| refused())?;
+            if f.envelope.prev != from.hash {
+                return Err(refused());
+            }
+            tail = Position { lsn: f.envelope.lsn, hash: f.envelope.hash };
+        }
+        if frames.is_empty() || tail != upto {
+            return Err(refused());
         }
         Ok(frames)
+    }
+
+    /// Where the next pack's log starts, given where the store's packs
+    /// end: there, if the local log holds that position; the `kept` of the
+    /// local gap it falls in, if it is lost to this node (an unanchored
+    /// pack of a Warden that lost the Chronicle).
+    fn log_base(&self, segments: &[&Segment], end: Position) -> Result<Position, PackError> {
+        let conflict = PackError::Conflict { lsn: end.lsn };
+        match locate(segments, end.lsn) {
+            Spot::Genesis => (end.hash == HashVal::GENESIS).then_some(end).ok_or(conflict),
+            Spot::Frame(i) => match local_frame(segments, i, end.lsn)? {
+                Some(f) if f.envelope.hash == end.hash => Ok(end),
+                _ => Err(conflict),
+            },
+            Spot::Base(i) => (segments[i].base() == end).then_some(end).ok_or(conflict),
+            Spot::Lost { kept } => Ok(kept),
+            Spot::Before => Err(PackError::Refused(format!(
+                "the store ends at lsn {}, before the local segments",
+                end.lsn.get()
+            ))),
+            Spot::Beyond => Err(PackError::Refused(format!(
+                "the store ends at lsn {}, past the local log",
+                end.lsn.get()
+            ))),
+        }
+    }
+
+    /// The last shipped `fs` section the local log holds: a store section
+    /// whose Seal a gap swallowed is skipped (it was never anchored, and
+    /// this node has no snapshot of it).  Reads one header per section it
+    /// looks at, newest first.
+    fn fs_base(&self, segments: &[&Segment]) -> Result<Option<FsRef>, PackError> {
+        let mut names: Vec<(String, Name)> = self.names()?.into_iter().filter(|(_, n)| n.fs_to.is_some()).collect();
+        names.sort_by_key(|(_, n)| std::cmp::Reverse(n.fs_to));
+        for (key, name) in names {
+            let to = name.fs_to.expect("filtered");
+            match locate(segments, to) {
+                Spot::Lost { .. } => continue,
+                Spot::Base(i) if i > 0 => continue,
+                Spot::Frame(i) => {
+                    let fs = self.read_header(&key, name)?.fs.expect("a name with an fs Seal has an fs section");
+                    return match local_frame(segments, i, to)? {
+                        Some(f) if f.envelope.hash == fs.to.hash && f.envelope.stream == Stream::Ctl => Ok(Some(fs)),
+                        _ => Err(PackError::Conflict { lsn: to }),
+                    };
+                }
+                _ => {
+                    return Err(PackError::Refused(format!(
+                        "the store holds an fs section for Seal {}, which the local log does not",
+                        to.get()
+                    )))
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Write one pack; returns its header.
@@ -744,8 +926,9 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
 
     /// Ship every accepted frame not yet shipped, up to `upto` (which
     /// must be accepted: at or below the anchored head), as one pack.
+    /// `segments` are the Chronicle's local segments, oldest first.
     /// `None` if there is nothing new.
-    pub fn ship_log(&self, segment: &Segment, upto: Position) -> Result<Option<PackHeader>, PackError> {
+    pub fn ship_log(&self, segments: &[&Segment], upto: Position) -> Result<Option<PackHeader>, PackError> {
         let s = self.shipped()?;
         if upto.lsn <= s.log.lsn {
             if upto.lsn == s.log.lsn && upto.hash != s.log.hash {
@@ -753,31 +936,32 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             }
             return Ok(None);
         }
-        let frames = self.frames_after(segment, s.log, upto)?;
-        self.put_pack(PackHeader { chronicle: self.chronicle, base: s.log, end: upto, fs: None }, &frames, None)
-            .map(Some)
+        let base = self.log_base(segments, s.log)?;
+        let frames = self.frames_after(segments, base, upto)?;
+        self.put_pack(PackHeader { chronicle: self.chronicle, base, end: upto, fs: None }, &frames, None).map(Some)
     }
 
     /// Ship the Seal of `snapshot` (an accepted Seal's layer): the log up
     /// to its record if not shipped yet, and its `fs` stream, in one put.
     /// `None` if this Seal's `fs` is already shipped.
     ///
-    /// The stream is incremental from the previous shipped `fs` Seal.  For
-    /// the first one, the `Lineage` record decides: born from the void, a
-    /// full stream (`origin` must be `None`); a fork or a succession, an
-    /// incremental from the parent's Seal snapshot, which the caller passes
-    /// as `origin` and which must be bound to exactly the lineage's parent
-    /// Seal.  `origin` is refused for any later Seal.
+    /// The stream is incremental from the last shipped `fs` Seal the local
+    /// log holds ([`Packs::fs_base`]).  For the first one, the `Lineage`
+    /// record decides: born from the void, a full stream (`origin` must be
+    /// `None`); a fork or a succession, an incremental from the parent's
+    /// Seal snapshot, which the caller passes as `origin` and which must be
+    /// bound to exactly the lineage's parent Seal.  `origin` is refused for
+    /// any later Seal.
     pub fn ship_seal(
         &self,
-        segment: &Segment,
+        segments: &[&Segment],
         snapshot: &Snapshot,
         origin: Option<&Snapshot>,
     ) -> Result<Option<PackHeader>, PackError> {
         let hash = snapshot.seal_hash.ok_or_else(|| PackError::Refused("the snapshot is not bound to a Seal".into()))?;
         let seal = Position { lsn: snapshot.seal, hash };
-        let s = self.shipped()?;
-        if let Some(f) = s.fs {
+        let shipped_fs = self.fs_base(segments)?;
+        if let Some(f) = shipped_fs {
             if f.to == seal && f.guid == snapshot.guid {
                 return Ok(None);
             }
@@ -789,18 +973,19 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                 )));
             }
         }
-        let frames_all = segment.frames()?;
         // The Seal must be a Ctl record with this hash in the local log.
-        let is_seal = frames_all
-            .iter()
-            .any(|f| f.envelope.lsn == seal.lsn && f.envelope.hash == seal.hash && f.envelope.stream == Stream::Ctl);
+        let is_seal = match locate(segments, seal.lsn) {
+            Spot::Frame(i) => local_frame(segments, i, seal.lsn)?
+                .is_some_and(|f| f.envelope.hash == seal.hash && f.envelope.stream == Stream::Ctl),
+            _ => false,
+        };
         if !is_seal {
             return Err(PackError::Refused(format!(
-                "lsn {} is not a Seal record with this hash in the local segment",
+                "lsn {} is not a Seal record with this hash in the local segments",
                 seal.lsn.get()
             )));
         }
-        let (base, from_snapshot) = match s.fs {
+        let (base, from_snapshot) = match shipped_fs {
             Some(f) => {
                 if origin.is_some() {
                     return Err(PackError::Refused("an origin is only for a Vessel's first Seal".into()));
@@ -808,9 +993,11 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                 (FsBase::Seal(f.to), Some(snapshot.dataset.seal_snapshot(f.to.lsn)))
             }
             None => {
-                let lineage = frames_all
-                    .iter()
-                    .find(|f| f.envelope.lsn == Lsn::new(1))
+                let first = match locate(segments, Lsn::new(1)) {
+                    Spot::Frame(i) => local_frame(segments, i, Lsn::new(1))?,
+                    _ => None,
+                };
+                let lineage = first
                     .and_then(|f| match Payload::decode(&f.payload) {
                         Ok(Payload::Lineage(l)) => Some(l),
                         _ => None,
@@ -842,19 +1029,20 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                 }
             }
         };
-        let (end, frames) = if seal.lsn > s.log.lsn {
-            (seal, self.frames_after(segment, s.log, seal)?)
+        let log_base = self.log_base(segments, self.shipped()?.log)?;
+        let (end, frames) = if seal.lsn > log_base.lsn {
+            (seal, self.frames_after(segments, log_base, seal)?)
         } else {
-            (s.log, Vec::new())
+            (log_base, Vec::new())
         };
         let fs = FsRef { base, to: seal, guid: snapshot.guid };
         let stream = self.sender.send(&snapshot.dataset, from_snapshot.as_deref(), seal.lsn)?;
-        self.put_pack(PackHeader { chronicle: self.chronicle, base: s.log, end, fs: Some(fs) }, &frames, Some(stream))
+        self.put_pack(PackHeader { chronicle: self.chronicle, base: log_base, end, fs: Some(fs) }, &frames, Some(stream))
             .map(Some)
     }
 
     /// Verify and merge every pack (see the module docs).  With `anchor`,
-    /// the chain must also contain that position.
+    /// the chain must also contain that position, and ends there.
     pub fn chain(&self, anchor: Option<Position>) -> Result<Chain, PackError> {
         let mut by_lsn: BTreeMap<Lsn, Frame> = BTreeMap::new();
         let mut fs_by_to: BTreeMap<Lsn, FsRef> = BTreeMap::new();
@@ -882,35 +1070,79 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             }
             bases.push(h.base);
         }
-        // Continuous from genesis, each frame chained to the one before.
+        // Walk from genesis: each frame follows the one before, as the next
+        // record chained to it or as a Gap record that keeps a record the
+        // chain holds (an earlier one than the tail if an unanchored pack
+        // of the previous holder is in the store).  Records a Gap says are
+        // lost are verified here but not returned.
         let mut tail = Position::GENESIS;
-        for (lsn, f) in &by_lsn {
-            if *lsn != tail.lsn.next() {
-                return Err(PackError::Gap { missing: tail.lsn.next() });
-            }
-            if f.envelope.prev != tail.hash {
-                return Err(PackError::Conflict { lsn: *lsn });
-            }
-            tail = Position { lsn: *lsn, hash: f.envelope.hash };
-        }
-        let at = |p: Position| -> bool {
+        let mut lost: Vec<(Lsn, Lsn)> = Vec::new(); // (kept, resumes]
+        let mut resumed: Vec<Position> = Vec::new(); // known by a Gap's hash
+        let is_lost = |lost: &[(Lsn, Lsn)], lsn: Lsn| lost.iter().any(|&(k, r)| k < lsn && lsn <= r);
+        let seen = |p: Position| -> bool {
             if p.lsn == Lsn::new(0) {
                 p.hash == HashVal::GENESIS
             } else {
                 by_lsn.get(&p.lsn).is_some_and(|f| f.envelope.hash == p.hash)
             }
         };
-        // Every pack's base is a position of this chain.
-        if let Some(b) = bases.iter().find(|b| !at(**b)) {
+        for (lsn, f) in &by_lsn {
+            let gap = gap_of(f);
+            // Every Gap here is well-formed: `read_log` checked it.  It must
+            // keep a record the chain holds and returns (so one before the
+            // tail: the walk is in lsn order).
+            if let Some(g) = &gap {
+                let kept = kept_of(g);
+                if is_lost(&lost, kept.lsn) || !seen(kept) {
+                    return Err(PackError::Conflict { lsn: *lsn });
+                }
+            }
+            if *lsn == tail.lsn.next() {
+                if f.envelope.prev != tail.hash {
+                    return Err(PackError::Conflict { lsn: *lsn });
+                }
+            } else if gap.is_none() {
+                if anchor.is_some_and(|a| tail.lsn >= a.lsn) {
+                    break; // nothing past the anchor is used
+                }
+                return Err(PackError::Gap { missing: tail.lsn.next() });
+            }
+            if let Some(g) = &gap {
+                lost.push((g.kept, g.resumes));
+                resumed.push(resumes_of(g));
+            }
+            tail = Position { lsn: *lsn, hash: f.envelope.hash };
+        }
+        // A position the chain returns: walked, held, and not lost.
+        let returned = |p: Position| p.lsn <= tail.lsn && !is_lost(&lost, p.lsn) && seen(p);
+        let end = match anchor {
+            Some(a) if !returned(a) => return Err(PackError::NotAnchored { anchor: a }),
+            Some(a) => a,
+            None => tail,
+        };
+        // Every pack's base is a position of this chain (lost ones too:
+        // the previous holder's packs start there).  Past the anchor only
+        // the walk's conflicts count.
+        let based = |b: Position| (b.lsn <= tail.lsn && seen(b)) || resumed.contains(&b);
+        if let Some(b) = bases.iter().find(|b| !(based(**b) || (anchor.is_some() && b.lsn > tail.lsn))) {
             return Err(PackError::Conflict { lsn: b.lsn });
         }
-        // Every fs section is anchored in the log; the first starts from
-        // what the lineage says, every later one from the one before.
+        // Every fs section up to the end is anchored in the log; the first
+        // starts from what the lineage says, every later one from the one
+        // before.  A section whose Seal a gap swallowed is skipped.
+        let mut seals = Vec::new();
         let mut prev: Option<Position> = None;
         for fs in fs_by_to.values() {
-            let is_seal = by_lsn
-                .get(&fs.to.lsn)
-                .is_some_and(|f| f.envelope.hash == fs.to.hash && f.envelope.stream == Stream::Ctl);
+            if anchor.is_some() && fs.to.lsn > end.lsn {
+                break;
+            }
+            if is_lost(&lost, fs.to.lsn) {
+                continue;
+            }
+            let is_seal = fs.to.lsn <= tail.lsn
+                && by_lsn
+                    .get(&fs.to.lsn)
+                    .is_some_and(|f| f.envelope.hash == fs.to.hash && f.envelope.stream == Stream::Ctl);
             if !is_seal {
                 return Err(PackError::FsAheadOfLog { to: fs.to.lsn });
             }
@@ -938,13 +1170,10 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                 return Err(PackError::BrokenFsChain { at: fs.to.lsn });
             }
             prev = Some(fs.to);
+            seals.push(*fs);
         }
-        if let Some(a) = anchor {
-            if !at(a) {
-                return Err(PackError::NotAnchored { anchor: a });
-            }
-        }
-        Ok(Chain { frames: by_lsn.into_values().collect(), end: tail, seals: fs_by_to.into_values().collect() })
+        let frames = by_lsn.into_values().filter(|f| f.envelope.lsn <= end.lsn && !is_lost(&lost, f.envelope.lsn)).collect();
+        Ok(Chain { frames, end, seals })
     }
 
     /// The `fs` stream that brings a dataset to the Seal at `to`, read
@@ -983,13 +1212,13 @@ impl<S: ObjectStore, X: Sender> Publish for PackPublisher<S, X> {
         &mut self,
         chronicle: ChronicleId,
         epoch: Epoch,
-        segment: &Segment,
+        segments: &[&Segment],
         upto: Position,
     ) -> Result<(), PublishError> {
         if chronicle != self.packs.chronicle {
             return Err(PublishError("the packs belong to another Chronicle".into()));
         }
-        self.packs.ship_log(segment, upto).map_err(|e| PublishError(format!("pack: {e}")))?;
+        self.packs.ship_log(segments, upto).map_err(|e| PublishError(format!("pack: {e}")))?;
         self.coord
             .advance_shipped(self.warden, chronicle, epoch, upto)
             .map_err(|e| PublishError(format!("coordinator: {e}")))?;
@@ -1018,10 +1247,13 @@ mod tests {
 
     // ── fixtures ────────────────────────────────────────────────────
 
-    /// A segment with records 1..=n; the lsns in `seals` are Seal records.
+    /// Local segments with records 1..=n; the lsns in `seals` are Seal
+    /// records.  `seg` is the first; `more` follow it, and the last is
+    /// written.
     struct Log {
         _dir: tempfile::TempDir,
         seg: Segment,
+        more: Vec<Segment>,
         pos: Vec<Position>, // pos[i] = position of lsn i (pos[0] = genesis)
         last_seal: Option<HashVal>,
     }
@@ -1031,7 +1263,45 @@ mod tests {
         fn bare() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let seg = Segment::create(dir.path().join("seg"), ID, Position::GENESIS).unwrap();
-            Self { _dir: dir, seg, pos: vec![Position::GENESIS], last_seal: None }
+            Self { _dir: dir, seg, more: Vec::new(), pos: vec![Position::GENESIS], last_seal: None }
+        }
+        /// Every segment, oldest first.
+        fn segs(&self) -> Vec<&Segment> {
+            std::iter::once(&self.seg).chain(self.more.iter()).collect()
+        }
+        /// Every local frame, oldest first.
+        fn frames(&self) -> Vec<Frame> {
+            self.segs().iter().flat_map(|s| s.frames().unwrap()).collect()
+        }
+        fn lsns(frames: &[Frame]) -> Vec<u64> {
+            frames.iter().map(|f| f.envelope.lsn.get()).collect()
+        }
+        /// Continue in a new segment from the tail (no gap).
+        fn split(&mut self) {
+            let tail = *self.pos.last().unwrap();
+            let path = self._dir.path().join(format!("seg-{}", self.more.len() + 1));
+            self.more.push(Segment::create(path, ID, tail).unwrap());
+        }
+        /// Node B after taking `old` over with only `kept` shipped and
+        /// anchored: its first segment holds `old`'s records 1..=kept, a
+        /// second starts at `old`'s head and opens with `gap` (as
+        /// `Chronicle::open_after_gap` writes it).
+        fn takeover_with(old: &Log, kept: u64, gap: GapRecord) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let mut seg = Segment::create(dir.path().join("seg"), ID, Position::GENESIS).unwrap();
+            for f in old.seg.frames().unwrap().iter().filter(|f| f.envelope.lsn.get() <= kept) {
+                seg.append(&f.envelope, &f.payload).unwrap();
+            }
+            let head = *old.pos.last().unwrap();
+            let cont = Segment::create(dir.path().join("seg-1"), ID, head).unwrap();
+            let mut l = Self { _dir: dir, seg, more: vec![cont], pos: old.pos.clone(), last_seal: None };
+            l.push_payload(Stream::Ctl, Payload::Gap(gap));
+            l
+        }
+        fn takeover(old: &Log, kept: u64) -> Self {
+            let head = *old.pos.last().unwrap();
+            let gap = GapRecord { kept: Lsn::new(kept), kept_hash: old.at(kept).hash, resumes: head.lsn, resumes_hash: head.hash };
+            Self::takeover_with(old, kept, gap)
         }
         fn with_origin(origin: Origin) -> Self {
             let mut l = Self::bare();
@@ -1055,7 +1325,8 @@ mod tests {
             let tail = *self.pos.last().unwrap();
             let lsn = tail.lsn.next();
             let rec = Record::new(ID, BranchId::TRUNK, Epoch::FIRST, stream, lsn, tail.hash, payload);
-            self.seg.append(&rec.envelope, &rec.payload.canon_bytes()).unwrap();
+            let seg = self.more.last_mut().unwrap_or(&mut self.seg);
+            seg.append(&rec.envelope, &rec.payload.canon_bytes()).unwrap();
             let p = Position { lsn, hash: rec.envelope.hash };
             self.pos.push(p);
             p
@@ -1265,7 +1536,7 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(5, &[]);
-        let h = e.packs.ship_log(&log.seg, log.at(5)).unwrap().unwrap();
+        let h = e.packs.ship_log(&log.segs(), log.at(5)).unwrap().unwrap();
         assert_eq!((h.base, h.end, h.fs), (Position::GENESIS, log.at(5), None));
         let c = e.packs.chain(Some(log.at(5))).unwrap();
         assert_eq!(c.frames, log.seg.frames().unwrap());
@@ -1279,12 +1550,12 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(5, &[]);
-        e.packs.ship_log(&log.seg, log.at(5)).unwrap();
-        assert_eq!(e.packs.ship_log(&log.seg, log.at(5)).unwrap(), None);
-        assert_eq!(e.packs.ship_log(&log.seg, log.at(3)).unwrap(), None, "older positions are shipped too");
+        e.packs.ship_log(&log.segs(), log.at(5)).unwrap();
+        assert_eq!(e.packs.ship_log(&log.segs(), log.at(5)).unwrap(), None);
+        assert_eq!(e.packs.ship_log(&log.segs(), log.at(3)).unwrap(), None, "older positions are shipped too");
         assert_eq!(e.keys().len(), 1);
         log.fill(8, &[]);
-        let h = e.packs.ship_log(&log.seg, log.at(8)).unwrap().unwrap();
+        let h = e.packs.ship_log(&log.segs(), log.at(8)).unwrap().unwrap();
         assert_eq!((h.base, h.end), (log.at(5), log.at(8)));
         assert_eq!(e.keys().len(), 2);
         assert_eq!(e.packs.chain(Some(log.at(8))).unwrap().frames.len(), 8);
@@ -1295,15 +1566,15 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(6, &[6]);
-        let h = e.packs.ship_seal(&log.seg, &log.snap(6, 100), None).unwrap().unwrap();
+        let h = e.packs.ship_seal(&log.segs(), &log.snap(6, 100), None).unwrap().unwrap();
         assert_eq!((h.base, h.end), (Position::GENESIS, log.at(6)));
         assert_eq!(h.fs, Some(FsRef { base: FsBase::Full, to: log.at(6), guid: 100 }));
         assert_eq!(e.read_fs(6).unwrap(), body(None, Lsn::new(6), 0));
         // Again: nothing.
-        assert_eq!(e.packs.ship_seal(&log.seg, &log.snap(6, 100), None).unwrap(), None);
+        assert_eq!(e.packs.ship_seal(&log.segs(), &log.snap(6, 100), None).unwrap(), None);
         // A second Seal is incremental from the first.
         log.fill(9, &[6, 9]);
-        let h2 = e.packs.ship_seal(&log.seg, &log.snap(9, 101), None).unwrap().unwrap();
+        let h2 = e.packs.ship_seal(&log.segs(), &log.snap(9, 101), None).unwrap().unwrap();
         assert_eq!(h2.fs.unwrap().base, FsBase::Seal(log.at(6)));
         let s6 = "tank/v@taso-seal-00000000000000000006";
         assert_eq!(*e.send.calls.borrow(), vec![(None, Lsn::new(6)), (Some(s6.to_string()), Lsn::new(9))]);
@@ -1319,8 +1590,8 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(8, &[6]);
-        e.packs.ship_log(&log.seg, log.at(8)).unwrap();
-        let h = e.packs.ship_seal(&log.seg, &log.snap(6, 5), None).unwrap().unwrap();
+        e.packs.ship_log(&log.segs(), log.at(8)).unwrap();
+        let h = e.packs.ship_seal(&log.segs(), &log.snap(6, 5), None).unwrap().unwrap();
         assert_eq!((h.base, h.end), (log.at(8), log.at(8)));
         assert_eq!(e.keys().len(), 2);
         let c = e.packs.chain(None).unwrap();
@@ -1334,18 +1605,18 @@ mod tests {
         let mut log = Log::new();
         log.fill(6, &[4]);
         // Not in the segment, or a different hash.
-        assert!(matches!(e.packs.ship_log(&log.seg, Position { lsn: Lsn::new(9), hash: log.at(6).hash }), Err(PackError::Refused(_))));
-        assert!(matches!(e.packs.ship_log(&log.seg, Position { lsn: Lsn::new(6), hash: log.at(5).hash }), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_log(&log.segs(), Position { lsn: Lsn::new(9), hash: log.at(6).hash }), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_log(&log.segs(), Position { lsn: Lsn::new(6), hash: log.at(5).hash }), Err(PackError::Refused(_))));
         // A snapshot whose Seal is not a Seal record, or unbound.
-        assert!(matches!(e.packs.ship_seal(&log.seg, &log.snap(5, 1), None), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_seal(&log.segs(), &log.snap(5, 1), None), Err(PackError::Refused(_))));
         let mut unbound = log.snap(4, 1);
         unbound.seal_hash = None;
-        assert!(matches!(e.packs.ship_seal(&log.seg, &unbound, None), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_seal(&log.segs(), &unbound, None), Err(PackError::Refused(_))));
         assert!(e.keys().is_empty());
         // An older Seal after a newer one.
         log.fill(7, &[4, 7]);
-        e.packs.ship_seal(&log.seg, &log.snap(7, 2), None).unwrap();
-        assert!(matches!(e.packs.ship_seal(&log.seg, &log.snap(4, 1), None), Err(PackError::Refused(_))));
+        e.packs.ship_seal(&log.segs(), &log.snap(7, 2), None).unwrap();
+        assert!(matches!(e.packs.ship_seal(&log.segs(), &log.snap(4, 1), None), Err(PackError::Refused(_))));
     }
 
     #[test]
@@ -1354,10 +1625,10 @@ mod tests {
         let mut log = Log::new();
         log.fill(3, &[3]);
         e.send.fail.set(true);
-        assert!(matches!(e.packs.ship_seal(&log.seg, &log.snap(3, 1), None), Err(PackError::Io(_))));
+        assert!(matches!(e.packs.ship_seal(&log.segs(), &log.snap(3, 1), None), Err(PackError::Io(_))));
         assert!(e.keys().is_empty());
         e.send.fail.set(false);
-        assert!(e.packs.ship_seal(&log.seg, &log.snap(3, 1), None).unwrap().is_some());
+        assert!(e.packs.ship_seal(&log.segs(), &log.snap(3, 1), None).unwrap().is_some());
     }
 
     /// `shipped()` runs on every start and after every crash: it reads at
@@ -1367,9 +1638,9 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(6, &[6]);
-        e.packs.ship_seal(&log.seg, &log.snap(6, 1), None).unwrap();
+        e.packs.ship_seal(&log.segs(), &log.snap(6, 1), None).unwrap();
         log.fill(20, &[6]);
-        e.packs.ship_log(&log.seg, log.at(20)).unwrap();
+        e.packs.ship_log(&log.segs(), log.at(20)).unwrap();
         e.opened.store(0, Ordering::Relaxed);
         e.bytes.store(0, Ordering::Relaxed);
         let s = e.packs.shipped().unwrap();
@@ -1416,7 +1687,7 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(5, &[]);
-        e.packs.ship_log(&log.seg, log.at(5)).unwrap();
+        e.packs.ship_log(&log.segs(), log.at(5)).unwrap();
         // Same Chronicle, different record at lsn 3 onwards.
         let mut other = Log::new();
         other.fill(2, &[]);
@@ -1433,9 +1704,9 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(5, &[]);
-        let first = e.packs.ship_log(&log.seg, log.at(5)).unwrap().unwrap();
+        let first = e.packs.ship_log(&log.segs(), log.at(5)).unwrap().unwrap();
         log.fill(8, &[]);
-        e.packs.ship_log(&log.seg, log.at(8)).unwrap();
+        e.packs.ship_log(&log.segs(), log.at(8)).unwrap();
         std::fs::remove_file(e.path(&e.packs.key(&first))).unwrap();
         assert!(matches!(e.packs.chain(None), Err(PackError::Gap { missing }) if missing == Lsn::new(1)));
     }
@@ -1477,7 +1748,7 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(5, &[]);
-        e.packs.ship_log(&log.seg, log.at(5)).unwrap();
+        e.packs.ship_log(&log.segs(), log.at(5)).unwrap();
         assert!(e.packs.chain(Some(log.at(3))).is_ok());
         assert!(e.packs.chain(Some(Position::GENESIS)).is_ok());
         let wrong = Position { lsn: Lsn::new(3), hash: log.at(4).hash };
@@ -1493,7 +1764,7 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(4, &[4]);
-        let h = e.packs.ship_seal(&log.seg, &log.snap(4, 1), None).unwrap().unwrap();
+        let h = e.packs.ship_seal(&log.segs(), &log.snap(4, 1), None).unwrap().unwrap();
         let path = e.path(&e.packs.key(&h));
         let good = std::fs::read(&path).unwrap();
         let write = |b: &[u8]| std::fs::write(&path, b).unwrap();
@@ -1526,7 +1797,7 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(5, &[]);
-        let h = e.packs.ship_log(&log.seg, log.at(5)).unwrap().unwrap();
+        let h = e.packs.ship_log(&log.segs(), log.at(5)).unwrap().unwrap();
         // The same pack under a name that claims another range.
         let good = std::fs::read(e.path(&e.packs.key(&h))).unwrap();
         let liar = format!("{}/{:020}-{:020}-{:020}", e.packs.dir, 9, 0, 0);
@@ -1544,12 +1815,309 @@ mod tests {
         let e = env();
         let mut log = Log::new();
         log.fill(3, &[]);
-        let h = e.packs.ship_log(&log.seg, log.at(3)).unwrap().unwrap();
+        let h = e.packs.ship_log(&log.segs(), log.at(3)).unwrap().unwrap();
         let key = e.packs.key(&h);
         let mut b = std::fs::read(e.path(&key)).unwrap();
         b[9] ^= 1; // the chronicle id
         std::fs::write(e.path(&key), &b).unwrap();
         assert!(matches!(e.packs.chain(None), Err(PackError::Corrupt { .. })));
+    }
+
+    // ── several segments, gaps, unanchored packs ────────────────────
+
+    /// Packs start inside a closed segment and run into the next one.
+    #[test]
+    fn ships_across_segments() {
+        let e = env();
+        let mut log = Log::new();
+        log.fill(5, &[]);
+        e.packs.ship_log(&log.segs(), log.at(3)).unwrap();
+        log.split();
+        log.fill(8, &[]);
+        let h = e.packs.ship_log(&log.segs(), log.at(8)).unwrap().unwrap();
+        assert_eq!((h.base, h.end), (log.at(3), log.at(8)));
+        assert_eq!(e.packs.chain(Some(log.at(8))).unwrap().frames, log.frames());
+    }
+
+    /// The takeover shape: B holds 1..=3 and continues after the head (5)
+    /// with a Gap record at 6.  It ships from the anchor in its closed
+    /// segment, through the Gap, and the chain is exactly B's local log.
+    #[test]
+    fn ships_through_a_gap() {
+        let e = env();
+        let mut old = Log::new();
+        old.fill(5, &[]);
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        let mut b = Log::takeover(&old, 3);
+        b.fill(7, &[]);
+        let h = e.packs.ship_log(&b.segs(), b.at(7)).unwrap().unwrap();
+        assert_eq!((h.base, h.end), (old.at(3), b.at(7)));
+        let c = e.packs.chain(Some(b.at(7))).unwrap();
+        assert_eq!(Log::lsns(&c.frames), vec![1, 2, 3, 6, 7]);
+        assert_eq!(c.frames, b.frames());
+        assert_eq!(c.end, b.at(7));
+        assert_eq!(e.packs.chain(None).unwrap().frames, b.frames());
+    }
+
+    /// The old Warden shipped up to its head (5) but died before the
+    /// anchor moved.  B ships from there (it knows 5 by its segment's base
+    /// hash); the Gap at 6 is then a plain link, and 4, 5 are verified but
+    /// not returned.
+    #[test]
+    fn an_unanchored_pack_up_to_the_old_head() {
+        let e = env();
+        let mut old = Log::new();
+        old.fill(5, &[]);
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        let stale = e.packs.ship_log(&old.segs(), old.at(5)).unwrap().unwrap(); // never anchored
+        let mut b = Log::takeover(&old, 3);
+        b.fill(7, &[]);
+        let h = e.packs.ship_log(&b.segs(), b.at(7)).unwrap().unwrap();
+        assert_eq!(h.base, old.at(5));
+        for anchor in [None, Some(b.at(7))] {
+            let c = e.packs.chain(anchor).unwrap();
+            assert_eq!(Log::lsns(&c.frames), vec![1, 2, 3, 6, 7], "{anchor:?}");
+            assert_eq!(c.frames, b.frames());
+        }
+        // Without the stale pack B's pack still has a known base: the
+        // Gap's `resumes` hash.
+        std::fs::remove_file(e.path(&e.packs.key(&stale))).unwrap();
+        assert_eq!(e.packs.chain(Some(b.at(7))).unwrap().frames, b.frames());
+        // A lost position is no anchor, even where a pack holds it.
+        assert!(matches!(e.packs.chain(Some(old.at(5))), Err(PackError::NotAnchored { .. })));
+    }
+
+    /// The old Warden's unanchored pack ends inside the gap (4): B holds
+    /// no lsn 4, so it ships from the Gap's `kept` (3), and the merge lets
+    /// the Gap keep a record before the tail.
+    #[test]
+    fn an_unanchored_pack_inside_the_gap() {
+        let e = env();
+        let mut old = Log::new();
+        old.fill(5, &[]);
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        e.packs.ship_log(&old.segs(), old.at(4)).unwrap(); // never anchored
+        let mut b = Log::takeover(&old, 3);
+        b.fill(7, &[]);
+        let h = e.packs.ship_log(&b.segs(), b.at(7)).unwrap().unwrap();
+        assert_eq!(h.base, old.at(3));
+        let c = e.packs.chain(Some(b.at(7))).unwrap();
+        assert_eq!(c.frames, b.frames());
+        assert!(matches!(e.packs.chain(Some(old.at(4))), Err(PackError::NotAnchored { .. })));
+        // And the next pack starts where B's ended.
+        b.fill(9, &[]);
+        let h = e.packs.ship_log(&b.segs(), b.at(9)).unwrap().unwrap();
+        assert_eq!(h.base, b.at(7));
+        assert_eq!(e.packs.chain(Some(b.at(9))).unwrap().frames, b.frames());
+    }
+
+    /// The gap swallows a Seal: the old Warden shipped Seal 4's pack but
+    /// only lsn 3 was anchored.  B never received Seal 4; its next Seal
+    /// ships from the last Seal it holds (2), and the chain skips Seal 4.
+    #[test]
+    fn a_gap_that_swallows_a_seal() {
+        let e = env();
+        let mut old = Log::new();
+        old.fill(5, &[2, 4, 5]);
+        e.packs.ship_seal(&old.segs(), &old.snap(2, 20), None).unwrap().unwrap();
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap(); // the anchor
+        // Never anchored: Seal 4 inside the gap, Seal 5 at the old head.
+        e.packs.ship_seal(&old.segs(), &old.snap(4, 40), None).unwrap().unwrap();
+        e.packs.ship_seal(&old.segs(), &old.snap(5, 50), None).unwrap().unwrap();
+        let mut b = Log::takeover(&old, 3);
+        b.fill(8, &[8]);
+        let h = e.packs.ship_seal(&b.segs(), &b.snap(8, 80), None).unwrap().unwrap();
+        assert_eq!(h.fs.unwrap().base, FsBase::Seal(old.at(2)));
+        let s2 = "tank/v@taso-seal-00000000000000000002".to_string();
+        assert_eq!(e.send.calls.borrow().last().unwrap(), &(Some(s2), Lsn::new(8)));
+        for anchor in [None, Some(b.at(8))] {
+            let c = e.packs.chain(anchor).unwrap();
+            assert_eq!(Log::lsns(&c.frames), vec![1, 2, 3, 6, 7, 8], "{anchor:?}");
+            assert_eq!(c.seals.iter().map(|f| f.to.lsn.get()).collect::<Vec<_>>(), vec![2, 8]);
+        }
+        // Again: nothing.
+        assert_eq!(e.packs.ship_seal(&b.segs(), &b.snap(8, 80), None).unwrap(), None);
+    }
+
+    /// What rebirth reads: up to the anchor and no further.  Packs past it
+    /// are not used, but a conflict there is still reported; a hole there
+    /// only ends what is read.
+    #[test]
+    fn chain_ends_at_the_anchor() {
+        let e = env();
+        let mut old = Log::new();
+        old.fill(6, &[2, 5]);
+        e.packs.ship_seal(&old.segs(), &old.snap(2, 1), None).unwrap();
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        e.packs.ship_seal(&old.segs(), &old.snap(5, 2), None).unwrap();
+        let c = e.packs.chain(Some(old.at(3))).unwrap();
+        assert_eq!(Log::lsns(&c.frames), vec![1, 2, 3]);
+        assert_eq!((c.end, c.seals.len()), (old.at(3), 1));
+        // A hole past the anchor: a pack (6..7] with nothing holding 6.
+        old.fill(7, &[2, 5]);
+        let frames = old.seg.frames().unwrap();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: old.at(6), end: old.at(7), fs: None }, &frames[6..7], None).unwrap();
+        assert_eq!(e.packs.chain(Some(old.at(3))).unwrap().end, old.at(3));
+        assert!(matches!(e.packs.chain(None), Err(PackError::Gap { missing }) if missing == Lsn::new(6)));
+        // Another history past the anchor is still a conflict.
+        let mut other = Log::new();
+        other.fill(3, &[2]);
+        other.push(false, 99);
+        other.fill(5, &[2]);
+        let of = other.seg.frames().unwrap();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: other.at(3), end: other.at(5), fs: None }, &of[3..5], None).unwrap();
+        assert!(matches!(e.packs.chain(Some(old.at(3))), Err(PackError::Conflict { lsn }) if lsn == Lsn::new(4)));
+    }
+
+    /// One pack with the takeover's frames, put by hand.
+    fn put_takeover(e: &Env, b: &Log, base: Position, upto: u64) {
+        let frames: Vec<Frame> =
+            b.frames().into_iter().filter(|f| f.envelope.lsn > base.lsn && f.envelope.lsn.get() <= upto).collect();
+        e.packs.put_pack(PackHeader { chronicle: ID, base, end: b.at(upto), fs: None }, &frames, None).unwrap();
+    }
+
+    #[test]
+    fn gaps_must_keep_what_the_chain_holds() {
+        // Inside one pack a Gap keeps exactly the frame before it.
+        let mut old = Log::new();
+        old.fill(5, &[]);
+        let wrong = GapRecord { kept: Lsn::new(3), kept_hash: old.at(2).hash, resumes: Lsn::new(5), resumes_hash: old.at(5).hash };
+        let b = Log::takeover_with(&old, 3, wrong.clone());
+        let e = env();
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        put_takeover(&e, &b, old.at(3), 6);
+        assert!(matches!(e.packs.chain(None), Err(PackError::Corrupt { .. })));
+        // Across packs, with a plain link at 6: still checked.
+        let e = env();
+        e.packs.ship_log(&old.segs(), old.at(5)).unwrap();
+        put_takeover(&e, &b, old.at(5), 6);
+        assert!(matches!(e.packs.chain(None), Err(PackError::Conflict { lsn }) if lsn == Lsn::new(6)));
+        // A Gap that keeps a record after the tail.
+        let mut old = Log::new();
+        old.fill(6, &[]);
+        let late = GapRecord { kept: Lsn::new(5), kept_hash: old.at(5).hash, resumes: Lsn::new(6), resumes_hash: old.at(6).hash };
+        let b = Log::takeover_with(&old, 3, late);
+        let e = env();
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        put_takeover(&e, &b, old.at(6), 7);
+        assert!(matches!(e.packs.chain(None), Err(PackError::Conflict { lsn }) if lsn == Lsn::new(7)));
+        // A second takeover keeping a record the first one lost (4).
+        let mut old = Log::new();
+        old.fill(5, &[]);
+        let mut b = Log::takeover(&old, 3);
+        b.fill(7, &[]);
+        let twice = GapRecord { kept: Lsn::new(4), kept_hash: old.at(4).hash, resumes: Lsn::new(7), resumes_hash: b.at(7).hash };
+        let c = Log::takeover_with(&b, 3, twice);
+        let e = env();
+        e.packs.ship_log(&old.segs(), old.at(5)).unwrap();
+        e.packs.ship_log(&b.segs(), b.at(7)).unwrap();
+        put_takeover(&e, &c, b.at(7), 8);
+        assert!(matches!(e.packs.chain(None), Err(PackError::Conflict { lsn }) if lsn == Lsn::new(8)));
+        // A malformed Gap: it does not resume right before itself.
+        let mut old = Log::new();
+        old.fill(5, &[]);
+        let bad = GapRecord { kept: Lsn::new(3), kept_hash: old.at(3).hash, resumes: Lsn::new(4), resumes_hash: old.at(4).hash };
+        let b = Log::takeover_with(&old, 3, bad);
+        let e = env();
+        e.packs.ship_log(&old.segs(), old.at(5)).unwrap();
+        put_takeover(&e, &b, old.at(5), 6);
+        assert!(matches!(e.packs.chain(None), Err(PackError::Corrupt { .. })));
+        // A jump without a Gap record.
+        let mut old = Log::new();
+        old.fill(7, &[]);
+        let e = env();
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        let frames = old.seg.frames().unwrap();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: old.at(5), end: old.at(7), fs: None }, &frames[5..7], None).unwrap();
+        assert!(matches!(e.packs.chain(None), Err(PackError::Gap { missing }) if missing == Lsn::new(4)));
+    }
+
+    /// The writer never builds on what it cannot hold.
+    #[test]
+    fn the_writer_refuses_a_store_it_does_not_hold() {
+        let mut old = Log::new();
+        old.fill(5, &[2, 4]);
+        let mut b = Log::takeover(&old, 3);
+        b.fill(8, &[8]);
+        // The store ends at B's segment base (5), but with another record.
+        let mut other = Log::new();
+        other.fill(3, &[2, 4]);
+        other.push(false, 99);
+        other.fill(5, &[2, 4]);
+        let e = env();
+        e.packs.ship_log(&old.segs(), old.at(3)).unwrap();
+        e.packs.put_pack(PackHeader { chronicle: ID, base: old.at(3), end: other.at(5), fs: None }, &other.seg.frames().unwrap()[3..5], None).unwrap();
+        assert!(matches!(e.packs.ship_log(&b.segs(), b.at(7)), Err(PackError::Conflict { lsn }) if lsn == Lsn::new(5)));
+        // Where the store ends, read against B's local log.
+        let at = |lsn: u64, hash: HashVal| Position { lsn: Lsn::new(lsn), hash };
+        let p = &e.packs;
+        assert_eq!(p.log_base(&b.segs(), Position::GENESIS).unwrap(), Position::GENESIS);
+        assert_eq!(p.log_base(&b.segs(), b.at(2)).unwrap(), b.at(2));
+        assert!(matches!(p.log_base(&b.segs(), at(2, b.at(1).hash)), Err(PackError::Conflict { .. })));
+        assert_eq!(p.log_base(&b.segs(), old.at(4)).unwrap(), old.at(3), "inside the gap: kept");
+        assert_eq!(p.log_base(&b.segs(), at(4, b.at(1).hash)).unwrap(), old.at(3), "a lost hash cannot be checked");
+        assert_eq!(p.log_base(&b.segs(), old.at(5)).unwrap(), old.at(5));
+        assert!(matches!(p.log_base(&b.segs(), at(9, b.at(8).hash)), Err(PackError::Refused(_))));
+        // Frames after a position the local log holds with another hash.
+        assert!(matches!(p.frames_after(&b.segs(), at(2, b.at(1).hash), b.at(7)), Err(PackError::Refused(_))));
+        assert!(matches!(p.frames_after(&b.segs(), at(5, b.at(1).hash), b.at(7)), Err(PackError::Refused(_))));
+        assert_eq!(Log::lsns(&p.frames_after(&b.segs(), old.at(3), b.at(7)).unwrap()), vec![6, 7]);
+        // An fs section on a local lsn with another record.
+        let e = env();
+        let s = || -> ByteStream { Box::new(io::Cursor::new(b"x".to_vec())) };
+        let frames = other.seg.frames().unwrap();
+        e.packs
+            .put_pack(PackHeader { chronicle: ID, base: Position::GENESIS, end: other.at(2), fs: Some(FsRef { base: FsBase::Full, to: at(2, b.at(1).hash), guid: 1 }) }, &frames[..2], Some(s()))
+            .unwrap();
+        assert!(matches!(e.packs.fs_base(&b.segs()), Err(PackError::Conflict { .. })));
+        assert!(matches!(e.packs.ship_seal(&b.segs(), &b.snap(8, 1), None), Err(PackError::Conflict { .. })));
+        // An fs section past the local log.
+        let e = env();
+        let mut long = Log::new();
+        long.fill(9, &[9]);
+        e.packs.ship_seal(&long.segs(), &long.snap(9, 1), None).unwrap();
+        assert!(matches!(e.packs.fs_base(&b.segs()), Err(PackError::Refused(_))));
+    }
+
+    #[test]
+    fn locate_reads_bases_and_tails() {
+        let mut old = Log::new();
+        old.fill(5, &[]);
+        let mut b = Log::takeover(&old, 3);
+        b.fill(7, &[]);
+        let segs = b.segs();
+        let l = |n: u64| locate(&segs, Lsn::new(n));
+        assert_eq!(l(0), Spot::Genesis);
+        assert_eq!(l(3), Spot::Frame(0));
+        assert_eq!(l(4), Spot::Lost { kept: old.at(3) });
+        assert_eq!(l(5), Spot::Base(1));
+        assert_eq!(l(6), Spot::Frame(1));
+        assert_eq!(l(8), Spot::Beyond);
+        // A split without a gap: the joint is the first segment's frame.
+        let mut log = Log::new();
+        log.fill(3, &[]);
+        log.split();
+        log.fill(5, &[]);
+        let segs = log.segs();
+        assert_eq!(locate(&segs, Lsn::new(3)), Spot::Frame(0));
+        assert_eq!(locate(&segs, Lsn::new(4)), Spot::Frame(1));
+    }
+
+    #[test]
+    fn publisher_ships_from_every_segment() {
+        let mut log = Log::new();
+        log.fill(5, &[]);
+        log.split();
+        log.fill(8, &[]);
+        let (_cd, coord) = coord_for(&log);
+        let dir = tempfile::tempdir().unwrap();
+        let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
+        let mut p = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
+        p.publish(ID, Epoch::FIRST, &log.segs(), log.at(3)).unwrap();
+        p.publish(ID, Epoch::FIRST, &log.segs(), log.at(8)).unwrap();
+        assert_eq!(coord.shipped(ID).unwrap(), log.at(8));
+        let reader = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
+        assert_eq!(reader.chain(Some(log.at(8))).unwrap().frames, log.frames());
     }
 
     // ── PackPublisher ───────────────────────────────────────────────
@@ -1560,7 +2128,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Coordinator::open(dir.path().join("coord.redb")).unwrap();
         c.register(ID, WardenId::new(1)).unwrap();
-        for f in log.seg.frames().unwrap() {
+        for f in log.frames() {
             c.append(WardenId::new(1), &f.envelope).unwrap();
         }
         (dir, Arc::new(c))
@@ -1574,12 +2142,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
         let mut p = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
-        p.publish(ID, Epoch::FIRST, &log.seg, log.at(3)).unwrap();
+        p.publish(ID, Epoch::FIRST, &log.segs(), log.at(3)).unwrap();
         assert_eq!(coord.shipped(ID).unwrap(), log.at(3));
-        p.publish(ID, Epoch::FIRST, &log.seg, log.at(5)).unwrap();
+        p.publish(ID, Epoch::FIRST, &log.segs(), log.at(5)).unwrap();
         assert_eq!(coord.shipped(ID).unwrap(), log.at(5));
         // Nothing new: still fine, nothing changes.
-        p.publish(ID, Epoch::FIRST, &log.seg, log.at(5)).unwrap();
+        p.publish(ID, Epoch::FIRST, &log.segs(), log.at(5)).unwrap();
         let reader = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
         assert_eq!(reader.chain(Some(coord.shipped(ID).unwrap())).unwrap().end, log.at(5));
         assert_eq!(reader.store.list(&reader.dir).unwrap().len(), 2);
@@ -1596,20 +2164,20 @@ mod tests {
         std::fs::write(&root, b"x").unwrap();
         let packs = Packs::new(LocalStore::new(&root), FakeSend::default(), "vessels", ID).unwrap();
         let mut p = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
-        assert!(p.publish(ID, Epoch::FIRST, &log.seg, log.at(4)).is_err());
+        assert!(p.publish(ID, Epoch::FIRST, &log.segs(), log.at(4)).is_err());
         assert_eq!(coord.shipped(ID).unwrap(), Position::GENESIS, "no anchor without the pack");
         // The coordinator refuses: a stale epoch, another holder.
         let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
         let mut p = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
-        assert!(p.publish(ID, Epoch::new(7), &log.seg, log.at(4)).is_err());
+        assert!(p.publish(ID, Epoch::new(7), &log.segs(), log.at(4)).is_err());
         let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", ID).unwrap();
         let mut other = PackPublisher::new(packs, coord.clone(), WardenId::new(2));
-        assert!(other.publish(ID, Epoch::FIRST, &log.seg, log.at(4)).is_err());
+        assert!(other.publish(ID, Epoch::FIRST, &log.segs(), log.at(4)).is_err());
         assert_eq!(coord.shipped(ID).unwrap(), Position::GENESIS);
         // Another Chronicle's packs.
         let packs = Packs::new(LocalStore::new(dir.path()), FakeSend::default(), "vessels", TPL).unwrap();
         let mut wrong = PackPublisher::new(packs, coord.clone(), WardenId::new(1));
-        assert!(wrong.publish(ID, Epoch::FIRST, &log.seg, log.at(4)).is_err());
+        assert!(wrong.publish(ID, Epoch::FIRST, &log.segs(), log.at(4)).is_err());
     }
 
     // ── the first fs section starts where the lineage says ──────────
@@ -1635,7 +2203,7 @@ mod tests {
         let e = env();
         let mut log = Log::fork(parent());
         log.fill(3, &[3]);
-        let h = e.packs.ship_seal(&log.seg, &log.snap(3, 7), Some(&origin_snap(500))).unwrap().unwrap();
+        let h = e.packs.ship_seal(&log.segs(), &log.snap(3, 7), Some(&origin_snap(500))).unwrap().unwrap();
         let want = FsBase::Origin {
             chronicle: TPL,
             seal: Position { lsn: Lsn::new(40), hash: HashVal::from_bytes([0x40; 32]) },
@@ -1646,10 +2214,10 @@ mod tests {
         // Later Seals are incremental from the previous one; no origin then.
         log.fill(6, &[3, 6]);
         assert!(matches!(
-            e.packs.ship_seal(&log.seg, &log.snap(6, 8), Some(&origin_snap(500))),
+            e.packs.ship_seal(&log.segs(), &log.snap(6, 8), Some(&origin_snap(500))),
             Err(PackError::Refused(_))
         ));
-        let h2 = e.packs.ship_seal(&log.seg, &log.snap(6, 8), None).unwrap().unwrap();
+        let h2 = e.packs.ship_seal(&log.segs(), &log.snap(6, 8), None).unwrap().unwrap();
         assert_eq!(h2.fs.unwrap().base, FsBase::Seal(log.at(3)));
         let c = e.packs.chain(Some(log.at(6))).unwrap();
         assert_eq!(c.seals.iter().map(|f| f.base).collect::<Vec<_>>(), vec![want, FsBase::Seal(log.at(3))]);
@@ -1661,21 +2229,21 @@ mod tests {
         let e = env();
         let mut fork = Log::fork(parent());
         fork.fill(3, &[3]);
-        assert!(matches!(e.packs.ship_seal(&fork.seg, &fork.snap(3, 1), None), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_seal(&fork.segs(), &fork.snap(3, 1), None), Err(PackError::Refused(_))));
         let mut wrong = origin_snap(1);
         wrong.seal = Lsn::new(41);
-        assert!(matches!(e.packs.ship_seal(&fork.seg, &fork.snap(3, 1), Some(&wrong)), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_seal(&fork.segs(), &fork.snap(3, 1), Some(&wrong)), Err(PackError::Refused(_))));
         let mut wrong = origin_snap(1);
         wrong.seal_hash = Some(HashVal::from_bytes([1; 32]));
-        assert!(matches!(e.packs.ship_seal(&fork.seg, &fork.snap(3, 1), Some(&wrong)), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_seal(&fork.segs(), &fork.snap(3, 1), Some(&wrong)), Err(PackError::Refused(_))));
         // A void-born Vessel given an origin.
         let mut void = Log::new();
         void.fill(3, &[3]);
-        assert!(matches!(e.packs.ship_seal(&void.seg, &void.snap(3, 1), Some(&origin_snap(1))), Err(PackError::Refused(_))));
+        assert!(matches!(e.packs.ship_seal(&void.segs(), &void.snap(3, 1), Some(&origin_snap(1))), Err(PackError::Refused(_))));
         // No lineage at lsn 1 at all.
         let mut bare = Log::bare();
         bare.fill(3, &[3]);
-        assert!(matches!(e.packs.ship_seal(&bare.seg, &bare.snap(3, 1), None), Err(PackError::NoLineage)));
+        assert!(matches!(e.packs.ship_seal(&bare.segs(), &bare.snap(3, 1), None), Err(PackError::NoLineage)));
         assert!(e.keys().is_empty());
     }
 
@@ -1776,8 +2344,8 @@ mod tests {
 
             let store_dir = tempfile::tempdir().unwrap();
             let packs = Packs::new(LocalStore::new(store_dir.path()), ZfsSend::default(), "vessels", ID).unwrap();
-            let h3 = packs.ship_seal(&log.seg, &s3, Some(&t40)).unwrap().unwrap();
-            packs.ship_seal(&log.seg, &s7, None).unwrap().unwrap();
+            let h3 = packs.ship_seal(&log.segs(), &s3, Some(&t40)).unwrap().unwrap();
+            packs.ship_seal(&log.segs(), &s7, None).unwrap().unwrap();
             let pack3 = std::fs::metadata(store_dir.path().join(packs.key(&h3))).unwrap().len();
             println!("first Seal pack {pack3} bytes (Template is over 1 MiB)");
             assert!(pack3 < 200_000, "the Template does not travel with the Vessel");

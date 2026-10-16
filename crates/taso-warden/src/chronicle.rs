@@ -553,6 +553,11 @@ impl<L: Layers> Chronicle<L> {
         &self.segment
     }
 
+    /// Every local segment, oldest first; the last is the one written.
+    pub fn segments(&self) -> Vec<&Segment> {
+        self.closed.iter().chain(std::iter::once(&self.segment)).collect()
+    }
+
     /// Every local record, oldest first, across all segment files.  After
     /// a gap the records jump from the kept lsn to the Gap record.
     pub fn frames(&self) -> Result<Vec<Frame>, SegmentError> {

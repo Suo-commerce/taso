@@ -101,14 +101,15 @@ impl std::error::Error for PublishError {}
 /// cannot ship cannot send.
 pub trait Publish {
     /// Ship every accepted record of `chronicle` up to `upto` (which is
-    /// accepted: at or below the anchored head), then record `upto` as the
+    /// accepted: at or below the anchored head) from its local `segments`
+    /// (oldest first), then record `upto` as the
     /// coordinator's shipped anchor under `epoch`.  `Ok` only when both
     /// are done.
     fn publish(
         &mut self,
         chronicle: ChronicleId,
         epoch: Epoch,
-        segment: &Segment,
+        segments: &[&Segment],
         upto: Position,
     ) -> Result<(), PublishError>;
 }
@@ -120,7 +121,7 @@ pub(crate) struct AlwaysPublish;
 
 #[cfg(test)]
 impl Publish for AlwaysPublish {
-    fn publish(&mut self, _: ChronicleId, _: Epoch, _: &Segment, _: Position) -> Result<(), PublishError> {
+    fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], _: Position) -> Result<(), PublishError> {
         Ok(())
     }
 }
@@ -269,7 +270,7 @@ impl Effects {
     /// Publish the ledger up to the Vessel's tail.
     fn publish<L: Layers>(&mut self, vessel: &Vessel<L>) -> Result<(), PublishError> {
         let c = vessel.chronicle();
-        self.publisher.publish(c.id(), c.epoch(), c.segment(), c.tail())
+        self.publisher.publish(c.id(), c.epoch(), &c.segments(), c.tail())
     }
 
     fn record_sent<L: Layers>(
@@ -476,7 +477,7 @@ mod tests {
     struct TestPublish(Arc<Mutex<World>>);
 
     impl Publish for TestPublish {
-        fn publish(&mut self, _: ChronicleId, _: Epoch, _: &Segment, upto: Position) -> Result<(), PublishError> {
+        fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], upto: Position) -> Result<(), PublishError> {
             let mut w = self.0.lock().unwrap();
             if w.publish_fails > 0 {
                 w.publish_fails -= 1;
