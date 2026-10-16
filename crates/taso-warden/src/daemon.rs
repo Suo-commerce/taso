@@ -630,6 +630,7 @@ impl Node {
     pub fn run_vessel(&self, vc: &VesselConf) -> Result<Report, DaemonError> {
         let (mut vessel, start, mut verdict) = self.start(vc)?;
         let id = vc.id();
+        self.log(vc, format_args!("dataset {}", vessel.dataset()));
         let mut publisher =
             SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0 };
         // A crash between taking a Seal and publishing it: publish now.
