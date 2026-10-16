@@ -927,6 +927,12 @@ mod tests {
         fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
             self.inner.head(c)
         }
+        fn advance_shipped(&self, w: WardenId, c: ChronicleId, e: Epoch, to: Position) -> Result<Position, CoordError> {
+            self.inner.advance_shipped(w, c, e, to)
+        }
+        fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+            self.inner.shipped(c)
+        }
     }
 
     /// The CAS landed but the answer was lost.  The Chronicle must keep
