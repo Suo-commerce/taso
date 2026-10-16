@@ -76,6 +76,31 @@ to the decision lists in the session handoffs.
     be in the log without a shipped `fs` section; they are reported as
     missing layers and their state is lost (v0.4 §8.5).
 
+13. **Takeover is the operator's call** (2026-10-16). The daemon takes a
+    Vessel that another Warden holds only when its configuration says
+    `"takeover": true`; otherwise it refuses to start it. Taking over
+    fences the other holder (v0.4 §8.2), and whether that holder is dead
+    is not something one node can know. A Vessel this Warden already
+    holds is opened (or reborn, if its local state is gone) without asking.
+14. **Seal snapshots are batched** (2026-10-16). Concurrent Seals on a
+    node share one ZFS channel program per pool: each snapshot and its
+    `taso:seal` binding are set in the same transaction group, so a
+    snapshot is never visible unbound (as with `zfs snapshot -o`). The
+    program reports each snapshot's guid and txg; only a program that
+    fails is checked against `zfs list`. Measured at p64: Seal p95 283 →
+    132 ms, bounded below by the storage's txg sync.
+15. **A failed Seal publish does not undo the Seal** (2026-10-16). The
+    Seal record is accepted and its layer exists; if shipping it or
+    advancing the shipped anchor fails, the failure is counted and the
+    next Seal's publish ships from the last named section, so nothing is
+    skipped for good. Until then the Seal is not anchored, and a rebirth
+    starts from the last one that is (amendment 11).
+16. **Coordinator writes are group-committed** (2026-10-16). Requests that
+    arrive while a commit is in flight share one transaction and one
+    fsync. Each is still checked on its own against the state the ones
+    before it left, so no answer changes; a group that fails to commit
+    answers every accepted request "outcome unknown", never a refusal.
+
 ### Amendments already applied from the Phase 4 plan
 
 12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
