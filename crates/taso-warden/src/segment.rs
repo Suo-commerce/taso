@@ -158,6 +158,12 @@ pub enum SegmentError {
         /// The segment's base lsn.
         base: Lsn,
     },
+    /// A closed segment (not the newest) has bytes after its valid prefix.
+    /// A closed segment is complete by definition: nothing is cut from it.
+    ClosedTorn {
+        /// Bytes after the valid prefix.
+        invalid_bytes: u64,
+    },
     /// `truncate_to` an lsn outside `[base, tail]`.
     OutOfRange {
         /// The requested lsn.
@@ -199,6 +205,9 @@ impl fmt::Display for SegmentError {
                 anchored.get(),
                 base.get()
             ),
+            Self::ClosedTorn { invalid_bytes } => {
+                write!(f, "a closed segment has {invalid_bytes} bytes after its valid frames")
+            }
             Self::OutOfRange { lsn } => write!(f, "lsn {} is outside the segment", lsn.get()),
             Self::Poisoned => write!(f, "segment is poisoned by an earlier failed write"),
         }
@@ -328,6 +337,45 @@ impl Segment {
             seg.cut(keep)?;
         }
         Ok((seg, recovery))
+    }
+
+    /// Open a closed segment: one that a newer segment follows.  It is read
+    /// and verified in full and never written: every byte must belong to a
+    /// valid frame ([`SegmentError::ClosedTorn`] otherwise), because only the
+    /// newest segment can have been cut off by a crash.  The returned
+    /// segment refuses appends.
+    pub fn open_closed(path: impl AsRef<Path>) -> Result<Self, SegmentError> {
+        let (seg, file_len) = Self::read_only(path.as_ref())?;
+        let valid_end = seg.end_of_index(seg.hashes.len());
+        if valid_end != file_len {
+            return Err(SegmentError::ClosedTorn { invalid_bytes: file_len - valid_end });
+        }
+        Ok(seg)
+    }
+
+    /// The position of the last valid frame in the segment at `path`, read
+    /// without writing anything (a torn tail is ignored, not cut).
+    pub fn peek_tail(path: impl AsRef<Path>) -> Result<Position, SegmentError> {
+        Ok(Self::read_only(path.as_ref())?.0.tail())
+    }
+
+    /// Open read-only and index the valid prefix; also return the file length.
+    fn read_only(path: &Path) -> Result<(Self, u64), SegmentError> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let file_len = file.metadata()?.len();
+        let (chronicle, base) = read_header(&file)?;
+        let mut seg = Self {
+            path: path.to_path_buf(),
+            file,
+            chronicle,
+            base,
+            hashes: Vec::new(),
+            ends: Vec::new(),
+            // Read-only: refuse writes the same way a failed write does.
+            poisoned: true,
+        };
+        seg.scan(file_len)?;
+        Ok((seg, file_len))
     }
 
     /// Append one record and fsync it.
@@ -685,6 +733,31 @@ mod tests {
         assert_eq!(rec.unaccepted_frames, 2);
         assert_eq!(seg.tail(), base);
         assert!(seg.is_empty());
+    }
+
+    /// A closed segment is read whole and never cut: a torn tail is an
+    /// error, not something to repair, and it refuses appends.
+    #[test]
+    fn closed_segments_are_complete_and_read_only() {
+        let (_d, path, mut seg) = fresh(Position::GENESIS);
+        let recs = chain(chron(1), Position::GENESIS, &[3, 3, 3]);
+        for (e, p) in &recs {
+            seg.append(e, p).unwrap();
+        }
+        let tail = seg.tail();
+        drop(seg);
+        let len = file_len(&path);
+        let mut closed = Segment::open_closed(&path).unwrap();
+        assert_eq!((closed.tail(), closed.frames().unwrap().len()), (tail, 3));
+        let more = chain(chron(1), tail, &[1]);
+        assert!(matches!(closed.append(&more[0].0, &more[0].1), Err(SegmentError::Poisoned)));
+        assert_eq!(file_len(&path), len, "nothing written");
+        // A torn tail: refused, and left exactly as it is.
+        let f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all_at(&[1, 2, 3], len).unwrap();
+        drop(f);
+        assert!(matches!(Segment::open_closed(&path), Err(SegmentError::ClosedTorn { invalid_bytes: 3 })));
+        assert_eq!(file_len(&path), len + 3);
     }
 
     #[test]

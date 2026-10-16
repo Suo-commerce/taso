@@ -241,7 +241,7 @@ pub struct Host<P: Pool> {
 #[derive(Debug)]
 pub enum Ensured {
     /// It existed; it was opened and recovered.
-    Opened(Recovery),
+    Opened(Box<Recovery>),
     /// It did not exist; it was born from the void.
     Born,
     /// A void birth had been interrupted; it was finished.
@@ -279,7 +279,7 @@ impl<P: Pool> Host<P> {
             }
             Some(_) => {
                 let (v, r) = self.open_in(id, Some(namespace))?;
-                Ok((v, Ensured::Opened(r)))
+                Ok((v, Ensured::Opened(Box::new(r))))
             }
         }
     }
@@ -430,7 +430,7 @@ impl<P: Pool> Host<P> {
         if chronicle.tail().lsn == Lsn::new(0) {
             return Err(VesselError::IncompleteBirth(id));
         }
-        let frames = chronicle.segment().frames().map_err(ChronicleError::Segment)?;
+        let frames = chronicle.frames().map_err(ChronicleError::Segment)?;
         let (lineage, successor) = read_lineage(&frames)?;
         if let Some(expected) = expected {
             if lineage.namespace != expected {
@@ -635,7 +635,7 @@ impl<L: Layers> Vessel<L> {
     }
 
     fn frames(&self) -> Result<Vec<Frame>, VesselError> {
-        Ok(self.chronicle.segment().frames().map_err(ChronicleError::Segment)?)
+        Ok(self.chronicle.frames().map_err(ChronicleError::Segment)?)
     }
 }
 

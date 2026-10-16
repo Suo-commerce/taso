@@ -78,7 +78,6 @@ impl<'v, L: Layers> Session<'v, L> {
     pub fn new(vessel: &'v mut Vessel<L>, first_verdict: Verdict) -> Result<Self, VesselError> {
         let frames = vessel
             .chronicle()
-            .segment()
             .frames()
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
         let mut transcript = Lsn::new(0);
@@ -374,7 +373,7 @@ mod tests {
 
         // The Seal's cut and turn are in the record.
         let seal = v.last_seal().unwrap();
-        let frames = v.chronicle().segment().frames().unwrap();
+        let frames = v.chronicle().frames().unwrap();
         let f = frames.iter().find(|f| f.envelope.lsn == seal.lsn).unwrap();
         let Payload::Seal(rec) = Payload::decode(&f.payload).unwrap() else { panic!() };
         assert_eq!(rec.cut.transcript, Lsn::new(2));
@@ -408,7 +407,6 @@ mod tests {
         drop(s);
         let verdicts: Vec<Verdict> = v
             .chronicle()
-            .segment()
             .frames()
             .unwrap()
             .iter()
@@ -464,7 +462,7 @@ mod tests {
         // The Seal's ledger_pos covers the effect records.
         s.handle(Request::TurnEnd { turn: 1, quiescent: true });
         drop(s);
-        let frames = v.chronicle().segment().frames().unwrap();
+        let frames = v.chronicle().frames().unwrap();
         let last_effect = frames.iter().rfind(|f| f.envelope.stream == Stream::Effect).unwrap();
         let seal = frames.last().unwrap();
         let Payload::Seal(rec) = Payload::decode(&seal.payload).unwrap() else { panic!() };
