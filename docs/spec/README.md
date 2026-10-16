@@ -67,7 +67,16 @@ to the decision lists in the session handoffs.
    accepted or neither, never a sendable state without its intent.
    Recovery still handles an intent accepted alone.
 
+10. **Rebirth takes ownership before it reads anything** (2026-10-16).
+    v0.4 §8.4 fetches the sealed prefix, then opens at a new epoch. The
+    code transfers first, so a previous holder that is still alive can
+    no longer move the shipped anchor while it is being read.
+11. **"Byte-identical to the last Seal" (v1.0 §1, P2 exit gate) means the
+    last *anchored, named* Seal** (2026-10-16). Seal records past it may
+    be in the log without a shipped `fs` section; they are reported as
+    missing layers and their state is lost (v0.4 §8.5).
+
 ### Amendments already applied from the Phase 4 plan
 
-10. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
+12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
    unavailable, Phase 4 is brought forward.

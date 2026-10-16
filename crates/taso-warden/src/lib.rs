@@ -16,6 +16,7 @@ pub mod effects;
 pub mod field;
 pub mod pack;
 pub mod quiesce;
+pub mod rebirth;
 pub mod runtime;
 pub mod segment;
 pub mod ship;

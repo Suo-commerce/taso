@@ -76,7 +76,7 @@ use crate::coordinator::{Coord, CoordError};
 use crate::pack::{PackError, Packs};
 use crate::segment::{Frame, Position};
 use crate::ship::{ObjectStore, Sender};
-use crate::zfs::{Dataset, DatasetInfo, Runner, Snapshot, Zfs};
+use crate::zfs::{CloneBase, Dataset, DatasetInfo, Runner, Snapshot, Zfs};
 use taso_core::record::FsShippedRecord;
 
 // ── Pool ────────────────────────────────────────────────────────────
@@ -100,6 +100,29 @@ pub trait Pool {
     fn info(&self, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError>;
     /// The layer store of `dataset`.
     fn layers(&self, dataset: &Dataset) -> Self::Layers;
+    /// Receive a stream into `dataset` (rebirth): a full one into a new
+    /// dataset (`from` is `None`), or an incremental from its Seal
+    /// snapshot `from`.  The result is the Seal snapshot `to`, bound to its
+    /// hash.  A stream that fails as it is read leaves nothing.  Calling it
+    /// again for a snapshot already there binds it and returns.  Returns
+    /// the snapshot's guid.
+    fn receive(
+        &self,
+        dataset: &Dataset,
+        from: Option<(Lsn, HashVal)>,
+        to: (Lsn, HashVal),
+        stream: &mut dyn std::io::Read,
+    ) -> Result<u64, LayerError>;
+    /// Receive a stream that is incremental from another dataset's Seal
+    /// snapshot (`base`, a Template's) into the new clone `dataset`.  As
+    /// [`Pool::receive`] otherwise.
+    fn receive_clone(
+        &self,
+        dataset: &Dataset,
+        base: &CloneBase,
+        to: (Lsn, HashVal),
+        stream: &mut dyn std::io::Read,
+    ) -> Result<u64, LayerError>;
 }
 
 impl<R: Runner + Clone> Pool for Zfs<R> {
@@ -125,6 +148,26 @@ impl<R: Runner + Clone> Pool for Zfs<R> {
 
     fn layers(&self, dataset: &Dataset) -> ZfsLayers<R> {
         ZfsLayers::new(Clone::clone(self), dataset.clone())
+    }
+
+    fn receive(
+        &self,
+        dataset: &Dataset,
+        from: Option<(Lsn, HashVal)>,
+        to: (Lsn, HashVal),
+        stream: &mut dyn std::io::Read,
+    ) -> Result<u64, LayerError> {
+        Ok(Zfs::receive(self, dataset, from, to, stream)?.guid)
+    }
+
+    fn receive_clone(
+        &self,
+        dataset: &Dataset,
+        base: &CloneBase,
+        to: (Lsn, HashVal),
+        stream: &mut dyn std::io::Read,
+    ) -> Result<u64, LayerError> {
+        Ok(Zfs::receive_clone(self, dataset, base, to, stream)?.guid)
     }
 }
 
@@ -199,6 +242,23 @@ pub enum VesselError {
     ReservedPayload,
     /// The snapshot is not a Seal layer of this Vessel.
     NotThisSeal(String),
+    /// Rebirth: nothing of this Vessel is anchored as shipped.
+    NothingShipped(ChronicleId),
+    /// Rebirth: the parent's Seal snapshot (a Template's) is not on this
+    /// node, or not with that hash.
+    ParentMissing(ParentSeal),
+    /// Rebirth: a dataset of this Vessel is already here and is not a
+    /// rebirth of this chain in progress.
+    LocalState(String),
+    /// Rebirth: a received snapshot is not the one the Seal was taken from.
+    WrongSnapshot {
+        /// The Seal.
+        seal: Lsn,
+        /// The guid the shipped chain names.
+        expected: u64,
+        /// The guid received.
+        got: u64,
+    },
 }
 
 impl fmt::Display for VesselError {
@@ -234,6 +294,17 @@ impl fmt::Display for VesselError {
             Self::SelfSuccession => write!(f, "a vessel cannot succeed itself"),
             Self::ReservedPayload => write!(f, "Lineage, Succession, Gap and FsShipped records are reserved"),
             Self::NotThisSeal(why) => write!(f, "not a Seal of this vessel: {why}"),
+            Self::NothingShipped(id) => write!(f, "nothing of vessel {} is shipped and anchored", hex(id)),
+            Self::ParentMissing(p) => write!(
+                f,
+                "the parent Seal {} of vessel {} is not on this node",
+                p.seal.get(),
+                hex(&p.chronicle)
+            ),
+            Self::LocalState(why) => write!(f, "local state in the way: {why}"),
+            Self::WrongSnapshot { seal, expected, got } => {
+                write!(f, "Seal {} was received with guid {got}, not {expected}", seal.get())
+            }
         }
     }
 }
@@ -448,15 +519,35 @@ impl<P: Pool> Host<P> {
         Ok(chronicle)
     }
 
+    /// Open a Vessel whose local log may end before the anchored head
+    /// (rebirth): [`Chronicle::open_after_gap`], with every check of
+    /// [`Host::open`].
+    pub(crate) fn open_after_gap(&self, id: ChronicleId) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
+        self.open_with(id, None, true)
+    }
+
     fn open_in(
         &self,
         id: ChronicleId,
         expected: Option<Namespace>,
     ) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
+        self.open_with(id, expected, false)
+    }
+
+    fn open_with(
+        &self,
+        id: ChronicleId,
+        expected: Option<Namespace>,
+        after_gap: bool,
+    ) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
         let dataset = self.dataset_for(id);
         let dir = self.dir_for(id);
         let layers = self.pool.layers(&dataset);
-        let (chronicle, recovery) = Chronicle::open(&dir, self.coord.clone(), id, self.warden, layers)?;
+        let (chronicle, recovery) = if after_gap {
+            Chronicle::open_after_gap(&dir, self.coord.clone(), id, self.warden, layers)?
+        } else {
+            Chronicle::open(&dir, self.coord.clone(), id, self.warden, layers)?
+        };
         if chronicle.tail().lsn == Lsn::new(0) {
             return Err(VesselError::IncompleteBirth(id));
         }
@@ -841,10 +932,18 @@ pub(crate) mod tests {
     // ── an in-memory pool ───────────────────────────────────────────
 
     #[derive(Default)]
-    struct FakeDs {
+    pub(crate) struct FakeDs {
         origin: Option<String>,
         parent: Option<HashVal>,
         snaps: BTreeMap<Lsn, HashVal>,
+        /// Streams received into it, in order (rebirth).
+        pub(crate) received: Vec<Vec<u8>>,
+    }
+
+    /// A Seal snapshot's guid in the fake pool: the same wherever it was
+    /// taken or received, as with ZFS.
+    pub(crate) fn fake_guid(seal: Lsn) -> u64 {
+        1000 + seal.get()
     }
 
     #[derive(Clone, Default)]
@@ -866,6 +965,23 @@ pub(crate) mod tests {
         }
         fn set_parent(&self, name: &str, parent: Option<HashVal>) {
             self.0.borrow_mut().get_mut(name).unwrap().parent = parent;
+        }
+        /// The Seal snapshots of `name`, `(lsn, hash)`, in order.
+        pub(crate) fn snaps_of(&self, name: &str) -> Vec<(Lsn, HashVal)> {
+            self.0.borrow().get(name).map(|d| d.snaps.iter().map(|(&l, &h)| (l, h)).collect()).unwrap_or_default()
+        }
+        /// The streams received into `name`.
+        pub(crate) fn received_of(&self, name: &str) -> Vec<Vec<u8>> {
+            self.0.borrow().get(name).map(|d| d.received.clone()).unwrap_or_default()
+        }
+        /// Put a dataset with one Seal snapshot here, as if received from
+        /// another node (a Template on node B).
+        pub(crate) fn put_snapshot(&self, name: &str, seal: Lsn, hash: HashVal) {
+            self.0.borrow_mut().entry(name.to_string()).or_default().snaps.insert(seal, hash);
+        }
+        /// Remove a dataset (a test's stale state).
+        pub(crate) fn remove(&self, name: &str) {
+            self.0.borrow_mut().remove(name);
         }
     }
 
@@ -899,6 +1015,7 @@ pub(crate) mod tests {
                     origin: Some(source.seal_snapshot(seal)),
                     parent: Some(seal_hash),
                     snaps: BTreeMap::new(),
+                    received: Vec::new(),
                 },
             );
             Ok(self.info_of(target.as_str()).unwrap())
@@ -908,6 +1025,65 @@ pub(crate) mod tests {
         }
         fn layers(&self, dataset: &Dataset) -> FakeLayers {
             FakeLayers { pool: Clone::clone(self), ds: dataset.to_string() }
+        }
+        fn receive(
+            &self,
+            dataset: &Dataset,
+            from: Option<(Lsn, HashVal)>,
+            to: (Lsn, HashVal),
+            stream: &mut dyn std::io::Read,
+        ) -> Result<u64, LayerError> {
+            let name = dataset.to_string();
+            if let Some(h) = self.0.borrow().get(&name).and_then(|d| d.snaps.get(&to.0).copied()) {
+                return if h == to.1 { Ok(fake_guid(to.0)) } else { Err("another snapshot at that Seal".into()) };
+            }
+            let exists = self.0.borrow().contains_key(&name);
+            match from {
+                None if exists => return Err("exists".into()),
+                Some(_) if !exists => return Err("no dataset to receive into".into()),
+                Some((l, h)) if self.0.borrow()[&name].snaps.get(&l) != Some(&h) => return Err("no such base".into()),
+                _ => {}
+            }
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes)?; // a failing stream leaves nothing
+            let mut p = self.0.borrow_mut();
+            let d = p.entry(name).or_default();
+            d.snaps.insert(to.0, to.1);
+            d.received.push(bytes);
+            Ok(fake_guid(to.0))
+        }
+        fn receive_clone(
+            &self,
+            dataset: &Dataset,
+            base: &CloneBase,
+            to: (Lsn, HashVal),
+            stream: &mut dyn std::io::Read,
+        ) -> Result<u64, LayerError> {
+            let name = dataset.to_string();
+            if self.0.borrow().get(&name).is_some_and(|d| d.snaps.get(&to.0) == Some(&to.1)) {
+                return Ok(fake_guid(to.0));
+            }
+            let bound = self.0.borrow().get(base.dataset.as_str()).and_then(|d| d.snaps.get(&base.seal).copied());
+            if bound != Some(base.hash) || base.guid != fake_guid(base.seal) {
+                return Err("no such base".into());
+            }
+            if self.0.borrow().contains_key(&name) {
+                return Err("exists".into());
+            }
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes)?;
+            let mut snaps = BTreeMap::new();
+            snaps.insert(to.0, to.1);
+            self.0.borrow_mut().insert(
+                name,
+                FakeDs {
+                    origin: Some(base.dataset.seal_snapshot(base.seal)),
+                    parent: Some(base.hash),
+                    snaps,
+                    received: vec![bytes],
+                },
+            );
+            Ok(fake_guid(to.0))
         }
     }
 
