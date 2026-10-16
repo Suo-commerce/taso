@@ -576,6 +576,8 @@ impl Node {
         let (mut effects, reconciled) = Effects::open(Registry::new(), Box::new(effects_publisher), &mut vessel)?;
         self.log(vc, format_args!("effects reconciled: {reconciled:?}"));
 
+        // A reborn dataset was received unmounted.
+        self.zfs.ensure_mounted(vessel.dataset()).map_err(|e| DaemonError::Io(format!("mount: {e}")))?;
         let mount = self
             .zfs
             .dataset_info(vessel.dataset())

@@ -44,6 +44,9 @@ struct Opts {
     stats: PathBuf,
     bare: bool,
     synchronous: String,
+    /// Pause after each turn (an agent thinking), so a harness can catch
+    /// it mid-run.
+    turn_sleep_ms: u64,
     /// Write every commit's latency here, in microseconds, one per line.
     samples: Option<PathBuf>,
 }
@@ -60,6 +63,7 @@ impl Default for Opts {
             bare: false,
             synchronous: "normal".into(),
             samples: None,
+            turn_sleep_ms: 0,
         }
     }
 }
@@ -79,6 +83,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--stats" => o.stats = val()?.into(),
             "--bare" => o.bare = true,
             "--samples" => o.samples = Some(val()?.into()),
+            "--turn-sleep-ms" => o.turn_sleep_ms = num(val()?)?,
             "--synchronous" => {
                 o.synchronous = val()?;
                 if !["off", "normal", "full", "extra"].contains(&o.synchronous.as_str()) {
@@ -169,6 +174,9 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
         if field.0.is_some() {
             turn_ends.push(t.elapsed());
         }
+        if o.turn_sleep_ms > 0 {
+            std::thread::sleep(Duration::from_millis(o.turn_sleep_ms));
+        }
     }
     if let Some(path) = &o.samples {
         let text: String = writes.iter().map(|d| format!("{}\n", d.as_micros())).collect();
@@ -257,6 +265,7 @@ mod tests {
             bare: true,
             synchronous: "normal".into(),
             samples: Some(dir.path().join("samples")),
+            turn_sleep_ms: 1,
         };
         let st = run(&o, None).unwrap();
         let samples = std::fs::read_to_string(dir.path().join("samples")).unwrap();
@@ -293,7 +302,7 @@ mod tests {
             }
             seen
         });
-        let o = Opts { turns: 3, txns: 1, rows: 1, row_bytes: 8, db: dir.path().join("s.db"), stats: dir.path().join("x"), bare: false, synchronous: "normal".into(), samples: None };
+        let o = Opts { turns: 3, txns: 1, rows: 1, row_bytes: 8, db: dir.path().join("s.db"), stats: dir.path().join("x"), bare: false, synchronous: "normal".into(), samples: None, turn_sleep_ms: 0 };
         let st = run(&o, Some(&sock)).unwrap();
         let seen = warden.join().unwrap();
         assert_eq!(st["resumed_after"], 5);
