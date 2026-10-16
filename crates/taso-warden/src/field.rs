@@ -444,7 +444,7 @@ mod tests {
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut reg = Registry::new();
         reg.register(Box::new(FakeProvider::new("mail")));
-        let (mut fx, _) = Effects::open(reg, &mut v).unwrap();
+        let (mut fx, _) = Effects::open(reg, Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_effects(&mut fx);
         s.handle(hello());
         let r = s.handle(Request::Effect {
