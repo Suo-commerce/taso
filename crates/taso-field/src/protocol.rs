@@ -212,15 +212,19 @@ pub fn write_frame(w: &mut impl Write, body: &[u8]) -> Result<(), ProtocolError>
 }
 
 /// Read one frame.  `Ok(None)` on a clean end of stream between frames;
-/// an end inside a frame is an error.
+/// an end inside a frame is an error.  An interrupted read is retried:
+/// a stopped and continued process gets `EINTR` from a socket read with a
+/// timeout even under `SA_RESTART`, and that is not a broken connection.
 pub fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < 4 {
-        match r.read(&mut len[got..])? {
-            0 if got == 0 => return Ok(None),
-            0 => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            n => got += n,
+        match r.read(&mut len[got..]) {
+            Ok(0) if got == 0 => return Ok(None),
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
         }
     }
     let len = u32::from_be_bytes(len);
@@ -492,6 +496,42 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::io::Cursor;
+
+    /// Yields one byte per read, with an `EINTR` before every byte.
+    struct Interrupting {
+        data: Vec<u8>,
+        at: usize,
+        interrupt: bool,
+    }
+
+    impl Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            if self.at == self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.at];
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    /// A stopped and continued process sees EINTR on a socket read with a
+    /// timeout (the gate-p2 round 12 finding): it is retried, never an
+    /// error, in the length as in the body.
+    #[test]
+    fn interrupted_reads_are_retried() {
+        let mut framed = Vec::new();
+        write_frame(&mut framed, b"hello").unwrap();
+        write_frame(&mut framed, b"").unwrap();
+        let mut r = Interrupting { data: framed, at: 0, interrupt: false };
+        assert_eq!(read_frame(&mut r).unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(read_frame(&mut r).unwrap(), Some(Vec::new()));
+        assert_eq!(read_frame(&mut r).unwrap(), None);
+    }
 
     fn blob() -> impl Strategy<Value = Vec<u8>> {
         proptest::collection::vec(any::<u8>(), 0..64)

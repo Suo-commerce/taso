@@ -640,7 +640,14 @@ impl RemoteCoord {
     fn call(&self, req: Request) -> Result<Reply, CoordError> {
         let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_none() {
-            let s = UnixStream::connect(&self.path).map_err(CoordError::Unavailable)?;
+            // An interrupted connect left nothing behind (a new socket each
+            // try): retry it.  See `read_frame` on EINTR.
+            let s = loop {
+                match UnixStream::connect(&self.path) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    other => break other.map_err(CoordError::Unavailable)?,
+                }
+            };
             s.set_read_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
             s.set_write_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
             *guard = Some(s);
