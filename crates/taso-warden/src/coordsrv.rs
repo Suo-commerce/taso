@@ -39,6 +39,7 @@
 //!   5 head       chronicle (16)
 //!   6 advance_shipped  warden (8) · chronicle (16) · epoch (8) · position (40)
 //!   7 shipped    chronicle (16)
+//!   8 append_batch  warden (8) · count (4) · count × envelope (137)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
@@ -51,13 +52,12 @@
 //! position lsn (8) · hash (32)
 //! ```
 //!
-//! Operations 6 and 7 were added to version 1 before any server ran
-//! outside a test.
+//! Operations 6, 7 and 8 were added to version 1 before any server ran
+//! outside a test.  A batch holds at most 4096 envelopes.
 //!
 //! A malformed request gets status 3 and the server closes the connection,
 //! since it can no longer trust the framing.  The version byte lets a
-//! later version add operations (a batched append, for Phase 4's `blk`
-//! stream) without guessing.
+//! later version add operations without guessing.
 //!
 //! # Scope
 //!
@@ -96,6 +96,10 @@ const OP_OWNERSHIP: u8 = 4;
 const OP_HEAD: u8 = 5;
 const OP_ADVANCE_SHIPPED: u8 = 6;
 const OP_SHIPPED: u8 = 7;
+const OP_APPEND_BATCH: u8 = 8;
+
+/// The most envelopes one batched append carries.
+const MAX_BATCH: u32 = 4096;
 
 const ST_OK: u8 = 0;
 const ST_REFUSED: u8 = 1;
@@ -111,6 +115,7 @@ const R_HEAD_MISMATCH: u8 = 6;
 const R_LSN_NOT_NEXT: u8 = 7;
 const R_SHIPPED_AHEAD: u8 = 8;
 const R_SHIPPED_CONFLICT: u8 = 9;
+const R_BAD_BATCH: u8 = 10;
 
 /// How often the accept loop checks whether it should stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
@@ -120,10 +125,11 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Messages ────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Request {
     Register { chronicle: ChronicleId, holder: WardenId },
     Append { warden: WardenId, envelope: Envelope },
+    AppendBatch { warden: WardenId, envelopes: Vec<Envelope> },
     Transfer { chronicle: ChronicleId, new_holder: WardenId },
     Ownership { chronicle: ChronicleId },
     Head { chronicle: ChronicleId },
@@ -163,6 +169,10 @@ impl Out {
         self
     }
     fn u64(&mut self, v: u64) -> &mut Self {
+        self.0.extend_from_slice(&v.to_be_bytes());
+        self
+    }
+    fn u32(&mut self, v: u32) -> &mut Self {
         self.0.extend_from_slice(&v.to_be_bytes());
         self
     }
@@ -207,6 +217,9 @@ impl<'a> In<'a> {
     }
     fn u64(&mut self) -> Result<u64, Malformed> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("8 bytes")))
+    }
+    fn u32(&mut self) -> Result<u32, Malformed> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("4 bytes")))
     }
     fn hash(&mut self) -> Result<HashVal, Malformed> {
         Ok(HashVal::from_bytes(self.take(32)?.try_into().expect("32 bytes")))
@@ -268,6 +281,13 @@ impl Request {
         match self {
             Self::Register { chronicle, holder } => o.u8(OP_REGISTER).bytes(chronicle.as_bytes()).u64(holder.get()),
             Self::Append { warden, envelope } => o.u8(OP_APPEND).u64(warden.get()).envelope(envelope),
+            Self::AppendBatch { warden, envelopes } => {
+                o.u8(OP_APPEND_BATCH).u64(warden.get()).u32(envelopes.len() as u32);
+                for e in envelopes {
+                    o.envelope(e);
+                }
+                &mut o
+            }
             Self::Transfer { chronicle, new_holder } => {
                 o.u8(OP_TRANSFER).bytes(chronicle.as_bytes()).u64(new_holder.get())
             }
@@ -292,6 +312,15 @@ impl Request {
         let req = match i.u8()? {
             OP_REGISTER => Self::Register { chronicle: i.chronicle()?, holder: i.warden()? },
             OP_APPEND => Self::Append { warden: i.warden()?, envelope: i.envelope()? },
+            OP_APPEND_BATCH => {
+                let warden = i.warden()?;
+                let count = i.u32()?;
+                if count > MAX_BATCH {
+                    return Err(Malformed("batch too large"));
+                }
+                let envelopes = (0..count).map(|_| i.envelope()).collect::<Result<_, _>>()?;
+                Self::AppendBatch { warden, envelopes }
+            }
             OP_TRANSFER => Self::Transfer { chronicle: i.chronicle()?, new_holder: i.warden()? },
             OP_OWNERSHIP => Self::Ownership { chronicle: i.chronicle()? },
             OP_HEAD => Self::Head { chronicle: i.chronicle()? },
@@ -311,7 +340,7 @@ impl Request {
     /// What kind of reply body an `Ok` carries.
     fn ok_kind(&self) -> OkKind {
         match self {
-            Self::Register { .. } | Self::Append { .. } | Self::Head { .. } => OkKind::Head,
+            Self::Register { .. } | Self::Append { .. } | Self::AppendBatch { .. } | Self::Head { .. } => OkKind::Head,
             Self::Transfer { .. } => OkKind::Epoch,
             Self::Ownership { .. } => OkKind::Ownership,
             Self::AdvanceShipped { .. } | Self::Shipped { .. } => OkKind::Position,
@@ -402,6 +431,7 @@ fn encode_refusal(e: &CoordError) -> Option<Vec<u8>> {
         CoordError::LsnNotNext { lsn, expected } => o.u8(R_LSN_NOT_NEXT).u64(lsn.get()).u64(expected.get()),
         CoordError::ShippedAhead { to, head } => o.u8(R_SHIPPED_AHEAD).u64(to.get()).u64(head.get()),
         CoordError::ShippedConflict { lsn } => o.u8(R_SHIPPED_CONFLICT).u64(lsn.get()),
+        CoordError::BadBatch { lsn } => o.u8(R_BAD_BATCH).u64(lsn.get()),
         CoordError::Corrupt { .. } | CoordError::Storage(_) | CoordError::Unavailable(_) => return None,
     };
     Some(o.0)
@@ -420,6 +450,7 @@ fn decode_refusal(i: &mut In<'_>) -> Result<CoordError, Malformed> {
         R_LSN_NOT_NEXT => CoordError::LsnNotNext { lsn: Lsn::new(i.u64()?), expected: Lsn::new(i.u64()?) },
         R_SHIPPED_AHEAD => CoordError::ShippedAhead { to: Lsn::new(i.u64()?), head: Lsn::new(i.u64()?) },
         R_SHIPPED_CONFLICT => CoordError::ShippedConflict { lsn: Lsn::new(i.u64()?) },
+        R_BAD_BATCH => CoordError::BadBatch { lsn: Lsn::new(i.u64()?) },
         _ => return Err(Malformed("unknown refusal")),
     })
 }
@@ -431,6 +462,7 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
     let r = match req {
         Request::Register { chronicle, holder } => coord.register(chronicle, holder).map(Reply::Head),
         Request::Append { warden, envelope } => coord.append(warden, &envelope).map(Reply::Head),
+        Request::AppendBatch { warden, envelopes } => coord.append_batch(warden, &envelopes).map(Reply::Head),
         Request::Transfer { chronicle, new_holder } => coord.transfer(chronicle, new_holder).map(Reply::Epoch),
         Request::Ownership { chronicle } => coord.ownership(chronicle).map(Reply::Ownership),
         Request::Head { chronicle } => coord.head(chronicle).map(Reply::Head),
@@ -670,6 +702,17 @@ impl Coord for RemoteCoord {
         }
     }
 
+    fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError> {
+        if envelopes.len() > MAX_BATCH as usize {
+            return Err(CoordError::BadBatch { lsn: envelopes[MAX_BATCH as usize].lsn });
+        }
+        match self.call(Request::AppendBatch { warden, envelopes: envelopes.to_vec() })? {
+            Reply::Head(h) => Ok(h),
+            Reply::Err(e) => Err(e),
+            r => Err(unexpected(r)),
+        }
+    }
+
     fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
         match self.call(Request::Transfer { chronicle, new_holder })? {
             Reply::Epoch(e) => Ok(e),
@@ -854,10 +897,12 @@ mod tests {
                 to: Position { lsn: Lsn::new(4), hash: HashVal::from_bytes([4; 32]) },
             },
             Request::Shipped { chronicle: chron(1) },
+            Request::AppendBatch { warden: A, envelopes: vec![record(&w, 1), record(&w, 1)] },
+            Request::AppendBatch { warden: A, envelopes: vec![] },
         ];
-        for r in reqs {
+        for r in reqs.clone() {
             let b = r.encode();
-            assert_eq!(Request::decode(&b), Ok(r));
+            assert_eq!(Request::decode(&b), Ok(r.clone()));
             assert!(Request::decode(&b[..b.len() - 1]).is_err(), "truncated {r:?}");
             let mut extra = b.clone();
             extra.push(0);
@@ -871,6 +916,29 @@ mod tests {
         assert_eq!(Request::decode(&bad_stream), Err(Malformed("unknown stream")));
         assert!(Request::decode(&[WIRE_V1, 99]).is_err());
         assert!(Request::decode(&[]).is_err());
+        // A batch larger than MAX_BATCH is malformed before it is read.
+        let mut huge = vec![WIRE_V1, OP_APPEND_BATCH];
+        huge.extend_from_slice(&A.get().to_be_bytes());
+        huge.extend_from_slice(&(MAX_BATCH + 1).to_be_bytes());
+        assert_eq!(Request::decode(&huge), Err(Malformed("batch too large")));
+    }
+
+    /// A batch over the socket: accepted whole, or refused whole with the
+    /// coordinator's own refusal.
+    #[test]
+    fn batches_cross_the_socket() {
+        let e = Env::new();
+        let c = e.client();
+        c.register(chron(1), A).unwrap();
+        let w = WardenModel::new(A, chron(1), Epoch::FIRST);
+        let first = record(&w, 1);
+        let w2 = WardenModel::resume(A, chron(1), Epoch::FIRST, ChronicleHead { lsn: first.lsn, hash: first.hash, epoch: Epoch::FIRST }, first.lsn.next());
+        let second = w2.build_record(Stream::Fs, Payload::Raw(vec![2])).envelope;
+        let h = c.append_batch(A, &[first, second]).unwrap();
+        assert_eq!((h.lsn, h.hash), (Lsn::new(2), second.hash));
+        assert!(matches!(c.append_batch(A, &[first]), Err(CoordError::HeadMismatch { .. })));
+        assert!(matches!(c.append_batch(A, &[]), Err(CoordError::BadBatch { .. })));
+        assert_eq!(c.head(chron(1)).unwrap(), h);
     }
 
     /// Garbage is answered "bad", the connection closed, the state untouched.

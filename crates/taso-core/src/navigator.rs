@@ -455,11 +455,8 @@ fn check_ledger(
             match terminal {
                 None if is_terminal(st) => terminal = Some((l, st)),
                 None => {}
-                Some((_, first)) => {
-                    if st != first {
-                        contradictory = true;
-                    }
-                }
+                Some((_, first)) if st != first => contradictory = true,
+                Some(_) => {}
             }
         }
         if contradictory {

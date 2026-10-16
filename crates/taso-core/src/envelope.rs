@@ -18,7 +18,7 @@ use crate::canon::{Canon, Canonical};
 
 /// A BLAKE3 hash value (32 bytes).
 ///
-/// [`Hash::GENESIS`] is the conventional "previous hash" for the first
+/// [`HashVal::GENESIS`] is the conventional "previous hash" for the first
 /// record in a chain.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HashVal([u8; 32]);

@@ -101,14 +101,15 @@ impl std::error::Error for PublishError {}
 /// cannot ship cannot send.
 pub trait Publish {
     /// Ship every accepted record of `chronicle` up to `upto` (which is
-    /// accepted: at or below the anchored head), then record `upto` as the
+    /// accepted: at or below the anchored head) from its local `segments`
+    /// (oldest first), then record `upto` as the
     /// coordinator's shipped anchor under `epoch`.  `Ok` only when both
     /// are done.
     fn publish(
         &mut self,
         chronicle: ChronicleId,
         epoch: Epoch,
-        segment: &Segment,
+        segments: &[&Segment],
         upto: Position,
     ) -> Result<(), PublishError>;
 }
@@ -120,7 +121,7 @@ pub(crate) struct AlwaysPublish;
 
 #[cfg(test)]
 impl Publish for AlwaysPublish {
-    fn publish(&mut self, _: ChronicleId, _: Epoch, _: &Segment, _: Position) -> Result<(), PublishError> {
+    fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], _: Position) -> Result<(), PublishError> {
         Ok(())
     }
 }
@@ -205,21 +206,35 @@ impl Effects {
         }
         self.next_op += 1;
 
-        // 1. Intent, durable.  Its barrier is its own lsn.
+        let _total = crate::timing::span("effect.total");
+        // 1–2. Intent and dispatch authorized, durable together: one write,
+        // one fsync, one CAS.  A crash during it leaves both or neither
+        // accepted (an intent alone is not, and recovery cuts it).  The
+        // barrier is the intent's own lsn.
         let lsn = vessel.tail().lsn.next();
         let barrier = (plan.consequence != Consequence::NoExternalMutation)
             .then(|| BarrierId::new(lsn.get()));
-        vessel.append(Stream::Effect, Payload::Intent(intent(op, provider, &plan, barrier)))?;
+        let intent = Payload::Intent(intent(op, provider, &plan, barrier));
         if stop == Some(CrashAfter::Intent) {
+            // Tests only: an intent accepted alone, as an older Warden that
+            // wrote them apart could leave it.  Recovery must still handle it.
+            vessel.append(Stream::Effect, intent)?;
             return Ok(None);
         }
-        // 2. Dispatch authorized, durable.
-        vessel.append(Stream::Effect, outcome(op, OutcomeState::DispatchAuthorized, None))?;
+        let t = crate::timing::span("effect.authorize");
+        vessel.append_batch(vec![
+            (Stream::Effect, intent),
+            (Stream::Effect, outcome(op, OutcomeState::DispatchAuthorized, None)),
+        ])?;
+        drop(t);
         if stop == Some(CrashAfter::Authorized) {
             return Ok(None);
         }
         // 3. The authorization goes off the node before the request does.
-        if let Err(e) = self.publish(vessel) {
+        let t = crate::timing::span("effect.publish");
+        let published = self.publish(vessel);
+        drop(t);
+        if let Err(e) = published {
             let reason = format!("ledger not shipped: {e}");
             vessel.append(
                 Stream::Effect,
@@ -232,11 +247,14 @@ impl Effects {
         }
         // 4. Send exactly the recorded request.
         let adapter = self.registry.get_mut(provider).expect("looked up above");
+        let t = crate::timing::span("effect.send");
         let sent = adapter.send(op, &plan);
+        drop(t);
         if stop == Some(CrashAfter::Send) {
             return Ok(None);
         }
         // 5. Record what the provider said.
+        let _t = crate::timing::span("effect.outcome");
         Ok(Some(self.record_sent(vessel, op, barrier, sent)?))
     }
 
@@ -269,7 +287,7 @@ impl Effects {
     /// Publish the ledger up to the Vessel's tail.
     fn publish<L: Layers>(&mut self, vessel: &Vessel<L>) -> Result<(), PublishError> {
         let c = vessel.chronicle();
-        self.publisher.publish(c.id(), c.epoch(), c.segment(), c.tail())
+        self.publisher.publish(c.id(), c.epoch(), &c.segments(), c.tail())
     }
 
     fn record_sent<L: Layers>(
@@ -476,7 +494,7 @@ mod tests {
     struct TestPublish(Arc<Mutex<World>>);
 
     impl Publish for TestPublish {
-        fn publish(&mut self, _: ChronicleId, _: Epoch, _: &Segment, upto: Position) -> Result<(), PublishError> {
+        fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], upto: Position) -> Result<(), PublishError> {
             let mut w = self.0.lock().unwrap();
             if w.publish_fails > 0 {
                 w.publish_fails -= 1;

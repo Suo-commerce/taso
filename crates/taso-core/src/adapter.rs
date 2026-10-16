@@ -193,6 +193,9 @@ impl AdapterModel {
     ///
     /// An optional `crash_at` interrupts the sequence at the specified
     /// point and returns [`DispatchError::Crash`].
+    // The model's one entry point takes every party of the §7.2 sequence
+    // explicitly; bundling them would hide which one a test crashes.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch_effect(
         &mut self,
         warden: &mut WardenModel,
