@@ -77,6 +77,10 @@ use crate::zfs::{Cli, Dataset, Runner, Zfs};
 /// File name of the first segment of a Chronicle (base lsn 0).
 const SEGMENT_FILE: &str = "seg-00000000000000000000";
 
+/// A segment past this many bytes is closed, and the next append starts
+/// a new one at the tail ([`Chronicle::set_roll_at`] changes it).
+pub const SEGMENT_MAX: u64 = 64 << 20;
+
 /// Prefix of every segment file name: `seg-<base lsn, 20 digits>`.
 const SEGMENT_PREFIX: &str = "seg-";
 
@@ -308,6 +312,8 @@ pub struct Chronicle<L: Layers> {
     /// Accepted Seals whose layer was not there at open.
     missing_layers: HashSet<Lsn>,
     health: Health,
+    /// Roll to a new segment once the current one has this many bytes.
+    roll_at: u64,
     _lock: File,
 }
 
@@ -422,6 +428,7 @@ impl<L: Layers> Chronicle<L> {
             last_seal: None,
             missing_layers: HashSet::new(),
             health: Health::Live,
+            roll_at: SEGMENT_MAX,
             _lock: lock,
         };
         let mut gap = None;
@@ -644,12 +651,35 @@ impl<L: Layers> Chronicle<L> {
         &self.layers
     }
 
+    /// Roll to a new segment file once the current one reaches `bytes`
+    /// (default [`SEGMENT_MAX`]).
+    pub fn set_roll_at(&mut self, bytes: u64) {
+        self.roll_at = bytes.max(1);
+    }
+
     /// True once ownership was lost.
     pub fn is_fenced(&self) -> bool {
         self.health == Health::Fenced
     }
 
     // ── internals ───────────────────────────────────────────────────
+
+    /// Close a full segment and start the next at its tail.  Only called
+    /// while live, so every frame in the old file is accepted: it opens
+    /// later as a complete closed segment, and the new one joins it end to
+    /// start.  A crash right after the new file is created leaves an empty
+    /// newest segment based at the head, which opens as usual.
+    fn roll_if_full(&mut self) -> Result<(), ChronicleError> {
+        if self.segment.is_empty() || self.segment.bytes() < self.roll_at {
+            return Ok(());
+        }
+        let tail = self.segment.tail();
+        let dir = self.segment.path().parent().map(Path::to_path_buf).unwrap_or_default();
+        let next = Segment::create(dir.join(segment_name(tail.lsn)), self.id, tail)?;
+        let old = std::mem::replace(&mut self.segment, next);
+        self.closed.push(old);
+        Ok(())
+    }
 
     fn ready(&self) -> Result<(), ChronicleError> {
         match self.health {
@@ -674,6 +704,7 @@ impl<L: Layers> Chronicle<L> {
     /// fsync, one CAS for all of them.  On refusal every one is cut.
     fn commit_all(&mut self, recs: &[Record]) -> Result<ChronicleHead, ChronicleError> {
         let _t = crate::timing::span("append.total");
+        self.roll_if_full()?;
         let before = self.segment.tail();
         let payloads: Vec<Vec<u8>> = recs.iter().map(|r| r.payload.canon_bytes()).collect();
         let frames: Vec<(&Envelope, &[u8])> =
@@ -951,6 +982,77 @@ mod tests {
 
     fn seal<L: Layers>(c: &mut Chronicle<L>, turn: u64) -> Result<Sealed, ChronicleError> {
         c.seal(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(turn))
+    }
+
+    // ── rolling ─────────────────────────────────────────────────────
+
+    /// A full segment is closed and the next starts at its tail: one log
+    /// across many files, reopened whole, with a Seal found in a closed
+    /// file and appends continuing.
+    #[test]
+    fn full_segments_roll_and_reopen_whole() {
+        let e = env();
+        let mut c = e.create();
+        // Lineage-sized frames: roll after every second record or so.
+        c.set_roll_at(crate::segment::HEADER_LEN + 300);
+        for n in 0..9 {
+            c.append(Stream::Fs, raw(n)).unwrap();
+        }
+        let sealed = seal(&mut c, 1).unwrap();
+        c.append(Stream::Fs, raw(99)).unwrap();
+        let files = list_segments(&e.dir).unwrap();
+        assert!(files.len() >= 4, "{} files", files.len());
+        assert_eq!(lsns(&c), (1..=11).collect::<Vec<_>>());
+        // Every file starts where the one before ends.
+        for pair in c.segments().windows(2) {
+            assert_eq!(pair[0].tail(), pair[1].base());
+        }
+        drop(c);
+
+        let (mut c, r) = e.open(A);
+        assert_eq!(r.last_seal, Some(sealed.seal));
+        assert_eq!((r.segment.unaccepted_frames, r.gap), (0, None));
+        assert_eq!(lsns(&c), (1..=11).collect::<Vec<_>>());
+        assert_eq!(c.frame(Lsn::new(3)).unwrap().unwrap().envelope.lsn, Lsn::new(3), "read from a closed file");
+        c.append(Stream::Fs, raw(100)).unwrap();
+        assert_eq!(c.tail().lsn, Lsn::new(12));
+        // The default never rolls a small log.
+        drop(c);
+        let (mut c, _) = e.open(A);
+        let n = list_segments(&e.dir).unwrap().len();
+        c.set_roll_at(SEGMENT_MAX);
+        c.append(Stream::Fs, raw(101)).unwrap();
+        assert_eq!(list_segments(&e.dir).unwrap().len(), n);
+    }
+
+    /// A roll whose first append is refused leaves an empty newest file
+    /// based at the head (the crash case too): it opens, and the next
+    /// holder writes into it.
+    #[test]
+    fn an_empty_rolled_segment_opens_at_the_head() {
+        let e = env();
+        let mut a = e.create();
+        a.append(Stream::Fs, raw(1)).unwrap();
+        a.set_roll_at(1);
+        // Another incarnation takes over: A's next append rolls, then is refused.
+        e.coord.transfer(cid(), B).unwrap();
+        assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
+        let files = list_segments(&e.dir).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].file_name().unwrap().to_str().unwrap(), segment_name(Lsn::new(1)), "named after its base: the tail it starts at");
+        assert!(a.segment().is_empty());
+        drop(a);
+        let (mut b, r) = e.open(B);
+        assert_eq!(r.segment.unaccepted_frames, 0);
+        // Rolling at every append, but an empty file is written, not rolled.
+        b.set_roll_at(1);
+        b.append(Stream::Fs, raw(3)).unwrap();
+        assert_eq!(lsns(&b), vec![1, 2], "A's refused record was cut; B's is lsn 2");
+        assert_eq!(b.segments().len(), 2, "written into the empty file, not past it");
+        b.append(Stream::Fs, raw(4)).unwrap();
+        b.append(Stream::Fs, raw(5)).unwrap();
+        assert_eq!(lsns(&b), vec![1, 2, 3, 4]);
+        assert_eq!(b.segments().len(), 4);
     }
 
     // ── batches ─────────────────────────────────────────────────────

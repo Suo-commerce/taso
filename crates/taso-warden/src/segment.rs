@@ -46,7 +46,7 @@ use taso_core::envelope::{
 
 const MAGIC: [u8; 8] = *b"TASOSEG\0";
 const VERSION: u8 = 1;
-const HEADER_LEN: u64 = 8 + 1 + 16 + 8 + 32;
+pub(crate) const HEADER_LEN: u64 = 8 + 1 + 16 + 8 + 32;
 pub(crate) const ENVELOPE_LEN: usize = 16 + 8 + 8 + 1 + 8 + 32 + 32 + 32;
 const FRAME_PREFIX: usize = 4 + ENVELOPE_LEN;
 
@@ -469,6 +469,11 @@ impl Segment {
     /// The segment's file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Bytes in the file: the header and every frame.
+    pub fn bytes(&self) -> u64 {
+        self.ends.last().copied().unwrap_or(HEADER_LEN)
     }
 
     /// Number of frames.
