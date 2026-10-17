@@ -203,6 +203,46 @@ to the decision lists in the session handoffs.
     under a changed slot. It also refuses, until it is designed, the fork
     or succession into another slot that amendment 20 leaves open.
 
+24. **A uid slot stays with the Vessel whose files its range owns, across
+    Warden restarts** (2026-10-17). At start, after the sweep and before
+    the source is read, the Warden reads from the pool which slot ranges
+    own files in each Vessel dataset under its root (`zfs userspace`, which
+    works on unmounted, received datasets too) and seeds the guard with it:
+    a Vessel whose files belong to one slot is bound to it; a Vessel whose
+    files span several slots is never run and none of those slots is
+    given; a slot owning two Vessels' files is given to neither. A pool
+    that cannot be read stops the start. Without this, a new Warden seeing
+    an old Vessel and a newcomer on one slot gave it to the smaller Vessel
+    id (found by `scripts/k2-e2e.sh`), so two Vessels shared a range on one
+    node. Amendment 23 checks a Vessel's own dataset; this one keeps every
+    other Vessel off a range that owns files.
+
+25. **Vessels from Kubernetes; a stop on SIGTERM** (2026-10-17). With
+    `"source": {"kubernetes": ...}` the Warden lists the `Vessel` resources
+    whose `spec.node` is its node (a field selector; RBAC cannot restrict
+    reads by field, so it narrows, it does not fence) and checks each again
+    against the node's config, refusing (never clamping) what breaks a
+    rule: unknown fields; the resource's Kubernetes namespace must map to
+    one tenant on the node and `spec.tenant` must be it, and no tenant is
+    mapped from two namespaces (so namespace RBAC is the tenancy boundary);
+    `spec.rootfs.path` must resolve, symlinks followed, to a directory
+    strictly inside the node's `rootfs_dir` (the resolved path runs);
+    `spec.takeover` is refused until the conditional transfer exists
+    (fencing review F1/F2); memory and pids at most the node's maxima
+    (which are required); Landlock off only where the node allows it; two
+    resources naming one Vessel are both refused. args, env and quiescence
+    come from the resource alone. A running resource edited into a refused
+    spec keeps its last good one; deleting it stops it; another node's
+    resources are skipped, never written. Cluster Vessels restart
+    `always`. Status is written best-effort from the supervisor's events,
+    only to resources in the latest list, each write a get, a check of uid
+    and `spec.node`, and a patch at the resourceVersion read (a status
+    patch ignores `metadata.uid`; measured). SIGTERM or SIGINT now asks for
+    a stop, in both modes: every agent is stopped (a crash of that agent,
+    amendment 21), every run waited for, the last statuses written; a
+    second signal is a crash. This replaces "SIGTERM remains a crash" in
+    amendment 22.
+
 ### Amendments already applied from the Phase 4 plan
 
 12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
