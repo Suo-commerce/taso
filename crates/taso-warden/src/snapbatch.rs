@@ -554,12 +554,21 @@ mod tests {
 
     /// Many Vessels sealing at once share programs; each gets its own
     /// bound snapshot; a dataset never appears twice in one program.
+    ///
+    /// Batching needs Seals to overlap, and the fake program returns at
+    /// once, so on a fast machine nothing need overlap.  The first program
+    /// is therefore held until two Seals wait behind it (each from another
+    /// Vessel: a Vessel has one Seal in flight), so the next program
+    /// carries at least two whatever the machine.  Then every program runs.
     #[test]
     fn concurrent_seals_share_programs() {
         const VESSELS: u8 = 32;
         const TURNS: u64 = 10;
+        let seals = usize::from(VESSELS) * TURNS as usize;
         let fake = FakeZfs::default();
         let zfs = driver(&fake);
+        let (release, gate) = mpsc::channel();
+        *fake.gate.lock().unwrap() = Some(gate);
         let start = Barrier::new(usize::from(VESSELS));
         std::thread::scope(|s| {
             for v in 0..VESSELS {
@@ -572,8 +581,14 @@ mod tests {
                     }
                 });
             }
+            while queued(&zfs) < 2 {
+                std::thread::yield_now();
+            }
+            // One release per program at most; spares are never received.
+            for _ in 0..seals {
+                release.send(()).unwrap();
+            }
         });
-        let seals = usize::from(VESSELS) * TURNS as usize;
         assert_eq!(fake.snaps.lock().unwrap().len(), seals);
         let programs = zfs.batch().unwrap().programs.load(std::sync::atomic::Ordering::Relaxed);
         assert!(programs < seals, "{programs} programs for {seals} Seals: nothing was batched");
