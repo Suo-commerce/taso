@@ -3,6 +3,16 @@
 //! `taso-wardend <config.json>` reads a [`Config`] and runs every Vessel
 //! it lists, one thread each, until their agents exit.
 //!
+//! # Starting
+//!
+//! Before any Vessel, [`Node::new`] claims the run directory
+//! ([`claim_run_dir`]: one daemon per `run_dir`, held until it exits) and
+//! then sweeps its runc root ([`sweep_stale`]).  Holding the lock proves
+//! that every container in that root was left by a dead incarnation of
+//! this daemon, whichever Vessel it ran, including one since reborn on
+//! another node.  If any of them cannot be removed the daemon does not
+//! start: an old agent may still be writing into its dataset.
+//!
 //! # One Vessel
 //!
 //! 1. **Find it** ([`decide`]): born from the void if the coordinator does
@@ -20,9 +30,9 @@
 //!    Vessel's mapped root so the agent can connect.  Each Vessel has its
 //!    own host uid/gid range ([`VesselConf::uid_slot`]); the dataset's
 //!    top directory and the socket belong to it.
-//! 5. **runc**: a stale container of the same id (left by a killed
-//!    daemon) is deleted, then the agent runs in the foreground on its
-//!    own thread.
+//! 5. **runc**: a stale container of the same id is deleted (a backstop;
+//!    the startup sweep already removed it), then the agent runs in the
+//!    foreground on its own thread.
 //! 6. **Serve** the socket until the agent exits.  Every Seal is published
 //!    right after it is taken ([`SealPublisher`]): ship the `fs` section
 //!    and the log, advance the shipped anchor.  A failed publish is
@@ -33,8 +43,8 @@
 //! There is no shutdown protocol.  The Warden is built to be killed: every
 //! step is durable before it is answered, and recovery finishes or drops
 //! what was in flight.  SIGTERM and SIGKILL are both a crash.  (The agent's
-//! container outlives a killed daemon until the next start deletes it; it
-//! can no longer record anything.)
+//! container outlives a killed daemon until the next start sweeps it; it
+//! can no longer record anything or reach the network.)
 //!
 //! # Not yet
 //!
@@ -48,6 +58,8 @@
 //!   nodes it is forwarded (e.g. `ssh -L local.sock:remote.sock`).
 
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,7 +78,7 @@ use crate::field::{serve, AfterSeal, FieldSocket, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
-use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, VesselSpec, ID_RANGE};
+use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, RuncRunner, Swept, VesselSpec, ID_RANGE};
 use crate::segment::Position;
 use crate::s3::{S3Config, S3Store};
 use crate::ship::{LocalStore, SharedStore, ZfsSend};
@@ -607,6 +619,57 @@ fn io(what: &str) -> impl Fn(std::io::Error) -> DaemonError + '_ {
     move |e| DaemonError::Io(format!("{what}: {e}"))
 }
 
+/// The lock file in a run directory.
+pub const RUN_LOCK: &str = "daemon.lock";
+
+/// A claimed run directory: the lock is held until this is dropped (or
+/// the process exits, however it exits).
+#[derive(Debug)]
+pub struct RunDirLock {
+    _file: File,
+    path: PathBuf,
+}
+
+impl RunDirLock {
+    /// The lock file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Claim `run_dir` for this daemon: create it, then take an exclusive
+/// `flock` on [`RUN_LOCK`] without waiting.  Two daemons on one run
+/// directory would share a runc root and sweep each other's agents, so a
+/// held lock is a refusal (`WouldBlock`), not something to wait out.  The
+/// kernel releases it when the holder dies, so a restart after a crash is
+/// never refused by its own dead predecessor.
+pub fn claim_run_dir(run_dir: &Path) -> io::Result<RunDirLock> {
+    std::fs::create_dir_all(run_dir)?;
+    let path = run_dir.join(RUN_LOCK);
+    let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(RunDirLock { _file: file, path }),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{} is held by another taso-wardend (one daemon per run_dir)", path.display()),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// Remove every container in a claimed run directory's runc root
+/// ([`Runc::sweep`]).  Any container that could not be removed is an
+/// error naming it: its agent may still be writing into its dataset, so
+/// the daemon must not start Vessels beside it.
+pub fn sweep_stale<R: RuncRunner>(runc: &Runc<R>) -> io::Result<Swept> {
+    let swept = runc.sweep()?;
+    if swept.failed.is_empty() {
+        return Ok(swept);
+    }
+    let failed: Vec<String> = swept.failed.iter().map(|(id, why)| format!("{id} ({})", why.trim())).collect();
+    Err(io::Error::other(format!("stale containers could not be removed: {}", failed.join(", "))))
+}
+
 /// Everything a node's Vessels share.
 pub struct Node {
     /// The configuration.
@@ -617,13 +680,29 @@ pub struct Node {
     pub zfs: Zfs<Cli>,
     /// The store (opened from `config.store`).
     pub store: SharedStore,
+    /// The run directory, held for the node's lifetime.
+    run_lock: RunDirLock,
 }
 
 impl Node {
-    /// A node: opens the store.
+    /// A node: claims the run directory, sweeps containers a dead
+    /// incarnation left in its runc root (see "Starting" in the module
+    /// docs), then opens the store.  Each error says which step failed.
     pub fn new(config: Config, coord: Arc<dyn Coord>, zfs: Zfs<Cli>) -> std::io::Result<Self> {
-        let store = config.store.open()?;
-        Ok(Self { config, coord, zfs, store })
+        let ctx = |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
+        let run_lock = claim_run_dir(&config.run_dir).map_err(ctx("claiming the run directory"))?;
+        let swept = sweep_stale(&Runc::new(RuncCli::new(config.run_dir.join("runc"))))
+            .map_err(ctx("sweeping stale containers"))?;
+        for id in &swept.deleted {
+            eprintln!("taso-wardend[{}]: deleted stale container {id}", config.warden.get());
+        }
+        let store = config.store.open().map_err(ctx("opening the store"))?;
+        Ok(Self { config, coord, zfs, store, run_lock })
+    }
+
+    /// The run directory's lock file.
+    pub fn run_lock(&self) -> &Path {
+        self.run_lock.path()
     }
 
     fn host(&self) -> Host<Zfs<Cli>> {
@@ -797,6 +876,90 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Starting: run directory and sweep ───────────────────────────
+
+    #[test]
+    fn a_run_dir_is_claimed_once_and_released_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run/taso");
+        let first = claim_run_dir(&run).unwrap();
+        assert_eq!(first.path(), run.join(RUN_LOCK));
+        let e = claim_run_dir(&run).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        assert!(e.to_string().contains("held by another taso-wardend"), "{e}");
+        // Still refused while the first is held; free once it is dropped.
+        assert!(claim_run_dir(&run).is_err());
+        drop(first);
+        let again = claim_run_dir(&run).unwrap();
+        // Another run directory is independent.
+        let _other = claim_run_dir(&tmp.path().join("run/other")).unwrap();
+        drop(again);
+    }
+
+    #[test]
+    fn a_held_lock_is_not_stolen_by_a_leftover_file() {
+        // The lock file stays after its holder exits; only the flock counts.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(RUN_LOCK), b"left by a dead daemon").unwrap();
+        let held = claim_run_dir(tmp.path()).unwrap();
+        assert!(claim_run_dir(tmp.path()).is_err());
+        drop(held);
+    }
+
+    #[test]
+    fn a_node_claims_its_run_dir_before_anything_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        let store = tmp.path().join("store");
+        let mut v: Value = serde_json::from_str(GOOD).unwrap();
+        v["run_dir"] = run.to_string_lossy().into();
+        v["store"] = store.to_string_lossy().into();
+        let config = Config::parse(&v.to_string()).unwrap();
+        let coord: Arc<dyn Coord> = Arc::new(crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap());
+        let _held = claim_run_dir(&run).unwrap();
+        let e = Node::new(config, coord, Zfs::cli()).err().expect("a held run directory is refused");
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        assert!(e.to_string().starts_with("claiming the run directory: "), "{e}");
+        // Refused before the sweep (no runc root) and before the store.
+        assert!(!run.join("runc").exists());
+        assert!(!store.exists());
+    }
+
+    struct Scripted(std::cell::RefCell<Vec<(bool, String, String)>>, std::cell::RefCell<Vec<Vec<String>>>);
+    impl RuncRunner for Scripted {
+        fn run(&self, args: &[String]) -> io::Result<(bool, String, String)> {
+            self.1.borrow_mut().push(args.to_vec());
+            Ok(self.0.borrow_mut().remove(0))
+        }
+    }
+    fn scripted(replies: &[(bool, &str, &str)]) -> Runc<Scripted> {
+        Runc::new(Scripted(
+            std::cell::RefCell::new(replies.iter().map(|(a, b, c)| (*a, b.to_string(), c.to_string())).collect()),
+            Default::default(),
+        ))
+    }
+
+    #[test]
+    fn sweep_stale_removes_everything_or_refuses_naming_what_stayed() {
+        let clean = scripted(&[(true, r#"[{"id":"taso-a","status":"running"}]"#, ""), (true, "", "")]);
+        assert_eq!(sweep_stale(&clean).unwrap().deleted, vec!["taso-a".to_string()]);
+
+        let empty = scripted(&[(true, "null", "")]);
+        assert_eq!(sweep_stale(&empty).unwrap(), Swept::default());
+
+        let stuck = scripted(&[
+            (true, r#"[{"id":"taso-a","status":"running"},{"id":"taso-b","status":"running"}]"#, ""),
+            (false, "", "unable to kill: device busy\n"),
+            (true, "", ""),
+        ]);
+        let e = sweep_stale(&stuck).unwrap_err().to_string();
+        assert!(e.contains("taso-a (runc delete --force taso-a: unable to kill: device busy)"), "{e}");
+        assert!(!e.contains("taso-b"), "{e}");
+
+        let unreadable = scripted(&[(false, "", "permission denied")]);
+        assert!(sweep_stale(&unreadable).unwrap_err().to_string().contains("permission denied"));
+    }
 
     const GOOD: &str = r#"{
         "warden": 1,
