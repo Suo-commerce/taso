@@ -230,6 +230,17 @@ ok3 = q(seals, .95) < 50
 print(f"1. SIGBUS: {sigbus} (failed agents: {failed}) -> {'PASS' if ok1 else 'FAIL'}")
 print(f"2. write p95 warden/bare: {ratio:.2f} (<= 1.5) -> {'PASS' if ok2 else 'FAIL'}")
 print(f"3. Seal p95: {q(seals, .95):.1f} ms (< 50) -> {'PASS' if ok3 else 'FAIL'}")
+# Where the time goes: every span the daemons recorded, pooled across runs
+# (seal.total = seal.snapshot + append.*; append.cas is the coordinator).
+spans = {}
+for f in glob.glob(os.path.join(out, "warden-*.spans")):
+    for l in open(f):
+        name, us = l.split()
+        spans.setdefault(name, []).append(int(us) / 1000)
+print(f"spans {'':12} {'n':>7} {'p50 ms':>9} {'p95 ms':>9} {'max ms':>9}")
+for name in sorted(spans):
+    v = spans[name]
+    print(f"  {name:<16} {len(v):>7} {q(v, .5):9.1f} {q(v, .95):9.1f} {q(v, 1):9.1f}")
 PY
 if [ "$HUB" = 1 ]; then where="hub coordinator over the network, Garage store"; else where="in-process coordinator, local store directory"; fi
 echo "coordinator and store: $where" | tee -a "$OUT/summary.txt"
