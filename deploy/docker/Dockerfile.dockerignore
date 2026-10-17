@@ -1,0 +1,5 @@
+# Context for deploy/docker/Dockerfile (BuildKit reads <Dockerfile>.dockerignore).
+# Without this the build sends target/ (gigabytes) as context.
+target/
+.git/
+**/proptest-regressions/
