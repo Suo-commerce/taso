@@ -674,6 +674,26 @@ mod tests {
         assert!(runs[1].1.duration_since(started_at) >= Duration::from_millis(30 * 2), "restarted while the source failed");
     }
 
+    /// A run that ends by itself after its stop was requested still counts
+    /// as stopped: it is reported so, and its policy does not restart it.
+    #[test]
+    fn a_requested_stop_counts_even_if_the_agent_exited_by_itself() {
+        // The run ignores the stop and exits ok on its own, reporting "not stopped".
+        let f = Fake::with(&[("a", &[Act::Slow(Some(true), 150)])]);
+        let (live, shutdown, events, h) = spawn_live(&f);
+        live.push(Ok(Some(vec![vc("a", 0, Restart::Always)])));
+        wait_for("a to run", || f.live.lock().unwrap().get("a") == Some(&1));
+        live.push(Ok(Some(vec![])));
+        wait_for("the run to end", || f.runs_of("a").len() == 1);
+        std::thread::sleep(Duration::from_millis(60));
+        shutdown.request();
+        h.join().unwrap();
+        assert!(!f.runs_of("a")[0].3, "the run itself did not see the stop");
+        let ev = events.lock().unwrap();
+        assert!(ev.contains(&E::Exited("a".into(), true, false)), "stopped, no restart: {ev:?}");
+        assert_eq!(f.runs_of("a").len(), 1);
+    }
+
     // ── the guard in the loop ───────────────────────────────────────
 
     #[test]
