@@ -314,6 +314,27 @@ pub enum Status {
     Other(String),
 }
 
+impl Status {
+    fn parse(s: &str) -> Self {
+        match s {
+            "created" => Status::Created,
+            "running" => Status::Running,
+            "stopped" => Status::Stopped,
+            "paused" => Status::Paused,
+            other => Status::Other(other.to_string()),
+        }
+    }
+}
+
+/// What [`Runc::sweep`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    /// Containers removed.
+    pub deleted: Vec<String>,
+    /// Containers that could not be removed, with runc's reason.
+    pub failed: Vec<(String, String)>,
+}
+
 /// Runs `runc` with arguments; the seam for tests.
 pub trait RuncRunner {
     /// Run and return (success, stdout, stderr).
@@ -410,13 +431,49 @@ impl<R: RuncRunner> Runc<R> {
         }
         let v: Value = serde_json::from_str(&out)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(Some(match v["status"].as_str().unwrap_or("") {
-            "created" => Status::Created,
-            "running" => Status::Running,
-            "stopped" => Status::Stopped,
-            "paused" => Status::Paused,
-            other => Status::Other(other.to_string()),
-        }))
+        Ok(Some(Status::parse(v["status"].as_str().unwrap_or(""))))
+    }
+
+    /// Every container in this runc root, with its status.  runc prints
+    /// `null` (or nothing) for an empty or missing root; both are an empty
+    /// list.  An entry without a string `id` is an error, not skipped: a
+    /// sweep must not miss a container because its entry was odd.
+    pub fn list(&self) -> io::Result<Vec<(String, Status)>> {
+        let out = self.ok(s(&["list", "--format", "json"]))?;
+        let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("runc list: {why}"));
+        let v: Value = if out.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&out).map_err(|e| bad(e.to_string()))?
+        };
+        let entries = match v {
+            Value::Null => return Ok(Vec::new()),
+            Value::Array(a) => a,
+            other => return Err(bad(format!("expected an array, got {other}"))),
+        };
+        entries
+            .iter()
+            .map(|e| {
+                let id = e["id"].as_str().ok_or_else(|| bad(format!("entry without an id: {e}")))?;
+                Ok((id.to_string(), Status::parse(e["status"].as_str().unwrap_or(""))))
+            })
+            .collect()
+    }
+
+    /// Remove every container in this runc root, running or not
+    /// (`delete --force` kills a running one first).  For a daemon that
+    /// holds its run directory's lock: whatever is in its root was left by
+    /// a dead incarnation.  Tries every container even when one fails, and
+    /// reports both lists.
+    pub fn sweep(&self) -> io::Result<Swept> {
+        let mut swept = Swept::default();
+        for (id, _) in self.list()? {
+            match self.delete(&id) {
+                Ok(()) => swept.deleted.push(id),
+                Err(e) => swept.failed.push((id, e.to_string())),
+            }
+        }
+        Ok(swept)
     }
 
     /// Send SIGKILL to every process of the container.
@@ -617,6 +674,62 @@ mod tests {
     }
 
     #[test]
+    fn list_parses_entries_and_empty_roots() {
+        let r = fake(&[
+            (true, r#"[{"id":"a","status":"running","pid":7},{"id":"b","status":"stopped"}]"#, ""),
+            (true, "null\n", ""),
+            (true, "", ""),
+            (true, "[]", ""),
+        ]);
+        assert_eq!(r.list().unwrap(), vec![("a".into(), Status::Running), ("b".into(), Status::Stopped)]);
+        assert_eq!(r.list().unwrap(), vec![]);
+        assert_eq!(r.list().unwrap(), vec![]);
+        assert_eq!(r.list().unwrap(), vec![]);
+        assert_eq!(*r.runner.calls.borrow(), vec![s(&["list", "--format", "json"]); 4]);
+    }
+
+    #[test]
+    fn list_refuses_what_it_cannot_read() {
+        for out in [r#"[{"status":"running"}]"#, r#"[{"id":7}]"#, r#"{"id":"a"}"#, "not json"] {
+            let r = fake(&[(true, out, "")]);
+            assert_eq!(r.list().unwrap_err().kind(), io::ErrorKind::InvalidData, "{out}");
+        }
+        let r = fake(&[(false, "", "permission denied")]);
+        assert!(r.list().unwrap_err().to_string().contains("permission denied"));
+    }
+
+    #[test]
+    fn sweep_deletes_every_container_and_reports_failures() {
+        let r = fake(&[
+            (true, r#"[{"id":"a","status":"running"},{"id":"b","status":"created"},{"id":"c","status":"stopped"}]"#, ""),
+            (true, "", ""),
+            (false, "", "device busy"),
+            (true, "", ""),
+        ]);
+        let swept = r.sweep().unwrap();
+        assert_eq!(swept.deleted, vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(swept.failed.len(), 1);
+        assert_eq!(swept.failed[0].0, "b");
+        assert!(swept.failed[0].1.contains("device busy"), "{swept:?}");
+        assert_eq!(
+            *r.runner.calls.borrow(),
+            vec![
+                s(&["list", "--format", "json"]),
+                s(&["delete", "--force", "a"]),
+                s(&["delete", "--force", "b"]),
+                s(&["delete", "--force", "c"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn sweep_of_an_empty_root_does_nothing() {
+        let r = fake(&[(true, "null", "")]);
+        assert_eq!(r.sweep().unwrap(), Swept::default());
+        assert_eq!(r.runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
     fn missing_runc_says_so() {
         let cli = RuncCli { program: "/nonexistent/runc".into(), root: "/tmp".into() };
         let e = Runc::new(cli).start("v1").unwrap_err();
@@ -734,6 +847,65 @@ while read l; do echo "$l"; done < /proc/self/status > /work/status
 
             // What the agent wrote belongs to its range on the host.
             assert_eq!(std::fs::metadata(work.join("out")).unwrap().uid(), base);
+        }
+
+        /// What a killed daemon leaves behind: a running container in its
+        /// runc root.  `list` reads real runc output, and `sweep` removes
+        /// it; the `runc run` that started it then returns.
+        #[test]
+        #[ignore = "needs runc and root"]
+        fn sweep_removes_a_running_container_under_runc() {
+            let dir = tempfile::tempdir().unwrap();
+            let rootfs = dir.path().join("rootfs");
+            tiny_rootfs(&rootfs);
+            let work = dir.path().join("work");
+            std::fs::create_dir(&work).unwrap();
+            prepare_work_dir(&work, 200_000).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let sock = dir.path().join("field.sock");
+            let _listener = UnixListener::bind(&sock).unwrap();
+            let spec = VesselSpec {
+                id: format!("taso-sweep-{}", std::process::id()),
+                rootfs,
+                work,
+                socket: sock,
+                host_uid_base: 200_000,
+                // Never exits by itself; pid 1 ignores SIGTERM.
+                args: vec!["/bin/sh".into(), "-c".into(), "while :; do :; done".into()],
+                env: vec![],
+                landlock_shim: None,
+                memory_bytes: Some(64 << 20),
+                pids: Some(16),
+            };
+            let bundle = dir.path().join("bundle");
+            write_bundle(&bundle, &spec).unwrap();
+            let state = dir.path().join("runc-state");
+            let runc = Runc::new(RuncCli::new(&state));
+
+            // An empty or not yet created root lists as empty.
+            assert_eq!(runc.list().unwrap(), vec![]);
+
+            let agent = {
+                let (state, bundle, id) = (state.clone(), bundle.clone(), spec.id.clone());
+                std::thread::spawn(move || Runc::new(RuncCli::new(&state)).run(&bundle, &id))
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let l = runc.list().unwrap();
+                if l.iter().any(|(id, st)| id == &spec.id && *st == Status::Running) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "the container never ran: {l:?}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+
+            let swept = runc.sweep().unwrap();
+            assert_eq!(swept, Swept { deleted: vec![spec.id.clone()], failed: vec![] });
+            assert_eq!(runc.list().unwrap(), vec![]);
+            assert_eq!(runc.state(&spec.id).unwrap(), None);
+            let (ok, _) = agent.join().unwrap().unwrap();
+            assert!(!ok, "a swept agent was killed, it did not exit cleanly");
         }
     }
 }
