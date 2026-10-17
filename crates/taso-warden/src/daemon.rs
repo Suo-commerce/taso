@@ -59,6 +59,11 @@
 //! container outlives a killed daemon until the next start sweeps it; it
 //! can no longer record anything or reach the network.)
 //!
+//! One Vessel can be stopped on its own ([`Stop`], [`Node::run_vessel_until`]):
+//! its container is killed, which is a crash of that agent only; the next
+//! start rolls the state back to the last Seal.  Each Vessel says whether its
+//! agent is started again after it exits ([`Restart`], `"restart"`).
+//!
 //! # Not yet
 //!
 //! - Forks and successions under another `uid_slot`: their dataset is a
@@ -203,6 +208,60 @@ pub struct VesselConf {
     /// in this range and `zfs send` keeps them, so a Vessel keeps its slot
     /// on every node it runs on.
     pub uid_slot: u32,
+    /// What to do when its agent exits ([`Restart`]); `never` by default.
+    pub restart: Restart,
+}
+
+/// When a long-running Warden starts a Vessel's agent again after it
+/// exited (`"restart"` in the config).  A Vessel stopped on purpose (removed
+/// from the Warden's source) is never restarted, whatever this says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Restart {
+    /// Run once (`"never"`): today's behaviour, and the default.
+    #[default]
+    Never,
+    /// Again only if the agent failed, or never started (`"on-failure"`).
+    OnFailure,
+    /// Again whenever it exits (`"always"`).
+    Always,
+}
+
+impl Restart {
+    /// Whether to run again after a run that did not stop on purpose.
+    /// `agent_ok` is `Some(true)` if the agent exited successfully,
+    /// `Some(false)` if it failed, `None` if it never ran (the start
+    /// failed, or the container could not be started).
+    pub fn again(self, agent_ok: Option<bool>) -> bool {
+        match self {
+            Self::Never => false,
+            Self::OnFailure => agent_ok != Some(true),
+            Self::Always => true,
+        }
+    }
+}
+
+/// Asks a running Vessel to stop ([`Node::run_vessel_until`]).  Clones share
+/// one request.  Stopping kills the agent's container: the turn in progress
+/// was never sealed, and the next start rolls the state back to the last
+/// Seal, so a stop is as safe as a crash and no more.
+#[derive(Clone, Debug, Default)]
+pub struct Stop(Arc<AtomicBool>);
+
+impl Stop {
+    /// A stop not yet requested.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request the stop.  Idempotent.
+    pub fn request(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a stop was requested.
+    pub fn requested(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl VesselConf {
@@ -362,6 +421,15 @@ impl Config {
                             field(x, "uid_slot")?.as_u64().ok_or_else(|| bad("\"uid_slot\" must be an integer"))?,
                         )
                         .map_err(|_| bad("\"uid_slot\" is too large"))?,
+                        restart: match x.get("restart") {
+                            None => Restart::Never,
+                            Some(r) => match r.as_str() {
+                                Some("never") => Restart::Never,
+                                Some("on-failure") => Restart::OnFailure,
+                                Some("always") => Restart::Always,
+                                _ => return Err(bad("\"restart\" must be \"never\", \"on-failure\" or \"always\"")),
+                            },
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, ConfigError>>()?,
@@ -597,6 +665,9 @@ pub struct Report {
     pub agent: Option<(bool, String)>,
     /// What settling the state did before the agent ran.
     pub settled: Settled,
+    /// The run ended because a stop was requested ([`Stop`]): the agent
+    /// was killed, or never started.
+    pub stopped: bool,
 }
 
 /// What [`settle`] did.
@@ -821,6 +892,15 @@ impl Node {
 
     /// Run one Vessel until its agent exits (see the module docs).
     pub fn run_vessel(&self, vc: &VesselConf) -> Result<Report, DaemonError> {
+        self.run_vessel_until(vc, &Stop::new())
+    }
+
+    /// Run one Vessel until its agent exits or `stop` is requested.  A stop
+    /// before the agent starts returns without starting it; a stop while it
+    /// runs kills its container (right away, also in the middle of a Field
+    /// session), and the run ends as on an agent exit, with
+    /// [`Report::stopped`] set.
+    pub fn run_vessel_until(&self, vc: &VesselConf, stop: &Stop) -> Result<Report, DaemonError> {
         let (mut vessel, start, mut verdict) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
@@ -891,6 +971,22 @@ impl Node {
             runc.delete(&spec.id).map_err(io("runc delete"))?;
         }
 
+        if stop.requested() {
+            self.log(vc, "stopped before the agent started");
+            return Ok(Report {
+                subject: vc.subject.clone(),
+                start,
+                connections: 0,
+                published: publisher.published,
+                publish_failures: 0,
+                pruned: publisher.pruned,
+                prune_failures: (publisher.prune_failures, publisher.prune_error.clone()),
+                agent: None,
+                settled,
+                stopped: true,
+            });
+        }
+
         let exited = Arc::new(AtomicBool::new(false));
         let agent = {
             let (exited, id) = (exited.clone(), spec.id.clone());
@@ -900,6 +996,25 @@ impl Node {
                 let _ = runc.delete(&id);
                 exited.store(true, Ordering::SeqCst);
                 r
+            })
+        };
+
+        // A stop kills the container from here, whatever the Field loop is
+        // doing; the agent's connection then closes and the loop ends as on
+        // an exit.  It keeps trying until the agent is gone (a kill can fail
+        // while the container is still being created).
+        let stopper = {
+            let (stop, exited, id) = (stop.clone(), exited.clone(), spec.id.clone());
+            let runc = Runc::new(RuncCli::new(self.config.run_dir.join("runc")));
+            std::thread::spawn(move || {
+                let mut killed = false;
+                while !exited.load(Ordering::SeqCst) {
+                    if stop.requested() {
+                        killed |= runc.kill(&id).is_ok();
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                killed || stop.requested()
             })
         };
 
@@ -934,7 +1049,11 @@ impl Node {
         if let Some((ok, err)) = &agent {
             self.log(vc, format_args!("agent exited {}{}", if *ok { "ok" } else { "with failure: " }, if *ok { "" } else { err.trim() }));
         }
-        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, pruned: publisher.pruned, prune_failures: (publisher.prune_failures, publisher.prune_error.clone()), agent, settled })
+        let stopped = stopper.join().map_err(|_| DaemonError::Io("the stop thread panicked".into()))?;
+        if stopped {
+            self.log(vc, "stopped on request: the agent's container was killed");
+        }
+        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, pruned: publisher.pruned, prune_failures: (publisher.prune_failures, publisher.prune_error.clone()), agent, settled, stopped })
     }
 }
 
@@ -1182,6 +1301,43 @@ mod tests {
         let mut v: Value = serde_json::from_str(GOOD).unwrap();
         edit(&mut v);
         Config::parse(&v.to_string())
+    }
+
+    #[test]
+    fn restart_is_parsed_and_defaults_to_never() {
+        let c = Config::parse(GOOD).unwrap();
+        assert!(c.vessels.iter().all(|v| v.restart == Restart::Never), "no \"restart\": never");
+        for (text, want) in [("never", Restart::Never), ("on-failure", Restart::OnFailure), ("always", Restart::Always)] {
+            let c = with(|v| v["vessels"][0]["restart"] = text.into()).unwrap();
+            assert_eq!(c.vessels[0].restart, want, "{text}");
+        }
+        for bad in [serde_json::json!("sometimes"), serde_json::json!(true), serde_json::json!("Always")] {
+            let e = with(|v| v["vessels"][0]["restart"] = bad.clone()).unwrap_err();
+            assert!(e.to_string().contains("\"restart\" must be"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn restart_policies() {
+        use Restart::*;
+        //                     exited ok      failed         never ran
+        let table = [(Never, [false, false, false]), (OnFailure, [false, true, true]), (Always, [true, true, true])];
+        for (policy, want) in table {
+            let got = [policy.again(Some(true)), policy.again(Some(false)), policy.again(None)];
+            assert_eq!(got, want, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn a_stop_is_shared_by_its_clones() {
+        let s = Stop::new();
+        let c = s.clone();
+        assert!(!s.requested() && !c.requested());
+        c.request();
+        assert!(s.requested() && c.requested());
+        c.request();
+        assert!(s.requested(), "idempotent");
+        assert!(!Stop::new().requested(), "a new one is independent");
     }
 
     #[test]
