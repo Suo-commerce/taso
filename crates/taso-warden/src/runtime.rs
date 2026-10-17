@@ -357,6 +357,13 @@ impl RuncCli {
 
 impl RuncRunner for RuncCli {
     fn run(&self, args: &[String]) -> io::Result<(bool, String, String)> {
+        // runc creates its root on `run`/`create`, but other subcommands
+        // (`list`, at least on runc 1.x) fail on a missing one.  Create it
+        // first, as runc would (0700), so an empty root is just empty.
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&self.root)?;
+        }
         let out = Command::new(&self.program)
             .arg("--root")
             .arg(&self.root)
@@ -727,6 +734,20 @@ mod tests {
         let r = fake(&[(true, "null", "")]);
         assert_eq!(r.sweep().unwrap(), Swept::default());
         assert_eq!(r.runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn cli_creates_its_root_before_running() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("a/runc");
+        let cli = RuncCli { program: "true".into(), root: root.clone() };
+        let (ok, _, _) = cli.run(&s(&["list"])).unwrap();
+        assert!(ok);
+        assert!(root.is_dir());
+        assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        // An existing root is left as it is.
+        cli.run(&s(&["list"])).unwrap();
     }
 
     #[test]
