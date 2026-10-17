@@ -16,9 +16,14 @@
 //! - **One entry per Vessel id**, and a slot range that fits above the
 //!   node's `host_uid_base`.
 //! - **No two Vessels share a uid slot** — not at once, and not over time:
-//!   a slot once admitted for one Vessel stays bound to it for the life of
-//!   this Warden, also after that Vessel is removed (its files on the node
-//!   are owned by that range).
+//!   a slot once admitted for one Vessel stays bound to it, also after that
+//!   Vessel is removed (its files on the node are owned by that range).
+//!   "Over time" spans Warden restarts: a guard starts [`Guard::seeded`]
+//!   with what the node's pool says ([`Held`]: which range owns each
+//!   Vessel's files), so a newcomer never takes a slot whose range owns
+//!   another Vessel's files, whichever entry a new Warden sees first.  A
+//!   Vessel whose files belong to more than one range is never run, and
+//!   none of those slots is given to anyone else.
 //! - **Immutable once admitted:** a Vessel's uid slot never changes for the
 //!   life of this Warden, also across a removal and a return (its dataset's
 //!   files are owned by its range); an entry that tries is refused.
@@ -119,22 +124,87 @@ pub struct Admitted {
     pub refused: Vec<Refused>,
 }
 
+/// What the node holds of one Vessel before this Warden started: the uid
+/// slots whose ranges own files in its dataset (empty: none yet, a fresh
+/// dataset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// The Vessel.
+    pub key: VesselKey,
+    /// The slots owning its files.
+    pub slots: std::collections::BTreeSet<u32>,
+}
+
 /// Checks every set a source reports (see the module docs).
 #[derive(Debug)]
 pub struct Guard {
     runtime: RuntimeConf,
     /// The Vessels in the current set: their last good entry.
     running: BTreeMap<VesselKey, VesselConf>,
-    /// Every Vessel ever admitted and its slot, for good (both directions).
+    /// Every Vessel ever admitted (or found on the node) and its slot, for
+    /// good (both directions).
     bound: BTreeMap<VesselKey, u32>,
     slots: BTreeMap<u32, VesselKey>,
+    /// Vessels never to run, and slots never to give, with the reason.
+    blocked_keys: BTreeMap<VesselKey, String>,
+    blocked_slots: BTreeMap<u32, String>,
 }
 
 impl Guard {
     /// A guard for a node whose runtime is `runtime` (its `host_uid_base`
-    /// decides which slots fit).
+    /// decides which slots fit), knowing nothing of the node.
     pub fn new(runtime: RuntimeConf) -> Self {
-        Self { runtime, running: BTreeMap::new(), bound: BTreeMap::new(), slots: BTreeMap::new() }
+        Self::seeded(runtime, Vec::new())
+    }
+
+    /// A guard that starts from what the node holds (see the module docs):
+    ///
+    /// - a Vessel whose files belong to one slot is bound to it;
+    /// - a Vessel whose files belong to several slots is blocked, and so
+    ///   are those slots (whose files they are cannot be told);
+    /// - a slot owning the files of two Vessels is blocked, and so are both
+    ///   Vessels.
+    pub fn seeded(runtime: RuntimeConf, held: Vec<Held>) -> Self {
+        let mut g = Self {
+            runtime,
+            running: BTreeMap::new(),
+            bound: BTreeMap::new(),
+            slots: BTreeMap::new(),
+            blocked_keys: BTreeMap::new(),
+            blocked_slots: BTreeMap::new(),
+        };
+        let mut owners: BTreeMap<u32, Vec<VesselKey>> = BTreeMap::new();
+        for h in &held {
+            for s in &h.slots {
+                owners.entry(*s).or_default().push(h.key);
+            }
+        }
+        for h in &held {
+            if h.slots.len() > 1 {
+                let list: Vec<String> = h.slots.iter().map(u32::to_string).collect();
+                g.blocked_keys.insert(h.key, format!("its dataset holds files of uid slots {} on this node", list.join(", ")));
+                for s in &h.slots {
+                    g.blocked_slots.insert(*s, format!("uid slot {s} owns files of a Vessel whose dataset spans several slots"));
+                }
+            }
+        }
+        for (slot, keys) in &owners {
+            if keys.len() > 1 {
+                g.blocked_slots.insert(*slot, format!("uid slot {slot} owns files of {} Vessels on this node", keys.len()));
+                for k in keys {
+                    g.blocked_keys.insert(*k, format!("its uid slot {slot} also owns another Vessel's files on this node"));
+                }
+            }
+        }
+        for h in held {
+            if let (1, Some(&s)) = (h.slots.len(), h.slots.first()) {
+                if !g.blocked_keys.contains_key(&h.key) {
+                    g.bound.insert(h.key, s);
+                    g.slots.insert(s, h.key);
+                }
+            }
+        }
+        g
     }
 
     /// Check a proposed set against the invariants and against everything
@@ -173,6 +243,10 @@ impl Guard {
                 refuse(vc, key, format!("uid_slot {} does not fit above host_uid_base {}", vc.uid_slot, self.runtime.host_uid_base), &self.running);
                 continue;
             }
+            if let Some(why) = self.blocked_keys.get(&key) {
+                refuse(vc, key, format!("{} is not run: {why}", vc.subject), &self.running);
+                continue;
+            }
             if let Some(&slot) = self.bound.get(&key) {
                 if slot != vc.uid_slot {
                     refuse(vc, key, format!("uid_slot is fixed once admitted: {} stays {}, not {}", vc.subject, slot, vc.uid_slot), &self.running);
@@ -184,6 +258,10 @@ impl Guard {
                     refuse(vc, key, format!("uid_slot {} is bound to another Vessel on this node", vc.uid_slot), &self.running);
                     continue;
                 }
+            }
+            if let Some(why) = self.blocked_slots.get(&vc.uid_slot) {
+                refuse(vc, key, format!("uid_slot {} is not given: {why}", vc.uid_slot), &self.running);
+                continue;
             }
             if let Some(other) = slots_now.get(&vc.uid_slot) {
                 if *other != key {
@@ -223,7 +301,7 @@ mod tests {
 
     fn runtime() -> RuntimeConf {
         RuntimeConf {
-            rootfs: "/srv/taso/rootfs".into(),
+            rootfs: Some("/srv/taso/rootfs".into()),
             host_uid_base: 200_000,
             landlock_shim: None,
             args: vec!["/agent".into()],
@@ -240,6 +318,7 @@ mod tests {
             takeover: false,
             uid_slot: slot,
             restart: Restart::Never,
+            runtime: None,
         }
     }
 
@@ -383,6 +462,58 @@ mod tests {
 
     /// Other fields of an admitted Vessel may change (restart policy,
     /// takeover): only identity and slot are fixed.
+    fn held(subject: &str, slots: &[u32]) -> Held {
+        Held { key: *vc(subject, 0).id().as_bytes(), slots: slots.iter().copied().collect() }
+    }
+
+    /// The K2 end-to-end finding: a new Warden sees an old Vessel and a
+    /// newcomer on the same slot.  Without the node's state the smaller id
+    /// won, either of them; seeded, the Vessel whose files the range owns
+    /// keeps it, in any order.
+    #[test]
+    fn a_seeded_guard_keeps_a_slot_with_the_vessel_whose_files_it_owns() {
+        for order in [["runner", "clash"], ["clash", "runner"]] {
+            let mut g = Guard::seeded(runtime(), vec![held("runner", &[1])]);
+            let a = g.admit(order.iter().map(|s| vc(s, 1)).collect());
+            assert_eq!(subjects(&a), vec![("runner".to_string(), 1)], "{order:?}");
+            assert_eq!(reasons(&a), vec![("clash".to_string(), false)]);
+            assert!(a.refused[0].reason.contains("bound to another Vessel"), "{:?}", a.refused);
+        }
+        // Not listed yet: its slot is still not given to a newcomer.
+        let mut g = Guard::seeded(runtime(), vec![held("runner", &[1])]);
+        assert!(g.admit(vec![vc("clash", 1)]).set.is_empty());
+        // And the Vessel itself may not move to another slot.
+        let a = g.admit(vec![vc("runner", 2)]);
+        assert!(a.set.is_empty() && a.refused[0].reason.contains("fixed once admitted"), "{a:?}");
+        // A fresh dataset (no files of any slot yet) binds nothing.
+        let mut g = Guard::seeded(runtime(), vec![held("new", &[])]);
+        assert_eq!(subjects(&g.admit(vec![vc("other", 1)])), vec![("other".to_string(), 1)]);
+    }
+
+    #[test]
+    fn a_dataset_spanning_slots_blocks_the_vessel_and_its_slots() {
+        let mut g = Guard::seeded(runtime(), vec![held("mixed", &[1, 2])]);
+        let a = g.admit(vec![vc("mixed", 1), vc("x", 2), vc("y", 3)]);
+        assert_eq!(subjects(&a), vec![("y".to_string(), 3)]);
+        let why: Vec<&str> = a.refused.iter().map(|r| r.reason.as_str()).collect();
+        assert!(why.iter().any(|r| r.contains("mixed is not run") && r.contains("uid slots 1, 2")), "{why:?}");
+        assert!(why.iter().any(|r| r.contains("uid_slot 2 is not given")), "{why:?}");
+        // Also at the slot it does not ask for.
+        assert!(g.admit(vec![vc("mixed", 3)]).set.is_empty());
+    }
+
+    #[test]
+    fn a_slot_owning_two_vessels_files_blocks_both_and_the_slot() {
+        let mut g = Guard::seeded(runtime(), vec![held("a", &[4]), held("b", &[4])]);
+        let a = g.admit(vec![vc("a", 4), vc("b", 5), vc("c", 4)]);
+        assert!(a.set.is_empty(), "{a:?}");
+        let why: Vec<&str> = a.refused.iter().map(|r| r.reason.as_str()).collect();
+        assert!(why.iter().filter(|r| r.contains("also owns another Vessel's files")).count() == 2, "{why:?}");
+        assert!(why.iter().any(|r| r.contains("uid_slot 4 is not given") && r.contains("2 Vessels")), "{why:?}");
+        // Other slots are unaffected.
+        assert_eq!(subjects(&g.admit(vec![vc("d", 6)])), vec![("d".to_string(), 6)]);
+    }
+
     #[test]
     fn non_identity_fields_may_change() {
         let mut g = Guard::new(runtime());

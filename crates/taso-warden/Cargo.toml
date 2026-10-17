@@ -16,6 +16,7 @@ hmac = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 sha2 = "0.10"
+libc = "0.2"
 
 [dev-dependencies]
 proptest = { workspace = true }
