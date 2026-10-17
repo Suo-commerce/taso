@@ -15,6 +15,7 @@ pub mod adapter;
 pub mod canon;
 pub mod decode;
 pub mod envelope;
+pub mod frame;
 pub mod model;
 pub mod navigator;
 pub mod record;

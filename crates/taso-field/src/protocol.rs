@@ -33,11 +33,13 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+use taso_core::frame::{self, FrameError};
+
 /// The protocol version this crate speaks.
 pub const VERSION: u16 = 1;
 
-/// Largest frame body accepted, in bytes.
-pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
+/// Largest frame body accepted, in bytes ([`taso_core::frame`]).
+pub use taso_core::frame::MAX_FRAME;
 
 // ── Messages ────────────────────────────────────────────────────────
 
@@ -197,43 +199,27 @@ impl From<io::Error> for ProtocolError {
     }
 }
 
-// ── Framing ─────────────────────────────────────────────────────────
-
-/// Write one frame and flush.
-pub fn write_frame(w: &mut impl Write, body: &[u8]) -> Result<(), ProtocolError> {
-    let len = u32::try_from(body.len())
-        .ok()
-        .filter(|&n| n <= MAX_FRAME)
-        .ok_or(ProtocolError::TooLarge(u32::MAX))?;
-    w.write_all(&len.to_be_bytes())?;
-    w.write_all(body)?;
-    w.flush()?;
-    Ok(())
-}
-
-/// Read one frame.  `Ok(None)` on a clean end of stream between frames;
-/// an end inside a frame is an error.  An interrupted read is retried:
-/// a stopped and continued process gets `EINTR` from a socket read with a
-/// timeout even under `SA_RESTART`, and that is not a broken connection.
-pub fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>, ProtocolError> {
-    let mut len = [0u8; 4];
-    let mut got = 0;
-    while got < 4 {
-        match r.read(&mut len[got..]) {
-            Ok(0) if got == 0 => return Ok(None),
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e.into()),
+impl From<FrameError> for ProtocolError {
+    fn from(e: FrameError) -> Self {
+        match e {
+            FrameError::Io(e) => Self::Io(e),
+            FrameError::TooLarge(n) => Self::TooLarge(n),
         }
     }
-    let len = u32::from_be_bytes(len);
-    if len > MAX_FRAME {
-        return Err(ProtocolError::TooLarge(len));
-    }
-    let mut body = vec![0u8; len as usize];
-    r.read_exact(&mut body)?;
-    Ok(Some(body))
+}
+
+// ── Framing ─────────────────────────────────────────────────────────
+
+/// Write one frame and flush ([`taso_core::frame::write_frame`]).
+pub fn write_frame(w: &mut impl Write, body: &[u8]) -> Result<(), ProtocolError> {
+    Ok(frame::write_frame(w, body)?)
+}
+
+/// Read one frame ([`taso_core::frame::read_frame`]).  `Ok(None)` on a
+/// clean end of stream between frames; an end inside a frame is an error;
+/// an interrupted read is retried.
+pub fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>, ProtocolError> {
+    Ok(frame::read_frame(r)?)
 }
 
 /// Send a request.
