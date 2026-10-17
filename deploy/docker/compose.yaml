@@ -20,12 +20,18 @@
 #                           at the same paths (the gate scripts read them there)
 #   state, store            persistent: the local Chronicle segments and packs
 #   coord-run               the coordinator's socket
-# Unverified until D2 (the node tests run inside this image): mount
-# propagation with rshared, runc nesting under cgroup v2, and that stopping
-# the Warden container ends its agents (they live in its pid namespace).
+# Verified by D2 (deploy/docker/test-in-image.sh): mount propagation with
+# rshared, runc inside the container (the image's cgroup-init), and that
+# killing the Warden's container ends its agents.  This file itself is
+# tested by deploy/docker/compose-test.sh.
 #
-# taso-wardend runs its Vessels until their agents exit, then exits; so no
-# restart policy yet.  A long-running Warden is step W1.
+# With the config's static Vessels taso-wardend runs them until their agents
+# exit, then exits (each Vessel's "restart" decides); so no restart policy
+# here.  SIGTERM (docker compose stop) stops every agent, then the Warden.
+#
+# The Warden waits for the coordinator's socket (healthcheck): started
+# first, it would fail its Vessels.  coordd runs under an init (it has no
+# SIGTERM handler; as PID 1 it would ignore docker's stop for 10 s).
 
 name: taso
 
@@ -36,9 +42,15 @@ services:
       dockerfile: deploy/docker/Dockerfile
       target: coordd
     image: taso-coordd:dev
+    init: true
     volumes:
       - coord-data:/var/lib/taso
       - coord-run:/run/taso
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/taso/coord.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
 
   wardend:
     build:
@@ -47,7 +59,8 @@ services:
       target: wardend
     image: taso-wardend:dev
     depends_on:
-      - coordd
+      coordd:
+        condition: service_healthy
     privileged: true
     devices:
       - /dev/zfs:/dev/zfs
