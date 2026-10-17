@@ -31,14 +31,16 @@ CG=/sys/fs/cgroup
 if [ "$(cat /proc/self/cgroup 2>/dev/null)" = "0::/" ] && [ -f "$CG/cgroup.controllers" ]; then
     mkdir -p "$CG/init"
     # Processes can appear while they are moved: repeat until none is left.
+    # Only shell builtins here (read, echo): any command run would be a new
+    # process in the root cgroup.  (Not `[ -s ]`: cgroup files report size 0.)
     i=0
-    while [ -s "$CG/cgroup.procs" ]; do
+    while read -r first < "$CG/cgroup.procs"; do
         while read -r pid; do
             echo "$pid" > "$CG/init/cgroup.procs" 2>/dev/null || :
         done < "$CG/cgroup.procs"
         i=$((i + 1))
         if [ "$i" -ge 20 ]; then
-            echo "cgroup-init: processes keep appearing in $CG: $(tr '\n' ' ' < "$CG/cgroup.procs")" >&2
+            echo "cgroup-init: processes keep appearing in $CG (first: $first)" >&2
             exit 1
         fi
     done
@@ -49,7 +51,9 @@ if [ "$(cat /proc/self/cgroup 2>/dev/null)" = "0::/" ] && [ -f "$CG/cgroup.contr
             *) echo "cgroup-init: the $c controller is not available here ($available): agents need it" >&2; exit 1 ;;
         esac
         if ! echo "+$c" > "$CG/cgroup.subtree_control"; then
-            echo "cgroup-init: could not enable $c for child cgroups" >&2
+            left=""
+            read -r left < "$CG/cgroup.procs" || :
+            echo "cgroup-init: could not enable $c for child cgroups (a process left in the root: ${left:-none})" >&2
             exit 1
         fi
     done
