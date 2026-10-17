@@ -221,7 +221,8 @@ fn wait_until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
 ///    the agent was killed was rolled back, not kept and done twice;
 /// 3. listed with restart always: every run that ends by itself is started
 ///    again and resumes after the turn the one before ended on; once
-///    removed, it is stopped and never started again.
+///    removed, a run going is stopped (one waiting out its backoff is
+///    dropped) and it is never started again.
 #[test]
 #[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
 fn supervisor_stops_relists_and_restarts_on_a_real_node() {
@@ -314,7 +315,11 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     source.push(vec![with(Restart::Always)]);
     wait_until("two more runs ending by themselves", 180, || runs() >= 4);
     source.push(vec![]);
-    wait_until("the stop after always", 30, || seen.lock().unwrap().last().is_some_and(|s| s.stopped));
+    // Removed while a run is going (it is stopped) or while one waits out
+    // its backoff (nothing runs, nothing starts again): either way, every
+    // run started has ended.
+    let all_ended = || runs() == starts.load(std::sync::atomic::Ordering::SeqCst);
+    wait_until("every started run to end after the removal", 30, || all_ended() && taso_sim_processes() == 0);
     let starts_at_removal = starts.load(std::sync::atomic::Ordering::SeqCst);
     std::thread::sleep(std::time::Duration::from_millis(1500)); // past any backoff
     assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), starts_at_removal, "never started again once removed");
