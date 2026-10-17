@@ -718,10 +718,28 @@ impl<L: Layers> Vessel<L> {
 
     /// Judge resuming from the Seal at `seal` against this Vessel's log
     /// and the coordinator's anchor
-    /// ([`crate::navigate::navigate_frames`]).  Reads the local segments,
-    /// so the log here must start at genesis.
-    pub fn navigate(&self, seal: Lsn) -> Result<taso_core::navigator::Navigation, VesselError> {
-        crate::navigate::navigate_frames(self.chronicle.coord().as_ref(), self.id(), &self.frames()?, seal)
+    /// ([`crate::navigate::navigate_frames`]).
+    ///
+    /// The Navigator reads the log from genesis.  If older segments were
+    /// pruned (amendment 17), the shipped history comes from `packs`,
+    /// verified up to the shipped anchor, and the local records after it
+    /// follow; the store is read only then.
+    pub fn navigate<S: ObjectStore, X: Sender>(
+        &self,
+        packs: &Packs<S, X>,
+        seal: Lsn,
+    ) -> Result<taso_core::navigator::Navigation, VesselError> {
+        let local = self.frames()?;
+        let pruned = self.chronicle.segments().first().is_some_and(|s| s.base() != Position::GENESIS);
+        let frames = if pruned {
+            let shipped = self.chronicle.coord().shipped(self.id()).map_err(VesselError::Coord)?;
+            let mut chain = packs.chain(Some(shipped)).map_err(VesselError::Pack)?;
+            chain.frames.extend(local.into_iter().filter(|f| f.envelope.lsn > chain.end.lsn));
+            chain.frames
+        } else {
+            local
+        };
+        crate::navigate::navigate_frames(self.chronicle.coord().as_ref(), self.id(), &frames, seal)
             .map_err(VesselError::Coord)
     }
 
@@ -1448,6 +1466,43 @@ pub(crate) mod tests {
             assert_eq!(c.frames.first().unwrap().envelope.lsn, Lsn::new(1), "the store has everything");
             assert_eq!(c.frames.last().unwrap().envelope.lsn, v.tail().lsn);
             assert_eq!(c.seals.iter().map(|s| s.fs.to).collect::<Vec<_>>(), vec![s1, s2, s3]);
+        }
+
+        /// After a prune the Navigator reads the shipped history from the
+        /// store and the rest from the local segments.
+        #[test]
+        fn navigate_after_a_prune_reads_the_store() {
+            use taso_core::navigator::Navigation;
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (mut v, s1) = sealed(&p);
+            v.publish_seal(&p.packs, &snap(&v, s1), None).unwrap();
+            v.set_roll_at(1);
+            for i in 0..3 {
+                v.append(Stream::Fs, raw(i)).unwrap();
+            }
+            let s2 = seal(&mut v);
+            v.publish_seal(&p.packs, &snap(&v, s2), None).unwrap();
+            assert_eq!(v.navigate(&p.packs, s1.lsn).unwrap(), Navigation::Consistent(vec![]));
+            v.prune(0).unwrap();
+            assert!(v.frames().unwrap()[0].envelope.lsn > s2.lsn, "both Seal records are gone locally");
+            v.append(Stream::Fs, raw(9)).unwrap(); // local only, after the anchor
+            let s3 = seal(&mut v);
+            for s in [s1, s2, s3] {
+                assert_eq!(v.navigate(&p.packs, s.lsn).unwrap(), Navigation::Consistent(vec![]), "{s:?}");
+            }
+            // Shipped again: now local records overlap the store's; each
+            // is read once.
+            v.publish_seal(&p.packs, &snap(&v, s3), None).unwrap();
+            v.append(Stream::Fs, raw(10)).unwrap(); // and one past the anchor
+            let shipped = p.coord.shipped(v.id()).unwrap().lsn;
+            assert!(v.frames().unwrap()[0].envelope.lsn <= shipped && shipped < v.tail().lsn);
+            assert_eq!(v.navigate(&p.packs, s3.lsn).unwrap(), Navigation::Consistent(vec![]));
+
+            // Without the store's history the log does not reach back to
+            // genesis: never Consistent.
+            let empty = penv(vessel_id(ns(1), b"user-2"));
+            let r = v.navigate(&empty.packs, s1.lsn);
+            assert!(matches!(r, Err(VesselError::Pack(_))), "{r:?}");
         }
 
         #[test]
