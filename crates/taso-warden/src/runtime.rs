@@ -272,8 +272,43 @@ pub fn check_rootfs(rootfs: &Path) -> Vec<String> {
 /// Make the dataset mountpoint writable by the Vessel's root (host uid
 /// `host_uid_base`): chown the top directory, mode 0750.  Files the agent
 /// creates are then owned by its range, never by host root.
+///
+/// Only if the dataset is this Vessel's.  The top directory's owner is a
+/// durable mark of whose it is: it travels with the dataset (`zfs send`
+/// keeps owners), so it holds across Warden restarts and nodes, where the
+/// source guard's memory does not.  Accepted:
+/// - owned by host root (uid and gid 0): a fresh dataset, never prepared
+///   (also one rolled back to its birth Seal, which froze it fresh);
+/// - owned by exactly `host_uid_base` (uid and gid): prepared before for
+///   this Vessel, here or on another node.
+///
+/// Anything else is refused with `PermissionDenied` and **nothing is
+/// changed**: another Vessel's range (a slot that changed, or a dataset that
+/// is not this Vessel's), a stray owner, or a fork from a parent in another
+/// slot (whose files are the parent's range).  A path that is not a plain
+/// directory (a symlink included) is refused with `InvalidInput`.
 pub fn prepare_work_dir(work: &Path, host_uid_base: u32) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let m = std::fs::symlink_metadata(work)?;
+    if !m.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory (a symlink is not accepted)", work.display()),
+        ));
+    }
+    let (uid, gid) = (m.uid(), m.gid());
+    let fresh = uid == 0 && gid == 0;
+    let ours = uid == host_uid_base && gid == host_uid_base;
+    if !fresh && !ours {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is owned by {uid}:{gid}, not by this Vessel's range ({host_uid_base}) nor fresh (0:0): \
+                 another Vessel's dataset, or its uid_slot changed; refusing to run it here",
+                work.display()
+            ),
+        ));
+    }
     std::os::unix::fs::chown(work, Some(host_uid_base), Some(host_uid_base))?;
     std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o750))
 }
@@ -748,6 +783,81 @@ mod tests {
         assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
         // An existing root is left as it is.
         cli.run(&s(&["list"])).unwrap();
+    }
+
+    // ── prepare_work_dir: whose dataset is it ───────────────────────
+
+    use std::os::unix::fs::MetadataExt;
+
+    fn owner(p: &Path) -> (u32, u32) {
+        let m = std::fs::metadata(p).unwrap();
+        (m.uid(), m.gid())
+    }
+
+    fn running_as_root() -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        owner(dir.path()).0 == 0
+    }
+
+    /// A directory owned by someone who is neither root nor the Vessel's
+    /// range: as root, chowned to a foreign range; otherwise it is simply
+    /// the test user's own (non-root, and not 200000).
+    fn foreign_dir() -> (tempfile::TempDir, (u32, u32)) {
+        let dir = tempfile::tempdir().unwrap();
+        if running_as_root() {
+            std::os::unix::fs::chown(dir.path(), Some(300_000), Some(300_000)).unwrap();
+        }
+        let o = owner(dir.path());
+        assert!(o != (0, 0) && o != (200_000, 200_000), "{o:?}");
+        (dir, o)
+    }
+
+    #[test]
+    fn another_owners_dataset_is_refused_and_left_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, before) = foreign_dir();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        let e = prepare_work_dir(dir.path(), 200_000).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("not by this Vessel's range (200000)"), "{e}");
+        assert_eq!(owner(dir.path()), before, "owner unchanged");
+        assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode(), mode, "mode unchanged");
+    }
+
+    #[test]
+    fn only_a_plain_directory_is_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(prepare_work_dir(&file, 200_000).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        assert_eq!(prepare_work_dir(&link, 200_000).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(prepare_work_dir(&dir.path().join("missing"), 200_000).is_err());
+    }
+
+    /// Root-owned (fresh) is prepared; then it is the Vessel's and is
+    /// accepted again; a half match (uid ours, gid not) is refused, as is
+    /// another slot's range.  Needs root to set owners.
+    #[test]
+    #[ignore = "needs root"]
+    fn fresh_then_ours_is_accepted_and_nothing_else() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(running_as_root(), "run as root");
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
+        prepare_work_dir(dir.path(), 200_000).unwrap();
+        assert_eq!(owner(dir.path()), (200_000, 200_000));
+        assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777, 0o750);
+        prepare_work_dir(dir.path(), 200_000).unwrap();
+        assert_eq!(owner(dir.path()), (200_000, 200_000), "prepared again: unchanged");
+        // The next slot's range, as after a slot change: refused.
+        assert_eq!(prepare_work_dir(dir.path(), 200_000 + 65_536).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        // Half ours.
+        std::os::unix::fs::chown(dir.path(), Some(200_000), Some(0)).unwrap();
+        assert_eq!(prepare_work_dir(dir.path(), 200_000).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(200_000)).unwrap();
+        assert_eq!(prepare_work_dir(dir.path(), 200_000).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

@@ -143,6 +143,66 @@ to the decision lists in the session handoffs.
     node the Vessel runs on. A fork or succession into another slot needs
     its files moved into its range first (not yet built).
 
+21. **A restart starts from a Seal, as a rebirth does** (2026-10-17).
+    v0.4 §5.4 says a resumed Vessel restarts quiescent from state and
+    transcript; the code makes "state" exact:
+    - *Birth Seal.* Every Vessel takes a Seal before its agent first runs:
+      turn 0, an empty cut, ledger position 0, `Clean`, right after the
+      Lineage record. It freezes the state the Vessel was born with (empty
+      from the void; the parent's Seal for a fork or succession), is
+      published like any Seal, so a Vessel that dies before turn 1 can be
+      reborn, and is the level a restart rolls back to until turn 1 is
+      sealed. Turn 0 belongs to the Warden: a harness's `TurnEnd` with
+      turn 0 is refused, and `Hello` reports a birth-Seal-only log as no
+      turn sealed. It is taken only on a pristine Vessel (nothing after
+      Lineage); a Vessel with no Seal but later records is refused, not
+      sealed over.
+    - *Rollback on start.* Before its agent runs, the Vessel's state is
+      rolled back to its last Seal (plain `zfs rollback`, never `-r`), so
+      what a crashed or stopped turn wrote after it is discarded and a
+      restart on the same node starts from exactly what a rebirth elsewhere
+      would. If the last Seal's layer is missing, the newest Seal with a
+      layer is used and a warning says the state is behind (see the fencing
+      review, F4). A failed rollback stops the start.
+    - *Nothing writes while it rolls back.* On ZFS an open file does not
+      stop a rollback (measured), so the order is required: one daemon per
+      run directory (an exclusive lock, refused if held), and before any
+      Vessel the daemon removes every container left in its runc root by a
+      dead incarnation; a container that cannot be removed stops the start.
+
+22. **Which Vessels run comes from an untrusted source, through a guard**
+    (2026-10-17). The daemon runs the Vessels a source reports (its config
+    today, a Kubernetes watch next) under a supervisor. Every set passes a
+    guard that enforces, whatever the source or a CRD in front of it
+    claims: one entry per Vessel; a slot range that fits; no two Vessels
+    on one slot, at once or over the Warden's life (a slot stays bound to
+    its Vessel after removal); a Vessel's slot fixed for the Warden's life,
+    also across removal and return; a bad entry hurts only itself (a
+    running Vessel keeps its last good entry, a removed one is not
+    revived); refusals reported; the outcome independent of the source's
+    order. A source that fails means *unknown*, never *empty*: nothing is
+    started, stopped or restarted until it answers. The supervisor runs one
+    run per Vessel at a time; stops a removed Vessel by killing its
+    container (a crash of that agent only; the next start rolls back,
+    amendment 21); restarts by the entry's `restart` policy (`never` by
+    default, `on-failure`, `always`) after a doubling backoff that a
+    healthy run resets; never restarts a Vessel stopped on purpose, but
+    starts it afresh if it was listed again while being stopped; applies a
+    changed entry at the next start and never bounces a running agent for
+    it. With the config as source the daemon still exits once every Vessel
+    is done and none waits to restart. SIGTERM remains a crash.
+
+23. **A dataset's owner marks whose it is** (2026-10-17). Before a
+    Vessel's agent runs, the dataset's top directory must be owned by host
+    root (fresh, never prepared, or rolled back to its birth Seal) or by
+    exactly the Vessel's own range (uid and gid); only then is it chowned
+    to that range. Anything else is refused and nothing is changed. The
+    owner travels with the dataset (`zfs send` keeps it), so this holds
+    across Warden restarts and nodes, where the guard's memory (amendment
+    22) does not: a Vessel can never run on another Vessel's dataset or
+    under a changed slot. It also refuses, until it is designed, the fork
+    or succession into another slot that amendment 20 leaves open.
+
 ### Amendments already applied from the Phase 4 plan
 
 12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
