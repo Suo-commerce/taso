@@ -1,0 +1,98 @@
+# Taso on one host with Docker Compose (plan: claude/Taso_plan_k8s_docker_2026-10-17.md, D1).
+#
+#   cd deploy/docker
+#   TASO_DATASET=tasotest/vessel TASO_POOL_MOUNT=/tasotest TASO_ROOTFS=/srv/taso/rootfs \
+#     docker compose up --build
+#
+# Two services, mirroring the cluster layout: the coordinator in its own
+# container, and one Warden that reaches it over a shared socket directory.
+# The store is a local directory (as gate-p1 HUB=0); Garage comes with the
+# cluster manifests, where it is needed across nodes.
+#
+# Needs: Docker Compose >= 2.23.1 (inline `configs.content`), the host's
+# ZFS pool and module (2.4.1, matching the image's userland), and an agent
+# rootfs at $TASO_ROOTFS (e.g. the taso-sim rootfs gate-p1.sh builds).
+#
+# What the Warden container gets, and why:
+#   privileged + /dev/zfs   zfs ioctls, runc namespaces and mounts
+#   $TASO_POOL_MOUNT, rshared
+#                           datasets the Warden mounts stay visible on the host
+#                           at the same paths (the gate scripts read them there)
+#   state, store            persistent: the local Chronicle segments and packs
+#   coord-run               the coordinator's socket
+# Unverified until D2 (the node tests run inside this image): mount
+# propagation with rshared, runc nesting under cgroup v2, and that stopping
+# the Warden container ends its agents (they live in its pid namespace).
+#
+# taso-wardend runs its Vessels until their agents exit, then exits; so no
+# restart policy yet.  A long-running Warden is step W1.
+
+name: taso
+
+services:
+  coordd:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: coordd
+    image: taso-coordd:dev
+    volumes:
+      - coord-data:/var/lib/taso
+      - coord-run:/run/taso
+
+  wardend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: wardend
+    image: taso-wardend:dev
+    depends_on:
+      - coordd
+    privileged: true
+    devices:
+      - /dev/zfs:/dev/zfs
+    configs:
+      - source: wardend
+        target: /etc/taso/wardend.json
+    volumes:
+      - type: bind
+        source: ${TASO_POOL_MOUNT:?set TASO_POOL_MOUNT to the pool's mountpoint, e.g. /tasotest}
+        target: ${TASO_POOL_MOUNT}
+        bind:
+          propagation: rshared
+      - type: bind
+        source: ${TASO_ROOTFS:?set TASO_ROOTFS to an agent rootfs directory}
+        target: /srv/taso/rootfs
+        read_only: true
+      - state:/var/lib/taso/state
+      - store:/srv/taso/store
+      - coord-run:/run/taso-coord
+
+configs:
+  wardend:
+    content: |
+      {
+        "warden": 1,
+        "coordinator": { "remote": "/run/taso-coord/coord.sock" },
+        "root": "${TASO_DATASET:?set TASO_DATASET to a dataset the Warden may use, e.g. tasotest/vessel}",
+        "state_dir": "/var/lib/taso/state",
+        "store": "/srv/taso/store",
+        "run_dir": "/run/taso",
+        "runtime": {
+          "rootfs": "/srv/taso/rootfs",
+          "host_uid_base": 200000,
+          "landlock_shim": "/usr/lib/taso/landlock",
+          "args": ["/usr/bin/taso-sim", "--turns", "5", "--txns", "2", "--rows", "3"],
+          "memory_bytes": 268435456,
+          "pids": 64
+        },
+        "vessels": [
+          { "namespace": "07070707070707070707070707070707", "subject": "${TASO_SUBJECT:-compose-1}", "uid_slot": 1 }
+        ]
+      }
+
+volumes:
+  coord-data:
+  coord-run:
+  state:
+  store:
