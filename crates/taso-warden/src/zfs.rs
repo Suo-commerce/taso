@@ -560,6 +560,10 @@ impl Zfs<Cli> {
     }
 }
 
+fn strs_of(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
 impl<R: Runner> Zfs<R> {
     /// The driver over any runner.
     pub fn with_runner(runner: R) -> Self {
@@ -723,6 +727,37 @@ impl<R: Runner> Zfs<R> {
             Err(ZfsError::Exit { stderr, .. }) if stderr.contains("does not exist") => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// The filesystems directly under `root` (not `root` itself, nor
+    /// deeper ones).
+    pub fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, ZfsError> {
+        let stdout = self.run(strs_of(&["list", "-H", "-o", "name", "-t", "filesystem", "-d", "1", root.as_str()]))?;
+        let mut out = Vec::new();
+        for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if line == root.as_str() {
+                continue;
+            }
+            let child = Dataset::new(line).map_err(|_| ZfsError::Parse { line: line.to_string(), why: "not a dataset name" })?;
+            match line.strip_prefix(root.as_str()).and_then(|r| r.strip_prefix('/')) {
+                Some(rest) if !rest.contains('/') => out.push(child),
+                _ => return Err(ZfsError::Parse { line: line.to_string(), why: "not a direct child of the root" }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// The uids owning space in `dataset`, as ZFS accounts it (`zfs
+    /// userspace`: POSIX users, numeric).  Works on an unmounted dataset
+    /// too (measured on taso-test 2026-10-17), so a received one counts.
+    pub fn owner_uids(&self, dataset: &Dataset) -> Result<std::collections::BTreeSet<u32>, ZfsError> {
+        let stdout = self.run(strs_of(&["userspace", "-H", "-n", "-p", "-t", "posixuser", "-o", "name", dataset.as_str()]))?;
+        stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.parse::<u32>().map_err(|_| ZfsError::Parse { line: l.to_string(), why: "not a numeric uid" }))
+            .collect()
     }
 
     /// Info for a dataset that was just created.
@@ -975,6 +1010,35 @@ mod tests {
     }
 
     // ── Names ──────────────────────────────────────────────────────
+
+    #[test]
+    fn children_are_the_direct_filesystems_under_the_root() {
+        let z = Zfs::with_runner(Fake::default().reply(true, "tasotest/vessel\ntasotest/vessel/v-01\ntasotest/vessel/v-02\n\n", ""));
+        let got = z.children(&ds()).unwrap();
+        assert_eq!(got.iter().map(Dataset::as_str).collect::<Vec<_>>(), vec!["tasotest/vessel/v-01", "tasotest/vessel/v-02"]);
+        assert_eq!(z.runner.calls.borrow()[0], strs(&["list", "-H", "-o", "name", "-t", "filesystem", "-d", "1", "tasotest/vessel"]));
+        for bad in ["tasotest/vessel/a/b\n", "tasotest/other\n", "tasotest/vesselx\n", "tasotest/vessel/a b\n"] {
+            let z = Zfs::with_runner(Fake::default().reply(true, bad, ""));
+            assert!(matches!(z.children(&ds()), Err(ZfsError::Parse { .. })), "{bad:?}");
+        }
+        let z = Zfs::with_runner(Fake::default().reply(false, "", "cannot open 'tasotest/vessel': dataset does not exist"));
+        assert!(matches!(z.children(&ds()), Err(ZfsError::Exit { .. })), "a missing root is an error, not no children");
+    }
+
+    #[test]
+    fn owner_uids_are_parsed_numerically() {
+        let z = Zfs::with_runner(Fake::default().reply(true, "0\n265536\n265537\n\n", ""));
+        assert_eq!(z.owner_uids(&ds()).unwrap(), [0, 265_536, 265_537].into());
+        assert_eq!(z.runner.calls.borrow()[0], strs(&["userspace", "-H", "-n", "-p", "-t", "posixuser", "-o", "name", "tasotest/vessel"]));
+        for bad in ["root\n", "-1\n", "4294967296\n"] {
+            let z = Zfs::with_runner(Fake::default().reply(true, bad, ""));
+            assert!(matches!(z.owner_uids(&ds()), Err(ZfsError::Parse { .. })), "{bad:?}");
+        }
+        let z = Zfs::with_runner(Fake::default().reply(true, "", ""));
+        assert!(z.owner_uids(&ds()).unwrap().is_empty());
+        let z = Zfs::with_runner(Fake::default().reply(false, "", "boom"));
+        assert!(z.owner_uids(&ds()).is_err());
+    }
 
     #[test]
     fn valid_dataset_names() {

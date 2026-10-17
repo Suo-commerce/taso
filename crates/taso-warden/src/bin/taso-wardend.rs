@@ -135,7 +135,9 @@ fn main() -> ExitCode {
     };
     let warden = node.config.warden;
 
-    let guard = Guard::new(node.config.runtime.clone());
+    // Seeded with what the pool holds: a uid slot whose range owns a
+    // Vessel's files stays that Vessel's across restarts of the Warden.
+    let guard = Guard::seeded(node.config.runtime.clone(), node.held().to_vec());
     let mut supervisor = Supervisor::new(node.clone(), guard, Timing::default());
     // Per Vessel, whether its last run went well (a refused entry counts as
     // not).  The exit status is about how each Vessel ended, not about

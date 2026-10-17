@@ -120,7 +120,8 @@ use crate::s3::{S3Config, S3Store};
 use crate::ship::{LocalStore, SharedStore, ZfsSend};
 use crate::chronicle::Layers;
 use crate::vessel::{Ensured, Host, Vessel, VesselError};
-use crate::zfs::{Cli, Dataset, Snapshot, Zfs};
+use crate::zfs::{Cli, Dataset, Runner, Snapshot, Zfs, ZfsError};
+use crate::source::Held;
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -1097,6 +1098,51 @@ pub fn sweep_stale<R: RuncRunner>(runc: &Runc<R>) -> io::Result<Swept> {
     Err(io::Error::other(format!("stale containers could not be removed: {}", failed.join(", "))))
 }
 
+/// What the node's pool holds of each Vessel under `root`, for
+/// [`crate::source::Guard::seeded`]: for every `v-<id>` dataset, the uid
+/// slots whose ranges own files in it (`zfs userspace`, mounted or not).
+/// Root (uid 0) owns a fresh dataset's top directory and counts for no
+/// slot.  Also returns warnings: datasets that are not a Vessel's, and uids
+/// in no slot's range (they count for none).  Any failure to read the pool
+/// is an error: without it, a slot could be given to a second Vessel.
+pub fn held_on<R: Runner>(zfs: &Zfs<R>, root: &Dataset, host_uid_base: u32) -> Result<(Vec<Held>, Vec<String>), ZfsError> {
+    let mut held = Vec::new();
+    let mut warnings = Vec::new();
+    for ds in zfs.children(root)? {
+        let name = ds.as_str().rsplit('/').next().unwrap_or_default();
+        let Some(key) = name.strip_prefix("v-").and_then(key_of_hex) else {
+            warnings.push(format!("{ds} is not a Vessel dataset (v-<id>): ignored"));
+            continue;
+        };
+        let mut slots = std::collections::BTreeSet::new();
+        for uid in zfs.owner_uids(&ds)? {
+            if uid == 0 {
+                continue;
+            }
+            match uid.checked_sub(host_uid_base) {
+                Some(off) => {
+                    slots.insert(off / ID_RANGE);
+                }
+                None => warnings.push(format!("{ds} has files of uid {uid}, below host_uid_base {host_uid_base}: in no slot")),
+            }
+        }
+        held.push(Held { key, slots });
+    }
+    Ok((held, warnings))
+}
+
+/// A Vessel key from 32 lowercase hex digits.
+fn key_of_hex(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 || !s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+        return None;
+    }
+    let mut k = [0u8; 16];
+    for (i, b) in k.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(k)
+}
+
 /// Everything a node's Vessels share.
 pub struct Node {
     /// The configuration.
@@ -1109,6 +1155,8 @@ pub struct Node {
     pub store: SharedStore,
     /// The run directory, held for the node's lifetime.
     run_lock: RunDirLock,
+    /// What the pool held of each Vessel when the node started ([`held_on`]).
+    held: Vec<Held>,
 }
 
 impl Node {
@@ -1123,8 +1171,20 @@ impl Node {
         for id in &swept.deleted {
             eprintln!("taso-wardend[{}]: deleted stale container {id}", config.warden.get());
         }
+        // After the sweep: nothing writes into a dataset now.
+        let (held, warnings) = held_on(&zfs, &config.root, config.runtime.host_uid_base)
+            .map_err(|e| io::Error::other(format!("reading the uid slots of the pool's Vessels: {e}")))?;
+        for w in &warnings {
+            eprintln!("taso-wardend[{}]: {w}", config.warden.get());
+        }
         let store = config.store.open().map_err(ctx("opening the store"))?;
-        Ok(Self { config, coord, zfs, store, run_lock })
+        Ok(Self { config, coord, zfs, store, run_lock, held })
+    }
+
+    /// What the pool held of each Vessel when the node started: the seed of
+    /// a guard ([`crate::source::Guard::seeded`]).
+    pub fn held(&self) -> &[Held] {
+        &self.held
     }
 
     /// The run directory's lock file.
@@ -1933,6 +1993,55 @@ mod tests {
         for no in ["", "-a", "a-", "A", "a.b", "a_b", &"n".repeat(64), "a b"] {
             assert!(!valid_kube_namespace(no), "{no}");
         }
+    }
+
+    /// A zfs runner answering `list` and `userspace` from a table.
+    struct ZfsTable(BTreeMap<String, String>);
+    impl Runner for ZfsTable {
+        fn run(&self, args: &[String]) -> Result<crate::zfs::Output, ZfsError> {
+            let key = format!("{} {}", args[0], args.last().unwrap());
+            let out = |stdout: &str| crate::zfs::Output { success: true, code: Some(0), stdout: stdout.into(), stderr: String::new() };
+            self.0.get(&key).map(|s| out(s)).ok_or_else(|| ZfsError::Spawn(format!("unexpected: {key}")))
+        }
+        fn run_input(&self, _: &[String], _: &mut dyn std::io::Read) -> Result<crate::zfs::Output, ZfsError> {
+            unreachable!()
+        }
+    }
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn the_pool_says_which_slots_own_each_vessels_files() {
+        let (a, b, c) = ("aa".repeat(16), "bb".repeat(16), "cc".repeat(16));
+        let pool = ZfsTable(
+            [
+                ("list t/v".to_string(), format!("t/v\nt/v/v-{a}\nt/v/v-{b}\nt/v/v-{c}\nt/v/scratch\nt/v/v-XYZ\n")),
+                (format!("userspace t/v/v-{a}"), "0\n265536\n265537\n".into()),
+                (format!("userspace t/v/v-{b}"), "0\n".into()),
+                (format!("userspace t/v/v-{c}"), "331072\n265536\n1000\n".into()),
+            ]
+            .into(),
+        );
+        let (held, warnings) = held_on(&Zfs::with_runner(pool), &Dataset::new("t/v").unwrap(), 200_000).unwrap();
+        let got: Vec<(u8, Vec<u32>)> = held.iter().map(|h| (h.key[0], h.slots.iter().copied().collect())).collect();
+        assert_eq!(got, vec![(0xaa, vec![1]), (0xbb, vec![]), (0xcc, vec![1, 2])]);
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("scratch is not a Vessel")));
+        assert!(warnings.iter().any(|w| w.contains("v-XYZ is not a Vessel")));
+        assert!(warnings.iter().any(|w| w.contains("uid 1000, below host_uid_base")));
+        // A pool that cannot be read is an error, never "nothing held".
+        let broken = ZfsTable([("list t/v".to_string(), format!("t/v\nt/v/v-{a}\n"))].into());
+        assert!(held_on(&Zfs::with_runner(broken), &Dataset::new("t/v").unwrap(), 200_000).is_err());
+    }
+
+    #[test]
+    fn vessel_keys_from_hex() {
+        assert_eq!(key_of_hex(&"0a".repeat(16)), Some([0x0a; 16]));
+        for bad in ["0A".repeat(16), "0a".repeat(15), "0a".repeat(17), "zz".repeat(16), String::new()] {
+            assert_eq!(key_of_hex(&bad), None, "{bad}");
+        }
+        // The name the Vessel layer gives a dataset parses back to its id.
+        let id = vessel_id(Namespace::from_bytes([7; 16]), b"s");
+        assert_eq!(key_of_hex(&id_hex(id)), Some(*id.as_bytes()));
     }
 
     #[test]

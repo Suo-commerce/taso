@@ -24,7 +24,11 @@
 #                 same agent process, and its status says why
 #   7. sigterm    SIGTERM: the Warden stops every agent and exits 0; the last
 #                 status of each says it was stopped
-#   8. resumed    a new Warden opens the Vessels again (Open, no second
+#   8. slots      a new Warden keeps every uid slot with the Vessel whose
+#                 files its range owns: runner runs again on slot 1, the
+#                 newcomer asking for it stays refused (the guard is seeded
+#                 from the pool; before, the smaller Vessel id won)
+#   9. resumed    that new Warden opens the Vessels again (Open, no second
 #                 birth Seal): the state is rolled back to a Seal past the
 #                 birth Seal and the agent runs again
 #
@@ -347,7 +351,14 @@ fi
 K patch vessel -n team-a editme --type merge -p '{"spec":{"resources":{"pids":64}}}' >/dev/null
 start_warden warden-2
 if wait_for 60 is_phase team-a runner Running && wait_for 30 agent 101; then
+    # 8. slots: the newcomer on runner's slot stays refused, and never ran.
     sleep 3
+    m=$(message team-b clash)
+    if is_phase team-b clash Refused && case "$m" in *"uid_slot 1 is bound to another Vessel"*) true ;; *) false ;; esac && ! agent 116 >/dev/null; then
+        pass slots "after the restart runner keeps slot 1; clash stays Refused: $m"
+    else
+        fail slots "clash: $(phase team-b clash): $m; agent: $(agent 116 || echo none)"
+    fi
     kill -TERM "$WARDEN_PID"
     for _ in $(seq 1 60); do kill -0 "$WARDEN_PID" 2>/dev/null || break; sleep 0.5; done
     wait "$WARDEN_PID" 2>/dev/null
@@ -361,7 +372,8 @@ if wait_for 60 is_phase team-a runner Running && wait_for 30 agent 101; then
         fail resumed "start '$start', rolledBackTo '$rolled'"
     fi
 else
-    fail resumed "runner did not run again: $(phase team-a runner): $(message team-a runner)"
+    fail slots "runner did not run again: $(phase team-a runner): $(message team-a runner)"
+    fail resumed "runner did not run again"
 fi
 
 # ── summary ───────────────────────────────────────────────────────────
@@ -369,7 +381,7 @@ K get vessels -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,N
 {
     echo
     echo "K2 end to end ($(date -u +%FT%TZ), $(uname -r), envtest $ENVTEST_VERSION)"
-    for row in crd running refused elsewhere deleted kept sigterm resumed; do
+    for row in crd running refused elsewhere deleted kept sigterm slots resumed; do
         printf '  %-10s %s\n' "$row" "${RESULT[$row]:-not run}"
     done
     echo "results in $OUT"
