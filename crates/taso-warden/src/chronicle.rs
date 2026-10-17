@@ -111,6 +111,14 @@ pub trait Layers {
     /// Destroy the layer at `lsn`, if it exists.  Used only for orphans:
     /// layers whose record was never accepted.
     fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError>;
+    /// Make the current state the layer at `lsn` again, which must be
+    /// bound to `hash`: everything written after it is discarded.  Must
+    /// refuse, changing nothing, if a later layer exists; never destroys
+    /// one.  A store that cannot roll back says so (the default).
+    fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        let _ = hash;
+        Err(format!("this layer store cannot roll back (to layer {})", lsn.get()).into())
+    }
 }
 
 /// [`Layers`] over a ZFS dataset.
@@ -151,6 +159,11 @@ impl<R: Runner> Layers for ZfsLayers<R> {
         if let Some(snap) = self.zfs.get(&self.dataset, lsn)? {
             self.zfs.destroy(&snap)?;
         }
+        Ok(())
+    }
+
+    fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        self.zfs.rollback(&self.dataset, lsn, hash)?;
         Ok(())
     }
 }
@@ -664,6 +677,40 @@ impl<L: Layers> Chronicle<L> {
         self.missing_layers.contains(&seal)
     }
 
+    /// Roll the state back to the newest Seal whose layer is here,
+    /// discarding everything written after it (a restart resumes from a
+    /// Seal, as a rebirth does).  Returns that Seal, or `None` if no Seal
+    /// has a layer here (nothing is touched).
+    ///
+    /// The target is normally the last Seal.  If its layer is missing
+    /// ([`Self::layer_missing`]) it is the newest Seal before it that has
+    /// one; the caller sees which from the returned position.  After open
+    /// every layer left is a Seal's (orphans are destroyed), so a layer
+    /// past the last Seal is an inconsistency and refused, as is a fenced
+    /// or poisoned Chronicle.  Nothing is appended: the log is not state.
+    pub fn rollback_to_last_seal(&mut self) -> Result<Option<Position>, ChronicleError> {
+        self.ready()?;
+        let Some(last) = self.last_seal else {
+            return Ok(None);
+        };
+        let layers = self.layers.list().map_err(ChronicleError::Layer)?;
+        let Some(&(lsn, hash)) = layers.last() else {
+            return Ok(None);
+        };
+        if lsn > last.lsn {
+            return Err(ChronicleError::Layer(
+                format!("layer {} is past the last Seal {}: not rolling back", lsn.get(), last.lsn.get()).into(),
+            ));
+        }
+        if lsn == last.lsn && hash != last.hash {
+            return Err(ChronicleError::Layer(
+                format!("layer {} is not bound to the last Seal's record", lsn.get()).into(),
+            ));
+        }
+        self.layers.rollback(lsn, hash).map_err(ChronicleError::Layer)?;
+        Ok(Some(Position { lsn, hash }))
+    }
+
     /// The newest local segment: the one being written.
     pub fn segment(&self) -> &Segment {
         &self.segment
@@ -1033,6 +1080,8 @@ mod tests {
         snaps: Rc<RefCell<BTreeMap<Lsn, HashVal>>>,
         /// Take the snapshot, then report failure (a crash after it).
         fail_after_snapshot: Rc<RefCell<bool>>,
+        /// Every rollback, by target lsn.
+        rolled_back: Rc<RefCell<Vec<Lsn>>>,
     }
 
     impl FakeLayers {
@@ -1058,6 +1107,21 @@ mod tests {
         }
         fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
             self.snaps.borrow_mut().remove(&lsn);
+            Ok(())
+        }
+        /// Like `zfs rollback`: the layer must be there with this hash,
+        /// and nothing later may exist.
+        fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+            let s = self.snaps.borrow();
+            match s.get(&lsn) {
+                None => return Err(format!("no layer {}", lsn.get()).into()),
+                Some(h) if *h != hash => return Err(format!("layer {} has another hash", lsn.get()).into()),
+                Some(_) => {}
+            }
+            if s.range(lsn.next()..).next().is_some() {
+                return Err("more recent layers exist".into());
+            }
+            self.rolled_back.borrow_mut().push(lsn);
             Ok(())
         }
     }
@@ -1360,6 +1424,142 @@ mod tests {
         assert!(a.is_fenced());
         assert_eq!(std::fs::metadata(a.segment().path()).unwrap().len(), len);
         assert_eq!(e.coord.head(cid()).unwrap().lsn, Lsn::new(1));
+    }
+
+    // ── rollback to the last Seal ───────────────────────────────────
+
+    /// A restart rolls the state back to the last Seal: the newest layer,
+    /// bound to the last Seal's record.
+    #[test]
+    fn rollback_goes_to_the_last_seal() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        seal(&mut c, 1).unwrap();
+        let s2 = seal(&mut c, 2).unwrap().seal;
+        c.append(Stream::Fs, raw(2)).unwrap(); // written after the Seal
+        drop(c);
+        let (mut c, _) = e.open(A);
+        assert_eq!(c.rollback_to_last_seal().unwrap(), Some(s2));
+        assert_eq!(*e.layers.rolled_back.borrow(), vec![s2.lsn]);
+        assert_eq!(c.last_seal(), Some(s2), "the log is untouched");
+    }
+
+    /// No Seal yet: nothing to roll back to, nothing touched.
+    #[test]
+    fn rollback_without_a_seal_does_nothing() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        assert_eq!(c.rollback_to_last_seal().unwrap(), None);
+        assert!(e.layers.rolled_back.borrow().is_empty());
+    }
+
+    /// The last Seal's layer is gone: roll back to the newest Seal that
+    /// still has one, and say which.
+    #[test]
+    fn rollback_with_the_last_layer_missing_goes_to_the_one_before() {
+        let e = env();
+        let mut c = e.create();
+        let s1 = seal(&mut c, 1).unwrap().seal;
+        let s2 = seal(&mut c, 2).unwrap().seal;
+        drop(c);
+        e.layers.clone().destroy(s2.lsn).unwrap();
+        let (mut c, _) = e.open(A);
+        assert!(c.layer_missing(s2.lsn));
+        assert_eq!(c.rollback_to_last_seal().unwrap(), Some(s1));
+        assert_eq!(*e.layers.rolled_back.borrow(), vec![s1.lsn]);
+    }
+
+    /// No layer at all although Seals exist (every one lost): nothing to
+    /// roll back to.
+    #[test]
+    fn rollback_with_every_layer_missing_does_nothing() {
+        let e = env();
+        let mut c = e.create();
+        let s1 = seal(&mut c, 1).unwrap().seal;
+        drop(c);
+        e.layers.clone().destroy(s1.lsn).unwrap();
+        let (mut c, _) = e.open(A);
+        assert_eq!(c.rollback_to_last_seal().unwrap(), None);
+        assert!(e.layers.rolled_back.borrow().is_empty());
+    }
+
+    /// A layer past the last Seal, or one bound to another record, is
+    /// refused: nothing rolled back.
+    #[test]
+    fn rollback_refuses_layers_that_do_not_match_the_log() {
+        let e = env();
+        let mut c = e.create();
+        let s1 = seal(&mut c, 1).unwrap().seal;
+        // Made behind the Chronicle's back after open.
+        e.layers.clone().snapshot(Lsn::new(9), HashVal::from_bytes([9; 32])).unwrap();
+        let err = c.rollback_to_last_seal().unwrap_err();
+        assert!(err.to_string().contains("past the last Seal"), "{err}");
+        e.layers.clone().destroy(Lsn::new(9)).unwrap();
+        e.layers.clone().destroy(s1.lsn).unwrap();
+        e.layers.clone().snapshot(s1.lsn, HashVal::from_bytes([7; 32])).unwrap();
+        let err = c.rollback_to_last_seal().unwrap_err();
+        assert!(err.to_string().contains("not bound to the last Seal"), "{err}");
+        assert!(e.layers.rolled_back.borrow().is_empty());
+    }
+
+    /// A fenced Chronicle does not touch the state.
+    #[test]
+    fn a_fenced_chronicle_does_not_roll_back() {
+        let e = env();
+        let mut a = e.create();
+        seal(&mut a, 1).unwrap();
+        e.coord.transfer(cid(), B).unwrap();
+        assert!(matches!(a.append(Stream::Fs, raw(1)), Err(ChronicleError::Refused(_))));
+        assert!(matches!(a.rollback_to_last_seal(), Err(ChronicleError::Fenced)));
+        assert!(e.layers.rolled_back.borrow().is_empty());
+    }
+
+    /// ZFS layers roll back with `zfs rollback` on the Seal's snapshot,
+    /// after checking its binding.
+    #[test]
+    fn zfs_layers_roll_back_with_zfs() {
+        struct Rec(Rc<RefCell<Vec<Vec<String>>>>, RefCell<Vec<crate::zfs::Output>>);
+        impl Runner for Rec {
+            fn run(&self, args: &[String]) -> Result<crate::zfs::Output, crate::zfs::ZfsError> {
+                self.0.borrow_mut().push(args.to_vec());
+                Ok(self.1.borrow_mut().remove(0))
+            }
+            fn run_input(&self, _: &[String], _: &mut dyn std::io::Read) -> Result<crate::zfs::Output, crate::zfs::ZfsError> {
+                unreachable!()
+            }
+        }
+        let ok = |stdout: &str| crate::zfs::Output { success: true, code: Some(0), stdout: stdout.into(), stderr: String::new() };
+        let ds = Dataset::new("tasotest/vessel/v").unwrap();
+        let name = ds.seal_snapshot(Lsn::new(4));
+        let h = HashVal::from_bytes([4; 32]);
+        let calls = Rc::new(RefCell::new(vec![]));
+        let rec = Rec(calls.clone(), RefCell::new(vec![ok(&format!("{name}\t845\t17\t{h}\n")), ok("")]));
+        let mut layers = ZfsLayers::new(Zfs::with_runner(rec), ds);
+        layers.rollback(Lsn::new(4), h).unwrap();
+        let calls = calls.borrow().clone();
+        assert_eq!(calls.last().unwrap(), &vec!["rollback".to_string(), name]);
+        assert_eq!(calls.len(), 2, "get, then rollback: {calls:?}");
+    }
+
+    /// A layer store without rollback says so; nothing pretends it worked.
+    #[test]
+    fn a_store_without_rollback_refuses() {
+        struct NoRollback;
+        impl Layers for NoRollback {
+            fn snapshot(&mut self, _: Lsn, _: HashVal) -> Result<(), LayerError> {
+                Ok(())
+            }
+            fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
+                Ok(vec![])
+            }
+            fn destroy(&mut self, _: Lsn) -> Result<(), LayerError> {
+                Ok(())
+            }
+        }
+        let e = NoRollback.rollback(Lsn::new(3), HashVal::from_bytes([3; 32])).unwrap_err();
+        assert!(e.to_string().contains("cannot roll back"), "{e}");
     }
 
     // ── layers that are not there ───────────────────────────────────

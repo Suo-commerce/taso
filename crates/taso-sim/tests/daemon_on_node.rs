@@ -2,9 +2,11 @@
 //! set TASO_ZFS_DATASET).  Two "nodes" share the coordinator, the store
 //! and the pool, each with its own root dataset and state directory:
 //!
-//! 1. node A: the Vessel is born, the agent runs 5 turns, each sealed and
-//!    published;
-//! 2. node A again: opened, the agent resumes after turn 5;
+//! 1. node A: the Vessel is born and takes its birth Seal, the agent runs
+//!    5 turns, each sealed and published (6 Seals published);
+//! 2. node A again, after a stray file was left in the dataset (what a
+//!    turn cut short by a crash leaves): opened, the state rolled back to
+//!    the last Seal (the file is gone), the agent resumes after turn 5;
 //! 3. node B, taking over: reborn from the store, the agent resumes after
 //!    turn 10 with the database as of the last Seal;
 //! 4. node A again, not taking over: refused.
@@ -66,12 +68,17 @@ fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool) -> Co
     Config::parse(&v.to_string()).unwrap()
 }
 
-fn stats(node: &Node) -> Value {
+fn mount(node: &Node) -> PathBuf {
     let id = node.config.vessels[0].id();
     let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     let ds = format!("{}/v-{hex}", node.config.root);
     let mount = Command::new("zfs").args(["get", "-H", "-o", "value", "mountpoint", &ds]).output().unwrap();
-    let mount = String::from_utf8(mount.stdout).unwrap();
+    PathBuf::from(String::from_utf8(mount.stdout).unwrap().trim())
+}
+
+fn stats(node: &Node) -> Value {
+    let mount = mount(node);
+    let mount = mount.to_str().unwrap();
     // The dataset belongs to this Vessel's own uid range (slot 3), on every node.
     let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(mount.trim()).unwrap());
     assert_eq!(Some(owner), node.config.vessels[0].host_uid(&node.config.runtime));
@@ -102,14 +109,24 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     println!("A, first: {r:?}\n{}", stats(&a));
     assert_eq!(r.start, Start::Birth);
     assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
-    assert_eq!((r.published, r.publish_failures, r.prune_failures.0), (5, 0, 0));
+    let birth = r.settled.birth.expect("a birth Seal");
+    assert_eq!(birth.lsn.get(), 2, "right after the Lineage record");
+    assert_eq!((r.settled.rolled_back_to, r.settled.last_seal), (Some(birth), Some(birth)));
+    assert_eq!((r.published, r.publish_failures, r.prune_failures.0), (6, 0, 0), "the birth Seal and 5 turns");
     let s = stats(&a);
     assert_eq!((s["turns"].clone(), s["sealed"].clone(), s["rows_in_db"].clone()), (json!([1, 5]), json!(5), json!(30)));
 
-    // 2. Reopened on A: resumes after turn 5.
+    // 2. Reopened on A after a crashed turn left a file behind: the state
+    //    is rolled back to the last Seal, then the agent resumes after turn 5.
+    let stray = mount(&a).join("stray-from-a-crashed-turn");
+    std::fs::write(&stray, b"written after the last Seal").unwrap();
     let r = a.run_vessel(&a.config.vessels[0]).unwrap();
     println!("A, again: {r:?}\n{}", stats(&a));
     assert_eq!(r.start, Start::Open);
+    assert!(!stray.exists(), "a file written after the last Seal is gone");
+    assert_eq!(r.settled.birth, None, "a birth Seal only once");
+    assert!(r.settled.rolled_back_to.is_some_and(|s| s.lsn.get() > 2), "{:?}", r.settled);
+    assert_eq!(r.settled.rolled_back_to, r.settled.last_seal);
     assert_eq!((r.published, r.publish_failures), (5, 0), "the last Seal was already published: no extra");
     let s = stats(&a);
     assert_eq!((s["resumed_after"].clone(), s["turns"].clone(), s["rows_in_db"].clone()), (json!(5), json!([6, 10]), json!(60)));
@@ -120,6 +137,9 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     println!("B, takeover: {r:?}\n{}", stats(&b));
     assert_eq!(r.start, Start::Rebirth);
     assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
+    assert_eq!(r.settled.birth, None);
+    assert!(r.settled.rolled_back_to.is_some());
+    assert_eq!(r.settled.rolled_back_to, r.settled.last_seal, "a reborn dataset is at its last Seal");
     let s = stats(&b);
     assert_eq!((s["resumed_after"].clone(), s["turns"].clone(), s["rows_in_db"].clone()), (json!(10), json!([11, 15]), json!(90)));
     assert_eq!(coord.ownership(a.config.vessels[0].id()).unwrap().holder.get(), 2);
