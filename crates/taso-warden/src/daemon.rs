@@ -17,7 +17,9 @@
 //!    publisher: no effect is sent before its authorization is shipped.
 //!    No adapters are registered yet (P3), so effect requests are refused.
 //! 4. **Field socket** at `<run_dir>/v-<id>/field.sock`, owned by the
-//!    Vessel's mapped root so the agent can connect.
+//!    Vessel's mapped root so the agent can connect.  Each Vessel has its
+//!    own host uid/gid range ([`VesselConf::uid_slot`]); the dataset's
+//!    top directory and the socket belong to it.
 //! 5. **runc**: a stale container of the same id (left by a killed
 //!    daemon) is deleted, then the agent runs in the foreground on its
 //!    own thread.
@@ -35,6 +37,12 @@
 //! can no longer record anything.)
 //!
 //! # Not yet
+//!
+//! - Forks and successions under another `uid_slot`: their dataset is a
+//!   clone of the parent's, so its files belong to the parent's range.
+//!   The daemon only births from the void today; a child in its own slot
+//!   needs its files moved into its range (a chown pass, or an idmapped
+//!   mount) before it runs.
 //!
 //! - A coordinator on another node: `remote` is a Unix socket, so across
 //!   nodes it is forwarded (e.g. `ssh -L local.sock:remote.sock`).
@@ -58,7 +66,7 @@ use crate::field::{serve, AfterSeal, FieldSocket, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
-use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, VesselSpec};
+use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, VesselSpec, ID_RANGE};
 use crate::segment::Position;
 use crate::s3::{S3Config, S3Store};
 use crate::ship::{LocalStore, SharedStore, ZfsSend};
@@ -103,6 +111,8 @@ pub enum StoreConf {
         access_key_id: String,
         /// A file holding the secret key (mode 0600 is the operator's job).
         secret_key_file: PathBuf,
+        /// For an `https://` endpoint: trust only this CA (PEM).
+        ca_file: Option<PathBuf>,
     },
 }
 
@@ -111,7 +121,7 @@ impl StoreConf {
     pub fn open(&self) -> std::io::Result<SharedStore> {
         Ok(match self {
             Self::Local(dir) => Arc::new(LocalStore::new(dir)),
-            Self::S3 { endpoint, region, bucket, access_key_id, secret_key_file } => {
+            Self::S3 { endpoint, region, bucket, access_key_id, secret_key_file, ca_file } => {
                 let secret = std::fs::read_to_string(secret_key_file)
                     .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", secret_key_file.display())))?;
                 Arc::new(S3Store::new(
@@ -121,6 +131,7 @@ impl StoreConf {
                         bucket: bucket.clone(),
                         access_key_id: access_key_id.clone(),
                         secret_key: secret.trim().to_string(),
+                        ca_file: ca_file.clone(),
                     },
                     Duration::from_secs(30),
                 )?)
@@ -134,7 +145,9 @@ impl StoreConf {
 pub struct RuntimeConf {
     /// The image's root filesystem (read-only).
     pub rootfs: PathBuf,
-    /// First host uid/gid of the Vessels' range.
+    /// First host uid/gid of the node's Vessel ranges: the Vessel in
+    /// slot `n` maps its uids 0..65536 to `host_uid_base + n·65536`
+    /// ([`VesselConf::uid_slot`]).
     pub host_uid_base: u32,
     /// The Landlock shim inside the rootfs, if used.
     pub landlock_shim: Option<String>,
@@ -157,12 +170,26 @@ pub struct VesselConf {
     pub subject: String,
     /// Take it over if another Warden holds it.
     pub takeover: bool,
+    /// Its host uid/gid range: slot `n` is
+    /// `host_uid_base + n·65536 ..+65536`.  No two Vessels on a node share
+    /// one, so one Vessel's processes cannot touch another's files or
+    /// signal its processes.  The dataset's files are owned by host ids
+    /// in this range and `zfs send` keeps them, so a Vessel keeps its slot
+    /// on every node it runs on.
+    pub uid_slot: u32,
 }
 
 impl VesselConf {
     /// The Vessel's id.
     pub fn id(&self) -> ChronicleId {
         vessel_id(self.namespace, self.subject.as_bytes())
+    }
+
+    /// The first host uid/gid of its range, if the range fits in a u32.
+    pub fn host_uid(&self, rt: &RuntimeConf) -> Option<u32> {
+        let base = self.uid_slot.checked_mul(ID_RANGE)?.checked_add(rt.host_uid_base)?;
+        base.checked_add(ID_RANGE - 1)?;
+        Some(base)
     }
 }
 
@@ -305,15 +332,26 @@ impl Config {
                         namespace: namespace(&string(x, "namespace")?)?,
                         subject: string(x, "subject")?,
                         takeover: bool_or(x, "takeover", false)?,
+                        uid_slot: u32::try_from(
+                            field(x, "uid_slot")?.as_u64().ok_or_else(|| bad("\"uid_slot\" must be an integer"))?,
+                        )
+                        .map_err(|_| bad("\"uid_slot\" is too large"))?,
                     })
                 })
                 .collect::<Result<Vec<_>, ConfigError>>()?,
             _ => return Err(bad("\"vessels\" must be an array")),
         };
         let mut ids = std::collections::BTreeSet::new();
+        let mut slots = std::collections::BTreeMap::new();
         for vc in &vessels {
             if !ids.insert(*vc.id().as_bytes()) {
                 return Err(bad(format!("vessel {:?} is listed twice", vc.subject)));
+            }
+            if vc.host_uid(&runtime).is_none() {
+                return Err(bad(format!("vessel {:?}: uid_slot {} does not fit above host_uid_base", vc.subject, vc.uid_slot)));
+            }
+            if let Some(other) = slots.insert(vc.uid_slot, vc.subject.clone()) {
+                return Err(bad(format!("vessels {other:?} and {:?} share uid_slot {}", vc.subject, vc.uid_slot)));
             }
         }
         let quiescence = strings(&v, "quiescence")?;
@@ -336,6 +374,7 @@ impl Config {
                         bucket: string(s, "bucket")?,
                         access_key_id: string(s, "access_key_id")?,
                         secret_key_file: abs_path(s, "secret_key_file")?,
+                        ca_file: if s.get("ca_file").is_some() { Some(abs_path(s, "ca_file")?) } else { None },
                     }
                 }
                 _ => return Err(bad("\"store\" must be a directory or {\"s3\": {...}}")),
@@ -459,7 +498,17 @@ pub struct SealPublisher {
     origin: Option<Snapshot>,
     /// Seals published.
     pub published: u64,
+    /// Segment files pruned after a publish.
+    pub pruned: u64,
+    /// Prunes that failed (the publish stood; the files stay for the next).
+    pub prune_failures: u64,
+    /// The last prune failure.
+    pub prune_error: Option<String>,
 }
+
+/// Closed segment files kept on local disk after a prune: the newest
+/// ones, for readers that start near the head.
+pub const KEEP_CLOSED: usize = 2;
 
 impl SealPublisher {
     /// Publish `seal` of `vessel`.
@@ -479,6 +528,15 @@ impl AfterSeal<ZfsLayers<Cli>> for SealPublisher {
     fn after_seal(&mut self, vessel: &mut Vessel<ZfsLayers<Cli>>, seal: Position) -> Result<(), String> {
         self.publish(vessel, seal)?;
         self.published += 1;
+        // What is shipped need not stay on local disk.  A failed prune
+        // leaves the files in place; the next publish tries again.
+        match vessel.prune(KEEP_CLOSED) {
+            Ok(p) => self.pruned += p.removed.len() as u64,
+            Err(e) => {
+                self.prune_failures += 1;
+                self.prune_error = Some(e.to_string());
+            }
+        }
         Ok(())
     }
 }
@@ -486,10 +544,8 @@ impl AfterSeal<ZfsLayers<Cli>> for SealPublisher {
 /// Whether the log already names a shipped `fs` section.
 fn has_fs_shipped(vessel: &Vessel<ZfsLayers<Cli>>) -> Result<bool, DaemonError> {
     let frames = vessel.chronicle().frames().map_err(|e| DaemonError::Io(format!("reading the log: {e}")))?;
-    Ok(frames.iter().any(|f| {
-        f.envelope.stream == taso_core::envelope::Stream::Ctl
-            && matches!(taso_core::record::Payload::decode(&f.payload), Ok(taso_core::record::Payload::FsShipped(_)))
-    }))
+    let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, e)| DaemonError::Io(format!("reading the log at lsn {}: {e}", lsn.get())))?;
+    Ok(summary.fs_shipped.is_some())
 }
 
 // ── Running a Vessel ────────────────────────────────────────────────
@@ -507,6 +563,10 @@ pub struct Report {
     pub published: u64,
     /// Publishes that failed (the Seal stood).
     pub publish_failures: u64,
+    /// Segment files pruned.
+    pub pruned: u64,
+    /// Prunes that failed, and the last reason.
+    pub prune_failures: (u64, Option<String>),
     /// Whether the agent exited successfully, and its stderr.
     pub agent: Option<(bool, String)>,
 }
@@ -638,7 +698,7 @@ impl Node {
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
         let mut publisher =
-            SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0 };
+            SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0, pruned: 0, prune_failures: 0, prune_error: None };
         // A crash between taking a Seal and publishing it: publish now.
         if let Some(seal) = vessel.last_seal() {
             if let Err(e) = publisher.publish(&mut vessel, seal) {
@@ -658,12 +718,13 @@ impl Node {
             .and_then(|i| i.mountpoint)
             .ok_or_else(|| DaemonError::Io(format!("{} is not mounted", vessel.dataset())))?;
         let rt = &self.config.runtime;
-        prepare_work_dir(&mount, rt.host_uid_base).map_err(io("preparing the dataset"))?;
+        let uid = vc.host_uid(rt).ok_or_else(|| DaemonError::Io(format!("uid_slot {} does not fit", vc.uid_slot)))?;
+        prepare_work_dir(&mount, uid).map_err(io("preparing the dataset"))?;
 
         let dir = self.config.run_dir.join(format!("v-{}", id_hex(id)));
         std::fs::create_dir_all(&dir).map_err(io("run dir"))?;
         let socket = FieldSocket::bind(dir.join("field.sock")).map_err(io("field socket"))?;
-        std::os::unix::fs::chown(socket.path(), Some(rt.host_uid_base), Some(rt.host_uid_base))
+        std::os::unix::fs::chown(socket.path(), Some(uid), Some(uid))
             .map_err(io("field socket owner"))?;
 
         let spec = VesselSpec {
@@ -671,7 +732,7 @@ impl Node {
             rootfs: rt.rootfs.clone(),
             work: mount.clone(),
             socket: socket.path().to_path_buf(),
-            host_uid_base: rt.host_uid_base,
+            host_uid_base: uid,
             args: rt.args.clone(),
             env: rt.env.clone(),
             landlock_shim: rt.landlock_shim.clone(),
@@ -729,7 +790,7 @@ impl Node {
         if let Some((ok, err)) = &agent {
             self.log(vc, format_args!("agent exited {}{}", if *ok { "ok" } else { "with failure: " }, if *ok { "" } else { err.trim() }));
         }
-        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, agent })
+        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, pruned: publisher.pruned, prune_failures: (publisher.prune_failures, publisher.prune_error.clone()), agent })
     }
 }
 
@@ -754,8 +815,8 @@ mod tests {
         },
         "quiescence": ["state.db"],
         "vessels": [
-            { "namespace": "01010101010101010101010101010101", "subject": "a" },
-            { "namespace": "01010101010101010101010101010101", "subject": "b", "takeover": true }
+            { "namespace": "01010101010101010101010101010101", "subject": "a", "uid_slot": 0 },
+            { "namespace": "01010101010101010101010101010101", "subject": "b", "takeover": true, "uid_slot": 7 }
         ]
     }"#;
 
@@ -774,6 +835,8 @@ mod tests {
         assert_eq!(c.vessels.len(), 2);
         assert_eq!(c.vessels[0].namespace, Namespace::from_bytes([1; 16]));
         assert!(!c.vessels[0].takeover && c.vessels[1].takeover);
+        let uids: Vec<_> = c.vessels.iter().map(|v| v.host_uid(&c.runtime)).collect();
+        assert_eq!(uids, vec![Some(200_000), Some(200_000 + 7 * 65_536)], "one 65536-id range per slot");
         assert_eq!(c.quiescence, vec!["state.db".to_string()]);
         assert_eq!(c.store, StoreConf::Local("/srv/taso/store".into()));
         let s3 = with(|v| {
@@ -790,6 +853,7 @@ mod tests {
                 bucket: "taso".into(),
                 access_key_id: "GK1".into(),
                 secret_key_file: "/etc/taso/s3.secret".into(),
+                ca_file: None,
             }
         );
     }
@@ -804,6 +868,7 @@ mod tests {
             bucket: "taso".into(),
             access_key_id: "GK1".into(),
             secret_key_file: file,
+            ca_file: None,
         };
         assert!(s3(dir.path().join("missing")).open().is_err(), "no secret file, no store");
         std::fs::write(dir.path().join("secret"), "s3cr3t\n").unwrap();
@@ -836,6 +901,17 @@ mod tests {
             ("db outside", Box::new(|v| v["quiescence"] = serde_json::json!(["../x.db"]))),
             ("takeover not bool", Box::new(|v| v["vessels"][0]["takeover"] = "yes".into())),
             ("huge uid base", Box::new(|v| v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) + 1).into())),
+            ("no uid slot", Box::new(|v| { v["vessels"][0].as_object_mut().unwrap().remove("uid_slot"); })),
+            ("uid slot not a number", Box::new(|v| v["vessels"][0]["uid_slot"] = "1".into())),
+            ("uid slot shared", Box::new(|v| v["vessels"][1]["uid_slot"] = 0.into())),
+            ("uid slot huge", Box::new(|v| v["vessels"][1]["uid_slot"] = (u64::from(u32::MAX) + 1).into())),
+            // 200000 + 65535·65536 overflows a u32; so does the end of the
+            // last range that would start below u32::MAX.
+            ("uid slot past u32", Box::new(|v| v["vessels"][1]["uid_slot"] = 65_535.into())),
+            ("range end past u32", Box::new(|v| {
+                v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) - 65_536).into();
+                v["vessels"][1]["uid_slot"] = 1.into();
+            })),
         ];
         for (name, edit) in cases {
             assert!(with(edit).is_err(), "{name} was accepted");

@@ -1008,8 +1008,17 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         for seg in segments.iter().rev() {
             let mut lsn = seg.tail().lsn;
             while lsn > seg.base().lsn {
-                if let Some(r) = seg.frame(lsn)?.as_ref().and_then(fs_shipped_of) {
-                    return Ok(Some(r));
+                if let Some(f) = seg.frame(lsn)? {
+                    if let Some(r) = fs_shipped_of(&f) {
+                        return Ok(Some(r));
+                    }
+                    // A Checkpoint stands for every record before it
+                    // (which may be pruned): its FsShipped is the newest.
+                    if f.envelope.stream == Stream::Ctl {
+                        if let Ok(Payload::Checkpoint(c)) = Payload::decode(&f.payload) {
+                            return Ok(c.fs_shipped);
+                        }
+                    }
                 }
                 lsn = Lsn::new(lsn.get() - 1);
             }

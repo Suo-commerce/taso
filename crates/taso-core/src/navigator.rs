@@ -29,6 +29,20 @@
 //! `Inconsistent` would refuse it.  [`Mode::AmbiguousOutcome`] is kept for
 //! evidence that contradicts itself.
 //!
+//! # Gaps (amendment 19)
+//!
+//! A log may skip records lost at a takeover: the records after the
+//! shipped anchor that the old holder accepted but never shipped.  The
+//! new holder writes a [`GapRecord`](crate::record::GapRecord) naming the
+//! last record kept and the last record lost, and the log jumps there.
+//! The chain accepts a jump only at such a record (on `ctl`, naming
+//! exactly the record before it and its own `prev`), as the Warden's
+//! segment joints do.  Nothing in a gap was the authorization of a sent
+//! effect (publish before send), so a Seal before the gap is judged as
+//! usual: an intent kept before the gap whose outcome was lost in it is
+//! [`Reason::MissingOutcome`] until reconciled.  A cut position or
+//! `ledger_pos` inside a gap is not present, so it is invalid.
+//!
 //! # Not produced by the P0 model
 //!
 //! [`Mode::StaleDependency`], [`Mode::Nondeterministic`],
@@ -220,11 +234,10 @@ pub fn navigate(
             AuthorityFault::HeadMismatch,
         )]);
     }
-    if let Some(fault) = check_chain(records, anchor.chronicle, head) {
-        return Navigation::Inconsistent(vec![Mode::IncompleteState(fault)]);
-    }
-    // check_chain confirmed the records reach the head.
-    let prefix = &records[..head.lsn.get() as usize];
+    let prefix = match check_chain(records, anchor.chronicle, head) {
+        Ok(n) => &records[..n],
+        Err(fault) => return Navigation::Inconsistent(vec![Mode::IncompleteState(fault)]),
+    };
 
     // Phase 2: the Seal.
     let Some((seal_env_epoch, s)) = find_seal(prefix, seal) else {
@@ -278,39 +291,58 @@ pub fn navigate(
 
 // ── Checks ─────────────────────────────────────────────────────────
 
-/// Verify every record through `head`: in sequence from lsn 1, same
-/// Chronicle, `prev` linked, hashes valid, ending exactly at the head.
+/// Verify every record through `head`: in sequence from lsn 1 (jumping
+/// only at a Gap record), same Chronicle, `prev` linked, hashes valid,
+/// ending exactly at the head.  Returns how many records that is.
 fn check_chain(
     records: &[Record],
     chronicle: ChronicleId,
     head: ChronicleHead,
-) -> Option<StateFault> {
-    let mut prev = HashVal::GENESIS;
-    for (i, r) in records.iter().enumerate() {
-        let expected = Lsn::new(i as u64 + 1);
-        if expected > head.lsn {
+) -> Result<usize, StateFault> {
+    let (mut tail_lsn, mut tail_hash) = (Lsn::new(0), HashVal::GENESIS);
+    let mut n = 0;
+    for r in records {
+        if tail_lsn >= head.lsn {
             break;
         }
-        if r.envelope.lsn != expected
-            || r.envelope.chronicle != chronicle
-            || r.envelope.prev != prev
-            || !r.verify()
-        {
-            return Some(StateFault::ChainBroken { lsn: expected });
+        let expected = tail_lsn.next();
+        let gap = match (&r.payload, r.envelope.stream) {
+            (Payload::Gap(g), Stream::Ctl) => Some(g),
+            (Payload::Gap(_), _) => return Err(StateFault::ChainBroken { lsn: expected }),
+            _ => None,
+        };
+        // A Gap record must jump from the record before it to its own
+        // `prev`; any other record follows on.
+        let linked = match gap {
+            Some(g) => {
+                g.kept == tail_lsn
+                    && g.kept_hash == tail_hash
+                    && g.resumes > tail_lsn
+                    && g.resumes.next() == r.envelope.lsn
+                    && g.resumes_hash == r.envelope.prev
+            }
+            None => r.envelope.lsn == expected && r.envelope.prev == tail_hash,
+        };
+        if !linked || r.envelope.chronicle != chronicle || !r.verify() {
+            return Err(StateFault::ChainBroken { lsn: expected });
         }
-        prev = r.envelope.hash;
+        (tail_lsn, tail_hash) = (r.envelope.lsn, r.envelope.hash);
+        n += 1;
     }
-    let reached = (records.len() as u64) >= head.lsn.get();
-    if !reached || prev != head.hash {
-        return Some(StateFault::HeadNotReached);
+    if tail_lsn != head.lsn || tail_hash != head.hash {
+        return Err(StateFault::HeadNotReached);
     }
-    None
+    Ok(n)
+}
+
+/// The record at `lsn`, if present (`prefix` is in lsn order).
+fn at(prefix: &[Record], lsn: Lsn) -> Option<&Record> {
+    prefix.binary_search_by_key(&lsn, |r| r.envelope.lsn).ok().map(|i| &prefix[i])
 }
 
 /// The Seal at `seal`, with the epoch it was written under.
 fn find_seal(prefix: &[Record], seal: Lsn) -> Option<(crate::envelope::Epoch, &SealRecord)> {
-    let i = seal.get().checked_sub(1)? as usize;
-    let r = prefix.get(i)?;
+    let r = at(prefix, seal)?;
     match &r.payload {
         Payload::Seal(s) => Some((r.envelope.epoch, s)),
         _ => None,
@@ -318,7 +350,7 @@ fn find_seal(prefix: &[Record], seal: Lsn) -> Option<(crate::envelope::Epoch, &S
 }
 
 /// True if a cut position or `ledger_pos` is invalid: it must be zero, or
-/// point at a record before the Seal on its own stream.
+/// point at a present record before the Seal on its own stream.
 fn check_cut(prefix: &[Record], seal: Lsn, s: &SealRecord) -> bool {
     let positions = [
         (Stream::Fs, s.cut.fs),
@@ -328,8 +360,7 @@ fn check_cut(prefix: &[Record], seal: Lsn, s: &SealRecord) -> bool {
     ];
     positions.iter().any(|&(stream, lsn)| {
         lsn.get() != 0
-            && (lsn >= seal
-                || prefix[lsn.get() as usize - 1].envelope.stream != stream)
+            && (lsn >= seal || at(prefix, lsn).is_none_or(|r| r.envelope.stream != stream))
     })
 }
 
@@ -498,7 +529,7 @@ mod tests {
     use crate::envelope::Epoch;
     use crate::model::{WardenId, WardenModel};
     use crate::record::{
-        Dispatch, GroupRecord, LayerRef, OutcomeRecord, RetryPolicy, TurnId,
+        Dispatch, GapRecord, GroupRecord, LayerRef, OutcomeRecord, RetryPolicy, TurnId,
     };
 
     fn cid() -> ChronicleId {
@@ -515,6 +546,8 @@ mod tests {
         last_seal: Option<HashVal>,
         turn: u64,
         keys: u64,
+        /// Records lost in gaps, as inclusive lsn ranges.
+        lost: Vec<(Lsn, Lsn)>,
     }
 
     impl Sim {
@@ -529,6 +562,7 @@ mod tests {
                 last_seal: None,
                 turn: 0,
                 keys: 0,
+                lost: Vec::new(),
             }
         }
 
@@ -596,6 +630,34 @@ mod tests {
             self.reconcile();
         }
 
+        /// Take over and lose every record after `keep`: the other Warden
+        /// fences, then writes a Gap record naming `keep` and the head.
+        /// Returns the Gap record's lsn.
+        fn gap(&mut self, keep: Lsn) -> Lsn {
+            let head = self.coord.head();
+            assert!(keep < head.lsn && !self.is_lost(keep));
+            let kept_hash =
+                if keep.get() == 0 { HashVal::GENESIS } else { self.coord.log()[keep.get() as usize - 1].envelope.hash };
+            let next = WardenId::new(if self.warden_id.get() == 1 { 2 } else { 1 });
+            let epoch = self.coord.transfer(next);
+            self.warden = WardenModel::resume(next, cid(), epoch, head, head.lsn.next());
+            self.warden_id = next;
+            self.lost.push((keep.next(), head.lsn));
+            self.append(
+                Stream::Ctl,
+                Payload::Gap(GapRecord { kept: keep, kept_hash, resumes: head.lsn, resumes_hash: head.hash }),
+            )
+        }
+
+        fn is_lost(&self, lsn: Lsn) -> bool {
+            self.lost.iter().any(|&(from, to)| from <= lsn && lsn <= to)
+        }
+
+        /// The log as the new holder has it: without the lost records.
+        fn records(&self) -> Vec<Record> {
+            self.coord.log().iter().filter(|r| !self.is_lost(r.envelope.lsn)).cloned().collect()
+        }
+
         /// One fs write and its group record.
         fn fs_group(&mut self, gid: u64, depends_on: Vec<GroupId>, commit: bool) {
             let lsn = self.append(Stream::Fs, Payload::Raw(b"fs-write".to_vec()));
@@ -619,7 +681,7 @@ mod tests {
         fn seal_with(&mut self, verdict: Verdict) -> Lsn {
             let mut cut = StreamCut::EMPTY;
             let mut ledger_pos = Lsn::new(0);
-            for r in self.coord.log() {
+            for r in self.records() {
                 let l = r.envelope.lsn;
                 match r.envelope.stream {
                     Stream::Fs => cut.fs = l,
@@ -647,7 +709,7 @@ mod tests {
         }
 
         fn nav(&self, seal: Lsn) -> Navigation {
-            self.nav_records(self.coord.log(), seal)
+            self.nav_records(&self.records(), seal)
         }
 
         fn nav_records(&self, records: &[Record], seal: Lsn) -> Navigation {
@@ -950,6 +1012,164 @@ mod tests {
         assert_eq!(sim.nav(s), Navigation::Consistent(vec![suppress(op, 1)]));
     }
 
+    // ── Gaps (amendment 19) ───────────────────────────────────────
+
+    fn transcript(sim: &mut Sim) -> Lsn {
+        sim.append(Stream::Transcript, Payload::Raw(b"t".to_vec()))
+    }
+
+    fn chain_broken(lsn: u64) -> Navigation {
+        Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::ChainBroken { lsn: Lsn::new(lsn) })])
+    }
+
+    /// The Seal before the gap is judged as if there were none; the log
+    /// with the lost records still in it does not chain to the Gap.
+    #[test]
+    fn seal_before_a_gap_stays_consistent() {
+        let mut sim = Sim::new();
+        transcript(&mut sim);
+        let s = sim.seal();
+        transcript(&mut sim);
+        transcript(&mut sim);
+        let g = sim.gap(s);
+        assert_eq!(sim.nav(s), Navigation::Consistent(vec![]));
+        assert_eq!(sim.nav_records(sim.coord.log(), s), chain_broken(g.get()), "the Gap names a record that is not before it");
+    }
+
+    /// An effect authorized before the gap whose outcome was lost in it
+    /// is a missing outcome until the new holder records one.
+    #[test]
+    fn outcome_lost_in_a_gap_is_missing_until_reconciled() {
+        let mut sim = Sim::new();
+        let s = sim.seal();
+        let op = sim.mail(None);
+        assert_eq!(sim.provider.effect_count(op), 1);
+        let auth = sim
+            .coord
+            .log()
+            .iter()
+            .rev()
+            .find(|r| matches!(&r.payload, Payload::Outcome(o) if o.state == OutcomeState::DispatchAuthorized))
+            .unwrap()
+            .envelope
+            .lsn;
+        assert!(auth < sim.coord.head().lsn, "the applied outcome comes after the authorization");
+        sim.gap(auth);
+        assert_eq!(sim.nav(s), Navigation::Insufficient(vec![Reason::MissingOutcome(op)]));
+        sim.append(Stream::Effect, outcome(op.get(), OutcomeState::ConfirmedApplied));
+        assert_eq!(sim.nav(s), Navigation::Consistent(vec![suppress(op, 1)]));
+    }
+
+    /// The first Seal after a gap cuts only what is present.  Unverified,
+    /// as the Warden writes it, it is insufficient; a cut into the gap is
+    /// invalid.
+    #[test]
+    fn seals_after_a_gap() {
+        let mut sim = Sim::new();
+        let keep = transcript(&mut sim);
+        let lost = transcript(&mut sim);
+        sim.gap(keep);
+        let after = sim.seal_with(Verdict::Unverified("after a gap".into()));
+        assert_eq!(
+            sim.nav(after),
+            Navigation::Insufficient(vec![Reason::MissingVerification("after a gap".into())]),
+        );
+
+        // A Seal whose transcript cut names the lost record.
+        let rec = SealRecord {
+            parent: None,
+            cut: StreamCut { transcript: lost, ..StreamCut::EMPTY },
+            layer: LayerRef::new(99),
+            verdict: Verdict::Clean,
+            ledger_pos: Lsn::new(0),
+            turn: TurnId::new(99),
+        };
+        let bad = sim.append(Stream::Ctl, Payload::Seal(rec));
+        assert_eq!(sim.nav(bad), Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::CutInvalid)]));
+    }
+
+    /// Everything lost: the Gap keeps genesis.
+    #[test]
+    fn gap_from_genesis() {
+        let mut sim = Sim::new();
+        transcript(&mut sim);
+        sim.seal();
+        sim.gap(Lsn::new(0));
+        let s = sim.seal();
+        assert_eq!(sim.nav(s), Navigation::Consistent(vec![]));
+        assert_eq!(sim.records().len(), 2);
+    }
+
+    /// The jump is accepted only at a Gap record on `ctl` that names the
+    /// record before it and its own `prev`.
+    #[test]
+    fn a_jump_needs_its_gap_record() {
+        let mut sim = Sim::new();
+        let keep = transcript(&mut sim);
+        transcript(&mut sim);
+        transcript(&mut sim);
+        let g = sim.gap(keep);
+        let s = sim.seal();
+        let good = sim.records();
+        assert_eq!(sim.nav_records(&good, s), Navigation::Consistent(vec![]));
+        let anchor = Anchor::of(&sim.coord);
+        let head = sim.coord.head();
+        let gi = good.iter().position(|r| r.envelope.lsn == g).unwrap();
+
+        // No Gap record: the records after it no longer chain.
+        let mut skipped = good.clone();
+        skipped.remove(gi);
+        assert_eq!(navigate(&skipped, &anchor, s, head), chain_broken(keep.get() + 1));
+
+        // A Gap record that names the wrong ends, re-hashed so only the
+        // naming is wrong (the records after it no longer link to it, but
+        // the jump is refused first).
+        let wrong = |f: &dyn Fn(&mut GapRecord), stream: Stream| {
+            let mut copy = good.clone();
+            let r = &mut copy[gi];
+            let Payload::Gap(mut gr) = r.payload.clone() else { unreachable!() };
+            f(&mut gr);
+            let e = &r.envelope;
+            let fixed = Record::new(e.chronicle, e.branch, e.epoch, stream, e.lsn, e.prev, Payload::Gap(gr));
+            *r = fixed;
+            navigate(&copy, &anchor, s, head)
+        };
+        assert_eq!(wrong(&|g| g.kept = Lsn::new(0), Stream::Ctl), chain_broken(keep.get() + 1));
+        assert_eq!(wrong(&|g| g.kept_hash = HashVal::GENESIS, Stream::Ctl), chain_broken(keep.get() + 1));
+        assert_eq!(wrong(&|g| g.resumes = g.resumes.next(), Stream::Ctl), chain_broken(keep.get() + 1));
+        assert_eq!(wrong(&|g| g.resumes_hash = HashVal::GENESIS, Stream::Ctl), chain_broken(keep.get() + 1));
+        assert_eq!(wrong(&|_| {}, Stream::Transcript), chain_broken(keep.get() + 1));
+
+        // A Gap record that does not jump is refused too.
+        let mut sim = Sim::new();
+        let t = transcript(&mut sim);
+        let h = sim.coord.head();
+        sim.append(Stream::Ctl, Payload::Gap(GapRecord { kept: t, kept_hash: h.hash, resumes: t, resumes_hash: h.hash }));
+        let s = sim.seal();
+        assert_eq!(sim.nav(s), chain_broken(t.get() + 1));
+
+        // Nor is one on another stream, even in sequence.
+        let mut sim = Sim::new();
+        let t = transcript(&mut sim);
+        let h = sim.coord.head();
+        sim.append(Stream::Transcript, Payload::Gap(GapRecord { kept: t, kept_hash: h.hash, resumes: t, resumes_hash: h.hash }));
+        let s = sim.seal();
+        assert_eq!(sim.nav(s), chain_broken(t.get() + 1));
+    }
+
+    /// Records after the anchored head are not read.
+    #[test]
+    fn records_past_the_head_are_ignored() {
+        let mut sim = Sim::new();
+        let s = sim.seal();
+        let mut anchor = Anchor::of(&sim.coord);
+        let head = anchor.head;
+        let _ = sim.mail(None);
+        anchor.ownership = sim.coord.ownership().clone();
+        assert!(sim.coord.head().lsn > head.lsn);
+        assert_eq!(navigate(sim.coord.log(), &anchor, s, head), Navigation::Consistent(vec![]));
+    }
+
     // ── Soundness ──────────────────────────────────────────────────
 
     mod prop {
@@ -963,6 +1183,9 @@ mod tests {
             Seal,
             Reconcile,
             Rebirth,
+            /// A rebirth that loses up to this many records off the end
+            /// of the log, none of them on the effect stream.
+            Gap(u8),
             State,
         }
 
@@ -985,6 +1208,7 @@ mod tests {
                 3 => Just(Step::Seal),
                 1 => Just(Step::Reconcile),
                 1 => Just(Step::Rebirth),
+                1 => (1u8..6).prop_map(Step::Gap),
                 2 => Just(Step::State),
             ]
         }
@@ -1044,6 +1268,23 @@ mod tests {
                             resolve(&mut pending, &mut known);
                         }
                         Step::Rebirth => {
+                            sim.rebirth();
+                            resolve(&mut pending, &mut known);
+                        }
+                        Step::Gap(n) => {
+                            // Never past an effect record or an earlier Gap.
+                            let floor = sim
+                                .records()
+                                .iter()
+                                .rev()
+                                .find(|r| r.envelope.stream == Stream::Effect || matches!(r.payload, Payload::Gap(_)))
+                                .map_or(0, |r| r.envelope.lsn.get());
+                            let head = sim.coord.head().lsn.get();
+                            let keep = head.saturating_sub(u64::from(*n)).max(floor);
+                            if keep < head {
+                                sim.gap(Lsn::new(keep));
+                                seals.retain(|(l, _)| !sim.is_lost(*l));
+                            }
                             sim.rebirth();
                             resolve(&mut pending, &mut known);
                         }

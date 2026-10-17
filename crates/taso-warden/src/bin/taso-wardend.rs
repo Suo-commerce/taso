@@ -78,14 +78,17 @@ fn main() -> ExitCode {
         match h.join() {
             Ok((_, Ok(r))) => {
                 let agent_ok = r.agent.as_ref().is_some_and(|(ok, _)| *ok);
-                ok &= agent_ok && r.publish_failures == 0;
+                ok &= agent_ok && r.publish_failures == 0 && r.prune_failures.0 == 0;
                 println!(
-                    "{}: {:?}, {} connections, {} Seals published, {} publish failures, agent {}",
+                    "{}: {:?}, {} connections, {} Seals published, {} publish failures, {} segments pruned, {} prune failures{}, agent {}",
                     r.subject,
                     r.start,
                     r.connections,
                     r.published,
                     r.publish_failures,
+                    r.pruned,
+                    r.prune_failures.0,
+                    r.prune_failures.1.as_deref().map(|e| format!(" (last: {e})")).unwrap_or_default(),
                     if agent_ok { "ok" } else { "failed" }
                 );
             }

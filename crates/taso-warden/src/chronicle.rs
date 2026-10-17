@@ -77,6 +77,10 @@ use crate::zfs::{Cli, Dataset, Runner, Zfs};
 /// File name of the first segment of a Chronicle (base lsn 0).
 const SEGMENT_FILE: &str = "seg-00000000000000000000";
 
+/// A segment past this many bytes is closed, and the next append starts
+/// a new one at the tail ([`Chronicle::set_roll_at`] changes it).
+pub const SEGMENT_MAX: u64 = 64 << 20;
+
 /// Prefix of every segment file name: `seg-<base lsn, 20 digits>`.
 const SEGMENT_PREFIX: &str = "seg-";
 
@@ -202,6 +206,15 @@ pub enum ChronicleError {
         /// The anchored head the continuation starts at.
         head: Lsn,
     },
+    /// A local record's payload does not decode.
+    Decode {
+        /// The record.
+        lsn: Lsn,
+        /// Why.
+        error: taso_core::decode::DecodeError,
+    },
+    /// A Checkpoint needs the Lineage record, and this log has none.
+    NoLineage,
 }
 
 impl fmt::Display for ChronicleError {
@@ -225,6 +238,8 @@ impl fmt::Display for ChronicleError {
                 write!(f, "the segment at lsn {} does not join the one before: {why}", at.get())
             }
             Self::StateExists(p) => write!(f, "{} already exists", p.display()),
+            Self::Decode { lsn, error } => write!(f, "record at lsn {} does not decode: {error}", lsn.get()),
+            Self::NoLineage => write!(f, "the log has no Lineage record to checkpoint"),
             Self::GapPending { kept, head } => write!(
                 f,
                 "a takeover after a gap ({}..={}) was interrupted; open_after_gap finishes it",
@@ -275,6 +290,15 @@ pub struct Recovery {
     pub gap: Option<(Position, Position)>,
 }
 
+/// What [`Chronicle::prune`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pruned {
+    /// The Checkpoint record written, if anything was pruned.
+    pub checkpoint: Option<Position>,
+    /// The segment files removed, oldest first.
+    pub removed: Vec<PathBuf>,
+}
+
 /// A Seal that was taken and accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sealed {
@@ -308,6 +332,8 @@ pub struct Chronicle<L: Layers> {
     /// Accepted Seals whose layer was not there at open.
     missing_layers: HashSet<Lsn>,
     health: Health,
+    /// Roll to a new segment once the current one has this many bytes.
+    roll_at: u64,
     _lock: File,
 }
 
@@ -409,7 +435,31 @@ impl<L: Layers> Chronicle<L> {
                 return Err(ChronicleError::SegmentsDisagree { at: seg.base().lsn, why: "another Chronicle's segment" });
             }
         }
-        let pending = check_joints(&closed, &segment)?;
+        // Older segments may have been pruned: then the first one starts
+        // after genesis, at or below the shipped anchor (only shipped
+        // records are pruned), and a Checkpoint in what is left stands for
+        // what is gone.
+        let first_base = closed.first().unwrap_or(&segment).base();
+        let pruned = first_base != Position::GENESIS;
+        if pruned {
+            let shipped = coord.shipped(id).map_err(ChronicleError::Coord)?;
+            if first_base.lsn > shipped.lsn {
+                return Err(ChronicleError::SegmentsDisagree {
+                    at: first_base.lsn,
+                    why: "the first segment starts after genesis, past what was shipped",
+                });
+            }
+            let has_checkpoint = closed.iter().chain(std::iter::once(&segment)).try_fold(false, |found, seg| {
+                Ok::<bool, ChronicleError>(found || seg.frames()?.iter().any(is_checkpoint))
+            })?;
+            if !has_checkpoint {
+                return Err(ChronicleError::SegmentsDisagree {
+                    at: first_base.lsn,
+                    why: "the first segment starts after genesis and no Checkpoint stands for what is gone",
+                });
+            }
+        }
+        let pending = check_joints(&closed, &segment, pruned)?;
 
         let mut chronicle = Self {
             id,
@@ -422,6 +472,7 @@ impl<L: Layers> Chronicle<L> {
             last_seal: None,
             missing_layers: HashSet::new(),
             health: Health::Live,
+            roll_at: SEGMENT_MAX,
             _lock: lock,
         };
         let mut gap = None;
@@ -446,14 +497,23 @@ impl<L: Layers> Chronicle<L> {
             gap = Some((kept, resumes));
         }
 
-        // Accepted Seal records, in lsn order, across every segment (which
-        // together start at genesis: check_joints).
-        let seals: Vec<Position> = chronicle
-            .frames()?
-            .into_iter()
+        // Accepted Seal records, in lsn order, across every local segment;
+        // if older segments were pruned, the last Seal before the newest
+        // Checkpoint comes from it.
+        let frames = chronicle.frames()?;
+        let local_from = frames.first().map_or(Lsn::new(1), |f| f.envelope.lsn);
+        let mut seals: Vec<Position> = frames
+            .iter()
             .filter(|f| f.envelope.stream == Stream::Ctl && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_))))
             .map(|f| Position { lsn: f.envelope.lsn, hash: f.envelope.hash })
             .collect();
+        let summary =
+            crate::summary::Summary::of(&frames).map_err(|(lsn, error)| ChronicleError::Decode { lsn, error })?;
+        if let Some(cs) = summary.seal {
+            if !seals.iter().any(|p| p.lsn == cs.lsn) {
+                seals.insert(0, Position { lsn: cs.lsn, hash: cs.hash });
+            }
+        }
         let by_lsn: HashMap<Lsn, HashVal> = seals.iter().map(|p| (p.lsn, p.hash)).collect();
 
         let mut orphan_layers = Vec::new();
@@ -464,6 +524,9 @@ impl<L: Layers> Chronicle<L> {
         for (lsn, hash) in chronicle.layers.list().map_err(ChronicleError::Layer)? {
             if by_lsn.get(&lsn) == Some(&hash) {
                 present.insert(lsn);
+            } else if lsn < local_from {
+                // Its record was pruned with its segment; it was judged
+                // when it was taken.  Kept, not judged again.
             } else {
                 chronicle.layers.destroy(lsn).map_err(ChronicleError::Layer)?;
                 orphan_layers.push(lsn);
@@ -644,12 +707,79 @@ impl<L: Layers> Chronicle<L> {
         &self.layers
     }
 
+    /// Remove the oldest local segment files that are no longer needed
+    /// here, keeping the newest `keep_closed` closed ones (decision 1,
+    /// 2026-10-16).
+    ///
+    /// A closed segment may go only when every record in it is at or
+    /// below the shipped anchor: it is in the store, and a rebirth reads it
+    /// from there.  Before any file goes, a Checkpoint record is appended
+    /// and accepted: it carries what the readers need from the records
+    /// before it ([`crate::summary`]), so they read from it instead.  Files
+    /// are removed oldest first, so what is left is always a contiguous
+    /// suffix of the log, which [`Chronicle::open`] accepts.  A crash
+    /// anywhere leaves either nothing removed or a suffix with its
+    /// Checkpoint.  Nothing to remove: nothing is written.
+    pub fn prune(&mut self, keep_closed: usize) -> Result<Pruned, ChronicleError> {
+        self.ready()?;
+        if self.closed.len() <= keep_closed {
+            return Ok(Pruned::default());
+        }
+        let shipped = self.coord.shipped(self.id).map_err(ChronicleError::Coord)?;
+        let removable = |closed: &[Segment]| {
+            closed[..closed.len().saturating_sub(keep_closed)].iter().take_while(|seg| seg.tail().lsn <= shipped.lsn).count()
+        };
+        if removable(&self.closed) == 0 {
+            return Ok(Pruned::default());
+        }
+        let summary = crate::summary::Summary::of(&self.frames()?)
+            .map_err(|(lsn, error)| ChronicleError::Decode { lsn, error })?;
+        let checkpoint = summary.checkpoint().ok_or(ChronicleError::NoLineage)?;
+        let head = self.append(Stream::Ctl, Payload::Checkpoint(Box::new(checkpoint)))?;
+        // Counted again: the Checkpoint's own append may have rolled.
+        let n = removable(&self.closed);
+        let mut removed = Vec::with_capacity(n);
+        for _ in 0..n {
+            let path = self.closed[0].path().to_path_buf();
+            std::fs::remove_file(&path).map_err(|e| ChronicleError::Segment(SegmentError::Io(e)))?;
+            self.closed.remove(0);
+            removed.push(path);
+        }
+        if let Some(dir) = removed.last().and_then(|p| p.parent()) {
+            File::open(dir).and_then(|d| d.sync_all()).map_err(|e| ChronicleError::Segment(SegmentError::Io(e)))?;
+        }
+        Ok(Pruned { checkpoint: Some(Position { lsn: head.lsn, hash: head.hash }), removed })
+    }
+
+    /// Roll to a new segment file once the current one reaches `bytes`
+    /// (default [`SEGMENT_MAX`]).
+    pub fn set_roll_at(&mut self, bytes: u64) {
+        self.roll_at = bytes.max(1);
+    }
+
     /// True once ownership was lost.
     pub fn is_fenced(&self) -> bool {
         self.health == Health::Fenced
     }
 
     // ── internals ───────────────────────────────────────────────────
+
+    /// Close a full segment and start the next at its tail.  Only called
+    /// while live, so every frame in the old file is accepted: it opens
+    /// later as a complete closed segment, and the new one joins it end to
+    /// start.  A crash right after the new file is created leaves an empty
+    /// newest segment based at the head, which opens as usual.
+    fn roll_if_full(&mut self) -> Result<(), ChronicleError> {
+        if self.segment.is_empty() || self.segment.bytes() < self.roll_at {
+            return Ok(());
+        }
+        let tail = self.segment.tail();
+        let dir = self.segment.path().parent().map(Path::to_path_buf).unwrap_or_default();
+        let next = Segment::create(dir.join(segment_name(tail.lsn)), self.id, tail)?;
+        let old = std::mem::replace(&mut self.segment, next);
+        self.closed.push(old);
+        Ok(())
+    }
 
     fn ready(&self) -> Result<(), ChronicleError> {
         match self.health {
@@ -674,6 +804,7 @@ impl<L: Layers> Chronicle<L> {
     /// fsync, one CAS for all of them.  On refusal every one is cut.
     fn commit_all(&mut self, recs: &[Record]) -> Result<ChronicleHead, ChronicleError> {
         let _t = crate::timing::span("append.total");
+        self.roll_if_full()?;
         let before = self.segment.tail();
         let payloads: Vec<Vec<u8>> = recs.iter().map(|r| r.payload.canon_bytes()).collect();
         let frames: Vec<(&Envelope, &[u8])> =
@@ -820,17 +951,24 @@ fn list_segments(dir: &Path) -> Result<Vec<PathBuf>, ChronicleError> {
     Ok(found.into_iter().map(|(_, p)| p).collect())
 }
 
-/// Check that the segments form one chain.  The first starts at genesis;
+/// Whether a frame is a Checkpoint record.
+fn is_checkpoint(f: &Frame) -> bool {
+    f.envelope.stream == Stream::Ctl && matches!(Payload::decode(&f.payload), Ok(Payload::Checkpoint(_)))
+}
+
+/// Check that the segments form one chain.  The first starts at genesis
+/// (or, `pruned`, wherever the oldest kept segment starts: the caller
+/// checked that a Checkpoint stands for what is gone);
 /// each later one either starts where the one before ends, or starts
 /// further on (at the anchored head of a takeover after a gap) and opens
 /// with a Gap record naming exactly both ends.
 ///
 /// Returns the kept position if the newest segment is such a continuation
 /// whose Gap record is not written yet.
-fn check_joints(closed: &[Segment], newest: &Segment) -> Result<Option<Position>, ChronicleError> {
+fn check_joints(closed: &[Segment], newest: &Segment, pruned: bool) -> Result<Option<Position>, ChronicleError> {
     let disagree = |at: Lsn, why| ChronicleError::SegmentsDisagree { at, why };
     let first = closed.first().unwrap_or(newest);
-    if first.base() != Position::GENESIS {
+    if first.base() != Position::GENESIS && !pruned {
         return Err(disagree(first.base().lsn, "the first segment does not start at genesis"));
     }
     let mut pending = None;
@@ -951,6 +1089,231 @@ mod tests {
 
     fn seal<L: Layers>(c: &mut Chronicle<L>, turn: u64) -> Result<Sealed, ChronicleError> {
         c.seal(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(turn))
+    }
+
+    // ── rolling ─────────────────────────────────────────────────────
+
+    /// A full segment is closed and the next starts at its tail: one log
+    /// across many files, reopened whole, with a Seal found in a closed
+    /// file and appends continuing.
+    #[test]
+    fn full_segments_roll_and_reopen_whole() {
+        let e = env();
+        let mut c = e.create();
+        // Lineage-sized frames: roll after every second record or so.
+        c.set_roll_at(crate::segment::HEADER_LEN + 300);
+        for n in 0..9 {
+            c.append(Stream::Fs, raw(n)).unwrap();
+        }
+        let sealed = seal(&mut c, 1).unwrap();
+        c.append(Stream::Fs, raw(99)).unwrap();
+        let files = list_segments(&e.dir).unwrap();
+        assert!(files.len() >= 4, "{} files", files.len());
+        assert_eq!(lsns(&c), (1..=11).collect::<Vec<_>>());
+        // Every file starts where the one before ends.
+        for pair in c.segments().windows(2) {
+            assert_eq!(pair[0].tail(), pair[1].base());
+        }
+        drop(c);
+
+        let (mut c, r) = e.open(A);
+        assert_eq!(r.last_seal, Some(sealed.seal));
+        assert_eq!((r.segment.unaccepted_frames, r.gap), (0, None));
+        assert_eq!(lsns(&c), (1..=11).collect::<Vec<_>>());
+        assert_eq!(c.frame(Lsn::new(3)).unwrap().unwrap().envelope.lsn, Lsn::new(3), "read from a closed file");
+        c.append(Stream::Fs, raw(100)).unwrap();
+        assert_eq!(c.tail().lsn, Lsn::new(12));
+        // The default never rolls a small log.
+        drop(c);
+        let (mut c, _) = e.open(A);
+        let n = list_segments(&e.dir).unwrap().len();
+        c.set_roll_at(SEGMENT_MAX);
+        c.append(Stream::Fs, raw(101)).unwrap();
+        assert_eq!(list_segments(&e.dir).unwrap().len(), n);
+    }
+
+    /// A roll whose first append is refused leaves an empty newest file
+    /// based at the head (the crash case too): it opens, and the next
+    /// holder writes into it.
+    #[test]
+    fn an_empty_rolled_segment_opens_at_the_head() {
+        let e = env();
+        let mut a = e.create();
+        a.append(Stream::Fs, raw(1)).unwrap();
+        a.set_roll_at(1);
+        // Another incarnation takes over: A's next append rolls, then is refused.
+        e.coord.transfer(cid(), B).unwrap();
+        assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
+        let files = list_segments(&e.dir).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].file_name().unwrap().to_str().unwrap(), segment_name(Lsn::new(1)), "named after its base: the tail it starts at");
+        assert!(a.segment().is_empty());
+        drop(a);
+        let (mut b, r) = e.open(B);
+        assert_eq!(r.segment.unaccepted_frames, 0);
+        // Rolling at every append, but an empty file is written, not rolled.
+        b.set_roll_at(1);
+        b.append(Stream::Fs, raw(3)).unwrap();
+        assert_eq!(lsns(&b), vec![1, 2], "A's refused record was cut; B's is lsn 2");
+        assert_eq!(b.segments().len(), 2, "written into the empty file, not past it");
+        b.append(Stream::Fs, raw(4)).unwrap();
+        b.append(Stream::Fs, raw(5)).unwrap();
+        assert_eq!(lsns(&b), vec![1, 2, 3, 4]);
+        assert_eq!(b.segments().len(), 4);
+    }
+
+    // ── pruning ─────────────────────────────────────────────────────
+
+    fn lineage() -> Payload {
+        Payload::Lineage(taso_core::record::LineageRecord {
+            origin: taso_core::record::Origin::Void,
+            namespace: taso_core::record::Namespace::from_bytes([1; 16]),
+            ledger_pos: Lsn::new(0),
+        })
+    }
+
+    /// A Chronicle with a Lineage and many small segments: `n` records,
+    /// a Seal at the third.
+    fn rolled(e: &Env, n: u8) -> (Chronicle<FakeLayers>, Sealed) {
+        let mut c = e.create();
+        c.append(Stream::Ctl, lineage()).unwrap();
+        c.append(Stream::Fs, raw(0)).unwrap();
+        let sealed = seal(&mut c, 1).unwrap();
+        c.set_roll_at(crate::segment::HEADER_LEN + 200);
+        for i in 0..n {
+            c.append(Stream::Fs, raw(i)).unwrap();
+        }
+        (c, sealed)
+    }
+
+    fn ship_to_tail(e: &Env, c: &Chronicle<FakeLayers>) {
+        e.coord.advance_shipped(A, cid(), c.epoch(), c.tail()).unwrap();
+    }
+
+    /// Nothing shipped: nothing pruned and nothing written.  Shipped:
+    /// the oldest closed files go, the newest `keep` stay, a Checkpoint
+    /// is accepted first, and the log reopens from what is left with its
+    /// last Seal (whose record is gone) still known.
+    #[test]
+    fn prune_removes_only_shipped_segments_after_a_checkpoint() {
+        let e = env();
+        let (mut c, sealed) = rolled(&e, 12);
+        let files = list_segments(&e.dir).unwrap().len();
+        assert!(files >= 6, "{files}");
+        let tail = c.tail();
+        assert_eq!(c.prune(2).unwrap(), Pruned::default(), "nothing shipped");
+        assert_eq!(c.tail(), tail, "no Checkpoint written");
+
+        // Ship half of it: only files wholly at or below the anchor go.
+        let half = c.segments()[files / 2].tail();
+        e.coord.advance_shipped(A, cid(), c.epoch(), half).unwrap();
+        let p = c.prune(2).unwrap();
+        assert!(!p.removed.is_empty());
+        assert_eq!(list_segments(&e.dir).unwrap().len(), c.segments().len(), "the files are the segments");
+        for gone in &p.removed {
+            assert!(!gone.exists());
+        }
+        assert!(c.segments()[0].base().lsn <= half.lsn, "nothing past the anchor went");
+        let cp = p.checkpoint.unwrap();
+        assert_eq!(cp.lsn, tail.lsn.next(), "the Checkpoint is the next record");
+
+        // Everything shipped: prune down to 2 closed files.
+        ship_to_tail(&e, &c);
+        c.prune(2).unwrap();
+        assert_eq!(c.segments().len(), 3);
+        let first_kept = c.segments()[0].base().lsn;
+        assert!(first_kept > sealed.seal.lsn, "the Seal's record is gone");
+        let lsns_before = lsns(&c);
+        drop(c);
+
+        let (mut c, r) = e.open(A);
+        assert_eq!(lsns(&c), lsns_before);
+        assert_eq!(r.last_seal, Some(sealed.seal), "known from the Checkpoint");
+        assert!(r.missing_layers.is_empty() && r.orphan_layers.is_empty(), "{r:?}");
+        assert!(e.layers.snaps().iter().any(|(l, _)| *l == sealed.seal.lsn), "its layer is kept");
+        c.append(Stream::Fs, raw(200)).unwrap();
+        let s2 = seal(&mut c, 2).unwrap();
+        drop(c);
+        let (_, r) = e.open(A);
+        assert_eq!(r.last_seal, Some(s2.seal));
+    }
+
+    /// Layers of Seals older than the summarised one, whose records went
+    /// with their segment, are kept at open: not orphans.
+    #[test]
+    fn layers_of_pruned_seals_are_kept() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Ctl, lineage()).unwrap();
+        c.append(Stream::Fs, raw(0)).unwrap();
+        let first = seal(&mut c, 1).unwrap();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        let second = seal(&mut c, 2).unwrap();
+        c.set_roll_at(crate::segment::HEADER_LEN + 200);
+        for i in 0..8 {
+            c.append(Stream::Fs, raw(i)).unwrap();
+        }
+        ship_to_tail(&e, &c);
+        c.prune(1).unwrap();
+        assert!(c.segments()[0].base().lsn > second.seal.lsn, "both Seal records are gone");
+        drop(c);
+
+        let (_, r) = e.open(A);
+        assert_eq!(r.last_seal, Some(second.seal));
+        assert!(r.orphan_layers.is_empty(), "{r:?}");
+        let snaps: Vec<Lsn> = e.layers.snaps().iter().map(|(l, _)| *l).collect();
+        assert!(snaps.contains(&first.seal.lsn) && snaps.contains(&second.seal.lsn), "{snaps:?}");
+    }
+
+    #[test]
+    fn prune_needs_a_lineage_and_a_live_chronicle() {
+        let e = env();
+        let mut c = e.create();
+        c.set_roll_at(1);
+        for i in 0..4 {
+            c.append(Stream::Fs, raw(i)).unwrap();
+        }
+        ship_to_tail(&e, &c);
+        assert!(matches!(c.prune(1), Err(ChronicleError::NoLineage)));
+        assert_eq!(c.segments().len(), 4, "nothing removed");
+        e.coord.transfer(cid(), B).unwrap();
+        let (mut c2, _) = {
+            drop(c);
+            e.open(A)
+        };
+        c2.set_roll_at(1);
+        e.coord.transfer(cid(), B).unwrap();
+        assert!(c2.prune(0).is_err(), "fenced: it may not write the Checkpoint");
+    }
+
+    /// A log cut without a Checkpoint, or cut past what was shipped, is
+    /// refused at open.
+    #[test]
+    fn a_cut_log_without_its_checkpoint_is_refused() {
+        let e = env();
+        let (c, _) = rolled(&e, 6);
+        ship_to_tail(&e, &c);
+        drop(c);
+        let files = list_segments(&e.dir).unwrap();
+        std::fs::remove_file(&files[0]).unwrap();
+        let r = Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone());
+        assert!(
+            matches!(r, Err(ChronicleError::SegmentsDisagree { why, .. }) if why.contains("no Checkpoint")),
+            "{:?}",
+            r.err()
+        );
+
+        let e = env();
+        let (c, _) = rolled(&e, 6);
+        drop(c);
+        let files = list_segments(&e.dir).unwrap();
+        std::fs::remove_file(&files[0]).unwrap();
+        let r = Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone());
+        assert!(
+            matches!(r, Err(ChronicleError::SegmentsDisagree { why, .. }) if why.contains("past what was shipped")),
+            "{:?}",
+            r.err()
+        );
     }
 
     // ── batches ─────────────────────────────────────────────────────
@@ -1551,31 +1914,31 @@ mod tests {
 
         // End to start; a gap with its record; a continuation not begun.
         let next = seg(kept, vec![(Stream::Fs, raw(3))]);
-        assert_eq!(check_joints(std::slice::from_ref(&first), &next).unwrap(), None);
+        assert_eq!(check_joints(std::slice::from_ref(&first), &next, false).unwrap(), None);
         let cont = seg(far, vec![gap(kept, far), (Stream::Fs, raw(4))]);
-        assert_eq!(check_joints(std::slice::from_ref(&first), &cont).unwrap(), None);
+        assert_eq!(check_joints(std::slice::from_ref(&first), &cont, false).unwrap(), None);
         let empty = seg(far, vec![]);
-        assert_eq!(check_joints(std::slice::from_ref(&first), &empty).unwrap(), Some(kept));
+        assert_eq!(check_joints(std::slice::from_ref(&first), &empty, false).unwrap(), Some(kept));
 
         // Refusals.
         let not_genesis = seg(kept, vec![]);
-        assert_eq!(why(check_joints(&[], &not_genesis)), "the first segment does not start at genesis");
+        assert_eq!(why(check_joints(&[], &not_genesis, false)), "the first segment does not start at genesis");
         let inside = seg(Position { lsn: Lsn::new(1), hash: HashVal::from_bytes([1; 32]) }, vec![]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &inside)), "it starts inside the one before");
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &inside, false)), "it starts inside the one before");
         let same_lsn = seg(Position { lsn: kept.lsn, hash: HashVal::from_bytes([1; 32]) }, vec![]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &same_lsn)), "it starts inside the one before");
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &same_lsn, false)), "it starts inside the one before");
         let no_record = seg(far, vec![(Stream::Fs, raw(4))]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &no_record)), "it skips records without a Gap record");
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &no_record, false)), "it skips records without a Gap record");
         let wrong_kept = seg(far, vec![gap(Position { lsn: Lsn::new(1), hash: kept.hash }, far)]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_kept)), "it skips records without a Gap record");
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_kept, false)), "it skips records without a Gap record");
         let wrong_resumes =
             seg(far, vec![gap(kept, Position { lsn: far.lsn, hash: HashVal::from_bytes([4; 32]) })]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_resumes)), "it skips records without a Gap record");
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_resumes, false)), "it skips records without a Gap record");
         let gap_on_fs = seg(far, vec![(Stream::Fs, gap(kept, far).1)]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &gap_on_fs)), "it skips records without a Gap record");
+        assert_eq!(why(check_joints(std::slice::from_ref(&first), &gap_on_fs, false)), "it skips records without a Gap record");
         let empty_middle = seg(far, vec![]);
         let after = seg(far, vec![(Stream::Fs, raw(5))]);
-        assert_eq!(why(check_joints(&[first, empty_middle], &after)), "an empty segment after a gap");
+        assert_eq!(why(check_joints(&[first, empty_middle], &after, false)), "an empty segment after a gap");
     }
 
     // ── unknown outcomes (remote coordinator) ───────────────────────

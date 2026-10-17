@@ -18,9 +18,10 @@
 //! - A put reads the whole body into memory to hash it before sending.
 //!   Packs are small (a Template's full stream ~1 MB, a Vessel's
 //!   incremental a few KB); multipart upload comes when they are not.
-//! - Plain HTTP: Garage on the node's private network.  TLS is a feature
-//!   flag of the HTTP client, to be turned on when Garage is reached across
-//!   anything else.
+//! - HTTP or HTTPS.  `http://` is for Garage on the node's private
+//!   network.  `https://` verifies the server against the public web roots,
+//!   or, with [`S3Config::ca_file`], against that CA alone (a Garage behind
+//!   a proxy with a private CA).
 //! - One attempt per request; the callers decide about retrying (a failed
 //!   publish is retried by the next one).
 
@@ -36,7 +37,7 @@ use crate::ship::{valid_key, ByteStream, ObjectStore};
 /// Where the bucket is and how to sign for it.
 #[derive(Clone)]
 pub struct S3Config {
-    /// `http://host:port`, no trailing slash.
+    /// `http://host[:port]` or `https://host[:port]`, no trailing slash.
     pub endpoint: String,
     /// The region the store expects in signatures (`garage` by default).
     pub region: String,
@@ -46,6 +47,9 @@ pub struct S3Config {
     pub access_key_id: String,
     /// The secret key.
     pub secret_key: String,
+    /// For `https://`: trust only the CA certificates in this PEM file
+    /// instead of the public web roots.
+    pub ca_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -56,6 +60,7 @@ impl std::fmt::Debug for S3Config {
             .field("bucket", &self.bucket)
             .field("access_key_id", &self.access_key_id)
             .field("secret_key", &"<hidden>")
+            .field("ca_file", &self.ca_file)
             .finish()
     }
 }
@@ -71,19 +76,32 @@ pub struct S3Store {
 impl S3Store {
     /// A store over `config`.  Requests time out after `timeout`.
     pub fn new(config: S3Config, timeout: Duration) -> io::Result<Self> {
-        let host = config
-            .endpoint
-            .strip_prefix("http://")
-            .filter(|h| !h.is_empty() && !h.contains('/'))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("endpoint {:?} must be http://host[:port]", config.endpoint))
-            })?
-            .to_string();
+        let bad_endpoint = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("endpoint {:?} must be http://host[:port] or https://host[:port]", config.endpoint),
+            )
+        };
+        let (tls, rest) = match (config.endpoint.strip_prefix("https://"), config.endpoint.strip_prefix("http://")) {
+            (Some(rest), _) => (true, rest),
+            (None, Some(rest)) => (false, rest),
+            (None, None) => return Err(bad_endpoint()),
+        };
+        if rest.is_empty() || rest.contains('/') {
+            return Err(bad_endpoint());
+        }
+        let host = rest.to_string();
+        if config.ca_file.is_some() && !tls {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a CA file needs an https:// endpoint"));
+        }
         if config.bucket.is_empty() || !config.bucket.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.') {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid bucket name {:?}", config.bucket)));
         }
-        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
-        Ok(Self { config, host, agent })
+        let mut agent = ureq::AgentBuilder::new().timeout(timeout);
+        if let Some(ca) = &config.ca_file {
+            agent = agent.tls_config(std::sync::Arc::new(tls_trusting(ca)?));
+        }
+        Ok(Self { config, host, agent: agent.build() })
     }
 
     fn path(&self, key: &str) -> String {
@@ -114,6 +132,27 @@ impl S3Store {
         }
         req
     }
+}
+
+/// A TLS client configuration that trusts exactly the CA certificates in
+/// the PEM file `ca`.
+fn tls_trusting(ca: &std::path::Path) -> io::Result<rustls::ClientConfig> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::CertificateDer;
+    let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("CA file {}: {why}", ca.display()));
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(ca).map_err(|e| bad(e.to_string()))? {
+        roots.add(cert.map_err(|e| bad(e.to_string()))?).map_err(|e| bad(e.to_string()))?;
+    }
+    if roots.is_empty() {
+        return Err(bad("no certificate in it".into()));
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    Ok(rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| bad(e.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth())
 }
 
 fn bad_key(key: &str) -> io::Error {
@@ -363,6 +402,7 @@ mod tests {
             bucket: "examplebucket".into(),
             access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            ca_file: None,
         }
     }
 
@@ -430,13 +470,88 @@ mod tests {
     fn bad_endpoints_and_buckets_are_refused() {
         let ok = S3Config { endpoint: "http://127.0.0.1:3900".into(), region: "garage".into(), bucket: "taso".into(), ..aws_example() };
         assert!(S3Store::new(ok.clone(), Duration::from_secs(1)).is_ok());
-        for endpoint in ["https://x", "127.0.0.1:3900", "http://", "http://h/path"] {
+        assert!(S3Store::new(S3Config { endpoint: "https://garage.example:3900".into(), ..ok.clone() }, Duration::from_secs(1)).is_ok());
+        assert!(
+            S3Store::new(S3Config { ca_file: Some("/nonexistent.pem".into()), ..ok.clone() }, Duration::from_secs(1)).is_err(),
+            "a CA file with http://"
+        );
+        for endpoint in ["ftp://x", "127.0.0.1:3900", "http://", "https://", "http://h/path"] {
             assert!(S3Store::new(S3Config { endpoint: endpoint.into(), ..ok.clone() }, Duration::from_secs(1)).is_err(), "{endpoint}");
         }
         for bucket in ["", "Taso", "a/b"] {
             assert!(S3Store::new(S3Config { bucket: bucket.into(), ..ok.clone() }, Duration::from_secs(1)).is_err(), "{bucket}");
         }
         assert!(!format!("{ok:?}").contains("EXAMPLEKEY"), "the secret is never printed");
+    }
+
+    /// HTTPS against a local server whose certificate is signed by a
+    /// private CA: trusted with that CA as `ca_file`, refused without it
+    /// (the public roots do not know it) and with another CA.  Skipped if
+    /// `openssl` or `python3` is missing.
+    #[test]
+    fn https_trusts_exactly_the_given_ca() {
+        use std::process::{Command, Stdio};
+        let have = |c: &str| Command::new(c).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+        if !have("openssl") || !have("python3") {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n).to_string_lossy().into_owned();
+        let sh = |args: &[&str]| assert!(Command::new("openssl").args(args).stderr(Stdio::null()).status().unwrap().success(), "{args:?}");
+        for ca in ["ca", "other"] {
+            sh(&["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "2",
+                 "-subj", &format!("/CN=taso test {ca}"), "-keyout", &p(&format!("{ca}.key")), "-out", &p(&format!("{ca}.pem"))]);
+        }
+        sh(&["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-subj", "/CN=localhost",
+             "-keyout", &p("srv.key"), "-out", &p("srv.csr")]);
+        std::fs::write(p("ext"), "subjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
+        sh(&["x509", "-req", "-in", &p("srv.csr"), "-CA", &p("ca.pem"), "-CAkey", &p("ca.key"), "-CAcreateserial",
+             "-days", "2", "-extfile", &p("ext"), "-out", &p("srv.pem")]);
+        // A server that answers every HEAD with 404 (the key does not exist).
+        let server = format!(
+            r#"
+import http.server, ssl, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain("{}", "{}")
+s.socket = c.wrap_socket(s.socket, server_side=True)
+print(s.server_address[1], flush=True)
+s.serve_forever()
+"#,
+            p("srv.pem"),
+            p("srv.key")
+        );
+        let mut child = Command::new("python3").args(["-c", &server]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut port = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.as_mut().unwrap()), &mut port).unwrap();
+        let store = |ca: Option<&str>| {
+            S3Store::new(
+                S3Config {
+                    endpoint: format!("https://localhost:{}", port.trim()),
+                    region: "garage".into(),
+                    bucket: "taso".into(),
+                    ca_file: ca.map(|c| dir.path().join(c)),
+                    ..aws_example()
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap()
+        };
+        let trusted = store(Some("ca.pem")).exists("a/b");
+        let public_roots = store(None).exists("a/b");
+        let other = store(Some("other.pem")).exists("a/b");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!trusted.unwrap(), "with its CA: a 404 answer, so the key does not exist");
+        assert!(public_roots.is_err(), "the public roots do not know a private CA");
+        assert!(other.is_err(), "another CA is not trusted");
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        assert!(tls_trusting(&empty).is_err(), "a CA file with no certificate");
     }
 
     /// The same contract tests as `LocalStore`, against a real Garage:
@@ -453,6 +568,7 @@ mod tests {
                 bucket: env("TASO_S3_BUCKET"),
                 access_key_id: env("TASO_S3_KEY_ID"),
                 secret_key: env("TASO_S3_SECRET"),
+                ca_file: std::env::var_os("TASO_S3_CA").map(Into::into),
             },
             Duration::from_secs(10),
         )

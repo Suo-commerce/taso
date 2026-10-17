@@ -30,8 +30,14 @@
 //!   destroyed, no Seal exists, and the reply is `sealed: None`.
 //! - **After each Seal** an [`AfterSeal`] hook runs, if one is given
 //!   ([`Session::with_after_seal`]): the daemon publishes the Seal there
-//!   (ships it and advances the shipped anchor).  Its failure does not
-//!   undo the Seal, which is accepted and stays; it is counted
+//!   (ships it and advances the shipped anchor).  It runs **after the
+//!   TurnEnd reply is sent** and before the next request is handled
+//!   ([`Session::after_reply`]), so the agent's turn pause is the Seal
+//!   alone (decision 3, 2026-10-16).  Until it lands the Seal is not
+//!   anchored: a crash in that window rebirths from the Seal before it,
+//!   one turn more lost, never a wrong state; effects are unaffected (they
+//!   publish before sending, always).  Its failure does not undo the Seal,
+//!   which is accepted and stays; it is counted
 //!   ([`Session::after_seal_failures`]) and the next Seal's publish ships
 //!   from the last one that was named, so nothing is skipped for good.
 //! - A malformed body is answered with `Malformed` and the connection
@@ -89,6 +95,8 @@ pub struct Session<'v, L: Layers> {
     /// How many times it failed, and the last reason.
     after_seal_failures: u64,
     last_after_seal_error: Option<String>,
+    /// A Seal taken whose hook has not run yet (it runs after the reply).
+    pending_seal: Option<Position>,
 }
 
 impl<'v, L: Layers> Session<'v, L> {
@@ -100,23 +108,10 @@ impl<'v, L: Layers> Session<'v, L> {
             .chronicle()
             .frames()
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
-        let mut transcript = Lsn::new(0);
-        let mut ledger = Lsn::new(0);
-        let mut last_sealed_turn = None;
-        for f in &frames {
-            match f.envelope.stream {
-                Stream::Transcript => transcript = f.envelope.lsn,
-                Stream::Effect => ledger = f.envelope.lsn,
-                Stream::Ctl if Some(f.envelope.lsn) == vessel.last_seal().map(|s| s.lsn) => {
-                    let p = Payload::decode(&f.payload)
-                        .map_err(|error| VesselError::Decode { lsn: f.envelope.lsn, error })?;
-                    if let Payload::Seal(s) = p {
-                        last_sealed_turn = Some(s.turn.get());
-                    }
-                }
-                _ => {}
-            }
-        }
+        // From the newest Checkpoint on: older segments may be gone.
+        let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+        let (transcript, ledger) = (summary.transcript, summary.effect);
+        let last_sealed_turn = summary.seal.map(|s| s.turn.get());
         Ok(Self {
             vessel,
             greeted: false,
@@ -129,6 +124,7 @@ impl<'v, L: Layers> Session<'v, L> {
             after_seal: None,
             after_seal_failures: 0,
             last_after_seal_error: None,
+            pending_seal: None,
         })
     }
 
@@ -160,8 +156,23 @@ impl<'v, L: Layers> Session<'v, L> {
         self.last_sealed_turn
     }
 
+    /// Run the after-Seal hook for a Seal taken by the last request, if
+    /// any.  [`serve`] calls it right after sending each reply; [`Session::handle`]
+    /// calls it first, so a pending publish always runs before the next
+    /// request is handled.
+    pub fn after_reply(&mut self) {
+        let Some(seal) = self.pending_seal.take() else { return };
+        if let Some(hook) = self.after_seal.as_deref_mut() {
+            if let Err(e) = hook.after_seal(self.vessel, seal) {
+                self.after_seal_failures += 1;
+                self.last_after_seal_error = Some(e);
+            }
+        }
+    }
+
     /// Answer one request.
     pub fn handle(&mut self, req: Request) -> Reply {
+        self.after_reply();
         match (self.greeted, req) {
             (false, Request::Hello { version }) if version == VERSION => {
                 self.greeted = true;
@@ -235,12 +246,8 @@ impl<'v, L: Layers> Session<'v, L> {
         match self.vessel.seal_checked(cut, verdict.clone(), self.ledger, TurnId::new(turn), check) {
             Ok(sealed) => {
                 self.last_sealed_turn = Some(turn);
-                if let Some(hook) = self.after_seal.as_deref_mut() {
-                    if let Err(e) = hook.after_seal(self.vessel, sealed.seal) {
-                        self.after_seal_failures += 1;
-                        self.last_after_seal_error = Some(e);
-                    }
-                }
+                // Published after the reply: Session::after_reply.
+                self.pending_seal = Some(sealed.seal);
                 Reply::TurnEnd { turn, sealed: Some(sealed.seal.lsn.get()) }
             }
             Err(VesselError::Chronicle(ChronicleError::CheckFailed(_))) => {
@@ -283,19 +290,23 @@ pub enum Ended {
 /// Serve one connection until it ends.  Every request gets exactly one
 /// reply; a malformed body gets `Malformed` and the connection continues.
 pub fn serve<S: Read + Write, L: Layers>(stream: &mut S, session: &mut Session<'_, L>) -> Ended {
-    loop {
+    let ended = loop {
         let reply = match recv_request(stream) {
-            Ok(None) => return Ended::Closed,
+            Ok(None) => break Ended::Closed,
             Ok(Some(req)) => session.handle(req),
             Err(ProtocolError::Malformed { at, why }) => {
                 error(ErrorCode::Malformed, format!("byte {at}: {why}"))
             }
-            Err(e) => return Ended::Broken(e),
+            Err(e) => break Ended::Broken(e),
         };
         if let Err(e) = send_reply(stream, &reply) {
-            return Ended::Broken(e);
+            break Ended::Broken(e);
         }
-    }
+        // The reply is on its way: now publish the Seal it announced.
+        session.after_reply();
+    };
+    session.after_reply();
+    ended
 }
 
 /// A Vessel's Field socket.
@@ -510,6 +521,9 @@ mod tests {
         s.handle(hello());
         assert_eq!(s.handle(Request::TurnEnd { turn: 1, quiescent: false }), Reply::TurnEnd { turn: 1, sealed: None });
         assert_eq!(s.handle(Request::TurnEnd { turn: 1, quiescent: true }), Reply::TurnEnd { turn: 1, sealed: Some(2) });
+        assert_eq!(s.pending_seal.map(|p| p.lsn.get()), Some(2), "not yet: after the reply");
+        s.after_reply();
+        s.after_reply();
         assert_eq!(s.after_seal_failures(), (0, None));
         drop(s);
         assert_eq!(hook.seen.iter().map(|p| p.lsn.get()).collect::<Vec<_>>(), vec![2], "not for the unsealed turn");
@@ -518,9 +532,83 @@ mod tests {
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_after_seal(&mut hook);
         s.handle(hello());
         assert_eq!(s.handle(Request::TurnEnd { turn: 2, quiescent: true }), Reply::TurnEnd { turn: 2, sealed: Some(3) });
+        // The next request runs the pending hook first.
+        s.handle(Request::Transcript { entry: b"next".to_vec() });
         assert_eq!(s.after_seal_failures(), (1, Some("store down")));
         drop(s);
         assert_eq!(v.last_seal().unwrap().lsn, Lsn::new(3), "the Seal stands");
+    }
+
+    /// Over a connection: the TurnEnd reply is written before the hook
+    /// runs, and a hook still pending when the agent hangs up runs anyway.
+    #[test]
+    fn the_reply_goes_out_before_the_publish() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        /// Sealed TurnEnd replies already written.
+        fn sealed_replies(out: &[u8]) -> usize {
+            let mut r = out;
+            let mut n = 0;
+            while let Some(reply) = recv_reply(&mut r).unwrap() {
+                n += usize::from(matches!(reply, Reply::TurnEnd { sealed: Some(_), .. }));
+            }
+            n
+        }
+        struct Duplex {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Rc<RefCell<Vec<u8>>>,
+            published: Rc<RefCell<usize>>,
+        }
+        impl Read for Duplex {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                // The Warden must not wait for the agent's next request
+                // to publish a Seal it already announced.
+                assert_eq!(
+                    *self.published.borrow(),
+                    sealed_replies(&self.output.borrow()),
+                    "reading the next request with a Seal still unpublished"
+                );
+                self.input.read(b)
+            }
+        }
+        impl Write for Duplex {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.output.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Watching(Rc<RefCell<Vec<u8>>>, Vec<usize>, Rc<RefCell<usize>>);
+        impl<L: Layers> AfterSeal<L> for Watching {
+            fn after_seal(&mut self, _: &mut Vessel<L>, _: Position) -> Result<(), String> {
+                // How many replies the agent already has.
+                let out = self.0.borrow().clone();
+                let mut r = &out[..];
+                let mut n = 0;
+                while recv_reply(&mut r).unwrap().is_some() {
+                    n += 1;
+                }
+                self.1.push(n);
+                *self.2.borrow_mut() += 1;
+                Ok(())
+            }
+        }
+        let mut input = Vec::new();
+        for req in [hello(), Request::TurnEnd { turn: 1, quiescent: true }, Request::TurnEnd { turn: 2, quiescent: true }] {
+            taso_field::protocol::send_request(&mut input, &req).unwrap();
+        }
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let published = Rc::new(RefCell::new(0));
+        let mut stream = Duplex { input: std::io::Cursor::new(input), output: output.clone(), published: published.clone() };
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut hook = Watching(output.clone(), Vec::new(), published.clone());
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_after_seal(&mut hook);
+        assert!(matches!(serve(&mut stream, &mut s), Ended::Closed));
+        drop(s);
+        assert_eq!(hook.1, vec![2, 3], "each publish ran after its TurnEnd reply was written");
     }
 
     #[test]

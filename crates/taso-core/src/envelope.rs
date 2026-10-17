@@ -148,7 +148,8 @@ impl Canonical for Epoch {
 
 // ── Lsn ─────────────────────────────────────────────────────────────
 
-/// A log sequence number within a stream.
+/// A log sequence number: the position of a record in its Chronicle,
+/// counted from 1 across all streams (each record takes the next one).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Lsn(u64);
 
