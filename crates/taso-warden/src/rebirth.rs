@@ -610,6 +610,66 @@ mod tests {
         assert!(fx.open_obligations().is_empty());
     }
 
+    /// The Navigator on a reborn log (amendment 19): the Seals before the
+    /// gap are judged as usual, the first after it is unverified, and the
+    /// old holder's log no longer reaches the anchored head.
+    #[test]
+    fn seals_before_the_gap_navigate_after_rebirth() {
+        use taso_core::navigator::{Navigation, Reason};
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
+        let s1 = turn(&mut v, 1);
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        let s2 = turn(&mut v, 2);
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s2), None).unwrap();
+        assert_eq!(v.navigate(s2.lsn).unwrap(), Navigation::Consistent(vec![]));
+        v.append(Stream::Fs, raw(3)).unwrap(); // never shipped: lost
+
+        let (mut w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
+        assert!(r.gap.is_some());
+        for s in [s1, s2] {
+            assert_eq!(w.navigate(s.lsn).unwrap(), Navigation::Consistent(vec![]), "{s:?}");
+        }
+        let why = "reborn: 1 record lost".to_string();
+        let s3 = w.seal(StreamCut::EMPTY, Verdict::Unverified(why.clone()), Lsn::new(0), TurnId::new(3)).unwrap().seal;
+        assert_eq!(w.navigate(s3.lsn).unwrap(), Navigation::Insufficient(vec![Reason::MissingVerification(why)]));
+        assert_eq!(w.navigate(s2.lsn).unwrap(), Navigation::Consistent(vec![]));
+        assert!(matches!(v.navigate(s2.lsn).unwrap(), Navigation::Inconsistent(_)));
+    }
+
+    /// An effect sent before the node died, its outcome never shipped:
+    /// after rebirth the Seal before it waits on that outcome until the
+    /// engine reconciles it.
+    #[test]
+    fn an_outcome_lost_in_the_gap_is_missing_until_reconciled() {
+        use taso_core::navigator::{Navigation, Reason};
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
+        let s1 = turn(&mut v, 1);
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        let mut reg = Registry::new();
+        reg.register(Box::new(FakeProvider::new("mail")));
+        let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), a.warden);
+        let (mut fx, _) = Effects::open(reg, Box::new(publisher), &mut v).unwrap();
+        let call = Call { operation: "send".into(), args: b"someone".to_vec() };
+        assert!(fx.dispatch_until(&mut v, "mail", call, None).unwrap().is_some(), "sent and applied");
+        let known = v.navigate(s1.lsn).unwrap();
+        let Navigation::Consistent(obligations) = &known else { panic!("{known:?}") };
+        let [o] = obligations[..] else { panic!("{obligations:?}") };
+
+        let (mut w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
+        assert!(r.gap.is_some(), "the applied outcome was not shipped");
+        assert_eq!(w.navigate(s1.lsn).unwrap(), Navigation::Insufficient(vec![Reason::MissingOutcome(o.op)]));
+        let mut reg = Registry::new();
+        reg.register(Box::new(FakeProvider::new("mail")));
+        let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), b.warden);
+        let (_fx, rec) = Effects::open(reg, Box::new(publisher), &mut w).unwrap();
+        assert_eq!(rec.settled, vec![o.op]);
+        assert_eq!(w.navigate(s1.lsn).unwrap(), known, "reconciled: the same answer as before the gap");
+    }
+
     // ── on a real pool ──────────────────────────────────────────────
 
     mod node {
