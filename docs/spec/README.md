@@ -76,6 +76,62 @@ to the decision lists in the session handoffs.
     be in the log without a shipped `fs` section; they are reported as
     missing layers and their state is lost (v0.4 §8.5).
 
+13. **Takeover is the operator's call** (2026-10-16). The daemon takes a
+    Vessel that another Warden holds only when its configuration says
+    `"takeover": true`; otherwise it refuses to start it. Taking over
+    fences the other holder (v0.4 §8.2), and whether that holder is dead
+    is not something one node can know. A Vessel this Warden already
+    holds is opened (or reborn, if its local state is gone) without asking.
+14. **Seal snapshots are batched** (2026-10-16). Concurrent Seals on a
+    node share one ZFS channel program per pool: each snapshot and its
+    `taso:seal` binding are set in the same transaction group, so a
+    snapshot is never visible unbound (as with `zfs snapshot -o`). The
+    program reports each snapshot's guid and txg; only a program that
+    fails is checked against `zfs list`. Measured at p64: Seal p95 283 →
+    132 ms, bounded below by the storage's txg sync.
+15. **A failed Seal publish does not undo the Seal** (2026-10-16). The
+    Seal record is accepted and its layer exists; if shipping it or
+    advancing the shipped anchor fails, the failure is counted and the
+    next Seal's publish ships from the last named section, so nothing is
+    skipped for good. Until then the Seal is not anchored, and a rebirth
+    starts from the last one that is (amendment 11).
+16. **Coordinator writes are group-committed** (2026-10-16). Requests that
+    arrive while a commit is in flight share one transaction and one
+    fsync. Each is still checked on its own against the state the ones
+    before it left, so no answer changes; a group that fails to commit
+    answers every accepted request "outcome unknown", never a refusal.
+
+17. **Segments roll and shipped ones are pruned behind a Checkpoint**
+    (2026-10-16). A Chronicle rolls to a new segment file at 64 MiB.
+    After a Seal is published, the Warden appends a Checkpoint record
+    (Ctl, tag 9) and removes the oldest closed segment files whose every
+    record is at or below the shipped anchor, keeping the newest two.
+    The Checkpoint carries what readers need from the records before it:
+    lineage, transcript and effect positions, the last Seal (turn and
+    ledger position), the last FsShipped, open effects with their latest
+    state, and the next op id. Readers start from the newest Checkpoint.
+    A log whose first local segment is not genesis opens only if that
+    segment begins at or below the shipped anchor and a Checkpoint is
+    present; the full history stays in the packs. Layers of Seals whose
+    records were pruned are kept, not judged again.
+18. **The TurnEnd reply goes out before the Seal is published**
+    (2026-10-16). The Seal is accepted before the reply, as before; the
+    publish (shipping its packs and advancing the shipped anchor) runs
+    after the reply is sent and before the next request is read, so it
+    is off the agent's turn latency. A failed publish is handled as in
+    amendment 15.
+
+19. **A Seal before a gap stays navigable** (2026-10-16). The Navigator
+    accepts a jump in lsn only at a Gap record on `ctl` that names the
+    record before it and its own `prev` (the rule of the segment joints).
+    Nothing lost in a gap authorized a sent effect (it is shipped and
+    anchored before the send), so a Seal before the gap is judged as
+    usual: an outcome lost in the gap is `MissingOutcome` until the new
+    holder reconciles it. No new reason is added to v0.4 §6. A cut
+    position or `ledger_pos` inside a gap is not present and is
+    `IncompleteState(CutInvalid)`; the first Seal after a gap is
+    `Unverified`, as before.
+
 ### Amendments already applied from the Phase 4 plan
 
 12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is
