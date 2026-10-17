@@ -237,8 +237,31 @@ impl Kube {
     /// Merge `status` into the object's status (the `status` subresource,
     /// JSON merge patch).  Returns the object as the server now has it.
     pub fn patch_status(&self, r: Resource, namespace: &str, name: &str, status: &Value) -> Result<Value, KubeError> {
+        self.patch_status_at(r, namespace, name, None, status)
+    }
+
+    /// [`Kube::patch_status`], applied only if the object is still at
+    /// `resource_version` (else `409 Conflict`, nothing written).  This is
+    /// the only precondition a status patch honours: a `metadata.uid` in
+    /// the patch is ignored (measured on kube-apiserver 1.35), so "still the
+    /// object I read" is checked by its resourceVersion.
+    pub fn patch_status_at(
+        &self,
+        r: Resource,
+        namespace: &str,
+        name: &str,
+        resource_version: Option<&str>,
+        status: &Value,
+    ) -> Result<Value, KubeError> {
         let url = format!("{}{}/status", self.api, self.path(r, Some(namespace), Some(name))?);
-        self.send(self.agent.request("PATCH", &url), Some(&serde_json::json!({ "status": status })))
+        let mut body = serde_json::json!({ "status": status });
+        if let Some(rv) = resource_version {
+            if rv.is_empty() {
+                return Err(KubeError::BadName("an empty resourceVersion".into()));
+            }
+            body["metadata"] = serde_json::json!({ "resourceVersion": rv });
+        }
+        self.send(self.agent.request("PATCH", &url), Some(&body))
     }
 }
 
@@ -290,6 +313,7 @@ mod tests {
         // And a bad name is refused before any request (no network needed).
         assert!(matches!(k.get(VESSELS, "a", "b/c"), Err(KubeError::BadName(_))));
         assert!(matches!(k.patch_status(VESSELS, "ns/x", "b", &Value::Null), Err(KubeError::BadName(_))));
+        assert!(matches!(k.patch_status_at(VESSELS, "a", "b", Some(""), &Value::Null), Err(KubeError::BadName(_))));
     }
 
     #[test]
@@ -375,6 +399,13 @@ mod tests {
 
         let missing = k.get(VESSELS, ns, "no-such-vessel").unwrap_err();
         assert!(missing.is_not_found(), "{missing}");
+        // At a resourceVersion: applied while it is current, refused after.
+        let rv = after["metadata"]["resourceVersion"].as_str().unwrap().to_string();
+        let at = k.patch_status_at(VESSELS, ns, name, Some(&rv), &serde_json::json!({ "message": "at rv" })).unwrap();
+        assert_eq!(at["status"]["message"], "at rv");
+        let stale = k.patch_status_at(VESSELS, ns, name, Some(&rv), &serde_json::json!({ "message": "stale" })).unwrap_err();
+        assert!(matches!(stale, KubeError::Status { code: 409, .. }), "{stale}");
+        assert_eq!(k.get(VESSELS, ns, name).unwrap()["status"]["message"], "at rv", "a stale patch writes nothing");
         let bad_phase = k.patch_status(VESSELS, ns, name, &serde_json::json!({ "phase": "Sleeping" })).unwrap_err();
         assert!(matches!(bad_phase, KubeError::Status { code: 422, .. }), "the CRD's enum is enforced: {bad_phase}");
 
