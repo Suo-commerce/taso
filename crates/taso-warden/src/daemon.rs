@@ -21,19 +21,32 @@
 //!    is taken over only if its entry says `"takeover": true`: taking
 //!    over fences the other Warden, so it is the operator's call, never
 //!    the daemon's.
-//! 2. **Publish what is not yet published**: the last Seal, if a crash
-//!    came between taking and publishing it.
-//! 3. **Effects**: the engine is opened (and reconciles) with the pack
+//! 2. **Settle the state** ([`settle`]).  A Vessel with no Seal takes its
+//!    birth Seal (turn 0, [`Vessel::seal_birth`]) before anything else:
+//!    every Vessel has a Seal before its agent first runs.  Then the
+//!    dataset is rolled back to the last Seal ([`Vessel::rollback`]), so
+//!    a restart on this node starts from exactly what a rebirth elsewhere
+//!    would: what a crashed turn wrote after its last Seal is discarded.
+//!    This is safe only because nothing is writing: the startup sweep
+//!    removed every old container, and on ZFS an open file does not stop
+//!    a rollback (measured 2026-10-17).  If the last Seal's layer is
+//!    missing, the rollback goes to the newest Seal that has one and a
+//!    warning says so.  A failed rollback stops the start.
+//! 3. **Publish what is not yet published**: the last Seal, if a crash
+//!    came between taking and publishing it (the birth Seal on a new
+//!    Vessel: shipped and anchored, so it is reborn elsewhere even if it
+//!    dies before turn 1).
+//! 4. **Effects**: the engine is opened (and reconciles) with the pack
 //!    publisher: no effect is sent before its authorization is shipped.
 //!    No adapters are registered yet (P3), so effect requests are refused.
-//! 4. **Field socket** at `<run_dir>/v-<id>/field.sock`, owned by the
+//! 5. **Field socket** at `<run_dir>/v-<id>/field.sock`, owned by the
 //!    Vessel's mapped root so the agent can connect.  Each Vessel has its
 //!    own host uid/gid range ([`VesselConf::uid_slot`]); the dataset's
 //!    top directory and the socket belong to it.
-//! 5. **runc**: a stale container of the same id is deleted (a backstop;
+//! 6. **runc**: a stale container of the same id is deleted (a backstop;
 //!    the startup sweep already removed it), then the agent runs in the
 //!    foreground on its own thread.
-//! 6. **Serve** the socket until the agent exits.  Every Seal is published
+//! 7. **Serve** the socket until the agent exits.  Every Seal is published
 //!    right after it is taken ([`SealPublisher`]): ship the `fs` section
 //!    and the log, advance the shipped anchor.  A failed publish is
 //!    counted and logged; the Seal stands and the next one catches up.
@@ -82,6 +95,7 @@ use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, RuncRunner, 
 use crate::segment::Position;
 use crate::s3::{S3Config, S3Store};
 use crate::ship::{LocalStore, SharedStore, ZfsSend};
+use crate::chronicle::Layers;
 use crate::vessel::{Ensured, Host, Vessel, VesselError};
 use crate::zfs::{Cli, Dataset, Snapshot, Zfs};
 
@@ -581,6 +595,40 @@ pub struct Report {
     pub prune_failures: (u64, Option<String>),
     /// Whether the agent exited successfully, and its stderr.
     pub agent: Option<(bool, String)>,
+    /// What settling the state did before the agent ran.
+    pub settled: Settled,
+}
+
+/// What [`settle`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settled {
+    /// The birth Seal, if this start took it.
+    pub birth: Option<Position>,
+    /// The Seal the state was rolled back to, if any had a layer.
+    pub rolled_back_to: Option<Position>,
+    /// The last Seal in the log.
+    pub last_seal: Option<Position>,
+}
+
+impl Settled {
+    /// The state is older than the last Seal: its layer was missing, so
+    /// the rollback went to an earlier one (or to none).
+    pub fn behind(&self) -> bool {
+        self.rolled_back_to != self.last_seal
+    }
+}
+
+/// Put a Vessel's state at a Seal before its agent runs (step 2 in the
+/// module docs): the birth Seal if it has none, then a rollback to the
+/// last Seal.  `NotPristine` (no Seal, but records after Lineage) is an
+/// error: there is no level to put the state at.
+pub fn settle<L: Layers>(vessel: &mut Vessel<L>) -> Result<Settled, VesselError> {
+    let birth = match vessel.last_seal() {
+        None => Some(vessel.seal_birth()?.seal),
+        Some(_) => None,
+    };
+    let rolled_back_to = vessel.rollback()?;
+    Ok(Settled { birth, rolled_back_to, last_seal: vessel.last_seal() })
 }
 
 /// Why a Vessel could not run.
@@ -723,7 +771,7 @@ impl Node {
         eprintln!("taso-wardend[{}] {}: {msg}", self.config.warden.get(), vc.subject);
     }
 
-    /// Find, open or rebirth the Vessel (steps 1–2).
+    /// Find, open or rebirth the Vessel (step 1).
     fn start(&self, vc: &VesselConf) -> Result<(Vessel<ZfsLayers<Cli>>, Start, Verdict), DaemonError> {
         let host = self.host();
         let id = vc.id();
@@ -776,6 +824,23 @@ impl Node {
         let (mut vessel, start, mut verdict) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
+        let settled = settle(&mut vessel)?;
+        if let Some(b) = settled.birth {
+            self.log(vc, format_args!("birth Seal at lsn {}", b.lsn.get()));
+        }
+        match settled.rolled_back_to {
+            Some(s) => self.log(vc, format_args!("state rolled back to the Seal at lsn {}", s.lsn.get())),
+            None => self.log(vc, "no Seal layer here: state not rolled back"),
+        }
+        if settled.behind() {
+            self.log(
+                vc,
+                format_args!(
+                    "WARNING: the last Seal (lsn {}) has no layer here; the state is older than the turn the agent resumes after",
+                    settled.last_seal.map_or(0, |s| s.lsn.get())
+                ),
+            );
+        }
         let mut publisher =
             SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0, pruned: 0, prune_failures: 0, prune_error: None };
         // A crash between taking a Seal and publishing it: publish now.
@@ -869,13 +934,88 @@ impl Node {
         if let Some((ok, err)) = &agent {
             self.log(vc, format_args!("agent exited {}{}", if *ok { "ok" } else { "with failure: " }, if *ok { "" } else { err.trim() }));
         }
-        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, pruned: publisher.pruned, prune_failures: (publisher.prune_failures, publisher.prune_error.clone()), agent })
+        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, pruned: publisher.pruned, prune_failures: (publisher.prune_failures, publisher.prune_error.clone()), agent, settled })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Settling the state ──────────────────────────────────────────
+
+    use crate::vessel::tests::{env as vessel_env, ns};
+    use crate::vessel::Pool;
+    use taso_core::envelope::{Lsn, Stream};
+    use taso_core::record::{Payload, StreamCut, TurnId};
+
+    fn turn<L: Layers>(v: &mut Vessel<L>, t: u64) -> Position {
+        v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(t)).unwrap().seal
+    }
+
+    /// A new Vessel: the birth Seal, then the state is at it.  Settling
+    /// again takes no second birth Seal.
+    #[test]
+    fn a_new_vessel_settles_at_its_birth_seal() {
+        let e = vessel_env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let s = settle(&mut v).unwrap();
+        let b = s.birth.expect("a birth Seal");
+        assert_eq!(b.lsn, Lsn::new(2));
+        assert_eq!((s.rolled_back_to, s.last_seal), (Some(b), Some(b)));
+        assert!(!s.behind());
+        let again = settle(&mut v).unwrap();
+        assert_eq!(again, Settled { birth: None, rolled_back_to: Some(b), last_seal: Some(b) });
+    }
+
+    /// A Vessel with turns: no birth Seal, the state goes back to the last
+    /// Seal, whatever was recorded after it.
+    #[test]
+    fn a_running_vessel_settles_at_its_last_seal() {
+        let e = vessel_env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        settle(&mut v).unwrap();
+        turn(&mut v, 1);
+        let s2 = turn(&mut v, 2);
+        v.append(Stream::Transcript, Payload::Raw(vec![3])).unwrap(); // turn 3, cut short
+        let s = settle(&mut v).unwrap();
+        assert_eq!(s, Settled { birth: None, rolled_back_to: Some(s2), last_seal: Some(s2) });
+    }
+
+    /// No Seal but records after Lineage: no birth Seal over unsealed work.
+    #[test]
+    fn unsealed_work_without_a_seal_is_refused() {
+        let e = vessel_env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.append(Stream::Transcript, Payload::Raw(vec![1])).unwrap();
+        assert!(matches!(settle(&mut v), Err(VesselError::NotPristine(_))));
+        assert_eq!(v.last_seal(), None);
+    }
+
+    /// The last Seal's layer gone: the state goes to the Seal before it,
+    /// and `behind` says so.
+    #[test]
+    fn a_missing_last_layer_settles_behind() {
+        let e = vessel_env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let b = settle(&mut v).unwrap().birth.unwrap();
+        let s1 = turn(&mut v, 1);
+        drop(v);
+        e.host.pool.layers(&e.host.dataset_for(vessel_id(ns(1), b"u"))).destroy(s1.lsn).unwrap();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let s = settle(&mut v).unwrap();
+        assert_eq!(s, Settled { birth: None, rolled_back_to: Some(b), last_seal: Some(s1) });
+        assert!(s.behind());
+    }
+
+    #[test]
+    fn behind_is_only_when_a_seal_exists_and_differs() {
+        let p = |n| Position { lsn: Lsn::new(n), hash: taso_core::envelope::HashVal::from_bytes([n as u8; 32]) };
+        assert!(!Settled::default().behind());
+        assert!(!Settled { birth: None, rolled_back_to: Some(p(3)), last_seal: Some(p(3)) }.behind());
+        assert!(Settled { birth: None, rolled_back_to: Some(p(2)), last_seal: Some(p(3)) }.behind());
+        assert!(Settled { birth: None, rolled_back_to: None, last_seal: Some(p(3)) }.behind());
+    }
 
     // ── Starting: run directory and sweep ───────────────────────────
 
