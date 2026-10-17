@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use taso_warden::coordinator::{Coord, Coordinator};
-use taso_warden::daemon::{Config, Node, Start};
+use taso_warden::daemon::{Config, DaemonError, Node, Report, Restart, Start, Stop, VesselConf};
+use taso_warden::source::{Guard, SourceError, VesselSource};
+use taso_warden::supervisor::{Event, Supervisor, Timing};
 use taso_warden::zfs::Zfs;
 
 const SIM: &str = env!("CARGO_BIN_EXE_taso-sim");
@@ -49,6 +51,12 @@ impl Drop for Cleanup {
 }
 
 fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool) -> Config {
+    config_with(tmp, base, node, warden, takeover, &["--turns", "5", "--txns", "2", "--rows", "3"])
+}
+
+fn config_with(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool, sim_args: &[&str]) -> Config {
+    let mut args = vec!["/usr/bin/taso-sim"];
+    args.extend_from_slice(sim_args);
     let v = json!({
         "warden": warden,
         "coordinator": { "local": tmp.join("coord.redb") },
@@ -59,7 +67,7 @@ fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool) -> Co
         "runtime": {
             "rootfs": tmp.join("rootfs"),
             "host_uid_base": 200000,
-            "args": ["/usr/bin/taso-sim", "--turns", "5", "--txns", "2", "--rows", "3"],
+            "args": args,
             "memory_bytes": 268435456,
             "pids": 64
         },
@@ -148,4 +156,183 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     let e = a.run_vessel(&a.config.vessels[0]).unwrap_err();
     println!("A, after the takeover: {e}");
     assert!(e.to_string().contains("held by Warden 2"), "{e}");
+}
+
+// ── W1: the supervisor on a real node ─────────────────────────────────
+
+/// A source the test drives: each pushed set is answered once.
+#[derive(Clone, Default)]
+struct Driven(Arc<std::sync::Mutex<std::collections::VecDeque<Vec<VesselConf>>>>);
+
+impl VesselSource for Driven {
+    fn poll(&mut self, wait: std::time::Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+        let next = self.0.lock().unwrap().pop_front();
+        if next.is_none() {
+            std::thread::sleep(wait);
+        }
+        Ok(next)
+    }
+    fn is_finite(&self) -> bool {
+        false
+    }
+}
+
+impl Driven {
+    fn push(&self, set: Vec<VesselConf>) {
+        self.0.lock().unwrap().push_back(set);
+    }
+}
+
+/// What the test sees of one run.
+#[derive(Debug)]
+struct Seen {
+    stopped: bool,
+    agent_ok: Option<bool>,
+    restarting: bool,
+    /// sim-stats.json as the agent left it (only if it exited by itself).
+    stats: Option<Value>,
+}
+
+fn taso_sim_processes() -> usize {
+    let out = Command::new("pgrep").args(["-f", "^/usr/bin/taso-sim --turns 20 --turn-sleep-ms"]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().count()
+}
+
+fn snapshots(dataset: &str) -> usize {
+    let out = Command::new("zfs").args(["list", "-H", "-t", "snapshot", "-o", "name", "-r", dataset]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).lines().count()
+}
+
+fn wait_until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while !cond() {
+        assert!(std::time::Instant::now() < end, "timed out after {secs} s waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// W1 on real ZFS and runc, one node:
+///
+/// 1. a slow agent is stopped mid-run by removing its Vessel from the
+///    source: its container is gone at once, the run reports `stopped`;
+/// 2. listed again (restart never): it starts afresh, resumes right after
+///    its last sealed turn and runs to the end; the database holds exactly
+///    one row per turn up to the last — a turn committed but not sealed when
+///    the agent was killed was rolled back, not kept and done twice;
+/// 3. listed with restart always: every run that ends by itself is started
+///    again and resumes after the turn the one before ended on; once
+///    removed, it is stopped and never started again.
+#[test]
+#[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
+fn supervisor_stops_relists_and_restarts_on_a_real_node() {
+    let base = format!("{}/w1-{}", std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"), std::process::id());
+    for ds in [base.clone(), format!("{base}/a")] {
+        assert!(Command::new("zfs").args(["create", &ds]).status().unwrap().success());
+    }
+    let _c = Cleanup(base.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    rootfs(&tmp.path().join("rootfs"));
+    let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
+    let sim = ["--turns", "20", "--turn-sleep-ms", "50", "--txns", "1", "--rows", "1"];
+    let node = Arc::new(Node::new(config_with(tmp.path(), &base, "a", 1, false, &sim), coord, Zfs::cli().batched()).unwrap());
+    let vessel = node.config.vessels[0].clone();
+    let with = |restart: Restart| VesselConf { restart, ..vessel.clone() };
+    let id = vessel.id();
+    let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let dataset = format!("{base}/a/v-{hex}");
+
+    let source = Driven::default();
+    let shutdown = Stop::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
+    let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sup = {
+        let (node, mut source, shutdown, seen, starts) = (node.clone(), source.clone(), shutdown.clone(), seen.clone(), starts.clone());
+        let timing = Timing { tick: std::time::Duration::from_millis(50), backoff_first: std::time::Duration::from_millis(200), backoff_max: std::time::Duration::from_secs(1), healthy: std::time::Duration::from_secs(600) };
+        std::thread::spawn(move || {
+            let guard = Guard::new(node.config.runtime.clone());
+            let stats_of = |node: &Node| -> Option<Value> {
+                std::fs::read_to_string(mount(node).join("sim-stats.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+            };
+            Supervisor::new(node.clone(), guard, timing).run(&mut source, &shutdown, |e: Event<Result<Report, DaemonError>>| match e {
+                Event::Started(_) => {
+                    starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Event::Exited { out, stopped, restart_in, .. } => {
+                    let r = out.expect("the run itself must not fail");
+                    println!("run ended: stopped={stopped} restart_in={restart_in:?} {r:?}");
+                    // Read before any next start rolls the state back.
+                    let stats = if stopped { None } else { stats_of(&node) };
+                    seen.lock().unwrap().push(Seen { stopped: r.stopped, agent_ok: r.agent.as_ref().map(|a| a.0), restarting: restart_in.is_some(), stats });
+                }
+                Event::Panicked { .. } => panic!("a run panicked"),
+                Event::Refused(r) => panic!("refused: {r:?}"),
+                Event::SourceFailed(e) => panic!("{e}"),
+                Event::Stopping(_) => {}
+            })
+        })
+    };
+    let runs = || seen.lock().unwrap().len();
+
+    // 1. Run, then remove mid-run: stopped at once.
+    source.push(vec![with(Restart::Never)]);
+    wait_until("3 sealed turns (birth Seal + 3 snapshots)", 60, || snapshots(&dataset) >= 4);
+    assert_eq!(taso_sim_processes(), 1, "the agent runs");
+    let asked = std::time::Instant::now();
+    source.push(vec![]);
+    wait_until("the stopped run to end", 10, || runs() == 1);
+    println!("stopped in {:?}", asked.elapsed());
+    {
+        let s = &seen.lock().unwrap()[0];
+        assert!(s.stopped, "the run reports it was stopped: {s:?}");
+        assert_ne!(s.agent_ok, Some(true), "a killed agent did not exit ok: {s:?}");
+    }
+    assert_eq!(taso_sim_processes(), 0, "no agent process outlives its stop");
+
+    // 2. Listed again: resumes after its last sealed turn, runs to the end,
+    //    and the database holds exactly one row per turn.
+    source.push(vec![with(Restart::Never)]);
+    wait_until("the second run to end by itself", 120, || runs() == 2);
+    let (resumed, last) = {
+        let s = &seen.lock().unwrap()[1];
+        assert!(!s.stopped && s.agent_ok == Some(true) && !s.restarting, "{s:?}");
+        let st = s.stats.as_ref().expect("stats of a finished run");
+        let resumed = st["resumed_after"].as_u64().expect("it resumed after a sealed turn");
+        let (first, last) = (st["turns"][0].as_u64().unwrap(), st["turns"][1].as_u64().unwrap());
+        assert!(resumed >= 3, "at least the 3 turns sealed before the stop: {st}");
+        assert_eq!(first, resumed + 1, "resumes right after its last sealed turn: {st}");
+        assert_eq!(st["rows_in_db"].as_u64(), Some(last), "one row per turn, none twice and none lost: {st}");
+        (resumed, last)
+    };
+    println!("second run: resumed after {resumed}, ran to {last}");
+
+    // 3. Restart always: runs that end by themselves start again and go on
+    //    from where the one before ended; removal stops it for good.
+    source.push(vec![]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    source.push(vec![with(Restart::Always)]);
+    wait_until("two more runs ending by themselves", 180, || runs() >= 4);
+    source.push(vec![]);
+    wait_until("the stop after always", 30, || seen.lock().unwrap().last().is_some_and(|s| s.stopped));
+    let starts_at_removal = starts.load(std::sync::atomic::Ordering::SeqCst);
+    std::thread::sleep(std::time::Duration::from_millis(1500)); // past any backoff
+    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), starts_at_removal, "never started again once removed");
+    assert_eq!(taso_sim_processes(), 0);
+    {
+        let seen = seen.lock().unwrap();
+        let finished: Vec<&Value> = seen[2..].iter().filter(|s| !s.stopped).map(|s| s.stats.as_ref().unwrap()).collect();
+        assert!(finished.len() >= 2, "{seen:?}");
+        let mut prev_last = last;
+        for st in finished {
+            assert_eq!(st["resumed_after"].as_u64(), Some(prev_last), "each run resumes where the one before ended: {st}");
+            prev_last = st["turns"][1].as_u64().unwrap();
+            assert_eq!(st["rows_in_db"].as_u64(), Some(prev_last), "{st}");
+        }
+        assert!(seen[2..].iter().filter(|s| !s.stopped).all(|s| s.restarting), "always: every run that ended by itself was restarted");
+    }
+
+    shutdown.request();
+    sup.join().unwrap();
+    assert_eq!(taso_sim_processes(), 0);
 }
