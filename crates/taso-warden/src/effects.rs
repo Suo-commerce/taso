@@ -1,5 +1,12 @@
-//! The effect engine: intent before dispatch, outcomes in five states,
-//! reconciliation before authority (v0.4 §7.2–7.4).
+//! The effect engine of the reference runner: dispatch over the ledger
+//! (v0.4 §7.2–7.4).
+//!
+//! The record of every effect, and every rule about it that is storage,
+//! lives in [`crate::ledger`]: intent before dispatch, the ledger off the
+//! node before any send, every answer recorded, reconciliation before
+//! authority, operator resolution.  This module is the relay: it knows
+//! the providers (adapters), plans, sends and probes, and tells the ledger
+//! what happened at each step.
 //!
 //! # Dispatch
 //!
@@ -9,130 +16,48 @@
 //! 2. No adapter for the provider → refused.  The adapter's plan refuses
 //!    → refused.  A `Deferrable` plan is refused for now (dispatch at the
 //!    next Seal is not built yet).  Nothing is recorded for a refusal.
-//! 3. `Intent { op, provider, request, footprint, retry, consequence,
-//!    authority, barrier }` is appended and fsynced.  `barrier` is the
-//!    intent's own lsn unless the consequence is `NoExternalMutation`.
-//! 4. `Outcome(DispatchAuthorized)` is appended and fsynced.
-//! 5. The ledger is **published** up to that record ([`Publish`]): shipped
-//!    off the node and recorded as the coordinator's shipped anchor.  If
-//!    that fails, nothing is sent: `ConfirmedNotApplied` ("ledger not
-//!    shipped") is recorded and returned.
-//! 6. The adapter sends exactly `plan.request`.
-//! 7. The answer is recorded: `ConfirmedApplied` (receipt as evidence),
-//!    `ConfirmedNotApplied` (reason), or `OutcomeUnknown`.  An unknown
-//!    outcome on a barrier intent withdraws effect authority until it is
-//!    reconciled or resolved.
+//! 3. The ledger authorizes it ([`Ledger::authorize`]): `Intent` and
+//!    `DispatchAuthorized`, durable together.
+//! 4. The ledger is shipped ([`Ledger::ship_before_send`]).  If that
+//!    fails, nothing is sent: the ledger has recorded
+//!    `ConfirmedNotApplied` ("ledger not shipped"), which is returned.
+//! 5. The adapter sends exactly `plan.request`.
+//! 6. The answer is recorded ([`Ledger::record`]).
 //!
 //! A crash anywhere leaves at worst an intent that reconciliation
 //! settles.
 //!
-//! Why step 5: an effect whose authorization exists only on this node
-//! cannot be reconciled by another node that takes the Vessel over.  If
-//! this node is lost after sending, the new holder must find
-//! `DispatchAuthorized` in the shipped chain, under the anchor, and
-//! reconcile it, never treat the intent as "never authorized" and lose a
-//! real send.
-//!
 //! # Reconciliation (on open, before any authority)
 //!
-//! Every intent whose latest outcome is not terminal:
-//! - none (crash after the intent) → `ConfirmedNotApplied`: dispatch was
-//!   never authorized, so it never happened;
-//! - `DispatchAuthorized` / `OutcomeUnknown`, by the intent's retry:
-//!   - `ProviderDeduplicated` → publish, re-send the recorded request;
-//!     record what the provider says;
-//!   - `Queryable` → probe; applied → `ConfirmedApplied`; not applied →
-//!     publish, send, record; unknown → stays open;
-//!   - `UnsafeToRetry` → `OutcomeUnknown`, stays open: an operator
-//!     decides.
-//!   - no adapter for its provider any more → stays open.
-//!   - a publish that fails before a send → nothing is sent; stays open.
-//!
-//! An open barrier intent is an obligation; effect authority is granted
-//! only when there are none.  [`Effects::resolve`] is the one place a
-//! human is in the recovery path by design (v0.4 §14): an operator,
-//! with a reason, records what really happened.
+//! The ledger visits every unsettled intent and settles the never
+//! authorized ones itself.  For an authorized or unknown one, by its
+//! retry policy:
+//! - `ProviderDeduplicated` → ship, re-send the recorded request;
+//!   record what the provider says;
+//! - `Queryable` → probe; applied → `ConfirmedApplied`; not applied →
+//!   ship, send, record; unknown → stays open;
+//! - `UnsafeToRetry` → `OutcomeUnknown`, stays open: an operator
+//!   decides ([`Effects::resolve`]).
+//! - no adapter for its provider any more → stays open.
+//! - a ship that fails before a send → nothing is sent; stays open.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use taso_core::canon::Canonical;
-use taso_core::envelope::Stream;
-use taso_core::record::{
-    Authority, BarrierId, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord, OutcomeState,
-    Payload, RetryPolicy,
-};
+use taso_core::record::{Authority, Dispatch, IntentRecord, OpId, OutcomeState, RetryPolicy};
 use taso_field::adapter::{Call, Plan, Probed, Registry, Sent};
 use taso_field::protocol::EffectResult;
 
-use taso_core::envelope::{ChronicleId, Epoch};
-
-use crate::chronicle::{ChronicleError, Layers};
-use crate::segment::{Position, Segment};
+use crate::chronicle::Layers;
+use crate::ledger::{Answer, Ledger, Proposed};
 use crate::vessel::{Vessel, VesselError};
 
-/// What reconciliation did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Reconciled {
-    /// Intents settled to a terminal outcome now.
-    pub settled: Vec<OpId>,
-    /// Barrier intents still open: obligations an operator must resolve.
-    pub open: Vec<OpId>,
-}
-
-// ── Publishing ──────────────────────────────────────────────────────
-
-/// Why the ledger could not be published.  Whatever the cause (the store,
-/// a coordinator refusal, an unknown coordinator outcome), nothing is sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishError(pub String);
-
-impl std::fmt::Display for PublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for PublishError {}
-
-/// Makes the ledger durable off the node before anything is sent.
-///
-/// The real one is [`crate::pack::PackPublisher`].  There is deliberately
-/// no implementation that skips publishing outside tests: a Warden that
-/// cannot ship cannot send.
-pub trait Publish {
-    /// Ship every accepted record of `chronicle` up to `upto` (which is
-    /// accepted: at or below the anchored head) from its local `segments`
-    /// (oldest first), then record `upto` as the
-    /// coordinator's shipped anchor under `epoch`.  `Ok` only when both
-    /// are done.
-    fn publish(
-        &mut self,
-        chronicle: ChronicleId,
-        epoch: Epoch,
-        segments: &[&Segment],
-        upto: Position,
-    ) -> Result<(), PublishError>;
-}
-
-/// Publishes nothing and always succeeds.  Tests only: there is no such
-/// thing outside them.
-#[cfg(test)]
-pub(crate) struct AlwaysPublish;
+pub use crate::ledger::{Publish, PublishError, Reconciled, ResolveError};
 
 #[cfg(test)]
-impl Publish for AlwaysPublish {
-    fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], _: Position) -> Result<(), PublishError> {
-        Ok(())
-    }
-}
+pub(crate) use crate::ledger::AlwaysPublish;
 
 /// The effect engine of one Vessel.
 pub struct Effects {
     registry: Registry,
-    publisher: Box<dyn Publish>,
-    next_op: u64,
-    /// Open barrier intents: effect authority is withheld while any exist.
-    open: BTreeSet<OpId>,
+    ledger: Ledger,
 }
 
 /// Where a test stops the dispatch sequence, simulating a crash after
@@ -151,23 +76,22 @@ impl Effects {
     /// grant effect authority if nothing is left open.  `publisher` ships
     /// the ledger before every send, here and in reconciliation.
     pub fn open<L: Layers>(
-        registry: Registry,
+        mut registry: Registry,
         publisher: Box<dyn Publish>,
         vessel: &mut Vessel<L>,
     ) -> Result<(Self, Reconciled), VesselError> {
-        let mut e = Self { registry, publisher, next_op: 1, open: BTreeSet::new() };
-        let r = e.reconcile(vessel)?;
-        Ok((e, r))
+        let (ledger, r) = Ledger::open(publisher, vessel, |l, v, i, s| settle(&mut registry, l, v, i, s))?;
+        Ok((Self { registry, ledger }, r))
     }
 
     /// True if effects may be dispatched.
     pub fn authorized(&self) -> bool {
-        self.open.is_empty()
+        self.ledger.authorized()
     }
 
     /// Open obligations.
     pub fn open_obligations(&self) -> Vec<OpId> {
-        self.open.iter().copied().collect()
+        self.ledger.open_obligations()
     }
 
     /// Run one effect request through the full sequence.
@@ -187,16 +111,16 @@ impl Effects {
         call: Call,
         stop: Option<CrashAfter>,
     ) -> Result<Option<EffectResult>, VesselError> {
-        if !self.authorized() {
+        if !self.ledger.authorized() {
             return Ok(Some(refused(format!(
                 "no effect authority: {} unresolved effect(s)",
-                self.open.len()
+                self.ledger.open_obligations().len()
             ))));
         }
         let Some(adapter) = self.registry.get_mut(provider) else {
             return Ok(Some(refused(format!("no adapter for provider {provider:?}"))));
         };
-        let op = OpId::new(self.next_op);
+        let op = self.ledger.next_op();
         let plan = match adapter.plan(op, &call) {
             Ok(p) => p,
             Err(r) => return Ok(Some(refused(r.to_string()))),
@@ -204,58 +128,41 @@ impl Effects {
         if plan.dispatch == Dispatch::Deferrable {
             return Ok(Some(refused("deferrable dispatch is not supported yet".into())));
         }
-        self.next_op += 1;
+        let proposed = proposed(provider, &plan);
 
         let _total = crate::timing::span("effect.total");
-        // 1–2. Intent and dispatch authorized, durable together: one write,
-        // one fsync, one CAS.  A crash during it leaves both or neither
-        // accepted (an intent alone is not, and recovery cuts it).  The
-        // barrier is the intent's own lsn.
-        let lsn = vessel.tail().lsn.next();
-        let barrier = (plan.consequence != Consequence::NoExternalMutation)
-            .then(|| BarrierId::new(lsn.get()));
-        let intent = Payload::Intent(intent(op, provider, &plan, barrier));
         if stop == Some(CrashAfter::Intent) {
             // Tests only: an intent accepted alone, as an older Warden that
             // wrote them apart could leave it.  Recovery must still handle it.
-            vessel.append(Stream::Effect, intent)?;
+            self.ledger.append_intent_alone(vessel, &proposed)?;
             return Ok(None);
         }
-        let t = crate::timing::span("effect.authorize");
-        vessel.append_batch(vec![
-            (Stream::Effect, intent),
-            (Stream::Effect, outcome(op, OutcomeState::DispatchAuthorized, None)),
-        ])?;
-        drop(t);
+        // 3. Intent and dispatch authorized, durable together.
+        let a = self.ledger.authorize(vessel, &proposed)?;
+        debug_assert_eq!(a.op, op, "the plan was made for the op id the ledger assigned");
         if stop == Some(CrashAfter::Authorized) {
             return Ok(None);
         }
-        // 3. The authorization goes off the node before the request does.
-        let t = crate::timing::span("effect.publish");
-        let published = self.publish(vessel);
-        drop(t);
-        if let Err(e) = published {
-            let reason = format!("ledger not shipped: {e}");
-            vessel.append(
-                Stream::Effect,
-                outcome(op, OutcomeState::ConfirmedNotApplied, Some(reason.clone().into_bytes())),
-            )?;
+        // 4. The authorization goes off the node before the request does.
+        if let Err(reason) = self.ledger.ship_before_send(vessel, &a)? {
             return Ok(Some(EffectResult::NotApplied { reason }));
         }
         if stop == Some(CrashAfter::Published) {
             return Ok(None);
         }
-        // 4. Send exactly the recorded request.
+        // 5. Send exactly the recorded request.
         let adapter = self.registry.get_mut(provider).expect("looked up above");
         let t = crate::timing::span("effect.send");
-        let sent = adapter.send(op, &plan);
+        let sent = adapter.send(a.op, &plan);
         drop(t);
         if stop == Some(CrashAfter::Send) {
             return Ok(None);
         }
-        // 5. Record what the provider said.
+        // 6. Record what the provider said.
         let _t = crate::timing::span("effect.outcome");
-        Ok(Some(self.record_sent(vessel, op, barrier, sent)?))
+        let answer = answer(sent);
+        self.ledger.record(vessel, a.op, a.barrier, &answer)?;
+        Ok(Some(result(answer)))
     }
 
     /// Operator resolution of an open effect: record what really happened.
@@ -268,173 +175,59 @@ impl Effects {
         applied: bool,
         authority: Authority,
     ) -> Result<(), ResolveError> {
-        if authority.actor.trim().is_empty() || authority.reason.trim().is_empty() {
-            return Err(ResolveError::EmptyAuthority);
-        }
-        if !self.open.contains(&op) {
-            return Err(ResolveError::NotOpen(op));
-        }
-        let state = if applied { OutcomeState::ConfirmedApplied } else { OutcomeState::ConfirmedNotApplied };
-        vessel
-            .append(Stream::Effect, outcome(op, state, Some(authority.canon_bytes())))
-            .map_err(ResolveError::Vessel)?;
-        self.open.remove(&op);
-        Ok(())
-    }
-
-    // ── internals ───────────────────────────────────────────────────
-
-    /// Publish the ledger up to the Vessel's tail.
-    fn publish<L: Layers>(&mut self, vessel: &Vessel<L>) -> Result<(), PublishError> {
-        let c = vessel.chronicle();
-        self.publisher.publish(c.id(), c.epoch(), &c.segments(), c.tail())
-    }
-
-    fn record_sent<L: Layers>(
-        &mut self,
-        vessel: &mut Vessel<L>,
-        op: OpId,
-        barrier: Option<BarrierId>,
-        sent: Sent,
-    ) -> Result<EffectResult, VesselError> {
-        match sent {
-            Sent::Applied { receipt } => {
-                vessel.append(Stream::Effect, outcome(op, OutcomeState::ConfirmedApplied, Some(receipt.clone())))?;
-                self.open.remove(&op);
-                Ok(EffectResult::Applied { receipt })
-            }
-            Sent::NotApplied { reason } => {
-                vessel.append(
-                    Stream::Effect,
-                    outcome(op, OutcomeState::ConfirmedNotApplied, Some(reason.clone().into_bytes())),
-                )?;
-                self.open.remove(&op);
-                Ok(EffectResult::NotApplied { reason })
-            }
-            Sent::Unknown => {
-                vessel.append(Stream::Effect, outcome(op, OutcomeState::OutcomeUnknown, None))?;
-                if barrier.is_some() {
-                    self.open.insert(op);
-                }
-                Ok(EffectResult::Unknown)
-            }
-        }
-    }
-
-    fn reconcile<L: Layers>(&mut self, vessel: &mut Vessel<L>) -> Result<Reconciled, VesselError> {
-        let frames = vessel
-            .chronicle()
-            .frames()
-            .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
-        // From the newest Checkpoint on: older segments may be gone.
-        let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
-        self.next_op = self.next_op.max(summary.next_op);
-        let intents: BTreeMap<OpId, IntentRecord> =
-            summary.open.iter().map(|(op, e)| (*op, e.intent.clone())).collect();
-        let latest: BTreeMap<OpId, OutcomeState> =
-            summary.open.iter().filter_map(|(op, e)| e.state.map(|s| (*op, s))).collect();
-
-        let mut report = Reconciled::default();
-        for (op, i) in intents {
-            let state = latest.get(&op).copied();
-            if matches!(state, Some(OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied)) {
-                continue;
-            }
-            let settled = match state {
-                None | Some(OutcomeState::Prepared) => {
-                    vessel.append(
-                        Stream::Effect,
-                        outcome(op, OutcomeState::ConfirmedNotApplied, Some(b"reconcile: never authorized".to_vec())),
-                    )?;
-                    true
-                }
-                _ => self.settle(vessel, &i, state)?,
-            };
-            if settled {
-                report.settled.push(op);
-            } else if i.barrier.is_some() {
-                self.open.insert(op);
-                report.open.push(op);
-            }
-        }
-        Ok(report)
-    }
-
-    /// Settle one authorized-or-unknown intent.  `true` if it is now
-    /// terminal.
-    fn settle<L: Layers>(
-        &mut self,
-        vessel: &mut Vessel<L>,
-        i: &IntentRecord,
-        state: Option<OutcomeState>,
-    ) -> Result<bool, VesselError> {
-        let plan = Plan {
-            request: i.request.clone(),
-            footprint: i.footprint.clone(),
-            retry: i.retry.clone(),
-            consequence: i.consequence,
-            dispatch: i.dispatch,
-            authority: i.authority.clone(),
-        };
-        let mark_unknown = |v: &mut Vessel<L>| -> Result<bool, VesselError> {
-            if state != Some(OutcomeState::OutcomeUnknown) {
-                v.append(Stream::Effect, outcome(i.op, OutcomeState::OutcomeUnknown, None))?;
-            }
-            Ok(false)
-        };
-        if self.registry.get_mut(&i.provider).is_none() {
-            return mark_unknown(vessel);
-        }
-        // Whether this ends in a send; a probe decides for Queryable.
-        let must_send = match &i.retry {
-            RetryPolicy::ProviderDeduplicated { .. } => None,
-            RetryPolicy::Queryable { .. } => {
-                let adapter = self.registry.get_mut(&i.provider).expect("checked above");
-                match adapter.probe(i.op, &plan) {
-                    Probed::Applied { receipt } => Some(Sent::Applied { receipt }),
-                    Probed::NotApplied => None,
-                    Probed::Unknown => return mark_unknown(vessel),
-                }
-            }
-            RetryPolicy::UnsafeToRetry => return mark_unknown(vessel),
-        };
-        let sent = match must_send {
-            Some(answer) => answer,
-            None => {
-                // Nothing is sent from a ledger that is not off the node.
-                if self.publish(vessel).is_err() {
-                    return mark_unknown(vessel);
-                }
-                let adapter = self.registry.get_mut(&i.provider).expect("checked above");
-                adapter.send(i.op, &plan)
-            }
-        };
-        if sent == Sent::Unknown {
-            return mark_unknown(vessel);
-        }
-        self.record_sent(vessel, i.op, i.barrier, sent)?;
-        Ok(true)
+        self.ledger.resolve(vessel, op, applied, authority)
     }
 }
 
-/// Why an operator resolution was refused.
-#[derive(Debug)]
-pub enum ResolveError {
-    /// No actor or no reason.
-    EmptyAuthority,
-    /// The effect is not open.
-    NotOpen(OpId),
-    /// Recording it failed.
-    Vessel(VesselError),
+/// Settle one authorized-or-unknown intent during reconciliation.  `true`
+/// if it is now terminal.
+fn settle<L: Layers>(
+    registry: &mut Registry,
+    ledger: &mut Ledger,
+    vessel: &mut Vessel<L>,
+    i: &IntentRecord,
+    state: Option<OutcomeState>,
+) -> Result<bool, VesselError> {
+    let plan = Plan {
+        request: i.request.clone(),
+        footprint: i.footprint.clone(),
+        retry: i.retry.clone(),
+        consequence: i.consequence,
+        dispatch: i.dispatch,
+        authority: i.authority.clone(),
+    };
+    let Some(adapter) = registry.get_mut(&i.provider) else {
+        return ledger.mark_unknown(vessel, i.op, state);
+    };
+    // Whether this ends in a send; a probe decides for Queryable.
+    let must_send = match &i.retry {
+        RetryPolicy::ProviderDeduplicated { .. } => None,
+        RetryPolicy::Queryable { .. } => match adapter.probe(i.op, &plan) {
+            Probed::Applied { receipt } => Some(Sent::Applied { receipt }),
+            Probed::NotApplied => None,
+            Probed::Unknown => return ledger.mark_unknown(vessel, i.op, state),
+        },
+        RetryPolicy::UnsafeToRetry => return ledger.mark_unknown(vessel, i.op, state),
+    };
+    let sent = match must_send {
+        Some(answer) => answer,
+        None => {
+            // Nothing is sent from a ledger that is not off the node.
+            if ledger.ship(vessel).is_err() {
+                return ledger.mark_unknown(vessel, i.op, state);
+            }
+            adapter.send(i.op, &plan)
+        }
+    };
+    if sent == Sent::Unknown {
+        return ledger.mark_unknown(vessel, i.op, state);
+    }
+    ledger.record(vessel, i.op, i.barrier, &answer(sent))?;
+    Ok(true)
 }
 
-fn refused(reason: String) -> EffectResult {
-    EffectResult::Refused { reason }
-}
-
-fn intent(op: OpId, provider: &str, plan: &Plan, barrier: Option<BarrierId>) -> IntentRecord {
-    IntentRecord {
-        op,
+fn proposed(provider: &str, plan: &Plan) -> Proposed {
+    Proposed {
         provider: provider.to_string(),
         request: plan.request.clone(),
         footprint: plan.footprint.clone(),
@@ -442,12 +235,27 @@ fn intent(op: OpId, provider: &str, plan: &Plan, barrier: Option<BarrierId>) -> 
         retry: plan.retry.clone(),
         consequence: plan.consequence,
         authority: plan.authority.clone(),
-        barrier,
     }
 }
 
-fn outcome(op: OpId, state: OutcomeState, evidence: Option<Vec<u8>>) -> Payload {
-    Payload::Outcome(OutcomeRecord { op, state, evidence })
+fn answer(sent: Sent) -> Answer {
+    match sent {
+        Sent::Applied { receipt } => Answer::Applied { receipt },
+        Sent::NotApplied { reason } => Answer::NotApplied { reason },
+        Sent::Unknown => Answer::Unknown,
+    }
+}
+
+fn result(answer: Answer) -> EffectResult {
+    match answer {
+        Answer::Applied { receipt } => EffectResult::Applied { receipt },
+        Answer::NotApplied { reason } => EffectResult::NotApplied { reason },
+        Answer::Unknown => EffectResult::Unknown,
+    }
+}
+
+fn refused(reason: String) -> EffectResult {
+    EffectResult::Refused { reason }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -455,7 +263,12 @@ fn outcome(op: OpId, state: OutcomeState, evidence: Option<Vec<u8>>) -> Payload 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::segment::{Position, Segment};
     use crate::vessel::tests::{env, ns, Env, FakeLayers};
+    use std::collections::BTreeMap;
+    use taso_core::canon::Canonical;
+    use taso_core::envelope::{ChronicleId, Epoch, Stream};
+    use taso_core::record::{BarrierId, Consequence, Payload};
     use proptest::prelude::*;
     use std::sync::{Arc, Mutex};
     use taso_field::adapter::{Adapter, Fault, FakeProvider, Refusal};

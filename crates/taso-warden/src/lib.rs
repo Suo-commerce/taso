@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod effects;
 pub mod field;
 pub mod kube;
+pub mod ledger;
 pub mod navigate;
 pub mod pack;
 pub mod quiesce;
