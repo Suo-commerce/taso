@@ -58,7 +58,7 @@ fn main() -> ExitCode {
     let node = match Node::new(config, coord, zfs) {
         Ok(n) => Arc::new(n),
         Err(e) => {
-            eprintln!("taso-wardend: opening the store: {e}");
+            eprintln!("taso-wardend: starting: {e}");
             return ExitCode::FAILURE;
         }
     };
