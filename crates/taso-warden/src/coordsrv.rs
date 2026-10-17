@@ -616,14 +616,20 @@ impl Drop for Server {
 
 /// A [`Coord`] served by a [`Server`].
 ///
-/// One connection, opened lazily and used for one request at a time.  Any
-/// failure to get an answer is [`CoordError::Unavailable`]; the connection
-/// is dropped and the next call opens a new one.  Nothing is retried.
+/// Concurrent callers each get their own connection, so their requests are
+/// in flight together and the server can group-commit them; one connection
+/// carries one request at a time.  Idle connections are kept for reuse
+/// (at most [`MAX_IDLE`]).  Any failure to get an answer is
+/// [`CoordError::Unavailable`]; that connection is dropped, never reused,
+/// and the next call opens a new one.  Nothing is retried.
 pub struct RemoteCoord {
     path: PathBuf,
     timeout: Duration,
-    conn: Mutex<Option<UnixStream>>,
+    idle: Mutex<Vec<UnixStream>>,
 }
+
+/// Idle connections a [`RemoteCoord`] keeps; more are closed when freed.
+pub const MAX_IDLE: usize = 128;
 
 impl RemoteCoord {
     /// A client for the server at `path`, waiting at most
@@ -634,28 +640,40 @@ impl RemoteCoord {
 
     /// A client waiting at most `timeout` for each answer.
     pub fn with_timeout(path: impl Into<PathBuf>, timeout: Duration) -> Self {
-        Self { path: path.into(), timeout, conn: Mutex::new(None) }
+        Self { path: path.into(), timeout, idle: Mutex::new(Vec::new()) }
+    }
+
+    /// An idle connection, or a new one.
+    fn checkout(&self) -> Result<UnixStream, CoordError> {
+        if let Some(s) = self.idle.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+            return Ok(s);
+        }
+        // An interrupted connect left nothing behind (a new socket each
+        // try): retry it.  See `read_frame` on EINTR.
+        let s = loop {
+            match UnixStream::connect(&self.path) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                other => break other.map_err(CoordError::Unavailable)?,
+            }
+        };
+        s.set_read_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
+        s.set_write_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
+        Ok(s)
+    }
+
+    /// Give a connection that just answered cleanly back for reuse.
+    fn checkin(&self, s: UnixStream) {
+        let mut idle = self.idle.lock().unwrap_or_else(|p| p.into_inner());
+        if idle.len() < MAX_IDLE {
+            idle.push(s);
+        }
     }
 
     fn call(&self, req: Request) -> Result<Reply, CoordError> {
-        let mut guard = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.is_none() {
-            // An interrupted connect left nothing behind (a new socket each
-            // try): retry it.  See `read_frame` on EINTR.
-            let s = loop {
-                match UnixStream::connect(&self.path) {
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    other => break other.map_err(CoordError::Unavailable)?,
-                }
-            };
-            s.set_read_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
-            s.set_write_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
-            *guard = Some(s);
-        }
-        let stream = guard.as_mut().expect("connected");
+        let mut stream = self.checkout()?;
         let result = (|| {
-            write_frame(stream, &req.encode()).map_err(unavailable)?;
-            let body = read_frame(stream)
+            write_frame(&mut stream, &req.encode()).map_err(unavailable)?;
+            let body = read_frame(&mut stream)
                 .map_err(unavailable)?
                 .ok_or_else(|| CoordError::Unavailable(io::Error::from(io::ErrorKind::UnexpectedEof)))?;
             Reply::decode(&body, req.ok_kind())
@@ -665,18 +683,19 @@ impl RemoteCoord {
             Ok(Reply::Bad(why)) => {
                 // The server could not read our request and closed: a bug
                 // on one side.  Nothing was applied, but report it as
-                // unavailable rather than invent a refusal.
-                *guard = None;
+                // unavailable rather than invent a refusal.  The
+                // connection is dropped.
                 Err(CoordError::Unavailable(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("coordinator rejected the request: {why}"),
                 )))
             }
-            Ok(reply) => Ok(reply),
-            Err(e) => {
-                *guard = None;
-                Err(e)
+            Ok(reply) => {
+                self.checkin(stream);
+                Ok(reply)
             }
+            // The connection is dropped: whatever it holds is not trusted.
+            Err(e) => Err(e),
         }
     }
 }
@@ -1009,6 +1028,80 @@ mod tests {
     }
 
     /// A server that never answers: the client times out as unavailable.
+    /// A coordinator that holds every `head` for `delay` and records how
+    /// many it is answering at once.
+    struct Slow {
+        inner: Coordinator,
+        delay: Duration,
+        now: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+    impl Coord for Slow {
+        fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+            self.inner.register(c, h)
+        }
+        fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
+            self.inner.append(w, e)
+        }
+        fn append_batch(&self, w: WardenId, e: &[Envelope]) -> Result<ChronicleHead, CoordError> {
+            self.inner.append_batch(w, e)
+        }
+        fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+            self.inner.transfer(c, h)
+        }
+        fn ownership(&self, c: ChronicleId) -> Result<Ownership, CoordError> {
+            self.inner.ownership(c)
+        }
+        fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.now.fetch_add(1, SeqCst) + 1;
+            self.most.fetch_max(n, SeqCst);
+            std::thread::sleep(self.delay);
+            self.now.fetch_sub(1, SeqCst);
+            self.inner.head(c)
+        }
+        fn advance_shipped(&self, w: WardenId, c: ChronicleId, e: Epoch, to: Position) -> Result<Position, CoordError> {
+            self.inner.advance_shipped(w, c, e, to)
+        }
+        fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+            self.inner.shipped(c)
+        }
+    }
+
+    /// Concurrent callers of one client are served concurrently (each on
+    /// its own connection), so the server can group their writes; a
+    /// connection that answered is reused, not reopened.
+    #[test]
+    fn concurrent_calls_are_in_flight_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let slow = Arc::new(Slow {
+            inner: Coordinator::open(dir.path().join("c.redb")).unwrap(),
+            delay: Duration::from_millis(200),
+            now: Default::default(),
+            most: Default::default(),
+        });
+        let _server = Server::spawn(dir.path().join("c.sock"), slow.clone()).unwrap();
+        let c = Arc::new(RemoteCoord::with_timeout(dir.path().join("c.sock"), Duration::from_secs(5)));
+        c.register(chron(1), A).unwrap();
+        let t0 = std::time::Instant::now();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let c = c.clone();
+                std::thread::spawn(move || c.head(chron(1)).unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let took = t0.elapsed();
+        assert_eq!(slow.most.load(std::sync::atomic::Ordering::SeqCst), 8, "all eight at once");
+        assert!(took < Duration::from_millis(800), "not one after another: {took:?}");
+        let idle = c.idle.lock().unwrap().len();
+        assert_eq!(idle, 8, "each connection kept for reuse");
+        c.head(chron(1)).unwrap();
+        assert_eq!(c.idle.lock().unwrap().len(), 8, "reused, not a ninth");
+    }
+
     #[test]
     fn silent_server_times_out() {
         let dir = tempfile::tempdir().unwrap();
