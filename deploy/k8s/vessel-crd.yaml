@@ -45,6 +45,12 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      # Each Warden lists only its own node's Vessels, filtered by the API
+      # server (--field-selector spec.node=<node>); GA in Kubernetes 1.32.
+      # RBAC cannot restrict reads by field: this narrows what a Warden
+      # asks for, it is not an access boundary.
+      selectableFields:
+        - jsonPath: .spec.node
       subresources:
         status: {}
       additionalPrinterColumns:
