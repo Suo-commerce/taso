@@ -311,7 +311,7 @@ mod tests {
 
     fn runtime() -> RuntimeConf {
         RuntimeConf {
-            rootfs: "/r".into(),
+            rootfs: Some("/r".into()),
             host_uid_base: 200_000,
             landlock_shim: None,
             args: vec!["/a".into()],
@@ -322,7 +322,7 @@ mod tests {
     }
 
     fn vc(subject: &str, slot: u32, restart: Restart) -> VesselConf {
-        VesselConf { namespace: Namespace::from_bytes([7; 16]), subject: subject.into(), takeover: false, uid_slot: slot, restart }
+        VesselConf { namespace: Namespace::from_bytes([7; 16]), subject: subject.into(), takeover: false, uid_slot: slot, restart, runtime: None }
     }
 
     fn timing() -> Timing {

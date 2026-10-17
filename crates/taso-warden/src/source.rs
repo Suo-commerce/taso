@@ -223,7 +223,7 @@ mod tests {
 
     fn runtime() -> RuntimeConf {
         RuntimeConf {
-            rootfs: "/srv/taso/rootfs".into(),
+            rootfs: Some("/srv/taso/rootfs".into()),
             host_uid_base: 200_000,
             landlock_shim: None,
             args: vec!["/agent".into()],
@@ -240,6 +240,7 @@ mod tests {
             takeover: false,
             uid_slot: slot,
             restart: Restart::Never,
+            runtime: None,
         }
     }
 

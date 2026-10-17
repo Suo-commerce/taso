@@ -3,6 +3,24 @@
 //! `taso-wardend <config.json>` reads a [`Config`] and runs every Vessel
 //! it lists, one thread each, until their agents exit.
 //!
+//! # Where Vessels come from
+//!
+//! The config's `"source"` ([`SourceConf`]): its own `"vessels"` list
+//! (`static`, the default), or the Vessel resources of a Kubernetes
+//! cluster that name this node (`kubernetes`, [`KubeSourceConf`]).  A
+//! cluster is not trusted: what a Vessel resource may ask for is bounded by
+//! this node's config (which Kubernetes namespaces map to which tenant,
+//! where rootfs directories may be, memory and process maxima, whether
+//! Landlock may be turned off), and anything outside it is refused, never
+//! clamped.  Every source goes through the same guard
+//! ([`crate::source::Guard`]).
+//!
+//! A Vessel may carry its own runtime ([`VesselRuntime`]: rootfs, command
+//! line, environment, Landlock, limits, quiescence); what it leaves out is
+//! the node's `"runtime"`.  It is resolved ([`VesselConf::effective`])
+//! before anything else in a start, so a Vessel whose runtime is incomplete
+//! is refused before the coordinator hears of it.
+//!
 //! # Starting
 //!
 //! Before any Vessel, [`Node::new`] claims the run directory
@@ -171,18 +189,20 @@ impl StoreConf {
     }
 }
 
-/// How Vessels run.
+/// How Vessels run on this node: the defaults for what a Vessel's own
+/// [`VesselRuntime`] leaves out, and the node-wide settings (the uid base,
+/// the Landlock shim).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeConf {
-    /// The image's root filesystem (read-only).
-    pub rootfs: PathBuf,
+    /// The image's root filesystem (read-only), if Vessels share one.
+    pub rootfs: Option<PathBuf>,
     /// First host uid/gid of the node's Vessel ranges: the Vessel in
     /// slot `n` maps its uids 0..65536 to `host_uid_base + n·65536`
     /// ([`VesselConf::uid_slot`]).
     pub host_uid_base: u32,
     /// The Landlock shim inside the rootfs, if used.
     pub landlock_shim: Option<String>,
-    /// The agent's command line.
+    /// The agent's command line (may be empty if every Vessel names its own).
     pub args: Vec<String>,
     /// Extra environment, `KEY=value`.
     pub env: Vec<String>,
@@ -190,6 +210,74 @@ pub struct RuntimeConf {
     pub memory_bytes: Option<u64>,
     /// Maximum number of processes.
     pub pids: Option<u64>,
+}
+
+/// A Vessel's own runtime: each field it sets replaces the node's
+/// ([`RuntimeConf`], and the config's `"quiescence"`); each it leaves out
+/// (`None`) is the node's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VesselRuntime {
+    /// Its root filesystem (read-only), an absolute path on the node.
+    pub rootfs: Option<PathBuf>,
+    /// Its agent's command line (not empty).
+    pub args: Option<Vec<String>>,
+    /// Its agent's environment, `NAME=value`.
+    pub env: Option<Vec<String>>,
+    /// Run the agent through the node's Landlock shim (`true`) or not
+    /// (`false`).  `true` on a node without a shim is an error, not a
+    /// silent run without it.
+    pub landlock: Option<bool>,
+    /// Memory limit in bytes (at least 1).
+    pub memory_bytes: Option<u64>,
+    /// Maximum number of processes (at least 1).
+    pub pids: Option<u64>,
+    /// Databases whose quiescence is checked at each Seal.
+    pub quiescence: Option<Vec<String>>,
+}
+
+/// What a Vessel runs with: its own runtime over the node's, resolved and
+/// checked ([`VesselConf::effective`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Effective {
+    /// The root filesystem.
+    pub rootfs: PathBuf,
+    /// The agent's command line (not empty).
+    pub args: Vec<String>,
+    /// The agent's environment.
+    pub env: Vec<String>,
+    /// The Landlock shim inside the rootfs, if used.
+    pub landlock_shim: Option<String>,
+    /// Memory limit in bytes.
+    pub memory_bytes: Option<u64>,
+    /// Maximum number of processes.
+    pub pids: Option<u64>,
+    /// Databases whose quiescence is checked at each Seal.
+    pub quiescence: Vec<String>,
+}
+
+/// Check an environment: each entry `NAME=value`, the name a C identifier,
+/// no NUL anywhere.
+pub fn check_env(env: &[String]) -> Result<(), String> {
+    for e in env {
+        let name = e.split_once('=').map(|(n, _)| n).ok_or_else(|| format!("env {e:?} must be NAME=value"))?;
+        let mut chars = name.chars();
+        let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("env {e:?}: {name:?} is not a valid variable name"));
+        }
+        if e.contains('\0') {
+            return Err(format!("env {name:?} contains a NUL byte"));
+        }
+    }
+    Ok(())
+}
+
+/// Check quiescence paths: relative to the dataset, not empty, no `..`.
+pub fn check_quiescence(dbs: &[String]) -> Result<(), String> {
+    match dbs.iter().find(|q| q.is_empty() || q.contains('\0') || Path::new(q).is_absolute() || q.split('/').any(|c| c == "..")) {
+        Some(q) => Err(format!("quiescence path {q:?} must be relative to the dataset, without \"..\"")),
+        None => Ok(()),
+    }
 }
 
 /// One Vessel to run.
@@ -210,6 +298,9 @@ pub struct VesselConf {
     pub uid_slot: u32,
     /// What to do when its agent exits ([`Restart`]); `never` by default.
     pub restart: Restart,
+    /// Its own runtime, over the node's; `None` runs it with the node's.
+    /// (Boxed: most Vessels have none, and a `VesselConf` is moved a lot.)
+    pub runtime: Option<Box<VesselRuntime>>,
 }
 
 /// When a long-running Warden starts a Vessel's agent again after it
@@ -276,6 +367,94 @@ impl VesselConf {
         base.checked_add(ID_RANGE - 1)?;
         Some(base)
     }
+
+    /// What it runs with: its own runtime over the node's `rt` and the
+    /// config's `quiescence`, checked.  An error says what is missing or
+    /// wrong; the Vessel is not started.
+    pub fn effective(&self, rt: &RuntimeConf, quiescence: &[String]) -> Result<Effective, String> {
+        let own = self.runtime.as_deref().cloned().unwrap_or_default();
+        let rootfs = own
+            .rootfs
+            .or_else(|| rt.rootfs.clone())
+            .ok_or("no rootfs: neither the Vessel nor the node's runtime names one")?;
+        if !rootfs.is_absolute() || rootfs.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err(format!("rootfs {} must be an absolute path", rootfs.display()));
+        }
+        let args = own.args.unwrap_or_else(|| rt.args.clone());
+        if args.is_empty() {
+            return Err("no agent: neither the Vessel nor the node's runtime has args".into());
+        }
+        if args.iter().any(|a| a.contains('\0')) {
+            return Err("args contain a NUL byte".into());
+        }
+        let env = own.env.unwrap_or_else(|| rt.env.clone());
+        check_env(&env)?;
+        let landlock_shim = match own.landlock {
+            None => rt.landlock_shim.clone(),
+            Some(false) => None,
+            Some(true) => Some(rt.landlock_shim.clone().ok_or("Landlock asked for, but the node has no runtime.landlock_shim")?),
+        };
+        let memory_bytes = own.memory_bytes.or(rt.memory_bytes);
+        let pids = own.pids.or(rt.pids);
+        if memory_bytes == Some(0) || pids == Some(0) {
+            return Err("memory_bytes and pids must be at least 1".into());
+        }
+        let quiescence = own.quiescence.unwrap_or_else(|| quiescence.to_vec());
+        check_quiescence(&quiescence)?;
+        Ok(Effective { rootfs, args, env, landlock_shim, memory_bytes, pids, quiescence })
+    }
+}
+
+/// Where a node's Vessels come from (`"source"`; see the module docs).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SourceConf {
+    /// The config's own `"vessels"` list (`"static"`, the default).
+    #[default]
+    Static,
+    /// Vessel resources in a Kubernetes cluster (`{"kubernetes": {...}}`).
+    Kubernetes(KubeSourceConf),
+}
+
+/// How to reach the Kubernetes API, if not from inside a pod.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubeApiConf {
+    /// `https://host:port` (never plain http: the token goes with every
+    /// request).
+    pub url: String,
+    /// A file holding the bearer token (re-read on every request).
+    pub token_file: PathBuf,
+    /// Trust only this CA (PEM), if given.
+    pub ca_file: Option<PathBuf>,
+}
+
+/// What a Kubernetes cluster may ask of this node.  Every bound is checked
+/// per Vessel resource, which is refused if it asks for more.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KubeSourceConf {
+    /// This node's name: only Vessels whose `spec.node` is it are run here.
+    pub node: String,
+    /// The Kubernetes namespaces Vessels are taken from, each with the one
+    /// Taso tenant its Vessels must name (decision D1).  No tenant belongs to
+    /// two namespaces, so one namespace's users can never name another's
+    /// Vessels.  Vessels in any other namespace are refused.
+    pub tenants: std::collections::BTreeMap<String, Namespace>,
+    /// Every Vessel's `spec.rootfs.path` must resolve to a directory inside
+    /// this one (D2).
+    pub rootfs_dir: PathBuf,
+    /// The most memory a Vessel may ask for, in bytes.
+    pub max_memory_bytes: u64,
+    /// The most processes a Vessel may ask for.
+    pub max_pids: u64,
+    /// Whether a Vessel may ask to run without Landlock (`false`: refused).
+    pub allow_without_landlock: bool,
+    /// The API server; `None` is the in-cluster service account.
+    pub api: Option<KubeApiConf>,
+}
+
+/// A Kubernetes namespace name (an RFC 1123 label: lowercase letters,
+/// digits and `-`, at most 63, starting and ending with a letter or digit).
+pub fn valid_kube_namespace(s: &str) -> bool {
+    s.len() <= 63 && !s.contains('.') && crate::kube::valid_name(s)
 }
 
 /// The daemon's configuration (JSON).
@@ -303,7 +482,9 @@ pub struct Config {
     /// Databases (paths in the dataset) whose quiescence is checked at
     /// each Seal.
     pub quiescence: Vec<String>,
-    /// The Vessels to run.
+    /// Where the Vessels come from.
+    pub source: SourceConf,
+    /// The Vessels to run (a static source; empty for any other).
     pub vessels: Vec<VesselConf>,
 }
 
@@ -364,6 +545,111 @@ fn bool_or(v: &Value, key: &str, default: bool) -> Result<bool, ConfigError> {
     }
 }
 
+/// Refuse keys of `v` not in `keys`: in objects where a misspelt key
+/// would quietly loosen a bound.
+fn only_keys(v: &Value, what: &str, keys: &[&str]) -> Result<(), ConfigError> {
+    let o = v.as_object().ok_or_else(|| bad(format!("{what:?} must be an object")))?;
+    match o.keys().find(|k| !keys.contains(&k.as_str())) {
+        Some(k) => Err(bad(format!("{what:?}: unknown key {k:?}"))),
+        None => Ok(()),
+    }
+}
+
+/// An optional integer of at least 1.
+fn opt_positive(v: &Value, key: &str) -> Result<Option<u64>, ConfigError> {
+    match opt_u64(v, key)? {
+        Some(0) => Err(bad(format!("{key:?} must be at least 1"))),
+        n => Ok(n),
+    }
+}
+
+/// An optional array of strings (`None` if absent).
+fn opt_strings(v: &Value, key: &str) -> Result<Option<Vec<String>>, ConfigError> {
+    if v.get(key).is_none() {
+        return Ok(None);
+    }
+    strings(v, key).map(Some)
+}
+
+/// A Vessel's own `"runtime"` in a static config.
+fn vessel_runtime(r: &Value) -> Result<VesselRuntime, ConfigError> {
+    only_keys(r, "runtime", &["rootfs", "args", "env", "landlock", "memory_bytes", "pids", "quiescence"])?;
+    Ok(VesselRuntime {
+        rootfs: if r.get("rootfs").is_some() { Some(abs_path(r, "rootfs")?) } else { None },
+        args: opt_strings(r, "args")?,
+        env: opt_strings(r, "env")?,
+        landlock: match r.get("landlock") {
+            None => None,
+            Some(x) => Some(x.as_bool().ok_or_else(|| bad("\"landlock\" must be true or false"))?),
+        },
+        memory_bytes: opt_positive(r, "memory_bytes")?,
+        pids: opt_positive(r, "pids")?,
+        quiescence: opt_strings(r, "quiescence")?,
+    })
+}
+
+/// The `"kubernetes"` source.
+fn kube_source(k: &Value, rt: &RuntimeConf) -> Result<KubeSourceConf, ConfigError> {
+    only_keys(k, "kubernetes", &["node", "tenants", "rootfs_dir", "max_memory_bytes", "max_pids", "allow_without_landlock", "api"])?;
+    let node = string(k, "node")?;
+    if !crate::kube::valid_name(&node) {
+        return Err(bad(format!("kubernetes.node {node:?} is not a valid node name")));
+    }
+    let mut tenants = std::collections::BTreeMap::new();
+    let mut owner: std::collections::BTreeMap<[u8; 16], String> = std::collections::BTreeMap::new();
+    match field(k, "tenants")? {
+        Value::Object(o) if !o.is_empty() => {
+            for (ns, t) in o {
+                if !valid_kube_namespace(ns) {
+                    return Err(bad(format!("kubernetes.tenants: {ns:?} is not a valid namespace name")));
+                }
+                let t = t.as_str().ok_or_else(|| bad(format!("kubernetes.tenants.{ns}: must be 32 hex digits")))?;
+                let tenant = namespace(t)?;
+                if let Some(other) = owner.insert(*tenant.as_bytes(), ns.clone()) {
+                    return Err(bad(format!("kubernetes.tenants: {other:?} and {ns:?} map to the same tenant (one namespace per tenant)")));
+                }
+                tenants.insert(ns.clone(), tenant);
+            }
+        }
+        _ => return Err(bad("kubernetes.tenants must map at least one namespace to its tenant")),
+    }
+    let max = |key: &str| -> Result<u64, ConfigError> {
+        opt_positive(k, key)?.ok_or_else(|| bad(format!("kubernetes.{key} is required (no unbounded agents from a cluster)")))
+    };
+    let (max_memory_bytes, max_pids) = (max("max_memory_bytes")?, max("max_pids")?);
+    if rt.memory_bytes.is_some_and(|m| m > max_memory_bytes) || rt.pids.is_some_and(|p| p > max_pids) {
+        return Err(bad("the node's runtime memory_bytes/pids are above kubernetes.max_memory_bytes/max_pids"));
+    }
+    let allow_without_landlock = bool_or(k, "allow_without_landlock", false)?;
+    if rt.landlock_shim.is_none() && !allow_without_landlock {
+        return Err(bad("kubernetes needs runtime.landlock_shim (or allow_without_landlock: true)"));
+    }
+    let api = match k.get("api") {
+        None => None,
+        Some(a) => {
+            only_keys(a, "api", &["url", "token_file", "ca_file"])?;
+            let url = string(a, "url")?;
+            if !url.starts_with("https://") {
+                return Err(bad("kubernetes.api.url must be https:// (the token goes with every request)"));
+            }
+            Some(KubeApiConf {
+                url,
+                token_file: abs_path(a, "token_file")?,
+                ca_file: if a.get("ca_file").is_some() { Some(abs_path(a, "ca_file")?) } else { None },
+            })
+        }
+    };
+    Ok(KubeSourceConf {
+        node,
+        tenants,
+        rootfs_dir: abs_path(k, "rootfs_dir")?,
+        max_memory_bytes,
+        max_pids,
+        allow_without_landlock,
+        api,
+    })
+}
+
 /// A namespace: 32 hex digits.
 fn namespace(s: &str) -> Result<Namespace, ConfigError> {
     let err = || bad(format!("namespace {s:?} must be 32 hex digits"));
@@ -394,7 +680,7 @@ impl Config {
         let root = Dataset::new(&string(&v, "root")?).map_err(|e| bad(e.to_string()))?;
         let r = field(&v, "runtime")?;
         let runtime = RuntimeConf {
-            rootfs: abs_path(r, "rootfs")?,
+            rootfs: if r.get("rootfs").is_some() { Some(abs_path(r, "rootfs")?) } else { None },
             host_uid_base: u32::try_from(field(r, "host_uid_base")?.as_u64().ok_or_else(|| bad("\"host_uid_base\" must be an integer"))?)
                 .map_err(|_| bad("\"host_uid_base\" is too large"))?,
             landlock_shim: match r.get("landlock_shim") {
@@ -406,11 +692,24 @@ impl Config {
             memory_bytes: opt_u64(r, "memory_bytes")?,
             pids: opt_u64(r, "pids")?,
         };
-        if runtime.args.is_empty() {
-            return Err(bad("\"runtime.args\" must name the agent"));
-        }
-        let vessels = match field(&v, "vessels")? {
-            Value::Array(a) => a
+        check_env(&runtime.env).map_err(|e| bad(format!("runtime: {e}")))?;
+        let source = match v.get("source") {
+            None => SourceConf::Static,
+            Some(Value::String(s)) if s == "static" => SourceConf::Static,
+            Some(s @ Value::Object(o)) if o.contains_key("kubernetes") => {
+                only_keys(s, "source", &["kubernetes"])?;
+                SourceConf::Kubernetes(kube_source(&o["kubernetes"], &runtime)?)
+            }
+            Some(_) => return Err(bad("\"source\" must be \"static\" or {\"kubernetes\": {...}}")),
+        };
+        let vessels = match (v.get("vessels"), &source) {
+            (None, SourceConf::Kubernetes(_)) => Vec::new(),
+            (Some(Value::Array(a)), SourceConf::Kubernetes(_)) if a.is_empty() => Vec::new(),
+            (Some(_), SourceConf::Kubernetes(_)) => {
+                return Err(bad("\"vessels\" and a kubernetes source exclude each other: the cluster lists the Vessels"))
+            }
+            (None, SourceConf::Static) => return Err(bad("missing \"vessels\"")),
+            (Some(Value::Array(a)), SourceConf::Static) => a
                 .iter()
                 .map(|x| {
                     Ok(VesselConf {
@@ -430,11 +729,17 @@ impl Config {
                                 _ => return Err(bad("\"restart\" must be \"never\", \"on-failure\" or \"always\"")),
                             },
                         },
+                        runtime: match x.get("runtime") {
+                            None => None,
+                            Some(r) => Some(Box::new(vessel_runtime(r)?)),
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, ConfigError>>()?,
-            _ => return Err(bad("\"vessels\" must be an array")),
+            (Some(_), SourceConf::Static) => return Err(bad("\"vessels\" must be an array")),
         };
+        let quiescence = strings(&v, "quiescence")?;
+        check_quiescence(&quiescence).map_err(bad)?;
         let mut ids = std::collections::BTreeSet::new();
         let mut slots = std::collections::BTreeMap::new();
         for vc in &vessels {
@@ -447,10 +752,7 @@ impl Config {
             if let Some(other) = slots.insert(vc.uid_slot, vc.subject.clone()) {
                 return Err(bad(format!("vessels {other:?} and {:?} share uid_slot {}", vc.subject, vc.uid_slot)));
             }
-        }
-        let quiescence = strings(&v, "quiescence")?;
-        if let Some(q) = quiescence.iter().find(|q| Path::new(q).is_absolute() || q.split('/').any(|c| c == "..")) {
-            return Err(bad(format!("quiescence path {q:?} must be relative to the dataset, without \"..\"")));
+            vc.effective(&runtime, &quiescence).map_err(|e| bad(format!("vessel {:?}: {e}", vc.subject)))?;
         }
         Ok(Self {
             warden: WardenId::new(warden),
@@ -477,6 +779,7 @@ impl Config {
             run_dir: abs_path(&v, "run_dir")?,
             runtime,
             quiescence,
+            source,
             vessels,
         })
     }
@@ -713,6 +1016,8 @@ pub enum DaemonError {
     Io(String),
     /// Held by another Warden.
     Refused(String),
+    /// Its runtime is incomplete or wrong ([`VesselConf::effective`]).
+    Runtime(String),
 }
 
 impl fmt::Display for DaemonError {
@@ -722,6 +1027,7 @@ impl fmt::Display for DaemonError {
             Self::Coord(e) => write!(f, "coordinator: {e}"),
             Self::Io(e) => write!(f, "{e}"),
             Self::Refused(e) => write!(f, "refused: {e}"),
+            Self::Runtime(e) => write!(f, "runtime: {e}"),
         }
     }
 }
@@ -901,6 +1207,8 @@ impl Node {
     /// session), and the run ends as on an agent exit, with
     /// [`Report::stopped`] set.
     pub fn run_vessel_until(&self, vc: &VesselConf, stop: &Stop) -> Result<Report, DaemonError> {
+        // Before anything touches the coordinator or the dataset.
+        let rt = vc.effective(&self.config.runtime, &self.config.quiescence).map_err(DaemonError::Runtime)?;
         let (mut vessel, start, mut verdict) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
@@ -941,8 +1249,7 @@ impl Node {
             .map_err(|e| DaemonError::Io(e.to_string()))?
             .and_then(|i| i.mountpoint)
             .ok_or_else(|| DaemonError::Io(format!("{} is not mounted", vessel.dataset())))?;
-        let rt = &self.config.runtime;
-        let uid = vc.host_uid(rt).ok_or_else(|| DaemonError::Io(format!("uid_slot {} does not fit", vc.uid_slot)))?;
+        let uid = vc.host_uid(&self.config.runtime).ok_or_else(|| DaemonError::Io(format!("uid_slot {} does not fit", vc.uid_slot)))?;
         prepare_work_dir(&mount, uid).map_err(io("preparing the dataset"))?;
 
         let dir = self.config.run_dir.join(format!("v-{}", id_hex(id)));
@@ -1023,10 +1330,10 @@ impl Node {
         let stop = || exited.load(Ordering::SeqCst);
         while let Some(mut stream) = socket.accept_until(&stop, Duration::from_millis(20)).map_err(io("accept"))? {
             connections += 1;
-            let watch = if self.config.quiescence.is_empty() {
+            let watch = if rt.quiescence.is_empty() {
                 None
             } else {
-                let dbs: Vec<&str> = self.config.quiescence.iter().map(String::as_str).collect();
+                let dbs: Vec<&str> = rt.quiescence.iter().map(String::as_str).collect();
                 Some(Watch::new(&mount, &dbs).map_err(io("quiescence watch"))?)
             };
             let mut session = Session::new(&mut vessel, verdict.clone())?.with_effects(&mut effects).with_after_seal(&mut publisher);
@@ -1378,6 +1685,248 @@ mod tests {
         assert!(Config::parse("not json").is_err());
         let remote = with(|v| v["coordinator"] = serde_json::json!({ "remote": "/run/taso/coord.sock" })).unwrap();
         assert_eq!(remote.coordinator, CoordConf::Remote { socket: "/run/taso/coord.sock".into() });
+    }
+
+    // ── Per-Vessel runtime ──────────────────────────────────────────
+
+    fn effective_of(c: &Config, i: usize) -> Result<Effective, String> {
+        c.vessels[i].effective(&c.runtime, &c.quiescence)
+    }
+
+    #[test]
+    fn a_vessel_without_its_own_runtime_runs_with_the_nodes() {
+        let c = Config::parse(GOOD).unwrap();
+        assert_eq!(c.source, SourceConf::Static, "static by default");
+        assert_eq!(c.vessels[0].runtime, None);
+        let e = effective_of(&c, 0).unwrap();
+        assert_eq!(
+            e,
+            Effective {
+                rootfs: "/srv/taso/rootfs".into(),
+                args: vec!["/usr/bin/agent".into(), "--serve".into()],
+                env: vec![],
+                landlock_shim: Some("/usr/lib/taso/landlock".into()),
+                memory_bytes: Some(256 << 20),
+                pids: Some(64),
+                quiescence: vec!["state.db".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_vessels_own_runtime_replaces_each_field_it_sets() {
+        let c = with(|v| {
+            v["vessels"][0]["runtime"] = serde_json::json!({
+                "rootfs": "/srv/taso/images/a", "args": ["/bin/a"], "env": ["X=1"],
+                "landlock": false, "memory_bytes": 1024, "pids": 3, "quiescence": []
+            });
+            v["vessels"][1]["runtime"] = serde_json::json!({ "pids": 9 });
+        })
+        .unwrap();
+        let a = effective_of(&c, 0).unwrap();
+        assert_eq!(
+            a,
+            Effective {
+                rootfs: "/srv/taso/images/a".into(),
+                args: vec!["/bin/a".into()],
+                env: vec!["X=1".into()],
+                landlock_shim: None,
+                memory_bytes: Some(1024),
+                pids: Some(3),
+                quiescence: vec![],
+            }
+        );
+        let b = effective_of(&c, 1).unwrap();
+        assert_eq!(b.pids, Some(9));
+        assert_eq!((b.rootfs.as_path(), b.memory_bytes), (Path::new("/srv/taso/rootfs"), Some(256 << 20)), "the rest is the node's");
+        assert_eq!(b.landlock_shim.as_deref(), Some("/usr/lib/taso/landlock"));
+    }
+
+    #[test]
+    fn landlock_asked_for_on_a_node_without_a_shim_is_refused() {
+        let mut rt = Config::parse(GOOD).unwrap().runtime;
+        rt.landlock_shim = None;
+        let vc = |landlock| VesselConf {
+            namespace: Namespace::from_bytes([1; 16]),
+            subject: "a".into(),
+            takeover: false,
+            uid_slot: 0,
+            restart: Restart::Never,
+            runtime: Some(Box::new(VesselRuntime { landlock, ..Default::default() })),
+        };
+        let e = vc(Some(true)).effective(&rt, &[]).unwrap_err();
+        assert!(e.contains("no runtime.landlock_shim"), "{e}");
+        // Checked here too, not only by the parser: other sources build a
+        // VesselRuntime themselves.
+        for own in [VesselRuntime { memory_bytes: Some(0), ..Default::default() }, VesselRuntime { pids: Some(0), ..Default::default() }] {
+            let e = VesselConf { runtime: Some(Box::new(own)), ..vc(None) }.effective(&rt, &[]).unwrap_err();
+            assert!(e.contains("at least 1"), "{e}");
+        }
+        assert_eq!(vc(None).effective(&rt, &[]).unwrap().landlock_shim, None);
+        assert_eq!(vc(Some(false)).effective(&rt, &[]).unwrap().landlock_shim, None);
+    }
+
+    #[test]
+    fn a_node_without_rootfs_or_args_needs_them_from_every_vessel() {
+        let bare = |v: &mut Value| {
+            let r = v["runtime"].as_object_mut().unwrap();
+            r.remove("rootfs");
+            r.remove("args");
+        };
+        let e = with(bare).unwrap_err().to_string();
+        assert!(e.contains("vessel \"a\"") && e.contains("no rootfs"), "{e}");
+        let only_rootfs = with(|v| {
+            bare(v);
+            for i in 0..2 {
+                v["vessels"][i]["runtime"] = serde_json::json!({ "rootfs": "/r" });
+            }
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(only_rootfs.contains("no agent"), "{only_rootfs}");
+        let c = with(|v| {
+            bare(v);
+            for i in 0..2 {
+                v["vessels"][i]["runtime"] = serde_json::json!({ "rootfs": "/r", "args": ["/a"] });
+            }
+        })
+        .unwrap();
+        assert_eq!(c.runtime.rootfs, None);
+        assert!(effective_of(&c, 1).is_ok());
+    }
+
+    #[test]
+    fn bad_vessel_runtimes_are_refused() {
+        let cases: Vec<(&str, Value)> = vec![
+            ("relative rootfs", serde_json::json!({ "rootfs": "images/a" })),
+            ("empty args", serde_json::json!({ "args": [] })),
+            ("args not strings", serde_json::json!({ "args": [1] })),
+            ("NUL in args", serde_json::json!({ "args": ["/a\0b"] })),
+            ("env without =", serde_json::json!({ "env": ["X"] })),
+            ("env bad name", serde_json::json!({ "env": ["1X=1"] })),
+            ("env empty name", serde_json::json!({ "env": ["=1"] })),
+            ("env dash", serde_json::json!({ "env": ["A-B=1"] })),
+            ("NUL in env", serde_json::json!({ "env": ["X=a\0"] })),
+            ("landlock not bool", serde_json::json!({ "landlock": "no" })),
+            ("zero memory", serde_json::json!({ "memory_bytes": 0 })),
+            ("zero pids", serde_json::json!({ "pids": 0 })),
+            ("negative pids", serde_json::json!({ "pids": -1 })),
+            ("absolute db", serde_json::json!({ "quiescence": ["/etc/passwd"] })),
+            ("db outside", serde_json::json!({ "quiescence": ["a/../../x"] })),
+            ("empty db", serde_json::json!({ "quiescence": [""] })),
+            ("misspelt key", serde_json::json!({ "memory_byte": 1 })),
+            ("not an object", serde_json::json!(["/r"])),
+        ];
+        for (name, rt) in cases {
+            assert!(with(|v| v["vessels"][0]["runtime"] = rt.clone()).is_err(), "{name} was accepted");
+        }
+        assert!(with(|v| v["runtime"]["env"] = serde_json::json!(["bad name=1"])).is_err(), "the node's env is checked too");
+        assert!(with(|v| v["runtime"]["env"] = serde_json::json!(["OK_1=a=b"])).is_ok(), "= in the value is fine");
+    }
+
+    // ── The Kubernetes source ───────────────────────────────────────
+
+    const TENANT_A: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
+    const TENANT_B: &str = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+
+    fn kube(edit: impl FnOnce(&mut Value)) -> Result<Config, ConfigError> {
+        with(|v| {
+            v.as_object_mut().unwrap().remove("vessels");
+            v["source"] = serde_json::json!({ "kubernetes": {
+                "node": "worker-3",
+                "tenants": { "team-a": TENANT_A, "team-b": TENANT_B },
+                "rootfs_dir": "/srv/taso/rootfs",
+                "max_memory_bytes": 1u64 << 30,
+                "max_pids": 512
+            } });
+            edit(v);
+        })
+    }
+
+    #[test]
+    fn a_kubernetes_source_parses_with_safe_defaults() {
+        let c = kube(|_| {}).unwrap();
+        let SourceConf::Kubernetes(k) = &c.source else { panic!("{:?}", c.source) };
+        assert_eq!(k.node, "worker-3");
+        assert_eq!(k.tenants.len(), 2);
+        assert_eq!(k.tenants["team-a"], Namespace::from_bytes([0x0a; 16]));
+        assert_eq!(k.tenants["team-b"], Namespace::from_bytes([0x0b; 16]));
+        assert_eq!(k.rootfs_dir, PathBuf::from("/srv/taso/rootfs"));
+        assert_eq!((k.max_memory_bytes, k.max_pids), (1 << 30, 512));
+        assert!(!k.allow_without_landlock, "Landlock stays on unless the node allows otherwise");
+        assert_eq!(k.api, None, "in-cluster by default");
+        assert!(c.vessels.is_empty());
+
+        let c = kube(|v| {
+            v["vessels"] = serde_json::json!([]);
+            v["source"]["kubernetes"]["allow_without_landlock"] = true.into();
+            v["source"]["kubernetes"]["api"] =
+                serde_json::json!({ "url": "https://127.0.0.1:16443", "token_file": "/t", "ca_file": "/ca.crt" });
+        })
+        .unwrap();
+        let SourceConf::Kubernetes(k) = &c.source else { panic!() };
+        assert!(k.allow_without_landlock);
+        assert_eq!(
+            k.api,
+            Some(KubeApiConf { url: "https://127.0.0.1:16443".into(), token_file: "/t".into(), ca_file: Some("/ca.crt".into()) })
+        );
+        assert!(with(|v| v["source"] = "static".into()).is_ok());
+    }
+
+    #[test]
+    fn bad_kubernetes_sources_are_refused() {
+        type Edit = Box<dyn FnOnce(&mut Value)>;
+        let k = |f: fn(&mut Value)| -> Edit { Box::new(move |v: &mut Value| f(&mut v["source"]["kubernetes"])) };
+        let cases: Vec<(&str, &str, Edit)> = vec![
+            ("vessels too", "exclude each other", Box::new(|v| v["vessels"] = serde_json::json!([{ "namespace": TENANT_A, "subject": "a", "uid_slot": 0 }]))),
+            ("one tenant, two namespaces", "same tenant", k(|k| k["tenants"]["team-c"] = TENANT_A.into())),
+            ("no tenants", "at least one", k(|k| k["tenants"] = serde_json::json!({}))),
+            ("tenants not a map", "at least one", k(|k| k["tenants"] = serde_json::json!([TENANT_A]))),
+            ("bad tenant", "32 hex", k(|k| k["tenants"]["team-a"] = "0a".into())),
+            ("tenant not a string", "32 hex", k(|k| k["tenants"]["team-a"] = 1.into())),
+            ("namespace upper case", "namespace name", k(|k| k["tenants"]["Team-A"] = TENANT_A.into())),
+            ("namespace with a dot", "namespace name", k(|k| k["tenants"]["team.c"] = "0c".repeat(16).into())),
+            ("namespace too long", "namespace name", k(|k| k["tenants"]["n".repeat(64)] = "0c".repeat(16).into())),
+            ("no node", "missing \"node\"", k(|k| { k.as_object_mut().unwrap().remove("node"); })),
+            ("bad node", "node name", k(|k| k["node"] = "worker/3".into())),
+            ("relative rootfs_dir", "absolute", k(|k| k["rootfs_dir"] = "rootfs".into())),
+            ("no memory max", "max_memory_bytes is required", k(|k| { k.as_object_mut().unwrap().remove("max_memory_bytes"); })),
+            ("no pids max", "max_pids is required", k(|k| { k.as_object_mut().unwrap().remove("max_pids"); })),
+            ("zero pids max", "at least 1", k(|k| k["max_pids"] = 0.into())),
+            ("node default above max", "above", k(|k| k["max_pids"] = 63.into())),
+            ("plain http", "https://", k(|k| k["api"] = serde_json::json!({ "url": "http://10.0.0.1:6443", "token_file": "/t" }))),
+            ("relative token", "absolute", k(|k| k["api"] = serde_json::json!({ "url": "https://h:1", "token_file": "t" }))),
+            ("misspelt key", "unknown key", k(|k| k["allow_without_landlok"] = true.into())),
+            ("misspelt api key", "unknown key", k(|k| k["api"] = serde_json::json!({ "url": "https://h:1", "token_file": "/t", "ca": "/c" }))),
+            ("landlock not bool", "true or false", k(|k| k["allow_without_landlock"] = "yes".into())),
+            ("no shim", "landlock_shim", Box::new(|v| { v["runtime"].as_object_mut().unwrap().remove("landlock_shim"); })),
+            ("other source", "\"source\" must be", Box::new(|v| v["source"] = "etcd".into())),
+            ("extra source key", "unknown key", Box::new(|v| v["source"]["static"] = true.into())),
+        ];
+        for (name, want, edit) in cases {
+            match kube(edit) {
+                Ok(_) => panic!("{name} was accepted"),
+                Err(e) => assert!(e.to_string().contains(want), "{name}: {e} (wanted {want:?})"),
+            }
+        }
+        // Without a shim, a node that allows it may still take a cluster's Vessels.
+        assert!(kube(|v| {
+            v["runtime"].as_object_mut().unwrap().remove("landlock_shim");
+            v["source"]["kubernetes"]["allow_without_landlock"] = true.into();
+        })
+        .is_ok());
+        // A static config still needs its list.
+        assert!(with(|v| { v.as_object_mut().unwrap().remove("vessels"); }).unwrap_err().to_string().contains("missing \"vessels\""));
+    }
+
+    #[test]
+    fn kubernetes_namespace_names() {
+        for ok in ["a", "team-a", "a1", "1a", &"n".repeat(63)] {
+            assert!(valid_kube_namespace(ok), "{ok}");
+        }
+        for no in ["", "-a", "a-", "A", "a.b", "a_b", &"n".repeat(64), "a b"] {
+            assert!(!valid_kube_namespace(no), "{no}");
+        }
     }
 
     #[test]
