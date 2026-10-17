@@ -57,6 +57,8 @@ OUT=${OUT:-/root/taso-gate-p1-$(date +%Y%m%d-%H%M%S)}
 # Subjects are new on every run: with the hub's coordinator, Vessels of an
 # earlier run are still registered (and held by whichever Warden ended them).
 RUN=$(date +%Y%m%d%H%M%S)-$$
+# A Vessel that ran clean, as taso-wardend reports it (bin/taso-wardend.rs).
+export VESSEL_OK=' 0 publish failures, [0-9]+ segments pruned, 0 prune failures, agent ok$'
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
 for t in zfs runc ldd python3 cargo; do
@@ -169,10 +171,11 @@ PY
         [ -f "$m/turn-samples" ] && cat "$m/turn-samples" >> "$OUT/turn.samples"
         [ -f "$m/sim-stats.json" ] && cp "$m/sim-stats.json" "$OUT/warden-$r-${ds##*/}.json"
     done
-    # One line per Vessel; ok means agent ok and every Seal published.
-    local ok; ok=$(grep -c " 0 publish failures, agent ok$" "$OUT/warden-$r.out" || true)
+    # One line per Vessel (taso-wardend's report); ok means every Seal
+    # published, no prune failed, and the agent exited successfully.
+    local ok; ok=$(grep -cE "$VESSEL_OK" "$OUT/warden-$r.out" || true)
     echo "warden run $r: exit $rc, $ok of $P Vessels ok"
-    grep -v " 0 publish failures, agent ok$" "$OUT/warden-$r.out" | grep -E "^gate-p1-" | head -5 || true
+    grep -vE "$VESSEL_OK" "$OUT/warden-$r.out" | grep -E "^gate-p1-" | head -5 || true
 }
 
 : > "$OUT/bare.samples"
@@ -207,7 +210,7 @@ for f in glob.glob(os.path.join(out, "warden-*.spans")):
 failed = sigbus = 0
 for f in glob.glob(os.path.join(out, "warden-*.out")):
     lines = [l for l in open(f) if l.startswith("gate-p1-")]
-    failed += int(p) - sum(1 for l in lines if l.rstrip().endswith(" 0 publish failures, agent ok"))
+    failed += int(p) - sum(1 for l in lines if re.search(os.environ["VESSEL_OK"], l.rstrip()))
 for f in glob.glob(os.path.join(out, "warden-*.err")) + glob.glob(os.path.join(out, "bare-*.err")):
     text = open(f, errors="replace").read()
     sigbus += len(re.findall(r"SIGBUS|signal: 7|Bus error", text))
