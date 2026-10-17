@@ -136,7 +136,7 @@ impl S3Store {
 
 /// A TLS client configuration that trusts exactly the CA certificates in
 /// the PEM file `ca`.
-fn tls_trusting(ca: &std::path::Path) -> io::Result<rustls::ClientConfig> {
+pub(crate) fn tls_trusting(ca: &std::path::Path) -> io::Result<rustls::ClientConfig> {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::CertificateDer;
     let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("CA file {}: {why}", ca.display()));
