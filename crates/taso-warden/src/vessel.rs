@@ -252,6 +252,12 @@ pub enum VesselError {
     /// Rebirth: a dataset of this Vessel is already here and is not a
     /// rebirth of this chain in progress.
     LocalState(String),
+    /// A birth Seal was asked for, but the Vessel already has a Seal.
+    AlreadySealed(Position),
+    /// A birth Seal was asked for, but records follow the Lineage record:
+    /// something ran without a Seal, and freezing that would make a
+    /// half-done state the level to step up from.
+    NotPristine(Position),
     /// Rebirth: a received snapshot is not the one the Seal was taken from.
     WrongSnapshot {
         /// The Seal.
@@ -285,6 +291,12 @@ impl fmt::Display for VesselError {
             Self::SealNotLocal(p) => write!(f, "the Seal at lsn {} was pruned from the local log", p.lsn.get()),
             Self::LayerMissing(p) => write!(f, "the layer of Seal {} is not on this node", p.lsn.get()),
             Self::NoSeal => write!(f, "vessel has no Seal"),
+            Self::AlreadySealed(p) => write!(f, "vessel already has a Seal (lsn {}): no birth Seal", p.lsn.get()),
+            Self::NotPristine(tail) => write!(
+                f,
+                "vessel has no Seal but records up to lsn {} after its Lineage: no birth Seal over unsealed work",
+                tail.lsn.get()
+            ),
             Self::SealNotLast { seal, tail } => write!(
                 f,
                 "last Seal is at lsn {} but the tail is at {}: seal first",
@@ -660,6 +672,10 @@ pub struct Succeeded<L: Layers> {
     pub predecessor: Vessel<L>,
 }
 
+/// The turn of the birth Seal ([`Vessel::seal_birth`]).  It belongs to
+/// the Warden: an agent's turns start at 1.
+pub const BIRTH_TURN: TurnId = TurnId::new(0);
+
 /// A succession that may have stopped after closing the predecessor
 /// (test hook for the crash point).
 type Partial<L> = (Option<Vessel<L>>, Vessel<L>);
@@ -799,6 +815,39 @@ impl<L: Layers> Vessel<L> {
     ) -> Result<Sealed, VesselError> {
         self.writable()?;
         Ok(self.chronicle.seal(cut, verdict, ledger_pos, turn)?)
+    }
+
+    /// Take the birth Seal: turn [`BIRTH_TURN`], an empty cut, ledger
+    /// position 0, `Clean`.  It freezes the state the Vessel was born
+    /// with (empty from the void; the parent's Seal for a fork or
+    /// succession) so that every Vessel has a Seal before its agent ever
+    /// runs: a restart always has a level to roll back to, and a Vessel is
+    /// reborn elsewhere even if it dies before its first turn.
+    ///
+    /// Only on a pristine Vessel: refused ([`VesselError::AlreadySealed`])
+    /// if it has a Seal, and ([`VesselError::NotPristine`]) if any record
+    /// follows the Lineage record.  A crash between birth and this Seal
+    /// leaves exactly the pristine case, so taking it again is the
+    /// recovery.
+    pub fn seal_birth(&mut self) -> Result<Sealed, VesselError> {
+        self.writable()?;
+        if let Some(s) = self.last_seal() {
+            return Err(VesselError::AlreadySealed(s));
+        }
+        let tail = self.tail();
+        if tail.lsn != Lsn::new(1) {
+            return Err(VesselError::NotPristine(tail));
+        }
+        Ok(self.chronicle.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), BIRTH_TURN)?)
+    }
+
+    /// Roll the state back to the newest Seal whose layer is here
+    /// ([`Chronicle::rollback_to_last_seal`]): what was written after it is
+    /// discarded.  Returns that Seal, or `None` if there is none.  The
+    /// caller must make sure nothing is writing (no agent running).
+    pub fn rollback(&mut self) -> Result<Option<Position>, VesselError> {
+        self.writable()?;
+        Ok(self.chronicle.rollback_to_last_seal()?)
     }
 
     /// Take a Seal, refused if `check` fails once the layer is frozen (see
@@ -993,6 +1042,8 @@ pub(crate) mod tests {
         snaps: BTreeMap<Lsn, HashVal>,
         /// Streams received into it, in order (rebirth).
         pub(crate) received: Vec<Vec<u8>>,
+        /// Every rollback, by target lsn.
+        pub(crate) rolled_back: Vec<Lsn>,
     }
 
     /// A Seal snapshot's guid in the fake pool: the same wherever it was
@@ -1071,6 +1122,7 @@ pub(crate) mod tests {
                     parent: Some(seal_hash),
                     snaps: BTreeMap::new(),
                     received: Vec::new(),
+                    rolled_back: Vec::new(),
                 },
             );
             Ok(self.info_of(target.as_str()).unwrap())
@@ -1136,6 +1188,7 @@ pub(crate) mod tests {
                     parent: Some(base.hash),
                     snaps,
                     received: vec![bytes],
+                    rolled_back: Vec::new(),
                 },
             );
             Ok(fake_guid(to.0))
@@ -1162,6 +1215,26 @@ pub(crate) mod tests {
                 d.snaps.remove(&lsn);
             }
             Ok(())
+        }
+        /// Like `zfs rollback`: the layer must be there with this hash,
+        /// and nothing later may exist.
+        fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+            let mut p = self.pool.0.borrow_mut();
+            let d = p.get_mut(&self.ds).ok_or("no dataset")?;
+            if d.snaps.get(&lsn) != Some(&hash) {
+                return Err(format!("no layer {} with that hash", lsn.get()).into());
+            }
+            if d.snaps.range(lsn.next()..).next().is_some() {
+                return Err("more recent layers exist".into());
+            }
+            d.rolled_back.push(lsn);
+            Ok(())
+        }
+    }
+
+    impl FakePool {
+        fn rolled_back(&self, ds: &Dataset) -> Vec<Lsn> {
+            self.0.borrow().get(ds.as_str()).map(|d| d.rolled_back.clone()).unwrap_or_default()
         }
     }
 
@@ -1199,6 +1272,98 @@ pub(crate) mod tests {
 
     fn seal<L: Layers>(v: &mut Vessel<L>) -> Position {
         v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(1)).unwrap().seal
+    }
+
+    // ── birth Seal and rollback ─────────────────────────────────────
+
+    fn seal_record<L: Layers>(v: &Vessel<L>, at: Position) -> taso_core::record::SealRecord {
+        let frames = v.frames().unwrap();
+        let f = frames.iter().find(|f| f.envelope.lsn == at.lsn).unwrap();
+        match Payload::decode(&f.payload).unwrap() {
+            Payload::Seal(s) => s,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A void-born Vessel's birth Seal: right after Lineage, turn 0, an
+    /// empty cut, Clean, with its layer.
+    #[test]
+    fn the_birth_seal_follows_lineage() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
+        let b = v.seal_birth().unwrap().seal;
+        assert_eq!(b.lsn, Lsn::new(2));
+        assert_eq!(v.last_seal(), Some(b));
+        let rec = seal_record(&v, b);
+        assert_eq!((rec.turn, rec.cut, rec.ledger_pos, rec.verdict), (BIRTH_TURN, StreamCut::EMPTY, Lsn::new(0), Verdict::Clean));
+        assert_eq!(rec.turn.get(), 0, "turn 0: an agent's turns start at 1");
+        assert_eq!(rec.parent, None, "the first Seal");
+        assert_eq!(v.chronicle().layers().list().unwrap(), vec![(b.lsn, b.hash)]);
+        // Kept across a reopen.
+        drop(v);
+        let (v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
+        assert_eq!(v.last_seal(), Some(b));
+    }
+
+    /// A fork's birth Seal freezes the parent's Seal state as its own
+    /// first layer.
+    #[test]
+    fn a_fork_takes_its_birth_seal() {
+        let e = env();
+        let (mut parent, _) = e.host.ensure(ns(1), b"parent").unwrap();
+        parent.append(Stream::Fs, raw(1)).unwrap();
+        let s = seal(&mut parent);
+        let mut child = e.host.fork(&parent, s, b"child").unwrap();
+        let b = child.seal_birth().unwrap().seal;
+        assert_eq!(b.lsn, Lsn::new(2));
+        assert_eq!(seal_record(&child, b).turn, BIRTH_TURN);
+        assert_eq!(child.chronicle().layers().list().unwrap(), vec![(b.lsn, b.hash)]);
+    }
+
+    /// Only once, and only before anything else was recorded.
+    #[test]
+    fn the_birth_seal_is_refused_unless_pristine() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
+        let b = v.seal_birth().unwrap().seal;
+        assert!(matches!(v.seal_birth(), Err(VesselError::AlreadySealed(p)) if p == b));
+
+        let (mut w, _) = e.host.ensure(ns(1), b"user-2").unwrap();
+        w.append(Stream::Transcript, raw(1)).unwrap();
+        match w.seal_birth() {
+            Err(VesselError::NotPristine(tail)) => assert_eq!(tail.lsn, Lsn::new(2)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(w.last_seal(), None, "nothing sealed");
+        assert!(w.chronicle().layers().list().unwrap().is_empty(), "no layer left behind");
+    }
+
+    /// Rollback goes to the last Seal (the birth Seal at first); with no
+    /// Seal there is nothing to roll back to.
+    #[test]
+    fn rollback_goes_to_the_last_seal_from_birth_on() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
+        assert_eq!(v.rollback().unwrap(), None);
+        assert!(e.host.pool.rolled_back(v.dataset()).is_empty());
+        let b = v.seal_birth().unwrap().seal;
+        v.append(Stream::Transcript, raw(1)).unwrap();
+        assert_eq!(v.rollback().unwrap(), Some(b));
+        let s = seal(&mut v);
+        assert_eq!(v.rollback().unwrap(), Some(s));
+        assert_eq!(e.host.pool.rolled_back(v.dataset()), vec![b.lsn, s.lsn]);
+    }
+
+    /// A closed Vessel neither takes a birth Seal nor rolls back.
+    #[test]
+    fn a_closed_vessel_refuses_birth_seal_and_rollback() {
+        let e = env();
+        let (mut old, _) = e.host.ensure(ns(1), b"user-old").unwrap();
+        seal(&mut old);
+        let Succeeded { predecessor: mut old, .. } = e.host.succeed(old, ns(1), b"user-new", auth(), false).unwrap();
+        assert!(matches!(old.seal_birth(), Err(VesselError::Closed { .. })));
+        assert!(matches!(old.rollback(), Err(VesselError::Closed { .. })));
+        assert!(e.host.pool.rolled_back(old.dataset()).is_empty());
     }
 
     // ── void birth and find ─────────────────────────────────────────
