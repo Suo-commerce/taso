@@ -18,8 +18,9 @@
 //! `--bare` runs the same writes with no Field at all: the baseline the
 //! gate compares against ("p95 write latency ≤ 1.5× bare local NVMe").
 //!
-//! At the end it writes `--stats` (JSON), and with `--samples` every
-//! commit's latency in microseconds (for quantiles across Vessels), and
+//! At the end it writes `--stats` (JSON), with `--samples` every commit's
+//! latency and with `--turn-samples` every TurnEnd's round trip, in
+//! microseconds (for quantiles across Vessels), and
 //! exits 0; any protocol or
 //! database error exits 1.  A SIGBUS kills it, which the runtime reports
 //! as a failed agent: the gate counts those.
@@ -47,6 +48,9 @@ struct Opts {
     /// Pause after each turn (an agent thinking), so a harness can catch
     /// it mid-run.
     turn_sleep_ms: u64,
+    /// Write every TurnEnd's round trip here (the agent's pause at the
+    /// turn boundary: Seal and publish), in microseconds, one per line.
+    turn_samples: Option<PathBuf>,
     /// Write every commit's latency here, in microseconds, one per line.
     samples: Option<PathBuf>,
 }
@@ -63,6 +67,7 @@ impl Default for Opts {
             bare: false,
             synchronous: "normal".into(),
             samples: None,
+            turn_samples: None,
             turn_sleep_ms: 0,
         }
     }
@@ -83,6 +88,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--stats" => o.stats = val()?.into(),
             "--bare" => o.bare = true,
             "--samples" => o.samples = Some(val()?.into()),
+            "--turn-samples" => o.turn_samples = Some(val()?.into()),
             "--turn-sleep-ms" => o.turn_sleep_ms = num(val()?)?,
             "--synchronous" => {
                 o.synchronous = val()?;
@@ -178,9 +184,11 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
             std::thread::sleep(Duration::from_millis(o.turn_sleep_ms));
         }
     }
-    if let Some(path) = &o.samples {
-        let text: String = writes.iter().map(|d| format!("{}\n", d.as_micros())).collect();
-        std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    for (path, v) in [(&o.samples, &writes), (&o.turn_samples, &turn_ends)] {
+        if let Some(path) = path {
+            let text: String = v.iter().map(|d| format!("{}\n", d.as_micros())).collect();
+            std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        }
     }
     let rows: i64 = db.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).map_err(|e| e.to_string())?;
     Ok(json!({
@@ -265,6 +273,7 @@ mod tests {
             bare: true,
             synchronous: "normal".into(),
             samples: Some(dir.path().join("samples")),
+            turn_samples: None,
             turn_sleep_ms: 1,
         };
         let st = run(&o, None).unwrap();
@@ -302,13 +311,15 @@ mod tests {
             }
             seen
         });
-        let o = Opts { turns: 3, txns: 1, rows: 1, row_bytes: 8, db: dir.path().join("s.db"), stats: dir.path().join("x"), bare: false, synchronous: "normal".into(), samples: None, turn_sleep_ms: 0 };
+        let o = Opts { turns: 3, txns: 1, rows: 1, row_bytes: 8, db: dir.path().join("s.db"), stats: dir.path().join("x"), bare: false, synchronous: "normal".into(), samples: None, turn_samples: Some(dir.path().join("turns")), turn_sleep_ms: 0 };
         let st = run(&o, Some(&sock)).unwrap();
         let seen = warden.join().unwrap();
         assert_eq!(st["resumed_after"], 5);
         assert_eq!(st["turns"], json!([6, 8]));
         assert_eq!((st["sealed"].clone(), st["not_sealed"].clone()), (json!(2), json!(1)));
         assert_eq!(st["turn_end"]["n"], 3);
+        let turns = std::fs::read_to_string(dir.path().join("turns")).unwrap();
+        assert_eq!(turns.lines().filter(|l| l.parse::<u64>().is_ok()).count(), 3);
         let turn_ends: Vec<(u64, bool)> = seen
             .iter()
             .filter_map(|r| match r { Request::TurnEnd { turn, quiescent } => Some((*turn, *quiescent)), _ => None })

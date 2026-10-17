@@ -15,7 +15,8 @@
 #           on the host: the same writes with no Warden, no container.
 #   warden  taso-wardend with $P Vessels (fresh subjects each run), each
 #           running taso-sim under runc (+ the Landlock shim if LANDLOCK=1);
-#           every Seal is published to a local store.
+#           every Seal is published (a local store directory, or Garage
+#           with HUB=1).
 # Then it pools every commit latency (bare and warden separately) and every
 # seal.total sample across runs, and prints the three gate lines.
 #
@@ -31,6 +32,10 @@
 #   SYNC (normal)       SQLite synchronous= for both bare and warden
 #   LANDLOCK (1)        run the agent through taso-landlock
 #   BATCHED (1)         batched Seal snapshots
+#   HUB (0)             1: the hub's coordinator (/run/taso/coord.sock) and
+#                       Garage (/root/taso-s3.env), as on the gate machines
+#                       (gate-cloud/node-setup.sh); 0: an in-process
+#                       coordinator and a local store directory
 #   OUT (/root/taso-gate-p1-<time>)   results directory (kept)
 #   KEEP (0)            keep the datasets and work dir for inspection
 
@@ -46,8 +51,14 @@ ROW_BYTES=${ROW_BYTES:-512}
 SYNC=${SYNC:-normal}
 LANDLOCK=${LANDLOCK:-1}
 BATCHED=${BATCHED:-1}
+HUB=${HUB:-0}
 KEEP=${KEEP:-0}
 OUT=${OUT:-/root/taso-gate-p1-$(date +%Y%m%d-%H%M%S)}
+# Subjects are new on every run: with the hub's coordinator, Vessels of an
+# earlier run are still registered (and held by whichever Warden ended them).
+RUN=$(date +%Y%m%d%H%M%S)-$$
+# A Vessel that ran clean, as taso-wardend reports it (bin/taso-wardend.rs).
+export VESSEL_OK=' 0 publish failures, [0-9]+ segments pruned, 0 prune failures, agent ok$'
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
 for t in zfs runc ldd python3 cargo; do
@@ -75,6 +86,20 @@ cleanup() {
 trap cleanup EXIT
 
 SIM_ARGS=(--turns "$TURNS" --txns "$TXNS" --rows "$ROWS" --row-bytes "$ROW_BYTES" --synchronous "$SYNC")
+
+if [ "$HUB" = 1 ]; then
+    [ -S /run/taso/coord.sock ] && [ -f /root/taso-s3.env ] || { echo "HUB=1 needs /run/taso/coord.sock and /root/taso-s3.env" >&2; exit 2; }
+    # shellcheck disable=SC1091
+    set -a; . /root/taso-s3.env; set +a
+    (umask 077; printf %s "$TASO_S3_SECRET" > "$WORK/s3.secret")
+    COORD_JSON='{"remote": "/run/taso/coord.sock"}'
+    STORE_JSON=$(python3 -c "import json; print(json.dumps({'s3': {'endpoint': '$TASO_S3_ENDPOINT', 'bucket': '$TASO_S3_BUCKET', 'access_key_id': '$TASO_S3_KEY_ID', 'secret_key_file': '$WORK/s3.secret'}}))")
+    PREFIX="gate-p1-$$"
+else
+    COORD_JSON="{\"local\": \"$WORK/coord.redb\"}"
+    STORE_JSON="\"$WORK/store\""
+    PREFIX="vessels"
+fi
 
 # ── rootfs: taso-sim, taso-landlock and their libraries ───────────────
 ROOTFS=$WORK/rootfs
@@ -116,13 +141,14 @@ run_warden() {   # $1 = run number
     python3 - "$cfg" "$r" <<PY
 import json, sys
 cfg, r = sys.argv[1], sys.argv[2]
-args = ["/usr/bin/taso-sim"] + "${SIM_ARGS[*]}".split() + ["--samples", "/work/samples", "--stats", "/work/sim-stats.json"]
+args = ["/usr/bin/taso-sim"] + "${SIM_ARGS[*]}".split() + ["--samples", "/work/samples", "--turn-samples", "/work/turn-samples", "--stats", "/work/sim-stats.json"]
 json.dump({
     "warden": 1,
-    "coordinator": {"local": "$WORK/coord.redb"},
+    "coordinator": json.loads('$COORD_JSON'),
     "root": "$root",
     "state_dir": "$WORK/w-$r/state",
-    "store": "$WORK/store",
+    "store": json.loads('$STORE_JSON'),
+    "prefix": "$PREFIX",
     "run_dir": "$WORK/w-$r/run",
     "batched_snapshots": "$BATCHED" == "1",
     "runtime": {
@@ -133,7 +159,7 @@ json.dump({
         "memory_bytes": 268435456,
         "pids": 64,
     },
-    "vessels": [{"namespace": "70" * 16, "subject": f"gate-p1-r{r}-v{i}", "uid_slot": i} for i in range($P)],
+    "vessels": [{"namespace": "70" * 16, "subject": f"gate-p1-$RUN-r{r}-v{i}", "uid_slot": i} for i in range($P)],
 }, open(cfg, "w"), indent=1)
 PY
     local rc=0
@@ -142,16 +168,19 @@ PY
     for ds in $(zfs list -H -o name -d 1 "$root" | tail -n +2); do
         local m; m=$(mount_of "$ds")
         [ -f "$m/samples" ] && cat "$m/samples" >> "$OUT/warden.samples"
+        [ -f "$m/turn-samples" ] && cat "$m/turn-samples" >> "$OUT/turn.samples"
         [ -f "$m/sim-stats.json" ] && cp "$m/sim-stats.json" "$OUT/warden-$r-${ds##*/}.json"
     done
-    # One line per Vessel; ok means agent ok and every Seal published.
-    local ok; ok=$(grep -c " 0 publish failures, agent ok$" "$OUT/warden-$r.out" || true)
+    # One line per Vessel (taso-wardend's report); ok means every Seal
+    # published, no prune failed, and the agent exited successfully.
+    local ok; ok=$(grep -cE "$VESSEL_OK" "$OUT/warden-$r.out" || true)
     echo "warden run $r: exit $rc, $ok of $P Vessels ok"
-    grep -v " 0 publish failures, agent ok$" "$OUT/warden-$r.out" | grep -E "^gate-p1-" | head -5 || true
+    grep -vE "$VESSEL_OK" "$OUT/warden-$r.out" | grep -E "^gate-p1-" | head -5 || true
 }
 
 : > "$OUT/bare.samples"
 : > "$OUT/warden.samples"
+: > "$OUT/turn.samples"
 for r in $(seq 1 "$RUNS"); do
     run_bare "$r"
     run_warden "$r"
@@ -169,14 +198,19 @@ def q(v, x):
 def load(name):
     return [int(l) / 1000 for l in open(os.path.join(out, name)) if l.strip()]
 
-bare, warden = load("bare.samples"), load("warden.samples")
-seals = []
+bare, warden, turn = load("bare.samples"), load("warden.samples"), load("turn.samples")
+seals, publish = [], []
 for f in glob.glob(os.path.join(out, "warden-*.spans")):
-    seals += [int(l.split()[1]) / 1000 for l in open(f) if l.startswith("seal.total ")]
+    for l in open(f):
+        name, us = l.split()
+        if name == "seal.total":
+            seals.append(int(us) / 1000)
+        elif name == "publish.total":
+            publish.append(int(us) / 1000)
 failed = sigbus = 0
 for f in glob.glob(os.path.join(out, "warden-*.out")):
     lines = [l for l in open(f) if l.startswith("gate-p1-")]
-    failed += int(p) - sum(1 for l in lines if l.rstrip().endswith(" 0 publish failures, agent ok"))
+    failed += int(p) - sum(1 for l in lines if re.search(os.environ["VESSEL_OK"], l.rstrip()))
 for f in glob.glob(os.path.join(out, "warden-*.err")) + glob.glob(os.path.join(out, "bare-*.err")):
     text = open(f, errors="replace").read()
     sigbus += len(re.findall(r"SIGBUS|signal: 7|Bus error", text))
@@ -186,8 +220,9 @@ print(f"P1 gate, agent taso-sim (stand-in for Hermes state.db): {runs} runs x p{
       f"{txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}, batched={batched}")
 print(f"commits: bare {len(bare)}, warden {len(warden)} (expected {expected} each)")
 print(f"{'':10} {'p50 ms':>9} {'p95 ms':>9} {'p99 ms':>9} {'max ms':>9}")
-for name, v in [("bare", bare), ("warden", warden), ("seal", seals)]:
+for name, v in [("bare", bare), ("warden", warden), ("seal", seals), ("publish", publish), ("turn pause", turn)]:
     print(f"{name:10} {q(v, .5):9.3f} {q(v, .95):9.3f} {q(v, .99):9.3f} {q(v, 1):9.3f}")
+print("(seal: snapshot + record; publish: ship + anchor; turn pause: the agent's TurnEnd round trip, both and the socket)")
 ratio = q(warden, .95) / q(bare, .95) if bare and warden else float("nan")
 ok1 = sigbus == 0 and failed == 0
 ok2 = ratio <= 1.5 and len(warden) == expected
@@ -195,5 +230,18 @@ ok3 = q(seals, .95) < 50
 print(f"1. SIGBUS: {sigbus} (failed agents: {failed}) -> {'PASS' if ok1 else 'FAIL'}")
 print(f"2. write p95 warden/bare: {ratio:.2f} (<= 1.5) -> {'PASS' if ok2 else 'FAIL'}")
 print(f"3. Seal p95: {q(seals, .95):.1f} ms (< 50) -> {'PASS' if ok3 else 'FAIL'}")
+# Where the time goes: every span the daemons recorded, pooled across runs
+# (seal.total = seal.snapshot + append.*; append.cas is the coordinator).
+spans = {}
+for f in glob.glob(os.path.join(out, "warden-*.spans")):
+    for l in open(f):
+        name, us = l.split()
+        spans.setdefault(name, []).append(int(us) / 1000)
+print(f"spans {'':12} {'n':>7} {'p50 ms':>9} {'p95 ms':>9} {'max ms':>9}")
+for name in sorted(spans):
+    v = spans[name]
+    print(f"  {name:<16} {len(v):>7} {q(v, .5):9.1f} {q(v, .95):9.1f} {q(v, 1):9.1f}")
 PY
+if [ "$HUB" = 1 ]; then where="hub coordinator over the network, Garage store"; else where="in-process coordinator, local store directory"; fi
+echo "coordinator and store: $where" | tee -a "$OUT/summary.txt"
 echo "results in $OUT"
