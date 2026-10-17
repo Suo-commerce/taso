@@ -133,7 +133,7 @@ json.dump({
         "memory_bytes": 268435456,
         "pids": 64,
     },
-    "vessels": [{"namespace": "70" * 16, "subject": f"gate-p1-r{r}-v{i}"} for i in range($P)],
+    "vessels": [{"namespace": "70" * 16, "subject": f"gate-p1-r{r}-v{i}", "uid_slot": i} for i in range($P)],
 }, open(cfg, "w"), indent=1)
 PY
     local rc=0

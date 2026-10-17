@@ -61,7 +61,7 @@ fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool) -> Co
             "memory_bytes": 268435456,
             "pids": 64
         },
-        "vessels": [{ "namespace": "07070707070707070707070707070707", "subject": "sim-1", "takeover": takeover }]
+        "vessels": [{ "namespace": "07070707070707070707070707070707", "subject": "sim-1", "takeover": takeover, "uid_slot": 3 }]
     });
     Config::parse(&v.to_string()).unwrap()
 }
@@ -72,6 +72,10 @@ fn stats(node: &Node) -> Value {
     let ds = format!("{}/v-{hex}", node.config.root);
     let mount = Command::new("zfs").args(["get", "-H", "-o", "value", "mountpoint", &ds]).output().unwrap();
     let mount = String::from_utf8(mount.stdout).unwrap();
+    // The dataset belongs to this Vessel's own uid range (slot 3), on every node.
+    let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(mount.trim()).unwrap());
+    assert_eq!(Some(owner), node.config.vessels[0].host_uid(&node.config.runtime));
+    assert_eq!(owner, 200_000 + 3 * 65_536);
     serde_json::from_str(&std::fs::read_to_string(Path::new(mount.trim()).join("sim-stats.json")).unwrap()).unwrap()
 }
 

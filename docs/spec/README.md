@@ -132,6 +132,17 @@ to the decision lists in the session handoffs.
     `IncompleteState(CutInvalid)`; the first Seal after a gap is
     `Unverified`, as before.
 
+20. **Each Vessel has its own uid range** (2026-10-17). A Vessel's entry
+    names a `uid_slot`; its user namespace maps ids 0..65536 to
+    `host_uid_base + slot·65536`, and the daemon refuses two Vessels on a
+    node with the same slot or a range that does not fit in 32 bits.
+    Vessels on one node can no longer read each other's files or signal
+    each other's processes through a shared host id. The dataset's files
+    are owned by host ids in the range and `zfs send` keeps them, so the
+    slot belongs to the Vessel, not to the node: it is the same on every
+    node the Vessel runs on. A fork or succession into another slot needs
+    its files moved into its range first (not yet built).
+
 ### Amendments already applied from the Phase 4 plan
 
 12. **Btrfs is not the fallback** (Phase 4 plan §9.1). If ZFS is

@@ -114,7 +114,7 @@ json.dump({
         "memory_bytes": 268435456,
         "pids": 64,
     },
-    "vessels": [{"namespace": "7a" * 16, "subject": subject, "takeover": takeover == "true"}],
+    "vessels": [{"namespace": "7a" * 16, "subject": subject, "takeover": takeover == "true", "uid_slot": 0}],
 }, open(out, "w"), indent=1)
 PY
 }
