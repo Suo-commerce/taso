@@ -108,23 +108,10 @@ impl<'v, L: Layers> Session<'v, L> {
             .chronicle()
             .frames()
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
-        let mut transcript = Lsn::new(0);
-        let mut ledger = Lsn::new(0);
-        let mut last_sealed_turn = None;
-        for f in &frames {
-            match f.envelope.stream {
-                Stream::Transcript => transcript = f.envelope.lsn,
-                Stream::Effect => ledger = f.envelope.lsn,
-                Stream::Ctl if Some(f.envelope.lsn) == vessel.last_seal().map(|s| s.lsn) => {
-                    let p = Payload::decode(&f.payload)
-                        .map_err(|error| VesselError::Decode { lsn: f.envelope.lsn, error })?;
-                    if let Payload::Seal(s) = p {
-                        last_sealed_turn = Some(s.turn.get());
-                    }
-                }
-                _ => {}
-            }
-        }
+        // From the newest Checkpoint on: older segments may be gone.
+        let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+        let (transcript, ledger) = (summary.transcript, summary.effect);
+        let last_sealed_turn = summary.seal.map(|s| s.turn.get());
         Ok(Self {
             vessel,
             greeted: false,

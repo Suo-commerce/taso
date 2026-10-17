@@ -58,7 +58,6 @@
 //!
 //! Normative references: v0.4 §3 (Lineage), §7.4 (barriers), §8; v1.0 §3.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,7 +66,7 @@ use taso_core::decode::DecodeError;
 use taso_core::envelope::{ChronicleHead, ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::{
-    vessel_id, Authority, LineageRecord, Namespace, OpId, Origin, OutcomeState, ParentSeal,
+    vessel_id, Authority, LineageRecord, Namespace, OpId, Origin, ParentSeal,
     Payload, StreamCut, SuccessionRecord, TurnId, Verdict,
 };
 
@@ -218,6 +217,9 @@ pub enum VesselError {
     },
     /// The position is not an accepted Seal of that Vessel.
     NotASeal(Position),
+    /// The Seal's record is no longer in the local log (its segment was
+    /// pruned after a Checkpoint); it is in the store.
+    SealNotLocal(Position),
     /// The Seal is accepted but its layer is not on this node.
     LayerMissing(Position),
     /// Succession needs a Seal, and the Vessel has none.
@@ -280,6 +282,7 @@ impl fmt::Display for VesselError {
                 write!(f, "vessel is closed; its state moved to {}", hex(successor))
             }
             Self::NotASeal(p) => write!(f, "lsn {} is not an accepted Seal", p.lsn.get()),
+            Self::SealNotLocal(p) => write!(f, "the Seal at lsn {} was pruned from the local log", p.lsn.get()),
             Self::LayerMissing(p) => write!(f, "the layer of Seal {} is not on this node", p.lsn.get()),
             Self::NoSeal => write!(f, "vessel has no Seal"),
             Self::SealNotLast { seal, tail } => write!(
@@ -292,7 +295,7 @@ impl fmt::Display for VesselError {
             Self::CrossNamespace => write!(f, "succession across namespaces was not allowed"),
             Self::EmptyAuthority => write!(f, "succession needs an actor and a reason"),
             Self::SelfSuccession => write!(f, "a vessel cannot succeed itself"),
-            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap and FsShipped records are reserved"),
+            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap, FsShipped and Checkpoint records are reserved"),
             Self::NotThisSeal(why) => write!(f, "not a Seal of this vessel: {why}"),
             Self::NothingShipped(id) => write!(f, "nothing of vessel {} is shipped and anchored", hex(id)),
             Self::ParentMissing(p) => write!(
@@ -732,11 +735,25 @@ impl<L: Layers> Vessel<L> {
         &self.chronicle
     }
 
-    /// Append a record.  Lineage, Succession, Gap and FsShipped records
-    /// are refused: only the Warden writes them, each at its own step.
+    /// Remove the oldest local segment files that are shipped, keeping
+    /// `keep_closed` closed ones, after a Checkpoint
+    /// ([`Chronicle::prune`]).
+    pub fn prune(&mut self, keep_closed: usize) -> Result<crate::chronicle::Pruned, VesselError> {
+        self.writable()?;
+        Ok(self.chronicle.prune(keep_closed)?)
+    }
+
+    /// Roll to a new segment file at `bytes` ([`Chronicle::set_roll_at`]).
+    pub fn set_roll_at(&mut self, bytes: u64) {
+        self.chronicle.set_roll_at(bytes);
+    }
+
+    /// Append a record.  Lineage, Succession, Gap, FsShipped and Checkpoint
+    /// records are refused: only the Warden writes them, each at its own
+    /// step.
     pub fn append(&mut self, stream: Stream, payload: Payload) -> Result<ChronicleHead, VesselError> {
         self.writable()?;
-        if matches!(payload, Payload::Lineage(_) | Payload::Succession(_) | Payload::Gap(_) | Payload::FsShipped(_)) {
+        if matches!(payload, Payload::Lineage(_) | Payload::Succession(_) | Payload::Gap(_) | Payload::FsShipped(_) | Payload::Checkpoint(_)) {
             return Err(VesselError::ReservedPayload);
         }
         Ok(self.chronicle.append(stream, payload)?)
@@ -747,7 +764,7 @@ impl<L: Layers> Vessel<L> {
     pub fn append_batch(&mut self, records: Vec<(Stream, Payload)>) -> Result<ChronicleHead, VesselError> {
         self.writable()?;
         if records.iter().any(|(_, p)| {
-            matches!(p, Payload::Lineage(_) | Payload::Succession(_) | Payload::Gap(_) | Payload::FsShipped(_))
+            matches!(p, Payload::Lineage(_) | Payload::Succession(_) | Payload::Gap(_) | Payload::FsShipped(_) | Payload::Checkpoint(_))
         }) {
             return Err(VesselError::ReservedPayload);
         }
@@ -861,21 +878,34 @@ fn decode(frame: &Frame) -> Result<Payload, VesselError> {
 /// Chronicle.  Refuses a second Lineage and anything after a Succession.
 fn read_lineage(frames: &[Frame]) -> Result<(LineageRecord, Option<SuccessionRecord>), VesselError> {
     let first = frames.first().ok_or(VesselError::NotAVessel("no records"))?;
-    if first.envelope.lsn != Lsn::new(1) || first.envelope.stream != Stream::Ctl {
-        return Err(VesselError::NotAVessel("lsn 1 is not a Ctl record"));
-    }
-    let Payload::Lineage(lineage) = decode(first)? else {
-        return Err(VesselError::NotAVessel("lsn 1 is not a Lineage record"));
+    // From lsn 1, or (older segments pruned) from the newest Checkpoint.
+    let (lineage, rest) = if first.envelope.lsn == Lsn::new(1) {
+        if first.envelope.stream != Stream::Ctl {
+            return Err(VesselError::NotAVessel("lsn 1 is not a Ctl record"));
+        }
+        let Payload::Lineage(lineage) = decode(first)? else {
+            return Err(VesselError::NotAVessel("lsn 1 is not a Lineage record"));
+        };
+        (lineage, &frames[1..])
+    } else {
+        let s = summary(frames)?;
+        match (s.from_checkpoint, s.lineage) {
+            (Some(_), Some(l)) => (l, frames),
+            _ => return Err(VesselError::NotAVessel("the log does not start at lsn 1 and holds no Checkpoint")),
+        }
     };
     let mut successor = None;
-    for (i, f) in frames.iter().enumerate().skip(1) {
+    for (i, f) in rest.iter().enumerate() {
         if f.envelope.stream != Stream::Ctl {
             continue;
         }
         match decode(f)? {
             Payload::Lineage(_) => return Err(VesselError::NotAVessel("a second Lineage record")),
+            Payload::Checkpoint(c) if c.lineage != lineage => {
+                return Err(VesselError::NotAVessel("a Checkpoint disagrees with the Lineage"))
+            }
             Payload::Succession(s) => {
-                if i + 1 != frames.len() {
+                if i + 1 != rest.len() {
                     return Err(VesselError::NotAVessel("records after a Succession record"));
                 }
                 successor = Some(s);
@@ -886,15 +916,28 @@ fn read_lineage(frames: &[Frame]) -> Result<(LineageRecord, Option<SuccessionRec
     Ok((lineage, successor))
 }
 
-/// The `ledger_pos` of the accepted Seal at `seal`, or `NotASeal`.
+/// The fold of `frames` ([`crate::summary`]).
+fn summary(frames: &[Frame]) -> Result<crate::summary::Summary, VesselError> {
+    crate::summary::Summary::of(frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })
+}
+
+/// The `ledger_pos` of the accepted Seal at `seal`: from its record, or
+/// from a Checkpoint if that is the Seal it names.  `SealNotLocal` if its
+/// record was pruned; `NotASeal` otherwise.
 fn seal_ledger_pos(frames: &[Frame], seal: Position) -> Result<Lsn, VesselError> {
-    let f = frames
-        .iter()
-        .find(|f| f.envelope.lsn == seal.lsn)
-        .filter(|f| f.envelope.hash == seal.hash && f.envelope.stream == Stream::Ctl)
-        .ok_or(VesselError::NotASeal(seal))?;
-    match decode(f)? {
-        Payload::Seal(s) => Ok(s.ledger_pos),
+    if let Some(f) = frames.iter().find(|f| f.envelope.lsn == seal.lsn) {
+        if f.envelope.hash != seal.hash || f.envelope.stream != Stream::Ctl {
+            return Err(VesselError::NotASeal(seal));
+        }
+        return match decode(f)? {
+            Payload::Seal(s) => Ok(s.ledger_pos),
+            _ => Err(VesselError::NotASeal(seal)),
+        };
+    }
+    let s = summary(frames)?;
+    match s.seal {
+        Some(c) if c.lsn == seal.lsn && c.hash == seal.hash => Ok(c.ledger_pos),
+        _ if frames.first().is_some_and(|f| seal.lsn < f.envelope.lsn) => Err(VesselError::SealNotLocal(seal)),
         _ => Err(VesselError::NotASeal(seal)),
     }
 }
@@ -902,24 +945,7 @@ fn seal_ledger_pos(frames: &[Frame], seal: Position) -> Result<Lsn, VesselError>
 /// Effects whose intent set a barrier and whose latest outcome is not
 /// terminal (`ConfirmedApplied` / `ConfirmedNotApplied`), in op order.
 fn open_obligations(frames: &[Frame]) -> Result<Vec<OpId>, VesselError> {
-    let mut open: BTreeMap<OpId, bool> = BTreeMap::new();
-    for f in frames.iter().filter(|f| f.envelope.stream == Stream::Effect) {
-        match decode(f)? {
-            Payload::Intent(i) if i.barrier.is_some() => {
-                open.entry(i.op).or_insert(true);
-            }
-            Payload::Outcome(o) => {
-                if let Some(is_open) = open.get_mut(&o.op) {
-                    *is_open = !matches!(
-                        o.state,
-                        OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(open.into_iter().filter(|&(_, o)| o).map(|(op, _)| op).collect())
+    Ok(summary(frames)?.open.into_iter().filter(|(_, e)| e.intent.barrier.is_some()).map(|(op, _)| op).collect())
 }
 
 fn hex(id: &ChronicleId) -> String {
@@ -931,6 +957,8 @@ fn hex(id: &ChronicleId) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use taso_core::record::OutcomeState;
     use crate::coordinator::Coordinator;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1393,6 +1421,35 @@ pub(crate) mod tests {
             }
         }
 
+        /// After a prune that removed the newest FsShipped record, the next
+        /// Seal still ships incrementally from the last named one (the
+        /// Checkpoint carries it), the log pack starts where the store
+        /// ends, and the store's chain holds the whole history.
+        #[test]
+        fn publish_after_a_prune_ships_from_the_checkpoint() {
+            let p = penv(vessel_id(ns(1), b"user-1"));
+            let (mut v, s1) = sealed(&p);
+            v.publish_seal(&p.packs, &snap(&v, s1), None).unwrap();
+            v.set_roll_at(1);
+            for i in 0..3 {
+                v.append(Stream::Fs, raw(i)).unwrap();
+            }
+            let s2 = seal(&mut v);
+            let r2 = v.publish_seal(&p.packs, &snap(&v, s2), None).unwrap();
+            let pruned = v.prune(0).unwrap();
+            assert!(!pruned.removed.is_empty());
+            let first = v.frames().unwrap()[0].envelope.lsn;
+            assert!(first > r2.anchor.lsn, "the FsShipped record of s2 is gone locally");
+            v.append(Stream::Fs, raw(9)).unwrap();
+            let s3 = seal(&mut v);
+            let r3 = v.publish_seal(&p.packs, &snap(&v, s3), None).unwrap();
+            assert_eq!(r3.record.unwrap().base, StreamBase::Seal { lsn: s2.lsn, hash: s2.hash });
+            let c = p.packs.chain(Some(r3.anchor)).unwrap();
+            assert_eq!(c.frames.first().unwrap().envelope.lsn, Lsn::new(1), "the store has everything");
+            assert_eq!(c.frames.last().unwrap().envelope.lsn, v.tail().lsn);
+            assert_eq!(c.seals.iter().map(|s| s.fs.to).collect::<Vec<_>>(), vec![s1, s2, s3]);
+        }
+
         #[test]
         fn publish_ships_names_and_anchors() {
             let p = penv(vessel_id(ns(1), b"user-1"));
@@ -1680,6 +1737,63 @@ pub(crate) mod tests {
             panic!("expected OpenObligations")
         };
         assert_eq!(ops, vec![OpId::new(2)]);
+    }
+
+    /// After pruning, every reader still sees what the pruned records
+    /// said: the Vessel reopens (Lineage from the Checkpoint), an effect
+    /// whose intent was pruned is still open, the last sealed turn is
+    /// known, a fork from the last Seal works and one from an older pruned
+    /// Seal is refused as not local, and a Checkpoint cannot be appended
+    /// by hand.
+    #[test]
+    fn readers_see_through_a_prune() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let intent = Payload::Intent(IntentRecord {
+            op: OpId::new(7),
+            provider: "mail".into(),
+            request: b"to: a".to_vec(),
+            footprint: vec![],
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::UnsafeToRetry,
+            consequence: Consequence::Irreversible,
+            authority: vec![],
+            barrier: Some(BarrierId::new(7)),
+        });
+        v.append(Stream::Effect, intent).unwrap();
+        v.append(
+            Stream::Effect,
+            Payload::Outcome(OutcomeRecord { op: OpId::new(7), state: OutcomeState::OutcomeUnknown, evidence: None }),
+        )
+        .unwrap();
+        let old = v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(3), TurnId::new(4)).unwrap().seal;
+        let last = v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(3), TurnId::new(5)).unwrap().seal;
+        v.set_roll_at(1);
+        for i in 0..6 {
+            v.append(Stream::Fs, raw(i)).unwrap();
+        }
+        e.host.coord.advance_shipped(e.host.warden, v.id(), v.chronicle().epoch(), v.tail()).unwrap();
+        let p = v.prune(1).unwrap();
+        assert!(!p.removed.is_empty());
+        assert!(v.frames().unwrap()[0].envelope.lsn > last.lsn, "every Seal and the intent are pruned");
+        assert!(matches!(
+            v.append(Stream::Ctl, Payload::Checkpoint(Box::new(crate::summary::Summary::of(&v.frames().unwrap()).unwrap().checkpoint().unwrap()))),
+            Err(VesselError::ReservedPayload)
+        ));
+        let id = v.id();
+        drop(v);
+
+        let (mut v, _) = e.host.open(id).unwrap();
+        assert_eq!(v.lineage().origin, Origin::Void);
+        let s = crate::field::Session::new(&mut v, Verdict::Clean).unwrap();
+        assert_eq!(s.last_sealed_turn(), Some(5));
+        drop(s);
+        let (_, report) =
+            crate::effects::Effects::open(taso_field::adapter::Registry::new(), Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
+        assert_eq!(report.open, vec![OpId::new(7)], "the pruned intent is still open");
+        assert_eq!(open_obligations(&v.frames().unwrap()).unwrap(), vec![OpId::new(7)]);
+        e.host.fork(&v, last, b"child").unwrap();
+        assert!(matches!(e.host.fork(&v, old, b"child2"), Err(VesselError::SealNotLocal(p)) if p == old));
     }
 
     #[test]

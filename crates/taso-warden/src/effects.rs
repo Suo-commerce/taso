@@ -326,22 +326,13 @@ impl Effects {
             .chronicle()
             .frames()
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
-        let mut intents: BTreeMap<OpId, IntentRecord> = BTreeMap::new();
-        let mut latest: BTreeMap<OpId, OutcomeState> = BTreeMap::new();
-        for f in frames.iter().filter(|f| f.envelope.stream == Stream::Effect) {
-            match Payload::decode(&f.payload)
-                .map_err(|error| VesselError::Decode { lsn: f.envelope.lsn, error })?
-            {
-                Payload::Intent(i) => {
-                    self.next_op = self.next_op.max(i.op.get() + 1);
-                    intents.insert(i.op, i);
-                }
-                Payload::Outcome(o) => {
-                    latest.insert(o.op, o.state);
-                }
-                _ => {}
-            }
-        }
+        // From the newest Checkpoint on: older segments may be gone.
+        let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+        self.next_op = self.next_op.max(summary.next_op);
+        let intents: BTreeMap<OpId, IntentRecord> =
+            summary.open.iter().map(|(op, e)| (*op, e.intent.clone())).collect();
+        let latest: BTreeMap<OpId, OutcomeState> =
+            summary.open.iter().filter_map(|(op, e)| e.state.map(|s| (*op, s))).collect();
 
         let mut report = Reconciled::default();
         for (op, i) in intents {

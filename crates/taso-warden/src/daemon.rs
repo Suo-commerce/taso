@@ -463,7 +463,17 @@ pub struct SealPublisher {
     origin: Option<Snapshot>,
     /// Seals published.
     pub published: u64,
+    /// Segment files pruned after a publish.
+    pub pruned: u64,
+    /// Prunes that failed (the publish stood; the files stay for the next).
+    pub prune_failures: u64,
+    /// The last prune failure.
+    pub prune_error: Option<String>,
 }
+
+/// Closed segment files kept on local disk after a prune: the newest
+/// ones, for readers that start near the head.
+pub const KEEP_CLOSED: usize = 2;
 
 impl SealPublisher {
     /// Publish `seal` of `vessel`.
@@ -483,6 +493,15 @@ impl AfterSeal<ZfsLayers<Cli>> for SealPublisher {
     fn after_seal(&mut self, vessel: &mut Vessel<ZfsLayers<Cli>>, seal: Position) -> Result<(), String> {
         self.publish(vessel, seal)?;
         self.published += 1;
+        // What is shipped need not stay on local disk.  A failed prune
+        // leaves the files in place; the next publish tries again.
+        match vessel.prune(KEEP_CLOSED) {
+            Ok(p) => self.pruned += p.removed.len() as u64,
+            Err(e) => {
+                self.prune_failures += 1;
+                self.prune_error = Some(e.to_string());
+            }
+        }
         Ok(())
     }
 }
@@ -490,10 +509,8 @@ impl AfterSeal<ZfsLayers<Cli>> for SealPublisher {
 /// Whether the log already names a shipped `fs` section.
 fn has_fs_shipped(vessel: &Vessel<ZfsLayers<Cli>>) -> Result<bool, DaemonError> {
     let frames = vessel.chronicle().frames().map_err(|e| DaemonError::Io(format!("reading the log: {e}")))?;
-    Ok(frames.iter().any(|f| {
-        f.envelope.stream == taso_core::envelope::Stream::Ctl
-            && matches!(taso_core::record::Payload::decode(&f.payload), Ok(taso_core::record::Payload::FsShipped(_)))
-    }))
+    let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, e)| DaemonError::Io(format!("reading the log at lsn {}: {e}", lsn.get())))?;
+    Ok(summary.fs_shipped.is_some())
 }
 
 // ── Running a Vessel ────────────────────────────────────────────────
@@ -511,6 +528,10 @@ pub struct Report {
     pub published: u64,
     /// Publishes that failed (the Seal stood).
     pub publish_failures: u64,
+    /// Segment files pruned.
+    pub pruned: u64,
+    /// Prunes that failed, and the last reason.
+    pub prune_failures: (u64, Option<String>),
     /// Whether the agent exited successfully, and its stderr.
     pub agent: Option<(bool, String)>,
 }
@@ -642,7 +663,7 @@ impl Node {
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
         let mut publisher =
-            SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0 };
+            SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0, pruned: 0, prune_failures: 0, prune_error: None };
         // A crash between taking a Seal and publishing it: publish now.
         if let Some(seal) = vessel.last_seal() {
             if let Err(e) = publisher.publish(&mut vessel, seal) {
@@ -733,7 +754,7 @@ impl Node {
         if let Some((ok, err)) = &agent {
             self.log(vc, format_args!("agent exited {}{}", if *ok { "ok" } else { "with failure: " }, if *ok { "" } else { err.trim() }));
         }
-        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, agent })
+        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, pruned: publisher.pruned, prune_failures: (publisher.prune_failures, publisher.prune_error.clone()), agent })
     }
 }
 
