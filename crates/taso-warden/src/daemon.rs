@@ -605,16 +605,18 @@ pub struct SealPublisher {
 pub const KEEP_CLOSED: usize = 2;
 
 impl SealPublisher {
-    /// Publish `seal` of `vessel`.
-    pub fn publish(&mut self, vessel: &mut Vessel<ZfsLayers<Cli>>, seal: Position) -> Result<(), String> {
+    /// Publish `seal` of `vessel`.  `Ok(true)` if this call shipped it,
+    /// `Ok(false)` if an earlier one had (a retry: only the log and the
+    /// anchor were brought up to date).
+    pub fn publish(&mut self, vessel: &mut Vessel<ZfsLayers<Cli>>, seal: Position) -> Result<bool, String> {
         let snap = self
             .zfs
             .get(vessel.dataset(), seal.lsn)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Seal {} has no snapshot", seal.lsn.get()))?;
-        vessel.publish_seal(&self.packs, &snap, self.origin.as_ref()).map_err(|e| e.to_string())?;
+        let published = vessel.publish_seal(&self.packs, &snap, self.origin.as_ref()).map_err(|e| e.to_string())?;
         self.origin = None;
-        Ok(())
+        Ok(published.record.is_some())
     }
 }
 
@@ -923,10 +925,14 @@ impl Node {
         }
         let mut publisher =
             SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0, pruned: 0, prune_failures: 0, prune_error: None };
-        // A crash between taking a Seal and publishing it: publish now.
+        // A crash between taking a Seal and publishing it, or the birth
+        // Seal just taken: publish now.  Counted only if this shipped it (a
+        // Seal published before the restart is not published again).
         if let Some(seal) = vessel.last_seal() {
-            if let Err(e) = publisher.publish(&mut vessel, seal) {
-                self.log(vc, format_args!("publishing the last Seal (lsn {}) failed: {e}", seal.lsn.get()));
+            match publisher.publish(&mut vessel, seal) {
+                Ok(true) => publisher.published += 1,
+                Ok(false) => {}
+                Err(e) => self.log(vc, format_args!("publishing the last Seal (lsn {}) failed: {e}", seal.lsn.get())),
             }
         }
         let effects_publisher = PackPublisher::new(self.packs(id)?, self.coord.clone(), self.config.warden);
