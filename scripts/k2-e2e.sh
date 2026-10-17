@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# K2 end to end (design: claude/Taso_design_k2_2026-10-17.md, file 7):
+# taso-wardend runs Vessels from a real Kubernetes API server on real ZFS
+# and runc, and writes their status back.
+#
+# The API server is envtest's (etcd + kube-apiserver, Kubernetes 1.35, on
+# 127.0.0.1, token auth): a real API server with the real CRD validation,
+# field selectors and status subresource, without a cluster.  The Warden
+# runs on this host, as the DaemonSet pod would on a node.
+#
+# Rows (each PASS or FAIL in the summary; the script goes on after a FAIL):
+#   1. crd        the Vessel CRD applies; a resource changing its uidSlot is
+#                 refused by the API server (CEL)
+#   2. running    the good Vessels (two namespaces) reach Running, their
+#                 agents run and seal turns (snapshots on their datasets)
+#   3. refused    D1 (tenant of another namespace, an unmapped namespace),
+#                 D2 (rootfs through a symlink out of rootfs_dir), D3
+#                 (takeover), limits, Landlock off, a uid slot already bound:
+#                 each Refused with its reason; nothing runs for them
+#   4. elsewhere  a Vessel of another node: no status, nothing runs
+#   5. deleted    a deleted Vessel's agent is stopped and not started again;
+#                 the others run on
+#   6. kept       a running Vessel edited past a limit runs on, with the
+#                 same agent process, and its status says why
+#   7. sigterm    SIGTERM: the Warden stops every agent and exits 0; the last
+#                 status of each says it was stopped
+#   8. resumed    a new Warden opens the Vessels again (Open, no second
+#                 birth Seal): the state is rolled back to a Seal past the
+#                 birth Seal and the agent runs again
+#
+# Usage (root, on a node with runc, ZFS and cargo; downloads envtest once):
+#   TASO_ZFS_DATASET=tasotest/vessel scripts/k2-e2e.sh
+#
+# Environment: TASO_ZFS_DATASET (required)  OUT (/root/taso-k2-e2e-<time>)
+#              ENVTEST_DIR (/root/.cache/taso-envtest)  KEEP (0)
+set -uo pipefail
+
+: "${TASO_ZFS_DATASET:?set TASO_ZFS_DATASET to a dataset this test may use, e.g. tasotest/vessel}"
+OUT=${OUT:-/root/taso-k2-e2e-$(date +%Y%m%d-%H%M%S)}
+ENVTEST_DIR=${ENVTEST_DIR:-/root/.cache/taso-envtest}
+ENVTEST_VERSION=v1.35.0
+KEEP=${KEEP:-0}
+PORT=16443
+NODE=e2e-node
+TA=0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e   # tenant of team-a
+TB=0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f   # tenant of team-b
+
+[ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
+for t in zfs runc cargo curl openssl python3 ldd pgrep; do
+    command -v "$t" >/dev/null || { echo "$t is missing" >&2; exit 2; }
+done
+cd "$(dirname "$0")/.." || exit 2
+ROOT=$PWD
+mkdir -p "$OUT"
+
+declare -A RESULT
+pass() { RESULT[$1]="PASS${2:+  ($2)}"; echo "== $1: PASS${2:+ ($2)}"; }
+fail() { RESULT[$1]="FAIL  ($2)"; echo "== $1: FAIL ($2)"; }
+# wait_for <seconds> <command...>: until the command succeeds.
+wait_for() {
+    local end=$((SECONDS + $1)); shift
+    until "$@" >/dev/null 2>&1; do
+        [ "$SECONDS" -ge "$end" ] && return 1
+        sleep 0.5
+    done
+}
+
+# ── envtest: etcd + kube-apiserver ────────────────────────────────────
+B=$ENVTEST_DIR/controller-tools/envtest
+if [ ! -x "$B/kube-apiserver" ]; then
+    echo "== downloading envtest $ENVTEST_VERSION"
+    mkdir -p "$ENVTEST_DIR"
+    curl -fsSL -o "$ENVTEST_DIR/envtest.tgz" \
+        "https://github.com/kubernetes-sigs/controller-tools/releases/download/envtest-$ENVTEST_VERSION/envtest-$ENVTEST_VERSION-linux-amd64.tar.gz" \
+        && tar -C "$ENVTEST_DIR" -xzf "$ENVTEST_DIR/envtest.tgz" \
+        || { echo "envtest download failed" >&2; exit 2; }
+fi
+
+WORK=$(mktemp -d /var/tmp/taso-k2e2e.XXXXXX)
+chmod 755 "$WORK"
+API=$WORK/api
+mkdir -p "$API/certs"
+BASE="$TASO_ZFS_DATASET/k2e2e-$$"
+ETCD_PID="" APISERVER_PID="" WARDEN_PID=""
+cleanup() {
+    [ -n "$WARDEN_PID" ] && kill -KILL "$WARDEN_PID" 2>/dev/null
+    for c in $(runc --root "$WORK/run/runc" list -q 2>/dev/null); do runc --root "$WORK/run/runc" delete --force "$c" 2>/dev/null; done
+    [ -n "$APISERVER_PID" ] && kill "$APISERVER_PID" 2>/dev/null
+    [ -n "$ETCD_PID" ] && kill "$ETCD_PID" 2>/dev/null
+    wait 2>/dev/null
+    if [ "$KEEP" = 1 ]; then
+        echo "kept: dataset $BASE, work dir $WORK"
+    else
+        zfs destroy -r "$BASE" 2>/dev/null
+        rm -rf "$WORK"
+    fi
+}
+trap cleanup EXIT
+
+openssl genrsa -out "$API/sa.key" 2048 2>/dev/null
+openssl rsa -in "$API/sa.key" -pubout -out "$API/sa.pub" 2>/dev/null
+TOKEN=$(openssl rand -hex 24)
+echo "$TOKEN,admin,1,system:masters" > "$API/tokens.csv"
+printf %s "$TOKEN" > "$API/token"
+chmod 600 "$API/token" "$API/tokens.csv"
+"$B/etcd" --data-dir "$API/etcd" --listen-client-urls http://127.0.0.1:12379 --advertise-client-urls http://127.0.0.1:12379 \
+    --listen-peer-urls http://127.0.0.1:12380 >"$OUT/etcd.log" 2>&1 &
+ETCD_PID=$!
+sleep 2
+"$B/kube-apiserver" --etcd-servers=http://127.0.0.1:12379 --cert-dir="$API/certs" --secure-port=$PORT --bind-address=127.0.0.1 \
+    --service-account-issuer=https://taso.local --service-account-key-file="$API/sa.pub" --service-account-signing-key-file="$API/sa.key" \
+    --token-auth-file="$API/tokens.csv" --authorization-mode=RBAC --service-cluster-ip-range=10.96.0.0/16 >"$OUT/apiserver.log" 2>&1 &
+APISERVER_PID=$!
+CA=$API/certs/apiserver.crt
+K() { "$B/kubectl" --server=https://127.0.0.1:$PORT --token="$TOKEN" --certificate-authority="$CA" "$@"; }
+wait_for 60 K get --raw /readyz || { echo "the API server did not come up: see $OUT/apiserver.log" >&2; exit 2; }
+echo "== API server ready (envtest $ENVTEST_VERSION)"
+
+# ── 1. the CRD ────────────────────────────────────────────────────────
+K apply -f deploy/k8s/vessel-crd.yaml >"$OUT/crd.log" 2>&1
+wait_for 30 K get vessels -A
+for ns in team-a team-b team-c; do K create namespace "$ns" >/dev/null; done
+
+# ── binaries and the agent's rootfs ───────────────────────────────────
+echo "== building (release)"
+cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock || { echo "build failed" >&2; exit 2; }
+BIN=$ROOT/target/release
+RD=$WORK/rootfs                      # the node's rootfs_dir
+R=$RD/sim                            # the agent image
+copy_with_libs() { install -D -m 755 "$1" "$R$2"; ldd "$1" | grep -o '/[^ ]*' | while read -r l; do install -D -m 755 "$l" "$R$l"; done; }
+copy_with_libs "$BIN/taso-sim" /usr/bin/taso-sim
+copy_with_libs "$BIN/taso-landlock" /usr/lib/taso/landlock
+mkdir -p "$R"/{proc,dev,sys,tmp,work,run/taso}
+: >"$R/run/taso/field.sock"
+mkdir -p "$WORK/outside"
+ln -s "$WORK/outside" "$RD/escape"    # D2: a symlink out of rootfs_dir
+
+# vessel <ns> <name> <tenant> <slot> <sleep-ms> [extra spec yaml...]
+# Each agent sleeps a different number of ms per turn, so its process is
+# found by its command line.
+vessel() {
+    local ns=$1 name=$2 tenant=$3 slot=$4 ms=$5; shift 5
+    cat <<EOF
+apiVersion: taso.suocommerce.com/v1alpha1
+kind: Vessel
+metadata: { namespace: $ns, name: $name }
+spec:
+  tenant: "$tenant"
+  subject: $name
+  uidSlot: $slot
+  node: ${NODE_OF:-$NODE}
+  rootfs: { path: ${ROOTFS_OF:-$R} }
+  args: [/usr/bin/taso-sim, --turns, "1000000", --turn-sleep-ms, "$ms", --txns, "1", --rows, "1"]
+EOF
+    for extra in "$@"; do echo "  $extra"; done
+}
+agent() { pgrep -f "^/usr/bin/taso-sim --turns 1000000 --turn-sleep-ms $1 "; }
+phase() { K get vessel -n "$1" "$2" -o jsonpath='{.status.phase}'; }
+message() { K get vessel -n "$1" "$2" -o jsonpath='{.status.message}'; }
+is_phase() { [ "$(phase "$1" "$2")" = "$3" ]; }
+
+{
+    vessel team-a runner  $TA 1 101; echo ---
+    vessel team-b runner-b $TB 2 102; echo ---
+    vessel team-a doomed  $TA 3 103; echo ---
+    vessel team-a editme  $TA 4 104; echo ---
+    # Refused:
+    vessel team-a wrong-tenant $TB 10 110; echo ---
+    vessel team-c unmapped     $TA 11 111; echo ---
+    vessel team-a takeover     $TA 12 112 "takeover: { holder: 9, epoch: 3 }"; echo ---
+    ROOTFS_OF=$RD/escape vessel team-a escape $TA 13 113; echo ---
+    vessel team-a bigmem       $TA 14 114 "resources: { memory: 8Gi }"; echo ---
+    vessel team-a no-landlock  $TA 15 115 "landlock: false"; echo ---
+    NODE_OF=other-node vessel team-a elsewhere $TA 17 117
+} >"$WORK/vessels.yaml"
+K apply -f "$WORK/vessels.yaml" >"$OUT/vessels.log" 2>&1
+
+# The API server's own fence: uidSlot is fixed once set.
+if K patch vessel -n team-a runner --type merge -p '{"spec":{"uidSlot":5}}' >"$OUT/crd-immutable.log" 2>&1; then
+    fail crd "a uidSlot change was accepted by the API server"
+elif grep -q "uidSlot is fixed once set" "$OUT/crd-immutable.log"; then
+    pass crd "applied; a uidSlot change is refused by CEL"
+else
+    fail crd "a uidSlot change failed for another reason: see $OUT/crd-immutable.log"
+fi
+
+# ── the Warden ────────────────────────────────────────────────────────
+zfs create "$BASE"
+CONFIG=$WORK/wardend.json
+cat >"$CONFIG" <<EOF
+{
+  "warden": 1,
+  "coordinator": { "local": "$WORK/coord.redb" },
+  "root": "$BASE",
+  "state_dir": "$WORK/state",
+  "store": "$WORK/store",
+  "run_dir": "$WORK/run",
+  "runtime": {
+    "host_uid_base": 200000,
+    "landlock_shim": "/usr/lib/taso/landlock",
+    "memory_bytes": 268435456
+  },
+  "source": { "kubernetes": {
+    "node": "$NODE",
+    "tenants": { "team-a": "$TA", "team-b": "$TB" },
+    "rootfs_dir": "$RD",
+    "max_memory_bytes": 1073741824,
+    "max_pids": 256,
+    "api": { "url": "https://127.0.0.1:$PORT", "token_file": "$API/token", "ca_file": "$CA" }
+  } }
+}
+EOF
+start_warden() {   # $1 = log name
+    "$BIN/taso-wardend" "$CONFIG" >"$OUT/$1.log" 2>&1 &
+    WARDEN_PID=$!
+}
+start_warden warden-1
+
+# ── 2. running ────────────────────────────────────────────────────────
+good=(team-a/runner team-b/runner-b team-a/doomed team-a/editme)
+running_ok=1
+for v in "${good[@]}"; do
+    wait_for 60 is_phase "${v%/*}" "${v#*/}" Running || { running_ok=0; fail running "$v is $(phase "${v%/*}" "${v#*/}"): $(message "${v%/*}" "${v#*/}")"; break; }
+done
+if [ "$running_ok" = 1 ]; then
+    for ms in 101 102 103 104; do
+        wait_for 30 agent $ms || { running_ok=0; fail running "no agent process for turn sleep $ms ms"; break; }
+    done
+fi
+if [ "$running_ok" = 1 ]; then
+    # Each good Vessel has its own dataset, and its agent seals turns there.
+    sealed() { [ "$(zfs list -H -t snapshot -o name -r "$BASE" | grep -c '@taso-seal-')" -ge $((4 * 4)) ]; }
+    if wait_for 60 sealed; then
+        n=$(zfs list -H -o name -r "$BASE" | grep -c '/v-')
+        holder=$(K get vessel -n team-a runner -o jsonpath='{.status.holder}')
+        if [ "$n" = 4 ] && [ "$holder" = 1 ]; then
+            pass running "4 Vessels in 2 namespaces Running (holder 1), 4 datasets, sealing turns"
+        else
+            fail running "$n Vessel datasets (want 4), holder '$holder' (want 1)"
+        fi
+    else
+        fail running "the agents did not seal 3 turns each: $(zfs list -H -t snapshot -o name -r "$BASE" | grep -c '@taso-seal-') Seal snapshots"
+    fi
+fi
+
+# ── 3. refused ────────────────────────────────────────────────────────
+# A newcomer on runner's uid slot, once runner holds it (created together,
+# the guard would give the slot to the smaller Vessel id, either of them).
+vessel team-b clash $TB 1 116 | K apply -f - >>"$OUT/vessels.log" 2>&1
+refused_ok=1
+check_refused() {   # ns name reason-part sleep-ms
+    if ! wait_for 20 is_phase "$1" "$2" Refused; then
+        refused_ok=0; fail refused "$1/$2 is '$(phase "$1" "$2")': $(message "$1" "$2")"; return
+    fi
+    local m; m=$(message "$1" "$2")
+    case "$m" in *"$3"*) ;; *) refused_ok=0; fail refused "$1/$2: '$m' lacks '$3'"; return ;; esac
+    if agent "$4" >/dev/null; then refused_ok=0; fail refused "$1/$2 is refused but its agent runs"; fi
+}
+check_refused team-a wrong-tenant 'not the tenant of namespace "team-a"' 110
+[ "$refused_ok" = 1 ] && check_refused team-c unmapped 'not mapped to a tenant' 111
+[ "$refused_ok" = 1 ] && check_refused team-a takeover 'F1/F2' 112
+[ "$refused_ok" = 1 ] && check_refused team-a escape 'not inside this node' 113
+[ "$refused_ok" = 1 ] && check_refused team-a bigmem 'this node allows 1 to 1073741824' 114
+[ "$refused_ok" = 1 ] && check_refused team-a no-landlock 'does not allow agents without Landlock' 115
+[ "$refused_ok" = 1 ] && check_refused team-b clash 'uid_slot 1 is bound to another Vessel' 116
+[ "$refused_ok" = 1 ] && pass refused "D1 x2, D2 symlink escape, D3 takeover, memory, Landlock off, a bound uid slot: each Refused with its reason, none ran"
+[ -n "$(ls -A "$WORK/outside")" ] && fail refused "something was written through the escaping symlink"
+
+# ── 4. elsewhere ──────────────────────────────────────────────────────
+if [ -z "$(K get vessel -n team-a elsewhere -o jsonpath='{.status}')" ] && ! agent 117 >/dev/null; then
+    pass elsewhere "another node's Vessel: no status, no agent"
+else
+    fail elsewhere "status '$(K get vessel -n team-a elsewhere -o jsonpath='{.status}')', agent $(agent 117 || echo none)"
+fi
+
+# ── 5. deleted ────────────────────────────────────────────────────────
+if agent 103 >/dev/null; then
+    K delete vessel -n team-a doomed >/dev/null
+    gone() { ! agent 103; }
+    if wait_for 20 gone; then
+        sleep 6   # past the first restart backoffs
+        if agent 103 >/dev/null; then
+            fail deleted "the deleted Vessel's agent was started again"
+        elif agent 101 >/dev/null && agent 102 >/dev/null && agent 104 >/dev/null; then
+            pass deleted "its agent stopped and stayed stopped; the other three run on"
+        else
+            fail deleted "another agent stopped with it"
+        fi
+    else
+        fail deleted "the deleted Vessel's agent still runs after 20 s"
+    fi
+else
+    fail deleted "the Vessel to delete was not running"
+fi
+
+# ── 6. kept ───────────────────────────────────────────────────────────
+before=$(agent 104 | head -1)
+if [ -n "$before" ]; then
+    K patch vessel -n team-a editme --type merge -p '{"spec":{"resources":{"pids":9999}}}' >/dev/null
+    says_kept() { case "$(message team-a editme)" in *"running its last good spec"*"at most 256"*) return 0 ;; *) return 1 ;; esac; }
+    if wait_for 20 says_kept; then
+        sleep 3
+        after=$(agent 104 | head -1)
+        if [ "$after" = "$before" ] && is_phase team-a editme Running; then
+            pass kept "refused edit: same agent process ($before), Running, status says why"
+        else
+            fail kept "agent $before -> ${after:-none}, phase $(phase team-a editme)"
+        fi
+    else
+        fail kept "status message: $(message team-a editme)"
+    fi
+else
+    fail kept "the Vessel to edit was not running"
+fi
+
+# ── 7. sigterm ────────────────────────────────────────────────────────
+kill -TERM "$WARDEN_PID"
+code=""
+for _ in $(seq 1 60); do
+    if ! kill -0 "$WARDEN_PID" 2>/dev/null; then wait "$WARDEN_PID"; code=$?; break; fi
+    sleep 0.5
+done
+WARDEN_PID_DONE=$WARDEN_PID
+WARDEN_PID=""
+left=$(pgrep -f "^/usr/bin/taso-sim --turns 1000000" | tr '\n' ' ')
+if [ -z "$code" ]; then
+    fail sigterm "the Warden did not exit within 30 s of SIGTERM"
+    kill -KILL "$WARDEN_PID_DONE" 2>/dev/null
+elif [ "$code" != 0 ]; then
+    fail sigterm "exit status $code: see $OUT/warden-1.log"
+elif [ -n "$left" ]; then
+    fail sigterm "agents left running: $left"
+else
+    stopped_ok=1
+    for v in team-a/runner team-b/runner-b; do
+        is_phase "${v%/*}" "${v#*/}" Exited && [ "$(message "${v%/*}" "${v#*/}")" = "stopped on request" ] || { stopped_ok=0; fail sigterm "$v: $(phase "${v%/*}" "${v#*/}"): $(message "${v%/*}" "${v#*/}")"; break; }
+    done
+    # editme's refused edit still stands, so its message keeps saying so.
+    [ "$stopped_ok" = 1 ] && ! is_phase team-a editme Exited && { stopped_ok=0; fail sigterm "team-a/editme: $(phase team-a editme)"; }
+    [ "$stopped_ok" = 1 ] && pass sigterm "exit 0, no agent left, statuses Exited: stopped on request"
+fi
+
+# ── 8. resumed ────────────────────────────────────────────────────────
+# A new Warden on the same node: Open, rolled back to the last Seal, and
+# the agent resumes after its last sealed turn.  The editme Vessel is put
+# back within the limits first, so it runs again too.
+K patch vessel -n team-a editme --type merge -p '{"spec":{"resources":{"pids":64}}}' >/dev/null
+start_warden warden-2
+if wait_for 60 is_phase team-a runner Running && wait_for 30 agent 101; then
+    sleep 3
+    kill -TERM "$WARDEN_PID"
+    for _ in $(seq 1 60); do kill -0 "$WARDEN_PID" 2>/dev/null || break; sleep 0.5; done
+    wait "$WARDEN_PID" 2>/dev/null
+    WARDEN_PID=""
+    start=$(K get vessel -n team-a runner -o jsonpath='{.status.start}')
+    rolled=$(K get vessel -n team-a runner -o jsonpath='{.status.settled.rolledBackTo}')
+    birth=$(K get vessel -n team-a runner -o jsonpath='{.status.settled.birthSeal}')
+    if [ "$start" = Open ] && [ -n "$rolled" ] && [ "$rolled" -gt 2 ] && [ -z "$birth" ]; then
+        pass resumed "start Open, no new birth Seal, rolled back to the Seal at lsn $rolled, ran again"
+    else
+        fail resumed "start '$start', rolledBackTo '$rolled'"
+    fi
+else
+    fail resumed "runner did not run again: $(phase team-a runner): $(message team-a runner)"
+fi
+
+# ── summary ───────────────────────────────────────────────────────────
+K get vessels -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.node,PHASE:.status.phase,START:.status.start,MESSAGE:.status.message' >"$OUT/vessels-final.txt" 2>&1
+{
+    echo
+    echo "K2 end to end ($(date -u +%FT%TZ), $(uname -r), envtest $ENVTEST_VERSION)"
+    for row in crd running refused elsewhere deleted kept sigterm resumed; do
+        printf '  %-10s %s\n' "$row" "${RESULT[$row]:-not run}"
+    done
+    echo "results in $OUT"
+} | tee "$OUT/summary.txt"
