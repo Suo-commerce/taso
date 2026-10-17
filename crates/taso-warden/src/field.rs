@@ -12,7 +12,9 @@
 //! - **Transcript** entries become `Transcript` records, durable (segment
 //!   fsync + CAS) before `Recorded` is sent.
 //! - **TurnEnd** seals when the harness reports the turn quiescent, and
-//!   not otherwise.  Turns must increase.  In Phase 1 file changes live in
+//!   not otherwise.  Turns start at 1 and must increase: turn 0 is the
+//!   Warden's birth Seal ([`crate::vessel::Vessel::seal_birth`]), which
+//!   `Hello` reports as no turn sealed.  In Phase 1 file changes live in
 //!   the dataset, not in records, so the Warden cannot tell an unchanged
 //!   turn from a changed one cheaply; it seals every quiescent turn (a
 //!   snapshot is metadata-only).  The Seal's cut records the highest
@@ -63,7 +65,7 @@ use crate::chronicle::{ChronicleError, Layers};
 use crate::effects::Effects;
 use crate::quiesce::{verify, Watch};
 use crate::segment::Position;
-use crate::vessel::{Vessel, VesselError};
+use crate::vessel::{Vessel, VesselError, BIRTH_TURN};
 use taso_field::adapter::Call;
 
 // ── Session ─────────────────────────────────────────────────────────
@@ -151,7 +153,8 @@ impl<'v, L: Layers> Session<'v, L> {
         (self.after_seal_failures, self.last_after_seal_error.as_deref())
     }
 
-    /// The last turn sealed, if any.
+    /// The last turn sealed, if any, counting the birth Seal (turn 0,
+    /// [`BIRTH_TURN`]).  `Hello` reports the birth Seal as no turn.
     pub fn last_sealed_turn(&self) -> Option<u64> {
         self.last_sealed_turn
     }
@@ -176,7 +179,9 @@ impl<'v, L: Layers> Session<'v, L> {
         match (self.greeted, req) {
             (false, Request::Hello { version }) if version == VERSION => {
                 self.greeted = true;
-                Reply::Hello { version: VERSION, last_sealed_turn: self.last_sealed_turn }
+                // The birth Seal is the Warden's, not a harness turn.
+                let last = self.last_sealed_turn.filter(|&t| t != BIRTH_TURN.get());
+                Reply::Hello { version: VERSION, last_sealed_turn: last }
             }
             (false, Request::Hello { version }) => error(
                 ErrorCode::BadHello,
@@ -218,6 +223,9 @@ impl<'v, L: Layers> Session<'v, L> {
     }
 
     fn turn_end(&mut self, turn: u64, quiescent: bool) -> Reply {
+        if turn == BIRTH_TURN.get() {
+            return error(ErrorCode::Malformed, format!("turn {turn} is the Warden's birth Seal; turns start at 1"));
+        }
         if self.last_sealed_turn.is_some_and(|last| turn <= last) {
             return error(
                 ErrorCode::Malformed,
@@ -455,6 +463,41 @@ mod tests {
         assert_eq!(rec.cut.transcript, Lsn::new(2));
         assert_eq!(rec.turn, TurnId::new(1));
         assert_eq!(rec.verdict, Verdict::Clean);
+    }
+
+    /// After the birth Seal (turn 0) the harness still hears "nothing
+    /// sealed yet" and starts at turn 1; turn 0 is never the harness's.
+    #[test]
+    fn the_birth_seal_is_not_a_harness_turn() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let birth = v.seal_birth().unwrap().seal;
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        assert_eq!(s.last_sealed_turn(), Some(0), "the session knows the birth Seal");
+        assert_eq!(s.handle(hello()), Reply::Hello { version: VERSION, last_sealed_turn: None });
+        assert!(is_error(&s.handle(Request::TurnEnd { turn: 0, quiescent: true }), ErrorCode::Malformed));
+        assert_eq!(
+            s.handle(Request::TurnEnd { turn: 1, quiescent: true }),
+            Reply::TurnEnd { turn: 1, sealed: Some(birth.lsn.get() + 1) }
+        );
+        drop(s);
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        assert_eq!(s.handle(hello()), Reply::Hello { version: VERSION, last_sealed_turn: Some(1) });
+    }
+
+    /// Turn 0 is refused even before any Seal: a harness Seal at turn 0
+    /// would look like a birth Seal.
+    #[test]
+    fn turn_zero_is_refused_without_a_birth_seal_too() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        s.handle(hello());
+        let r = s.handle(Request::TurnEnd { turn: 0, quiescent: true });
+        assert!(is_error(&r, ErrorCode::Malformed), "{r:?}");
+        assert_eq!(s.last_sealed_turn(), None);
+        drop(s);
+        assert_eq!(v.last_seal(), None, "nothing sealed");
     }
 
     #[test]
