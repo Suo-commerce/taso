@@ -110,7 +110,7 @@ pub enum ZfsError {
     },
     /// A snapshot for this Seal, or a dataset, already exists.
     AlreadyExists(String),
-    /// The Seal snapshot to clone from does not exist.
+    /// The Seal snapshot to clone from or roll back to does not exist.
     NotFound(String),
     /// The snapshot exists but is not bound to the Seal the caller named
     /// (its `taso:seal` is another hash, or unset).
@@ -868,6 +868,25 @@ impl<R: Runner> Zfs<R> {
         }
     }
 
+    /// Roll `dataset` back to the snapshot of the Seal at `seal`, which
+    /// must be bound to `seal_hash`: everything written after it is
+    /// discarded.  Returns that snapshot.
+    ///
+    /// Plain `zfs rollback`, never `-r`, `-R` or `-f`: if any later
+    /// snapshot exists zfs refuses ([`ZfsError::Exit`]) and nothing
+    /// changes, so this never destroys a snapshot.  A missing snapshot is
+    /// [`ZfsError::NotFound`]; one bound to another hash, or unbound, is
+    /// [`ZfsError::SealMismatch`] (nothing is rolled back to a snapshot
+    /// that is not this Seal's layer).
+    pub fn rollback(&self, dataset: &Dataset, seal: Lsn, seal_hash: HashVal) -> Result<Snapshot, ZfsError> {
+        let snap = self.get(dataset, seal)?.ok_or_else(|| ZfsError::NotFound(dataset.seal_snapshot(seal)))?;
+        if snap.seal_hash != Some(seal_hash) {
+            return Err(ZfsError::SealMismatch(snap.name()));
+        }
+        self.run(vec!["rollback".to_string(), snap.name()])?;
+        Ok(snap)
+    }
+
     /// Destroy one Seal snapshot.  For test cleanup only: purge rules
     /// (what may be destroyed, and when) come with the sanction loop.
     pub fn destroy(&self, snapshot: &Snapshot) -> Result<(), ZfsError> {
@@ -1131,6 +1150,55 @@ mod tests {
             zfs.runner.calls.borrow()[0],
             strs(&["destroy", "tasotest/vessel@taso-seal-00000000000000000004"]),
         );
+    }
+
+    // ── Rollback ───────────────────────────────────────────────────
+
+    const SNAP4: &str = "tasotest/vessel@taso-seal-00000000000000000004";
+
+    fn get_args(name: &str) -> Vec<String> {
+        list_args(name, false)
+    }
+
+    #[test]
+    fn rollback_checks_the_binding_then_rolls_back_plainly() {
+        let line = format!("{SNAP4}\t845\t17\t{}\n", hash(4));
+        let zfs = Zfs::with_runner(Fake::default().reply(true, &line, "").reply(true, "", ""));
+        let snap = zfs.rollback(&ds(), Lsn::new(4), hash(4)).unwrap();
+        assert_eq!((snap.seal, snap.guid, snap.seal_hash), (Lsn::new(4), 17, Some(hash(4))));
+        assert_eq!(*zfs.runner.calls.borrow(), vec![get_args(SNAP4), strs(&["rollback", SNAP4])]);
+    }
+
+    #[test]
+    fn rollback_refuses_a_snapshot_that_is_not_this_seals_layer() {
+        for bound in [format!("{}", hash(9)), "-".to_string()] {
+            let line = format!("{SNAP4}\t845\t17\t{bound}\n");
+            let zfs = Zfs::with_runner(Fake::default().reply(true, &line, ""));
+            assert!(matches!(zfs.rollback(&ds(), Lsn::new(4), hash(4)), Err(ZfsError::SealMismatch(n)) if n == SNAP4));
+            assert_eq!(zfs.runner.calls.borrow().len(), 1, "no rollback after a mismatch ({bound})");
+        }
+    }
+
+    #[test]
+    fn rollback_to_a_missing_snapshot_is_not_found() {
+        let zfs = Zfs::with_runner(Fake::default().reply(false, "", "cannot open 'x': dataset does not exist"));
+        assert!(matches!(zfs.rollback(&ds(), Lsn::new(4), hash(4)), Err(ZfsError::NotFound(n)) if n == SNAP4));
+        assert_eq!(zfs.runner.calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_rollback_is_reported_as_is() {
+        let line = format!("{SNAP4}\t845\t17\t{}\n", hash(4));
+        let zfs = Zfs::with_runner(
+            Fake::default().reply(true, &line, "").reply(false, "", "cannot rollback: more recent snapshots or bookmarks exist"),
+        );
+        match zfs.rollback(&ds(), Lsn::new(4), hash(4)) {
+            Err(ZfsError::Exit { args, stderr, .. }) => {
+                assert_eq!(args, strs(&["rollback", SNAP4]));
+                assert!(stderr.contains("more recent"), "{stderr}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1744,6 +1812,50 @@ mod tests {
                 // -R: also the clones made from its snapshots.
                 let _ = Command::new("zfs").args(["destroy", "-R", self.ds.as_str()]).status();
             }
+        }
+
+        /// What `zfs rollback` does on this ZFS, checked rather than
+        /// assumed: changes after the Seal are discarded on a mounted
+        /// dataset; with a later snapshot it refuses and destroys nothing;
+        /// and what happens with a file held open (printed, not asserted:
+        /// the daemon rolls back only after its sweep, with no agent).
+        #[test]
+        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
+        fn rollback_on_zfs() {
+            let s = Scratch::new("rollback");
+            let zfs = Zfs::cli();
+            let (a, b) = (s.mountpoint.join("a"), s.mountpoint.join("b"));
+            std::fs::write(&a, b"sealed").unwrap();
+            zfs.snapshot(&s.ds, Lsn::new(3), hash(3)).unwrap();
+
+            std::fs::write(&a, b"after the Seal").unwrap();
+            std::fs::write(&b, b"new after the Seal").unwrap();
+            let snap = zfs.rollback(&s.ds, Lsn::new(3), hash(3)).unwrap();
+            assert_eq!(snap.seal, Lsn::new(3));
+            assert_eq!(std::fs::read(&a).unwrap(), b"sealed");
+            assert!(!b.exists(), "a file made after the Seal is gone");
+            assert_eq!(zfs_cmd(&["get", "-H", "-o", "value", "mounted", s.ds.as_str()]).trim(), "yes");
+
+            // The wrong hash: nothing happens.
+            std::fs::write(&b, b"kept").unwrap();
+            assert!(matches!(zfs.rollback(&s.ds, Lsn::new(3), hash(9)), Err(ZfsError::SealMismatch(_))));
+            assert!(b.exists());
+
+            // A later snapshot: refused, both snapshots and the file stay.
+            zfs.snapshot(&s.ds, Lsn::new(5), hash(5)).unwrap();
+            let e = zfs.rollback(&s.ds, Lsn::new(3), hash(3)).unwrap_err();
+            println!("rollback past a later snapshot: {e:?}");
+            assert!(matches!(e, ZfsError::Exit { .. }), "{e:?}");
+            assert_eq!(zfs.list(&s.ds).unwrap().iter().map(|x| x.seal.get()).collect::<Vec<_>>(), vec![3, 5]);
+            assert!(b.exists());
+
+            // A file held open while rolling back to the latest Seal.
+            std::fs::write(&a, b"dirty").unwrap();
+            let held = std::fs::File::open(&a).unwrap();
+            let r = zfs.rollback(&s.ds, Lsn::new(5), hash(5));
+            println!("rollback with a file held open: {r:?}");
+            drop(held);
+            println!("a after it: {:?}", std::fs::read_to_string(&a));
         }
 
         #[test]
