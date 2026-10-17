@@ -91,7 +91,9 @@ DAEMON=$(exes taso-sim daemon_on_node)
 run_tests() {   # $1 = row, $2 = executable, rest = test filter args
     local row=$1 exe=$2; shift 2
     if [ -z "$exe" ]; then fail "$row" "test binary not found"; return; fi
-    if in_image --entrypoint "$exe" "$IMAGE" --ignored --test-threads=1 --nocapture "$@" >"$OUT/$row.log" 2>&1; then
+    # Through the image's cgroup-init, as taso-wardend runs: runc in the
+    # container needs it (cgroup v2 nesting).
+    if in_image --entrypoint /usr/lib/taso/cgroup-init "$IMAGE" "$exe" --ignored --test-threads=1 --nocapture "$@" >"$OUT/$row.log" 2>&1; then
         pass "$row" "$(grep -o '[0-9]* passed' "$OUT/$row.log" | tail -1)"
     else
         fail "$row" "$(grep -E 'test result|panicked' "$OUT/$row.log" | tail -2 | tr '\n' ' ') see $OUT/$row.log"
@@ -144,9 +146,11 @@ cat >"$WORK/wardend.json" <<EOF
   "vessels": [ { "namespace": "0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d", "subject": "d2-$$", "uid_slot": 9 } ]
 }
 EOF
+mkdir -p "$WORK/state"
 docker run -d --name "$NAME" --privileged --device /dev/zfs \
     --mount "type=bind,source=$POOL_MOUNT,target=$POOL_MOUNT,bind-propagation=rshared" \
     -v "$R:/srv/taso/rootfs:ro" -v "$WORK/wardend.json:/etc/taso/wardend.json:ro" \
+    -v "$WORK/state:/var/lib/taso" \
     "$IMAGE" >/dev/null
 
 # Wait for the agent: a taso-sim process on the host, inside the container's
@@ -159,11 +163,16 @@ for _ in $(seq 1 100); do
 done
 docker logs "$NAME" >"$OUT/container.log" 2>&1
 
+# A Warden that did not get to its agent: say why in the summary.
+if [ -z "$agent" ]; then
+    why=$(grep -m1 -E "taso-wardend|cgroup-init" "$OUT/container.log" | cut -c1-160)
+fi
+
 # 6. the Vessel's dataset, mounted by zfs inside the container, seen from the host
 vds=$(zfs list -H -o name -r "$DS" | grep '/v-' | head -1)
 mnt=${vds:+$(zfs get -H -o value mountpoint "$vds")}
 if [ -z "$agent" ]; then
-    fail mounts "the agent never started: see $OUT/container.log"
+    fail mounts "the agent never started (${why:-no log}): see $OUT/container.log"
 elif [ -n "$mnt" ] && findmnt -n "$mnt" >/dev/null && [ -n "$(ls -A "$mnt" 2>/dev/null)" ]; then
     pass mounts "$mnt is mounted on the host with the agent's files"
 else
@@ -172,7 +181,7 @@ fi
 
 # 7. kill the container like a crash; its agents must go with it
 if [ -z "$agent" ]; then
-    fail agents "the agent never started: see $OUT/container.log"
+    fail agents "the agent never started (${why:-no log}): see $OUT/container.log"
 else
     docker kill "$NAME" >/dev/null
     left=""

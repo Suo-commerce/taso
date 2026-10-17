@@ -14,6 +14,10 @@
 #             module version needs another base; checked in step D2, not here.
 #             taso-landlock is at /usr/lib/taso/landlock, to copy into agent
 #             rootfs images (it runs inside the agent's container, not here).
+#             The entrypoint is /usr/lib/taso/cgroup-init, which prepares
+#             the container's cgroup for the agents' cgroups (cgroup v2)
+#             and then runs taso-wardend; a command run in this image that
+#             starts runc must go through it too.
 #   coordd    taso-coordd alone.  It serves a Unix socket; mount the
 #             directory holding it where the Wardens can reach it.  Over a
 #             network it needs authentication first (fencing review, F3).
@@ -57,9 +61,15 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/taso-wardend /out/taso-logcheck /usr/local/bin/
 COPY --from=builder /out/taso-landlock /usr/lib/taso/landlock
+# Makes the container's cgroup able to hold the agents' cgroups (cgroup v2
+# nesting, measured in D2), then execs the command.
+COPY deploy/docker/cgroup-init.sh /usr/lib/taso/cgroup-init
+# The Warden's state (local coordinator, Chronicle state); mount a volume
+# here or point the config elsewhere.
+RUN mkdir -p /var/lib/taso /run/taso
 # The config names the coordinator, the pool, the store, run_dir and the
 # Vessels; mount it here.
-ENTRYPOINT ["/usr/local/bin/taso-wardend"]
+ENTRYPOINT ["/usr/lib/taso/cgroup-init", "/usr/local/bin/taso-wardend"]
 CMD ["/etc/taso/wardend.json"]
 
 # ── taso-coordd ───────────────────────────────────────────────────────
