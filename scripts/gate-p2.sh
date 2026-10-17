@@ -51,6 +51,9 @@ LANDLOCK=${LANDLOCK:-1}
 KEEP=${KEEP:-0}
 B_HOST=${B_HOST:-}
 OUT=${OUT:-/root/taso-gate-p2-$(date +%Y%m%d-%H%M%S)}
+# Subjects are new on every run: with the hub's coordinator, Vessels of an
+# earlier run are still registered (and held by whichever Warden ended them).
+RUN=$(date +%Y%m%d%H%M%S)-$$
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
 for t in zfs runc ldd python3 cargo; do
@@ -113,7 +116,7 @@ copy_with_libs "$BIN/taso-landlock" /usr/lib/taso/landlock
 mkdir -p "$ROOTFS"/{proc,dev,sys,tmp,work,run/taso}
 : > "$ROOTFS/run/taso/field.sock"
 mkdir -p "$WORK/bin"
-cp "$BIN/taso-wardend" "$WORK/bin/"
+cp "$BIN/taso-wardend" "$BIN/taso-logcheck" scripts/gate-cloud/dbcheck.py scripts/gate-cloud/logjudge.py "$WORK/bin/"
 if [ -n "$B_HOST" ]; then
     echo "== copying binaries and rootfs to $B_HOST"
     tar -C "$WORK" -cf - bin rootfs | on_b "tar -C $WORK -xf -"
@@ -179,7 +182,7 @@ snap_hash() {   # $1 snapshot name -> hash of every file's path and bytes
 
 : > "$OUT/rounds.tsv"
 for k in $(seq 1 "$N"); do
-    subject="gate-p2-$k"
+    subject="gate-p2-$RUN-$k"
     config a 1 false "$subject" 100000 "$WORK/a-$k.json"
     config b 2 true "$subject" 5 "$WORK/b-$k.json"
     [ -n "$B_HOST" ] && on_b "cat > $WORK/b-$k.json" < "$WORK/b-$k.json"
@@ -187,7 +190,11 @@ for k in $(seq 1 "$N"); do
     "$WORK/bin/taso-wardend" "$WORK/a-$k.json" >"$OUT/a-$k.out" 2>"$OUT/a-$k.err" &
     A=$!
     sleep "$RUN_S"
-    kill -STOP "$A"
+    if ! kill -STOP "$A" 2>/dev/null; then
+        echo "round $k: A's Warden exited before the freeze; its log:" >&2
+        sed 's/^/    /' "$OUT/a-$k.err" | tail -8 >&2
+        exit 1
+    fi
     t0=$(date +%s.%N)
 
     # B's stdout and stderr stream here (over ssh in two-node mode).
@@ -221,11 +228,37 @@ for k in $(seq 1 "$N"); do
         ha=$(snap_hash "$dsa@$last"); hb=$(on_b "$(declare -f snap_hash); snap_hash $dsb@$last")
         [ "$ga" = "$gb" ] && [ "$ha" = "$hb" ] && same=1
     fi
+    # Losses reported in ctl: both logs, read as files, judged against what
+    # the coordinator recorded at the takeover (gate-cloud/logjudge.py).
+    id=${dsb##*/v-}
+    "$WORK/bin/taso-logcheck" "$SOCK" "$WORK/a/state" "$id" >"$OUT/a-$k.log.json" 2>>"$OUT/a-$k.err" || echo '{}' >"$OUT/a-$k.log.json"
+    on_b "$WORK/bin/taso-logcheck $SOCK $WORK/b/state $id" >"$OUT/b-$k.log.json" 2>>"$OUT/b-$k.err" || echo '{}' >"$OUT/b-$k.log.json"
+    logv=$(python3 "$WORK/bin/logjudge.py" "$OUT/a-$k.log.json" "$OUT/b-$k.log.json" 2>&1 || echo '{"ok": false, "lost": null, "why": "logjudge failed"}')
+    echo "$logv" >"$OUT/judge-$k.json"
+    logok=$(python3 -c 'import json,sys; v=json.loads(sys.argv[1]); print(1 if v.get("ok") else 0)' "$logv" 2>/dev/null || echo 0)
+    lost=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("lost"))' "$logv" 2>/dev/null || echo None)
+    # No partial transaction: the agent's database at the last common Seal
+    # holds exactly the sealed turns, whole (gate-cloud/dbcheck.py, on B).
+    dbok=0
+    if [ -n "$last" ]; then
+        turn=$(python3 -c 'import json,sys
+b=json.load(open(sys.argv[1])); l=int(sys.argv[2])
+print(next(f["turn"] for f in b["frames"] if f["lsn"] == l and f["kind"] == "seal"))' "$OUT/b-$k.log.json" "$((10#${last#taso-seal-}))" 2>/dev/null || echo none)
+        if [ "$turn" != none ]; then
+            dbv=$(on_b "python3 $WORK/bin/dbcheck.py $dsb@$last $turn 2 4" 2>&1 || true)
+            echo "$dbv" >"$OUT/db-$k.json"
+            dbok=$(python3 -c 'import json,sys; print(1 if json.loads(sys.argv[1]).get("ok") else 0)' "$dbv" 2>/dev/null || echo 0)
+        else
+            echo '{"ok": false, "why": "the last common Seal is not in B'"'"'s log"}' >"$OUT/db-$k.json"
+        fi
+    fi
     resumed=$(on_b "cat \$(zfs get -H -o value mountpoint $dsb)/sim-stats.json" 2>/dev/null \
         | python3 -c "import json,sys; print(json.load(sys.stdin)['resumed_after'])" 2>/dev/null || echo none)
     how=$(grep -o 'reborn at epoch.*' "$OUT/b-$k.err" | tail -1 || true)
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$secs" "$refused" "$same" "${last:-none}" "$resumed" | tee -a "$OUT/rounds.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$secs" "$refused" "$same" "${last:-none}" "$resumed" "$logok" "$lost" "$dbok" | tee -a "$OUT/rounds.tsv"
     echo "  $how"
+    [ "$logok" = 1 ] || echo "  log check failed: $(cat "$OUT/judge-$k.json")"
+    [ "$dbok" = 1 ] || echo "  database check failed: $(cat "$OUT/db-$k.json" 2>/dev/null || echo 'no common Seal')"
     if [ "$resumed" = none ] || [ "$resumed" = None ]; then
         echo "  B did not resume; its log:"; sed 's/^/    /' "$OUT/b-$k.err" | tail -8; sed 's/^/    /' "$OUT/b-$k.out"
     fi
@@ -250,5 +283,10 @@ print(f"1. reborn: {reborn}/{n}, p50 {q(secs, .5):.2f} s, p95 {q(secs, .95):.2f}
 print(f"2. last common Seal identical (guid and bytes): {same}/{n} -> {'PASS' if same == n else 'FAIL'}")
 print(f"3. old Warden refused: {refused}/{n} -> {'PASS' if refused == n else 'FAIL'}")
 print(f"4. agent on B resumed after a sealed turn: {resumed}/{n} -> {'PASS' if resumed == n else 'FAIL'}")
+logok = sum(int(r[6]) for r in rows)
+lossy = sum(1 for r in rows if r[7] not in ("None", "0"))
+dbok = sum(int(r[8]) for r in rows)
+print(f"5. losses reported in ctl (Gap + Unverified first Seal, against the coordinator): {logok}/{n}, {lossy} rounds lost records -> {'PASS' if logok == n else 'FAIL'}")
+print(f"6. no partial transaction at the last common Seal (integrity_check, whole turns): {dbok}/{n} -> {'PASS' if dbok == n else 'FAIL'}")
 PY
 echo "results in $OUT"

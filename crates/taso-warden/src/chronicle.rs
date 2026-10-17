@@ -876,8 +876,20 @@ fn lock_dir(dir: &Path) -> Result<File, ChronicleError> {
     }
 }
 
-/// The segment files in `dir`, ordered by base lsn.  Any other file whose
-/// name starts with `seg-` is refused rather than skipped.
+/// Every valid frame in the Chronicle directory `dir`, oldest first,
+/// read without writing anything and without the coordinator: no file is
+/// opened for writing, a torn tail is ignored rather than cut, and
+/// records past the anchored head are included.  For inspection (the gate
+/// harness reads both nodes' logs this way); the joints and the chain are
+/// for the caller to judge.
+pub fn read_log(dir: &Path) -> Result<Vec<Frame>, ChronicleError> {
+    let mut frames = Vec::new();
+    for path in list_segments(dir)? {
+        frames.extend(Segment::open_read_only(&path)?.frames()?);
+    }
+    Ok(frames)
+}
+
 /// Write a Chronicle's log into the new directory `dir` from `frames`:
 /// oldest first, from genesis, jumping only at Gap records, as
 /// [`crate::pack::Packs::chain`] returns them (rebirth, v1.0 §1 P2).
@@ -934,6 +946,8 @@ pub fn restore_log(dir: &Path, id: ChronicleId, frames: &[Frame]) -> Result<(), 
     Ok(())
 }
 
+/// The segment files in `dir`, ordered by base lsn.  Any other file whose
+/// name starts with `seg-` is refused rather than skipped.
 fn list_segments(dir: &Path) -> Result<Vec<PathBuf>, ChronicleError> {
     let io = |e| ChronicleError::Segment(SegmentError::Io(e));
     let mut found = Vec::new();
@@ -1857,6 +1871,25 @@ mod tests {
             open_b(&e, &b_dir, FakeLayers::default()),
             Err(ChronicleError::Segment(SegmentError::ClosedTorn { invalid_bytes: 20 }))
         ));
+    }
+
+    /// `read_log` returns every valid frame across the segments and
+    /// writes nothing: a torn tail stays on disk.
+    #[test]
+    fn read_log_reads_every_segment_and_writes_nothing() {
+        let e = env();
+        let (c, _) = rolled(&e, 6);
+        assert!(c.segments().len() > 1);
+        let want = c.frames().unwrap();
+        drop(c);
+        let newest = list_segments(&e.dir).unwrap().pop().unwrap();
+        std::fs::OpenOptions::new().append(true).open(&newest).unwrap().write_all(&[7; 20]).unwrap();
+        let bytes = |p: &Path| std::fs::read(p).unwrap();
+        let before: Vec<Vec<u8>> = list_segments(&e.dir).unwrap().iter().map(|p| bytes(p)).collect();
+        assert_eq!(read_log(&e.dir).unwrap(), want);
+        let after: Vec<Vec<u8>> = list_segments(&e.dir).unwrap().iter().map(|p| bytes(p)).collect();
+        assert_eq!(before, after, "nothing was cut or written");
+        assert!(read_log(&e.dir.join("missing")).is_err());
     }
 
     #[test]

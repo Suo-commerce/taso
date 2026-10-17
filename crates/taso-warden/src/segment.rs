@@ -353,6 +353,13 @@ impl Segment {
         Ok(seg)
     }
 
+    /// Open the segment at `path` for reading only: the valid prefix is
+    /// indexed, a torn tail is ignored (not cut), and appends are refused.
+    /// For inspecting a log another process owns.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, SegmentError> {
+        Ok(Self::read_only(path.as_ref())?.0)
+    }
+
     /// The position of the last valid frame in the segment at `path`, read
     /// without writing anything (a torn tail is ignored, not cut).
     pub fn peek_tail(path: impl AsRef<Path>) -> Result<Position, SegmentError> {

@@ -54,6 +54,9 @@ BATCHED=${BATCHED:-1}
 HUB=${HUB:-0}
 KEEP=${KEEP:-0}
 OUT=${OUT:-/root/taso-gate-p1-$(date +%Y%m%d-%H%M%S)}
+# Subjects are new on every run: with the hub's coordinator, Vessels of an
+# earlier run are still registered (and held by whichever Warden ended them).
+RUN=$(date +%Y%m%d%H%M%S)-$$
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
 for t in zfs runc ldd python3 cargo; do
@@ -154,7 +157,7 @@ json.dump({
         "memory_bytes": 268435456,
         "pids": 64,
     },
-    "vessels": [{"namespace": "70" * 16, "subject": f"gate-p1-r{r}-v{i}", "uid_slot": i} for i in range($P)],
+    "vessels": [{"namespace": "70" * 16, "subject": f"gate-p1-$RUN-r{r}-v{i}", "uid_slot": i} for i in range($P)],
 }, open(cfg, "w"), indent=1)
 PY
     local rc=0
