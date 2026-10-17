@@ -24,6 +24,7 @@ pub mod s3;
 pub mod segment;
 pub mod snapbatch;
 pub mod source;
+pub mod supervisor;
 pub mod summary;
 pub mod ship;
 pub mod timing;
