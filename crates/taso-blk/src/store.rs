@@ -472,6 +472,18 @@ impl Store {
         self.append(K_NAME, &body)
     }
 
+    /// Whether `name` could be given to a new branch: valid and not taken.
+    /// Changes nothing.
+    pub fn check_name(&self, name: &str) -> Result<(), StoreError> {
+        if !valid_name(name) {
+            return Err(StoreError::BadName(name.to_string()));
+        }
+        if self.meta.names.contains_key(name) {
+            return Err(StoreError::NameTaken(name.to_string()));
+        }
+        Ok(())
+    }
+
     /// The live branch named `name`.
     pub fn find(&self, name: &str) -> Option<LayerId> {
         self.meta.names.get(name).copied()
@@ -1041,6 +1053,10 @@ mod tests {
         }
         assert!(matches!(s.seal_tagged(b, &[0; MAX_TAG + 1]), Err(StoreError::BadTag(_))));
         assert_eq!(s.lsn(), lsn, "refusals append nothing");
+        assert!(matches!(s.check_name("x"), Err(StoreError::NameTaken(_))));
+        assert!(matches!(s.check_name("a b"), Err(StoreError::BadName(_))));
+        assert!(matches!(s.check_name(""), Err(StoreError::BadName(_))));
+        s.check_name("free").unwrap();
         s.name(a, "x").unwrap(); // naming again with the same name is fine
         s.name(a, "y").unwrap(); // renaming frees the old name
         assert_eq!((s.find("x"), s.find("y")), (None, Some(a)));
