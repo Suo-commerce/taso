@@ -1,0 +1,11 @@
+[package]
+name = "taso-blk"
+description = "Taso block log spike: a userspace block device whose fork is a parent pointer (Phase 4 slice, plan 2026-10-18)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
