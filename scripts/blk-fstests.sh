@@ -35,6 +35,10 @@
 #     archive has them: dbench dump indent keyutils linux-headers-$(uname -r)
 #   /var/lib/taso-blk/xfstests   (xfstests v2026.05.17, built in place)
 #   users fsgqa (with home), fsgqa2, 123456-fsgqa and group fsgqa, if missing
+#   GNU coreutils in place of uutils, if the system has uutils (Ubuntu 25.10
+#   and later): apt package coreutils-from-gnu, and the pin
+#   /etc/apt/preferences.d/taso-gnu-coreutils so upgrades keep it.  Refused
+#   (nothing changed) if apt would remove anything but coreutils-from-uutils.
 # run touches, and nothing else:
 #   /var/lib/taso-blk/fst.log, fst.err, fst.log.ckpt   (removed at start)
 #   /var/lib/taso-blk/fst-loop-test.img, fst-loop-scratch.img (removed at end)
@@ -52,6 +56,11 @@
 # ext4 is mounted -o discard everywhere (fsx, and MOUNT_OPTIONS for
 # xfstests), as the Warden mounts Vessels: without it ext4 never tells the
 # device which blocks it freed, and live data grows toward the device size.
+#
+# xfstests is written against GNU coreutils; with uutils (Ubuntu 26.04's
+# default) 271 of the quick tests failed on an unsupported option before
+# testing anything (taso-test, 2026-10-18).  run refuses without GNU
+# coreutils; setup installs them.
 #
 # FST_NO_UBLK=1 skips the ublk module check, and FST_BLKD=path runs that
 # daemon instead of building one (both to try the script's own paths with a
@@ -80,6 +89,11 @@ STOP_FREE=${FST_STOP_FREE_GIB:-5}
 say() { printf '== %s\n' "$*"; }
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 
+# True if the core tools are GNU coreutils (xfstests' scripts assume them).
+# shellcheck disable=SC2012  # ls --version, not a listing
+coreutils_version() { ls --version 2>/dev/null | head -n 1; }
+gnu_coreutils() { coreutils_version | grep -q 'GNU coreutils'; }
+
 mode=${1:-}
 [[ "$mode" == setup || "$mode" == run ]] || { echo "usage: $0 setup | run [xfstests arguments]" >&2; exit 64; }
 shift
@@ -98,6 +112,17 @@ if [[ "$mode" == setup ]]; then
         apt-get install -y -q "$p" >/dev/null 2>&1 && echo "installed $p" \
             || echo "not installed: $p (optional; tests needing it will not run)"
     done
+
+    if ! gnu_coreutils; then
+        say "GNU coreutils in place of $(coreutils_version)"
+        removes=$(apt-get install -s coreutils-from-gnu | sed -n 's/^Remv \([^ ]*\).*/\1/p' | grep -vx coreutils-from-uutils || true)
+        [[ -z "$removes" ]] || die "installing coreutils-from-gnu would also remove: $removes (nothing changed; decide by hand)"
+        apt-get install -y -q coreutils-from-gnu
+        printf 'Package: coreutils-from-uutils\nPin: release a=*\nPin-Priority: -10\n' >/etc/apt/preferences.d/taso-gnu-coreutils
+        hash -r
+        gnu_coreutils || die "coreutils-from-gnu installed, but ls still reports: $(coreutils_version)"
+        echo "now: $(coreutils_version)"
+    fi
 
     if [[ ! -d "$XFS/.git" ]]; then
         mkdir -p "$DIR"
@@ -294,6 +319,7 @@ if [[ -z "${FST_BLKD:-}" ]] && ! command -v cargo >/dev/null; then
     command -v cargo >/dev/null || die "cargo not found (not in PATH, ~/.cargo/bin or /root/.cargo/bin)"
 fi
 [[ -x "$XFS/check" && -x "$XFS/ltp/fsx" ]] || die "xfstests not built in $XFS: run '$0 setup' first"
+gnu_coreutils || die "the core tools are $(coreutils_version), not GNU coreutils, which xfstests assumes: run '$0 setup' (it switches to coreutils-from-gnu)"
 if [[ "${FST_NO_UBLK:-}" != 1 ]]; then
     modprobe ublk_drv
     [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
