@@ -53,6 +53,12 @@ impl LayerId {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    /// The id a record names, read back from the log.  Only the store
+    /// makes ids from numbers, and only ones the map gave out.
+    pub(crate) fn from_raw(n: u64) -> Self {
+        Self(n)
+    }
 }
 
 impl fmt::Display for LayerId {
