@@ -226,7 +226,7 @@ fn mount_source(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
             let source = f.get(sep + 2)?;
             (unescape(f.get(4)?) == want).then(|| PathBuf::from(unescape(source)))
         })
-        .last()
+        .next_back() // the last mount on the point is the one on top
 }
 
 // ── the pool ────────────────────────────────────────────────────────
