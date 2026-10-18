@@ -24,6 +24,8 @@
 # The daemon compacts by itself during 2 to 4 when garbage passes
 # FST_COMPACT_PCT per cent of the log (default 25; 0 turns it off) and
 # FST_COMPACT_MIN_MIB (default 256); the summary counts the compactions.
+# Without compaction the log grows by everything written: the raw and fsx
+# phases alone write more than 15 GiB.
 # Exit 0 only if raw and fsx passed, no compaction failed, and no test is
 # OURS.
 #
@@ -47,7 +49,9 @@
 # run touches, and nothing else:
 #   /var/lib/taso-blk/fst.log, fst.err, fst.log.ckpt   (removed at start)
 #   /var/lib/taso-blk/fst-loop-test.img, fst-loop-scratch.img (removed at end)
-#   /var/lib/taso-blk/fstests/<time>/   (results: summary.txt and the logs)
+#   /var/lib/taso-blk/fstests/<time>/   (results: summary.txt, the logs, the
+#                                        daemon's log and the kernel's lines
+#                                        from the run: daemon.err, dmesg.txt)
 #   /run/taso-blk-fst.sock
 #   /mnt/blk-fst and mounts under it    (all unmounted at the end)
 #   the /dev/ublkb* devices the daemon creates, two loop devices in step 4
@@ -66,6 +70,10 @@
 # default) 271 of the quick tests failed on an unsupported option before
 # testing anything (taso-test, 2026-10-18).  run refuses without GNU
 # coreutils; setup installs them.
+#
+# FST_ONLY_XFSTESTS=1 skips raw and fsx, to look into single tests (with
+# FST_COMPACT_PCT=0 for one without compaction); the verdict then says
+# partial.
 #
 # FST_NO_UBLK=1 skips the ublk module check, and FST_BLKD=path runs that
 # daemon instead of building one (both to try the script's own paths with a
@@ -171,6 +179,7 @@ TESTS=("$@")
 [[ ${#TESTS[@]} -gt 0 ]] || TESTS=(-g quick)
 
 DAEMON_PID=
+DMESG_START=0
 CHECK_PID=
 WATCH_PID=
 LOOPS=()
@@ -260,6 +269,14 @@ note_stats() {
     echo "live $(( (${log:-0} - ${garbage:-0}) >> 20 )) MiB, log $(( ${log:-0} >> 20 )) MiB ($1): $st" | tee -a "$RES/summary.txt"
 }
 
+# Keep the evidence with the results: the daemon's log and the kernel's
+# lines from this run (the next run starts both afresh).
+keep_evidence() {
+    [[ -n "$RES" && -d "$RES" ]] || return 0
+    [[ -f "$ERR" ]] && cp "$ERR" "$RES/daemon.err"
+    dmesg 2>/dev/null | tail -n +"$((DMESG_START + 1))" >"$RES/dmesg.txt"
+}
+
 cleanup() {
     local rc=$?
     set +e
@@ -277,6 +294,7 @@ cleanup() {
     fi
     left=$(mounts_under | wc -l)
     [[ "$left" -eq 0 ]] || echo "WARNING: $left mounts left under $MNT"
+    keep_evidence
     exit "$rc"
 }
 trap cleanup EXIT
@@ -295,6 +313,7 @@ export TEST_DIR=$MNT/test
 export SCRATCH_DEV=$sdev
 export SCRATCH_MNT=$MNT/scratch
 export MOUNT_OPTIONS="-o discard"
+export TEST_FS_MOUNT_OPTS="-o discard"
 EOF
     mkfs.ext4 -q -F "$tdev"
     say "xfstests ($name): $* (output in $out)"
@@ -351,6 +370,7 @@ mkdir -p "$DIR" "$MNT"
 free=$(free_gib)
 [[ "$free" -ge "$MIN_FREE" ]] || die "only $free GiB free under $DIR (want $MIN_FREE; FST_MIN_FREE_GIB overrides)"
 
+DMESG_START=$(dmesg 2>/dev/null | wc -l)
 RES=$DIR/fstests/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$RES"
 {
@@ -369,6 +389,29 @@ fi
 rm -f "$LOG" "$ERR" "$LOG.ckpt"
 start_daemon
 ROOT=$(blk root)
+
+# The disk watch, for the whole run: below FST_STOP_FREE_GIB it stops what
+# is writing (xfstests, fio, fsx) before the log fills the disk.  A full
+# disk poisons the store, which then refuses every write (correct, but the
+# rest of the run would test nothing).
+( while sleep 5; do
+      # Once tripped it stays tripped: every writer that starts later in the
+      # run is stopped too, until the run ends at its next disk check.
+      if [[ -e "$RES/.disk-stop" || "$(free_gib)" -lt "$STOP_FREE" ]]; then
+          [[ -e "$RES/.disk-stop" ]] || echo "disk below $STOP_FREE GiB free: stopping the run" | tee -a "$RES/summary.txt"
+          touch "$RES/.disk-stop"
+          pid=$(cat "$RES/.check-pid" 2>/dev/null || true)
+          [[ -n "$pid" ]] && kill -TERM -- "-$pid" 2>/dev/null
+          pkill -TERM -P $$ -x fio 2>/dev/null
+          pkill -TERM -P $$ -x fsx 2>/dev/null
+      fi
+  done ) &
+WATCH_PID=$!
+disk_stopped() { [[ -e "$RES/.disk-stop" ]] && die "stopped: disk below $STOP_FREE GiB free (see $RES/summary.txt)"; return 0; }
+
+if [[ "${FST_ONLY_XFSTESTS:-}" == 1 ]]; then
+    echo "raw and fsx skipped (FST_ONLY_XFSTESTS=1): not a full result" | tee -a "$RES/summary.txt"
+else
 
 # ---- 1 raw -------------------------------------------------------------------
 say "1 raw: fio with checksums, discard, write-zeroes"
@@ -397,6 +440,7 @@ compact_now() {
 garbage() { blk stats | tr ' ' '\n' | sed -n 's/^garbage_bytes=//p'; }
 rc=0; fio_raw write 4242 || rc=$?
 check "raw: fio write and verify (4k and 128k, iodepth 32)" 0 "$rc"
+disk_stopped
 head -c $((256 << 20)) /dev/urandom | dd of="$RAWDEV" bs=1M seek=3072 oflag=direct status=none
 blkdiscard -o $((3 << 30)) -l $((128 << 20)) "$RAWDEV"
 blkdiscard -z -o $(((3 << 30) + (128 << 20))) -l $((128 << 20)) "$RAWDEV"
@@ -427,6 +471,7 @@ rc=0; fio_raw verify 777 --verify_only || rc=$?
 check "raw: fio verify after restart" 0 "$rc"
 check "raw: zeros after restart" zeros "$(zeros)"
 blk drop "$RAW" >/dev/null
+disk_stopped
 
 # ---- 2 fsx -------------------------------------------------------------------
 say "2 fsx on ext4 on our device"
@@ -446,6 +491,8 @@ rc=0; e2fsck -fn "$FSXDEV" >"$RES/fsx-fsck.txt" 2>&1 || rc=$?
 check "fsx: fsck clean" 0 "$rc"
 note_stats "after fsx"
 blk drop "$FSXB" >/dev/null
+disk_stopped
+fi
 
 # ---- 3 xfstests on our devices -------------------------------------------------
 read -r TB TDEV <<<"$(blk fork "$ROOT" fst-test)"
@@ -453,17 +500,6 @@ read -r SB SDEV <<<"$(blk fork "$ROOT" fst-scratch)"
 wait_dev "$TDEV"
 wait_dev "$SDEV"
 echo "our devices: TEST $TDEV ($TB), SCRATCH $SDEV ($SB)" | tee -a "$RES/summary.txt"
-
-( while sleep 10; do
-      if [[ "$(free_gib)" -lt "$STOP_FREE" ]]; then
-          echo "disk below $STOP_FREE GiB free: stopping xfstests" | tee -a "$RES/summary.txt"
-          touch "$RES/.disk-stop"
-          pid=$(cat "$RES/.check-pid" 2>/dev/null || true)
-          [[ -n "$pid" ]] && kill -TERM -- "-$pid" 2>/dev/null
-          exit 0
-      fi
-  done ) &
-WATCH_PID=$!
 
 rc=0; xfstests ours "$TDEV" "$SDEV" "$RES/failed-ours.txt" "${TESTS[@]}" || rc=$?
 [[ $rc -eq 0 ]] || FAILS=$((FAILS + 1))
@@ -476,7 +512,6 @@ OURS=() FLAKY=() BOTH=()
 if [[ ${#FAILED[@]} -gt 0 && ! -e "$RES/.disk-stop" ]]; then
     say "4 recheck: ${#FAILED[@]} failed tests, again on ours, then on loop"
     xfstests ours-again "$TDEV" "$SDEV" "$RES/failed-ours-again.txt" "${FAILED[@]}" || true
-    kill "$WATCH_PID" 2>/dev/null; WATCH_PID=
     blk detach "$TB" >/dev/null
     blk detach "$SB" >/dev/null
 
@@ -516,7 +551,11 @@ stop_daemon
 
 echo
 if [[ $FAILS -eq 0 ]]; then
-    echo "FSTESTS PASS (results: $RES)"
+    if [[ "${FST_ONLY_XFSTESTS:-}" == 1 ]]; then
+        echo "FSTESTS PASS, partial: raw and fsx skipped (results: $RES)"
+    else
+        echo "FSTESTS PASS (results: $RES)"
+    fi
 else
     echo "FSTESTS FAIL: $FAILS problems (results: $RES/summary.txt; daemon log: $ERR)"
     exit 1
