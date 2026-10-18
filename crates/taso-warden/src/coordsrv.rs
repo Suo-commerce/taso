@@ -82,7 +82,7 @@ use std::time::Duration;
 
 use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream};
 use taso_core::model::{Ownership, WardenId};
-use taso_field::protocol::{read_frame, write_frame, ProtocolError};
+use taso_core::frame::{read_frame, write_frame, FrameError};
 
 use crate::coordinator::{Coord, CoordError};
 use crate::segment::Position;
@@ -480,7 +480,7 @@ fn serve_conn(coord: &dyn Coord, mut stream: UnixStream) {
         let body = match read_frame(&mut stream) {
             Ok(Some(b)) => b,
             // Clean end, or a broken connection: nothing to answer.
-            Ok(None) | Err(ProtocolError::Io(_)) => return,
+            Ok(None) | Err(FrameError::Io(_)) => return,
             Err(e) => {
                 let _ = write_frame(&mut stream, &Reply::Bad(e.to_string()).encode());
                 return;
@@ -700,9 +700,9 @@ impl RemoteCoord {
     }
 }
 
-fn unavailable(e: ProtocolError) -> CoordError {
+fn unavailable(e: FrameError) -> CoordError {
     match e {
-        ProtocolError::Io(e) => CoordError::Unavailable(e),
+        FrameError::Io(e) => CoordError::Unavailable(e),
         other => CoordError::Unavailable(io::Error::new(io::ErrorKind::InvalidData, other.to_string())),
     }
 }
