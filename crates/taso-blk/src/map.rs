@@ -187,14 +187,42 @@ impl Map {
 
     /// Discard `count` blocks from `lba`: they read as zeros.  Returns the
     /// branch's own log locations this made garbage.
+    ///
+    /// Costs the blocks that exist in the range, not the range: the branch
+    /// drops its own, and gets a zero entry only where an ancestor would
+    /// show data.  A block no layer holds already reads as zero (the base
+    /// image), so a discard of a whole device is cheap, and a huge count
+    /// from a device or a stream cannot exhaust memory.
     pub fn discard(&mut self, branch: LayerId, lba: u64, count: u64) -> Result<Vec<u64>, MapError> {
         let end = lba.checked_add(count).ok_or(MapError::Overflow)?;
-        let l = self.branch_mut(branch)?;
+        let parent = self.branch_mut(branch)?.parent;
+        // Blocks in the range that an ancestor shows as data: the topmost
+        // ancestor holding a block decides it.
+        let mut decided = std::collections::BTreeSet::new();
+        let mut shows_data = Vec::new();
+        let mut cur = parent;
+        let mut steps = 0usize;
+        while let Some(p) = cur {
+            steps += 1;
+            assert!(steps <= self.layers.len(), "cycle in the layer chain at {p}");
+            let l = &self.layers[&p];
+            for (&b, loc) in l.blocks.range(lba..end) {
+                if decided.insert(b) && matches!(loc, Loc::Log(_)) {
+                    shows_data.push(b);
+                }
+            }
+            cur = l.parent;
+        }
+        let l = self.branch_mut(branch).expect("checked above");
+        let own: Vec<u64> = l.blocks.range(lba..end).map(|(b, _)| *b).collect();
         let mut garbage = Vec::new();
-        for b in lba..end {
-            if let Some(Loc::Log(off)) = l.blocks.insert(b, Loc::Zero) {
+        for b in own {
+            if let Some(Loc::Log(off)) = l.blocks.remove(&b) {
                 garbage.push(off);
             }
+        }
+        for b in shows_data {
+            l.blocks.insert(b, Loc::Zero);
         }
         Ok(garbage)
     }
@@ -431,10 +459,28 @@ mod tests {
         // Block 1 is in the Seal (hidden, not freed); block 2's 21 is the
         // branch's own (freed); block 3 was never written.
         assert_eq!(m.discard(b, 1, 3).unwrap(), vec![21]);
-        for lba in 1..4 {
-            assert_eq!(m.read(b, lba).unwrap(), Some(Loc::Zero));
+        for lba in 1..3 {
+            assert_eq!(m.read(b, lba).unwrap(), Some(Loc::Zero), "hides the Seal's block {lba}");
         }
+        assert_eq!(m.read(b, 3).unwrap(), None, "nothing to hide: reads the zero base image");
         assert_eq!(m.discard(b, u64::MAX, 2), Err(MapError::Overflow));
+    }
+
+    #[test]
+    fn a_huge_discard_costs_only_the_blocks_that_exist() {
+        let mut m = Map::new();
+        let s1 = m.root_seal(0);
+        let b = m.fork(s1).unwrap();
+        m.write(b, 7, log(1)).unwrap();
+        m.write(b, 1 << 40, log(2)).unwrap();
+        let s2 = m.seal(b, 1).unwrap();
+        m.write(b, 9, log(3)).unwrap();
+        let t = std::time::Instant::now();
+        assert_eq!(m.discard(b, 0, u64::MAX / 2).unwrap(), vec![3]);
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "not one step per block");
+        assert_eq!(m.delta(b).unwrap().count(), 2, "zero entries only over the Seal's two blocks");
+        assert_eq!((m.read(b, 7).unwrap(), m.read(b, 9).unwrap()), (Some(Loc::Zero), None));
+        assert_eq!(m.read(s2, 7).unwrap(), Some(log(1)), "the Seal is untouched");
     }
 
     #[test]
@@ -617,7 +663,9 @@ mod tests {
                 // Every live layer reads exactly as its materialised image.
                 for (layer, img) in &model {
                     for lba in 0..20 {
-                        prop_assert_eq!(m.read(*layer, lba).unwrap(), img.get(&lba).copied(),
+                        // No entry and a zero entry both read zeros.
+                        let norm = |l: Option<Loc>| l.filter(|l| *l != Loc::Zero);
+                        prop_assert_eq!(norm(m.read(*layer, lba).unwrap()), norm(img.get(&lba).copied()),
                             "layer {} block {}", layer, lba);
                     }
                 }

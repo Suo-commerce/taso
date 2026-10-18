@@ -58,6 +58,22 @@
 //! All three are rebuilt from the log on [`Store::open`], held back with
 //! their group like every other map change.
 //!
+//! # Export and import (shipping a Seal to another node)
+//!
+//! [`Store::export`] writes the blocks that differ between two Seals (or
+//! between a Seal and the zero base image) as a stream; [`Store::import`]
+//! applies one to a clean branch on another store.  Sealing that branch
+//! there gives the same image.  The stream:
+//!
+//! ```text
+//!   "TASOBLKX" | run* | 0u8 | blocks u64 | BLAKE3(everything before) [32]
+//!   run = kind u8 (1 data, 2 zeros) | lba u64 | count u32 | data (data runs)
+//! ```
+//!
+//! Import verifies as it goes and resets the branch on any failure (bad
+//! magic, truncation, wrong count or hash), so a stream that fails leaves
+//! nothing.
+//!
 //! The base image is zeros: a fresh device reads zeros until written, and
 //! ext4 is created by `mkfs` on a branch, then sealed.
 //!
@@ -100,6 +116,12 @@ const K_FLUSH: u8 = 8;
 const K_NAME: u8 = 9;
 const K_RESET: u8 = 10;
 
+/// Export streams: magic, run kinds, and the longest data run (4 MiB).
+const STREAM_MAGIC: &[u8; 8] = b"TASOBLKX";
+const RUN_DATA: u8 = 1;
+const RUN_ZERO: u8 = 2;
+const RUN_MAX: u64 = 1024;
+
 /// Why a store operation failed.
 #[derive(Debug)]
 pub enum StoreError {
@@ -131,6 +153,18 @@ pub enum StoreError {
     BadName(String),
     /// Another live branch already has this name.
     NameTaken(String),
+    /// The layer is not below the exported Seal.
+    NotAnAncestor {
+        /// The layer given as the base.
+        from: LayerId,
+        /// The Seal being exported.
+        to: LayerId,
+    },
+    /// Import into a branch that already holds blocks of its own.
+    NotClean(LayerId),
+    /// An import stream that is not whole or not valid.  Nothing of it was
+    /// kept.
+    BadStream(&'static str),
     /// A verified record about names or tags does not replay.
     ReplayMeta {
         /// The record's sequence number.
@@ -153,6 +187,9 @@ impl std::fmt::Display for StoreError {
             Self::BadName(n) => write!(f, "bad branch name {n:?}: 1 to {MAX_NAME} of A-Z a-z 0-9 _ . : / -"),
             Self::NameTaken(n) => write!(f, "branch name {n:?} is taken"),
             Self::ReplayMeta { lsn, reason } => write!(f, "record {lsn} does not replay: {reason}"),
+            Self::NotAnAncestor { from, to } => write!(f, "{from} is not below {to}"),
+            Self::NotClean(b) => write!(f, "{b} holds blocks of its own; reset it before importing"),
+            Self::BadStream(why) => write!(f, "bad import stream ({why}); nothing was kept"),
             Self::Replay { lsn, error } => write!(f, "record {lsn} does not replay: {error}"),
             Self::BadLength(n) => write!(f, "write of {n} bytes is not a whole number of {BLOCK}-byte blocks"),
             Self::TooLarge(n) => write!(f, "write of {n} bytes exceeds one record"),
@@ -515,6 +552,163 @@ impl Store {
         self.append(K_RESET, &branch.get().to_le_bytes())
     }
 
+    /// Write the blocks that make `from` (a Seal below `to`, or the zero
+    /// base image if `None`) into the Seal `to`, as an import stream.
+    /// Returns the blocks written.
+    pub fn export(&self, to: LayerId, from: Option<LayerId>, w: &mut impl io::Write) -> Result<u64, StoreError> {
+        if !matches!(self.map.kind(to)?, Kind::Seal { .. }) {
+            return Err(MapError::NotASeal(to).into());
+        }
+        if let Some(f) = from {
+            if !matches!(self.map.kind(f)?, Kind::Seal { .. }) {
+                return Err(MapError::NotASeal(f).into());
+            }
+        }
+        // Newest first: the first layer that holds a block decides it.
+        let mut blocks: BTreeMap<u64, Loc> = BTreeMap::new();
+        let mut cur = Some(to);
+        loop {
+            match cur {
+                Some(l) if Some(l) == from => break,
+                Some(l) => {
+                    for (lba, loc) in self.map.delta(l)? {
+                        blocks.entry(lba).or_insert(loc);
+                    }
+                    cur = self.map.parent(l)?;
+                }
+                None if from.is_none() => break,
+                None => return Err(StoreError::NotAnAncestor { from: from.expect("checked"), to }),
+            }
+        }
+        let mut out = HashingWriter { w, h: blake3::Hasher::new() };
+        out.put(STREAM_MAGIC)?;
+        let mut buf = vec![0u8; RUN_MAX as usize * BLOCK as usize];
+        let mut it = blocks.iter().peekable();
+        while let Some((&start, &loc)) = it.next() {
+            // A run: consecutive blocks of the same kind, at most RUN_MAX.
+            let data = matches!(loc, Loc::Log(_));
+            let mut count = 1u64;
+            while count < RUN_MAX {
+                match it.peek() {
+                    Some((&lba, &l)) if lba == start + count && matches!(l, Loc::Log(_)) == data => {
+                        it.next();
+                        count += 1;
+                    }
+                    _ => break,
+                }
+            }
+            out.put(&[if data { RUN_DATA } else { RUN_ZERO }])?;
+            out.put(&start.to_le_bytes())?;
+            out.put(&(count as u32).to_le_bytes())?;
+            if data {
+                let n = (count * BLOCK) as usize;
+                self.read(to, start, &mut buf[..n])?;
+                out.put(&buf[..n])?;
+            }
+        }
+        out.put(&[0])?;
+        out.put(&(blocks.len() as u64).to_le_bytes())?;
+        let hash = out.h.finalize();
+        out.w.write_all(hash.as_bytes())?;
+        out.w.flush()?;
+        Ok(blocks.len() as u64)
+    }
+
+    /// Apply an export stream to `branch`, which must hold no blocks of its
+    /// own (a fresh branch, or one just reset).  The writes are durable at
+    /// the next flush; seal the branch to keep them as a Seal.  On any
+    /// failure the branch is reset: nothing of the stream is kept.  Returns
+    /// the blocks applied.
+    pub fn import(&mut self, branch: LayerId, r: &mut impl Read) -> Result<u64, StoreError> {
+        self.check()?;
+        if self.map.kind(branch)? != Kind::Branch {
+            return Err(MapError::NotABranch(branch).into());
+        }
+        if self.map.delta(branch)?.next().is_some() {
+            return Err(StoreError::NotClean(branch));
+        }
+        match self.import_runs(branch, r) {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                // Take back what was applied; if even that fails the store
+                // is poisoned and reopening replays to a consistent state.
+                self.reset(branch)?;
+                Err(e)
+            }
+        }
+    }
+
+    fn import_runs(&mut self, branch: LayerId, r: &mut impl Read) -> Result<u64, StoreError> {
+        let mut r = HashingReader { r, h: blake3::Hasher::new() };
+        let bad = StoreError::BadStream;
+        let mut magic = [0u8; 8];
+        if !r.take(&mut magic)? || &magic != STREAM_MAGIC {
+            return Err(bad("not an export stream"));
+        }
+        let mut applied = 0u64;
+        let mut buf = vec![0u8; RUN_MAX as usize * BLOCK as usize];
+        loop {
+            let mut kind = [0u8; 1];
+            if !r.take(&mut kind)? {
+                return Err(bad("truncated"));
+            }
+            if kind[0] == 0 {
+                break;
+            }
+            let mut head = [0u8; 12];
+            if !r.take(&mut head)? {
+                return Err(bad("truncated"));
+            }
+            let lba = u64::from_le_bytes(head[..8].try_into().unwrap());
+            let count = u32::from_le_bytes(head[8..].try_into().unwrap()) as u64;
+            if count == 0 || lba.checked_add(count).is_none() {
+                return Err(bad("bad run"));
+            }
+            match kind[0] {
+                RUN_DATA => {
+                    if count > RUN_MAX {
+                        return Err(bad("run too long"));
+                    }
+                    let n = (count * BLOCK) as usize;
+                    if !r.take(&mut buf[..n])? {
+                        return Err(bad("truncated"));
+                    }
+                    self.write(branch, lba, &buf[..n], false)?;
+                }
+                RUN_ZERO => self.discard(branch, lba, count)?,
+                _ => return Err(bad("unknown run kind")),
+            }
+            applied += count;
+        }
+        let mut total = [0u8; 8];
+        if !r.take(&mut total)? {
+            return Err(bad("truncated"));
+        }
+        let want = r.h.finalize();
+        let mut hash = [0u8; HASH];
+        if !read_full(&mut r.r, &mut hash)? {
+            return Err(bad("truncated"));
+        }
+        if u64::from_le_bytes(total) != applied {
+            return Err(bad("block count does not match"));
+        }
+        if &hash != want.as_bytes() {
+            return Err(bad("hash does not match"));
+        }
+        let mut extra = [0u8; 1];
+        if read_full(&mut r.r, &mut extra)? {
+            return Err(bad("bytes after the end"));
+        }
+        Ok(applied)
+    }
+
+    /// Every live branch name, with its branch, in name order.
+    pub fn names(&self) -> Vec<(String, LayerId)> {
+        let mut v: Vec<(String, LayerId)> = self.meta.names.iter().map(|(n, b)| (n.clone(), *b)).collect();
+        v.sort();
+        v
+    }
+
     /// Drop a Seal nothing stands on; its blocks become garbage.
     pub fn drop_seal(&mut self, seal: LayerId) -> Result<(), StoreError> {
         self.check()?;
@@ -763,6 +957,36 @@ impl Meta {
 fn valid_name(name: &str) -> bool {
     (1..=MAX_NAME).contains(&name.len())
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'))
+}
+
+/// A writer that hashes what goes through it.
+struct HashingWriter<'a, W: io::Write> {
+    w: &'a mut W,
+    h: blake3::Hasher,
+}
+
+impl<W: io::Write> HashingWriter<'_, W> {
+    fn put(&mut self, b: &[u8]) -> io::Result<()> {
+        self.h.update(b);
+        self.w.write_all(b)
+    }
+}
+
+/// A reader that hashes what it reads.
+struct HashingReader<'a, R: Read> {
+    r: &'a mut R,
+    h: blake3::Hasher,
+}
+
+impl<R: Read> HashingReader<'_, R> {
+    /// Fill `buf`; `false` if the stream ends first.
+    fn take(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+        let whole = read_full(self.r, buf)?;
+        if whole {
+            self.h.update(buf);
+        }
+        Ok(whole)
+    }
 }
 
 /// A reader over `file[pos..end]` that does not move the file's cursor.
@@ -1128,6 +1352,163 @@ mod tests {
         assert_eq!((read1(&s, a, 0), read1(&s, a, 5)), (1, 0), "the reset survives a reopen");
         assert_eq!((s.find("tank/v-a"), s.seals_of(a)), (Some(a), vec![s1]));
         assert_eq!(s.map().parent(a).unwrap(), Some(s1));
+    }
+
+    /// Every block `0..span` of `layer`, one byte each (blocks are filled
+    /// with one value).
+    fn image(s: &Store, layer: LayerId, span: u64) -> Vec<u8> {
+        (0..span).map(|b| read1(s, layer, b)).collect()
+    }
+
+    fn export_bytes(s: &Store, to: LayerId, from: Option<LayerId>) -> Vec<u8> {
+        let mut out = Vec::new();
+        s.export(to, from, &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn export_and_import_ship_seals_between_stores() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Store::create(&dir.path().join("a")).unwrap();
+        let mut b = Store::create(&dir.path().join("b")).unwrap();
+        let (ra, rb) = (a.root_seal().unwrap(), b.root_seal().unwrap());
+
+        // Seal 1: full.
+        let va = a.fork(ra).unwrap();
+        a.write(va, 0, &blocks(1, 3), false).unwrap();
+        a.write(va, 10, &blocks(2, 1), false).unwrap();
+        a.discard(va, 1, 1).unwrap();
+        let s1 = a.seal(va).unwrap();
+        let vb = b.fork(rb).unwrap();
+        // Blocks 0, 2 and 10: block 1 was discarded and nothing below it
+        // holds data, so it needs no entry (it reads as the zero base).
+        assert_eq!(b.import(vb, &mut &export_bytes(&a, s1, None)[..]).unwrap(), 3);
+        let t1 = b.seal(vb).unwrap();
+        assert_eq!(image(&b, t1, 16), image(&a, s1, 16));
+
+        // Seal 2: incremental, with an overwrite and a discard of an old block.
+        a.write(va, 0, &blocks(3, 1), false).unwrap();
+        a.discard(va, 10, 1).unwrap();
+        a.write(va, 12, &blocks(4, 2), false).unwrap();
+        let s2 = a.seal(va).unwrap();
+        let inc = export_bytes(&a, s2, Some(s1));
+        assert!(inc.len() < export_bytes(&a, s2, None).len(), "incremental carries only the change");
+        assert_eq!(b.import(vb, &mut &inc[..]).unwrap(), 4);
+        let t2 = b.seal(vb).unwrap();
+        assert_eq!(image(&b, t2, 16), image(&a, s2, 16));
+        assert_eq!(image(&b, t2, 16)[10], 0, "the discard travelled");
+
+        // A clone's first Seal: incremental from the parent Seal.
+        let ca = a.fork(s1).unwrap();
+        a.write(ca, 5, &blocks(9, 1), false).unwrap();
+        let c1 = a.seal(ca).unwrap();
+        let cb = b.fork(t1).unwrap();
+        b.import(cb, &mut &export_bytes(&a, c1, Some(s1))[..]).unwrap();
+        let u1 = b.seal(cb).unwrap();
+        assert_eq!(image(&b, u1, 16), image(&a, c1, 16));
+
+        // Durable on b after a reopen.
+        b.flush().unwrap();
+        let path = b.path().to_path_buf();
+        drop(b);
+        let (b, _) = Store::open(&path).unwrap();
+        assert_eq!((image(&b, t2, 16), image(&b, u1, 16)), (image(&a, s2, 16), image(&a, c1, 16)));
+    }
+
+    #[test]
+    fn long_runs_are_split_and_arrive_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Store::create(&dir.path().join("a")).unwrap();
+        let mut b = Store::create(&dir.path().join("b")).unwrap();
+        let ra = a.root_seal().unwrap();
+        let va = a.fork(ra).unwrap();
+        let n = RUN_MAX as usize * 2 + 7;
+        let data: Vec<u8> = (0..n).flat_map(|i| [(i % 251) as u8; BLOCK as usize]).collect();
+        a.write(va, 3, &data, false).unwrap();
+        a.discard(va, 5000, 3000).unwrap();
+        let s1 = a.seal(va).unwrap();
+        let rb = b.root_seal().unwrap();
+        let vb = b.fork(rb).unwrap();
+        // The discard of blocks nothing holds ships nothing.
+        assert_eq!(b.import(vb, &mut &export_bytes(&a, s1, None)[..]).unwrap(), n as u64);
+        let mut got = vec![0u8; n * BLOCK as usize];
+        b.read(vb, 3, &mut got).unwrap();
+        assert!(got == data, "every block of the long run arrived");
+    }
+
+    #[test]
+    fn exports_that_make_no_sense_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = new_store(&dir);
+        let root = a.root_seal().unwrap();
+        let v = a.fork(root).unwrap();
+        let s1 = a.seal(v).unwrap();
+        let w = a.fork(root).unwrap();
+        let other = a.seal(w).unwrap();
+        let mut sink = Vec::new();
+        assert!(matches!(a.export(v, None, &mut sink), Err(StoreError::Map(MapError::NotASeal(_)))), "a live branch moves");
+        assert!(matches!(a.export(s1, Some(other), &mut sink), Err(StoreError::NotAnAncestor { .. })));
+        assert!(matches!(a.export(s1, Some(v), &mut sink), Err(StoreError::Map(MapError::NotASeal(_)))));
+        a.write(v, 0, &blocks(1, 1), false).unwrap();
+        let bytes = export_bytes(&a, s1, None);
+        assert!(matches!(a.import(v, &mut &bytes[..]), Err(StoreError::NotClean(_))));
+        assert!(matches!(a.import(s1, &mut &bytes[..]), Err(StoreError::Map(MapError::NotABranch(_)))));
+    }
+
+    #[test]
+    fn a_bad_stream_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Store::create(&dir.path().join("a")).unwrap();
+        let ra = a.root_seal().unwrap();
+        let va = a.fork(ra).unwrap();
+        a.write(va, 0, &blocks(1, 2), false).unwrap();
+        a.discard(va, 4, 2).unwrap();
+        a.write(va, 9, &blocks(2, 1), false).unwrap();
+        let s1 = a.seal(va).unwrap();
+        let good = export_bytes(&a, s1, None);
+
+        let mut b = Store::create(&dir.path().join("b")).unwrap();
+        let rb = b.root_seal().unwrap();
+        let vb = b.fork(rb).unwrap();
+        let clean = |b: &Store| b.map().delta(vb).unwrap().next().is_none();
+        let mut tried = 0;
+        // Cut at every length short of whole.
+        for len in 0..good.len() {
+            assert!(matches!(b.import(vb, &mut &good[..len]), Err(StoreError::BadStream(_))), "cut at {len}");
+            assert!(clean(&b), "cut at {len} left blocks");
+            tried += 1;
+        }
+        // Any one byte changed (each bit pattern that keeps the length).
+        for at in 0..good.len() {
+            let mut bad = good.clone();
+            bad[at] ^= 0x41;
+            match b.import(vb, &mut &bad[..]) {
+                Err(StoreError::BadStream(_)) => {}
+                other => panic!("byte {at} flipped: {other:?}"),
+            }
+            assert!(clean(&b), "byte {at} flipped left blocks");
+            tried += 1;
+        }
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(matches!(b.import(vb, &mut &longer[..]), Err(StoreError::BadStream("bytes after the end"))));
+        assert!(clean(&b));
+        assert!(tried > 2 * 8000, "{tried}");
+        // And the good one still goes in.
+        b.import(vb, &mut &good[..]).unwrap();
+        let t1 = b.seal(vb).unwrap();
+        assert_eq!(image(&b, t1, 12), image(&a, s1, 12));
+    }
+
+    #[test]
+    fn names_are_listed_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = new_store(&dir);
+        let root = s.root_seal().unwrap();
+        let (x, y) = (s.fork(root).unwrap(), s.fork(root).unwrap());
+        s.name(y, "tank/b").unwrap();
+        s.name(x, "tank/a").unwrap();
+        assert_eq!(s.names(), vec![("tank/a".to_string(), x), ("tank/b".to_string(), y)]);
     }
 
     #[test]
