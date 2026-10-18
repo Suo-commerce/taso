@@ -1,5 +1,5 @@
 //! `BlkPool` on real devices: the Warden's Vessels on `taso-blkd`, ublk,
-//! ext4 and real mounts.  Needs root, ublk and a running daemon, so it is
+//! ext4 and real mounts (birth, Seal, forks, reopen, rollback).  Needs root, ublk and a running daemon, so it is
 //! ignored by default; `scripts/blk-warden-test.sh` starts a daemon on a
 //! fresh log and runs it:
 //!
@@ -104,8 +104,15 @@ fn vessels_on_real_devices() {
     // Reopen the parent: lineage and layer checks pass on real layers.
     let id = v.id();
     drop((v, child, second));
-    let (v, _) = host.open(id).unwrap();
+    let (mut v, _) = host.open(id).unwrap();
     assert_eq!(v.last_seal(), Some(s1));
     let dev = host.pool.ensure_mounted(v.dataset()).unwrap();
     assert_eq!(host.pool.ensure_mounted(v.dataset()).unwrap(), dev, "mounted already: the same device");
+
+    // Rollback to the last Seal: unmount, reset, remount; the file is as
+    // sealed again and the later one is gone.
+    assert_eq!(v.rollback().unwrap(), Some(s1));
+    assert_eq!(std::fs::read(mp.join("note")).unwrap(), b"sealed");
+    assert!(!mp.join("later").exists());
+    assert_eq!(host.pool.layers(v.dataset()).list().unwrap(), [(birth.lsn, birth.hash), (s1.lsn, s1.hash)]);
 }

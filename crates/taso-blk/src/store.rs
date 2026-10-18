@@ -98,6 +98,7 @@ const K_DROP_BRANCH: u8 = 6;
 const K_DROP_SEAL: u8 = 7;
 const K_FLUSH: u8 = 8;
 const K_NAME: u8 = 9;
+const K_RESET: u8 = 10;
 
 /// Why a store operation failed.
 #[derive(Debug)]
@@ -503,6 +504,17 @@ impl Store {
         self.append(K_DROP_BRANCH, &branch.get().to_le_bytes())
     }
 
+    /// Reset `branch` to the Seal it stands on: its own blocks become
+    /// garbage, and it keeps its id, name and Seals.  Durable at the next
+    /// flush.  A mounted file system on the branch must be unmounted
+    /// first: its blocks change under it.
+    pub fn reset(&mut self, branch: LayerId) -> Result<(), StoreError> {
+        self.check()?;
+        let freed = self.map.reset(branch)?;
+        self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
+        self.append(K_RESET, &branch.get().to_le_bytes())
+    }
+
     /// Drop a Seal nothing stands on; its blocks become garbage.
     pub fn drop_seal(&mut self, seal: LayerId) -> Result<(), StoreError> {
         self.check()?;
@@ -572,7 +584,7 @@ fn read_record(r: &mut impl Read, prev: &[u8; HASH]) -> io::Result<Option<Record
     let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
     let len = u32::from_le_bytes(head[4..8].try_into().unwrap());
     let kind = head[8];
-    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_NAME).contains(&kind) {
+    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_RESET).contains(&kind) {
         return Ok(None);
     }
     let mut body = vec![0u8; len as usize];
@@ -685,6 +697,10 @@ fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError
             let freed = map.drop_seal(layer(0)).map_err(bad)?.len() as u64;
             meta.seals.remove(&layer(0));
             freed
+        }
+        K_RESET => {
+            need(8)?;
+            map.reset(layer(0)).map_err(bad)?.len() as u64
         }
         K_NAME => {
             let meta_err = |reason| StoreError::ReplayMeta { lsn: p.lsn, reason };
@@ -1088,6 +1104,33 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_branch_reads_as_its_seal_and_keeps_its_name_and_seals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (a, s1);
+        {
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            a = s.fork(root).unwrap();
+            s.name(a, "tank/v-a").unwrap();
+            s.write(a, 0, &blocks(1, 2), false).unwrap();
+            s1 = s.seal_tagged(a, b"t1").unwrap();
+            s.write(a, 0, &blocks(2, 1), false).unwrap();
+            s.write(a, 5, &blocks(3, 1), false).unwrap();
+            let g = s.stats().garbage_bytes;
+            s.reset(a).unwrap();
+            assert_eq!(s.stats().garbage_bytes, g + 2 * BLOCK, "the two blocks written after the Seal");
+            assert_eq!((read1(&s, a, 0), read1(&s, a, 1), read1(&s, a, 5)), (1, 1, 0), "reads as the Seal again");
+            assert!(matches!(s.reset(s1), Err(StoreError::Map(MapError::NotABranch(_)))));
+            s.flush().unwrap();
+        }
+        let (s, _) = Store::open(&path).unwrap();
+        assert_eq!((read1(&s, a, 0), read1(&s, a, 5)), (1, 0), "the reset survives a reopen");
+        assert_eq!((s.find("tank/v-a"), s.seals_of(a)), (Some(a), vec![s1]));
+        assert_eq!(s.map().parent(a).unwrap(), Some(s1));
+    }
+
+    #[test]
     fn a_name_after_the_last_flush_is_cut_with_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log");
@@ -1176,6 +1219,7 @@ mod tests {
         Fork(usize),
         Seal(usize, u8),
         Name(usize, u8),
+        Reset(usize),
         Flush,
     }
 
@@ -1186,6 +1230,7 @@ mod tests {
             1 => (0usize..6).prop_map(Op::Fork),
             1 => (0usize..6, 0u8..3).prop_map(|(i, t)| Op::Seal(i, t)),
             1 => (0usize..6, 0u8..3).prop_map(|(i, n)| Op::Name(i, n)),
+            1 => (0usize..6).prop_map(Op::Reset),
             2 => Just(Op::Flush),
         ]
     }
@@ -1210,6 +1255,10 @@ mod tests {
                     if let Ok(l) = s.fork(pick(i)) {
                         layers.push(l);
                     }
+                    false
+                }
+                Op::Reset(i) => {
+                    let _ = s.reset(pick(i));
                     false
                 }
                 Op::Name(i, n) => {
@@ -1255,7 +1304,7 @@ mod tests {
         let ops = [
             Op::Fork(0), Op::Write(1, 0, 1, 10, false), Op::Write(1, 1, 2, 11, false), Op::Flush,
             Op::Name(1, 1), Op::Write(1, 0, 1, 12, false), Op::Discard(1, 1, 1), Op::Seal(1, 2), Op::Fork(2),
-            Op::Name(3, 2), Op::Write(3, 2, 1, 13, false), Op::Write(1, 2, 1, 14, true), Op::Name(1, 0),
+            Op::Name(3, 2), Op::Write(3, 2, 1, 13, false), Op::Write(1, 2, 1, 14, true), Op::Reset(3), Op::Name(1, 0),
             Op::Write(3, 0, 1, 15, false),
         ];
         let (layers, points) = run(&mut s, &ops);

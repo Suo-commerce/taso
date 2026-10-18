@@ -70,6 +70,9 @@ fn the_client_and_the_daemon_agree() {
     let i = c.info(a).unwrap();
     assert_eq!((i.kind, i.parent, i.name.as_deref(), i.tag), (LayerKind::Branch, Some(s2), Some("tank/taso/a"), None));
 
+    c.reset(a).unwrap(); // detached: allowed
+    assert_eq!(c.info(a).unwrap().parent, Some(s2), "a reset branch keeps its place");
+    assert_eq!(c.seals(a).unwrap().len(), 2, "and its Seals");
     let b = c.branch(s1, Some("tank/taso/b")).unwrap();
     assert_eq!(c.seals(b).unwrap(), vec![], "a fork has no Seals of its own");
     c.name(b, Some("tank/taso/b2")).unwrap();

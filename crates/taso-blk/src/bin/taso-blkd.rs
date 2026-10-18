@@ -23,6 +23,7 @@
 //! | `seals <branch>` | the branch's own Seals, oldest first             | `ok <seal>:<tag> ...`|
 //! | `info <layer>`   | what a layer is                                  | `ok key=value ...`   |
 //! | `detach <branch>`| stop the branch's device                         | `ok`                 |
+//! | `reset <branch>` | back to the Seal it stands on (detached only)    | `ok`                 |
 //! | `drop <layer>`   | detach if needed, drop the branch or Seal        | `ok`                 |
 //! | `flush`          | end a group                                      | `ok <lsn>`           |
 //! | `stats`          | counters, for measurements                       | `ok key=value ...`   |
@@ -313,6 +314,18 @@ impl Daemon {
                 let branch = layer(1)?;
                 let tag = unhex(words.get(2).copied().unwrap_or(""))?;
                 Ok(self.store.lock().unwrap().seal_tagged(branch, &tag).map_err(store_err)?.to_string())
+            }
+            "reset" => {
+                let branch = layer(1)?;
+                // Hold the device table so no attach can start in between;
+                // the table is always taken before the store, never after.
+                let devices = self.devices.lock().unwrap();
+                if devices.contains_key(&branch) {
+                    return Err(format!("{branch} is attached; unmount and detach it first"));
+                }
+                self.store.lock().unwrap().reset(branch).map_err(store_err)?;
+                drop(devices);
+                Ok(String::new())
             }
             "detach" => {
                 self.detach(layer(1)?)?;

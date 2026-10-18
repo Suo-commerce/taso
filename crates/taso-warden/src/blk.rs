@@ -15,7 +15,7 @@
 //! | `snapshot` | freeze ext4 (only when mounted from the branch's device), Seal with the tag, thaw |
 //! | `list` | the branch's own Seals with a Taso tag, in lsn order |
 //! | `destroy` | drop that Seal (refused while something stands on it) |
-//! | `rollback` | not yet: the trait's default refusal (needs a branch reset in the store) |
+//! | `rollback` | only to the newest layer: unmount, detach, reset the branch to that Seal, remount |
 //! | `receive*` | not yet: rebirth needs the log off the node (adoption step 5) |
 //!
 //! # Origin and parent without extra state
@@ -98,6 +98,10 @@ pub trait Blkd {
     fn info(&mut self, layer: LayerId) -> Result<Info, LayerError>;
     /// Drop a branch or a Seal nothing stands on.
     fn drop_layer(&mut self, layer: LayerId) -> Result<(), LayerError>;
+    /// Stop `branch`'s device.
+    fn detach(&mut self, branch: LayerId) -> Result<(), LayerError>;
+    /// Reset a detached `branch` to the Seal it stands on.
+    fn reset(&mut self, branch: LayerId) -> Result<(), LayerError>;
     /// Make every change so far durable.
     fn flush(&mut self) -> Result<(), LayerError>;
 }
@@ -158,6 +162,12 @@ impl Blkd for Daemon {
     fn drop_layer(&mut self, layer: LayerId) -> Result<(), LayerError> {
         self.call(|c| c.drop_layer(layer))
     }
+    fn detach(&mut self, branch: LayerId) -> Result<(), LayerError> {
+        self.call(|c| c.detach(branch))
+    }
+    fn reset(&mut self, branch: LayerId) -> Result<(), LayerError> {
+        self.call(|c| c.reset(branch))
+    }
     fn flush(&mut self) -> Result<(), LayerError> {
         self.call(|c| c.flush()).map(|_| ())
     }
@@ -171,6 +181,8 @@ pub trait Mounts {
     fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()>;
     /// The device mounted on exactly `dir`, if something is.
     fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>>;
+    /// Unmount the file system mounted on `dir`.
+    fn umount(&self, dir: &Path) -> io::Result<()>;
     /// Freeze the file system mounted on `dir`.
     fn freeze(&self, dir: &Path) -> io::Result<()>;
     /// Thaw it.
@@ -203,6 +215,9 @@ impl Mounts for System {
     }
     fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
         Ok(mount_source(&std::fs::read_to_string("/proc/self/mountinfo")?, dir))
+    }
+    fn umount(&self, dir: &Path) -> io::Result<()> {
+        run(Command::new("umount").arg(dir))
     }
     fn freeze(&self, dir: &Path) -> io::Result<()> {
         run(Command::new("fsfreeze").arg("-f").arg(dir))
@@ -266,17 +281,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     }
 
     fn mount_branch(&self, d: &mut D, b: LayerId, dataset: &Dataset) -> Result<PathBuf, LayerError> {
-        let dev = match d.info(b)?.dev {
-            Some(dev) => dev,
-            None => d.attach(b)?,
-        };
-        let mp = self.mountpoint(dataset);
-        match self.mounts.source(&mp)? {
-            Some(src) if src == dev => {}
-            Some(other) => return Err(format!("{} is mounted from {}, not {}", mp.display(), other.display(), dev.display()).into()),
-            None => self.mounts.mount(&dev, &mp)?,
-        }
-        Ok(dev)
+        mount_branch(d, &*self.mounts, b, &self.mountpoint(dataset))
     }
 
     fn info_locked(&self, d: &mut D, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
@@ -284,6 +289,21 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
         let (origin, parent) = lineage(d, b)?;
         Ok(Some(DatasetInfo { dataset: dataset.clone(), mountpoint: Some(self.mountpoint(dataset)), origin, parent }))
     }
+}
+
+/// Give branch `b` a device if it has none and mount it on `mp` if nothing
+/// is mounted there; refuse if something else is.  Returns the device.
+fn mount_branch<D: Blkd, M: Mounts>(d: &mut D, m: &M, b: LayerId, mp: &Path) -> Result<PathBuf, LayerError> {
+    let dev = match d.info(b)?.dev {
+        Some(dev) => dev,
+        None => d.attach(b)?,
+    };
+    match m.source(mp)? {
+        Some(src) if src == dev => {}
+        Some(other) => return Err(format!("{} is mounted from {}, not {}", mp.display(), other.display(), dev.display()).into()),
+        None => m.mount(&dev, mp)?,
+    }
+    Ok(dev)
 }
 
 /// A clone's origin (`source@taso-seal-<lsn>`) and parent hash, read from
@@ -457,6 +477,49 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
         }
         Ok(())
     }
+
+    /// Back to the layer at `lsn`, which must be bound to `hash` and be the
+    /// newest one: the branch stands on it, so a reset is exactly "discard
+    /// everything written after it".  Refused, changing nothing, if a later
+    /// layer exists, the hash differs, or the mountpoint is mounted from
+    /// something else or busy (unmount fails).
+    fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let b = self.branch(&mut *d)?;
+        let own = d.seals(b)?;
+        let (layer, bound) = seal_at(&mut *d, b, lsn)?.ok_or_else(|| format!("no Seal layer {}", self.dataset.seal_snapshot(lsn)))?;
+        if bound != hash {
+            return Err(format!("Seal layer {} is bound to another record", self.dataset.seal_snapshot(lsn)).into());
+        }
+        if let Some(later) = own.iter().filter_map(|(_, t)| untag(t)).map(|(n, _)| n).find(|n| *n > lsn) {
+            return Err(format!("a later layer exists ({}); not rolling back", self.dataset.seal_snapshot(later)).into());
+        }
+        let info = d.info(b)?;
+        if info.parent != Some(layer) {
+            return Err(format!("{} does not stand on its newest layer; not rolling back", self.dataset).into());
+        }
+        let was_mounted = match (info.dev.as_ref(), self.mounts.source(&self.mountpoint)?) {
+            (Some(dev), Some(src)) if &src == dev => true,
+            (_, Some(src)) => {
+                return Err(format!("{} is mounted from {}, not from {}'s device", self.mountpoint.display(), src.display(), self.dataset).into())
+            }
+            (_, None) => false,
+        };
+        if was_mounted {
+            self.mounts.umount(&self.mountpoint)?; // busy: refused here, nothing changed
+        }
+        if info.dev.is_some() {
+            d.detach(b)?;
+        }
+        d.reset(b)?;
+        d.flush()?;
+        if was_mounted {
+            mount_branch(&mut *d, &*self.mounts, b, &self.mountpoint)?;
+        } else if info.dev.is_some() {
+            d.attach(b)?;
+        }
+        Ok(())
+    }
 }
 
 // ── tests ───────────────────────────────────────────────────────────
@@ -542,6 +605,15 @@ mod tests {
             }
             Ok(())
         }
+        fn detach(&mut self, branch: LayerId) -> Result<(), LayerError> {
+            self.devs.remove(&branch).map(|_| ()).ok_or_else(|| format!("{branch} is not attached").into())
+        }
+        fn reset(&mut self, branch: LayerId) -> Result<(), LayerError> {
+            if self.devs.contains_key(&branch) {
+                return Err("attached; detach first".into());
+            }
+            Ok(self.store.reset(branch)?)
+        }
         fn flush(&mut self) -> Result<(), LayerError> {
             self.store.flush()?;
             Ok(())
@@ -555,6 +627,7 @@ mod tests {
         frozen: RefCell<Vec<PathBuf>>,
         calls: RefCell<Vec<String>>,
         fail_mkfs: RefCell<bool>,
+        busy: RefCell<bool>,
     }
 
     impl Mounts for FakeMounts {
@@ -572,6 +645,13 @@ mod tests {
         }
         fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
             Ok(self.table.borrow().get(dir).cloned())
+        }
+        fn umount(&self, dir: &Path) -> io::Result<()> {
+            self.calls.borrow_mut().push(format!("umount {}", dir.display()));
+            if *self.busy.borrow() {
+                return Err(io::Error::other("target is busy"));
+            }
+            self.table.borrow_mut().remove(dir).map(|_| ()).ok_or_else(|| io::Error::other("not mounted"))
         }
         fn freeze(&self, dir: &Path) -> io::Result<()> {
             assert!(self.table.borrow().contains_key(dir), "froze {} which is not a mount", dir.display());
@@ -760,13 +840,69 @@ mod tests {
     }
 
     #[test]
-    fn rebirth_and_rollback_say_they_are_not_built() {
+    fn rebirth_says_it_is_not_built() {
         let p = pool();
         let a = ds("tank/v-a");
         p.create(&a).unwrap();
         let e = p.receive(&a, None, (Lsn::new(2), h(2)), &mut io::empty()).unwrap_err();
         assert!(e.to_string().contains("not built yet"));
-        assert!(p.layers(&a).rollback(Lsn::new(2), h(2)).is_err());
+    }
+
+    /// The bytes of block 0 of the dataset's branch, through the store.
+    fn block0(p: &TestPool, a: &Dataset) -> u8 {
+        let d = p.blkd.lock().unwrap();
+        let b = d.store.find(a.as_str()).unwrap();
+        let mut buf = vec![0u8; 4096];
+        d.store.read(b, 0, &mut buf).unwrap();
+        buf[0]
+    }
+
+    fn write0(p: &TestPool, a: &Dataset, v: u8) {
+        let mut d = p.blkd.lock().unwrap();
+        let b = d.store.find(a.as_str()).unwrap();
+        d.store.write(b, 0, &[v; 4096], false).unwrap();
+    }
+
+    #[test]
+    fn rollback_discards_what_came_after_the_newest_layer_and_remounts() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        let mut l = p.layers(&a);
+        write0(&p, &a, 1);
+        l.snapshot(Lsn::new(2), h(2)).unwrap();
+        write0(&p, &a, 2);
+        calls(&p);
+        l.rollback(Lsn::new(2), h(2)).unwrap();
+        assert_eq!(block0(&p, &a), 1, "back to the layer");
+        let c = calls(&p);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert_eq!(c[0], "umount /mnt/taso/tank/v-a");
+        assert!(c[1].starts_with("mount ") && c[1].ends_with(" /mnt/taso/tank/v-a"), "{c:?}");
+        assert_eq!(l.list().unwrap(), [(Lsn::new(2), h(2))], "the layer stays");
+        assert_eq!(p.info(&a).unwrap().unwrap().origin, None);
+    }
+
+    #[test]
+    fn rollback_refuses_and_changes_nothing() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        let mut l = p.layers(&a);
+        l.snapshot(Lsn::new(2), h(2)).unwrap();
+        l.snapshot(Lsn::new(4), h(4)).unwrap();
+        write0(&p, &a, 9);
+        calls(&p);
+        assert!(l.rollback(Lsn::new(2), h(2)).unwrap_err().to_string().contains("later layer"));
+        assert!(l.rollback(Lsn::new(4), h(5)).is_err(), "bound to another record");
+        assert!(l.rollback(Lsn::new(3), h(3)).is_err(), "no such layer");
+        *p.mounts.busy.borrow_mut() = true;
+        assert!(l.rollback(Lsn::new(4), h(4)).is_err(), "busy mount");
+        *p.mounts.busy.borrow_mut() = false;
+        p.mounts.table.borrow_mut().insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
+        assert!(l.rollback(Lsn::new(4), h(4)).is_err(), "mounted from elsewhere");
+        assert_eq!(block0(&p, &a), 9, "nothing was discarded");
+        assert!(calls(&p).iter().all(|c| c.starts_with("umount")), "only the refused unmount was tried");
     }
 
     // ── Vessels on the block log ────────────────────────────────────
@@ -803,7 +939,12 @@ mod tests {
 
         let id = v.id();
         drop(v);
-        let (v, _) = host.open(id).unwrap(); // the lineage and layer checks pass on the block log
+        let (mut v, _) = host.open(id).unwrap(); // the lineage and layer checks pass on the block log
         assert_eq!(v.last_seal(), Some(s1));
+
+        // A Vessel rollback goes back to the last Seal's blocks.
+        write0(&host.pool, v.dataset(), 7);
+        assert_eq!(v.rollback().unwrap(), Some(s1));
+        assert_eq!(block0(&host.pool, v.dataset()), 0, "the write after the last Seal is gone");
     }
 }

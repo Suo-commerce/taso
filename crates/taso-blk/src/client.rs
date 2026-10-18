@@ -160,6 +160,13 @@ impl Client {
         self.call_empty(&["detach", &branch.to_string()])
     }
 
+    /// Reset a detached `branch` to the Seal it stands on (its own writes
+    /// are dropped; it keeps its id, name and Seals).  Durable at the next
+    /// [`Client::flush`].
+    pub fn reset(&mut self, branch: LayerId) -> Result<()> {
+        self.call_empty(&["reset", &branch.to_string()])
+    }
+
     /// Freeze `branch` as a Seal carrying `tag` (at most 64 bytes).  A
     /// mounted ext4 must be made consistent first (frozen or unmounted).
     /// Durable when it returns.
