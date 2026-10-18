@@ -88,6 +88,17 @@
 //! which happened.  The records before the checkpoint were verified when
 //! they were written and when the checkpoint was made from them.
 //!
+//! # Compaction (taking the garbage out)
+//!
+//! Overwritten, discarded and dropped blocks stay in the log as garbage.
+//! [`Store::compaction`] writes a new log holding only the live blocks
+//! and the state that points at them (a **base**), followed by whatever
+//! the old log received meanwhile, and swaps it in; layer ids, names,
+//! tags and sequence numbers carry over.  A compacted log starts
+//! `TASOBLK3` and may hold two more record kinds, both only in its first
+//! group: `Data` (live blocks, no map effect) and `Base` (pieces of the
+//! state, in checkpoint encoding).  See the `compact` module.
+//!
 //! The base image is zeros: a fresh device reads zeros until written, and
 //! ext4 is created by `mkfs` on a branch, then sealed.
 //!
@@ -103,7 +114,15 @@ use std::path::{Path, PathBuf};
 
 use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
 
+mod compact;
+pub use compact::{Compacted, Compaction, OldLog};
+
 const FILE_MAGIC: &[u8; 8] = b"TASOBLK2";
+/// A log written by a compaction: it may begin with a base
+/// ([`K_DATA`] and [`K_BASE`] records).  Otherwise the same records.  A
+/// separate magic, so a version that does not know base records refuses
+/// the log instead of taking its first record for a torn end.
+const COMPACT_MAGIC: &[u8; 8] = b"TASOBLK3";
 /// The spike's format (no tags, origins or names).
 const OLD_MAGIC: &[u8; 8] = b"TASOBLK1";
 /// Largest Seal tag, in bytes.
@@ -129,6 +148,12 @@ const K_DROP_SEAL: u8 = 7;
 const K_FLUSH: u8 = 8;
 const K_NAME: u8 = 9;
 const K_RESET: u8 = 10;
+/// Block data with no map effect: the live blocks a compaction copied.
+const K_DATA: u8 = 11;
+/// A piece of a compacted log's base state (map, tags, names, sequence
+/// number), in checkpoint encoding; the pieces of the first group joined.
+const K_BASE: u8 = 12;
+const K_LAST: u8 = K_BASE;
 
 const CKPT_MAGIC: &[u8; 8] = b"TASOCKP1";
 
@@ -198,16 +223,27 @@ impl std::fmt::Display for StoreError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Map(e) => write!(f, "map: {e}"),
             Self::NotALog => write!(f, "not a taso-blk log"),
-            Self::OldFormat => write!(f, "a taso-blk log in the spike's format (TASOBLK1); this version reads TASOBLK2"),
+            Self::OldFormat => write!(
+                f,
+                "a taso-blk log in the spike's format (TASOBLK1); this version reads TASOBLK2"
+            ),
             Self::BadTag(n) => write!(f, "a tag of {n} bytes; at most {MAX_TAG}"),
-            Self::BadName(n) => write!(f, "bad branch name {n:?}: 1 to {MAX_NAME} of A-Z a-z 0-9 _ . : / -"),
+            Self::BadName(n) => write!(
+                f,
+                "bad branch name {n:?}: 1 to {MAX_NAME} of A-Z a-z 0-9 _ . : / -"
+            ),
             Self::NameTaken(n) => write!(f, "branch name {n:?} is taken"),
             Self::ReplayMeta { lsn, reason } => write!(f, "record {lsn} does not replay: {reason}"),
             Self::NotAnAncestor { from, to } => write!(f, "{from} is not below {to}"),
-            Self::NotClean(b) => write!(f, "{b} holds blocks of its own; reset it before importing"),
+            Self::NotClean(b) => {
+                write!(f, "{b} holds blocks of its own; reset it before importing")
+            }
             Self::BadStream(why) => write!(f, "bad import stream ({why}); nothing was kept"),
             Self::Replay { lsn, error } => write!(f, "record {lsn} does not replay: {error}"),
-            Self::BadLength(n) => write!(f, "write of {n} bytes is not a whole number of {BLOCK}-byte blocks"),
+            Self::BadLength(n) => write!(
+                f,
+                "write of {n} bytes is not a whole number of {BLOCK}-byte blocks"
+            ),
             Self::TooLarge(n) => write!(f, "write of {n} bytes exceeds one record"),
             Self::Poisoned => write!(f, "an earlier append failed; reopen the store"),
         }
@@ -276,11 +312,19 @@ impl Store {
     /// Create a new, empty log at `path` (which must not exist) and make
     /// its existence durable.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
-        // A checkpoint of an earlier log under this name is not ours.
-        match std::fs::remove_file(ckpt_path(path)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        // A checkpoint of an earlier log under this name is not ours, nor
+        // is an unfinished compaction of one.
+        for stale in [
+            ckpt_path(path),
+            compact::temp_path(path),
+            ckpt_path(&compact::temp_path(path)),
+        ] {
+            remove_if_there(&stale)?;
         }
         let mut header = [0u8; HEADER_LEN as usize];
         header[..8].copy_from_slice(FILE_MAGIC);
@@ -295,7 +339,10 @@ impl Store {
             tail: HEADER_LEN,
             lsn: 0,
             prev: seed(&header),
-            stats: Stats { log_bytes: HEADER_LEN, ..Stats::default() },
+            stats: Stats {
+                log_bytes: HEADER_LEN,
+                ..Stats::default()
+            },
             poisoned: false,
         })
     }
@@ -317,8 +364,17 @@ impl Store {
         if &header[..8] == OLD_MAGIC {
             return Err(StoreError::OldFormat);
         }
-        if &header[..8] != FILE_MAGIC {
+        let compacted = &header[..8] == COMPACT_MAGIC;
+        if &header[..8] != FILE_MAGIC && !compacted {
             return Err(StoreError::NotALog);
+        }
+        // A compaction that did not finish left its new log beside this
+        // one; this one is still the log.
+        for stale in [
+            compact::temp_path(path),
+            ckpt_path(&compact::temp_path(path)),
+        ] {
+            remove_if_there(&stale)?;
         }
 
         // Start from a checkpoint if one checks out, else from the header.
@@ -328,19 +384,54 @@ impl Store {
             Some(c) => (c.map, c.meta, c.end, c.lsn, c.prev, c.garbage),
             None => (Map::new(), Meta::default(), HEADER_LEN, 0, seed(&header), 0),
         };
-        let mut r = BufReader::with_capacity(1 << 20, ReadAt { file: &file, pos: start, end: len });
+        let mut r = BufReader::with_capacity(
+            1 << 20,
+            ReadAt {
+                file: &file,
+                pos: start,
+                end: len,
+            },
+        );
         let (mut pos, mut lsn, mut prev) = (start, start_lsn, start_prev);
         // State at the last verified Flush.
         let (mut end, mut good_lsn, mut good_prev, mut groups) = (start, start_lsn, prev, 0u64);
         let mut pending: Vec<Pending> = Vec::new();
+        // A compacted log's base: where its data records are, and the
+        // joined base pieces.  Only in the first group of the file.
+        let mut base = Base::default();
         while let Some((kind, body, hash)) = read_record(&mut r, &prev)? {
             lsn += 1;
             let data_at = pos + REC_HEAD;
             pos += REC_HEAD + body.len() as u64 + HASH as u64;
             prev = hash;
-            if kind == K_FLUSH {
+            if kind == K_DATA || kind == K_BASE {
+                let in_base = compacted && start == HEADER_LEN && groups == 0 && pending.is_empty();
+                if !in_base {
+                    return Err(StoreError::ReplayMeta {
+                        lsn,
+                        reason: "a base record outside a compacted log's first group",
+                    });
+                }
+                base.add(kind, &body, data_at)
+                    .map_err(|reason| StoreError::ReplayMeta { lsn, reason })?;
+            } else if kind == K_FLUSH {
                 if !body.is_empty() {
-                    return Err(StoreError::Replay { lsn, error: MapError::Overflow });
+                    return Err(StoreError::Replay {
+                        lsn,
+                        error: MapError::Overflow,
+                    });
+                }
+                if !base.is_empty() {
+                    if !pending.is_empty() {
+                        return Err(StoreError::ReplayMeta {
+                            lsn,
+                            reason: "other records in a base group",
+                        });
+                    }
+                    (map, meta, lsn) = base
+                        .decode()
+                        .map_err(|reason| StoreError::ReplayMeta { lsn, reason })?;
+                    base = Base::default();
                 }
                 for p in pending.drain(..) {
                     garbage += replay(&mut map, &mut meta, &p)?;
@@ -356,9 +447,32 @@ impl Store {
             file.set_len(end)?;
             file.sync_all()?;
         }
-        let stats = Stats { log_bytes: end, garbage_bytes: garbage, records: good_lsn, syncs: 0 };
-        let store = Self { file, path: path.to_path_buf(), map, meta, tail: end, lsn: good_lsn, prev: good_prev, stats, poisoned: false };
-        Ok((store, Recovered { records: good_lsn, groups, cut, checkpoint: from }))
+        let stats = Stats {
+            log_bytes: end,
+            garbage_bytes: garbage,
+            records: good_lsn,
+            syncs: 0,
+        };
+        let store = Self {
+            file,
+            path: path.to_path_buf(),
+            map,
+            meta,
+            tail: end,
+            lsn: good_lsn,
+            prev: good_prev,
+            stats,
+            poisoned: false,
+        };
+        Ok((
+            store,
+            Recovered {
+                records: good_lsn,
+                groups,
+                cut,
+                checkpoint: from,
+            },
+        ))
     }
 
     /// The map (read-only): layers, kinds, deltas.
@@ -387,7 +501,13 @@ impl Store {
         self.check()?;
         let lsn = self.lsn + 1;
         let id = self.map.root_seal(lsn);
-        self.meta.seals.insert(id, SealInfo { origin: None, tag: Vec::new() });
+        self.meta.seals.insert(
+            id,
+            SealInfo {
+                origin: None,
+                tag: Vec::new(),
+            },
+        );
         self.append(K_ROOT, &[])?;
         self.flush()?;
         Ok(id)
@@ -404,7 +524,13 @@ impl Store {
 
     /// Write `data` (whole blocks) at block `lba` of `branch`.  With `fua`
     /// it is durable when this returns; otherwise at the next flush.
-    pub fn write(&mut self, branch: LayerId, lba: u64, data: &[u8], fua: bool) -> Result<(), StoreError> {
+    pub fn write(
+        &mut self,
+        branch: LayerId,
+        lba: u64,
+        data: &[u8],
+        fua: bool,
+    ) -> Result<(), StoreError> {
         self.check()?;
         if data.is_empty() || !(data.len() as u64).is_multiple_of(BLOCK) {
             return Err(StoreError::BadLength(data.len()));
@@ -420,7 +546,11 @@ impl Store {
         // The data starts after the record head and the two fields.
         let data_at = self.tail + REC_HEAD + 16;
         for i in 0..count {
-            if self.map.write(branch, lba + i, Loc::Log(data_at + i * BLOCK))?.is_some() {
+            if self
+                .map
+                .write(branch, lba + i, Loc::Log(data_at + i * BLOCK))?
+                .is_some()
+            {
                 self.stats.garbage_bytes += BLOCK;
             }
         }
@@ -490,7 +620,13 @@ impl Store {
         }
         let lsn = self.lsn + 1;
         let seal = self.map.seal(branch, lsn)?;
-        self.meta.seals.insert(seal, SealInfo { origin: Some(branch), tag: tag.to_vec() });
+        self.meta.seals.insert(
+            seal,
+            SealInfo {
+                origin: Some(branch),
+                tag: tag.to_vec(),
+            },
+        );
         let mut body = Vec::with_capacity(8 + tag.len());
         body.extend_from_slice(&branch.get().to_le_bytes());
         body.extend_from_slice(tag);
@@ -513,7 +649,12 @@ impl Store {
 
     /// The live Seals made from `branch`, oldest first.
     pub fn seals_of(&self, branch: LayerId) -> Vec<LayerId> {
-        self.meta.seals.iter().filter(|(_, i)| i.origin == Some(branch)).map(|(id, _)| *id).collect()
+        self.meta
+            .seals
+            .iter()
+            .filter(|(_, i)| i.origin == Some(branch))
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Give `branch` the name `name`, or take its name away (`name` empty).
@@ -587,33 +728,31 @@ impl Store {
     pub fn checkpoint(&mut self) -> Result<u64, StoreError> {
         let before = self.prev;
         self.flush()?;
-        let mut b = Vec::with_capacity(1 << 16);
-        b.extend_from_slice(CKPT_MAGIC);
-        for v in [self.tail, self.lsn, self.stats.garbage_bytes] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-        b.extend_from_slice(&before);
-        b.extend_from_slice(&self.prev);
-        self.map.encode(&mut b);
-        self.meta.encode(&mut b);
-        let sum = blake3::hash(&b);
-        b.extend_from_slice(sum.as_bytes());
-        let path = ckpt_path(&self.path);
-        let tmp = path.with_extension("ckpt.tmp");
-        {
-            let f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
-            f.write_all_at(&b, 0)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &path)?;
-        sync_dir(&path)?;
+        let at = FlushPoint {
+            end: self.tail,
+            lsn: self.lsn,
+            before,
+            prev: self.prev,
+        };
+        write_checkpoint(
+            &self.path,
+            &at,
+            self.stats.garbage_bytes,
+            &self.map,
+            &self.meta,
+        )?;
         Ok(self.lsn)
     }
 
     /// Write the blocks that make `from` (a Seal below `to`, or the zero
     /// base image if `None`) into the Seal `to`, as an import stream.
     /// Returns the blocks written.
-    pub fn export(&self, to: LayerId, from: Option<LayerId>, w: &mut impl io::Write) -> Result<u64, StoreError> {
+    pub fn export(
+        &self,
+        to: LayerId,
+        from: Option<LayerId>,
+        w: &mut impl io::Write,
+    ) -> Result<u64, StoreError> {
         if !matches!(self.map.kind(to)?, Kind::Seal { .. }) {
             return Err(MapError::NotASeal(to).into());
         }
@@ -635,10 +774,18 @@ impl Store {
                     cur = self.map.parent(l)?;
                 }
                 None if from.is_none() => break,
-                None => return Err(StoreError::NotAnAncestor { from: from.expect("checked"), to }),
+                None => {
+                    return Err(StoreError::NotAnAncestor {
+                        from: from.expect("checked"),
+                        to,
+                    })
+                }
             }
         }
-        let mut out = HashingWriter { w, h: blake3::Hasher::new() };
+        let mut out = HashingWriter {
+            w,
+            h: blake3::Hasher::new(),
+        };
         out.put(STREAM_MAGIC)?;
         let mut buf = vec![0u8; RUN_MAX as usize * BLOCK as usize];
         let mut it = blocks.iter().peekable();
@@ -648,7 +795,9 @@ impl Store {
             let mut count = 1u64;
             while count < RUN_MAX {
                 match it.peek() {
-                    Some((&lba, &l)) if lba == start + count && matches!(l, Loc::Log(_)) == data => {
+                    Some((&lba, &l))
+                        if lba == start + count && matches!(l, Loc::Log(_)) == data =>
+                    {
                         it.next();
                         count += 1;
                     }
@@ -697,7 +846,10 @@ impl Store {
     }
 
     fn import_runs(&mut self, branch: LayerId, r: &mut impl Read) -> Result<u64, StoreError> {
-        let mut r = HashingReader { r, h: blake3::Hasher::new() };
+        let mut r = HashingReader {
+            r,
+            h: blake3::Hasher::new(),
+        };
         let bad = StoreError::BadStream;
         let mut magic = [0u8; 8];
         if !r.take(&mut magic)? || &magic != STREAM_MAGIC {
@@ -762,7 +914,12 @@ impl Store {
 
     /// Every live branch name, with its branch, in name order.
     pub fn names(&self) -> Vec<(String, LayerId)> {
-        let mut v: Vec<(String, LayerId)> = self.meta.names.iter().map(|(n, b)| (n.clone(), *b)).collect();
+        let mut v: Vec<(String, LayerId)> = self
+            .meta
+            .names
+            .iter()
+            .map(|(n, b)| (n.clone(), *b))
+            .collect();
         v.sort();
         v
     }
@@ -789,13 +946,8 @@ impl Store {
     /// Append one record at the tail.  The map has already applied it; if
     /// the file write fails, the two disagree and the store is poisoned.
     fn append(&mut self, kind: u8, body: &[u8]) -> Result<(), StoreError> {
-        let hash = chain(&self.prev, kind, body);
         let mut rec = Vec::with_capacity(REC_HEAD as usize + body.len() + HASH);
-        rec.extend_from_slice(&REC_MAGIC.to_le_bytes());
-        rec.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        rec.push(kind);
-        rec.extend_from_slice(body);
-        rec.extend_from_slice(&hash);
+        let hash = encode_record(&mut rec, &self.prev, kind, body);
         if let Err(e) = self.file.write_all_at(&rec, self.tail) {
             self.poisoned = true;
             return Err(e.into());
@@ -812,6 +964,18 @@ impl Store {
 /// The chain's seed: the hash of the header.
 fn seed(header: &[u8]) -> [u8; HASH] {
     *blake3::hash(header).as_bytes()
+}
+
+/// Append one whole record (head, body, chain hash) to `out`; returns its
+/// chain hash.
+fn encode_record(out: &mut Vec<u8>, prev: &[u8; HASH], kind: u8, body: &[u8]) -> [u8; HASH] {
+    let hash = chain(prev, kind, body);
+    out.extend_from_slice(&REC_MAGIC.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.push(kind);
+    out.extend_from_slice(body);
+    out.extend_from_slice(&hash);
+    hash
 }
 
 fn chain(prev: &[u8; HASH], kind: u8, body: &[u8]) -> [u8; HASH] {
@@ -836,7 +1000,7 @@ fn read_record(r: &mut impl Read, prev: &[u8; HASH]) -> io::Result<Option<Record
     let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
     let len = u32::from_le_bytes(head[4..8].try_into().unwrap());
     let kind = head[8];
-    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_RESET).contains(&kind) {
+    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_LAST).contains(&kind) {
         return Ok(None);
     }
     let mut body = vec![0u8; len as usize];
@@ -883,8 +1047,18 @@ struct Pending {
 
 impl Pending {
     fn of(kind: u8, body: &[u8], body_at: u64, lsn: u64) -> Self {
-        let fields = if kind == K_WRITE { body.len().min(16) } else { body.len() };
-        Self { kind, fields: body[..fields].to_vec(), data_len: body.len() - fields, body_at, lsn }
+        let fields = if kind == K_WRITE {
+            body.len().min(16)
+        } else {
+            body.len()
+        };
+        Self {
+            kind,
+            fields: body[..fields].to_vec(),
+            data_len: body.len() - fields,
+            body_at,
+            lsn,
+        }
     }
 }
 
@@ -894,7 +1068,13 @@ impl Pending {
 fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError> {
     let bad = |error| StoreError::Replay { lsn: p.lsn, error };
     let f = &p.fields;
-    let need = |n: usize| if f.len() == n && (p.kind == K_WRITE || p.data_len == 0) { Ok(()) } else { Err(bad(MapError::Overflow)) };
+    let need = |n: usize| {
+        if f.len() == n && (p.kind == K_WRITE || p.data_len == 0) {
+            Ok(())
+        } else {
+            Err(bad(MapError::Overflow))
+        }
+    };
     let layer = |at| LayerId::from_raw(u64_at(f, at));
     let freed = match p.kind {
         K_WRITE => {
@@ -904,7 +1084,8 @@ fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError
             }
             let (id, lba) = (layer(0), u64_at(f, 8));
             let count = p.data_len as u64 / BLOCK;
-            lba.checked_add(count).ok_or_else(|| bad(MapError::Overflow))?;
+            lba.checked_add(count)
+                .ok_or_else(|| bad(MapError::Overflow))?;
             let mut freed = 0;
             for i in 0..count {
                 let at = p.body_at + 16 + i * BLOCK;
@@ -916,12 +1097,20 @@ fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError
         }
         K_DISCARD => {
             need(24)?;
-            map.discard(layer(0), u64_at(f, 8), u64_at(f, 16)).map_err(bad)?.len() as u64
+            map.discard(layer(0), u64_at(f, 8), u64_at(f, 16))
+                .map_err(bad)?
+                .len() as u64
         }
         K_ROOT => {
             need(0)?;
             let id = map.root_seal(p.lsn);
-            meta.seals.insert(id, SealInfo { origin: None, tag: Vec::new() });
+            meta.seals.insert(
+                id,
+                SealInfo {
+                    origin: None,
+                    tag: Vec::new(),
+                },
+            );
             0
         }
         K_FORK => {
@@ -931,11 +1120,20 @@ fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError
         }
         K_SEAL => {
             if f.len() < 8 || f.len() > 8 + MAX_TAG {
-                return Err(StoreError::ReplayMeta { lsn: p.lsn, reason: "bad Seal record length" });
+                return Err(StoreError::ReplayMeta {
+                    lsn: p.lsn,
+                    reason: "bad Seal record length",
+                });
             }
             let branch = layer(0);
             let seal = map.seal(branch, p.lsn).map_err(bad)?;
-            meta.seals.insert(seal, SealInfo { origin: Some(branch), tag: f[8..].to_vec() });
+            meta.seals.insert(
+                seal,
+                SealInfo {
+                    origin: Some(branch),
+                    tag: f[8..].to_vec(),
+                },
+            );
             0
         }
         K_DROP_BRANCH => {
@@ -1060,7 +1258,11 @@ impl Meta {
             let id = live(u(b)?)?;
             let n = usize::try_from(u(b)?).ok().filter(|n| *n <= MAX_NAME)?;
             let name = std::str::from_utf8(take(b, n)?).ok()?;
-            if !valid_name(name) || map.kind(id).ok()? != Kind::Branch || meta.names.contains_key(name) || meta.by_layer.contains_key(&id) {
+            if !valid_name(name)
+                || map.kind(id).ok()? != Kind::Branch
+                || meta.names.contains_key(name)
+                || meta.by_layer.contains_key(&id)
+            {
                 return None;
             }
             meta.set_name(id, name);
@@ -1074,6 +1276,114 @@ fn ckpt_path(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".ckpt");
     PathBuf::from(p)
+}
+
+/// Remove `path` if it exists.
+fn remove_if_there(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// A durable point of a log: the end of a Flush record, its sequence
+/// number, and the chain hashes before and of it.
+struct FlushPoint {
+    end: u64,
+    lsn: u64,
+    before: [u8; HASH],
+    prev: [u8; HASH],
+}
+
+/// Write the checkpoint of the log at `log` for the state at `at`,
+/// atomically (a temporary file, synced, then renamed).
+fn write_checkpoint(
+    log: &Path,
+    at: &FlushPoint,
+    garbage: u64,
+    map: &Map,
+    meta: &Meta,
+) -> io::Result<()> {
+    let mut b = Vec::with_capacity(1 << 16);
+    b.extend_from_slice(CKPT_MAGIC);
+    for v in [at.end, at.lsn, garbage] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b.extend_from_slice(&at.before);
+    b.extend_from_slice(&at.prev);
+    map.encode(&mut b);
+    meta.encode(&mut b);
+    let sum = blake3::hash(&b);
+    b.extend_from_slice(sum.as_bytes());
+    let path = ckpt_path(log);
+    let tmp = path.with_extension("ckpt.tmp");
+    {
+        let f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all_at(&b, 0)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    sync_dir(&path)
+}
+
+/// A compacted log's base, as recovery reads it: the data records' places
+/// and the joined base pieces.
+#[derive(Default)]
+struct Base {
+    /// (offset, length) of each data record's body, in file order.
+    data: Vec<(u64, u64)>,
+    state: Vec<u8>,
+}
+
+impl Base {
+    fn is_empty(&self) -> bool {
+        self.data.is_empty() && self.state.is_empty()
+    }
+
+    fn add(&mut self, kind: u8, body: &[u8], body_at: u64) -> Result<(), &'static str> {
+        if kind == K_DATA {
+            if !self.state.is_empty() {
+                return Err("a data record after the base state");
+            }
+            if body.is_empty() || !(body.len() as u64).is_multiple_of(BLOCK) {
+                return Err("a data record that is not whole blocks");
+            }
+            self.data.push((body_at, body.len() as u64));
+        } else {
+            self.state.extend_from_slice(body);
+        }
+        Ok(())
+    }
+
+    /// The map, tags and names, and the sequence number the log goes on
+    /// from.  Every log location must be a block inside a data record.
+    fn decode(&self) -> Result<(Map, Meta, u64), &'static str> {
+        let mut r = self.state.as_slice();
+        let lsn = r.get(..8).ok_or("a short base state")?;
+        let lsn = u64::from_le_bytes(lsn.try_into().unwrap());
+        r = &r[8..];
+        let max = self.data.last().map_or(HEADER_LEN, |(at, n)| at + n);
+        let map = Map::decode(&mut r, max).ok_or("a base map that does not decode")?;
+        let meta = Meta::decode(&mut r, &map).ok_or("base tags or names that do not decode")?;
+        if !r.is_empty() {
+            return Err("bytes after the base state");
+        }
+        for off in map.log_locs() {
+            let i = self.data.partition_point(|(at, _)| *at <= off);
+            let inside = i > 0 && {
+                let (at, n) = self.data[i - 1];
+                off + BLOCK <= at + n && (off - at).is_multiple_of(BLOCK)
+            };
+            if !inside {
+                return Err("a base location outside the data records");
+            }
+        }
+        Ok((map, meta, lsn))
+    }
 }
 
 /// A checkpoint that checks out against the log.
@@ -1122,14 +1432,23 @@ fn load_checkpoint(path: &Path, file: &File, len: u64) -> Option<Checkpoint> {
     }
     let map = Map::decode(&mut r, end - flush_len)?;
     let meta = Meta::decode(&mut r, &map)?;
-    r.is_empty().then_some(Checkpoint { end, lsn, prev, garbage, map, meta })
+    r.is_empty().then_some(Checkpoint {
+        end,
+        lsn,
+        prev,
+        garbage,
+        map,
+        meta,
+    })
 }
 
 /// 1 to [`MAX_NAME`] bytes of `A-Z a-z 0-9 _ . : / -`: what dataset names
 /// use, and safe in the daemon's line protocol.
 fn valid_name(name: &str) -> bool {
     (1..=MAX_NAME).contains(&name.len())
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'))
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'))
 }
 
 /// A writer that hashes what goes through it.
@@ -1183,7 +1502,10 @@ impl Read for ReadAt<'_> {
 
 /// Make a new directory entry durable.
 fn sync_dir(path: &Path) -> io::Result<()> {
-    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     File::open(dir)?.sync_all()
 }
 
@@ -1204,7 +1526,10 @@ mod tests {
     fn read1(s: &Store, layer: LayerId, lba: u64) -> u8 {
         let mut buf = vec![0xEEu8; B];
         s.read(layer, lba, &mut buf).unwrap();
-        assert!(buf.iter().all(|b| *b == buf[0]), "a block is uniform in these tests");
+        assert!(
+            buf.iter().all(|b| *b == buf[0]),
+            "a block is uniform in these tests"
+        );
         buf[0]
     }
 
@@ -1219,13 +1544,20 @@ mod tests {
         let root = s.root_seal().unwrap();
         let b = s.fork(root).unwrap();
         s.write(b, 3, &blocks(7, 2), false).unwrap();
-        assert_eq!((read1(&s, b, 3), read1(&s, b, 4), read1(&s, b, 5)), (7, 7, 0));
+        assert_eq!(
+            (read1(&s, b, 3), read1(&s, b, 4), read1(&s, b, 5)),
+            (7, 7, 0)
+        );
         let mut two = vec![0u8; 2 * B];
         s.read(b, 4, &mut two).unwrap();
         assert!(two[..B].iter().all(|x| *x == 7) && two[B..].iter().all(|x| *x == 0));
         s.discard(b, 3, 1).unwrap();
         assert_eq!(read1(&s, b, 3), 0);
-        assert_eq!(read1(&s, root, 4), 0, "the Seal never sees a branch's writes");
+        assert_eq!(
+            read1(&s, root, 4),
+            0,
+            "the Seal never sees a branch's writes"
+        );
     }
 
     #[test]
@@ -1235,15 +1567,36 @@ mod tests {
         let root = s.root_seal().unwrap();
         let b = s.fork(root).unwrap();
         let before = s.stats();
-        assert!(matches!(s.write(b, 0, &[1u8; 100], false), Err(StoreError::BadLength(100))));
-        assert!(matches!(s.write(b, 0, &[], false), Err(StoreError::BadLength(0))));
-        assert!(matches!(s.write(root, 0, &blocks(1, 1), false), Err(StoreError::Map(MapError::NotABranch(_)))));
-        assert!(matches!(s.write(b, u64::MAX, &blocks(1, 1), false), Err(StoreError::Map(MapError::Overflow))));
-        assert!(matches!(s.write(b, 0, &blocks(1, 4097), false), Err(StoreError::TooLarge(_))));
-        assert!(matches!(s.fork(b), Err(StoreError::Map(MapError::NotASeal(_)))));
+        assert!(matches!(
+            s.write(b, 0, &[1u8; 100], false),
+            Err(StoreError::BadLength(100))
+        ));
+        assert!(matches!(
+            s.write(b, 0, &[], false),
+            Err(StoreError::BadLength(0))
+        ));
+        assert!(matches!(
+            s.write(root, 0, &blocks(1, 1), false),
+            Err(StoreError::Map(MapError::NotABranch(_)))
+        ));
+        assert!(matches!(
+            s.write(b, u64::MAX, &blocks(1, 1), false),
+            Err(StoreError::Map(MapError::Overflow))
+        ));
+        assert!(matches!(
+            s.write(b, 0, &blocks(1, 4097), false),
+            Err(StoreError::TooLarge(_))
+        ));
+        assert!(matches!(
+            s.fork(b),
+            Err(StoreError::Map(MapError::NotASeal(_)))
+        ));
         assert_eq!(s.stats(), before, "a refusal appends nothing");
         let mut odd = vec![0u8; 10];
-        assert!(matches!(s.read(b, 0, &mut odd), Err(StoreError::BadLength(10))));
+        assert!(matches!(
+            s.read(b, 0, &mut odd),
+            Err(StoreError::BadLength(10))
+        ));
     }
 
     #[test]
@@ -1269,9 +1622,20 @@ mod tests {
         // root, flush, fork, write, seal: the Seal is record 5, before and after.
         assert_eq!(seal_lsn, Kind::Seal { lsn: 5 });
         assert_eq!(s.map().kind(s2).unwrap(), seal_lsn);
-        assert_eq!(s.map().parent(b).unwrap(), Some(s2), "same ids after replay");
-        assert_eq!((read1(&s, b, 1), read1(&s, s2, 1), read1(&s, b, 2)), (2, 1, 0));
-        assert_eq!(s.stats().garbage_bytes, BLOCK, "block 2's write was discarded in its own layer");
+        assert_eq!(
+            s.map().parent(b).unwrap(),
+            Some(s2),
+            "same ids after replay"
+        );
+        assert_eq!(
+            (read1(&s, b, 1), read1(&s, s2, 1), read1(&s, b, 2)),
+            (2, 1, 0)
+        );
+        assert_eq!(
+            s.stats().garbage_bytes,
+            BLOCK,
+            "block 2's write was discarded in its own layer"
+        );
     }
 
     #[test]
@@ -1291,7 +1655,11 @@ mod tests {
         }
         let (mut s, rec) = Store::open(&path).unwrap();
         assert!(rec.cut > 0);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), durable_len, "the cut is on disk");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            durable_len,
+            "the cut is on disk"
+        );
         assert_eq!((read1(&s, b, 0), read1(&s, b, 1)), (1, 0));
         // And the log goes on from there.
         s.write(b, 1, &blocks(4, 1), true).unwrap();
@@ -1330,7 +1698,10 @@ mod tests {
             s.write(other, 1, &blocks(8, 1), true).unwrap();
         }
         let (s, _) = Store::open(&path).unwrap();
-        assert_eq!((read1(&s, other, 0), read1(&s, other, 1), read1(&s, seal, 1)), (9, 8, 9));
+        assert_eq!(
+            (read1(&s, other, 0), read1(&s, other, 1), read1(&s, seal, 1)),
+            (9, 8, 9)
+        );
     }
 
     #[test]
@@ -1385,7 +1756,8 @@ mod tests {
                 let mut bytes = good.clone();
                 bytes[at as usize] ^= mask;
                 std::fs::write(&flipped, &bytes).unwrap();
-                let (s, rec) = Store::open(&flipped).unwrap_or_else(|e| panic!("byte {} mask {mask:#x}: {e}", at - mid));
+                let (s, rec) = Store::open(&flipped)
+                    .unwrap_or_else(|e| panic!("byte {} mask {mask:#x}: {e}", at - mid));
                 assert_eq!(s.stats().log_bytes, mid, "byte {} mask {mask:#x}", at - mid);
                 assert_eq!(read1(&s, b, 0), 1, "byte {} mask {mask:#x}", at - mid);
                 assert_eq!(rec.cut, good.len() as u64 - mid);
@@ -1415,14 +1787,26 @@ mod tests {
         s.append(K_FORK, &99u64.to_le_bytes()).unwrap();
         s.append(K_FLUSH, &[]).unwrap();
         drop(s);
-        assert!(matches!(Store::open(&path), Err(StoreError::Replay { lsn: 3, error: MapError::Unknown(_) })));
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::Replay {
+                lsn: 3,
+                error: MapError::Unknown(_)
+            })
+        ));
     }
 
     #[test]
     fn a_new_log_counts_its_header() {
         let dir = tempfile::tempdir().unwrap();
         let s = new_store(&dir);
-        assert_eq!(s.stats(), Stats { log_bytes: HEADER_LEN, ..Stats::default() });
+        assert_eq!(
+            s.stats(),
+            Stats {
+                log_bytes: HEADER_LEN,
+                ..Stats::default()
+            }
+        );
         assert_eq!(std::fs::metadata(s.path()).unwrap().len(), HEADER_LEN);
     }
 
@@ -1453,10 +1837,21 @@ mod tests {
         assert_eq!(s.tag(s2), Some(&[0xff; MAX_TAG][..]));
         assert_eq!(s.tag(s3), Some(&b""[..]));
         assert_eq!(s.tag(root), Some(&b""[..]));
-        assert_eq!((s.origin(s1), s.origin(s3), s.origin(root)), (Some(a), Some(b), None));
+        assert_eq!(
+            (s.origin(s1), s.origin(s3), s.origin(root)),
+            (Some(a), Some(b), None)
+        );
         assert_eq!(s.seals_of(a), vec![s1, s2], "a's own Seals, oldest first");
-        assert_eq!(s.seals_of(b), vec![s3], "b's own Seals only, not the one it was forked from");
-        assert_eq!(read1(&s, a, 0), 2, "the name stays with the branch across Seals");
+        assert_eq!(
+            s.seals_of(b),
+            vec![s3],
+            "b's own Seals only, not the one it was forked from"
+        );
+        assert_eq!(
+            read1(&s, a, 0),
+            2,
+            "the name stays with the branch across Seals"
+        );
     }
 
     #[test]
@@ -1468,11 +1863,20 @@ mod tests {
         s.name(a, "x").unwrap();
         let lsn = s.lsn();
         assert!(matches!(s.name(b, "x"), Err(StoreError::NameTaken(_))));
-        assert!(matches!(s.name(root, "r"), Err(StoreError::Map(MapError::NotABranch(_)))));
+        assert!(matches!(
+            s.name(root, "r"),
+            Err(StoreError::Map(MapError::NotABranch(_)))
+        ));
         for bad in ["has space", "tab\t", "ä", &"n".repeat(MAX_NAME + 1)] {
-            assert!(matches!(s.name(b, bad), Err(StoreError::BadName(_))), "{bad:?}");
+            assert!(
+                matches!(s.name(b, bad), Err(StoreError::BadName(_))),
+                "{bad:?}"
+            );
         }
-        assert!(matches!(s.seal_tagged(b, &[0; MAX_TAG + 1]), Err(StoreError::BadTag(_))));
+        assert!(matches!(
+            s.seal_tagged(b, &[0; MAX_TAG + 1]),
+            Err(StoreError::BadTag(_))
+        ));
         assert_eq!(s.lsn(), lsn, "refusals append nothing");
         assert!(matches!(s.check_name("x"), Err(StoreError::NameTaken(_))));
         assert!(matches!(s.check_name("a b"), Err(StoreError::BadName(_))));
@@ -1492,7 +1896,10 @@ mod tests {
         s.drop_seal(sc).unwrap_err(); // c stands on it
         s.drop_branch(c).unwrap();
         s.drop_seal(sc).unwrap();
-        assert_eq!((s.tag(sc), s.origin(sc), s.seals_of(c)), (None, None, vec![]));
+        assert_eq!(
+            (s.tag(sc), s.origin(sc), s.seals_of(c)),
+            (None, None, vec![])
+        );
         s.flush().unwrap();
         let path = s.path().to_path_buf();
         drop(s);
@@ -1516,13 +1923,28 @@ mod tests {
             s.write(a, 5, &blocks(3, 1), false).unwrap();
             let g = s.stats().garbage_bytes;
             s.reset(a).unwrap();
-            assert_eq!(s.stats().garbage_bytes, g + 2 * BLOCK, "the two blocks written after the Seal");
-            assert_eq!((read1(&s, a, 0), read1(&s, a, 1), read1(&s, a, 5)), (1, 1, 0), "reads as the Seal again");
-            assert!(matches!(s.reset(s1), Err(StoreError::Map(MapError::NotABranch(_)))));
+            assert_eq!(
+                s.stats().garbage_bytes,
+                g + 2 * BLOCK,
+                "the two blocks written after the Seal"
+            );
+            assert_eq!(
+                (read1(&s, a, 0), read1(&s, a, 1), read1(&s, a, 5)),
+                (1, 1, 0),
+                "reads as the Seal again"
+            );
+            assert!(matches!(
+                s.reset(s1),
+                Err(StoreError::Map(MapError::NotABranch(_)))
+            ));
             s.flush().unwrap();
         }
         let (s, _) = Store::open(&path).unwrap();
-        assert_eq!((read1(&s, a, 0), read1(&s, a, 5)), (1, 0), "the reset survives a reopen");
+        assert_eq!(
+            (read1(&s, a, 0), read1(&s, a, 5)),
+            (1, 0),
+            "the reset survives a reopen"
+        );
         assert_eq!((s.find("tank/v-a"), s.seals_of(a)), (Some(a), vec![s1]));
         assert_eq!(s.map().parent(a).unwrap(), Some(s1));
     }
@@ -1555,7 +1977,10 @@ mod tests {
         let vb = b.fork(rb).unwrap();
         // Blocks 0, 2 and 10: block 1 was discarded and nothing below it
         // holds data, so it needs no entry (it reads as the zero base).
-        assert_eq!(b.import(vb, &mut &export_bytes(&a, s1, None)[..]).unwrap(), 3);
+        assert_eq!(
+            b.import(vb, &mut &export_bytes(&a, s1, None)[..]).unwrap(),
+            3
+        );
         let t1 = b.seal(vb).unwrap();
         assert_eq!(image(&b, t1, 16), image(&a, s1, 16));
 
@@ -1565,7 +1990,10 @@ mod tests {
         a.write(va, 12, &blocks(4, 2), false).unwrap();
         let s2 = a.seal(va).unwrap();
         let inc = export_bytes(&a, s2, Some(s1));
-        assert!(inc.len() < export_bytes(&a, s2, None).len(), "incremental carries only the change");
+        assert!(
+            inc.len() < export_bytes(&a, s2, None).len(),
+            "incremental carries only the change"
+        );
         assert_eq!(b.import(vb, &mut &inc[..]).unwrap(), 4);
         let t2 = b.seal(vb).unwrap();
         assert_eq!(image(&b, t2, 16), image(&a, s2, 16));
@@ -1576,7 +2004,8 @@ mod tests {
         a.write(ca, 5, &blocks(9, 1), false).unwrap();
         let c1 = a.seal(ca).unwrap();
         let cb = b.fork(t1).unwrap();
-        b.import(cb, &mut &export_bytes(&a, c1, Some(s1))[..]).unwrap();
+        b.import(cb, &mut &export_bytes(&a, c1, Some(s1))[..])
+            .unwrap();
         let u1 = b.seal(cb).unwrap();
         assert_eq!(image(&b, u1, 16), image(&a, c1, 16));
 
@@ -1585,7 +2014,10 @@ mod tests {
         let path = b.path().to_path_buf();
         drop(b);
         let (b, _) = Store::open(&path).unwrap();
-        assert_eq!((image(&b, t2, 16), image(&b, u1, 16)), (image(&a, s2, 16), image(&a, c1, 16)));
+        assert_eq!(
+            (image(&b, t2, 16), image(&b, u1, 16)),
+            (image(&a, s2, 16), image(&a, c1, 16))
+        );
     }
 
     #[test]
@@ -1596,14 +2028,19 @@ mod tests {
         let ra = a.root_seal().unwrap();
         let va = a.fork(ra).unwrap();
         let n = RUN_MAX as usize * 2 + 7;
-        let data: Vec<u8> = (0..n).flat_map(|i| [(i % 251) as u8; BLOCK as usize]).collect();
+        let data: Vec<u8> = (0..n)
+            .flat_map(|i| [(i % 251) as u8; BLOCK as usize])
+            .collect();
         a.write(va, 3, &data, false).unwrap();
         a.discard(va, 5000, 3000).unwrap();
         let s1 = a.seal(va).unwrap();
         let rb = b.root_seal().unwrap();
         let vb = b.fork(rb).unwrap();
         // The discard of blocks nothing holds ships nothing.
-        assert_eq!(b.import(vb, &mut &export_bytes(&a, s1, None)[..]).unwrap(), n as u64);
+        assert_eq!(
+            b.import(vb, &mut &export_bytes(&a, s1, None)[..]).unwrap(),
+            n as u64
+        );
         let mut got = vec![0u8; n * BLOCK as usize];
         b.read(vb, 3, &mut got).unwrap();
         assert!(got == data, "every block of the long run arrived");
@@ -1619,13 +2056,31 @@ mod tests {
         let w = a.fork(root).unwrap();
         let other = a.seal(w).unwrap();
         let mut sink = Vec::new();
-        assert!(matches!(a.export(v, None, &mut sink), Err(StoreError::Map(MapError::NotASeal(_)))), "a live branch moves");
-        assert!(matches!(a.export(s1, Some(other), &mut sink), Err(StoreError::NotAnAncestor { .. })));
-        assert!(matches!(a.export(s1, Some(v), &mut sink), Err(StoreError::Map(MapError::NotASeal(_)))));
+        assert!(
+            matches!(
+                a.export(v, None, &mut sink),
+                Err(StoreError::Map(MapError::NotASeal(_)))
+            ),
+            "a live branch moves"
+        );
+        assert!(matches!(
+            a.export(s1, Some(other), &mut sink),
+            Err(StoreError::NotAnAncestor { .. })
+        ));
+        assert!(matches!(
+            a.export(s1, Some(v), &mut sink),
+            Err(StoreError::Map(MapError::NotASeal(_)))
+        ));
         a.write(v, 0, &blocks(1, 1), false).unwrap();
         let bytes = export_bytes(&a, s1, None);
-        assert!(matches!(a.import(v, &mut &bytes[..]), Err(StoreError::NotClean(_))));
-        assert!(matches!(a.import(s1, &mut &bytes[..]), Err(StoreError::Map(MapError::NotABranch(_)))));
+        assert!(matches!(
+            a.import(v, &mut &bytes[..]),
+            Err(StoreError::NotClean(_))
+        ));
+        assert!(matches!(
+            a.import(s1, &mut &bytes[..]),
+            Err(StoreError::Map(MapError::NotABranch(_)))
+        ));
     }
 
     #[test]
@@ -1647,7 +2102,13 @@ mod tests {
         let mut tried = 0;
         // Cut at every length short of whole.
         for len in 0..good.len() {
-            assert!(matches!(b.import(vb, &mut &good[..len]), Err(StoreError::BadStream(_))), "cut at {len}");
+            assert!(
+                matches!(
+                    b.import(vb, &mut &good[..len]),
+                    Err(StoreError::BadStream(_))
+                ),
+                "cut at {len}"
+            );
             assert!(clean(&b), "cut at {len} left blocks");
             tried += 1;
         }
@@ -1664,7 +2125,10 @@ mod tests {
         }
         let mut longer = good.clone();
         longer.push(0);
-        assert!(matches!(b.import(vb, &mut &longer[..]), Err(StoreError::BadStream("bytes after the end"))));
+        assert!(matches!(
+            b.import(vb, &mut &longer[..]),
+            Err(StoreError::BadStream("bytes after the end"))
+        ));
         assert!(clean(&b));
         assert!(tried > 2 * 8000, "{tried}");
         // And the good one still goes in.
@@ -1681,7 +2145,10 @@ mod tests {
         let (x, y) = (s.fork(root).unwrap(), s.fork(root).unwrap());
         s.name(y, "tank/b").unwrap();
         s.name(x, "tank/a").unwrap();
-        assert_eq!(s.names(), vec![("tank/a".to_string(), x), ("tank/b".to_string(), y)]);
+        assert_eq!(
+            s.names(),
+            vec![("tank/a".to_string(), x), ("tank/b".to_string(), y)]
+        );
     }
 
     /// A store with layers, names, tags, discards and garbage, then a
@@ -1720,9 +2187,19 @@ mod tests {
         drop(s);
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!(rec.checkpoint, Some(at));
-        assert!(rec.groups < at, "only the groups after the checkpoint were replayed");
+        assert!(
+            rec.groups < at,
+            "only the groups after the checkpoint were replayed"
+        );
         assert_eq!(snapshot(&s, &layers, 9), want);
-        assert_eq!((s.stats().log_bytes, s.stats().garbage_bytes, s.stats().records), (stats.log_bytes, stats.garbage_bytes, stats.records));
+        assert_eq!(
+            (
+                s.stats().log_bytes,
+                s.stats().garbage_bytes,
+                s.stats().records
+            ),
+            (stats.log_bytes, stats.garbage_bytes, stats.records)
+        );
         assert_eq!(s.names(), names);
         assert_eq!(s.seals_of(layers[1]), vec![layers[2], layers[4]]);
         drop(s);
@@ -1815,7 +2292,13 @@ mod tests {
         s.append(K_NAME, &body).unwrap();
         s.append(K_FLUSH, &[]).unwrap();
         drop(s);
-        assert!(matches!(Store::open(&path), Err(StoreError::ReplayMeta { reason: "name taken by another branch", .. })));
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::ReplayMeta {
+                reason: "name taken by another branch",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1881,6 +2364,49 @@ mod tests {
         ]
     }
 
+    /// Apply one op to the layers made so far; true if it ended at a
+    /// durable point.
+    fn apply(s: &mut Store, layers: &mut Vec<LayerId>, o: &Op) -> bool {
+        let pick = |i: usize| layers[i % layers.len()];
+        match *o {
+            Op::Write(i, b, n, v, fua) => {
+                s.write(pick(i), b, &blocks(v, n as usize), fua).is_ok() && fua
+            }
+            Op::Discard(i, b, n) => {
+                let _ = s.discard(pick(i), b, n);
+                false
+            }
+            Op::Fork(i) => {
+                if let Ok(l) = s.fork(pick(i)) {
+                    layers.push(l);
+                }
+                false
+            }
+            Op::Reset(i) => {
+                let _ = s.reset(pick(i));
+                false
+            }
+            Op::Name(i, n) => {
+                let name = if n == 0 {
+                    String::new()
+                } else {
+                    format!("n{n}")
+                };
+                let _ = s.name(pick(i), &name);
+                false
+            }
+            Op::Seal(i, t) => match s.seal_tagged(pick(i), &vec![t; t as usize]) {
+                Ok(l) => {
+                    layers.push(l);
+                    true
+                }
+                Err(_) => false,
+            },
+            Op::Flush => s.flush().is_ok(),
+            Op::Checkpoint => s.checkpoint().is_ok(),
+        }
+    }
+
     /// Apply `ops`; return the layers made and a snapshot at every durable
     /// point: (log length at that point, snapshot).
     fn run(s: &mut Store, ops: &[Op]) -> (Vec<LayerId>, Vec<(u64, Snapshot)>) {
@@ -1890,46 +2416,19 @@ mod tests {
         let mut layers = vec![root];
         points.push((s.stats().log_bytes, snapshot(s, &layers, 9)));
         for o in ops {
-            let pick = |i: usize| layers[i % layers.len()];
-            let durable = match *o {
-                Op::Write(i, b, n, v, fua) => s.write(pick(i), b, &blocks(v, n as usize), fua).is_ok() && fua,
-                Op::Discard(i, b, n) => {
-                    let _ = s.discard(pick(i), b, n);
-                    false
-                }
-                Op::Fork(i) => {
-                    if let Ok(l) = s.fork(pick(i)) {
-                        layers.push(l);
-                    }
-                    false
-                }
-                Op::Reset(i) => {
-                    let _ = s.reset(pick(i));
-                    false
-                }
-                Op::Name(i, n) => {
-                    let name = if n == 0 { String::new() } else { format!("n{n}") };
-                    let _ = s.name(pick(i), &name);
-                    false
-                }
-                Op::Seal(i, t) => match s.seal_tagged(pick(i), &vec![t; t as usize]) {
-                    Ok(l) => {
-                        layers.push(l);
-                        true
-                    }
-                    Err(_) => false,
-                },
-                Op::Flush => s.flush().is_ok(),
-                Op::Checkpoint => s.checkpoint().is_ok(),
-            };
-            if durable {
+            if apply(s, &mut layers, o) {
                 points.push((s.stats().log_bytes, snapshot(s, &layers, 9)));
             }
         }
         (layers, points)
     }
 
-    fn check_cuts(path: &Path, layers: &[LayerId], points: &[(u64, Snapshot)], cuts: impl Iterator<Item = u64>) {
+    fn check_cuts(
+        path: &Path,
+        layers: &[LayerId],
+        points: &[(u64, Snapshot)],
+        cuts: impl Iterator<Item = u64>,
+    ) {
         let full = std::fs::read(path).unwrap();
         let cut_path = path.with_extension("cut");
         let ckpt = std::fs::read(ckpt_path(path)).ok();
@@ -1944,16 +2443,32 @@ mod tests {
                     }
                 }
                 let (s, rec) = Store::open(&cut_path).unwrap();
-                let (want_len, want) = points.iter().rev().find(|(l, _)| *l <= len).expect("the header is durable");
-                assert_eq!(s.stats().log_bytes, *want_len, "cut at {len}, checkpoint {with_ckpt}");
+                let (want_len, want) = points
+                    .iter()
+                    .rev()
+                    .find(|(l, _)| *l <= len)
+                    .expect("the header is durable");
+                assert_eq!(
+                    s.stats().log_bytes,
+                    *want_len,
+                    "cut at {len}, checkpoint {with_ckpt}"
+                );
                 assert_eq!(rec.cut, len - want_len);
-                assert_eq!(&snapshot(&s, layers, 9), want, "cut at {len}, checkpoint {with_ckpt}: state must be the last flush");
+                assert_eq!(
+                    &snapshot(&s, layers, 9),
+                    want,
+                    "cut at {len}, checkpoint {with_ckpt}: state must be the last flush"
+                );
                 if !with_ckpt {
                     assert_eq!(rec.checkpoint, None);
                 } else if let Some(c) = &ckpt {
                     // A cut that keeps the checkpoint's Flush must start from it.
                     let end = u64::from_le_bytes(c[8..16].try_into().unwrap());
-                    assert_eq!(rec.checkpoint.is_some(), len >= end, "cut at {len}, checkpoint ends at {end}");
+                    assert_eq!(
+                        rec.checkpoint.is_some(),
+                        len >= end,
+                        "cut at {len}, checkpoint ends at {end}"
+                    );
                 }
             }
         }
@@ -1967,10 +2482,22 @@ mod tests {
         let path = dir.path().join("log");
         let mut s = Store::create(&path).unwrap();
         let ops = [
-            Op::Fork(0), Op::Write(1, 0, 1, 10, false), Op::Write(1, 1, 2, 11, false), Op::Flush,
-            Op::Name(1, 1), Op::Write(1, 0, 1, 12, false), Op::Discard(1, 1, 1), Op::Seal(1, 2), Op::Fork(2),
-            Op::Name(3, 2), Op::Write(3, 2, 1, 13, false), Op::Write(1, 2, 1, 14, true), Op::Reset(3), Op::Name(1, 0),
-            Op::Checkpoint, Op::Write(3, 0, 1, 15, false),
+            Op::Fork(0),
+            Op::Write(1, 0, 1, 10, false),
+            Op::Write(1, 1, 2, 11, false),
+            Op::Flush,
+            Op::Name(1, 1),
+            Op::Write(1, 0, 1, 12, false),
+            Op::Discard(1, 1, 1),
+            Op::Seal(1, 2),
+            Op::Fork(2),
+            Op::Name(3, 2),
+            Op::Write(3, 2, 1, 13, false),
+            Op::Write(1, 2, 1, 14, true),
+            Op::Reset(3),
+            Op::Name(1, 0),
+            Op::Checkpoint,
+            Op::Write(3, 0, 1, 15, false),
         ];
         let (layers, points) = run(&mut s, &ops);
         drop(s);
@@ -2004,5 +2531,313 @@ mod tests {
             let cut = HEADER_LEN + at.index((len - HEADER_LEN + 1) as usize) as u64;
             check_cuts(&path, &layers, &points, [cut, len].into_iter());
         }
+    }
+
+    // ── Compaction ──────────────────────────────────────────────────
+
+    /// What a caller can see of a store, for before/after checks (not the
+    /// sequence number: a compaction's own flushes move it on).
+    type Whole = (Snapshot, Vec<(String, LayerId)>, Vec<Vec<LayerId>>, usize);
+
+    fn whole(s: &Store, layers: &[LayerId]) -> Whole {
+        let seals = layers.iter().map(|l| s.seals_of(*l)).collect();
+        (snapshot(s, layers, 9), s.names(), seals, s.map().layers())
+    }
+
+    fn compact(s: &mut Store) -> Compacted {
+        let mut c = s.compaction().unwrap();
+        c.copy().unwrap();
+        c.finish(s).unwrap()
+    }
+
+    #[test]
+    fn a_compaction_keeps_everything_and_drops_the_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (mut s, layers, _) = busy_store(&path);
+        // Garbage: the same blocks of `a` overwritten many times, and a
+        // branch written and dropped.
+        for v in 0..50u8 {
+            s.write(layers[1], 0, &blocks(v + 10, 3), false).unwrap();
+        }
+        let d = s.fork(layers[4]).unwrap();
+        s.write(d, 0, &blocks(9, 8), false).unwrap();
+        s.drop_branch(d).unwrap();
+        s.flush().unwrap();
+        let want = whole(&s, &layers);
+        let before = s.stats();
+        assert!(before.garbage_bytes >= 150 * BLOCK);
+
+        let done = compact(&mut s);
+        assert_eq!(
+            whole(&s, &layers),
+            want,
+            "the same store, seen from outside"
+        );
+        assert_eq!(
+            done.before,
+            before.log_bytes + 2 * (REC_HEAD + HASH as u64),
+            "the old log and the two flushes of the compaction"
+        );
+        assert_eq!(done.after, s.stats().log_bytes);
+        assert!(done.checkpoint);
+        assert_eq!(s.stats().garbage_bytes, 0);
+        assert!(done.after < before.log_bytes / 4, "{done:?}");
+        // Live: a has 3 (0..3) + 7; b has 6; the Seals 1 and 3 blocks.
+        assert_eq!(done.live, s.map().log_locs().len() as u64 * BLOCK);
+        assert_eq!(std::fs::read(&path).unwrap()[..8], *COMPACT_MAGIC);
+        assert!(!compact::temp_path(&path).exists());
+
+        // It goes on as a store, and opens as one: from its checkpoint,
+        // and by a full replay of the base.
+        s.write(layers[3], 8, &blocks(77, 1), false).unwrap();
+        s.flush().unwrap();
+        let want = whole(&s, &layers);
+        let garbage = s.stats().garbage_bytes;
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert!(rec.checkpoint.is_some());
+        assert_eq!(
+            (whole(&s, &layers), s.stats().garbage_bytes),
+            (want.clone(), garbage)
+        );
+        drop(s);
+        std::fs::remove_file(ckpt_path(&path)).unwrap();
+        let (mut s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.checkpoint, rec.cut), (None, 0));
+        assert_eq!(
+            (whole(&s, &layers), s.stats().garbage_bytes),
+            (want.clone(), garbage)
+        );
+        // And it compacts again.
+        compact(&mut s);
+        assert_eq!(whole(&s, &layers), want);
+    }
+
+    #[test]
+    fn what_comes_in_during_a_compaction_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (mut s, mut layers, _) = busy_store(&path);
+        let a = layers[1];
+        let mut c = s.compaction().unwrap();
+        // Before the copy, between copy and catch-up, and after it (not
+        // flushed: finish flushes).
+        s.write(a, 1, &blocks(40, 2), false).unwrap();
+        c.copy().unwrap();
+        let seal = s.seal_tagged(a, b"three").unwrap();
+        let e = s.fork(seal).unwrap();
+        s.name(e, "tank/e").unwrap();
+        s.write(e, 3, &blocks(41, 1), false).unwrap();
+        s.drop_seal(layers[4]).unwrap_err(); // has children: refused, appends nothing
+        assert!(c.catch_up().unwrap() > 0);
+        s.write(e, 4, &blocks(42, 1), false).unwrap();
+        s.discard(a, 0, 1).unwrap();
+        layers.extend([seal, e]);
+        let want = whole(&s, &layers);
+        let done = c.finish(&mut s).unwrap();
+        assert!(done.records > 0);
+        assert_eq!(whole(&s, &layers), want);
+        assert_eq!(s.tag(seal), Some(&b"three"[..]));
+        assert_eq!(s.find("tank/e"), Some(e));
+        drop(s);
+        let (s, _) = Store::open(&path).unwrap();
+        assert_eq!(
+            whole(&s, &layers),
+            want,
+            "the writes finish flushed are durable"
+        );
+    }
+
+    #[test]
+    fn an_unfinished_compaction_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (mut s, layers, _) = busy_store(&path);
+        let temp = compact::temp_path(&path);
+        let mut c = s.compaction().unwrap();
+        c.copy().unwrap();
+        assert!(temp.exists());
+        drop(c);
+        assert!(!temp.exists(), "dropped: its file is removed");
+        s.write(layers[1], 2, &blocks(50, 1), false).unwrap();
+        s.flush().unwrap();
+        let want = whole(&s, &layers);
+        assert_eq!(std::fs::read(&path).unwrap()[..8], *FILE_MAGIC);
+        drop(s);
+
+        // A crash during a compaction leaves its file beside the log.
+        std::fs::write(&temp, b"half a compaction").unwrap();
+        std::fs::write(ckpt_path(&temp), b"its checkpoint").unwrap();
+        let (s, _) = Store::open(&path).unwrap();
+        assert!(
+            !temp.exists() && !ckpt_path(&temp).exists(),
+            "open removes what an unfinished compaction left"
+        );
+        assert_eq!(whole(&s, &layers), want);
+    }
+
+    #[test]
+    fn a_crash_between_the_two_renames_means_a_full_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (mut s, layers, _) = busy_store(&path);
+        s.checkpoint().unwrap();
+        let old_ckpt = std::fs::read(ckpt_path(&path)).unwrap();
+        compact(&mut s);
+        let want = whole(&s, &layers);
+        drop(s);
+        // As if the log was renamed but its checkpoint was not.
+        std::fs::write(ckpt_path(&path), &old_ckpt).unwrap();
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(
+            rec.checkpoint, None,
+            "the old log's checkpoint does not check out"
+        );
+        assert_eq!(whole(&s, &layers), want);
+    }
+
+    #[test]
+    fn base_records_anywhere_else_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // In a log that was never compacted.
+        let path = dir.path().join("log");
+        let (mut s, _, _) = busy_store(&path);
+        s.append(K_DATA, &blocks(1, 1)).unwrap();
+        s.flush().unwrap();
+        drop(s);
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::ReplayMeta { .. })
+        ));
+        // After a compacted log's first group.
+        let path = dir.path().join("log2");
+        let (mut s, _, _) = busy_store(&path);
+        compact(&mut s);
+        s.append(K_BASE, &[0; 8]).unwrap();
+        s.flush().unwrap();
+        drop(s);
+        std::fs::remove_file(ckpt_path(&path)).unwrap();
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::ReplayMeta { .. })
+        ));
+    }
+
+    #[test]
+    fn a_compaction_finishes_only_with_its_own_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _, _) = busy_store(&dir.path().join("log"));
+        let (mut other, _, _) = busy_store(&dir.path().join("other"));
+        let mut c = s.compaction().unwrap();
+        c.copy().unwrap();
+        assert!(c.finish(&mut other).is_err());
+        assert!(!compact::temp_path(&dir.path().join("log")).exists());
+        let mut c = s.compaction().unwrap();
+        assert!(c.catch_up().is_err(), "catch_up needs the base first");
+        c.copy().unwrap();
+        assert!(c.copy().is_err(), "the base is written once");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        /// A compaction anywhere in a run of operations, with operations
+        /// between its steps: afterwards the store reads the same, opens
+        /// the same, and a crash after it recovers to the last flush.
+        #[test]
+        fn a_compaction_in_the_middle_of_anything_changes_nothing_visible(
+            ops in proptest::collection::vec(op(), 4..30),
+            split in proptest::collection::vec(any::<prop::sample::Index>(), 3),
+            at in any::<prop::sample::Index>(),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("log");
+            let mut s = Store::create(&path).unwrap();
+            let mut cuts: Vec<usize> = split.iter().map(|i| i.index(ops.len() + 1)).collect();
+            cuts.sort_unstable();
+            let (before, rest) = ops.split_at(cuts[0]);
+            let (mut layers, _) = run(&mut s, before);
+            let mut c = s.compaction().unwrap();
+            for o in &ops[cuts[0]..cuts[1]] {
+                apply(&mut s, &mut layers, o);
+            }
+            c.copy().unwrap();
+            for o in &ops[cuts[1]..cuts[2]] {
+                apply(&mut s, &mut layers, o);
+            }
+            c.catch_up().unwrap();
+            let after: Vec<Op> = rest[cuts[2] - cuts[0]..].to_vec();
+            let (mid, tail) = after.split_at(after.len() / 2);
+            for o in mid {
+                apply(&mut s, &mut layers, o);
+            }
+            let want = whole(&s, &layers);
+            c.finish(&mut s).unwrap();
+            prop_assert_eq!(whole(&s, &layers), want.clone());
+            // A durable point right after the switch (finish flushed), then
+            // the rest of the operations; a crash anywhere after the switch
+            // recovers to the last flush.
+            let mut points = vec![(s.stats().log_bytes, want.0)];
+            for o in tail {
+                if apply(&mut s, &mut layers, o) {
+                    points.push((s.stats().log_bytes, snapshot(&s, &layers, 9)));
+                }
+            }
+            drop(s);
+            let len = std::fs::metadata(&path).unwrap().len();
+            let from = points[0].0;
+            let cut = from + at.index((len - from + 1) as usize) as u64;
+            check_cuts(&path, &layers, &points, [cut, len].into_iter());
+        }
+    }
+
+    /// Timing, not a check: `cargo test --release -p taso-blk --lib
+    /// compaction_timing -- --ignored --nocapture`.  1 GiB live and 1 GiB
+    /// of garbage in 128 KiB writes, then 64 MiB more during the copy.
+    #[test]
+    #[ignore]
+    fn compaction_timing() {
+        use std::time::Instant;
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::create(&dir.path().join("log")).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        let chunk = vec![7u8; 128 << 10];
+        let n = (1u64 << 30) / chunk.len() as u64;
+        for pass in 0..2 {
+            for i in 0..n {
+                s.write(b, i * 32, &chunk, false).unwrap();
+            }
+            s.flush().unwrap();
+            eprintln!(
+                "pass {pass}: log {} MiB, garbage {} MiB",
+                s.stats().log_bytes >> 20,
+                s.stats().garbage_bytes >> 20
+            );
+        }
+        let t = Instant::now();
+        let mut c = s.compaction().unwrap();
+        let begin = t.elapsed();
+        for i in 0..512 {
+            s.write(b, i * 32, &chunk, false).unwrap();
+        }
+        let t = Instant::now();
+        c.copy().unwrap();
+        let copy = t.elapsed();
+        let t = Instant::now();
+        let caught = c.catch_up().unwrap();
+        let catch = t.elapsed();
+        for i in 0..8 {
+            s.write(b, i * 32, &chunk, false).unwrap();
+        }
+        let t = Instant::now();
+        let done = c.finish(&mut s).unwrap();
+        let finish = t.elapsed();
+        let t = Instant::now();
+        drop(done.old_log);
+        eprintln!("closing the old log (store not held) {:?}", t.elapsed());
+        let done = (done.before, done.after, done.live, done.records);
+        eprintln!("begin (store held) {begin:?}; copy {copy:?}; catch_up {caught} records {catch:?}; finish (store held) {finish:?}");
+        eprintln!("{done:?}");
     }
 }

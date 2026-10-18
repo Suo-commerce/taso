@@ -56,7 +56,10 @@ impl std::fmt::Display for ClientError {
             Self::Io(e) => write!(f, "taso-blkd socket: {e}"),
             Self::Daemon(e) => write!(f, "taso-blkd: {e}"),
             Self::Protocol(e) => write!(f, "taso-blkd answered something unexpected: {e}"),
-            Self::BadArgument(a) => write!(f, "argument {a:?} cannot be sent (empty, space or control character)"),
+            Self::BadArgument(a) => write!(
+                f,
+                "argument {a:?} cannot be sent (empty, space or control character)"
+            ),
         }
     }
 }
@@ -108,7 +111,10 @@ impl Client {
     /// Connect to the daemon's socket, with [`DEFAULT_TIMEOUT`].
     pub fn connect(socket: &Path) -> Result<Self> {
         let s = UnixStream::connect(socket)?;
-        let mut c = Self { reader: BufReader::new(s.try_clone()?), writer: s };
+        let mut c = Self {
+            reader: BufReader::new(s.try_clone()?),
+            writer: s,
+        };
         c.set_timeout(DEFAULT_TIMEOUT)?;
         Ok(c)
     }
@@ -171,10 +177,14 @@ impl Client {
     /// must not exist), incremental from the Seal `from` below it, or full.
     /// Returns the blocks written.
     pub fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64> {
-        let (t, f) = (to.to_string(), from.map_or_else(|| "-".to_string(), |f| f.to_string()));
+        let (t, f) = (
+            to.to_string(),
+            from.map_or_else(|| "-".to_string(), |f| f.to_string()),
+        );
         let p = path_arg(path)?;
         let a = self.call(&["export", &t, &f, &p])?;
-        a.parse().map_err(|_| ClientError::Protocol(format!("export answered {a:?}")))
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("export answered {a:?}")))
     }
 
     /// Apply the stream in the file `path` to a detached `branch` with no
@@ -183,14 +193,30 @@ impl Client {
     pub fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64> {
         let p = path_arg(path)?;
         let a = self.call(&["import", &branch.to_string(), &p])?;
-        a.parse().map_err(|_| ClientError::Protocol(format!("import answered {a:?}")))
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("import answered {a:?}")))
     }
 
     /// Flush and write a checkpoint, so the next start replays only what
     /// follows.  Returns its sequence number.
     pub fn checkpoint(&mut self) -> Result<u64> {
         let a = self.call(&["checkpoint"])?;
-        a.parse().map_err(|_| ClientError::Protocol(format!("checkpoint answered {a:?}")))
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("checkpoint answered {a:?}")))
+    }
+
+    /// Rewrite the log with only its live blocks, while devices keep
+    /// running.  Answers `before`, `after`, `live` (bytes) and `records`
+    /// (copied after the base), as `key → value`.
+    pub fn compact(&mut self) -> Result<BTreeMap<String, String>> {
+        let a = self.call(&["compact"])?;
+        a.split_whitespace()
+            .map(|kv| {
+                kv.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .ok_or_else(|| ClientError::Protocol(format!("compact answered {a:?}")))
+            })
+            .collect()
     }
 
     /// Every named branch, in name order.
@@ -198,7 +224,9 @@ impl Client {
         let a = self.call(&["names"])?;
         a.split_whitespace()
             .map(|item| {
-                let (n, l) = item.rsplit_once(':').ok_or_else(|| ClientError::Protocol(format!("names answered {a:?}")))?;
+                let (n, l) = item
+                    .rsplit_once(':')
+                    .ok_or_else(|| ClientError::Protocol(format!("names answered {a:?}")))?;
                 Ok((n.to_string(), layer(l)?))
             })
             .collect()
@@ -238,7 +266,9 @@ impl Client {
         let a = self.call(&["seals", &branch.to_string()])?;
         a.split_whitespace()
             .map(|item| {
-                let (l, t) = item.split_once(':').ok_or_else(|| ClientError::Protocol(format!("seals answered {a:?}")))?;
+                let (l, t) = item
+                    .split_once(':')
+                    .ok_or_else(|| ClientError::Protocol(format!("seals answered {a:?}")))?;
                 Ok((layer(l)?, unhex(t)?))
             })
             .collect()
@@ -249,10 +279,16 @@ impl Client {
         let a = self.call(&["info", &layer_id.to_string()])?;
         let mut kv = BTreeMap::new();
         for item in a.split_whitespace() {
-            let (k, v) = item.split_once('=').ok_or_else(|| ClientError::Protocol(format!("info answered {a:?}")))?;
+            let (k, v) = item
+                .split_once('=')
+                .ok_or_else(|| ClientError::Protocol(format!("info answered {a:?}")))?;
             kv.insert(k, (v != "-").then_some(v));
         }
-        let field = |k: &str| kv.get(k).copied().ok_or_else(|| ClientError::Protocol(format!("info has no {k}: {a:?}")));
+        let field = |k: &str| {
+            kv.get(k)
+                .copied()
+                .ok_or_else(|| ClientError::Protocol(format!("info has no {k}: {a:?}")))
+        };
         let kind = match field("kind")? {
             Some("branch") => LayerKind::Branch,
             Some("seal") => LayerKind::Seal,
@@ -283,7 +319,8 @@ impl Client {
     /// record's sequence number.
     pub fn flush(&mut self) -> Result<u64> {
         let a = self.call(&["flush"])?;
-        a.parse().map_err(|_| ClientError::Protocol(format!("flush answered {a:?}")))
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("flush answered {a:?}")))
     }
 
     /// The daemon's counters, as `key → value`.
@@ -315,7 +352,10 @@ impl Client {
         self.writer.write_all(line.as_bytes())?;
         let mut answer = String::new();
         if self.reader.read_line(&mut answer)? == 0 {
-            return Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "taso-blkd closed the connection")));
+            return Err(ClientError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "taso-blkd closed the connection",
+            )));
         }
         let answer = answer.trim_end_matches('\n');
         if answer == "ok" {
@@ -335,7 +375,10 @@ impl Client {
         if a.is_empty() {
             Ok(())
         } else {
-            Err(ClientError::Protocol(format!("{} answered {a:?}", words[0])))
+            Err(ClientError::Protocol(format!(
+                "{} answered {a:?}",
+                words[0]
+            )))
         }
     }
 }
@@ -366,7 +409,10 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
     if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return Err(bad());
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| bad())).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| bad()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -420,47 +466,99 @@ mod tests {
         let l = |n| LayerId::from_raw(n);
         assert_eq!(c.root().unwrap(), l(0));
         assert_eq!(c.branch(l(0), Some("tank/a")).unwrap(), l(1));
-        assert_eq!(c.fork(l(0), None).unwrap(), (l(2), PathBuf::from("/dev/ublkb3")));
+        assert_eq!(
+            c.fork(l(0), None).unwrap(),
+            (l(2), PathBuf::from("/dev/ublkb3"))
+        );
         assert_eq!(c.attach(l(1)).unwrap(), PathBuf::from("/dev/ublkb4"));
         assert_eq!(c.seal(l(1), &tag).unwrap(), l(5));
-        assert_eq!(c.seals(l(1)).unwrap(), vec![(l(5), tag.to_vec()), (l(7), vec![])]);
+        assert_eq!(
+            c.seals(l(1)).unwrap(),
+            vec![(l(5), tag.to_vec()), (l(7), vec![])]
+        );
         let i = c.info(l(5)).unwrap();
         assert_eq!(
             i,
-            Info { kind: LayerKind::Seal, parent: Some(l(0)), name: None, tag: Some(tag.to_vec()), origin: Some(l(1)), dev: None }
+            Info {
+                kind: LayerKind::Seal,
+                parent: Some(l(0)),
+                name: None,
+                tag: Some(tag.to_vec()),
+                origin: Some(l(1)),
+                dev: None
+            }
         );
         let i = c.info(l(1)).unwrap();
-        assert_eq!((i.kind, i.name.as_deref(), i.tag, i.dev), (LayerKind::Branch, Some("tank/a"), None, Some("/dev/ublkb4".into())));
+        assert_eq!(
+            (i.kind, i.name.as_deref(), i.tag, i.dev),
+            (
+                LayerKind::Branch,
+                Some("tank/a"),
+                None,
+                Some("/dev/ublkb4".into())
+            )
+        );
         c.name(l(1), None).unwrap();
         assert_eq!(c.flush().unwrap(), 42);
-        assert_eq!(c.stats().unwrap().get("layers").map(String::as_str), Some("3"));
+        assert_eq!(
+            c.stats().unwrap().get("layers").map(String::as_str),
+            Some("3")
+        );
         drop(c);
         assert_eq!(
             h.join().unwrap(),
             [
-                "root", "branch L0 tank/a", "fork L0", "attach L1", "seal L1 0700ab", "seals L1", "info L5", "info L1",
-                "name L1", "flush", "stats"
+                "root",
+                "branch L0 tank/a",
+                "fork L0",
+                "attach L1",
+                "seal L1 0700ab",
+                "seals L1",
+                "info L5",
+                "info L1",
+                "name L1",
+                "flush",
+                "stats"
             ]
         );
     }
 
     #[test]
     fn an_untagged_seal_reports_an_empty_tag() {
-        let (_d, path, h) = fake(&["ok L3", "ok kind=seal parent=L2 name=- tag= origin=L1 dev=-"]);
+        let (_d, path, h) = fake(&[
+            "ok L3",
+            "ok kind=seal parent=L2 name=- tag= origin=L1 dev=-",
+        ]);
         let mut c = Client::connect(&path).unwrap();
-        assert_eq!(c.seal(LayerId::from_raw(1), b"").unwrap(), LayerId::from_raw(3));
+        assert_eq!(
+            c.seal(LayerId::from_raw(1), b"").unwrap(),
+            LayerId::from_raw(3)
+        );
         assert_eq!(c.info(LayerId::from_raw(3)).unwrap().tag, Some(vec![]));
         drop(c);
-        assert_eq!(h.join().unwrap(), ["seal L1", "info L3"], "no tag word for an empty tag");
+        assert_eq!(
+            h.join().unwrap(),
+            ["seal L1", "info L3"],
+            "no tag word for an empty tag"
+        );
     }
 
     #[test]
     fn refusals_and_missing_names() {
-        let (_d, path, _h) = fake(&["err no branch named x", "err branch name \"a\" is taken", "err no layer L9"]);
+        let (_d, path, _h) = fake(&[
+            "err no branch named x",
+            "err branch name \"a\" is taken",
+            "err no layer L9",
+        ]);
         let mut c = Client::connect(&path).unwrap();
         assert_eq!(c.find("x").unwrap(), None);
-        assert!(matches!(c.branch(LayerId::from_raw(0), Some("a")), Err(ClientError::Daemon(e)) if e.contains("taken")));
-        assert!(matches!(c.drop_layer(LayerId::from_raw(9)), Err(ClientError::Daemon(_))));
+        assert!(
+            matches!(c.branch(LayerId::from_raw(0), Some("a")), Err(ClientError::Daemon(e)) if e.contains("taken"))
+        );
+        assert!(matches!(
+            c.drop_layer(LayerId::from_raw(9)),
+            Err(ClientError::Daemon(_))
+        ));
     }
 
     #[test]
@@ -468,26 +566,56 @@ mod tests {
         let (_d, path, h) = fake(&["ok L1"]);
         let mut c = Client::connect(&path).unwrap();
         for bad in ["a b", "a\nquit", "a\tb", "a\rb", "", "a\u{7f}"] {
-            assert!(matches!(c.find(bad), Err(ClientError::BadArgument(_))), "{bad:?}");
-            assert!(matches!(c.branch(LayerId::from_raw(0), Some(bad)), Err(ClientError::BadArgument(_))), "{bad:?}");
+            assert!(
+                matches!(c.find(bad), Err(ClientError::BadArgument(_))),
+                "{bad:?}"
+            );
+            assert!(
+                matches!(
+                    c.branch(LayerId::from_raw(0), Some(bad)),
+                    Err(ClientError::BadArgument(_))
+                ),
+                "{bad:?}"
+            );
         }
         assert_eq!(c.find("ok").unwrap(), Some(LayerId::from_raw(1)));
         drop(c);
-        assert_eq!(h.join().unwrap(), ["find ok"], "only the good command reached the daemon");
+        assert_eq!(
+            h.join().unwrap(),
+            ["find ok"],
+            "only the good command reached the daemon"
+        );
     }
 
     #[test]
     fn answers_that_do_not_fit_are_protocol_errors() {
-        let (_d, path, _h) = fake(&["ok banana", "ok", "hello", "ok L1 /dev/a b", "ok L1:zz", "ok kind=thing", "ok 1"]);
+        let (_d, path, _h) = fake(&[
+            "ok banana",
+            "ok",
+            "hello",
+            "ok L1 /dev/a b",
+            "ok L1:zz",
+            "ok kind=thing",
+            "ok 1",
+        ]);
         let mut c = Client::connect(&path).unwrap();
         let l0 = LayerId::from_raw(0);
         assert!(matches!(c.root(), Err(ClientError::Protocol(_))));
-        assert!(matches!(c.attach(l0), Err(ClientError::Protocol(_))), "empty device path");
-        assert!(matches!(c.flush(), Err(ClientError::Protocol(_))), "neither ok nor err");
+        assert!(
+            matches!(c.attach(l0), Err(ClientError::Protocol(_))),
+            "empty device path"
+        );
+        assert!(
+            matches!(c.flush(), Err(ClientError::Protocol(_))),
+            "neither ok nor err"
+        );
         assert!(matches!(c.fork(l0, None), Err(ClientError::Protocol(_))));
         assert!(matches!(c.seals(l0), Err(ClientError::Protocol(_))));
         assert!(matches!(c.info(l0), Err(ClientError::Protocol(_))));
-        assert!(matches!(c.detach(l0), Err(ClientError::Protocol(_))), "detach answers a bare ok");
+        assert!(
+            matches!(c.detach(l0), Err(ClientError::Protocol(_))),
+            "detach answers a bare ok"
+        );
     }
 
     #[test]

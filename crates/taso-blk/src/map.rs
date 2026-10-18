@@ -204,7 +204,10 @@ impl Map {
         let mut steps = 0usize;
         while let Some(p) = cur {
             steps += 1;
-            assert!(steps <= self.layers.len(), "cycle in the layer chain at {p}");
+            assert!(
+                steps <= self.layers.len(),
+                "cycle in the layer chain at {p}"
+            );
             let l = &self.layers[&p];
             for (&b, loc) in l.blocks.range(lba..end) {
                 if decided.insert(b) && matches!(loc, Loc::Log(_)) {
@@ -239,7 +242,16 @@ impl Map {
         let seal = LayerId(self.next);
         self.next += 1;
         let depth = parent.map_or(0, |p| self.layers[&p].depth + 1);
-        self.layers.insert(seal, Layer { kind: Kind::Seal { lsn }, parent, blocks, children: 1, depth });
+        self.layers.insert(
+            seal,
+            Layer {
+                kind: Kind::Seal { lsn },
+                parent,
+                blocks,
+                children: 1,
+                depth,
+            },
+        );
         let b = self.layers.get_mut(&branch).expect("checked above");
         b.parent = Some(seal);
         b.depth = depth + 1;
@@ -320,6 +332,32 @@ impl Map {
     pub fn live(&self, n: u64) -> Option<LayerId> {
         let id = LayerId(n);
         self.layers.contains_key(&id).then_some(id)
+    }
+
+    /// Every log location a live layer holds, in no particular order.  Each
+    /// appears once: a location belongs to exactly one layer.  What a
+    /// compaction copies.
+    pub(crate) fn log_locs(&self) -> Vec<u64> {
+        let mut v = Vec::new();
+        for l in self.layers.values() {
+            v.extend(l.blocks.values().filter_map(|loc| match loc {
+                Loc::Log(off) => Some(*off),
+                Loc::Zero => None,
+            }));
+        }
+        v
+    }
+
+    /// Move every log location to `f(old)`: after a compaction copied the
+    /// blocks to a new log.  Nothing else changes.
+    pub(crate) fn remap(&mut self, f: impl Fn(u64) -> u64) {
+        for l in self.layers.values_mut() {
+            for loc in l.blocks.values_mut() {
+                if let Loc::Log(off) = loc {
+                    *off = f(*off);
+                }
+            }
+        }
     }
 
     // ── internals ───────────────────────────────────────────────────
@@ -404,7 +442,19 @@ impl Map {
                 };
                 blocks.insert(lba, loc);
             }
-            if layers.insert(LayerId(id), Layer { kind, parent, blocks, children: 0, depth: 0 }).is_some() {
+            if layers
+                .insert(
+                    LayerId(id),
+                    Layer {
+                        kind,
+                        parent,
+                        blocks,
+                        children: 0,
+                        depth: 0,
+                    },
+                )
+                .is_some()
+            {
                 return None;
             }
         }
@@ -432,7 +482,12 @@ impl Map {
         Some(Map { layers, next })
     }
 
-    fn insert(&mut self, kind: Kind, parent: Option<LayerId>, blocks: BTreeMap<u64, Loc>) -> LayerId {
+    fn insert(
+        &mut self,
+        kind: Kind,
+        parent: Option<LayerId>,
+        blocks: BTreeMap<u64, Loc>,
+    ) -> LayerId {
         let id = LayerId(self.next);
         self.next += 1;
         let depth = match parent {
@@ -443,14 +498,26 @@ impl Map {
             }
             None => 0,
         };
-        self.layers.insert(id, Layer { kind, parent, blocks, children: 0, depth });
+        self.layers.insert(
+            id,
+            Layer {
+                kind,
+                parent,
+                blocks,
+                children: 0,
+                depth,
+            },
+        );
         id
     }
 
     fn remove(&mut self, id: LayerId) -> Vec<u64> {
         let l = self.layers.remove(&id).expect("checked by caller");
         if let Some(p) = l.parent {
-            self.layers.get_mut(&p).expect("a parent outlives its children").children -= 1;
+            self.layers
+                .get_mut(&p)
+                .expect("a parent outlives its children")
+                .children -= 1;
         }
         l.blocks
             .into_values()
@@ -491,7 +558,11 @@ mod tests {
         let mut m = Map::new();
         let s = m.root_seal(0);
         let b = m.fork(s).unwrap();
-        assert_eq!(m.read(b, 7).unwrap(), None, "nothing written: the base image");
+        assert_eq!(
+            m.read(b, 7).unwrap(),
+            None,
+            "nothing written: the base image"
+        );
         assert_eq!(m.depth(b).unwrap(), 2);
         assert_eq!(m.kind(b).unwrap(), Kind::Branch);
         assert_eq!(m.parent(b).unwrap(), Some(s));
@@ -568,9 +639,17 @@ mod tests {
         // branch's own (freed); block 3 was never written.
         assert_eq!(m.discard(b, 1, 3).unwrap(), vec![21]);
         for lba in 1..3 {
-            assert_eq!(m.read(b, lba).unwrap(), Some(Loc::Zero), "hides the Seal's block {lba}");
+            assert_eq!(
+                m.read(b, lba).unwrap(),
+                Some(Loc::Zero),
+                "hides the Seal's block {lba}"
+            );
         }
-        assert_eq!(m.read(b, 3).unwrap(), None, "nothing to hide: reads the zero base image");
+        assert_eq!(
+            m.read(b, 3).unwrap(),
+            None,
+            "nothing to hide: reads the zero base image"
+        );
         assert_eq!(m.discard(b, u64::MAX, 2), Err(MapError::Overflow));
     }
 
@@ -585,10 +664,24 @@ mod tests {
         m.write(b, 9, log(3)).unwrap();
         let t = std::time::Instant::now();
         assert_eq!(m.discard(b, 0, u64::MAX / 2).unwrap(), vec![3]);
-        assert!(t.elapsed() < std::time::Duration::from_secs(1), "not one step per block");
-        assert_eq!(m.delta(b).unwrap().count(), 2, "zero entries only over the Seal's two blocks");
-        assert_eq!((m.read(b, 7).unwrap(), m.read(b, 9).unwrap()), (Some(Loc::Zero), None));
-        assert_eq!(m.read(s2, 7).unwrap(), Some(log(1)), "the Seal is untouched");
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(1),
+            "not one step per block"
+        );
+        assert_eq!(
+            m.delta(b).unwrap().count(),
+            2,
+            "zero entries only over the Seal's two blocks"
+        );
+        assert_eq!(
+            (m.read(b, 7).unwrap(), m.read(b, 9).unwrap()),
+            (Some(Loc::Zero), None)
+        );
+        assert_eq!(
+            m.read(s2, 7).unwrap(),
+            Some(log(1)),
+            "the Seal is untouched"
+        );
     }
 
     #[test]
@@ -599,7 +692,11 @@ mod tests {
         assert_eq!(m.write(b, 5, log(1)).unwrap(), None);
         assert_eq!(m.write(b, 5, log(2)).unwrap(), Some(1));
         assert_eq!(m.write(b, 5, Loc::Zero).unwrap(), Some(2));
-        assert_eq!(m.write(b, 5, log(3)).unwrap(), None, "zeros held no log space");
+        assert_eq!(
+            m.write(b, 5, log(3)).unwrap(),
+            None,
+            "zeros held no log space"
+        );
     }
 
     #[test]
@@ -614,7 +711,11 @@ mod tests {
         assert_eq!(m.drop_seal(s2), Err(MapError::HasChildren(s2)));
         assert_eq!(m.drop_seal(s1), Err(MapError::HasChildren(s1)));
         assert_eq!(m.drop_branch(b).unwrap(), vec![20], "zeros are not garbage");
-        assert_eq!(m.drop_seal(s1), Err(MapError::HasChildren(s1)), "s2 stands on it");
+        assert_eq!(
+            m.drop_seal(s1),
+            Err(MapError::HasChildren(s1)),
+            "s2 stands on it"
+        );
         assert_eq!(m.drop_seal(s2).unwrap(), vec![10]);
         assert_eq!(m.drop_seal(s1).unwrap(), Vec::<u64>::new());
         assert_eq!(m.layers(), 0);
@@ -643,7 +744,11 @@ mod tests {
         let s_ = again.root_seal(0);
         let b_ = again.fork(s_).unwrap();
         again.drop_branch(b_).unwrap();
-        assert_eq!(again.fork(s_).unwrap(), c, "same calls, same ids: replay rebuilds the same map");
+        assert_eq!(
+            again.fork(s_).unwrap(),
+            c,
+            "same calls, same ids: replay rebuilds the same map"
+        );
     }
 
     #[test]
@@ -656,7 +761,10 @@ mod tests {
         }
         let big = m.seal(b, 1).unwrap();
         let f = m.fork(big).unwrap();
-        assert!(m.is_empty(f).unwrap(), "a fork holds nothing until it writes");
+        assert!(
+            m.is_empty(f).unwrap(),
+            "a fork holds nothing until it writes"
+        );
         assert_eq!(m.read(f, 99_999).unwrap(), Some(log(99_999 * BLOCK)));
     }
 

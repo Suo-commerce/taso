@@ -11,7 +11,9 @@
 # run, in order:
 #   1 raw     fio writes with checksums to a raw device (4 KiB and 128 KiB,
 #             two jobs at once), then discard and write-zeroes over random
-#             data; read back and checked, then again after a daemon restart.
+#             data; then every block overwritten with other data while the
+#             log is compacted twice, and once more when quiet; read back
+#             and checked, then again after a daemon restart.
 #   2 fsx     fsx on ext4 on our device: buffered with mmap, then O_DIRECT.
 #   3 xfstests the TESTS with TEST_DEV and SCRATCH_DEV on our devices.
 #   4 recheck every test that failed in 3 runs again on our devices, and on
@@ -19,7 +21,11 @@
 #             A test failing on ours twice and passing on loop is OURS; one
 #             passing the second time on ours is FLAKY; one failing on loop
 #             too is not about our device (kernel, tools, environment).
-# Exit 0 only if raw and fsx passed and no test is OURS.
+# The daemon compacts by itself during 2 to 4 when garbage passes
+# FST_COMPACT_PCT per cent of the log (default 25; 0 turns it off) and
+# FST_COMPACT_MIN_MIB (default 256); the summary counts the compactions.
+# Exit 0 only if raw and fsx passed, no compaction failed, and no test is
+# OURS.
 #
 # setup touches, and nothing else:
 #   apt packages: automake bc e2fsprogs fio gawk gcc git libacl1-dev
@@ -37,7 +43,7 @@
 #   /mnt/blk-fst and mounts under it    (all unmounted at the end)
 #   the /dev/ublkb* devices the daemon creates, two loop devices in step 4
 #
-# Disk: the log only grows (no compaction yet), and xfstests writes a lot.
+# Disk: xfstests writes a lot, and the log grows until a compaction.
 # The run refuses to start with less than FST_MIN_FREE_GIB (default 30)
 # free under /var/lib/taso-blk, and stops xfstests if it falls below
 # FST_STOP_FREE_GIB (default 5).  The log's size and garbage are in the
@@ -63,6 +69,8 @@ LOOP_SCRATCH_IMG=$DIR/fst-loop-scratch.img
 BLKD=${FST_BLKD:-target/release/taso-blkd}
 SIZE_GIB=8
 MIN_FREE=${FST_MIN_FREE_GIB:-30}
+COMPACT_PCT=${FST_COMPACT_PCT:-25}
+COMPACT_MIN=${FST_COMPACT_MIN_MIB:-256}
 STOP_FREE=${FST_STOP_FREE_GIB:-5}
 
 say() { printf '== %s\n' "$*"; }
@@ -136,17 +144,22 @@ check() { # check NAME EXPECTED ACTUAL
     fi
 }
 
-# One command to the daemon; prints the answer without "ok"; aborts on "err".
-blk() {
-    local answer
-    answer=$(python3 -c '
+# One command to the daemon; prints its whole answer line.
+blk_raw() {
+    python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_UNIX)
-s.settimeout(60)
+s.settimeout(600)
 s.connect(sys.argv[1])
 s.sendall((" ".join(sys.argv[2:]) + "\n").encode())
 print(s.makefile().readline().strip())
-' "$SOCK" "$@") || die "daemon did not answer: $*"
+' "$SOCK" "$@"
+}
+
+# One command to the daemon; prints the answer without "ok"; aborts on "err".
+blk() {
+    local answer
+    answer=$(blk_raw "$@") || die "daemon did not answer: $*"
     case "$answer" in
         "ok")    ;;
         "ok "*)  printf '%s\n' "${answer#ok }" ;;
@@ -155,7 +168,8 @@ print(s.makefile().readline().strip())
 }
 
 start_daemon() {
-    "$BLKD" "$LOG" "$SOCK" --size-gib "$SIZE_GIB" 2>>"$ERR" &
+    "$BLKD" "$LOG" "$SOCK" --size-gib "$SIZE_GIB" \
+        --compact-pct "$COMPACT_PCT" --compact-min-mib "$COMPACT_MIN" 2>>"$ERR" &
     DAEMON_PID=$!
     for _ in $(seq 100); do
         [[ -S "$SOCK" ]] && return 0
@@ -278,6 +292,7 @@ mkdir -p "$RES"
     echo "blk-fstests $(date -Is)"
     echo "kernel $(uname -r); taso $(git rev-parse --short HEAD 2>/dev/null || echo ?); xfstests $XFS_TAG"
     echo "tests: ${TESTS[*]}; devices ${SIZE_GIB} GiB; $free GiB free at start"
+    echo "automatic compaction at ${COMPACT_PCT}% garbage and ${COMPACT_MIN} MiB (0%: off)"
 } | tee "$RES/summary.txt"
 
 if [[ -z "${FST_BLKD:-}" ]]; then
@@ -294,14 +309,28 @@ ROOT=$(blk root)
 say "1 raw: fio with checksums, discard, write-zeroes"
 read -r RAW RAWDEV <<<"$(blk fork "$ROOT" fst-raw)"
 wait_dev "$RAWDEV"
-fio_raw() { # fio_raw EXTRA... : the same two jobs every time (fixed seeds)
+fio_raw() { # fio_raw NAME SEED EXTRA... : the same two jobs; the seed picks the data
     fio --output="$RES/fio-$1.txt" --ioengine=libaio --direct=1 --iodepth=32 \
-        --rw=randwrite --verify=crc32c --verify_fatal=1 --verify_state_save=0 --randrepeat=1 --randseed=4242 \
+        --rw=randwrite --verify=crc32c --verify_fatal=1 --verify_state_save=0 --randrepeat=1 --randseed="$2" \
         --filename="$RAWDEV" \
         --name=small --bs=4k --offset=0 --size=1g \
-        --name=large --bs=128k --offset=1g --size=2g "${@:2}"
+        --name=large --bs=128k --offset=1g --size=2g "${@:3}"
 }
-rc=0; fio_raw write || rc=$?
+# A compaction now; waits while the daemon's own one is running.
+compact_now() {
+    local answer
+    for _ in $(seq 600); do
+        answer=$(blk_raw compact) || die "daemon did not answer: compact"
+        case "$answer" in
+            "ok "*) printf '%s\n' "${answer#ok }"; return 0 ;;
+            *"already running"*) sleep 1 ;;
+            *) die "daemon: compact -> $answer" ;;
+        esac
+    done
+    die "compact: the daemon's compaction still running after 600 s"
+}
+garbage() { blk stats | tr ' ' '\n' | sed -n 's/^garbage_bytes=//p'; }
+rc=0; fio_raw write 4242 || rc=$?
 check "raw: fio write and verify (4k and 128k, iodepth 32)" 0 "$rc"
 head -c $((256 << 20)) /dev/urandom | dd of="$RAWDEV" bs=1M seek=3072 oflag=direct status=none
 blkdiscard -o $((3 << 30)) -l $((128 << 20)) "$RAWDEV"
@@ -309,13 +338,27 @@ blkdiscard -z -o $(((3 << 30) + (128 << 20))) -l $((128 << 20)) "$RAWDEV"
 zeros() { cmp -s -n $((256 << 20)) -i $((3 << 30)):0 "$RAWDEV" /dev/zero && echo zeros || echo "not zeros"; }
 check "raw: discard and write-zeroes read back as zeros" zeros "$(zeros)"
 note_stats "after raw writes"
+
+# Every block of the fio range again, with other data (another seed), while
+# two compactions run: a stale block from before would fail the checksums.
+( sleep 2; compact_now >"$RES/compact-1.txt"; sleep 2; compact_now >"$RES/compact-2.txt" ) 2>"$RES/compact-err.txt" &
+COMPACT_PID=$!
+rc=0; fio_raw overwrite 777 || rc=$?
+crc=0; wait "$COMPACT_PID" || crc=$?
+check "raw: fio overwrite and verify while compacting" 0 "$rc"
+check "raw: two compactions under load answered ok" 0 "$crc"
+echo "compactions under load: $(cat "$RES/compact-1.txt" 2>/dev/null) | $(cat "$RES/compact-2.txt" 2>/dev/null)" | tee -a "$RES/summary.txt"
+note_stats "after the overwrite"
+echo "compaction when quiet: $(compact_now)" | tee -a "$RES/summary.txt"
+check "raw: no garbage after a quiet compaction" 0 "$(garbage)"
+check "raw: zeros after compactions" zeros "$(zeros)"
 blk detach "$RAW" >/dev/null
 stop_daemon
 start_daemon
 check "raw: restart after a clean quit cuts nothing" "0 bytes cut" "$(grep -o '[0-9]* bytes cut' "$ERR" | tail -n 1)"
 RAWDEV=$(blk attach "$RAW")
 wait_dev "$RAWDEV"
-rc=0; fio_raw verify --verify_only || rc=$?
+rc=0; fio_raw verify 777 --verify_only || rc=$?
 check "raw: fio verify after restart" 0 "$rc"
 check "raw: zeros after restart" zeros "$(zeros)"
 blk drop "$RAW" >/dev/null
@@ -395,7 +438,12 @@ fi
     echo "failed once on ours, then passed (FLAKY): ${FLAKY[*]:-none}"
     echo "failed on loop too (not the device):      ${BOTH[*]:-none}"
     echo "log $(du -h --apparent-size "$LOG" 2>/dev/null | cut -f1); $(free_gib) GiB free at the end"
+    echo "automatic compactions: $(grep -c '^taso-blkd: compacted:' "$ERR" || true) done, $(grep -c '^taso-blkd: compaction:' "$ERR" || true) failed"
 } | tee -a "$RES/summary.txt"
+if grep -q '^taso-blkd: compaction:' "$ERR"; then
+    grep '^taso-blkd: compaction:' "$ERR" | tee -a "$RES/summary.txt"
+    FAILS=$((FAILS + 1))
+fi
 [[ ${#OURS[@]} -eq 0 ]] || FAILS=$((FAILS + 1))
 
 unmount_all
