@@ -16,7 +16,14 @@
 //! | `list` | the branch's own Seals with a Taso tag, in lsn order |
 //! | `destroy` | drop that Seal (refused while something stands on it) |
 //! | `rollback` | only to the newest layer: unmount, detach, reset the branch to that Seal, remount |
-//! | `receive*` | not yet: rebirth needs the log off the node (adoption step 5) |
+//! | `receive`, `receive_clone` | import a shipped stream into a branch (new, the dataset's, or a clone of the base Seal), then Seal it with the tag |
+//!
+//! Rebirth uses the Warden's existing shipping: [`BlkSend`] is the
+//! [`Sender`] that turns a Seal into a stream (`taso-blkd export`: the
+//! blocks changed since the base Seal, or the full image), the pack code
+//! ships it, and `receive` applies it on the new node.  A Seal's guid,
+//! which the shipped record carries and the receiver must reproduce, is
+//! derived from its binding ([`guid`]), so it is the same on every node.
 //!
 //! # Origin and parent without extra state
 //!
@@ -53,8 +60,9 @@ use taso_blk::map::LayerId;
 use taso_core::envelope::{HashVal, Lsn};
 
 use crate::chronicle::{LayerError, Layers};
+use crate::ship::{ByteStream, Sender};
 use crate::vessel::Pool;
-use crate::zfs::{CloneBase, Dataset, DatasetInfo};
+use crate::zfs::{CloneBase, Dataset, DatasetInfo, Snapshot, SNAP_PREFIX};
 
 // ── tags ────────────────────────────────────────────────────────────
 
@@ -76,6 +84,23 @@ pub fn untag(t: &[u8]) -> Option<(Lsn, HashVal)> {
     }
     let lsn = u64::from_le_bytes(t[..8].try_into().ok()?);
     Some((Lsn::new(lsn), HashVal::from_bytes(t[8..].try_into().ok()?)))
+}
+
+/// The guid of the Seal layer bound to (`lsn`, `hash`): the same on every
+/// node, since it depends on the binding only (ZFS's guid is the same on
+/// every node a snapshot is received on; the Warden checks it).
+pub fn guid(lsn: Lsn, hash: HashVal) -> u64 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"taso-blk seal guid v1");
+    h.update(&tag(lsn, hash));
+    u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().expect("8 bytes"))
+}
+
+/// `(dataset, lsn)` from a full Seal snapshot name `<dataset>@taso-seal-<lsn>`.
+fn parse_seal_name(name: &str) -> Option<(Dataset, Lsn)> {
+    let (ds, snap) = name.split_once('@')?;
+    let lsn = snap.strip_prefix(SNAP_PREFIX)?.parse().ok()?;
+    Some((Dataset::new(ds).ok()?, Lsn::new(lsn)))
 }
 
 // ── the daemon and the mounts ───────────────────────────────────────
@@ -102,6 +127,13 @@ pub trait Blkd {
     fn detach(&mut self, branch: LayerId) -> Result<(), LayerError>;
     /// Reset a detached `branch` to the Seal it stands on.
     fn reset(&mut self, branch: LayerId) -> Result<(), LayerError>;
+    /// Write Seal `to` (incremental from the Seal `from`, or full) as a
+    /// stream into the new file `path`.
+    fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64, LayerError>;
+    /// Apply the stream in `path` to a detached, clean `branch`.
+    fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError>;
+    /// Every named branch.
+    fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError>;
     /// Make every change so far durable.
     fn flush(&mut self) -> Result<(), LayerError>;
 }
@@ -167,6 +199,15 @@ impl Blkd for Daemon {
     }
     fn reset(&mut self, branch: LayerId) -> Result<(), LayerError> {
         self.call(|c| c.reset(branch))
+    }
+    fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64, LayerError> {
+        self.call(|c| c.export(to, from, path))
+    }
+    fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError> {
+        self.call(|c| c.import(branch, path))
+    }
+    fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError> {
+        self.call(|c| c.names())
     }
     fn flush(&mut self) -> Result<(), LayerError> {
         self.call(|c| c.flush()).map(|_| ())
@@ -251,20 +292,103 @@ pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
     blkd: Arc<Mutex<D>>,
     mounts: Arc<M>,
     mount_root: PathBuf,
+    spool: PathBuf,
+}
+
+impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
+    fn clone(&self) -> Self {
+        Self { blkd: self.blkd.clone(), mounts: self.mounts.clone(), mount_root: self.mount_root.clone(), spool: self.spool.clone() }
+    }
 }
 
 impl BlkPool<Daemon, System> {
     /// The pool served by the daemon on `socket`; dataset `a/b` is mounted
-    /// on `<mount_root>/a/b`.
-    pub fn new(socket: impl Into<PathBuf>, mount_root: impl Into<PathBuf>) -> Self {
-        Self::with(Daemon::new(socket), System, mount_root)
+    /// on `<mount_root>/a/b`; shipped streams pass through files in
+    /// `spool` (a directory the daemon can write and read, on this host).
+    pub fn new(socket: impl Into<PathBuf>, mount_root: impl Into<PathBuf>, spool: impl Into<PathBuf>) -> Self {
+        Self::with(Daemon::new(socket), System, mount_root, spool)
     }
 }
 
 impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// A pool over any daemon and mounts (tests use fakes).
-    pub fn with(blkd: D, mounts: M, mount_root: impl Into<PathBuf>) -> Self {
-        Self { blkd: Arc::new(Mutex::new(blkd)), mounts: Arc::new(mounts), mount_root: mount_root.into() }
+    pub fn with(blkd: D, mounts: M, mount_root: impl Into<PathBuf>, spool: impl Into<PathBuf>) -> Self {
+        Self { blkd: Arc::new(Mutex::new(blkd)), mounts: Arc::new(mounts), mount_root: mount_root.into(), spool: spool.into() }
+    }
+
+    /// The [`Sender`] for this pool's Seals.
+    pub fn sender(&self) -> BlkSend<D> {
+        BlkSend { blkd: self.blkd.clone(), spool: self.spool.clone() }
+    }
+
+    /// The Seal layer of `dataset` at `lsn`, as the publisher wants it
+    /// (the shape of a ZFS snapshot), or `None` if there is none.
+    pub fn snapshot(&self, dataset: &Dataset, lsn: Lsn) -> Result<Option<Snapshot>, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let Some(b) = d.find(dataset.as_str())? else { return Ok(None) };
+        Ok(seal_at(&mut *d, b, lsn)?.map(|(_, hash)| Snapshot {
+            dataset: dataset.clone(),
+            seal: lsn,
+            createtxg: lsn.get(),
+            guid: guid(lsn, hash),
+            seal_hash: Some(hash),
+        }))
+    }
+
+    /// The datasets directly under `root`.
+    pub fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, LayerError> {
+        let prefix = format!("{root}/");
+        let names = self.blkd.lock().unwrap().names()?;
+        Ok(names
+            .into_iter()
+            .filter_map(|(n, _)| n.strip_prefix(&prefix).filter(|rest| !rest.contains('/')).map(|_| n.clone()))
+            .filter_map(|n| Dataset::new(&n).ok())
+            .collect())
+    }
+
+    /// The uids owning files in `dataset` (it is mounted for the walk if
+    /// it is not).  What `zfs userspace` answers for ZFS.
+    pub fn owner_uids(&self, dataset: &Dataset) -> Result<std::collections::BTreeSet<u32>, LayerError> {
+        use std::os::unix::fs::MetadataExt;
+        self.ensure_mounted(dataset)?;
+        let mut uids = std::collections::BTreeSet::new();
+        let mut stack = vec![self.mountpoint(dataset)];
+        while let Some(dir) = stack.pop() {
+            let meta = std::fs::symlink_metadata(&dir)?;
+            uids.insert(meta.uid());
+            if !meta.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let m = entry.metadata()?; // does not follow symlinks
+                if m.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    uids.insert(m.uid());
+                }
+            }
+        }
+        Ok(uids)
+    }
+
+    /// Copy `stream` into a new spool file; the file is removed when the
+    /// returned guard drops.
+    fn spool_in(&self, stream: &mut dyn io::Read) -> Result<SpoolFile, LayerError> {
+        let f = SpoolFile::new(&self.spool, "recv")?;
+        let mut out = std::io::BufWriter::new(std::fs::OpenOptions::new().write(true).create_new(true).open(&f.0)?);
+        io::copy(stream, &mut out)?;
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        Ok(f)
+    }
+
+    /// Import the spooled stream into `b`, then Seal it with `to`'s tag.
+    fn import_and_seal(d: &mut D, b: LayerId, file: &SpoolFile, to: (Lsn, HashVal)) -> Result<u64, LayerError> {
+        d.import(b, &file.0)?;
+        d.seal(b, &tag(to.0, to.1))?;
+        d.flush()?;
+        Ok(guid(to.0, to.1))
     }
 
     /// Where `dataset` is mounted.
@@ -399,21 +523,147 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
     fn receive(
         &self,
         dataset: &Dataset,
-        _from: Option<(Lsn, HashVal)>,
-        _to: (Lsn, HashVal),
-        _stream: &mut dyn io::Read,
+        from: Option<(Lsn, HashVal)>,
+        to: (Lsn, HashVal),
+        stream: &mut dyn io::Read,
     ) -> Result<u64, LayerError> {
-        Err(format!("block-log rebirth is not built yet (adoption step 5): cannot receive {dataset}").into())
+        // Already here (an interrupted rebirth got this far): bind and return.
+        {
+            let mut d = self.blkd.lock().unwrap();
+            if let Some(b) = d.find(dataset.as_str())? {
+                if let Some((_, h)) = seal_at(&mut *d, b, to.0)? {
+                    return if h == to.1 { Ok(guid(to.0, to.1)) } else { Err(format!("Seal layer {} is bound to another record", dataset.seal_snapshot(to.0)).into()) };
+                }
+            }
+        }
+        let file = self.spool_in(stream)?; // a stream that fails as it is read leaves nothing
+        let mut d = self.blkd.lock().unwrap();
+        match from {
+            None => {
+                if d.find(dataset.as_str())?.is_some() {
+                    return Err(format!("dataset {dataset} exists; a full stream needs a new one").into());
+                }
+                let root = d.root()?;
+                let b = d.branch(root, dataset.as_str())?;
+                Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
+                    let _ = d.drop_layer(b);
+                    let _ = d.drop_layer(root);
+                    let _ = d.flush();
+                })
+            }
+            Some((lsn, hash)) => {
+                let b = d.find(dataset.as_str())?.ok_or_else(|| format!("no dataset {dataset} to receive into"))?;
+                let (layer, bound) = seal_at(&mut *d, b, lsn)?.ok_or_else(|| format!("no Seal layer {} to receive onto", dataset.seal_snapshot(lsn)))?;
+                if bound != hash {
+                    return Err(format!("Seal layer {} is bound to another record", dataset.seal_snapshot(lsn)).into());
+                }
+                let info = d.info(b)?;
+                if info.parent != Some(layer) {
+                    return Err(format!("{dataset} does not stand on {}", dataset.seal_snapshot(lsn)).into());
+                }
+                if info.dev.is_some() {
+                    return Err(format!("{dataset} is attached; a received dataset is not in use").into());
+                }
+                d.reset(b)?; // whatever an interrupted receive left
+                Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
+                    let _ = d.reset(b);
+                    let _ = d.flush();
+                })
+            }
+        }
     }
 
     fn receive_clone(
         &self,
         dataset: &Dataset,
-        _base: &CloneBase,
-        _to: (Lsn, HashVal),
-        _stream: &mut dyn io::Read,
+        base: &CloneBase,
+        to: (Lsn, HashVal),
+        stream: &mut dyn io::Read,
     ) -> Result<u64, LayerError> {
-        Err(format!("block-log rebirth is not built yet (adoption step 5): cannot receive {dataset}").into())
+        {
+            let mut d = self.blkd.lock().unwrap();
+            if let Some(b) = d.find(dataset.as_str())? {
+                if let Some((_, h)) = seal_at(&mut *d, b, to.0)? {
+                    return if h == to.1 { Ok(guid(to.0, to.1)) } else { Err(format!("Seal layer {} is bound to another record", dataset.seal_snapshot(to.0)).into()) };
+                }
+                return Err(format!("dataset {dataset} exists without Seal {}", to.0.get()).into());
+            }
+        }
+        if base.guid != guid(base.seal, base.hash) {
+            return Err(format!("the base {} has another guid", base.dataset.seal_snapshot(base.seal)).into());
+        }
+        let file = self.spool_in(stream)?;
+        let mut d = self.blkd.lock().unwrap();
+        let src = d.find(base.dataset.as_str())?.ok_or_else(|| format!("no base dataset {}", base.dataset))?;
+        let (layer, bound) = seal_at(&mut *d, src, base.seal)?.ok_or_else(|| format!("no base Seal layer {}", base.dataset.seal_snapshot(base.seal)))?;
+        if bound != base.hash {
+            return Err(format!("base Seal layer {} is bound to another record", base.dataset.seal_snapshot(base.seal)).into());
+        }
+        let b = d.branch(layer, dataset.as_str())?;
+        Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
+            let _ = d.drop_layer(b);
+            let _ = d.flush();
+        })
+    }
+}
+
+// ── sending ─────────────────────────────────────────────────────────
+
+/// The [`Sender`] of a [`BlkPool`]: a Seal as a stream of the blocks that
+/// changed since the base Seal (full if there is none).
+pub struct BlkSend<D: Blkd = Daemon> {
+    blkd: Arc<Mutex<D>>,
+    spool: PathBuf,
+}
+
+impl<D: Blkd> Sender for BlkSend<D> {
+    fn send(&self, dataset: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream> {
+        let err = |e: LayerError| io::Error::other(e.to_string());
+        let file = SpoolFile::new(&self.spool, "send")?;
+        {
+            let mut d = self.blkd.lock().unwrap();
+            let b = d.find(dataset.as_str()).map_err(err)?.ok_or_else(|| io::Error::other(format!("no dataset {dataset}")))?;
+            let (to_layer, _) = seal_at(&mut *d, b, to)
+                .map_err(err)?
+                .ok_or_else(|| io::Error::other(format!("no Seal layer {}", dataset.seal_snapshot(to))))?;
+            let from_layer = match from {
+                None => None,
+                Some(name) => {
+                    let (fds, flsn) = parse_seal_name(name).ok_or_else(|| io::Error::other(format!("{name:?} is not a Seal snapshot name")))?;
+                    let fb = d.find(fds.as_str()).map_err(err)?.ok_or_else(|| io::Error::other(format!("no dataset {fds}")))?;
+                    let (l, _) = seal_at(&mut *d, fb, flsn).map_err(err)?.ok_or_else(|| io::Error::other(format!("no Seal layer {name}")))?;
+                    Some(l)
+                }
+            };
+            d.export(to_layer, from_layer, &file.0).map_err(err)?;
+        }
+        // Opened, then the name removed: the stream lives as long as the
+        // reader, and nothing is left in the spool.
+        let f = std::fs::File::open(&file.0)?;
+        drop(file);
+        Ok(Box::new(io::BufReader::with_capacity(1 << 20, f)))
+    }
+}
+
+/// A file in the spool directory, removed when dropped.
+struct SpoolFile(PathBuf);
+
+impl SpoolFile {
+    /// A new, unused name in `dir` (created if missing); the file itself
+    /// is made by whoever writes it.
+    fn new(dir: &Path, kind: &str) -> io::Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::fs::create_dir_all(dir)?;
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        Ok(Self(dir.join(format!("{kind}-{}-{n}-{nanos}.blks", std::process::id()))))
+    }
+}
+
+impl Drop for SpoolFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -614,6 +864,19 @@ mod tests {
             }
             Ok(self.store.reset(branch)?)
         }
+        fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64, LayerError> {
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+            Ok(self.store.export(to, from, &mut f)?)
+        }
+        fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError> {
+            if self.devs.contains_key(&branch) {
+                return Err("attached".into());
+            }
+            Ok(self.store.import(branch, &mut std::fs::File::open(path)?)?)
+        }
+        fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError> {
+            Ok(self.store.names())
+        }
         fn flush(&mut self) -> Result<(), LayerError> {
             self.store.flush()?;
             Ok(())
@@ -669,7 +932,8 @@ mod tests {
     type TestPool = BlkPool<StoreBlkd, FakeMounts>;
 
     fn pool() -> TestPool {
-        BlkPool::with(StoreBlkd::new(), FakeMounts::default(), "/mnt/taso")
+        let spool = tempfile::tempdir().unwrap().keep();
+        BlkPool::with(StoreBlkd::new(), FakeMounts::default(), "/mnt/taso", spool)
     }
 
     fn ds(n: &str) -> Dataset {
@@ -793,11 +1057,11 @@ mod tests {
         p.create(&a).unwrap();
         p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
         p.layers(&a).snapshot(Lsn::new(4), h(4)).unwrap();
-        assert!(p.clone(&a, Lsn::new(2), h(9), &c).is_err(), "bound to another record");
-        assert!(p.clone(&a, Lsn::new(3), h(3), &c).is_err(), "no such layer");
+        assert!(Pool::clone(&p, &a, Lsn::new(2), h(9), &c).is_err(), "bound to another record");
+        assert!(Pool::clone(&p, &a, Lsn::new(3), h(3), &c).is_err(), "no such layer");
         assert_eq!(p.info(&c).unwrap(), None, "refusals make nothing");
         calls(&p);
-        let info = p.clone(&a, Lsn::new(2), h(2), &c).unwrap();
+        let info = Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
         assert_eq!(info.origin.as_deref(), Some(a.seal_snapshot(Lsn::new(2)).as_str()));
         assert_eq!(info.parent, Some(h(2)));
         assert_eq!(info.origin_seal(), Some((a.clone(), Lsn::new(2))));
@@ -808,7 +1072,7 @@ mod tests {
         p.layers(&c).snapshot(Lsn::new(3), h(33)).unwrap();
         assert_eq!(p.info(&c).unwrap().unwrap().origin_seal(), Some((a.clone(), Lsn::new(2))), "own Seals do not change the origin");
         assert_eq!(p.layers(&a).list().unwrap().len(), 2, "the source keeps its layers");
-        assert!(p.clone(&a, Lsn::new(2), h(2), &c).is_err(), "a target is made once");
+        assert!(Pool::clone(&p, &a, Lsn::new(2), h(2), &c).is_err(), "a target is made once");
     }
 
     #[test]
@@ -820,7 +1084,7 @@ mod tests {
         l.snapshot(Lsn::new(2), h(2)).unwrap();
         l.snapshot(Lsn::new(4), h(4)).unwrap();
         l.destroy(Lsn::new(9)).unwrap(); // absent: fine
-        p.clone(&a, Lsn::new(2), h(2), &c).unwrap();
+        Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
         assert!(l.destroy(Lsn::new(2)).is_err(), "the clone stands on it");
         assert_eq!(l.list().unwrap().len(), 2);
     }
@@ -840,12 +1104,105 @@ mod tests {
     }
 
     #[test]
-    fn rebirth_says_it_is_not_built() {
-        let p = pool();
+    fn guids_follow_the_binding_and_names_parse() {
+        assert_eq!(guid(Lsn::new(3), h(1)), guid(Lsn::new(3), h(1)));
+        assert_ne!(guid(Lsn::new(3), h(1)), guid(Lsn::new(4), h(1)));
+        assert_ne!(guid(Lsn::new(3), h(1)), guid(Lsn::new(3), h(2)));
         let a = ds("tank/v-a");
+        assert_eq!(parse_seal_name(&a.seal_snapshot(Lsn::new(7))), Some((a, Lsn::new(7))));
+        assert_eq!(parse_seal_name("tank/v-a@other-7"), None);
+        assert_eq!(parse_seal_name("tank/v-a"), None);
+    }
+
+    #[test]
+    fn snapshots_children_and_owner_uids() {
+        let mounts = tempfile::tempdir().unwrap();
+        let p = BlkPool::with(StoreBlkd::new(), FakeMounts::default(), mounts.path(), mounts.path().join("spool"));
+        let (a, c) = (ds("tank/vessels/v-a"), ds("tank/vessels/v-c"));
         p.create(&a).unwrap();
-        let e = p.receive(&a, None, (Lsn::new(2), h(2)), &mut io::empty()).unwrap_err();
-        assert!(e.to_string().contains("not built yet"));
+        p.create(&c).unwrap();
+        p.create(&ds("tank/other")).unwrap();
+        p.create(&ds("tank/vessels/v-a/deeper")).unwrap();
+        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        let snap = p.snapshot(&a, Lsn::new(2)).unwrap().unwrap();
+        assert_eq!((snap.name(), snap.guid, snap.seal_hash), (a.seal_snapshot(Lsn::new(2)), guid(Lsn::new(2), h(2)), Some(h(2))));
+        assert_eq!(p.snapshot(&a, Lsn::new(3)).unwrap(), None);
+        assert_eq!(p.snapshot(&ds("tank/none"), Lsn::new(2)).unwrap(), None);
+        assert_eq!(p.children(&ds("tank/vessels")).unwrap(), [a.clone(), c.clone()], "direct children only");
+        // owner_uids walks the mounted tree (here a plain directory).
+        let mp = p.mountpoint(&a);
+        std::fs::create_dir_all(mp.join("d")).unwrap();
+        std::fs::write(mp.join("d/f"), b"x").unwrap();
+        let me = std::fs::metadata(&mp).map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap();
+        assert_eq!(p.owner_uids(&a).unwrap().into_iter().collect::<Vec<_>>(), [me]);
+    }
+
+    /// A stream of `to`, from node `src` (incremental from `from`).
+    fn sent(src: &TestPool, d: &Dataset, from: Option<&str>, to: Lsn) -> Vec<u8> {
+        let mut out = Vec::new();
+        io::copy(&mut src.sender().send(d, from, to).unwrap(), &mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn seals_travel_between_nodes_by_send_and_receive() {
+        let (na, nb) = (pool(), pool());
+        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        na.create(&a).unwrap();
+        write0(&na, &a, 1);
+        na.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        write0(&na, &a, 2);
+        na.layers(&a).snapshot(Lsn::new(5), h(5)).unwrap();
+
+        // Full, then incremental, as rebirth does.
+        let g = nb.receive(&a, None, (Lsn::new(2), h(2)), &mut &sent(&na, &a, None, Lsn::new(2))[..]).unwrap();
+        assert_eq!(g, guid(Lsn::new(2), h(2)));
+        assert_eq!(block0(&nb, &a), 1);
+        let inc = sent(&na, &a, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(5));
+        nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut &inc[..]).unwrap();
+        assert_eq!(block0(&nb, &a), 2);
+        assert_eq!(nb.layers(&a).list().unwrap(), na.layers(&a).list().unwrap());
+        // Again: already there, bound: returns the guid, changes nothing.
+        assert_eq!(nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut io::empty()).unwrap(), guid(Lsn::new(5), h(5)));
+        assert!(nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(6)), &mut io::empty()).is_err(), "bound to another record");
+
+        // A clone of a's first Seal, received as a clone on the other node.
+        Pool::clone(&na, &a, Lsn::new(2), h(2), &c).unwrap();
+        write0(&na, &c, 9);
+        na.layers(&c).snapshot(Lsn::new(3), h(33)).unwrap();
+        let first = sent(&na, &c, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(3));
+        let base = CloneBase { dataset: a.clone(), seal: Lsn::new(2), hash: h(2), guid: guid(Lsn::new(2), h(2)) };
+        let wrong = CloneBase { guid: 1, ..base.clone() };
+        assert!(nb.receive_clone(&c, &wrong, (Lsn::new(3), h(33)), &mut &first[..]).is_err(), "base guid checked");
+        assert_eq!(nb.info(&c).unwrap(), None);
+        nb.receive_clone(&c, &base, (Lsn::new(3), h(33)), &mut &first[..]).unwrap();
+        assert_eq!(block0(&nb, &c), 9);
+        assert_eq!(nb.info(&c).unwrap().unwrap().origin_seal(), Some((a.clone(), Lsn::new(2))));
+        assert!(std::fs::read_dir(&nb.spool).unwrap().next().is_none(), "the spool is left empty");
+        assert!(std::fs::read_dir(&na.spool).unwrap().next().is_none(), "the spool is left empty");
+    }
+
+    #[test]
+    fn a_bad_stream_received_leaves_nothing() {
+        let (na, nb) = (pool(), pool());
+        let a = ds("tank/v-a");
+        na.create(&a).unwrap();
+        write0(&na, &a, 1);
+        na.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        write0(&na, &a, 2);
+        na.layers(&a).snapshot(Lsn::new(5), h(5)).unwrap();
+        let full = sent(&na, &a, None, Lsn::new(2));
+        assert!(nb.receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..full.len() - 1][..]).is_err());
+        assert_eq!(nb.info(&a).unwrap(), None, "no half-received dataset");
+        nb.receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..]).unwrap();
+        let inc = sent(&na, &a, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(5));
+        let mut bad = inc.clone();
+        bad[20] ^= 1;
+        assert!(nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut &bad[..]).is_err());
+        assert_eq!(nb.layers(&a).list().unwrap(), [(Lsn::new(2), h(2))], "no Seal from a bad stream");
+        assert_eq!(block0(&nb, &a), 1, "and none of its blocks");
+        nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut &inc[..]).unwrap();
+        assert_eq!(block0(&nb, &a), 2);
     }
 
     /// The bytes of block 0 of the dataset's branch, through the store.
@@ -946,5 +1303,58 @@ mod tests {
         write0(&host.pool, v.dataset(), 7);
         assert_eq!(v.rollback().unwrap(), Some(s1));
         assert_eq!(block0(&host.pool, v.dataset()), 0, "the write after the last Seal is gone");
+    }
+
+    #[test]
+    fn a_vessel_and_its_fork_are_reborn_on_another_block_log_node() {
+        use crate::pack::Packs;
+        use crate::ship::LocalStore;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("store")).unwrap();
+        let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
+        let node = |n: u64| Host {
+            coord: coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: tmp.path().join(format!("node-{n}")),
+            warden: WardenId::new(n),
+        };
+        let (a, b) = (node(1), node(2));
+        let packs = |h: &Host<TestPool>, id| Packs::new(LocalStore::new(tmp.path().join("store")), h.pool.sender(), "vessels", id).unwrap();
+        let ns = Namespace::from_bytes([3; 16]);
+
+        // Node A: a Vessel with two published Seals, and a fork of the first.
+        let (mut v, _) = a.ensure(ns, b"user").unwrap();
+        let pa = packs(&a, v.id());
+        let birth = v.seal_birth().unwrap().seal;
+        v.publish_seal(&pa, &a.pool.snapshot(v.dataset(), birth.lsn).unwrap().unwrap(), None).unwrap();
+        write0(&a.pool, v.dataset(), 1);
+        let s1 = seal(&mut v, 1);
+        v.publish_seal(&pa, &a.pool.snapshot(v.dataset(), s1.lsn).unwrap().unwrap(), None).unwrap();
+        write0(&a.pool, v.dataset(), 2);
+        let s2 = seal(&mut v, 2);
+        v.publish_seal(&pa, &a.pool.snapshot(v.dataset(), s2.lsn).unwrap().unwrap(), None).unwrap();
+
+        let mut child = a.fork(&v, s1, b"child").unwrap();
+        let pc = packs(&a, child.id());
+        let cb = child.seal_birth().unwrap().seal;
+        let origin = a.pool.snapshot(v.dataset(), s1.lsn).unwrap().unwrap();
+        child.publish_seal(&pc, &a.pool.snapshot(child.dataset(), cb.lsn).unwrap().unwrap(), Some(&origin)).unwrap();
+        write0(&a.pool, child.dataset(), 7);
+        let c1 = seal(&mut child, 1);
+        child.publish_seal(&pc, &a.pool.snapshot(child.dataset(), c1.lsn).unwrap().unwrap(), None).unwrap();
+
+        // Node B: rebirth from the packs alone.
+        let (w, r) = b.rebirth(v.id(), &packs(&b, v.id())).unwrap();
+        assert_eq!(r.received, vec![birth.lsn, s1.lsn, s2.lsn]);
+        assert_eq!(w.last_seal(), Some(s2));
+        assert_eq!(block0(&b.pool, w.dataset()), 2, "the state of the last Seal");
+        assert_eq!(b.pool.layers(w.dataset()).list().unwrap(), a.pool.layers(v.dataset()).list().unwrap());
+
+        let (wc, rc) = b.rebirth(child.id(), &packs(&b, child.id())).unwrap();
+        assert_eq!(rc.received, vec![cb.lsn, c1.lsn]);
+        assert_eq!(block0(&b.pool, wc.dataset()), 7);
+        let info = b.pool.info(wc.dataset()).unwrap().unwrap();
+        assert_eq!((info.origin_seal(), info.parent), (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash)));
     }
 }

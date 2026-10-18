@@ -62,7 +62,7 @@ fn vessels_on_real_devices() {
     let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     let host = Host {
         coord: Arc::new(Coordinator::open(state.path().join("coord.redb")).unwrap()),
-        pool: BlkPool::new(&socket, &mounts),
+        pool: BlkPool::new(&socket, &mounts, state.path().join("spool")),
         root: Dataset::new(&format!("blk/run-{run}")).unwrap(),
         state_dir: state.path().join("state"),
         warden: WardenId::new(1),
