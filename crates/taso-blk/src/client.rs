@@ -167,6 +167,36 @@ impl Client {
         self.call_empty(&["reset", &branch.to_string()])
     }
 
+    /// Write Seal `to` as a stream into the new file `path` (absolute;
+    /// must not exist), incremental from the Seal `from` below it, or full.
+    /// Returns the blocks written.
+    pub fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64> {
+        let (t, f) = (to.to_string(), from.map_or_else(|| "-".to_string(), |f| f.to_string()));
+        let p = path_arg(path)?;
+        let a = self.call(&["export", &t, &f, &p])?;
+        a.parse().map_err(|_| ClientError::Protocol(format!("export answered {a:?}")))
+    }
+
+    /// Apply the stream in the file `path` to a detached `branch` with no
+    /// blocks of its own; nothing is kept if the stream is bad.  Returns the
+    /// blocks applied.  Durable at the next [`Client::flush`] (or Seal).
+    pub fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64> {
+        let p = path_arg(path)?;
+        let a = self.call(&["import", &branch.to_string(), &p])?;
+        a.parse().map_err(|_| ClientError::Protocol(format!("import answered {a:?}")))
+    }
+
+    /// Every named branch, in name order.
+    pub fn names(&mut self) -> Result<Vec<(String, LayerId)>> {
+        let a = self.call(&["names"])?;
+        a.split_whitespace()
+            .map(|item| {
+                let (n, l) = item.rsplit_once(':').ok_or_else(|| ClientError::Protocol(format!("names answered {a:?}")))?;
+                Ok((n.to_string(), layer(l)?))
+            })
+            .collect()
+    }
+
     /// Freeze `branch` as a Seal carrying `tag` (at most 64 bytes).  A
     /// mounted ext4 must be made consistent first (frozen or unmounted).
     /// Durable when it returns.
@@ -300,6 +330,15 @@ impl Client {
         } else {
             Err(ClientError::Protocol(format!("{} answered {a:?}", words[0])))
         }
+    }
+}
+
+/// A path as one protocol word: absolute and UTF-8 (other checks are
+/// those of every argument).
+fn path_arg(p: &Path) -> Result<String> {
+    match p.to_str() {
+        Some(s) if p.is_absolute() => Ok(s.to_string()),
+        _ => Err(ClientError::BadArgument(p.display().to_string())),
     }
 }
 

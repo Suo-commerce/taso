@@ -70,6 +70,28 @@ fn the_client_and_the_daemon_agree() {
     let i = c.info(a).unwrap();
     assert_eq!((i.kind, i.parent, i.name.as_deref(), i.tag), (LayerKind::Branch, Some(s2), Some("tank/taso/a"), None));
 
+    // Export a Seal, import it into a fresh branch, seal: the same image,
+    // so exporting the copy gives the same bytes.
+    let (f1, f2) = (dir.path().join("s2.blks"), dir.path().join("copy.blks"));
+    let n = c.export(s2, None, &f1).unwrap();
+    assert!(matches!(c.export(s2, None, &f1), Err(ClientError::Daemon(_))), "never over an existing file");
+    assert!(matches!(c.export(s2, None, Path::new("relative.blks")), Err(ClientError::BadArgument(_))));
+    let copy = c.branch(root, Some("tank/taso/copy")).unwrap();
+    assert_eq!(c.import(copy, &f1).unwrap(), n);
+    let cs = c.seal(copy, b"").unwrap();
+    c.export(cs, None, &f2).unwrap();
+    assert_eq!(std::fs::read(&f1).unwrap(), std::fs::read(&f2).unwrap());
+    let empty = c.export(s2, Some(s2), &dir.path().join("empty.blks")).unwrap();
+    assert_eq!(empty, 0, "nothing between a Seal and itself");
+    assert_eq!(
+        c.names().unwrap(),
+        vec![("tank/taso/a".to_string(), a), ("tank/taso/copy".to_string(), copy)]
+    );
+    std::fs::write(dir.path().join("junk.blks"), b"junk").unwrap();
+    let j = c.branch(root, Some("tank/taso/j")).unwrap();
+    assert!(matches!(c.import(j, &dir.path().join("junk.blks")), Err(ClientError::Daemon(e)) if e.contains("bad import stream")));
+    c.drop_layer(j).unwrap();
+
     c.reset(a).unwrap(); // detached: allowed
     assert_eq!(c.info(a).unwrap().parent, Some(s2), "a reset branch keeps its place");
     assert_eq!(c.seals(a).unwrap().len(), 2, "and its Seals");

@@ -1,10 +1,11 @@
 //! `BlkPool` on real devices: the Warden's Vessels on `taso-blkd`, ublk,
-//! ext4 and real mounts (birth, Seal, forks, reopen, rollback).  Needs root, ublk and a running daemon, so it is
-//! ignored by default; `scripts/blk-warden-test.sh` starts a daemon on a
-//! fresh log and runs it:
+//! ext4 and real mounts (birth, Seal, forks, reopen, rollback), and
+//! rebirth on a second node from shipped packs.  Needs root, ublk and two
+//! running daemons (node A and node B), so it is ignored by default;
+//! `scripts/blk-warden-test.sh` starts them on fresh logs and runs it:
 //!
 //! ```text
-//! TASO_BLK_SOCKET=/run/x.sock TASO_BLK_MOUNTS=/mnt/blk-warden \
+//! TASO_BLK_SOCKET=/run/a.sock TASO_BLK_SOCKET_B=/run/b.sock TASO_BLK_MOUNTS=/mnt/blk-warden \
 //!   cargo test -p taso-warden --test blk_device -- --ignored --test-threads=1
 //! ```
 //!
@@ -18,6 +19,8 @@ use taso_core::envelope::Lsn;
 use taso_core::model::WardenId;
 use taso_core::record::{Namespace, StreamCut, TurnId, Verdict};
 use taso_warden::blk::BlkPool;
+use taso_warden::pack::Packs;
+use taso_warden::ship::LocalStore;
 use taso_warden::chronicle::Layers;
 use taso_warden::coordinator::Coordinator;
 use taso_warden::vessel::{Host, Pool};
@@ -62,7 +65,7 @@ fn vessels_on_real_devices() {
     let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
     let host = Host {
         coord: Arc::new(Coordinator::open(state.path().join("coord.redb")).unwrap()),
-        pool: BlkPool::new(&socket, &mounts),
+        pool: BlkPool::new(&socket, &mounts, state.path().join("spool")),
         root: Dataset::new(&format!("blk/run-{run}")).unwrap(),
         state_dir: state.path().join("state"),
         warden: WardenId::new(1),
@@ -115,4 +118,73 @@ fn vessels_on_real_devices() {
     assert_eq!(std::fs::read(mp.join("note")).unwrap(), b"sealed");
     assert!(!mp.join("later").exists());
     assert_eq!(host.pool.layers(v.dataset()).list().unwrap(), [(birth.lsn, birth.hash), (s1.lsn, s1.hash)]);
+}
+
+#[test]
+#[ignore = "needs root, ublk and two running taso-blkd; run scripts/blk-warden-test.sh"]
+fn rebirth_on_a_second_node_from_shipped_packs() {
+    let (socket_a, mounts) = setup();
+    let socket_b = std::env::var_os("TASO_BLK_SOCKET_B").map(PathBuf::from).expect("TASO_BLK_SOCKET_B is not set");
+    let _unmount = Unmount(mounts.clone());
+    let state = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(state.path().join("store")).unwrap();
+    let run = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let coord = Arc::new(Coordinator::open(state.path().join("coord.redb")).unwrap());
+    let node = |n: u64, socket: &Path| Host {
+        coord: coord.clone(),
+        pool: BlkPool::new(socket, mounts.join(format!("node-{n}")), state.path().join(format!("spool-{n}"))),
+        root: Dataset::new(&format!("blk/reb-{run}")).unwrap(),
+        state_dir: state.path().join(format!("state-{n}")),
+        warden: WardenId::new(n),
+    };
+    let (a, b) = (node(1, &socket_a), node(2, &socket_b));
+    let packs = |h: &Host<BlkPool>, id| Packs::new(LocalStore::new(state.path().join("store")), h.pool.sender(), "vessels", id).unwrap();
+    let publish = |h: &Host<BlkPool>, v: &mut taso_warden::vessel::Vessel<taso_warden::blk::BlkLayers>, at: Lsn, origin: Option<&taso_warden::zfs::Snapshot>| {
+        let snap = h.pool.snapshot(v.dataset(), at).unwrap().unwrap();
+        v.publish_seal(&packs(h, v.id()), &snap, origin).unwrap();
+    };
+    let ns = Namespace::from_bytes([9; 16]);
+
+    // Node A: a Vessel writes, seals and ships; then writes what it never ships.
+    let (mut v, _) = a.ensure(ns, b"user-1").unwrap();
+    let mp = a.pool.info(v.dataset()).unwrap().unwrap().mountpoint.unwrap();
+    let birth = v.seal_birth().unwrap().seal;
+    publish(&a, &mut v, birth.lsn, None);
+    std::fs::write(mp.join("note"), b"first").unwrap();
+    let s1 = seal(&mut v, 1);
+    publish(&a, &mut v, s1.lsn, None);
+    std::fs::write(mp.join("note"), b"second").unwrap();
+    std::fs::create_dir_all(mp.join("dir/deeper")).unwrap();
+    std::fs::write(mp.join("dir/deeper/big"), vec![7u8; 3 << 20]).unwrap();
+    let s2 = seal(&mut v, 2);
+    publish(&a, &mut v, s2.lsn, None);
+    std::fs::write(mp.join("unshipped"), b"lost with node A").unwrap();
+
+    // A fork of s1 on node A, shipped incrementally from its parent Seal.
+    let mut child = a.fork(&v, s1, b"child-1").unwrap();
+    let cmp = a.pool.info(child.dataset()).unwrap().unwrap().mountpoint.unwrap();
+    let cb = child.seal_birth().unwrap().seal;
+    let origin = a.pool.snapshot(v.dataset(), s1.lsn).unwrap().unwrap();
+    publish(&a, &mut child, cb.lsn, Some(&origin));
+    std::fs::write(cmp.join("child-note"), b"from the fork").unwrap();
+    let c1 = seal(&mut child, 1);
+    publish(&a, &mut child, c1.lsn, None);
+
+    // Node B: reborn from the packs alone, then mounted.
+    let (w, r) = b.rebirth(v.id(), &packs(&b, v.id())).unwrap();
+    assert_eq!(r.received, vec![birth.lsn, s1.lsn, s2.lsn]);
+    b.pool.ensure_mounted(w.dataset()).unwrap();
+    let wmp = b.pool.info(w.dataset()).unwrap().unwrap().mountpoint.unwrap();
+    assert_eq!(std::fs::read(wmp.join("note")).unwrap(), b"second", "the state of the last shipped Seal");
+    assert_eq!(std::fs::read(wmp.join("dir/deeper/big")).unwrap(), vec![7u8; 3 << 20]);
+    assert!(!wmp.join("unshipped").exists(), "nothing after the last shipped Seal");
+
+    let (wc, _) = b.rebirth(child.id(), &packs(&b, child.id())).unwrap();
+    b.pool.ensure_mounted(wc.dataset()).unwrap();
+    let wcmp = b.pool.info(wc.dataset()).unwrap().unwrap().mountpoint.unwrap();
+    assert_eq!(std::fs::read(wcmp.join("note")).unwrap(), b"first", "the fork stands on s1");
+    assert_eq!(std::fs::read(wcmp.join("child-note")).unwrap(), b"from the fork");
+    assert!(!wcmp.join("dir").exists(), "nothing of the parent after s1");
+    let info = b.pool.info(wc.dataset()).unwrap().unwrap();
+    assert_eq!((info.origin_seal(), info.parent), (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash)));
 }

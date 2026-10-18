@@ -106,7 +106,8 @@ use taso_core::envelope::ChronicleId;
 use taso_core::record::{vessel_id, Namespace, Verdict};
 use taso_field::adapter::Registry;
 
-use crate::chronicle::{Recovery, ZfsLayers};
+use crate::chronicle::{LayerError, Recovery};
+use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
 use crate::coordinator::{Coord, CoordError};
 use taso_core::model::WardenId;
 use crate::effects::Effects;
@@ -117,10 +118,10 @@ use crate::rebirth::Reborn;
 use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, RuncRunner, Swept, VesselSpec, ID_RANGE};
 use crate::segment::Position;
 use crate::s3::{S3Config, S3Store};
-use crate::ship::{LocalStore, SharedStore, ZfsSend};
+use crate::ship::{LocalStore, SharedStore};
 use crate::chronicle::Layers;
-use crate::vessel::{Ensured, Host, Vessel, VesselError};
-use crate::zfs::{Cli, Dataset, Runner, Snapshot, Zfs, ZfsError};
+use crate::vessel::{Ensured, Host, Vessel, VesselError, Pool};
+use crate::zfs::{Dataset, Snapshot};
 use crate::source::Held;
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -469,8 +470,11 @@ pub struct Config {
     pub root: Dataset,
     /// Parent of every Vessel's Warden state (outside `root`).
     pub state_dir: PathBuf,
-    /// Batch Seal snapshots ([`crate::snapbatch`]).
+    /// Batch Seal snapshots ([`crate::snapbatch`]; ZFS only).
     pub batched_snapshots: bool,
+    /// Where the Vessels live: `"zfs"` (the default) or
+    /// `{"blk": {"socket": ..., "mounts": ..., "spool": ...}}`.
+    pub storage: StorageConf,
     /// Where packs are kept: a directory (`"store": "/path"`) or Garage
     /// (`"store": {"s3": {...}}`).
     pub store: StoreConf,
@@ -487,6 +491,56 @@ pub struct Config {
     pub source: SourceConf,
     /// The Vessels to run (a static source; empty for any other).
     pub vessels: Vec<VesselConf>,
+}
+
+/// Where a node's Vessels live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageConf {
+    /// ZFS datasets under `root`.
+    Zfs,
+    /// The block log served by `taso-blkd`.
+    Blk {
+        /// The daemon's control socket.
+        socket: PathBuf,
+        /// Datasets are mounted under it (`<mounts>/<dataset>`).
+        mounts: PathBuf,
+        /// Where shipped streams pass through files (shared with the
+        /// daemon, on this host).
+        spool: PathBuf,
+    },
+}
+
+impl StorageConf {
+    /// The storage this configuration names (`batched`: ZFS Seal batching).
+    pub fn open(&self, batched: bool) -> crate::storage::Storage {
+        match self {
+            Self::Zfs => {
+                let z = crate::zfs::Zfs::cli();
+                crate::storage::Storage::Zfs(if batched { z.batched() } else { z })
+            }
+            Self::Blk { socket, mounts, spool } => {
+                crate::storage::Storage::Blk(crate::blk::BlkPool::new(socket, mounts, spool))
+            }
+        }
+    }
+}
+
+fn storage_conf(v: &Value) -> Result<StorageConf, ConfigError> {
+    match v.get("storage") {
+        None => Ok(StorageConf::Zfs),
+        Some(Value::String(s)) if s == "zfs" => Ok(StorageConf::Zfs),
+        Some(o @ Value::Object(m)) if m.contains_key("blk") => {
+            only_keys(o, "storage", &["blk"])?;
+            let b = &m["blk"];
+            only_keys(b, "storage.blk", &["socket", "mounts", "spool"])?;
+            let mounts = abs_path(b, "mounts")?;
+            if mounts == Path::new("/") {
+                return Err(bad("\"storage.blk.mounts\" must not be /"));
+            }
+            Ok(StorageConf::Blk { socket: abs_path(b, "socket")?, mounts, spool: abs_path(b, "spool")? })
+        }
+        Some(_) => Err(bad("\"storage\" must be \"zfs\" or {\"blk\": {\"socket\", \"mounts\", \"spool\"}}")),
+    }
 }
 
 /// A bad configuration: where and why.
@@ -761,6 +815,7 @@ impl Config {
             root,
             state_dir: abs_path(&v, "state_dir")?,
             batched_snapshots: bool_or(&v, "batched_snapshots", true)?,
+            storage: storage_conf(&v)?,
             store: match field(&v, "store")? {
                 Value::String(_) => StoreConf::Local(abs_path(&v, "store")?),
                 Value::Object(o) if o.contains_key("s3") => {
@@ -884,11 +939,11 @@ fn id_hex(id: ChronicleId) -> String {
 
 // ── Publishing Seals ────────────────────────────────────────────────
 
-/// Publishes each Seal as it is taken: finds its snapshot (one `zfs get`,
-/// never the whole list) and runs [`Vessel::publish_seal`].
+/// Publishes each Seal as it is taken: finds its layer (one lookup, never
+/// the whole list) and runs [`Vessel::publish_seal`].
 pub struct SealPublisher {
-    zfs: Zfs<Cli>,
-    packs: Packs<SharedStore, ZfsSend>,
+    storage: Storage,
+    packs: Packs<SharedStore, StorageSend>,
     /// The parent's Seal snapshot, for a Vessel forked from one whose
     /// first `fs` section is not shipped yet: that section is incremental
     /// from it.  Cleared once a section is shipped (later Seals are
@@ -912,10 +967,10 @@ impl SealPublisher {
     /// Publish `seal` of `vessel`.  `Ok(true)` if this call shipped it,
     /// `Ok(false)` if an earlier one had (a retry: only the log and the
     /// anchor were brought up to date).
-    pub fn publish(&mut self, vessel: &mut Vessel<ZfsLayers<Cli>>, seal: Position) -> Result<bool, String> {
+    pub fn publish(&mut self, vessel: &mut Vessel<StorageLayers>, seal: Position) -> Result<bool, String> {
         let snap = self
-            .zfs
-            .get(vessel.dataset(), seal.lsn)
+            .storage
+            .snapshot(vessel.dataset(), seal.lsn)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Seal {} has no snapshot", seal.lsn.get()))?;
         let published = vessel.publish_seal(&self.packs, &snap, self.origin.as_ref()).map_err(|e| e.to_string())?;
@@ -924,8 +979,8 @@ impl SealPublisher {
     }
 }
 
-impl AfterSeal<ZfsLayers<Cli>> for SealPublisher {
-    fn after_seal(&mut self, vessel: &mut Vessel<ZfsLayers<Cli>>, seal: Position) -> Result<(), String> {
+impl AfterSeal<StorageLayers> for SealPublisher {
+    fn after_seal(&mut self, vessel: &mut Vessel<StorageLayers>, seal: Position) -> Result<(), String> {
         self.publish(vessel, seal)?;
         self.published += 1;
         // What is shipped need not stay on local disk.  A failed prune
@@ -942,7 +997,7 @@ impl AfterSeal<ZfsLayers<Cli>> for SealPublisher {
 }
 
 /// Whether the log already names a shipped `fs` section.
-fn has_fs_shipped(vessel: &Vessel<ZfsLayers<Cli>>) -> Result<bool, DaemonError> {
+fn has_fs_shipped(vessel: &Vessel<StorageLayers>) -> Result<bool, DaemonError> {
     let frames = vessel.chronicle().frames().map_err(|e| DaemonError::Io(format!("reading the log: {e}")))?;
     let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, e)| DaemonError::Io(format!("reading the log at lsn {}: {e}", lsn.get())))?;
     Ok(summary.fs_shipped.is_some())
@@ -1100,22 +1155,23 @@ pub fn sweep_stale<R: RuncRunner>(runc: &Runc<R>) -> io::Result<Swept> {
 
 /// What the node's pool holds of each Vessel under `root`, for
 /// [`crate::source::Guard::seeded`]: for every `v-<id>` dataset, the uid
-/// slots whose ranges own files in it (`zfs userspace`, mounted or not).
+/// slots whose ranges own files in it (`zfs userspace`, mounted or not;
+/// on the block log, a walk of the mounted file system).
 /// Root (uid 0) owns a fresh dataset's top directory and counts for no
 /// slot.  Also returns warnings: datasets that are not a Vessel's, and uids
 /// in no slot's range (they count for none).  Any failure to read the pool
 /// is an error: without it, a slot could be given to a second Vessel.
-pub fn held_on<R: Runner>(zfs: &Zfs<R>, root: &Dataset, host_uid_base: u32) -> Result<(Vec<Held>, Vec<String>), ZfsError> {
+pub fn held_on<H: Holdings>(pool: &H, root: &Dataset, host_uid_base: u32) -> Result<(Vec<Held>, Vec<String>), LayerError> {
     let mut held = Vec::new();
     let mut warnings = Vec::new();
-    for ds in zfs.children(root)? {
+    for ds in pool.children(root)? {
         let name = ds.as_str().rsplit('/').next().unwrap_or_default();
         let Some(key) = name.strip_prefix("v-").and_then(key_of_hex) else {
             warnings.push(format!("{ds} is not a Vessel dataset (v-<id>): ignored"));
             continue;
         };
         let mut slots = std::collections::BTreeSet::new();
-        for uid in zfs.owner_uids(&ds)? {
+        for uid in pool.owner_uids(&ds)? {
             if uid == 0 {
                 continue;
             }
@@ -1149,8 +1205,9 @@ pub struct Node {
     pub config: Config,
     /// The coordinator.
     pub coord: Arc<dyn Coord>,
-    /// The ZFS driver (batched or not; clones share the batch).
-    pub zfs: Zfs<Cli>,
+    /// Where the Vessels live: ZFS (batched or not; clones share the
+    /// batch) or the block log.
+    pub storage: Storage,
     /// The store (opened from `config.store`).
     pub store: SharedStore,
     /// The run directory, held for the node's lifetime.
@@ -1163,7 +1220,7 @@ impl Node {
     /// A node: claims the run directory, sweeps containers a dead
     /// incarnation left in its runc root (see "Starting" in the module
     /// docs), then opens the store.  Each error says which step failed.
-    pub fn new(config: Config, coord: Arc<dyn Coord>, zfs: Zfs<Cli>) -> std::io::Result<Self> {
+    pub fn new(config: Config, coord: Arc<dyn Coord>, storage: Storage) -> std::io::Result<Self> {
         let ctx = |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
         let run_lock = claim_run_dir(&config.run_dir).map_err(ctx("claiming the run directory"))?;
         let swept = sweep_stale(&Runc::new(RuncCli::new(config.run_dir.join("runc"))))
@@ -1172,13 +1229,13 @@ impl Node {
             eprintln!("taso-wardend[{}]: deleted stale container {id}", config.warden.get());
         }
         // After the sweep: nothing writes into a dataset now.
-        let (held, warnings) = held_on(&zfs, &config.root, config.runtime.host_uid_base)
+        let (held, warnings) = held_on(&storage, &config.root, config.runtime.host_uid_base)
             .map_err(|e| io::Error::other(format!("reading the uid slots of the pool's Vessels: {e}")))?;
         for w in &warnings {
             eprintln!("taso-wardend[{}]: {w}", config.warden.get());
         }
         let store = config.store.open().map_err(ctx("opening the store"))?;
-        Ok(Self { config, coord, zfs, store, run_lock, held })
+        Ok(Self { config, coord, storage, store, run_lock, held })
     }
 
     /// What the pool held of each Vessel when the node started: the seed of
@@ -1192,18 +1249,18 @@ impl Node {
         self.run_lock.path()
     }
 
-    fn host(&self) -> Host<Zfs<Cli>> {
+    fn host(&self) -> Host<Storage> {
         Host {
             coord: self.coord.clone(),
-            pool: Clone::clone(&self.zfs),
+            pool: Clone::clone(&self.storage),
             root: self.config.root.clone(),
             state_dir: self.config.state_dir.clone(),
             warden: self.config.warden,
         }
     }
 
-    fn packs(&self, id: ChronicleId) -> Result<Packs<SharedStore, ZfsSend>, DaemonError> {
-        Packs::new(self.store.clone(), ZfsSend::default(), &self.config.prefix, id).map_err(io("packs"))
+    fn packs(&self, id: ChronicleId) -> Result<Packs<SharedStore, StorageSend>, DaemonError> {
+        Packs::new(self.store.clone(), self.storage.sender(), &self.config.prefix, id).map_err(io("packs"))
     }
 
     fn log(&self, vc: &VesselConf, msg: impl fmt::Display) {
@@ -1211,7 +1268,7 @@ impl Node {
     }
 
     /// Find, open or rebirth the Vessel (step 1).
-    fn start(&self, vc: &VesselConf) -> Result<(Vessel<ZfsLayers<Cli>>, Start, Verdict), DaemonError> {
+    fn start(&self, vc: &VesselConf) -> Result<(Vessel<StorageLayers>, Start, Verdict), DaemonError> {
         let host = self.host();
         let id = vc.id();
         let known = match self.coord.ownership(id) {
@@ -1247,14 +1304,14 @@ impl Node {
 
     /// The parent's Seal snapshot, for a forked Vessel with no `fs`
     /// section shipped yet.
-    fn origin(&self, vessel: &Vessel<ZfsLayers<Cli>>) -> Result<Option<Snapshot>, DaemonError> {
+    fn origin(&self, vessel: &Vessel<StorageLayers>) -> Result<Option<Snapshot>, DaemonError> {
         if has_fs_shipped(vessel)? {
             return Ok(None);
         }
-        let info = self.zfs.dataset_info(vessel.dataset()).map_err(|e| DaemonError::Io(e.to_string()))?;
+        let info = Pool::info(&self.storage, vessel.dataset()).map_err(|e| DaemonError::Io(e.to_string()))?;
         match info.and_then(|i| i.origin_seal()) {
             None => Ok(None),
-            Some((ds, lsn)) => self.zfs.get(&ds, lsn).map_err(|e| DaemonError::Io(e.to_string())),
+            Some((ds, lsn)) => self.storage.snapshot(&ds, lsn).map_err(|e| DaemonError::Io(e.to_string())),
         }
     }
 
@@ -1292,7 +1349,7 @@ impl Node {
             );
         }
         let mut publisher =
-            SealPublisher { zfs: Clone::clone(&self.zfs), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0, pruned: 0, prune_failures: 0, prune_error: None };
+            SealPublisher { storage: Clone::clone(&self.storage), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0, pruned: 0, prune_failures: 0, prune_error: None };
         // A crash between taking a Seal and publishing it, or the birth
         // Seal just taken: publish now.  Counted only if this shipped it (a
         // Seal published before the restart is not published again).
@@ -1308,10 +1365,8 @@ impl Node {
         self.log(vc, format_args!("effects reconciled: {reconciled:?}"));
 
         // A reborn dataset was received unmounted.
-        self.zfs.ensure_mounted(vessel.dataset()).map_err(|e| DaemonError::Io(format!("mount: {e}")))?;
-        let mount = self
-            .zfs
-            .dataset_info(vessel.dataset())
+        self.storage.ensure_mounted(vessel.dataset()).map_err(|e| DaemonError::Io(format!("mount: {e}")))?;
+        let mount = Pool::info(&self.storage, vessel.dataset())
             .map_err(|e| DaemonError::Io(e.to_string()))?
             .and_then(|i| i.mountpoint)
             .ok_or_else(|| DaemonError::Io(format!("{} is not mounted", vessel.dataset())))?;
@@ -1433,6 +1488,7 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zfs::{Runner, Zfs, ZfsError};
 
     // ── Settling the state ──────────────────────────────────────────
 
@@ -1550,7 +1606,7 @@ mod tests {
         let config = Config::parse(&v.to_string()).unwrap();
         let coord: Arc<dyn Coord> = Arc::new(crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap());
         let _held = claim_run_dir(&run).unwrap();
-        let e = Node::new(config, coord, Zfs::cli()).err().expect("a held run directory is refused");
+        let e = Node::new(config, coord, Storage::Zfs(Zfs::cli())).err().expect("a held run directory is refused");
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
         assert!(e.to_string().starts_with("claiming the run directory: "), "{e}");
         // Refused before the sweep (no runc root) and before the store.
@@ -1616,6 +1672,31 @@ mod tests {
     }"#;
 
     #[test]
+    fn storage_is_zfs_or_the_block_log() {
+        let with = |storage: Value| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            v["storage"] = storage;
+            Config::parse(&v.to_string())
+        };
+        assert_eq!(with(serde_json::json!("zfs")).unwrap().storage, StorageConf::Zfs);
+        let blk = serde_json::json!({"blk": {"socket": "/run/taso-blk.sock", "mounts": "/srv/taso", "spool": "/var/lib/taso-blk/spool"}});
+        assert_eq!(
+            with(blk).unwrap().storage,
+            StorageConf::Blk { socket: "/run/taso-blk.sock".into(), mounts: "/srv/taso".into(), spool: "/var/lib/taso-blk/spool".into() }
+        );
+        for bad in [
+            serde_json::json!("btrfs"),
+            serde_json::json!({"blk": {"socket": "/s", "mounts": "/", "spool": "/p"}}),
+            serde_json::json!({"blk": {"socket": "s", "mounts": "/m", "spool": "/p"}}),
+            serde_json::json!({"blk": {"socket": "/s", "mounts": "/m"}}),
+            serde_json::json!({"blk": {"socket": "/s", "mounts": "/m", "spool": "/p", "extra": 1}}),
+            serde_json::json!({"blk": {}, "zfs": {}}),
+        ] {
+            assert!(with(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_good_config_parses() {
         let c = Config::parse(GOOD).unwrap();
         assert_eq!(c.warden, WardenId::new(1));
@@ -1624,6 +1705,7 @@ mod tests {
             CoordConf::Local { path: "/var/lib/taso/coord.redb".into(), serve: Some("/run/taso/coord.sock".into()) }
         );
         assert!(c.batched_snapshots, "batched by default");
+        assert_eq!(c.storage, StorageConf::Zfs, "ZFS by default");
         assert_eq!(c.prefix, "vessels");
         assert_eq!(c.runtime.landlock_shim.as_deref(), Some("/usr/lib/taso/landlock"));
         assert_eq!((c.runtime.memory_bytes, c.runtime.pids), (Some(256 << 20), Some(64)));
