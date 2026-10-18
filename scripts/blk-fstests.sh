@@ -36,9 +36,14 @@
 #   /var/lib/taso-blk/xfstests   (xfstests v2026.05.17, built in place)
 #   users fsgqa (with home), fsgqa2, 123456-fsgqa and group fsgqa, if missing
 #   GNU coreutils in place of uutils, if the system has uutils (Ubuntu 25.10
-#   and later): apt package coreutils-from-gnu, and the pin
+#   and later): the compiler packages build-essential pulls in (gcc g++ make
+#   libc6-dev dpkg-dev, those installed) marked manually installed, so no
+#   autoremove takes them; then apt installs coreutils-from-gnu and removes
+#   coreutils-from-uutils and build-essential (only a bundle; 26.04 makes it
+#   depend on uutils), allowed with --allow-remove-essential; then the pin
 #   /etc/apt/preferences.d/taso-gnu-coreutils so upgrades keep it.  Refused
-#   (nothing changed) if apt would remove anything but coreutils-from-uutils.
+#   (nothing changed) if apt would remove anything else.  Checked after:
+#   ls reports GNU coreutils, and gcc still compiles.
 # run touches, and nothing else:
 #   /var/lib/taso-blk/fst.log, fst.err, fst.log.ckpt   (removed at start)
 #   /var/lib/taso-blk/fst-loop-test.img, fst-loop-scratch.img (removed at end)
@@ -115,13 +120,21 @@ if [[ "$mode" == setup ]]; then
 
     if ! gnu_coreutils; then
         say "GNU coreutils in place of $(coreutils_version)"
-        removes=$(apt-get install -s coreutils-from-gnu | sed -n 's/^Remv \([^ ]*\).*/\1/p' | grep -vx coreutils-from-uutils || true)
-        [[ -z "$removes" ]] || die "installing coreutils-from-gnu would also remove: $removes (nothing changed; decide by hand)"
-        apt-get install -y -q coreutils-from-gnu
+        swap=(coreutils-from-gnu coreutils-from-uutils-)
+        removes=$(apt-get install -s "${swap[@]}" | sed -n 's/^Remv \([^ ]*\).*/\1/p' \
+            | grep -vx -e coreutils-from-uutils -e build-essential || true)
+        [[ -z "$removes" ]] || die "the coreutils swap would also remove: $removes (nothing changed; decide by hand)"
+        keep=()
+        for p in gcc g++ make libc6-dev dpkg-dev; do
+            dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' && keep+=("$p")
+        done
+        [[ ${#keep[@]} -eq 0 ]] || apt-mark manual "${keep[@]}"
+        apt-get install -y -q --allow-remove-essential "${swap[@]}"
         printf 'Package: coreutils-from-uutils\nPin: release a=*\nPin-Priority: -10\n' >/etc/apt/preferences.d/taso-gnu-coreutils
         hash -r
         gnu_coreutils || die "coreutils-from-gnu installed, but ls still reports: $(coreutils_version)"
-        echo "now: $(coreutils_version)"
+        echo 'int main(void) { return 0; }' | gcc -x c - -o /dev/null || die "gcc no longer compiles after the coreutils swap"
+        echo "now: $(coreutils_version); gcc compiles; kept as manually installed: ${keep[*]}"
     fi
 
     if [[ ! -d "$XFS/.git" ]]; then
@@ -296,6 +309,13 @@ EOF
     rm -f "$RES/.check-pid"
     unmount_all
     grep -E '^(Ran|Not run|Failures|Passed all)' "$out" | sed "s/^/  $name: /" | tee -a "$RES/summary.txt" || true
+    local ran notrun failed
+    ran=$({ grep '^Ran:' "$out" || true; } | tail -n 1 | wc -w)
+    notrun=$({ grep '^Not run:' "$out" || true; } | tail -n 1 | wc -w)
+    failed=$({ grep '^Failures:' "$out" || true; } | tail -n 1 | wc -w)
+    # Each count includes its label's words ("Ran:", "Not run:", "Failures:").
+    ran=$(( ran > 0 ? ran - 1 : 0 )); notrun=$(( notrun > 1 ? notrun - 2 : 0 )); failed=$(( failed > 0 ? failed - 1 : 0 ))
+    echo "  $name: $((ran - notrun - failed)) passed, $failed failed, $notrun not run (of $ran)" | tee -a "$RES/summary.txt"
     local unknown
     unknown=$(sed -n 's/ - unknown test, ignored$//p' "$out" | tr '\n' ' ')
     if [[ -n "$unknown" ]]; then
