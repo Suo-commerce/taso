@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # blk-warden-test.sh: the Warden's BlkPool on real devices (adoption step 4).
 #
-# Starts taso-blkd on a fresh log, runs the ignored test
-# crates/taso-warden/tests/blk_device.rs against it (Vessels born, sealed,
-# forked and reopened on ublk devices with ext4), then stops the daemon.
+# Starts two taso-blkd on fresh logs (node A and node B), runs the ignored
+# tests in crates/taso-warden/tests/blk_device.rs against them (Vessels
+# born, sealed, forked, reopened and rolled back on ublk devices with ext4;
+# a Vessel and its fork reborn on node B from shipped packs), then stops
+# the daemons.
 #
 #   sudo scripts/blk-warden-test.sh            (from the repository root)
 #
 # Touches, and nothing else:
-#   /var/lib/taso-blk/warden.log, warden.err   (removed at start, kept after)
-#   /run/taso-blk-warden.sock
+#   /var/lib/taso-blk/warden.log, warden.err, warden-b.log, warden-b.err
+#                                              (removed at start, kept after)
+#   /run/taso-blk-warden.sock, /run/taso-blk-warden-b.sock
 #   /mnt/blk-warden and mounts under it        (all unmounted at the end)
 #   the /dev/ublkb* devices the daemon creates for this run
 #
@@ -23,10 +26,14 @@ DIR=/var/lib/taso-blk
 LOG=$DIR/warden.log
 ERR=$DIR/warden.err
 SOCK=/run/taso-blk-warden.sock
+LOG_B=$DIR/warden-b.log
+ERR_B=$DIR/warden-b.err
+SOCK_B=/run/taso-blk-warden-b.sock
 MNT=/mnt/blk-warden
 BLKD=target/release/taso-blkd
 
 DAEMON_PID=
+DAEMON_B_PID=
 
 say() { printf '== %s\n' "$*"; }
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
@@ -45,13 +52,16 @@ cleanup() {
         fsfreeze -u "$m" 2>/dev/null
         umount "$m" || umount -l "$m"
     done < <(mounts_under)
-    if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        python3 -c '
+    for pair in "$DAEMON_PID:$SOCK" "$DAEMON_B_PID:$SOCK_B"; do
+        pid=${pair%%:*} sock=${pair#*:}
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_UNIX); s.settimeout(30); s.connect(sys.argv[1])
-s.sendall(b"quit\n"); s.makefile().readline()' "$SOCK" 2>/dev/null || kill "$DAEMON_PID"
-        wait "$DAEMON_PID" 2>/dev/null
-    fi
+s.sendall(b"quit\n"); s.makefile().readline()' "$sock" 2>/dev/null || kill "$pid"
+            wait "$pid" 2>/dev/null
+        fi
+    done
     left=$(mounts_under | wc -l)
     [[ "$left" -eq 0 ]] || echo "WARNING: $left mounts left under $MNT"
     exit "$rc"
@@ -67,25 +77,29 @@ fi
 mkdir -p "$DIR" "$MNT"
 [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 [[ ! -S "$SOCK" ]] || die "$SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
+[[ ! -S "$SOCK_B" ]] || die "$SOCK_B exists: another run's daemon? (pgrep -x taso-blkd)"
 
 say "building"
 cargo build -q --release -p taso-blk
 cargo test -q -p taso-warden --test blk_device --no-run
 
-rm -f "$LOG" "$ERR"
+rm -f "$LOG" "$ERR" "$LOG_B" "$ERR_B"
 "$BLKD" "$LOG" "$SOCK" 2>>"$ERR" &
 DAEMON_PID=$!
-for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
+"$BLKD" "$LOG_B" "$SOCK_B" 2>>"$ERR_B" &
+DAEMON_B_PID=$!
+for _ in $(seq 100); do [[ -S "$SOCK" && -S "$SOCK_B" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || die "daemon socket did not appear; see $ERR"
-say "taso-blkd on $SOCK, log $LOG; mounts under $MNT"
+[[ -S "$SOCK_B" ]] || die "node B daemon socket did not appear; see $ERR_B"
+say "node A: taso-blkd on $SOCK (log $LOG); node B: $SOCK_B (log $LOG_B); mounts under $MNT"
 
 status=0
-TASO_BLK_SOCKET=$SOCK TASO_BLK_MOUNTS=$MNT \
+TASO_BLK_SOCKET=$SOCK TASO_BLK_SOCKET_B=$SOCK_B TASO_BLK_MOUNTS=$MNT \
     cargo test -q -p taso-warden --test blk_device -- --ignored --test-threads=1 || status=$?
 
 if [[ $status -eq 0 ]]; then
-    echo "BLKPOOL PASS: Vessels born, sealed, forked and reopened on real devices"
+    echo "BLKPOOL PASS: Vessels born, sealed, forked, reopened and rolled back on real devices; reborn on node B from packs"
 else
-    echo "BLKPOOL FAIL (test exit $status; daemon log: $ERR)"
+    echo "BLKPOOL FAIL (test exit $status; daemon logs: $ERR, $ERR_B)"
     exit 1
 fi
