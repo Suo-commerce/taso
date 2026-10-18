@@ -1006,6 +1006,14 @@ mod tests {
     }
 
     #[test]
+    fn a_new_log_counts_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = new_store(&dir);
+        assert_eq!(s.stats(), Stats { log_bytes: HEADER_LEN, ..Stats::default() });
+        assert_eq!(std::fs::metadata(s.path()).unwrap().len(), HEADER_LEN);
+    }
+
+    #[test]
     fn tags_origins_and_names_survive_a_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("log");
