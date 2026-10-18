@@ -9,6 +9,12 @@
 //!   cargo test -p taso-warden --test blk_device -- --ignored --test-threads=1
 //! ```
 //!
+//! The rebirth test ships its packs to a local directory, or to an S3
+//! bucket when `TASO_BLK_S3_ENDPOINT` is set (with `TASO_BLK_S3_REGION`,
+//! `TASO_BLK_S3_BUCKET`, `TASO_BLK_S3_ACCESS_KEY_ID` and
+//! `TASO_BLK_S3_SECRET_KEY_FILE`): the Warden's own S3 client, under a
+//! fresh prefix per run.
+//!
 //! Every mount it makes is unmounted when the test ends, also when it fails.
 
 use std::path::{Path, PathBuf};
@@ -19,8 +25,9 @@ use taso_core::envelope::Lsn;
 use taso_core::model::WardenId;
 use taso_core::record::{Namespace, StreamCut, TurnId, Verdict};
 use taso_warden::blk::BlkPool;
+use taso_warden::daemon::StoreConf;
 use taso_warden::pack::Packs;
-use taso_warden::ship::LocalStore;
+use taso_warden::ship::SharedStore;
 use taso_warden::chronicle::Layers;
 use taso_warden::coordinator::Coordinator;
 use taso_warden::vessel::{Host, Pool};
@@ -138,7 +145,25 @@ fn rebirth_on_a_second_node_from_shipped_packs() {
         warden: WardenId::new(n),
     };
     let (a, b) = (node(1, &socket_a), node(2, &socket_b));
-    let packs = |h: &Host<BlkPool>, id| Packs::new(LocalStore::new(state.path().join("store")), h.pool.sender(), "vessels", id).unwrap();
+    let store: SharedStore = match std::env::var("TASO_BLK_S3_ENDPOINT") {
+        Ok(endpoint) => {
+            let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set (TASO_BLK_S3_ENDPOINT is)"));
+            eprintln!("packs in S3: {endpoint}, bucket {}", env("TASO_BLK_S3_BUCKET"));
+            StoreConf::S3 {
+                endpoint,
+                region: env("TASO_BLK_S3_REGION"),
+                bucket: env("TASO_BLK_S3_BUCKET"),
+                access_key_id: env("TASO_BLK_S3_ACCESS_KEY_ID"),
+                secret_key_file: env("TASO_BLK_S3_SECRET_KEY_FILE").into(),
+                ca_file: None,
+            }
+            .open()
+            .unwrap()
+        }
+        Err(_) => StoreConf::Local(state.path().join("store")).open().unwrap(),
+    };
+    let prefix = format!("taso-test/reb-{run}");
+    let packs = |h: &Host<BlkPool>, id| Packs::new(store.clone(), h.pool.sender(), &prefix, id).unwrap();
     let publish = |h: &Host<BlkPool>, v: &mut taso_warden::vessel::Vessel<taso_warden::blk::BlkLayers>, at: Lsn, origin: Option<&taso_warden::zfs::Snapshot>| {
         let snap = h.pool.snapshot(v.dataset(), at).unwrap().unwrap();
         v.publish_seal(&packs(h, v.id()), &snap, origin).unwrap();

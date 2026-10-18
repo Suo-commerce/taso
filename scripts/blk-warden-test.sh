@@ -16,6 +16,10 @@
 #   /mnt/blk-warden and mounts under it        (all unmounted at the end)
 #   the /dev/ublkb* devices the daemon creates for this run
 #
+# Packs go to a local directory, or to S3 when TASO_BLK_S3_ENDPOINT,
+# TASO_BLK_S3_REGION, TASO_BLK_S3_BUCKET, TASO_BLK_S3_ACCESS_KEY_ID and
+# TASO_BLK_S3_SECRET_KEY_FILE are set in the environment (passed through).
+#
 # BLK_WARDEN_NO_UBLK=1 skips the ublk module check (to try the script's
 # own paths on a machine without ublk; the test then fails at the first
 # device, and the cleanup is what is being tried).
