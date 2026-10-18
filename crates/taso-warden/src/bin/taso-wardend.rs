@@ -45,7 +45,6 @@ use taso_warden::source::{Guard, StaticSource};
 use taso_warden::source_kube::{KubeSource, DEFAULT_TICK};
 use taso_warden::status_kube::StatusWriter;
 use taso_warden::supervisor::{Event, Supervisor, Timing};
-use taso_warden::zfs::Zfs;
 
 /// How long one request to the API server may take.
 const KUBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -125,8 +124,9 @@ fn main() -> ExitCode {
         }
         CoordConf::Remote { socket } => Arc::new(RemoteCoord::new(socket)),
     };
-    let zfs = if config.batched_snapshots { Zfs::cli().batched() } else { Zfs::cli() };
-    let node = match Node::new(config, coord, zfs) {
+    let storage = config.storage.open(config.batched_snapshots);
+    eprintln!("taso-wardend[{}]: storage {}", config.warden.get(), storage.kind());
+    let node = match Node::new(config, coord, storage) {
         Ok(n) => Arc::new(n),
         Err(e) => {
             eprintln!("taso-wardend: starting: {e}");
