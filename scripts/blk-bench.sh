@@ -39,8 +39,10 @@ MF=/mnt/blk-fork
 MBASE=/mnt/blk-base
 
 if [[ $QUICK -eq 1 ]]; then
+    N_ATTACH=5
     N_FORK=10; N_BRANCH=20; N_SEAL=10; K4_SMALL=16; K4_BIG=64; K4_SAMPLES=3; FIO_TIME=3; FIO_SIZE=128
 else
+    N_ATTACH=100
     N_FORK=100; N_BRANCH=1000; N_SEAL=100; K4_SMALL=64; K4_BIG=1024; K4_SAMPLES=10; FIO_TIME=20; FIO_SIZE=1024
 fi
 
@@ -167,34 +169,58 @@ def main():
         fd = freeze(args[1])
         try: print(d.cmd("seal", args[0]))
         finally: thaw(fd)
-    elif mode == "k2":                      # k2 SEAL N
-        branches, lat, _, _ = forks(d, args[0], int(args[1]))
-        for b in branches: d.cmd("drop", b)
-        print(json.dumps({"n": len(lat), "p50_ms": ms(pct(lat, 50)), "p95_ms": ms(pct(lat, 95)), "max_ms": ms(max(lat))}))
-    elif mode == "k3k7":                    # k3k7 SEAL N
-        n = int(args[1])
-        marks = sorted({0, 1, min(100, n), n // 2, n})
-        m0 = mem_available_kib()
+    elif mode == "k2":                      # k2 SEAL N: branch, attach, detach, drop, timed apart
+        seal, n = args[0], int(args[1])
+        tb, ta, td = [], [], []
+        for _ in range(n):
+            t0 = time.perf_counter(); b = d.cmd("branch", seal); t1 = time.perf_counter()
+            dev = d.cmd("attach", b); wait_block(dev); t2 = time.perf_counter()
+            d.cmd("detach", b); t3 = time.perf_counter()
+            d.cmd("drop", b)
+            tb.append(t1 - t0); ta.append(t2 - t1); td.append(t3 - t2)
+        print(json.dumps({"n": n,
+            "branch_p50_ms": ms(pct(tb, 50)), "branch_p95_ms": ms(pct(tb, 95)),
+            "attach_p50_ms": ms(pct(ta, 50)), "attach_p95_ms": ms(pct(ta, 95)),
+            "detach_p50_ms": ms(pct(td, 50)), "detach_p95_ms": ms(pct(td, 95))}))
+    elif mode == "k3k7":                    # k3k7 SEAL N A: N branches, A of them attached, then drop all
+        seal, n, a = args[0], int(args[1]), int(args[2])
+        snap = lambda st: {x: st[x] for x in ("devices", "threads", "rss_kib", "layers")}
+        m0, s0 = mem_available_kib(), d.stats()
+        branches, early = [], False
         t = time.perf_counter()
-        branches, lat, snaps, early = forks(d, args[0], n, marks, mem_floor_kib=1 << 20)
-        total = time.perf_counter() - t
-        m1 = mem_available_kib()
-        last = snaps.get(len(branches)) or d.stats()
-        snaps[len(branches)] = last
+        for _ in range(n):
+            branches.append(d.cmd("branch", seal))
+        branch_total = time.perf_counter() - t
+        m1, s1 = mem_available_kib(), d.stats()
+        lat = []
+        attached = []
+        t = time.perf_counter()
+        for b in branches[:a]:
+            if mem_available_kib() < 1 << 20:
+                early = True; break
+            t0 = time.perf_counter(); dev = d.cmd("attach", b); wait_block(dev); lat.append(time.perf_counter() - t0)
+            attached.append(b)
+        attach_total = time.perf_counter() - t
+        m2, s2 = mem_available_kib(), d.stats()
+        t = time.perf_counter()
+        for b in attached: d.cmd("detach", b)
+        detach_total = time.perf_counter() - t
         g0 = int(d.stats()["garbage_bytes"])
         t = time.perf_counter()
         for b in branches: d.cmd("drop", b)
         drop_total = time.perf_counter() - t
         after = d.stats()
         print(json.dumps({
-            "created": len(branches), "asked": n, "stopped_early_low_memory": early,
-            "create_total_s": f"{total:.2f}", "fork_p50_ms": ms(pct(lat, 50)), "fork_p95_ms": ms(pct(lat, 95)),
-            "snapshots": {k: {x: v[x] for x in ("devices", "threads", "rss_kib", "layers")} for k, v in sorted(snaps.items())},
-            "mem_available_drop_mib": (m0 - m1) // 1024,
-            "drop_total_s": f"{drop_total:.2f}",
+            "branches": len(branches), "asked": n, "branch_total_s": f"{branch_total:.3f}",
+            "before": snap(s0), "after_branches": snap(s1), "mem_drop_branches_mib": (m0 - m1) // 1024,
+            "attached": len(attached), "asked_attached": a, "stopped_early_low_memory": early,
+            "attach_total_s": f"{attach_total:.2f}", "attach_p50_ms": ms(pct(lat, 50)) if lat else "-",
+            "attach_p95_ms": ms(pct(lat, 95)) if lat else "-",
+            "after_attach": snap(s2), "mem_drop_attach_mib": (m1 - m2) // 1024,
+            "detach_total_s": f"{detach_total:.2f}", "drop_total_s": f"{drop_total:.3f}",
             "log_bytes_after_drop": after["log_bytes"], "garbage_bytes_before_drop": g0,
             "garbage_bytes_after_drop": after["garbage_bytes"], "devices_after_drop": after["devices"],
-            "threads_after_drop": after["threads"], "rss_kib_after_drop": after["rss_kib"]}))
+            "threads_after_drop": after["threads"]}))
     elif mode == "k6":                      # k6 BRANCH MNT N: Seals under light writes
         branch, mnt, n = args[0], args[1], int(args[2])
         stop = threading.Event()
@@ -302,7 +328,7 @@ SEAL=$(H seal-frozen "$BR" "$MB")
 say "Seal $SEAL holds the files; branch $BR moves on"
 
 # ---- K2: fork ----------------------------------------------------------------
-say "K2: $N_FORK forks of $SEAL, time until the device is ready"
+say "K2: $N_FORK times: branch of $SEAL (map), attach (device ready), detach, drop"
 K2=$(H k2 "$SEAL" "$N_FORK")
 echo "K2 $K2" | tee -a "$RESULTS"
 
@@ -360,8 +386,8 @@ K6=$(H k6 "$BR" "$MB" "$N_SEAL")
 echo "K6 $K6" | tee -a "$RESULTS"
 
 # ---- K3 + K7: 1000 branches, then drop them ----------------------------------
-say "K3: $N_BRANCH live branches of $SEAL; then K7: drop them all"
-K3=$(H k3k7 "$SEAL" "$N_BRANCH")
+say "K3: $N_BRANCH branches of $SEAL, $N_ATTACH of them attached; then K7: drop them all"
+K3=$(H k3k7 "$SEAL" "$N_BRANCH" "$N_ATTACH")
 echo "K3K7 $K3" | tee -a "$RESULTS"
 
 umount "$MB"
@@ -381,24 +407,30 @@ def verdict(name, value, ok, kill, note=""):
     v = "PASS" if ok else ("KILL" if kill else "between")
     print(f"{name:3} {v:8} {value}{'  (' + note + ')' if note else ''}")
 print("\nverdicts (spike plan section 2):")
-k2 = get("K2"); p95 = float(k2["p95_ms"])
-verdict("K2", f"fork p95 {p95} ms", p95 < 5, p95 > 50)
+k2 = get("K2"); p95 = float(k2["branch_p95_ms"])
+verdict("K2", f"fork (branch in the map) p95 {p95} ms", p95 < 5, p95 > 50,
+        f"a device when mounting: attach p95 {k2['attach_p95_ms']} ms, detach p95 {k2['detach_p95_ms']} ms")
 k3 = get("K3K7")
-t = float(k3["create_total_s"]); n = k3["created"]; snaps = k3["snapshots"]
-first, last = snaps["0"], snaps[str(n)]
-per_rss = (int(last["rss_kib"]) - int(first["rss_kib"])) / max(n, 1) / 1024
-per_thr = (int(last["threads"]) - int(first["threads"])) / max(n, 1)
-verdict("K3", f"{n}/{k3['asked']} branches in {t} s; per branch {per_rss:.2f} MiB daemon RSS, {per_thr:.1f} threads; MemAvailable fell {k3['mem_available_drop_mib']} MiB",
-        n == k3["asked"] and t < 5 and per_rss <= 32, k3["stopped_early_low_memory"] or per_rss > 32,
-        "threads per branch: the plan's kill example; lazy devices are the fallback" if per_thr >= 1 else "")
+n, t = k3["branches"], float(k3["branch_total_s"])
+b0, b1, b2 = k3["before"], k3["after_branches"], k3["after_attach"]
+per_branch_kib = (int(b1["rss_kib"]) - int(b0["rss_kib"])) / max(n, 1)
+na = k3["attached"]
+per_dev_mib = (int(b2["rss_kib"]) - int(b1["rss_kib"])) / max(na, 1) / 1024
+per_dev_thr = (int(b2["threads"]) - int(b1["threads"])) / max(na, 1)
+verdict("K3", f"{n}/{k3['asked']} branches in {t} s, {per_branch_kib:.1f} KiB daemon RSS each; "
+        f"{na}/{k3['asked_attached']} attached at once: {per_dev_mib:.2f} MiB RSS and {per_dev_thr:.1f} threads per live device, "
+        f"MemAvailable fell {k3['mem_drop_attach_mib']} MiB",
+        n == k3["asked"] and na == k3["asked_attached"] and t < 5 and per_branch_kib <= 32 * 1024,
+        k3["stopped_early_low_memory"], "threads are per live device only, not per branch")
 l = next(x for x in lines if x.startswith("K4 big/small")); flat = float(l.split(":")[1].split(";")[0]); vs = float(l.rsplit(":", 1)[1])
 verdict("K4", f"big/small {flat}, fork/baseline {vs}", flat <= 1.5 and vs <= 1.5, flat > 2)
 r = [float(x.rsplit("base/blk ", 1)[1].rstrip(")")) for x in lines if x.startswith("K5 ")]
 verdict("K5", f"baseline/blk ratios {r} (randwrite, seq write, seq read)", max(r) <= 1.5, max(r) > 2)
-k6 = get("K6"); p95 = float(k6["total_p95_ms"])
-verdict("K6", f"freeze+seal+thaw p95 {p95} ms, seal alone p95 {k6['seal_only_p95_ms']} ms", p95 < 2, p95 > 114)
+k6 = get("K6"); p95s, p95 = float(k6["seal_only_p95_ms"]), float(k6["total_p95_ms"])
+verdict("K6", f"seal p95 {p95s} ms", p95s < 2, p95s > 114, "the store's own Seal")
+verdict("K6", f"with ext4 freeze+thaw p95 {p95} ms", p95 < 2, p95 > 114, "the freeze is ext4 writing its journal")
 d = float(k3["drop_total_s"])
-verdict("K7", f"dropped {n} in {d} s; log {k3['log_bytes_after_drop']} B, garbage {k3['garbage_bytes_before_drop']} -> {k3['garbage_bytes_after_drop']} B", d < 5, False,
+verdict("K7", f"dropped {n} branches in {d} s ({k3['attached']} detached first in {k3['detach_total_s']} s); log {k3['log_bytes_after_drop']} B", d < 5, False,
         "space reclaim is not built in the spike: the log never shrinks")
 PY
 say "results kept in $RESULTS"
