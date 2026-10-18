@@ -49,6 +49,10 @@
 # FST_STOP_FREE_GIB (default 5).  The log's size and garbage are in the
 # summary: they are measurements for compaction.
 #
+# ext4 is mounted -o discard everywhere (fsx, and MOUNT_OPTIONS for
+# xfstests), as the Warden mounts Vessels: without it ext4 never tells the
+# device which blocks it freed, and live data grows toward the device size.
+#
 # FST_NO_UBLK=1 skips the ublk module check, and FST_BLKD=path runs that
 # daemon instead of building one (both to try the script's own paths with a
 # stand-in daemon on a machine without ublk).
@@ -209,7 +213,14 @@ unmount_all() {
     done < <(mounts_under)
 }
 
-note_stats() { echo "stats ($1): $(blk stats)" | tee -a "$RES/summary.txt"; }
+# The daemon's counters, and the live bytes (log minus garbage) in MiB.
+note_stats() {
+    local st log garbage
+    st=$(blk stats)
+    log=$(tr ' ' '\n' <<<"$st" | sed -n 's/^log_bytes=//p')
+    garbage=$(tr ' ' '\n' <<<"$st" | sed -n 's/^garbage_bytes=//p')
+    echo "live $(( (${log:-0} - ${garbage:-0}) >> 20 )) MiB, log $(( ${log:-0} >> 20 )) MiB ($1): $st" | tee -a "$RES/summary.txt"
+}
 
 cleanup() {
     local rc=$?
@@ -245,6 +256,7 @@ export TEST_DEV=$tdev
 export TEST_DIR=$MNT/test
 export SCRATCH_DEV=$sdev
 export SCRATCH_MNT=$MNT/scratch
+export MOUNT_OPTIONS="-o discard"
 EOF
     mkfs.ext4 -q -F "$tdev"
     say "xfstests ($name): $* (output in $out)"
@@ -274,6 +286,13 @@ EOF
 
 # ---- run: preflight ------------------------------------------------------------
 [[ -f Cargo.toml && -d crates/taso-blk ]] || die "run from the repository root"
+# sudo resets PATH; rustup installs cargo under the invoking user's home.
+if [[ -z "${FST_BLKD:-}" ]] && ! command -v cargo >/dev/null; then
+    for c in "${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)/.cargo/bin}" /root/.cargo/bin; do
+        [[ -n "$c" && -x "$c/cargo" ]] && { PATH=$c:$PATH; break; }
+    done
+    command -v cargo >/dev/null || die "cargo not found (not in PATH, ~/.cargo/bin or /root/.cargo/bin)"
+fi
 [[ -x "$XFS/check" && -x "$XFS/ltp/fsx" ]] || die "xfstests not built in $XFS: run '$0 setup' first"
 if [[ "${FST_NO_UBLK:-}" != 1 ]]; then
     modprobe ublk_drv
@@ -369,7 +388,7 @@ read -r FSXB FSXDEV <<<"$(blk fork "$ROOT" fst-fsx)"
 wait_dev "$FSXDEV"
 mkfs.ext4 -q -F "$FSXDEV"
 mkdir -p "$MNT/fsx"
-mount "$FSXDEV" "$MNT/fsx"
+mount -o discard "$FSXDEV" "$MNT/fsx"
 [[ "$(findmnt -n -o SOURCE --mountpoint "$MNT/fsx")" == "$FSXDEV" ]] || die "$MNT/fsx is not mounted from $FSXDEV"
 rc=0; "$XFS/ltp/fsx" -q -N 200000 -S 1 -l $((64 << 20)) -o $((1 << 20)) "$MNT/fsx/buffered" >"$RES/fsx-buffered.txt" 2>&1 || rc=$?
 check "fsx: 200000 ops, buffered and mmap" 0 "$rc"
@@ -438,7 +457,7 @@ fi
     echo "failed once on ours, then passed (FLAKY): ${FLAKY[*]:-none}"
     echo "failed on loop too (not the device):      ${BOTH[*]:-none}"
     echo "log $(du -h --apparent-size "$LOG" 2>/dev/null | cut -f1); $(free_gib) GiB free at the end"
-    echo "automatic compactions: $(grep -c '^taso-blkd: compacted:' "$ERR" || true) done, $(grep -c '^taso-blkd: compaction:' "$ERR" || true) failed"
+    echo "automatic compactions: $(grep -c '^taso-blkd: compacted:' "$ERR" || true) done, $(grep -c '^taso-blkd: compaction:' "$ERR" || true) failed, $(grep -c '^taso-blkd: compaction waits:' "$ERR" || true) times short of room"
 } | tee -a "$RES/summary.txt"
 if grep -q '^taso-blkd: compaction:' "$ERR"; then
     grep '^taso-blkd: compaction:' "$ERR" | tee -a "$RES/summary.txt"

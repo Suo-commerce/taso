@@ -60,8 +60,10 @@
 //! last records at the end.  With `--compact-pct N` (0, the default, is
 //! off) the daemon compacts by itself when garbage is at least N per cent
 //! of the log and at least `--compact-min-mib` (1024 by default).  One
-//! compaction runs at a time.  A compaction stopped by `quit` or a crash
-//! leaves the old log as it was.
+//! compaction runs at a time.  Neither starts unless the file system has
+//! room for a copy of the live blocks plus a quarter (at least 256 MiB)
+//! for what arrives meanwhile; the daemon says so once and waits.  A
+//! compaction stopped by `quit` or a crash leaves the old log as it was.
 //!
 //! # Lazy devices
 //!
@@ -86,7 +88,12 @@
 //!   durable; with them ext4 flushes at each journal commit and the store
 //!   commits a group there.  This is what makes the store's durability
 //!   rule (durable at flush) the disk's.
-//! - Discard and write-zeroes both become [`Store::discard`] (reads zeros).
+//! - Discard and write-zeroes both become [`Store::discard`] (reads zeros),
+//!   up to 1 GiB per request.  Mount ext4 with `-o discard`: without it
+//!   ext4 never says which blocks it freed, so every block it ever wrote
+//!   stays live for the store, compaction cannot drop it, and Seals and
+//!   exports carry it (measured on taso-test 2026-10-18: live grew to
+//!   4.8 GB under fsx on a 64 MiB file).
 //! - **User copy** (`UBLK_F_USER_COPY`): request data moves with `pread` /
 //!   `pwrite` on the device's character file into the daemon's own buffer.
 //!   No buffer is shared with the kernel.
@@ -127,6 +134,9 @@ use taso_blk::store::{Compacted, Store};
 /// The ublk target name of this daemon's devices; it is how a later
 /// daemon recognises leftovers as its own.
 const TARGET: &str = "taso-blk";
+
+/// Largest discard or write-zeroes request the device takes: 1 GiB.
+const MAX_DISCARD: u64 = 1 << 30;
 
 /// Device geometry and queue sizes, from the command line.
 #[derive(Clone, Copy)]
@@ -297,29 +307,46 @@ fn raise_open_files() -> u64 {
 fn upkeep(d: &Daemon) {
     let g = d.geometry;
     let mut last = d.store.lock().unwrap().stats().log_bytes;
+    // Said once until there is room again, not every 5 s.
+    let mut short_of_room = false;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
         let stats = d.store.lock().unwrap().stats();
-        if g.compact_pct > 0
+        let due = g.compact_pct > 0
             && stats.garbage_bytes >= g.compact_min
-            && stats.garbage_bytes * 100 >= stats.log_bytes * g.compact_pct
-        {
-            eprintln!(
-                "taso-blkd: compacting: {} MiB of garbage in {} MiB of log",
-                stats.garbage_bytes >> 20,
-                stats.log_bytes >> 20
-            );
-            match d.compact() {
-                Ok(c) => eprintln!("taso-blkd: compacted: {}", compacted(&c)),
-                Err(e) => {
-                    eprintln!("taso-blkd: compaction: {e}");
-                    // Not again at once (a full disk would fail the same way).
-                    std::thread::sleep(std::time::Duration::from_secs(60));
+            && stats.garbage_bytes * 100 >= stats.log_bytes * g.compact_pct;
+        // While another compaction (the `compact` command) runs, nothing
+        // to do this round.
+        if due && !d.compacting.load(Ordering::SeqCst) {
+            match d.room_to_compact() {
+                Err(why) => {
+                    if !short_of_room {
+                        eprintln!("taso-blkd: compaction waits: {why}");
+                        short_of_room = true;
+                    }
+                }
+                Ok(()) => {
+                    short_of_room = false;
+                    eprintln!(
+                        "taso-blkd: compacting: {} MiB of garbage in {} MiB of log",
+                        stats.garbage_bytes >> 20,
+                        stats.log_bytes >> 20
+                    );
+                    match d.compact() {
+                        Ok(c) => eprintln!("taso-blkd: compacted: {}", compacted(&c)),
+                        Err(e) if e == BUSY => {}
+                        Err(e) => {
+                            eprintln!("taso-blkd: compaction: {e}");
+                            // Not again at once: what failed would likely
+                            // fail the same way.
+                            std::thread::sleep(std::time::Duration::from_secs(60));
+                        }
+                    }
+                    // A compaction leaves a checkpoint of the new log.
+                    last = d.store.lock().unwrap().stats().log_bytes;
+                    continue;
                 }
             }
-            // A compaction leaves a checkpoint of the new log.
-            last = d.store.lock().unwrap().stats().log_bytes;
-            continue;
         }
         if g.checkpoint_every > 0 && stats.log_bytes.saturating_sub(last) >= g.checkpoint_every {
             let mut s = d.store.lock().unwrap();
@@ -334,6 +361,24 @@ fn upkeep(d: &Daemon) {
                 Err(e) => eprintln!("taso-blkd: checkpoint: {e}"),
             }
         }
+    }
+}
+
+/// What `compact` answers while a compaction is running.
+const BUSY: &str = "a compaction is already running";
+
+/// Bytes free for an unprivileged writer on the file system holding `dir`.
+fn free_bytes(dir: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: `c` is a valid NUL-terminated path for the whole call, and
+    // statvfs only writes the struct passed by reference.
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(st.f_bavail as u64 * st.f_frsize as u64)
     }
 }
 
@@ -562,7 +607,10 @@ impl Daemon {
                 .checkpoint()
                 .map_err(store_err)?
                 .to_string()),
-            "compact" => Ok(compacted(&self.compact()?)),
+            "compact" => {
+                self.room_to_compact()?;
+                Ok(compacted(&self.compact()?))
+            }
             "names" => {
                 let names = self.store.lock().unwrap().names();
                 Ok(names
@@ -653,10 +701,39 @@ impl Daemon {
         ))
     }
 
+    /// Whether the log's file system has room for a compaction: a copy
+    /// of the live blocks while the old log still stands, plus room for
+    /// what arrives meanwhile (a quarter of the live size, at least 256
+    /// MiB).  `Err` says how much is wanted and how much there is.
+    fn room_to_compact(&self) -> Result<(), String> {
+        let (live, path) = {
+            let s = self.store.lock().unwrap();
+            let st = s.stats();
+            (
+                st.log_bytes.saturating_sub(st.garbage_bytes),
+                s.path().to_path_buf(),
+            )
+        };
+        let want = live + (live / 4).max(256 << 20);
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let free = free_bytes(dir).map_err(|e| format!("cannot read free space: {e}"))?;
+        if free < want {
+            return Err(format!(
+                "not enough room: wants {} MiB free, has {} MiB",
+                want >> 20,
+                free >> 20
+            ));
+        }
+        Ok(())
+    }
+
     /// Compact the log, holding the store only to begin and to finish.
     fn compact(&self) -> Result<Compacted, String> {
         if self.compacting.swap(true, Ordering::SeqCst) {
-            return Err("a compaction is already running".to_string());
+            return Err(BUSY.to_string());
         }
         struct Done<'a>(&'a AtomicBool);
         impl Drop for Done<'_> {
@@ -870,8 +947,11 @@ fn run_device(
             },
             discard: sys::ublk_param_discard {
                 discard_granularity: BLOCK as u32,
-                max_discard_sectors: g.io_bytes >> 9,
-                max_write_zeroes_sectors: g.io_bytes >> 9,
+                // A discard costs a map change and one small record, not
+                // I/O, so take large ones whole: freeing a big file is one
+                // record instead of thousands (ext4 mounted -o discard).
+                max_discard_sectors: (MAX_DISCARD >> 9) as u32,
+                max_write_zeroes_sectors: (MAX_DISCARD >> 9) as u32,
                 max_discard_segments: 1,
                 ..Default::default()
             },
