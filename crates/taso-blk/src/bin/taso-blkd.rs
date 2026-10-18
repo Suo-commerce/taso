@@ -24,6 +24,9 @@
 //! | `info <layer>`   | what a layer is                                  | `ok key=value ...`   |
 //! | `detach <branch>`| stop the branch's device                         | `ok`                 |
 //! | `reset <branch>` | back to the Seal it stands on (detached only)    | `ok`                 |
+//! | `export <seal> <base>\|- <file>` | the Seal as a stream into a new file | `ok <blocks>`  |
+//! | `import <branch> <file>` | apply a stream (detached, clean branch)  | `ok <blocks>`        |
+//! | `names`          | every named branch                               | `ok <name>:<branch> ...` |
 //! | `drop <layer>`   | detach if needed, drop the branch or Seal        | `ok`                 |
 //! | `flush`          | end a group                                      | `ok <lsn>`           |
 //! | `stats`          | counters, for measurements                       | `ok key=value ...`   |
@@ -86,7 +89,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
@@ -219,6 +222,15 @@ fn raise_open_files() -> u64 {
     lim.rlim_cur
 }
 
+/// An absolute file path argument.
+fn file_arg(w: Option<&&str>) -> Result<PathBuf, String> {
+    let p = PathBuf::from(w.ok_or("missing file path")?);
+    if !p.is_absolute() {
+        return Err(format!("{} is not an absolute path", p.display()));
+    }
+    Ok(p)
+}
+
 /// Lowercase hex of `b`.
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -326,6 +338,51 @@ impl Daemon {
                 self.store.lock().unwrap().reset(branch).map_err(store_err)?;
                 drop(devices);
                 Ok(String::new())
+            }
+            "export" => {
+                let to = layer(1)?;
+                let from = match words.get(2) {
+                    Some(&"-") => None,
+                    Some(_) => Some(layer(2)?),
+                    None => return Err("missing base (a Seal or -)".into()),
+                };
+                let path = file_arg(words.get(3))?;
+                // A new file only, never over an existing one.
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+                let mut w = std::io::BufWriter::new(file);
+                let result = self.store.lock().unwrap().export(to, from, &mut w).map_err(store_err);
+                let result = result.and_then(|n| {
+                    let f = w.into_inner().map_err(|e| e.to_string())?;
+                    f.sync_all().map_err(|e| e.to_string())?;
+                    Ok(n)
+                });
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Ok(result?.to_string())
+            }
+            "import" => {
+                let branch = layer(1)?;
+                let path = file_arg(words.get(2))?;
+                let file = File::open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+                let mut r = std::io::BufReader::with_capacity(1 << 20, file);
+                // As for reset: the device table first, so no attach starts.
+                let devices = self.devices.lock().unwrap();
+                if devices.contains_key(&branch) {
+                    return Err(format!("{branch} is attached; unmount and detach it first"));
+                }
+                let n = self.store.lock().unwrap().import(branch, &mut r).map_err(store_err)?;
+                drop(devices);
+                Ok(n.to_string())
+            }
+            "names" => {
+                let names = self.store.lock().unwrap().names();
+                Ok(names.into_iter().map(|(n, b)| format!("{n}:{b}")).collect::<Vec<_>>().join(" "))
             }
             "detach" => {
                 self.detach(layer(1)?)?;
