@@ -5,10 +5,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["daemon"]
+# The ublk daemon (taso-blkd).  Off for users of the library alone (the
+# Warden's Pool and Layers use the store types and the client), so they do
+# not build libublk and its bindgen/clang build dependency.
+daemon = ["dep:libublk", "dep:libc"]
+
+[[bin]]
+name = "taso-blkd"
+path = "src/bin/taso-blkd.rs"
+required-features = ["daemon"]
+
 [dependencies]
 blake3 = { workspace = true }
-libublk = "0.4.8"
-libc = "0.2"
+libublk = { version = "0.4.8", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
