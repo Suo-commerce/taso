@@ -897,7 +897,9 @@ dependencies = [
 name = "taso-blk"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "proptest",
+ "tempfile",
 ]
 
 [[package]]
