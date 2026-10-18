@@ -44,7 +44,7 @@
 #   the /dev/ublkb* devices the daemon creates, two loop devices in step 4
 #
 # Disk: xfstests writes a lot, and the log grows until a compaction.
-# The run refuses to start with less than FST_MIN_FREE_GIB (default 30)
+# The run refuses to start with less than FST_MIN_FREE_GIB (default 20)
 # free under /var/lib/taso-blk, and stops xfstests if it falls below
 # FST_STOP_FREE_GIB (default 5).  The log's size and garbage are in the
 # summary: they are measurements for compaction.
@@ -72,7 +72,7 @@ LOOP_TEST_IMG=$DIR/fst-loop-test.img
 LOOP_SCRATCH_IMG=$DIR/fst-loop-scratch.img
 BLKD=${FST_BLKD:-target/release/taso-blkd}
 SIZE_GIB=8
-MIN_FREE=${FST_MIN_FREE_GIB:-30}
+MIN_FREE=${FST_MIN_FREE_GIB:-20}
 COMPACT_PCT=${FST_COMPACT_PCT:-25}
 COMPACT_MIN=${FST_COMPACT_MIN_MIB:-256}
 STOP_FREE=${FST_STOP_FREE_GIB:-5}
