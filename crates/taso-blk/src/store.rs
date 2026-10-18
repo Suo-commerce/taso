@@ -44,6 +44,20 @@
 //! was dropped.  Protection against media corruption comes later from a
 //! second copy (shipped packs), not from this file.
 //!
+//! # Tags, origins and names (for the Warden's `Pool` and `Layers`)
+//!
+//! - A Seal may carry a **tag**: up to [`MAX_TAG`] opaque bytes, written in
+//!   its `Seal` record.  The Warden puts its own Seal record's lsn and hash
+//!   there, as ZFS keeps them in a snapshot property.
+//! - The store remembers which branch each Seal was made from (its
+//!   **origin**), so [`Store::seals_of`] lists a dataset's own layers.
+//! - A branch may have a **name** (a `Name` record): the dataset name.
+//!   Names are unique among live branches, survive [`Store::seal`] (the
+//!   branch keeps its id), and are freed when the branch is dropped.
+//!
+//! All three are rebuilt from the log on [`Store::open`], held back with
+//! their group like every other map change.
+//!
 //! The base image is zeros: a fresh device reads zeros until written, and
 //! ext4 is created by `mkfs` on a branch, then sealed.
 //!
@@ -51,6 +65,7 @@
 //! of the file, so every later call fails until it is reopened, and
 //! reopening rebuilds the map from the log.
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
@@ -58,7 +73,13 @@ use std::path::{Path, PathBuf};
 
 use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
 
-const FILE_MAGIC: &[u8; 8] = b"TASOBLK1";
+const FILE_MAGIC: &[u8; 8] = b"TASOBLK2";
+/// The spike's format (no tags, origins or names).
+const OLD_MAGIC: &[u8; 8] = b"TASOBLK1";
+/// Largest Seal tag, in bytes.
+pub const MAX_TAG: usize = 64;
+/// Largest branch name, in bytes.
+pub const MAX_NAME: usize = 255;
 const HEADER_LEN: u64 = 16;
 const REC_MAGIC: u32 = 0x5442_4c4b; // "TBLK"
 /// magic + len + kind
@@ -76,6 +97,7 @@ const K_SEAL: u8 = 5;
 const K_DROP_BRANCH: u8 = 6;
 const K_DROP_SEAL: u8 = 7;
 const K_FLUSH: u8 = 8;
+const K_NAME: u8 = 9;
 
 /// Why a store operation failed.
 #[derive(Debug)]
@@ -87,6 +109,9 @@ pub enum StoreError {
     Map(MapError),
     /// The file is not a block log (bad header).
     NotALog,
+    /// A log in the spike's format (`TASOBLK1`), which this version does
+    /// not read.
+    OldFormat,
     /// A verified record does not replay: the log contradicts itself.
     Replay {
         /// The record's sequence number.
@@ -98,6 +123,20 @@ pub enum StoreError {
     BadLength(usize),
     /// A write is larger than one record may be.
     TooLarge(usize),
+    /// A Seal tag longer than [`MAX_TAG`].
+    BadTag(usize),
+    /// A branch name that is too long or has characters outside
+    /// `A-Z a-z 0-9 _ . : / -`.
+    BadName(String),
+    /// Another live branch already has this name.
+    NameTaken(String),
+    /// A verified record about names or tags does not replay.
+    ReplayMeta {
+        /// The record's sequence number.
+        lsn: u64,
+        /// What is wrong with it.
+        reason: &'static str,
+    },
     /// An earlier append failed; reopen the store.
     Poisoned,
 }
@@ -108,6 +147,11 @@ impl std::fmt::Display for StoreError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Map(e) => write!(f, "map: {e}"),
             Self::NotALog => write!(f, "not a taso-blk log"),
+            Self::OldFormat => write!(f, "a taso-blk log in the spike's format (TASOBLK1); this version reads TASOBLK2"),
+            Self::BadTag(n) => write!(f, "a tag of {n} bytes; at most {MAX_TAG}"),
+            Self::BadName(n) => write!(f, "bad branch name {n:?}: 1 to {MAX_NAME} of A-Z a-z 0-9 _ . : / -"),
+            Self::NameTaken(n) => write!(f, "branch name {n:?} is taken"),
+            Self::ReplayMeta { lsn, reason } => write!(f, "record {lsn} does not replay: {reason}"),
             Self::Replay { lsn, error } => write!(f, "record {lsn} does not replay: {error}"),
             Self::BadLength(n) => write!(f, "write of {n} bytes is not a whole number of {BLOCK}-byte blocks"),
             Self::TooLarge(n) => write!(f, "write of {n} bytes exceeds one record"),
@@ -160,6 +204,7 @@ pub struct Store {
     file: File,
     path: PathBuf,
     map: Map,
+    meta: Meta,
     /// End of the last record: where the next one goes.
     tail: u64,
     /// Sequence number of the last record (records count from 1).
@@ -184,6 +229,7 @@ impl Store {
             file,
             path: path.to_path_buf(),
             map: Map::new(),
+            meta: Meta::default(),
             tail: HEADER_LEN,
             lsn: 0,
             prev: seed(&header),
@@ -206,12 +252,16 @@ impl Store {
         }
         let mut header = [0u8; HEADER_LEN as usize];
         file.read_exact_at(&mut header, 0)?;
+        if &header[..8] == OLD_MAGIC {
+            return Err(StoreError::OldFormat);
+        }
         if &header[..8] != FILE_MAGIC {
             return Err(StoreError::NotALog);
         }
 
         let mut r = BufReader::with_capacity(1 << 20, ReadAt { file: &file, pos: HEADER_LEN, end: len });
         let mut map = Map::new();
+        let mut meta = Meta::default();
         let (mut pos, mut lsn, mut prev) = (HEADER_LEN, 0u64, seed(&header));
         // State at the last verified Flush.
         let (mut end, mut good_lsn, mut good_prev, mut groups, mut garbage) = (HEADER_LEN, 0u64, prev, 0u64, 0u64);
@@ -226,7 +276,7 @@ impl Store {
                     return Err(StoreError::Replay { lsn, error: MapError::Overflow });
                 }
                 for p in pending.drain(..) {
-                    garbage += replay(&mut map, &p)?;
+                    garbage += replay(&mut map, &mut meta, &p)?;
                 }
                 (end, good_lsn, good_prev) = (pos, lsn, prev);
                 groups += 1;
@@ -240,7 +290,7 @@ impl Store {
             file.sync_all()?;
         }
         let stats = Stats { log_bytes: end, garbage_bytes: garbage, records: good_lsn, syncs: 0 };
-        let store = Self { file, path: path.to_path_buf(), map, tail: end, lsn: good_lsn, prev: good_prev, stats, poisoned: false };
+        let store = Self { file, path: path.to_path_buf(), map, meta, tail: end, lsn: good_lsn, prev: good_prev, stats, poisoned: false };
         Ok((store, Recovered { records: good_lsn, groups, cut }))
     }
 
@@ -270,6 +320,7 @@ impl Store {
         self.check()?;
         let lsn = self.lsn + 1;
         let id = self.map.root_seal(lsn);
+        self.meta.seals.insert(id, SealInfo { origin: None, tag: Vec::new() });
         self.append(K_ROOT, &[])?;
         self.flush()?;
         Ok(id)
@@ -360,18 +411,82 @@ impl Store {
     /// Freeze `branch` as a new Seal standing for every record before it.
     /// Durable when this returns.
     pub fn seal(&mut self, branch: LayerId) -> Result<LayerId, StoreError> {
+        self.seal_tagged(branch, &[])
+    }
+
+    /// [`Store::seal`], with `tag` (at most [`MAX_TAG`] bytes) kept on the
+    /// Seal.
+    pub fn seal_tagged(&mut self, branch: LayerId, tag: &[u8]) -> Result<LayerId, StoreError> {
         self.check()?;
+        if tag.len() > MAX_TAG {
+            return Err(StoreError::BadTag(tag.len()));
+        }
         let lsn = self.lsn + 1;
         let seal = self.map.seal(branch, lsn)?;
-        self.append(K_SEAL, &branch.get().to_le_bytes())?;
+        self.meta.seals.insert(seal, SealInfo { origin: Some(branch), tag: tag.to_vec() });
+        let mut body = Vec::with_capacity(8 + tag.len());
+        body.extend_from_slice(&branch.get().to_le_bytes());
+        body.extend_from_slice(tag);
+        self.append(K_SEAL, &body)?;
         self.flush()?;
         Ok(seal)
+    }
+
+    /// The tag of a live Seal (empty if it has none); `None` if `seal` is
+    /// not a live Seal.
+    pub fn tag(&self, seal: LayerId) -> Option<&[u8]> {
+        self.meta.seals.get(&seal).map(|i| i.tag.as_slice())
+    }
+
+    /// The branch a live Seal was made from; `None` for a root Seal or if
+    /// `seal` is not a live Seal.
+    pub fn origin(&self, seal: LayerId) -> Option<LayerId> {
+        self.meta.seals.get(&seal).and_then(|i| i.origin)
+    }
+
+    /// The live Seals made from `branch`, oldest first.
+    pub fn seals_of(&self, branch: LayerId) -> Vec<LayerId> {
+        self.meta.seals.iter().filter(|(_, i)| i.origin == Some(branch)).map(|(id, _)| *id).collect()
+    }
+
+    /// Give `branch` the name `name`, or take its name away (`name` empty).
+    /// A branch has at most one name; naming it again renames it.  Durable
+    /// at the next flush.
+    pub fn name(&mut self, branch: LayerId, name: &str) -> Result<(), StoreError> {
+        self.check()?;
+        if !name.is_empty() && !valid_name(name) {
+            return Err(StoreError::BadName(name.to_string()));
+        }
+        if self.map.kind(branch)? != Kind::Branch {
+            return Err(MapError::NotABranch(branch).into());
+        }
+        if let Some(&other) = self.meta.names.get(name) {
+            if other != branch {
+                return Err(StoreError::NameTaken(name.to_string()));
+            }
+        }
+        self.meta.set_name(branch, name);
+        let mut body = Vec::with_capacity(8 + name.len());
+        body.extend_from_slice(&branch.get().to_le_bytes());
+        body.extend_from_slice(name.as_bytes());
+        self.append(K_NAME, &body)
+    }
+
+    /// The live branch named `name`.
+    pub fn find(&self, name: &str) -> Option<LayerId> {
+        self.meta.names.get(name).copied()
+    }
+
+    /// The name of `branch`, if it has one.
+    pub fn name_of(&self, branch: LayerId) -> Option<&str> {
+        self.meta.by_layer.get(&branch).map(String::as_str)
     }
 
     /// Drop a branch; its blocks become garbage.
     pub fn drop_branch(&mut self, branch: LayerId) -> Result<(), StoreError> {
         self.check()?;
         let freed = self.map.drop_branch(branch)?;
+        self.meta.set_name(branch, "");
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
         self.append(K_DROP_BRANCH, &branch.get().to_le_bytes())
     }
@@ -380,6 +495,7 @@ impl Store {
     pub fn drop_seal(&mut self, seal: LayerId) -> Result<(), StoreError> {
         self.check()?;
         let freed = self.map.drop_seal(seal)?;
+        self.meta.seals.remove(&seal);
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
         self.append(K_DROP_SEAL, &seal.get().to_le_bytes())
     }
@@ -444,7 +560,7 @@ fn read_record(r: &mut impl Read, prev: &[u8; HASH]) -> io::Result<Option<Record
     let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
     let len = u32::from_le_bytes(head[4..8].try_into().unwrap());
     let kind = head[8];
-    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_FLUSH).contains(&kind) {
+    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_NAME).contains(&kind) {
         return Ok(None);
     }
     let mut body = vec![0u8; len as usize];
@@ -499,7 +615,7 @@ impl Pending {
 /// Apply one verified record to `map`.  Returns the garbage bytes it made.
 /// A record that does not fit its kind, or that the map refuses, means the
 /// log contradicts itself: refused, never skipped.
-fn replay(map: &mut Map, p: &Pending) -> Result<u64, StoreError> {
+fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError> {
     let bad = |error| StoreError::Replay { lsn: p.lsn, error };
     let f = &p.fields;
     let need = |n: usize| if f.len() == n && (p.kind == K_WRITE || p.data_len == 0) { Ok(()) } else { Err(bad(MapError::Overflow)) };
@@ -528,7 +644,8 @@ fn replay(map: &mut Map, p: &Pending) -> Result<u64, StoreError> {
         }
         K_ROOT => {
             need(0)?;
-            map.root_seal(p.lsn);
+            let id = map.root_seal(p.lsn);
+            meta.seals.insert(id, SealInfo { origin: None, tag: Vec::new() });
             0
         }
         K_FORK => {
@@ -537,21 +654,87 @@ fn replay(map: &mut Map, p: &Pending) -> Result<u64, StoreError> {
             0
         }
         K_SEAL => {
-            need(8)?;
-            map.seal(layer(0), p.lsn).map_err(bad)?;
+            if f.len() < 8 || f.len() > 8 + MAX_TAG {
+                return Err(StoreError::ReplayMeta { lsn: p.lsn, reason: "bad Seal record length" });
+            }
+            let branch = layer(0);
+            let seal = map.seal(branch, p.lsn).map_err(bad)?;
+            meta.seals.insert(seal, SealInfo { origin: Some(branch), tag: f[8..].to_vec() });
             0
         }
         K_DROP_BRANCH => {
             need(8)?;
-            map.drop_branch(layer(0)).map_err(bad)?.len() as u64
+            let freed = map.drop_branch(layer(0)).map_err(bad)?.len() as u64;
+            meta.set_name(layer(0), "");
+            freed
         }
         K_DROP_SEAL => {
             need(8)?;
-            map.drop_seal(layer(0)).map_err(bad)?.len() as u64
+            let freed = map.drop_seal(layer(0)).map_err(bad)?.len() as u64;
+            meta.seals.remove(&layer(0));
+            freed
+        }
+        K_NAME => {
+            let meta_err = |reason| StoreError::ReplayMeta { lsn: p.lsn, reason };
+            if f.len() < 8 || f.len() > 8 + MAX_NAME {
+                return Err(meta_err("bad Name record length"));
+            }
+            let branch = layer(0);
+            let name = std::str::from_utf8(&f[8..]).map_err(|_| meta_err("name is not UTF-8"))?;
+            if !name.is_empty() && !valid_name(name) {
+                return Err(meta_err("bad name"));
+            }
+            if map.kind(branch).map_err(bad)? != Kind::Branch {
+                return Err(meta_err("names a Seal"));
+            }
+            if meta.names.get(name).is_some_and(|&other| other != branch) {
+                return Err(meta_err("name taken by another branch"));
+            }
+            meta.set_name(branch, name);
+            0
         }
         _ => unreachable!("read_record checks the kind; Flush is not pending"),
     };
     Ok(freed * BLOCK)
+}
+
+/// What a live Seal carries besides its blocks.
+#[derive(Debug)]
+struct SealInfo {
+    /// The branch it was made from; `None` for a root Seal.
+    origin: Option<LayerId>,
+    tag: Vec<u8>,
+}
+
+/// Tags, origins and names, kept beside the map.
+#[derive(Debug, Default)]
+struct Meta {
+    /// Live Seals, by id (ids grow, so this is creation order).
+    seals: BTreeMap<LayerId, SealInfo>,
+    /// Name to branch, and back.
+    names: HashMap<String, LayerId>,
+    by_layer: HashMap<LayerId, String>,
+}
+
+impl Meta {
+    /// Name `branch` (empty: no name), freeing any name it had.  The
+    /// caller has checked the name is free.
+    fn set_name(&mut self, branch: LayerId, name: &str) {
+        if let Some(old) = self.by_layer.remove(&branch) {
+            self.names.remove(&old);
+        }
+        if !name.is_empty() {
+            self.names.insert(name.to_string(), branch);
+            self.by_layer.insert(branch, name.to_string());
+        }
+    }
+}
+
+/// 1 to [`MAX_NAME`] bytes of `A-Z a-z 0-9 _ . : / -`: what dataset names
+/// use, and safe in the daemon's line protocol.
+fn valid_name(name: &str) -> bool {
+    (1..=MAX_NAME).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'))
 }
 
 /// A reader over `file[pos..end]` that does not move the file's cursor.
@@ -811,6 +994,120 @@ mod tests {
     }
 
     #[test]
+    fn tags_origins_and_names_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (root, a, b, s1, s2, s3);
+        {
+            let mut s = Store::create(&path).unwrap();
+            root = s.root_seal().unwrap();
+            a = s.fork(root).unwrap();
+            s.name(a, "tank/taso/vessel-a").unwrap();
+            s.write(a, 0, &blocks(1, 1), false).unwrap();
+            s1 = s.seal_tagged(a, b"lsn=7 hash=aa").unwrap();
+            s.write(a, 0, &blocks(2, 1), false).unwrap();
+            s2 = s.seal_tagged(a, &[0xff; MAX_TAG]).unwrap();
+            b = s.fork(s1).unwrap();
+            s.name(b, "tank/taso/vessel-b").unwrap();
+            s3 = s.seal(b).unwrap();
+            s.flush().unwrap();
+        }
+        let (s, _) = Store::open(&path).unwrap();
+        assert_eq!(s.find("tank/taso/vessel-a"), Some(a));
+        assert_eq!(s.find("tank/taso/vessel-b"), Some(b));
+        assert_eq!(s.name_of(a), Some("tank/taso/vessel-a"));
+        assert_eq!(s.tag(s1), Some(&b"lsn=7 hash=aa"[..]));
+        assert_eq!(s.tag(s2), Some(&[0xff; MAX_TAG][..]));
+        assert_eq!(s.tag(s3), Some(&b""[..]));
+        assert_eq!(s.tag(root), Some(&b""[..]));
+        assert_eq!((s.origin(s1), s.origin(s3), s.origin(root)), (Some(a), Some(b), None));
+        assert_eq!(s.seals_of(a), vec![s1, s2], "a's own Seals, oldest first");
+        assert_eq!(s.seals_of(b), vec![s3], "b's own Seals only, not the one it was forked from");
+        assert_eq!(read1(&s, a, 0), 2, "the name stays with the branch across Seals");
+    }
+
+    #[test]
+    fn name_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = new_store(&dir);
+        let root = s.root_seal().unwrap();
+        let (a, b) = (s.fork(root).unwrap(), s.fork(root).unwrap());
+        s.name(a, "x").unwrap();
+        let lsn = s.lsn();
+        assert!(matches!(s.name(b, "x"), Err(StoreError::NameTaken(_))));
+        assert!(matches!(s.name(root, "r"), Err(StoreError::Map(MapError::NotABranch(_)))));
+        for bad in ["has space", "tab\t", "ä", &"n".repeat(MAX_NAME + 1)] {
+            assert!(matches!(s.name(b, bad), Err(StoreError::BadName(_))), "{bad:?}");
+        }
+        assert!(matches!(s.seal_tagged(b, &[0; MAX_TAG + 1]), Err(StoreError::BadTag(_))));
+        assert_eq!(s.lsn(), lsn, "refusals append nothing");
+        s.name(a, "x").unwrap(); // naming again with the same name is fine
+        s.name(a, "y").unwrap(); // renaming frees the old name
+        assert_eq!((s.find("x"), s.find("y")), (None, Some(a)));
+        s.name(b, "x").unwrap();
+        s.name(b, "").unwrap(); // taking the name away
+        assert_eq!((s.find("x"), s.name_of(b)), (None, None));
+        s.drop_branch(a).unwrap(); // dropping frees the name
+        assert_eq!(s.find("y"), None);
+        let c = s.fork(root).unwrap();
+        s.name(c, "y").unwrap();
+        let sc = s.seal(c).unwrap();
+        s.drop_seal(sc).unwrap_err(); // c stands on it
+        s.drop_branch(c).unwrap();
+        s.drop_seal(sc).unwrap();
+        assert_eq!((s.tag(sc), s.origin(sc), s.seals_of(c)), (None, None, vec![]));
+        s.flush().unwrap();
+        let path = s.path().to_path_buf();
+        drop(s);
+        let (s, _) = Store::open(&path).unwrap();
+        assert_eq!((s.find("x"), s.find("y"), s.name_of(b)), (None, None, None));
+    }
+
+    #[test]
+    fn a_name_after_the_last_flush_is_cut_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let a;
+        {
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            a = s.fork(root).unwrap();
+            s.name(a, "kept").unwrap();
+            s.flush().unwrap();
+            s.name(a, "lost").unwrap();
+        }
+        let (s, rec) = Store::open(&path).unwrap();
+        assert!(rec.cut > 0);
+        assert_eq!((s.find("kept"), s.find("lost")), (Some(a), None));
+    }
+
+    #[test]
+    fn a_log_in_the_spike_format_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old");
+        let mut header = [0u8; HEADER_LEN as usize];
+        header[..8].copy_from_slice(OLD_MAGIC);
+        std::fs::write(&path, header).unwrap();
+        assert!(matches!(Store::open(&path), Err(StoreError::OldFormat)));
+    }
+
+    #[test]
+    fn verified_name_records_that_do_not_replay_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let (a, b) = (s.fork(root).unwrap(), s.fork(root).unwrap());
+        s.name(a, "x").unwrap();
+        let mut body = b.get().to_le_bytes().to_vec();
+        body.extend_from_slice(b"x"); // a second branch with the same name
+        s.append(K_NAME, &body).unwrap();
+        s.append(K_FLUSH, &[]).unwrap();
+        drop(s);
+        assert!(matches!(Store::open(&path), Err(StoreError::ReplayMeta { reason: "name taken by another branch", .. })));
+    }
+
+    #[test]
     fn garbage_is_counted_for_overwrites_discards_and_drops() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = new_store(&dir);
@@ -834,13 +1131,17 @@ mod tests {
     // still contains, never in between.
 
     /// What every live layer reads, per block, after a flush.
-    type Snapshot = BTreeMap<LayerId, Vec<u8>>;
+    /// Per live layer: its blocks, and its name, tag and origin.
+    type Snapshot = BTreeMap<LayerId, (Vec<u8>, String)>;
 
     fn snapshot(s: &Store, layers: &[LayerId], span: u64) -> Snapshot {
         layers
             .iter()
             .filter(|l| s.map().kind(**l).is_ok())
-            .map(|l| (*l, (0..span).map(|b| read1(s, *l, b)).collect()))
+            .map(|l| {
+                let meta = format!("{:?} {:?} {:?}", s.name_of(*l), s.tag(*l), s.origin(*l));
+                (*l, ((0..span).map(|b| read1(s, *l, b)).collect(), meta))
+            })
             .collect()
     }
 
@@ -849,7 +1150,8 @@ mod tests {
         Write(usize, u64, u8, u8, bool),
         Discard(usize, u64, u64),
         Fork(usize),
-        Seal(usize),
+        Seal(usize, u8),
+        Name(usize, u8),
         Flush,
     }
 
@@ -858,7 +1160,8 @@ mod tests {
             6 => (0usize..6, 0u64..6, 1u8..4, 1u8..255, any::<bool>()).prop_map(|(i, b, n, v, f)| Op::Write(i, b, n, v, f)),
             1 => (0usize..6, 0u64..6, 0u64..3).prop_map(|(i, b, n)| Op::Discard(i, b, n)),
             1 => (0usize..6).prop_map(Op::Fork),
-            1 => (0usize..6).prop_map(Op::Seal),
+            1 => (0usize..6, 0u8..3).prop_map(|(i, t)| Op::Seal(i, t)),
+            1 => (0usize..6, 0u8..3).prop_map(|(i, n)| Op::Name(i, n)),
             2 => Just(Op::Flush),
         ]
     }
@@ -885,7 +1188,12 @@ mod tests {
                     }
                     false
                 }
-                Op::Seal(i) => match s.seal(pick(i)) {
+                Op::Name(i, n) => {
+                    let name = if n == 0 { String::new() } else { format!("n{n}") };
+                    let _ = s.name(pick(i), &name);
+                    false
+                }
+                Op::Seal(i, t) => match s.seal_tagged(pick(i), &vec![t; t as usize]) {
                     Ok(l) => {
                         layers.push(l);
                         true
@@ -922,8 +1230,9 @@ mod tests {
         let mut s = Store::create(&path).unwrap();
         let ops = [
             Op::Fork(0), Op::Write(1, 0, 1, 10, false), Op::Write(1, 1, 2, 11, false), Op::Flush,
-            Op::Write(1, 0, 1, 12, false), Op::Discard(1, 1, 1), Op::Seal(1), Op::Fork(2),
-            Op::Write(3, 2, 1, 13, false), Op::Write(1, 2, 1, 14, true), Op::Write(3, 0, 1, 15, false),
+            Op::Name(1, 1), Op::Write(1, 0, 1, 12, false), Op::Discard(1, 1, 1), Op::Seal(1, 2), Op::Fork(2),
+            Op::Name(3, 2), Op::Write(3, 2, 1, 13, false), Op::Write(1, 2, 1, 14, true), Op::Name(1, 0),
+            Op::Write(3, 0, 1, 15, false),
         ];
         let (layers, points) = run(&mut s, &ops);
         drop(s);
