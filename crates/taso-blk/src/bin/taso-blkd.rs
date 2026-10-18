@@ -14,14 +14,25 @@
 //! | command          | does                                             | answer               |
 //! |------------------|--------------------------------------------------|----------------------|
 //! | `root`           | a Template's first Seal (empty, zeros)           | `ok <seal>`          |
-//! | `fork <seal>`    | a branch on the Seal, and a device for it        | `ok <branch> <dev>`  |
-//! | `attach <branch>`| a device for an existing branch (after restart)  | `ok <dev>`           |
+//! | `branch <seal>`  | a branch on the Seal, no device (lazy)           | `ok <branch>`        |
+//! | `fork <seal>`    | `branch`, then `attach`                          | `ok <branch> <dev>`  |
+//! | `attach <branch>`| a device for a branch (before mounting it)       | `ok <dev>`           |
 //! | `seal <branch>`  | freeze the branch as a Seal; device stays up     | `ok <seal>`          |
 //! | `detach <branch>`| stop the branch's device                         | `ok`                 |
 //! | `drop <layer>`   | detach if needed, drop the branch or Seal        | `ok`                 |
 //! | `flush`          | end a group                                      | `ok <lsn>`           |
 //! | `stats`          | counters, for measurements                       | `ok key=value ...`   |
 //! | `quit`           | stop every device, flush, then exit              | `ok`                 |
+//!
+//! # Lazy devices
+//!
+//! A branch is an entry in the map and costs a record in the log; a device
+//! is a kernel object with threads, descriptors and kernel memory, and
+//! takes milliseconds to create and remove (K2, K3, K7).  So the device is
+//! separate: `branch` makes a branch only, `attach` gives it a device while
+//! something mounts it, `detach` takes the device away again.  Many
+//! candidate branches cost map entries; devices exist only for the ones in
+//! use.  A new branch is durable at the next flush, like any map change.
 //!
 //! A Seal stands for every record before it, so a caller sealing a
 //! mounted ext4 makes ext4 consistent first (`fsfreeze -f`, or unmount)
@@ -145,7 +156,12 @@ fn main() {
 
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).unwrap_or_else(|e| fail(&format!("cannot bind {}: {e}", socket.display())));
-    eprintln!("taso-blkd: serving {} on {}", log.display(), socket.display());
+    eprintln!(
+        "taso-blkd: serving {} on {} (open-file limit {})",
+        log.display(),
+        socket.display(),
+        raise_open_files()
+    );
 
     let daemon = Arc::new(Daemon { store: Arc::new(Mutex::new(store)), devices: Mutex::new(HashMap::new()), geometry: g });
     for conn in listener.incoming() {
@@ -165,6 +181,28 @@ fn main() {
             }
         });
     }
+}
+
+/// Raise the open-file soft limit to the hard limit and return the soft
+/// limit in force.  Each live device holds about two descriptors (its
+/// character device and its io_uring); the usual soft limit of 1024 stopped
+/// K3 near 475 devices.
+fn raise_open_files() -> u64 {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: getrlimit and setrlimit only read and write the struct passed
+    // by reference, which lives for the whole call.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return 0;
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            let want = libc::rlimit { rlim_cur: lim.rlim_max, rlim_max: lim.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
+                lim = want;
+            }
+        }
+    }
+    lim.rlim_cur
 }
 
 fn fail(msg: &str) -> ! {
@@ -204,6 +242,10 @@ impl Daemon {
         let store_err = |e: taso_blk::store::StoreError| e.to_string();
         match words[0] {
             "root" => Ok(self.store.lock().unwrap().root_seal().map_err(store_err)?.to_string()),
+            "branch" => {
+                let seal = layer(1)?;
+                Ok(self.store.lock().unwrap().fork(seal).map_err(store_err)?.to_string())
+            }
             "fork" => {
                 let seal = layer(1)?;
                 let branch = self.store.lock().unwrap().fork(seal).map_err(store_err)?;
