@@ -324,6 +324,114 @@ impl Map {
 
     // ── internals ───────────────────────────────────────────────────
 
+    /// Append the map to `out`, for a checkpoint ([`Map::decode`] reads it
+    /// back).  Child counts and depths are not written: they follow from
+    /// the parents.
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        let put = |out: &mut Vec<u8>, v: u64| out.extend_from_slice(&v.to_le_bytes());
+        put(out, self.next);
+        let mut ids: Vec<&LayerId> = self.layers.keys().collect();
+        ids.sort();
+        put(out, ids.len() as u64);
+        for id in ids {
+            let l = &self.layers[id];
+            put(out, id.0);
+            match l.kind {
+                Kind::Branch => out.push(0),
+                Kind::Seal { lsn } => {
+                    out.push(1);
+                    put(out, lsn);
+                }
+            }
+            put(out, l.parent.map_or(u64::MAX, |p| p.0));
+            put(out, l.blocks.len() as u64);
+            for (&lba, loc) in &l.blocks {
+                put(out, lba);
+                match loc {
+                    Loc::Zero => out.push(0),
+                    Loc::Log(off) => {
+                        out.push(1);
+                        put(out, *off);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read a map written by [`Map::encode`] from the front of `b`.  `None`
+    /// if it is not one: short, unknown tags, ids at or past `next`, a
+    /// parent that is missing or a branch, or a cycle.  `max_off` bounds
+    /// every log location (the checkpoint's end of log).
+    pub(crate) fn decode(b: &mut &[u8], max_off: u64) -> Option<Map> {
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            let (h, t) = (b.get(..n)?, b.get(n..)?);
+            *b = t;
+            Some(h)
+        }
+        let u = |b: &mut &[u8]| take(b, 8).map(|x| u64::from_le_bytes(x.try_into().unwrap()));
+        let byte = |b: &mut &[u8]| take(b, 1).map(|x| x[0]);
+        let next = u(b)?;
+        let n = u(b)?;
+        let mut layers = HashMap::new();
+        for _ in 0..n {
+            let id = u(b)?;
+            if id >= next {
+                return None;
+            }
+            let kind = match byte(b)? {
+                0 => Kind::Branch,
+                1 => Kind::Seal { lsn: u(b)? },
+                _ => return None,
+            };
+            let parent = match u(b)? {
+                u64::MAX => None,
+                p => Some(LayerId(p)),
+            };
+            let nb = u(b)?;
+            let mut blocks = BTreeMap::new();
+            for _ in 0..nb {
+                let lba = u(b)?;
+                let loc = match byte(b)? {
+                    0 => Loc::Zero,
+                    1 => {
+                        let off = u(b)?;
+                        if off.checked_add(BLOCK)? > max_off {
+                            return None;
+                        }
+                        Loc::Log(off)
+                    }
+                    _ => return None,
+                };
+                blocks.insert(lba, loc);
+            }
+            if layers.insert(LayerId(id), Layer { kind, parent, blocks, children: 0, depth: 0 }).is_some() {
+                return None;
+            }
+        }
+        // Parents: present and Seals; children counted; depths by walking
+        // (a walk longer than the layer count is a cycle).
+        let ids: Vec<LayerId> = layers.keys().copied().collect();
+        for id in &ids {
+            if let Some(p) = layers[id].parent {
+                match layers.get_mut(&p) {
+                    Some(pl) if matches!(pl.kind, Kind::Seal { .. }) => pl.children += 1,
+                    _ => return None,
+                }
+            }
+            let mut depth = 0u32;
+            let mut cur = layers[id].parent;
+            while let Some(p) = cur {
+                depth += 1;
+                if depth as usize > layers.len() {
+                    return None;
+                }
+                cur = layers[&p].parent;
+            }
+            layers.get_mut(id).expect("listed").depth = depth;
+        }
+        Some(Map { layers, next })
+    }
+
     fn insert(&mut self, kind: Kind, parent: Option<LayerId>, blocks: BTreeMap<u64, Loc>) -> LayerId {
         let id = LayerId(self.next);
         self.next += 1;

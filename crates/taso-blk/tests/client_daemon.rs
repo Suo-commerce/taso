@@ -106,8 +106,10 @@ fn the_client_and_the_daemon_agree() {
     c.drop_layer(s1).unwrap_err(); // a stands on s2, which stands on s1
     assert!(c.flush().unwrap() > 0);
     assert_eq!(c.stats().unwrap()["devices"], "0");
+    assert!(c.checkpoint().unwrap() > 0);
     c.quit().unwrap();
     assert!(d.wait());
+    assert!(dir.path().join("log.ckpt").exists(), "quit leaves a checkpoint");
 
     let d = Daemon::start(&log, &sock);
     let mut c = Client::connect(&sock).unwrap();
