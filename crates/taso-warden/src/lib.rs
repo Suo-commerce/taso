@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod blk;
 pub mod chronicle;
 pub mod coordinator;
 pub mod coordsrv;

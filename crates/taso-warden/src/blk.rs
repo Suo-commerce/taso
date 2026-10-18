@@ -1,0 +1,809 @@
+//! The block log as a Warden storage backend (adoption step 4 of the plan
+//! `Taso_plan_blk_adoption_2026-10-18`).
+//!
+//! [`BlkPool`] and [`BlkLayers`] implement [`Pool`] and [`Layers`] over
+//! `taso-blkd`, the way [`crate::zfs::Zfs`] does over ZFS.  Nothing above
+//! the two traits changes: a Vessel's dataset is a named branch, a Seal
+//! layer is a block-log Seal tagged with the Seal record's lsn and hash,
+//! and a fork is a branch of that Seal.
+//!
+//! | Trait call | Block log |
+//! |---|---|
+//! | `create` | a root Seal, a branch named after the dataset, a device, `mkfs.ext4`, mount |
+//! | `clone` | a branch of the source's Seal bound to (lsn, hash), a device, mount |
+//! | `info` | name → branch; origin and parent read from the branch's ancestry |
+//! | `snapshot` | freeze ext4 (only when mounted from the branch's device), Seal with the tag, thaw |
+//! | `list` | the branch's own Seals with a Taso tag, in lsn order |
+//! | `destroy` | drop that Seal (refused while something stands on it) |
+//! | `rollback` | not yet: the trait's default refusal (needs a branch reset in the store) |
+//! | `receive*` | not yet: rebirth needs the log off the node (adoption step 5) |
+//!
+//! # Origin and parent without extra state
+//!
+//! ZFS keeps a clone's origin (`source@taso-seal-<lsn>`) and `taso:parent`.
+//! Here both are read from the store: walk the branch's parents past the
+//! Seals the branch made itself; the first Seal that another branch made is
+//! the clone's origin, and its tag holds the parent hash.  A walk that ends
+//! at a root Seal means a void birth.  A dataset name that ends up there
+//! comes from the origin branch's name, so the origin must still exist (as
+//! with ZFS, where the origin dataset cannot be destroyed under a clone).
+//!
+//! # Freezing
+//!
+//! A Seal stands for every block before it, so a mounted ext4 must be
+//! consistent first.  [`BlkLayers::snapshot`] freezes the mountpoint only
+//! after checking that it is mounted from this branch's own device, never
+//! anything else (the lesson of the 2026-10-18 incident: a freeze of a
+//! plain directory freezes the file system holding it).  The thaw always
+//! runs, also when the Seal fails.  A branch that is not mounted is sealed
+//! without a freeze.
+//!
+//! The daemon and the mount commands are behind [`Blkd`] and [`Mounts`],
+//! so the logic is tested here against the real block-log store with an
+//! in-memory mount table; [`Daemon`] and [`System`] are the real ones.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use taso_blk::client::{Client, ClientError, Info};
+use taso_blk::map::LayerId;
+use taso_core::envelope::{HashVal, Lsn};
+
+use crate::chronicle::{LayerError, Layers};
+use crate::vessel::Pool;
+use crate::zfs::{CloneBase, Dataset, DatasetInfo};
+
+// ── tags ────────────────────────────────────────────────────────────
+
+/// Length of a Taso tag: lsn (8 bytes, little-endian) and hash (32).
+pub const TAG_LEN: usize = 40;
+
+/// The tag binding a block-log Seal to the Seal record at `lsn` with `hash`.
+pub fn tag(lsn: Lsn, hash: HashVal) -> [u8; TAG_LEN] {
+    let mut t = [0u8; TAG_LEN];
+    t[..8].copy_from_slice(&lsn.get().to_le_bytes());
+    t[8..].copy_from_slice(hash.as_bytes());
+    t
+}
+
+/// The binding in a tag, if it is a Taso tag.
+pub fn untag(t: &[u8]) -> Option<(Lsn, HashVal)> {
+    if t.len() != TAG_LEN {
+        return None;
+    }
+    let lsn = u64::from_le_bytes(t[..8].try_into().ok()?);
+    Some((Lsn::new(lsn), HashVal::from_bytes(t[8..].try_into().ok()?)))
+}
+
+// ── the daemon and the mounts ───────────────────────────────────────
+
+/// What the pool needs from `taso-blkd` (implemented by [`Daemon`]).
+pub trait Blkd {
+    /// A new root Seal (zeros).
+    fn root(&mut self) -> Result<LayerId, LayerError>;
+    /// A branch of `seal` named `name`; a taken name makes nothing.
+    fn branch(&mut self, seal: LayerId, name: &str) -> Result<LayerId, LayerError>;
+    /// A block device for `branch`.
+    fn attach(&mut self, branch: LayerId) -> Result<PathBuf, LayerError>;
+    /// Seal `branch` with `tag`.
+    fn seal(&mut self, branch: LayerId, tag: &[u8]) -> Result<LayerId, LayerError>;
+    /// The live branch named `name`.
+    fn find(&mut self, name: &str) -> Result<Option<LayerId>, LayerError>;
+    /// The live Seals made from `branch`, oldest first, with tags.
+    fn seals(&mut self, branch: LayerId) -> Result<Vec<(LayerId, Vec<u8>)>, LayerError>;
+    /// What a layer is.
+    fn info(&mut self, layer: LayerId) -> Result<Info, LayerError>;
+    /// Drop a branch or a Seal nothing stands on.
+    fn drop_layer(&mut self, layer: LayerId) -> Result<(), LayerError>;
+    /// Make every change so far durable.
+    fn flush(&mut self) -> Result<(), LayerError>;
+}
+
+/// `taso-blkd` over its socket.  Connects on first use and again after a
+/// socket error (an answer may have been lost; the next call starts on a
+/// fresh connection).
+pub struct Daemon {
+    socket: PathBuf,
+    client: Option<Client>,
+}
+
+impl Daemon {
+    /// The daemon listening on `socket`.
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        Self { socket: socket.into(), client: None }
+    }
+
+    fn call<T>(&mut self, f: impl FnOnce(&mut Client) -> Result<T, ClientError>) -> Result<T, LayerError> {
+        if self.client.is_none() {
+            self.client = Some(Client::connect(&self.socket)?);
+        }
+        let c = self.client.as_mut().expect("connected above");
+        match f(c) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                if matches!(e, ClientError::Io(_)) {
+                    self.client = None;
+                }
+                Err(e.into())
+            }
+        }
+    }
+}
+
+impl Blkd for Daemon {
+    fn root(&mut self) -> Result<LayerId, LayerError> {
+        self.call(|c| c.root())
+    }
+    fn branch(&mut self, seal: LayerId, name: &str) -> Result<LayerId, LayerError> {
+        self.call(|c| c.branch(seal, Some(name)))
+    }
+    fn attach(&mut self, branch: LayerId) -> Result<PathBuf, LayerError> {
+        self.call(|c| c.attach(branch))
+    }
+    fn seal(&mut self, branch: LayerId, tag: &[u8]) -> Result<LayerId, LayerError> {
+        self.call(|c| c.seal(branch, tag))
+    }
+    fn find(&mut self, name: &str) -> Result<Option<LayerId>, LayerError> {
+        self.call(|c| c.find(name))
+    }
+    fn seals(&mut self, branch: LayerId) -> Result<Vec<(LayerId, Vec<u8>)>, LayerError> {
+        self.call(|c| c.seals(branch))
+    }
+    fn info(&mut self, layer: LayerId) -> Result<Info, LayerError> {
+        self.call(|c| c.info(layer))
+    }
+    fn drop_layer(&mut self, layer: LayerId) -> Result<(), LayerError> {
+        self.call(|c| c.drop_layer(layer))
+    }
+    fn flush(&mut self) -> Result<(), LayerError> {
+        self.call(|c| c.flush()).map(|_| ())
+    }
+}
+
+/// The file-system operations the pool needs (implemented by [`System`]).
+pub trait Mounts {
+    /// Make an ext4 file system on `dev`.
+    fn mkfs(&self, dev: &Path) -> io::Result<()>;
+    /// Mount `dev` on the directory `dir` (created if missing).
+    fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()>;
+    /// The device mounted on exactly `dir`, if something is.
+    fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>>;
+    /// Freeze the file system mounted on `dir`.
+    fn freeze(&self, dir: &Path) -> io::Result<()>;
+    /// Thaw it.
+    fn thaw(&self, dir: &Path) -> io::Result<()>;
+}
+
+/// The real [`Mounts`]: `mkfs.ext4`, `mount`, `fsfreeze`, and
+/// `/proc/self/mountinfo`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct System;
+
+fn run(cmd: &mut Command) -> io::Result<()> {
+    let out = cmd.output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("{cmd:?}: {}", String::from_utf8_lossy(&out.stderr).trim())))
+    }
+}
+
+impl Mounts for System {
+    fn mkfs(&self, dev: &Path) -> io::Result<()> {
+        // nodiscard: a fresh branch reads zeros already; discarding the
+        // whole device would only write records.
+        run(Command::new("mkfs.ext4").args(["-q", "-F", "-E", "nodiscard"]).arg(dev))
+    }
+    fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        run(Command::new("mount").arg(dev).arg(dir))
+    }
+    fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
+        Ok(mount_source(&std::fs::read_to_string("/proc/self/mountinfo")?, dir))
+    }
+    fn freeze(&self, dir: &Path) -> io::Result<()> {
+        run(Command::new("fsfreeze").arg("-f").arg(dir))
+    }
+    fn thaw(&self, dir: &Path) -> io::Result<()> {
+        run(Command::new("fsfreeze").arg("-u").arg(dir))
+    }
+}
+
+/// The source of the last mount on exactly `dir` in a mountinfo text
+/// (`proc(5)`: field 5 is the mount point, the field after `-` and the
+/// file-system type is the source; spaces are written as `\040`).
+fn mount_source(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
+    let unescape = |s: &str| s.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\");
+    let want = dir.to_str()?;
+    mountinfo
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            let sep = f.iter().position(|x| *x == "-")?;
+            let source = f.get(sep + 2)?;
+            (unescape(f.get(4)?) == want).then(|| PathBuf::from(unescape(source)))
+        })
+        .last()
+}
+
+// ── the pool ────────────────────────────────────────────────────────
+
+/// Vessel datasets as named branches of a block log.
+pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
+    blkd: Arc<Mutex<D>>,
+    mounts: Arc<M>,
+    mount_root: PathBuf,
+}
+
+impl BlkPool<Daemon, System> {
+    /// The pool served by the daemon on `socket`; dataset `a/b` is mounted
+    /// on `<mount_root>/a/b`.
+    pub fn new(socket: impl Into<PathBuf>, mount_root: impl Into<PathBuf>) -> Self {
+        Self::with(Daemon::new(socket), System, mount_root)
+    }
+}
+
+impl<D: Blkd, M: Mounts> BlkPool<D, M> {
+    /// A pool over any daemon and mounts (tests use fakes).
+    pub fn with(blkd: D, mounts: M, mount_root: impl Into<PathBuf>) -> Self {
+        Self { blkd: Arc::new(Mutex::new(blkd)), mounts: Arc::new(mounts), mount_root: mount_root.into() }
+    }
+
+    /// Where `dataset` is mounted.
+    pub fn mountpoint(&self, dataset: &Dataset) -> PathBuf {
+        self.mount_root.join(dataset.as_str())
+    }
+
+    /// Give `dataset` a device and mount it, if it has none or is not
+    /// mounted (after a daemon restart devices are gone: they are lazy).
+    pub fn ensure_mounted(&self, dataset: &Dataset) -> Result<PathBuf, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let b = d.find(dataset.as_str())?.ok_or_else(|| format!("no dataset {dataset}"))?;
+        self.mount_branch(&mut *d, b, dataset)
+    }
+
+    fn mount_branch(&self, d: &mut D, b: LayerId, dataset: &Dataset) -> Result<PathBuf, LayerError> {
+        let dev = match d.info(b)?.dev {
+            Some(dev) => dev,
+            None => d.attach(b)?,
+        };
+        let mp = self.mountpoint(dataset);
+        match self.mounts.source(&mp)? {
+            Some(src) if src == dev => {}
+            Some(other) => return Err(format!("{} is mounted from {}, not {}", mp.display(), other.display(), dev.display()).into()),
+            None => self.mounts.mount(&dev, &mp)?,
+        }
+        Ok(dev)
+    }
+
+    fn info_locked(&self, d: &mut D, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
+        let Some(b) = d.find(dataset.as_str())? else { return Ok(None) };
+        let (origin, parent) = lineage(d, b)?;
+        Ok(Some(DatasetInfo { dataset: dataset.clone(), mountpoint: Some(self.mountpoint(dataset)), origin, parent }))
+    }
+}
+
+/// A clone's origin (`source@taso-seal-<lsn>`) and parent hash, read from
+/// the ancestry of branch `b`: `(None, None)` for a void birth.
+fn lineage<D: Blkd>(d: &mut D, b: LayerId) -> Result<(Option<String>, Option<HashVal>), LayerError> {
+    let mut cur = d.info(b)?.parent;
+    while let Some(l) = cur {
+        let i = d.info(l)?;
+        if i.origin == Some(b) {
+            cur = i.parent; // a Seal this branch made: keep walking
+            continue;
+        }
+        let Some(src) = i.origin else { return Ok((None, None)) }; // a root Seal: void birth
+        let (lsn, hash) = i.tag.as_deref().and_then(untag).ok_or_else(|| format!("{b}'s origin Seal {l} has no Taso tag"))?;
+        let name = d.info(src)?.name.ok_or_else(|| format!("{b}'s origin branch {src} has no name"))?;
+        let source = Dataset::new(&name).map_err(|e| e.to_string())?;
+        return Ok((Some(source.seal_snapshot(lsn)), Some(hash)));
+    }
+    Err(format!("{b} has no root Seal below it").into())
+}
+
+/// The Seal of `branch` bound to `lsn`: `Ok(None)` if there is none.
+fn seal_at<D: Blkd>(d: &mut D, branch: LayerId, lsn: Lsn) -> Result<Option<(LayerId, HashVal)>, LayerError> {
+    Ok(d.seals(branch)?.into_iter().find_map(|(l, t)| untag(&t).filter(|(n, _)| *n == lsn).map(|(_, h)| (l, h))))
+}
+
+impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
+    type Layers = BlkLayers<D, M>;
+
+    fn create(&self, dataset: &Dataset) -> Result<DatasetInfo, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        if d.find(dataset.as_str())?.is_some() {
+            return Err(format!("dataset {dataset} already exists").into());
+        }
+        let root = d.root()?;
+        let b = d.branch(root, dataset.as_str())?;
+        let made = (|| -> Result<(), LayerError> {
+            d.flush()?;
+            let dev = d.attach(b)?;
+            self.mounts.mkfs(&dev)?;
+            self.mount_branch(&mut *d, b, dataset)?;
+            Ok(())
+        })();
+        if let Err(e) = made {
+            // Take it back so a retry starts clean (an unformatted branch
+            // must not be adopted as an interrupted birth).
+            let _ = d.drop_layer(b);
+            let _ = d.drop_layer(root);
+            let _ = d.flush();
+            return Err(e);
+        }
+        Ok(self.info_locked(&mut *d, dataset)?.expect("just made"))
+    }
+
+    fn clone(&self, source: &Dataset, seal: Lsn, seal_hash: HashVal, target: &Dataset) -> Result<DatasetInfo, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let src = d.find(source.as_str())?.ok_or_else(|| format!("no dataset {source}"))?;
+        let (layer, hash) = seal_at(&mut *d, src, seal)?.ok_or_else(|| format!("no Seal layer {}", source.seal_snapshot(seal)))?;
+        if hash != seal_hash {
+            return Err(format!("Seal layer {} is bound to another record", source.seal_snapshot(seal)).into());
+        }
+        if d.find(target.as_str())?.is_some() {
+            return Err(format!("dataset {target} already exists").into());
+        }
+        let b = d.branch(layer, target.as_str())?;
+        let made = (|| -> Result<(), LayerError> {
+            d.flush()?;
+            self.mount_branch(&mut *d, b, target)?;
+            Ok(())
+        })();
+        if let Err(e) = made {
+            let _ = d.drop_layer(b);
+            let _ = d.flush();
+            return Err(e);
+        }
+        Ok(self.info_locked(&mut *d, target)?.expect("just made"))
+    }
+
+    fn info(&self, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        self.info_locked(&mut *d, dataset)
+    }
+
+    fn layers(&self, dataset: &Dataset) -> BlkLayers<D, M> {
+        BlkLayers {
+            blkd: self.blkd.clone(),
+            mounts: self.mounts.clone(),
+            dataset: dataset.clone(),
+            mountpoint: self.mountpoint(dataset),
+        }
+    }
+
+    fn receive(
+        &self,
+        dataset: &Dataset,
+        _from: Option<(Lsn, HashVal)>,
+        _to: (Lsn, HashVal),
+        _stream: &mut dyn io::Read,
+    ) -> Result<u64, LayerError> {
+        Err(format!("block-log rebirth is not built yet (adoption step 5): cannot receive {dataset}").into())
+    }
+
+    fn receive_clone(
+        &self,
+        dataset: &Dataset,
+        _base: &CloneBase,
+        _to: (Lsn, HashVal),
+        _stream: &mut dyn io::Read,
+    ) -> Result<u64, LayerError> {
+        Err(format!("block-log rebirth is not built yet (adoption step 5): cannot receive {dataset}").into())
+    }
+}
+
+// ── layers ──────────────────────────────────────────────────────────
+
+/// The Seal layers of one dataset.
+pub struct BlkLayers<D: Blkd = Daemon, M: Mounts = System> {
+    blkd: Arc<Mutex<D>>,
+    mounts: Arc<M>,
+    dataset: Dataset,
+    mountpoint: PathBuf,
+}
+
+impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
+    fn branch(&self, d: &mut D) -> Result<LayerId, LayerError> {
+        Ok(d.find(self.dataset.as_str())?.ok_or_else(|| format!("no dataset {}", self.dataset))?)
+    }
+}
+
+impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
+    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let b = self.branch(&mut *d)?;
+        if seal_at(&mut *d, b, lsn)?.is_some() {
+            return Err(format!("Seal layer {} exists", self.dataset.seal_snapshot(lsn)).into());
+        }
+        let t = tag(lsn, hash);
+        let dev = d.info(b)?.dev;
+        let mounted = self.mounts.source(&self.mountpoint)?;
+        match (dev, mounted) {
+            (Some(dev), Some(src)) if src == dev => {
+                self.mounts.freeze(&self.mountpoint)?;
+                let sealed = d.seal(b, &t);
+                let thawed = self.mounts.thaw(&self.mountpoint);
+                sealed?;
+                thawed?;
+            }
+            (_, Some(src)) => {
+                return Err(format!("{} is mounted from {}, not from {}'s device; not freezing it", self.mountpoint.display(), src.display(), self.dataset).into());
+            }
+            (_, None) => {
+                d.seal(b, &t)?; // nothing mounted: the device is quiet
+            }
+        }
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let b = self.branch(&mut *d)?;
+        let by_lsn: BTreeMap<Lsn, HashVal> = d.seals(b)?.into_iter().filter_map(|(_, t)| untag(&t)).collect();
+        Ok(by_lsn.into_iter().collect())
+    }
+
+    fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let b = self.branch(&mut *d)?;
+        if let Some((layer, _)) = seal_at(&mut *d, b, lsn)? {
+            d.drop_layer(layer)?;
+            d.flush()?;
+        }
+        Ok(())
+    }
+}
+
+// ── tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::Coordinator;
+    use crate::segment::Position;
+    use crate::vessel::{Host, Vessel};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use taso_blk::client::LayerKind;
+    use taso_blk::map::Kind;
+    use taso_blk::store::Store;
+    use taso_core::model::WardenId;
+    use taso_core::record::{Namespace, StreamCut, TurnId, Verdict};
+
+    /// [`Blkd`] over a real block-log store, without devices: attach
+    /// hands out `/dev/fake<n>`.  `fail_seal` makes the next seal fail.
+    struct StoreBlkd {
+        _dir: tempfile::TempDir,
+        store: Store,
+        devs: HashMap<LayerId, PathBuf>,
+        fail_seal: bool,
+    }
+
+    impl StoreBlkd {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::create(&dir.path().join("log")).unwrap();
+            Self { _dir: dir, store, devs: HashMap::new(), fail_seal: false }
+        }
+    }
+
+    impl Blkd for StoreBlkd {
+        fn root(&mut self) -> Result<LayerId, LayerError> {
+            Ok(self.store.root_seal()?)
+        }
+        fn branch(&mut self, seal: LayerId, name: &str) -> Result<LayerId, LayerError> {
+            self.store.check_name(name)?;
+            let b = self.store.fork(seal)?;
+            self.store.name(b, name)?;
+            Ok(b)
+        }
+        fn attach(&mut self, branch: LayerId) -> Result<PathBuf, LayerError> {
+            if self.devs.contains_key(&branch) {
+                return Err("already attached".into());
+            }
+            let dev = PathBuf::from(format!("/dev/fake{}", branch.get()));
+            self.devs.insert(branch, dev.clone());
+            Ok(dev)
+        }
+        fn seal(&mut self, branch: LayerId, tag: &[u8]) -> Result<LayerId, LayerError> {
+            if std::mem::take(&mut self.fail_seal) {
+                return Err("injected seal failure".into());
+            }
+            Ok(self.store.seal_tagged(branch, tag)?)
+        }
+        fn find(&mut self, name: &str) -> Result<Option<LayerId>, LayerError> {
+            Ok(self.store.find(name))
+        }
+        fn seals(&mut self, branch: LayerId) -> Result<Vec<(LayerId, Vec<u8>)>, LayerError> {
+            Ok(self.store.seals_of(branch).into_iter().map(|l| (l, self.store.tag(l).unwrap().to_vec())).collect())
+        }
+        fn info(&mut self, l: LayerId) -> Result<Info, LayerError> {
+            let kind = self.store.map().kind(l)?;
+            Ok(Info {
+                kind: if kind == Kind::Branch { LayerKind::Branch } else { LayerKind::Seal },
+                parent: self.store.map().parent(l)?,
+                name: self.store.name_of(l).map(str::to_string),
+                tag: self.store.tag(l).map(<[u8]>::to_vec),
+                origin: self.store.origin(l),
+                dev: self.devs.get(&l).cloned(),
+            })
+        }
+        fn drop_layer(&mut self, l: LayerId) -> Result<(), LayerError> {
+            if self.store.map().kind(l)? == Kind::Branch {
+                self.devs.remove(&l);
+                self.store.drop_branch(l)?;
+            } else {
+                self.store.drop_seal(l)?;
+            }
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), LayerError> {
+            self.store.flush()?;
+            Ok(())
+        }
+    }
+
+    /// An in-memory mount table that records every call.
+    #[derive(Default)]
+    struct FakeMounts {
+        table: RefCell<HashMap<PathBuf, PathBuf>>,
+        frozen: RefCell<Vec<PathBuf>>,
+        calls: RefCell<Vec<String>>,
+        fail_mkfs: RefCell<bool>,
+    }
+
+    impl Mounts for FakeMounts {
+        fn mkfs(&self, dev: &Path) -> io::Result<()> {
+            self.calls.borrow_mut().push(format!("mkfs {}", dev.display()));
+            if *self.fail_mkfs.borrow() {
+                return Err(io::Error::other("mkfs failed"));
+            }
+            Ok(())
+        }
+        fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()> {
+            self.calls.borrow_mut().push(format!("mount {} {}", dev.display(), dir.display()));
+            self.table.borrow_mut().insert(dir.to_path_buf(), dev.to_path_buf());
+            Ok(())
+        }
+        fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
+            Ok(self.table.borrow().get(dir).cloned())
+        }
+        fn freeze(&self, dir: &Path) -> io::Result<()> {
+            assert!(self.table.borrow().contains_key(dir), "froze {} which is not a mount", dir.display());
+            self.calls.borrow_mut().push(format!("freeze {}", dir.display()));
+            self.frozen.borrow_mut().push(dir.to_path_buf());
+            Ok(())
+        }
+        fn thaw(&self, dir: &Path) -> io::Result<()> {
+            self.calls.borrow_mut().push(format!("thaw {}", dir.display()));
+            self.frozen.borrow_mut().retain(|d| d != dir);
+            Ok(())
+        }
+    }
+
+    type TestPool = BlkPool<StoreBlkd, FakeMounts>;
+
+    fn pool() -> TestPool {
+        BlkPool::with(StoreBlkd::new(), FakeMounts::default(), "/mnt/taso")
+    }
+
+    fn ds(n: &str) -> Dataset {
+        Dataset::new(n).unwrap()
+    }
+
+    fn h(b: u8) -> HashVal {
+        HashVal::from_bytes([b; 32])
+    }
+
+    fn calls(p: &TestPool) -> Vec<String> {
+        std::mem::take(&mut *p.mounts.calls.borrow_mut())
+    }
+
+    #[test]
+    fn tags_round_trip_and_other_tags_are_not_ours() {
+        let t = tag(Lsn::new(7), h(9));
+        assert_eq!(untag(&t), Some((Lsn::new(7), h(9))));
+        assert_eq!(untag(&t[..39]), None);
+        assert_eq!(untag(b""), None);
+    }
+
+    #[test]
+    fn mountinfo_is_read_for_the_exact_mount_point() {
+        let mi = "\
+22 1 252:2 / / rw,relatime shared:1 - ext4 /dev/vda2 rw
+90 22 259:3 / /mnt/taso/tank/v-1 rw,relatime shared:50 - ext4 /dev/ublkb3 rw
+91 22 259:4 / /mnt/taso/tank/v-1/sub rw - ext4 /dev/ublkb4 rw
+92 22 0:50 / /mnt/with\\040space rw - tmpfs tmp\\040fs rw
+93 90 259:9 / /mnt/taso/tank/v-1 rw - ext4 /dev/ublkb9 rw
+";
+        assert_eq!(mount_source(mi, Path::new("/mnt/taso/tank/v-1")), Some("/dev/ublkb9".into()), "the last mount on top wins");
+        assert_eq!(mount_source(mi, Path::new("/mnt/with space")), Some("tmp fs".into()));
+        assert_eq!(mount_source(mi, Path::new("/mnt/taso/tank")), None, "a directory under / is not a mount point");
+        assert_eq!(mount_source(mi, Path::new("/")), Some("/dev/vda2".into()));
+    }
+
+    #[test]
+    fn create_makes_a_formatted_mounted_void_born_dataset() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        let info = p.create(&a).unwrap();
+        assert_eq!(info.mountpoint, Some(PathBuf::from("/mnt/taso/tank/v-a")));
+        assert_eq!((info.origin, info.parent), (None, None));
+        let dev = {
+            let mut d = p.blkd.lock().unwrap();
+            let b = d.find("tank/v-a").unwrap().unwrap();
+            d.info(b).unwrap().dev.unwrap()
+        };
+        assert_eq!(calls(&p), [format!("mkfs {}", dev.display()), format!("mount {} /mnt/taso/tank/v-a", dev.display())]);
+        assert!(p.layers(&a).list().unwrap().is_empty());
+        assert!(p.create(&a).is_err(), "a dataset is created once");
+        assert_eq!(p.info(&ds("tank/none")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_failed_create_leaves_nothing_to_adopt() {
+        let p = pool();
+        *p.mounts.fail_mkfs.borrow_mut() = true;
+        assert!(p.create(&ds("tank/v-a")).is_err());
+        assert_eq!(p.info(&ds("tank/v-a")).unwrap(), None, "no half-made dataset");
+        *p.mounts.fail_mkfs.borrow_mut() = false;
+        p.create(&ds("tank/v-a")).unwrap();
+    }
+
+    #[test]
+    fn snapshots_freeze_only_their_own_mount_and_list_in_order() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        calls(&p);
+        let mut l = p.layers(&a);
+        l.snapshot(Lsn::new(2), h(2)).unwrap();
+        l.snapshot(Lsn::new(5), h(5)).unwrap();
+        assert_eq!(calls(&p), ["freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a", "freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a"]);
+        assert_eq!(l.list().unwrap(), [(Lsn::new(2), h(2)), (Lsn::new(5), h(5))]);
+        assert!(l.snapshot(Lsn::new(5), h(6)).is_err(), "one layer per lsn");
+        assert_eq!(l.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_mountpoint_mounted_from_elsewhere_is_never_frozen() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.mounts.table.borrow_mut().insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
+        calls(&p);
+        assert!(p.layers(&a).snapshot(Lsn::new(2), h(2)).is_err());
+        assert!(calls(&p).is_empty(), "no freeze, no seal");
+        assert!(p.layers(&a).list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_thaw_runs_when_the_seal_fails() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        calls(&p);
+        p.blkd.lock().unwrap().fail_seal = true;
+        assert!(p.layers(&a).snapshot(Lsn::new(2), h(2)).is_err());
+        assert_eq!(calls(&p), ["freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a"]);
+        assert!(p.mounts.frozen.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_unmounted_branch_is_sealed_without_a_freeze() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.mounts.table.borrow_mut().clear(); // as after a reboot
+        calls(&p);
+        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        assert!(calls(&p).is_empty());
+        assert_eq!(p.layers(&a).list().unwrap(), [(Lsn::new(2), h(2))]);
+    }
+
+    #[test]
+    fn clones_carry_origin_and_parent_like_zfs() {
+        let p = pool();
+        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        p.create(&a).unwrap();
+        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        p.layers(&a).snapshot(Lsn::new(4), h(4)).unwrap();
+        assert!(p.clone(&a, Lsn::new(2), h(9), &c).is_err(), "bound to another record");
+        assert!(p.clone(&a, Lsn::new(3), h(3), &c).is_err(), "no such layer");
+        assert_eq!(p.info(&c).unwrap(), None, "refusals make nothing");
+        calls(&p);
+        let info = p.clone(&a, Lsn::new(2), h(2), &c).unwrap();
+        assert_eq!(info.origin.as_deref(), Some(a.seal_snapshot(Lsn::new(2)).as_str()));
+        assert_eq!(info.parent, Some(h(2)));
+        assert_eq!(info.origin_seal(), Some((a.clone(), Lsn::new(2))));
+        let mounted = calls(&p);
+        assert_eq!(mounted.len(), 1, "mounted, not formatted: {mounted:?}");
+        assert!(mounted[0].starts_with("mount ") && mounted[0].ends_with(" /mnt/taso/tank/v-c"));
+        assert!(p.layers(&c).list().unwrap().is_empty(), "a clone has no layers of its own");
+        p.layers(&c).snapshot(Lsn::new(3), h(33)).unwrap();
+        assert_eq!(p.info(&c).unwrap().unwrap().origin_seal(), Some((a.clone(), Lsn::new(2))), "own Seals do not change the origin");
+        assert_eq!(p.layers(&a).list().unwrap().len(), 2, "the source keeps its layers");
+        assert!(p.clone(&a, Lsn::new(2), h(2), &c).is_err(), "a target is made once");
+    }
+
+    #[test]
+    fn destroy_drops_orphans_and_refuses_layers_that_carry_clones() {
+        let p = pool();
+        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        p.create(&a).unwrap();
+        let mut l = p.layers(&a);
+        l.snapshot(Lsn::new(2), h(2)).unwrap();
+        l.snapshot(Lsn::new(4), h(4)).unwrap();
+        l.destroy(Lsn::new(9)).unwrap(); // absent: fine
+        p.clone(&a, Lsn::new(2), h(2), &c).unwrap();
+        assert!(l.destroy(Lsn::new(2)).is_err(), "the clone stands on it");
+        assert_eq!(l.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ensure_mounted_reattaches_after_a_restart() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.blkd.lock().unwrap().devs.clear(); // the daemon restarted: devices are lazy
+        p.mounts.table.borrow_mut().clear();
+        calls(&p);
+        let dev = p.ensure_mounted(&a).unwrap();
+        assert_eq!(calls(&p), [format!("mount {} /mnt/taso/tank/v-a", dev.display())]);
+        assert_eq!(p.ensure_mounted(&a).unwrap(), dev);
+        assert!(calls(&p).is_empty(), "already mounted: nothing to do");
+    }
+
+    #[test]
+    fn rebirth_and_rollback_say_they_are_not_built() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        let e = p.receive(&a, None, (Lsn::new(2), h(2)), &mut io::empty()).unwrap_err();
+        assert!(e.to_string().contains("not built yet"));
+        assert!(p.layers(&a).rollback(Lsn::new(2), h(2)).is_err());
+    }
+
+    // ── Vessels on the block log ────────────────────────────────────
+
+    fn host(dir: &Path) -> Host<TestPool> {
+        Host {
+            coord: Arc::new(Coordinator::open(dir.join("coord.redb")).unwrap()),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: dir.join("state"),
+            warden: WardenId::new(1),
+        }
+    }
+
+    fn seal<L: Layers>(v: &mut Vessel<L>, turn: u64) -> Position {
+        v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn)).unwrap().seal
+    }
+
+    #[test]
+    fn vessels_are_born_sealed_forked_and_reopened_on_the_block_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = host(tmp.path());
+        let ns = Namespace::from_bytes([1; 16]);
+        let (mut v, _) = host.ensure(ns, b"user-1").unwrap();
+        let birth = v.seal_birth().unwrap().seal;
+        let s1 = seal(&mut v, 1);
+        let layers = host.pool.layers(v.dataset()).list().unwrap();
+        assert_eq!(layers, [(birth.lsn, birth.hash), (s1.lsn, s1.hash)], "a block-log Seal per Seal record");
+
+        let child = host.fork(&v, s1, b"child-1").unwrap();
+        let info = host.pool.info(child.dataset()).unwrap().unwrap();
+        assert_eq!((info.origin_seal(), info.parent), (Some((v.dataset().clone(), s1.lsn)), Some(s1.hash)));
+        drop(child);
+
+        let id = v.id();
+        drop(v);
+        let (v, _) = host.open(id).unwrap(); // the lineage and layer checks pass on the block log
+        assert_eq!(v.last_seal(), Some(s1));
+    }
+}
