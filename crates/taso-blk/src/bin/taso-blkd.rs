@@ -44,6 +44,15 @@
 //!   plus the thread that owns the device while it runs.  K3 measures what
 //!   1000 of them cost.
 //!
+//! # Leftover devices
+//!
+//! A daemon killed without `quit` (kill -9, a crash) leaves its ublk
+//! devices behind in the kernel; they would pile up and count against
+//! the module's `ublks_max`.  At start, before serving, the daemon deletes
+//! the ones that are its kind (libublk's record says target `taso-blk`)
+//! and whose owner is no longer a running `taso-blkd`.  Devices of a live
+//! daemon, and of other ublk users, are left alone.
+//!
 //! All devices share one store behind one lock.  Simple first; the
 //! measurements say whether contention matters.
 
@@ -63,6 +72,10 @@ use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use taso_blk::map::{Kind, LayerId, BLOCK};
 use taso_blk::store::Store;
+
+/// The ublk target name of this daemon's devices; it is how a later
+/// daemon recognises leftovers as its own.
+const TARGET: &str = "taso-blk";
 
 /// Device geometry and queue sizes, from the command line.
 #[derive(Clone, Copy)]
@@ -124,6 +137,11 @@ fn main() {
     } else {
         Store::create(&log).unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", log.display())))
     };
+
+    let (removed, failed) = reap_dead_devices();
+    if removed + failed > 0 {
+        eprintln!("taso-blkd: removed {removed} leftover devices of dead daemons ({failed} could not be removed)");
+    }
 
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).unwrap_or_else(|e| fail(&format!("cannot bind {}: {e}", socket.display())));
@@ -306,11 +324,50 @@ impl Daemon {
     }
 }
 
+/// Delete ublk devices left behind by a `taso-blkd` that died without
+/// stopping them.  Ours: libublk's json for the device names target
+/// [`TARGET`].  Dead: the process that added it is not a running
+/// `taso-blkd` (the kernel keeps the adder's pid in the device info from
+/// the moment the device is added, so a live daemon's half-started device
+/// is never taken).  Uses the asynchronous delete, which does not wait for
+/// the last opener: a leftover still mounted somewhere cannot hang the
+/// start.  Returns (removed, failed).
+fn reap_dead_devices() -> (usize, usize) {
+    let Ok(entries) = std::fs::read_dir("/sys/class/ublk-char") else { return (0, 0) };
+    let mut ids: Vec<i32> =
+        entries.flatten().filter_map(|e| e.file_name().to_str()?.strip_prefix("ublkc")?.parse().ok()).collect();
+    ids.sort_unstable();
+    let (mut removed, mut failed) = (0, 0);
+    for id in ids {
+        let Ok(ctrl) = UblkCtrl::new_simple(id) else { continue };
+        if ctrl.get_target_type_from_json().ok().as_deref() != Some(TARGET) {
+            continue;
+        }
+        if is_taso_blkd(ctrl.dev_info().ublksrv_pid) {
+            continue;
+        }
+        match ctrl.del_dev_async() {
+            Ok(_) => removed += 1,
+            Err(e) => {
+                eprintln!("taso-blkd: cannot remove leftover device {id}: {e:?}");
+                failed += 1;
+            }
+        }
+    }
+    (removed, failed)
+}
+
+/// Whether `pid` is a running `taso-blkd`.
+fn is_taso_blkd(pid: i32) -> bool {
+    pid > 0
+        && std::fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim_end() == "taso-blkd")
+}
+
 /// Own one ublk device for `branch` until it is stopped.  Sends the device
 /// id (or why it failed) on `ready` once the device is live.
 fn run_device(store: Arc<Mutex<Store>>, branch: LayerId, g: Geometry, ready: mpsc::Sender<Result<i32, String>>) {
     let ctrl = match UblkCtrlBuilder::default()
-        .name("taso-blk")
+        .name(TARGET)
         .id(-1)
         .nr_queues(1)
         .depth(g.depth)
