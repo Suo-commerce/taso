@@ -309,13 +309,13 @@ EOF
     rm -f "$RES/.check-pid"
     unmount_all
     grep -E '^(Ran|Not run|Failures|Passed all)' "$out" | sed "s/^/  $name: /" | tee -a "$RES/summary.txt" || true
-    local ran notrun failed
-    ran=$({ grep '^Ran:' "$out" || true; } | tail -n 1 | wc -w)
-    notrun=$({ grep '^Not run:' "$out" || true; } | tail -n 1 | wc -w)
-    failed=$({ grep '^Failures:' "$out" || true; } | tail -n 1 | wc -w)
+    local n_ran n_notrun n_failed
+    n_ran=$({ grep '^Ran:' "$out" || true; } | tail -n 1 | wc -w)
+    n_notrun=$({ grep '^Not run:' "$out" || true; } | tail -n 1 | wc -w)
+    n_failed=$({ grep '^Failures:' "$out" || true; } | tail -n 1 | wc -w)
     # Each count includes its label's words ("Ran:", "Not run:", "Failures:").
-    ran=$(( ran > 0 ? ran - 1 : 0 )); notrun=$(( notrun > 1 ? notrun - 2 : 0 )); failed=$(( failed > 0 ? failed - 1 : 0 ))
-    echo "  $name: $((ran - notrun - failed)) passed, $failed failed, $notrun not run (of $ran)" | tee -a "$RES/summary.txt"
+    n_ran=$(( n_ran > 0 ? n_ran - 1 : 0 )); n_notrun=$(( n_notrun > 1 ? n_notrun - 2 : 0 )); n_failed=$(( n_failed > 0 ? n_failed - 1 : 0 ))
+    echo "  $name: $((n_ran - n_notrun - n_failed)) passed, $n_failed failed, $n_notrun not run (of $n_ran)" | tee -a "$RES/summary.txt"
     local unknown
     unknown=$(sed -n 's/ - unknown test, ignored$//p' "$out" | tr '\n' ' ')
     if [[ -n "$unknown" ]]; then
