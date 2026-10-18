@@ -16,6 +16,7 @@
 #   /mnt/blk-bench, /mnt/blk-fork, /mnt/blk-base     (mounted, then unmounted)
 #   one loop device for the baseline (detached at the end)
 #   /sys/module/ublk_drv/parameters/ublks_max        (raised to 1200 if lower; left raised)
+#   this shell's open-file limit (raised for the daemon; ends with the script)
 #   the /dev/ublkb* devices the daemon creates for this run
 #
 # K3 stops early if MemAvailable drops below 1 GiB and reports how far it got.
@@ -276,6 +277,10 @@ mount_on "$BASEDEV" "$MBASE"
 
 say "taso-blkd: log $LOG"
 rm -f "$SOCK"
+# Each live device holds about two file descriptors (its character device
+# and its io_uring); the default soft limit of 1024 stops K3 near 475.
+ulimit -n 1048576 2>/dev/null || ulimit -n "$(ulimit -Hn)"
+say "open-file limit for the daemon: $(ulimit -n)"
 "$BLKD" "$LOG" "$SOCK" 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
