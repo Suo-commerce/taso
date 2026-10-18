@@ -224,6 +224,20 @@ impl Map {
         Ok(self.remove(branch))
     }
 
+    /// Reset a branch to its parent: drop every block it holds itself, so
+    /// it reads exactly as the Seal it stands on.  The branch keeps its id
+    /// and its parent.  Returns its own log locations, now garbage.
+    pub fn reset(&mut self, branch: LayerId) -> Result<Vec<u64>, MapError> {
+        let l = self.branch_mut(branch)?;
+        Ok(std::mem::take(&mut l.blocks)
+            .into_values()
+            .filter_map(|loc| match loc {
+                Loc::Log(off) => Some(off),
+                Loc::Zero => None,
+            })
+            .collect())
+    }
+
     /// Drop a Seal that nothing stands on.  Returns its own log locations,
     /// now garbage.
     pub fn drop_seal(&mut self, seal: LayerId) -> Result<Vec<u64>, MapError> {
@@ -506,6 +520,7 @@ mod tests {
         Seal(usize),
         DropBranch(usize),
         DropSeal(usize),
+        Reset(usize),
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -517,7 +532,8 @@ mod tests {
             1 => (ix.clone(), lba, 0u64..4).prop_map(|(i, b, n)| Op::Discard(i, b, n)),
             2 => ix.clone().prop_map(Op::Seal),
             1 => ix.clone().prop_map(Op::DropBranch),
-            1 => ix.prop_map(Op::DropSeal),
+            1 => ix.clone().prop_map(Op::DropSeal),
+            1 => ix.prop_map(Op::Reset),
         ]
     }
 
@@ -545,7 +561,7 @@ mod tests {
             for o in ops {
                 let Some(id) = (match &o {
                     Op::Fork(i) | Op::Write(i, _) | Op::Discard(i, _, _) | Op::Seal(i)
-                    | Op::DropBranch(i) | Op::DropSeal(i) => pick(*i, &model),
+                    | Op::DropBranch(i) | Op::DropSeal(i) | Op::Reset(i) => pick(*i, &model),
                 }) else { break };
                 let is_branch = m.kind(id).unwrap() == Kind::Branch;
                 match o {
@@ -578,6 +594,15 @@ mod tests {
                     },
                     Op::DropBranch(_) => match m.drop_branch(id) {
                         Ok(g) => { free(g, &mut freed); model.remove(&id); }
+                        Err(e) => prop_assert_eq!((e, is_branch), (MapError::NotABranch(id), false)),
+                    },
+                    Op::Reset(_) => match m.reset(id) {
+                        Ok(g) => {
+                            free(g, &mut freed);
+                            let parent = m.parent(id).unwrap().expect("a branch has a parent");
+                            let img = model[&parent].clone();
+                            model.insert(id, img);
+                        }
                         Err(e) => prop_assert_eq!((e, is_branch), (MapError::NotABranch(id), false)),
                     },
                     Op::DropSeal(_) => match m.drop_seal(id) {

@@ -14,15 +14,29 @@
 //! | command          | does                                             | answer               |
 //! |------------------|--------------------------------------------------|----------------------|
 //! | `root`           | a Template's first Seal (empty, zeros)           | `ok <seal>`          |
-//! | `branch <seal>`  | a branch on the Seal, no device (lazy)           | `ok <branch>`        |
-//! | `fork <seal>`    | `branch`, then `attach`                          | `ok <branch> <dev>`  |
+//! | `branch <seal> [name]` | a branch on the Seal, no device (lazy)     | `ok <branch>`        |
+//! | `fork <seal> [name]` | `branch`, then `attach`                      | `ok <branch> <dev>`  |
 //! | `attach <branch>`| a device for a branch (before mounting it)       | `ok <dev>`           |
-//! | `seal <branch>`  | freeze the branch as a Seal; device stays up     | `ok <seal>`          |
+//! | `seal <branch> [tag]` | freeze the branch as a Seal, tag in hex     | `ok <seal>`          |
+//! | `name <branch> [name]` | name the branch (no name: take it away)    | `ok`                 |
+//! | `find <name>`    | the live branch with that name                   | `ok <branch>`        |
+//! | `seals <branch>` | the branch's own Seals, oldest first             | `ok <seal>:<tag> ...`|
+//! | `info <layer>`   | what a layer is                                  | `ok key=value ...`   |
 //! | `detach <branch>`| stop the branch's device                         | `ok`                 |
+//! | `reset <branch>` | back to the Seal it stands on (detached only)    | `ok`                 |
 //! | `drop <layer>`   | detach if needed, drop the branch or Seal        | `ok`                 |
 //! | `flush`          | end a group                                      | `ok <lsn>`           |
 //! | `stats`          | counters, for measurements                       | `ok key=value ...`   |
 //! | `quit`           | stop every device, flush, then exit              | `ok`                 |
+//!
+//! Names are dataset names (`A-Z a-z 0-9 _ . : / -`, unique among live
+//! branches); tags are opaque bytes in lowercase hex (at most 64 bytes).
+//! A name given with `branch` or `fork` is checked before the branch is
+//! made, so a taken name makes nothing.  Names and branches are durable at
+//! the next `flush`; a Seal is durable when `seal` answers.
+//!
+//! `info` answers `kind=branch|seal parent=<layer>|- name=<name>|-
+//! tag=<hex>|- origin=<layer>|- dev=<path>|-`.
 //!
 //! # Lazy devices
 //!
@@ -205,6 +219,22 @@ fn raise_open_files() -> u64 {
     lim.rlim_cur
 }
 
+/// Lowercase hex of `b`.
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Bytes from lowercase or uppercase hex.
+fn unhex(s: &str) -> Result<Vec<u8>, String> {
+    if !s.len().is_multiple_of(2) {
+        return Err(format!("bad hex {s:?}: odd length"));
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2).unwrap_or("x"), 16).map_err(|_| format!("bad hex {s:?}")))
+        .collect()
+}
+
 fn fail(msg: &str) -> ! {
     eprintln!("taso-blkd: {msg}");
     std::process::exit(1);
@@ -244,13 +274,35 @@ impl Daemon {
             "root" => Ok(self.store.lock().unwrap().root_seal().map_err(store_err)?.to_string()),
             "branch" => {
                 let seal = layer(1)?;
-                Ok(self.store.lock().unwrap().fork(seal).map_err(store_err)?.to_string())
+                Ok(self.branch(seal, words.get(2).copied())?.to_string())
             }
             "fork" => {
                 let seal = layer(1)?;
-                let branch = self.store.lock().unwrap().fork(seal).map_err(store_err)?;
+                let branch = self.branch(seal, words.get(2).copied())?;
                 let dev = self.attach(branch)?;
                 Ok(format!("{branch} {dev}"))
+            }
+            "name" => {
+                let branch = layer(1)?;
+                let name = words.get(2).copied().unwrap_or("");
+                self.store.lock().unwrap().name(branch, name).map_err(store_err)?;
+                Ok(String::new())
+            }
+            "find" => {
+                let name = words.get(1).ok_or("missing name")?;
+                let found = self.store.lock().unwrap().find(name);
+                found.map(|b| b.to_string()).ok_or_else(|| format!("no branch named {name}"))
+            }
+            "seals" => {
+                let branch = layer(1)?;
+                let s = self.store.lock().unwrap();
+                let list: Vec<String> =
+                    s.seals_of(branch).into_iter().map(|l| format!("{l}:{}", hex(s.tag(l).unwrap_or(&[])))).collect();
+                Ok(list.join(" "))
+            }
+            "info" => {
+                let l = layer(1)?;
+                Ok(self.info(l)?)
             }
             "attach" => {
                 let branch = layer(1)?;
@@ -260,7 +312,20 @@ impl Daemon {
                 // Resolve the id before taking the lock: `find` locks too,
                 // and the store's mutex is not re-entrant.
                 let branch = layer(1)?;
-                Ok(self.store.lock().unwrap().seal(branch).map_err(store_err)?.to_string())
+                let tag = unhex(words.get(2).copied().unwrap_or(""))?;
+                Ok(self.store.lock().unwrap().seal_tagged(branch, &tag).map_err(store_err)?.to_string())
+            }
+            "reset" => {
+                let branch = layer(1)?;
+                // Hold the device table so no attach can start in between;
+                // the table is always taken before the store, never after.
+                let devices = self.devices.lock().unwrap();
+                if devices.contains_key(&branch) {
+                    return Err(format!("{branch} is attached; unmount and detach it first"));
+                }
+                self.store.lock().unwrap().reset(branch).map_err(store_err)?;
+                drop(devices);
+                Ok(String::new())
             }
             "detach" => {
                 self.detach(layer(1)?)?;
@@ -282,6 +347,41 @@ impl Daemon {
             "quit" => Ok(String::new()),
             other => Err(format!("unknown command {other}")),
         }
+    }
+
+    /// A new branch on `seal`, named `name` if given.  The name is checked
+    /// first and the store lock is held throughout, so a bad or taken name
+    /// makes no branch and appends nothing.
+    fn branch(&self, seal: LayerId, name: Option<&str>) -> Result<LayerId, String> {
+        let mut s = self.store.lock().unwrap();
+        if let Some(n) = name {
+            s.check_name(n).map_err(|e| e.to_string())?;
+        }
+        let branch = s.fork(seal).map_err(|e| e.to_string())?;
+        if let Some(n) = name {
+            // Checked above under the same lock; only an I/O error is left.
+            s.name(branch, n).map_err(|e| e.to_string())?;
+        }
+        Ok(branch)
+    }
+
+    /// `kind=… parent=… name=… tag=… origin=… dev=…` for a live layer.
+    fn info(&self, l: LayerId) -> Result<String, String> {
+        // The device table first, then the store: never both at once.
+        let dev = self.devices.lock().unwrap().get(&l).map(|d| format!("/dev/ublkb{}", d.dev_id));
+        let s = self.store.lock().unwrap();
+        let kind = s.map().kind(l).map_err(|e| e.to_string())?;
+        let parent = s.map().parent(l).map_err(|e| e.to_string())?;
+        let or_dash = |o: Option<String>| o.unwrap_or_else(|| "-".to_string());
+        Ok(format!(
+            "kind={} parent={} name={} tag={} origin={} dev={}",
+            if kind == Kind::Branch { "branch" } else { "seal" },
+            or_dash(parent.map(|p| p.to_string())),
+            or_dash(s.name_of(l).map(str::to_string)),
+            or_dash(s.tag(l).map(hex)),
+            or_dash(s.origin(l).map(|o| o.to_string())),
+            or_dash(dev),
+        ))
     }
 
     /// The live layer with id number `n`, if any.

@@ -8,6 +8,9 @@ license.workspace = true
 [dependencies]
 taso-core = { path = "../taso-core" }
 taso-field = { path = "../taso-field" }
+# The block log as a storage backend (blk.rs): the store types and the
+# client only, without the ublk daemon.
+taso-blk = { path = "../taso-blk", default-features = false }
 redb = { workspace = true }
 blake3 = { workspace = true }
 serde_json = { workspace = true }
