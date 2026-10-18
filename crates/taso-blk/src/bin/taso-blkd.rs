@@ -27,6 +27,7 @@
 //! | `export <seal> <base>\|- <file>` | the Seal as a stream into a new file | `ok <blocks>`  |
 //! | `import <branch> <file>` | apply a stream (detached, clean branch)  | `ok <blocks>`        |
 //! | `names`          | every named branch                               | `ok <name>:<branch> ...` |
+//! | `checkpoint`     | flush and write `<log>.ckpt` for a fast start    | `ok <lsn>`           |
 //! | `drop <layer>`   | detach if needed, drop the branch or Seal        | `ok`                 |
 //! | `flush`          | end a group                                      | `ok <lsn>`           |
 //! | `stats`          | counters, for measurements                       | `ok key=value ...`   |
@@ -40,6 +41,13 @@
 //!
 //! `info` answers `kind=branch|seal parent=<layer>|- name=<name>|-
 //! tag=<hex>|- origin=<layer>|- dev=<path>|-`.
+//!
+//! # Checkpoints
+//!
+//! A start replays the log after the last checkpoint only (see the
+//! store).  The daemon writes one on `quit`, on the `checkpoint` command,
+//! and by itself whenever the log has grown by `--checkpoint-mib` (256 by
+//! default; 0 turns that off) since the last one.
 //!
 //! # Lazy devices
 //!
@@ -111,6 +119,8 @@ struct Geometry {
     size: u64,
     depth: u16,
     io_bytes: u32,
+    /// Log growth between automatic checkpoints, in bytes (0: none).
+    checkpoint_every: u64,
 }
 
 /// A running device: its ublk id and the thread that owns it.
@@ -127,13 +137,13 @@ struct Daemon {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--io-kib N]";
+    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--io-kib N] [--checkpoint-mib N]";
     if args.len() < 3 {
         eprintln!("{usage}");
         std::process::exit(64);
     }
     let (log, socket) = (PathBuf::from(&args[1]), PathBuf::from(&args[2]));
-    let mut g = Geometry { size: 4 << 30, depth: 32, io_bytes: 128 << 10 };
+    let mut g = Geometry { size: 4 << 30, depth: 32, io_bytes: 128 << 10, checkpoint_every: 256 << 20 };
     let mut rest = args[3..].iter();
     while let Some(flag) = rest.next() {
         let value = rest.next().and_then(|v| v.parse::<u64>().ok());
@@ -141,6 +151,7 @@ fn main() {
             ("--size-gib", Some(v)) if v > 0 => g.size = v << 30,
             ("--depth", Some(v)) if (1..=4096).contains(&v) => g.depth = v as u16,
             ("--io-kib", Some(v)) if v >= 4 && v % 4 == 0 && v <= 16384 => g.io_bytes = (v as u32) << 10,
+            ("--checkpoint-mib", Some(v)) if v <= 1 << 20 => g.checkpoint_every = v << 20,
             _ => {
                 eprintln!("bad argument {flag}\n{usage}");
                 std::process::exit(64);
@@ -152,11 +163,15 @@ fn main() {
         match Store::open(&log) {
             Ok((s, rec)) => {
                 eprintln!(
-                    "taso-blkd: recovered {}: {} records, {} groups, {} bytes cut",
+                    "taso-blkd: recovered {}: {} records, {} groups, {} bytes cut ({})",
                     log.display(),
                     rec.records,
                     rec.groups,
-                    rec.cut
+                    rec.cut,
+                    match rec.checkpoint {
+                        Some(lsn) => format!("from the checkpoint at record {lsn}"),
+                        None => "full replay".to_string(),
+                    }
                 );
                 s
             }
@@ -181,6 +196,13 @@ fn main() {
     );
 
     let daemon = Arc::new(Daemon { store: Arc::new(Mutex::new(store)), devices: Mutex::new(HashMap::new()), geometry: g });
+    if g.checkpoint_every > 0 {
+        let store = daemon.store.clone();
+        std::thread::Builder::new()
+            .name("checkpoints".into())
+            .spawn(move || checkpoints(store, g.checkpoint_every))
+            .unwrap_or_else(|e| fail(&format!("cannot start the checkpoint thread: {e}")));
+    }
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let d = daemon.clone();
@@ -188,9 +210,10 @@ fn main() {
         std::thread::spawn(move || {
             if serve(&d, conn) {
                 d.stop_all();
-                // A clean shutdown loses nothing: end the last group.
-                if let Err(e) = d.store.lock().unwrap().flush() {
-                    eprintln!("taso-blkd: final flush: {e}");
+                // A clean shutdown loses nothing: end the last group, and
+                // leave a checkpoint so the next start is quick.
+                if let Err(e) = d.store.lock().unwrap().checkpoint() {
+                    eprintln!("taso-blkd: final checkpoint: {e}");
                 }
                 let _ = std::fs::remove_file(&socket);
                 eprintln!("taso-blkd: quit");
@@ -220,6 +243,26 @@ fn raise_open_files() -> u64 {
         }
     }
     lim.rlim_cur
+}
+
+/// Write a checkpoint whenever the log has grown by `every` bytes since
+/// the last one.  Runs for the daemon's life.
+fn checkpoints(store: Arc<Mutex<Store>>, every: u64) {
+    let mut last = store.lock().unwrap().stats().log_bytes;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let mut s = store.lock().unwrap();
+        let now = s.stats().log_bytes;
+        if now.saturating_sub(last) >= every {
+            match s.checkpoint() {
+                Ok(lsn) => {
+                    last = s.stats().log_bytes;
+                    eprintln!("taso-blkd: checkpoint at record {lsn} ({} MiB of log)", last >> 20);
+                }
+                Err(e) => eprintln!("taso-blkd: checkpoint: {e}"),
+            }
+        }
+    }
 }
 
 /// An absolute file path argument.
@@ -380,6 +423,7 @@ impl Daemon {
                 drop(devices);
                 Ok(n.to_string())
             }
+            "checkpoint" => Ok(self.store.lock().unwrap().checkpoint().map_err(store_err)?.to_string()),
             "names" => {
                 let names = self.store.lock().unwrap().names();
                 Ok(names.into_iter().map(|(n, b)| format!("{n}:{b}")).collect::<Vec<_>>().join(" "))

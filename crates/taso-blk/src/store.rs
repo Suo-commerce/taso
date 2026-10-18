@@ -74,6 +74,20 @@
 //! magic, truncation, wrong count or hash), so a stream that fails leaves
 //! nothing.
 //!
+//! # Checkpoints (a fast start with a large log)
+//!
+//! [`Store::open`] would otherwise read and verify the whole log.
+//! [`Store::checkpoint`] flushes, then writes `<log>.ckpt` atomically: the
+//! map, names, tags and garbage count at that durable point, its end
+//! offset and sequence number, and the hashes of that Flush record and the
+//! one before it.  `open` loads a checkpoint only if its own BLAKE3 is
+//! right and the Flush record at its offset is on disk with exactly that
+//! chain hash; then it replays only what follows.  Anything else (no
+//! file, damage, a log cut below it, another log's checkpoint) means a
+//! full replay, which is always correct.  [`Recovered::checkpoint`] says
+//! which happened.  The records before the checkpoint were verified when
+//! they were written and when the checkpoint was made from them.
+//!
 //! The base image is zeros: a fresh device reads zeros until written, and
 //! ext4 is created by `mkfs` on a branch, then sealed.
 //!
@@ -115,6 +129,8 @@ const K_DROP_SEAL: u8 = 7;
 const K_FLUSH: u8 = 8;
 const K_NAME: u8 = 9;
 const K_RESET: u8 = 10;
+
+const CKPT_MAGIC: &[u8; 8] = b"TASOCKP1";
 
 /// Export streams: magic, run kinds, and the longest data run (4 MiB).
 const STREAM_MAGIC: &[u8; 8] = b"TASOBLKX";
@@ -222,6 +238,9 @@ pub struct Recovered {
     /// Bytes cut from the end of the file: records after the last Flush,
     /// and anything torn or unverifiable.
     pub cut: u64,
+    /// The sequence number of the checkpoint the replay started from, or
+    /// `None` for a full replay.
+    pub checkpoint: Option<u64>,
 }
 
 /// Counters for measurements.
@@ -258,6 +277,11 @@ impl Store {
     /// its existence durable.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(path)?;
+        // A checkpoint of an earlier log under this name is not ours.
+        match std::fs::remove_file(ckpt_path(path)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
         let mut header = [0u8; HEADER_LEN as usize];
         header[..8].copy_from_slice(FILE_MAGIC);
         file.write_all_at(&header, 0)?;
@@ -297,12 +321,17 @@ impl Store {
             return Err(StoreError::NotALog);
         }
 
-        let mut r = BufReader::with_capacity(1 << 20, ReadAt { file: &file, pos: HEADER_LEN, end: len });
-        let mut map = Map::new();
-        let mut meta = Meta::default();
-        let (mut pos, mut lsn, mut prev) = (HEADER_LEN, 0u64, seed(&header));
+        // Start from a checkpoint if one checks out, else from the header.
+        let ck = load_checkpoint(path, &file, len);
+        let from = ck.as_ref().map(|c| c.lsn);
+        let (mut map, mut meta, start, start_lsn, start_prev, mut garbage) = match ck {
+            Some(c) => (c.map, c.meta, c.end, c.lsn, c.prev, c.garbage),
+            None => (Map::new(), Meta::default(), HEADER_LEN, 0, seed(&header), 0),
+        };
+        let mut r = BufReader::with_capacity(1 << 20, ReadAt { file: &file, pos: start, end: len });
+        let (mut pos, mut lsn, mut prev) = (start, start_lsn, start_prev);
         // State at the last verified Flush.
-        let (mut end, mut good_lsn, mut good_prev, mut groups, mut garbage) = (HEADER_LEN, 0u64, prev, 0u64, 0u64);
+        let (mut end, mut good_lsn, mut good_prev, mut groups) = (start, start_lsn, prev, 0u64);
         let mut pending: Vec<Pending> = Vec::new();
         while let Some((kind, body, hash)) = read_record(&mut r, &prev)? {
             lsn += 1;
@@ -329,7 +358,7 @@ impl Store {
         }
         let stats = Stats { log_bytes: end, garbage_bytes: garbage, records: good_lsn, syncs: 0 };
         let store = Self { file, path: path.to_path_buf(), map, meta, tail: end, lsn: good_lsn, prev: good_prev, stats, poisoned: false };
-        Ok((store, Recovered { records: good_lsn, groups, cut }))
+        Ok((store, Recovered { records: good_lsn, groups, cut, checkpoint: from }))
     }
 
     /// The map (read-only): layers, kinds, deltas.
@@ -550,6 +579,35 @@ impl Store {
         let freed = self.map.reset(branch)?;
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
         self.append(K_RESET, &branch.get().to_le_bytes())
+    }
+
+    /// Flush, then write a checkpoint of this durable point next to the
+    /// log (`<log>.ckpt`, replaced atomically), so the next [`Store::open`]
+    /// replays only what comes after it.  Returns its sequence number.
+    pub fn checkpoint(&mut self) -> Result<u64, StoreError> {
+        let before = self.prev;
+        self.flush()?;
+        let mut b = Vec::with_capacity(1 << 16);
+        b.extend_from_slice(CKPT_MAGIC);
+        for v in [self.tail, self.lsn, self.stats.garbage_bytes] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&before);
+        b.extend_from_slice(&self.prev);
+        self.map.encode(&mut b);
+        self.meta.encode(&mut b);
+        let sum = blake3::hash(&b);
+        b.extend_from_slice(sum.as_bytes());
+        let path = ckpt_path(&self.path);
+        let tmp = path.with_extension("ckpt.tmp");
+        {
+            let f = OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
+            f.write_all_at(&b, 0)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        sync_dir(&path)?;
+        Ok(self.lsn)
     }
 
     /// Write the blocks that make `from` (a Seal below `to`, or the zero
@@ -950,6 +1008,121 @@ impl Meta {
             self.by_layer.insert(branch, name.to_string());
         }
     }
+}
+
+impl Meta {
+    /// Append the Seal infos and names, for a checkpoint.
+    fn encode(&self, out: &mut Vec<u8>) {
+        let put = |out: &mut Vec<u8>, v: u64| out.extend_from_slice(&v.to_le_bytes());
+        put(out, self.seals.len() as u64);
+        for (id, i) in &self.seals {
+            put(out, id.get());
+            put(out, i.origin.map_or(u64::MAX, |o| o.get()));
+            put(out, i.tag.len() as u64);
+            out.extend_from_slice(&i.tag);
+        }
+        let mut names: Vec<(&String, &LayerId)> = self.names.iter().collect();
+        names.sort();
+        put(out, names.len() as u64);
+        for (n, b) in names {
+            put(out, b.get());
+            put(out, n.len() as u64);
+            out.extend_from_slice(n.as_bytes());
+        }
+    }
+
+    /// Read what [`Meta::encode`] wrote; `None` if it is not that, or if it
+    /// does not fit `map` (a tag on something that is not a Seal, a name on
+    /// something that is not a branch, a taken or bad name).
+    fn decode(b: &mut &[u8], map: &Map) -> Option<Meta> {
+        fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            let (h, t) = (b.get(..n)?, b.get(n..)?);
+            *b = t;
+            Some(h)
+        }
+        let u = |b: &mut &[u8]| take(b, 8).map(|x| u64::from_le_bytes(x.try_into().unwrap()));
+        let live = |n: u64| map.live(n);
+        let mut meta = Meta::default();
+        for _ in 0..u(b)? {
+            let id = live(u(b)?)?;
+            if !matches!(map.kind(id).ok()?, Kind::Seal { .. }) {
+                return None;
+            }
+            let origin = match u(b)? {
+                u64::MAX => None,
+                o => Some(LayerId::from_raw(o)), // the origin branch may since have been dropped
+            };
+            let n = usize::try_from(u(b)?).ok().filter(|n| *n <= MAX_TAG)?;
+            let tag = take(b, n)?.to_vec();
+            meta.seals.insert(id, SealInfo { origin, tag });
+        }
+        for _ in 0..u(b)? {
+            let id = live(u(b)?)?;
+            let n = usize::try_from(u(b)?).ok().filter(|n| *n <= MAX_NAME)?;
+            let name = std::str::from_utf8(take(b, n)?).ok()?;
+            if !valid_name(name) || map.kind(id).ok()? != Kind::Branch || meta.names.contains_key(name) || meta.by_layer.contains_key(&id) {
+                return None;
+            }
+            meta.set_name(id, name);
+        }
+        Some(meta)
+    }
+}
+
+/// Where the checkpoint of the log at `path` lives.
+fn ckpt_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".ckpt");
+    PathBuf::from(p)
+}
+
+/// A checkpoint that checks out against the log.
+struct Checkpoint {
+    end: u64,
+    lsn: u64,
+    prev: [u8; HASH],
+    garbage: u64,
+    map: Map,
+    meta: Meta,
+}
+
+/// The checkpoint of the log at `path`, if there is one and it checks
+/// out: its own hash, and the Flush record at its end offset on disk with
+/// the chain hash it names.  Any doubt: `None` (a full replay).
+fn load_checkpoint(path: &Path, file: &File, len: u64) -> Option<Checkpoint> {
+    let b = std::fs::read(ckpt_path(path)).ok()?;
+    let (body, sum) = b.split_at(b.len().checked_sub(HASH)?);
+    if blake3::hash(body).as_bytes() != sum || !body.starts_with(CKPT_MAGIC) {
+        return None;
+    }
+    let mut r = &body[CKPT_MAGIC.len()..];
+    let mut u = || -> Option<u64> {
+        let v = u64::from_le_bytes(r.get(..8)?.try_into().ok()?);
+        r = &r[8..];
+        Some(v)
+    };
+    let (end, lsn, garbage) = (u()?, u()?, u()?);
+    let before: [u8; HASH] = r.get(..HASH)?.try_into().ok()?;
+    let prev: [u8; HASH] = r.get(HASH..2 * HASH)?.try_into().ok()?;
+    r = &r[2 * HASH..];
+    // The Flush record that ends at `end`: exactly where the checkpoint
+    // says, with the chain hash it names.
+    let flush_len = REC_HEAD + HASH as u64;
+    if end > len || end < HEADER_LEN + flush_len || chain(&before, K_FLUSH, &[]) != prev {
+        return None;
+    }
+    let mut rec = vec![0u8; flush_len as usize];
+    file.read_exact_at(&mut rec, end - flush_len).ok()?;
+    let ok = u32::from_le_bytes(rec[0..4].try_into().unwrap()) == REC_MAGIC
+        && u32::from_le_bytes(rec[4..8].try_into().unwrap()) == 0
+        && rec[8] == K_FLUSH
+        && rec[REC_HEAD as usize..] == prev;
+    if !ok {
+        return None;
+    }
+    let map = Map::decode(&mut r, end - flush_len)?;
+    let meta = Meta::decode(&mut r, &map)?;
+    r.is_empty().then_some(Checkpoint { end, lsn, prev, garbage, map, meta })
 }
 
 /// 1 to [`MAX_NAME`] bytes of `A-Z a-z 0-9 _ . : / -`: what dataset names
@@ -1511,6 +1684,96 @@ mod tests {
         assert_eq!(s.names(), vec![("tank/a".to_string(), x), ("tank/b".to_string(), y)]);
     }
 
+    /// A store with layers, names, tags, discards and garbage, then a
+    /// checkpoint, then more of each after it (flushed).
+    fn busy_store(path: &Path) -> (Store, Vec<LayerId>, u64) {
+        let mut s = Store::create(path).unwrap();
+        let root = s.root_seal().unwrap();
+        let a = s.fork(root).unwrap();
+        s.name(a, "tank/a").unwrap();
+        s.write(a, 0, &blocks(1, 3), false).unwrap();
+        s.discard(a, 1, 1).unwrap();
+        let s1 = s.seal_tagged(a, b"one").unwrap();
+        s.write(a, 0, &blocks(2, 1), false).unwrap();
+        let b = s.fork(s1).unwrap();
+        s.name(b, "tank/b").unwrap();
+        s.write(b, 5, &blocks(3, 2), false).unwrap();
+        let at = s.checkpoint().unwrap();
+        s.write(a, 7, &blocks(4, 1), false).unwrap();
+        let s2 = s.seal_tagged(a, b"two").unwrap();
+        s.reset(b).unwrap();
+        s.write(b, 6, &blocks(5, 1), false).unwrap();
+        let c = s.fork(s2).unwrap();
+        s.name(c, "tank/c").unwrap();
+        s.name(b, "").unwrap();
+        s.flush().unwrap();
+        (s, vec![root, a, s1, b, s2, c], at)
+    }
+
+    #[test]
+    fn a_checkpoint_replays_only_the_tail_and_gives_the_same_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (s, layers, at) = busy_store(&path);
+        let want = snapshot(&s, &layers, 9);
+        let (stats, names) = (s.stats(), s.names());
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.checkpoint, Some(at));
+        assert!(rec.groups < at, "only the groups after the checkpoint were replayed");
+        assert_eq!(snapshot(&s, &layers, 9), want);
+        assert_eq!((s.stats().log_bytes, s.stats().garbage_bytes, s.stats().records), (stats.log_bytes, stats.garbage_bytes, stats.records));
+        assert_eq!(s.names(), names);
+        assert_eq!(s.seals_of(layers[1]), vec![layers[2], layers[4]]);
+        drop(s);
+        // The same as a full replay.
+        std::fs::remove_file(ckpt_path(&path)).unwrap();
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.checkpoint, None);
+        assert_eq!(snapshot(&s, &layers, 9), want);
+        assert_eq!(s.stats().garbage_bytes, stats.garbage_bytes);
+    }
+
+    #[test]
+    fn a_damaged_or_foreign_checkpoint_means_a_full_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (s, layers, _) = busy_store(&path);
+        let want = snapshot(&s, &layers, 9);
+        drop(s);
+        let good = std::fs::read(ckpt_path(&path)).unwrap();
+        for at in (0..good.len()).step_by(7).chain([good.len() - 1]) {
+            let mut bad = good.clone();
+            bad[at] ^= 0x10;
+            std::fs::write(ckpt_path(&path), &bad).unwrap();
+            let (s, rec) = Store::open(&path).unwrap();
+            assert_eq!(rec.checkpoint, None, "byte {at} flipped");
+            assert_eq!(snapshot(&s, &layers, 9), want, "byte {at} flipped");
+        }
+        std::fs::write(ckpt_path(&path), &good[..good.len() / 2]).unwrap();
+        assert_eq!(Store::open(&path).unwrap().1.checkpoint, None, "truncated");
+
+        // Another log's checkpoint, laid next to this one.
+        let other = dir.path().join("other");
+        let mut o = Store::create(&other).unwrap();
+        let r = o.root_seal().unwrap();
+        let x = o.fork(r).unwrap();
+        o.write(x, 0, &blocks(9, 1), false).unwrap();
+        o.checkpoint().unwrap();
+        drop(o);
+        std::fs::copy(ckpt_path(&other), ckpt_path(&path)).unwrap();
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.checkpoint, None, "not this log's");
+        assert_eq!(snapshot(&s, &layers, 9), want);
+
+        // A new log under a used name does not inherit the old checkpoint.
+        drop(s);
+        std::fs::remove_file(&other).unwrap();
+        assert!(ckpt_path(&other).exists());
+        drop(Store::create(&other).unwrap());
+        assert!(!ckpt_path(&other).exists());
+    }
+
     #[test]
     fn a_name_after_the_last_flush_is_cut_with_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1601,6 +1864,7 @@ mod tests {
         Seal(usize, u8),
         Name(usize, u8),
         Reset(usize),
+        Checkpoint,
         Flush,
     }
 
@@ -1613,6 +1877,7 @@ mod tests {
             1 => (0usize..6, 0u8..3).prop_map(|(i, n)| Op::Name(i, n)),
             1 => (0usize..6).prop_map(Op::Reset),
             2 => Just(Op::Flush),
+            1 => Just(Op::Checkpoint),
         ]
     }
 
@@ -1655,6 +1920,7 @@ mod tests {
                     Err(_) => false,
                 },
                 Op::Flush => s.flush().is_ok(),
+                Op::Checkpoint => s.checkpoint().is_ok(),
             };
             if durable {
                 points.push((s.stats().log_bytes, snapshot(s, &layers, 9)));
@@ -1666,15 +1932,33 @@ mod tests {
     fn check_cuts(path: &Path, layers: &[LayerId], points: &[(u64, Snapshot)], cuts: impl Iterator<Item = u64>) {
         let full = std::fs::read(path).unwrap();
         let cut_path = path.with_extension("cut");
+        let ckpt = std::fs::read(ckpt_path(path)).ok();
         for len in cuts {
-            std::fs::write(&cut_path, &full[..len as usize]).unwrap();
-            let (s, rec) = Store::open(&cut_path).unwrap();
-            let (want_len, want) = points.iter().rev().find(|(l, _)| *l <= len).expect("the header is durable");
-            assert_eq!(s.stats().log_bytes, *want_len, "cut at {len}");
-            assert_eq!(rec.cut, len - want_len);
-            assert_eq!(&snapshot(&s, layers, 9), want, "cut at {len}: state must be the last flush");
+            // With the log's checkpoint (if any), then without: the same.
+            for with_ckpt in [true, false] {
+                std::fs::write(&cut_path, &full[..len as usize]).unwrap();
+                match (&ckpt, with_ckpt) {
+                    (Some(c), true) => std::fs::write(ckpt_path(&cut_path), c).unwrap(),
+                    _ => {
+                        let _ = std::fs::remove_file(ckpt_path(&cut_path));
+                    }
+                }
+                let (s, rec) = Store::open(&cut_path).unwrap();
+                let (want_len, want) = points.iter().rev().find(|(l, _)| *l <= len).expect("the header is durable");
+                assert_eq!(s.stats().log_bytes, *want_len, "cut at {len}, checkpoint {with_ckpt}");
+                assert_eq!(rec.cut, len - want_len);
+                assert_eq!(&snapshot(&s, layers, 9), want, "cut at {len}, checkpoint {with_ckpt}: state must be the last flush");
+                if !with_ckpt {
+                    assert_eq!(rec.checkpoint, None);
+                } else if let Some(c) = &ckpt {
+                    // A cut that keeps the checkpoint's Flush must start from it.
+                    let end = u64::from_le_bytes(c[8..16].try_into().unwrap());
+                    assert_eq!(rec.checkpoint.is_some(), len >= end, "cut at {len}, checkpoint ends at {end}");
+                }
+            }
         }
         let _ = std::fs::remove_file(&cut_path);
+        let _ = std::fs::remove_file(ckpt_path(&cut_path));
     }
 
     #[test]
@@ -1686,7 +1970,7 @@ mod tests {
             Op::Fork(0), Op::Write(1, 0, 1, 10, false), Op::Write(1, 1, 2, 11, false), Op::Flush,
             Op::Name(1, 1), Op::Write(1, 0, 1, 12, false), Op::Discard(1, 1, 1), Op::Seal(1, 2), Op::Fork(2),
             Op::Name(3, 2), Op::Write(3, 2, 1, 13, false), Op::Write(1, 2, 1, 14, true), Op::Reset(3), Op::Name(1, 0),
-            Op::Write(3, 0, 1, 15, false),
+            Op::Checkpoint, Op::Write(3, 0, 1, 15, false),
         ];
         let (layers, points) = run(&mut s, &ops);
         drop(s);

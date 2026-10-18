@@ -186,6 +186,13 @@ impl Client {
         a.parse().map_err(|_| ClientError::Protocol(format!("import answered {a:?}")))
     }
 
+    /// Flush and write a checkpoint, so the next start replays only what
+    /// follows.  Returns its sequence number.
+    pub fn checkpoint(&mut self) -> Result<u64> {
+        let a = self.call(&["checkpoint"])?;
+        a.parse().map_err(|_| ClientError::Protocol(format!("checkpoint answered {a:?}")))
+    }
+
     /// Every named branch, in name order.
     pub fn names(&mut self) -> Result<Vec<(String, LayerId)>> {
         let a = self.call(&["names"])?;
