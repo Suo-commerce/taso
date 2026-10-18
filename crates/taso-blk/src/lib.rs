@@ -7,6 +7,7 @@
 //! - [`map`]: which log location holds each block of each branch and Seal.
 //! - [`store`]: the append-only log holding the blocks and the map, group
 //!   commit on flush, and recovery to the last flush after a crash.
+//! - `taso-blkd` (binary): serves branches as ublk block devices.
 //!
 //! Not wired into the Warden.  Judged against the spike's pass and kill
 //! criteria; deleted if a kill criterion is hit.
