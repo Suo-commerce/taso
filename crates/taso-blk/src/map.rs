@@ -273,6 +273,13 @@ impl Map {
         self.layers.len()
     }
 
+    /// The live layer whose id is `n`, if there is one: how a number typed
+    /// by a person or read from a record becomes an id, never otherwise.
+    pub fn live(&self, n: u64) -> Option<LayerId> {
+        let id = LayerId(n);
+        self.layers.contains_key(&id).then_some(id)
+    }
+
     // ── internals ───────────────────────────────────────────────────
 
     fn insert(&mut self, kind: Kind, parent: Option<LayerId>, blocks: BTreeMap<u64, Loc>) -> LayerId {
@@ -444,6 +451,16 @@ mod tests {
         assert_eq!(m.drop_seal(s1).unwrap(), Vec::<u64>::new());
         assert_eq!(m.layers(), 0);
         assert_eq!(m.read(b, 1), Err(MapError::Unknown(b)));
+    }
+
+    #[test]
+    fn only_live_layers_answer_to_their_number() {
+        let mut m = Map::new();
+        let s = m.root_seal(0);
+        let b = m.fork(s).unwrap();
+        assert_eq!((m.live(0), m.live(1), m.live(2)), (Some(s), Some(b), None));
+        m.drop_branch(b).unwrap();
+        assert_eq!(m.live(1), None, "a dropped layer is gone");
     }
 
     #[test]
