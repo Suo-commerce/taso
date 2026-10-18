@@ -281,8 +281,17 @@ def preflight(root, args):
     s = os.statvfs(root)
     free = s.f_bavail * s.f_frsize
     base = args.files * args.size + (args.big << 20)
-    per_branch = (args.size + (args.big << 20)) if not clones else 4 * (1 << 20)
-    need = 2 * base + args.branches * per_branch
+    if clones:
+        # Each branch: one small file copied up (its size) and one CoW unit
+        # of the big file.  1 MiB covers ZFS's largest common recordsize
+        # (measured on XFS: 196 KiB per branch).  Flatten clones: ~free.
+        per_branch = args.size + (1 << 20)
+        need = base + args.branches * per_branch + (64 << 20)
+    else:
+        # Each branch copies the whole small file and the whole big file;
+        # flatten copies the base once more.
+        per_branch = args.size + (args.big << 20)
+        need = 2 * base + args.branches * per_branch
     if need > free * 0.9:
         sys.exit(
             f"refusing: worst case {need / 2**30:.1f} GiB, {free / 2**30:.1f} GiB free on {root}"
