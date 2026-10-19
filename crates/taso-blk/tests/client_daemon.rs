@@ -21,14 +21,18 @@ impl Daemon {
 
     /// The same, with more arguments.
     fn start_with(log: &Path, sock: &Path, args: &[&str]) -> Self {
-        let d = Daemon(
+        Self::spawn(
             Command::new(env!("CARGO_BIN_EXE_taso-blkd"))
                 .arg(log)
                 .arg(sock)
-                .args(args)
-                .spawn()
-                .unwrap(),
-        );
+                .args(args),
+            sock,
+        )
+    }
+
+    /// Start the command and wait for `sock`.
+    fn spawn(cmd: &mut Command, sock: &Path) -> Self {
+        let d = Daemon(cmd.spawn().unwrap());
         for _ in 0..250 {
             if sock.exists() {
                 return d;
@@ -274,4 +278,38 @@ fn the_daemon_compacts_by_itself_and_keeps_what_is_live() {
     );
     c.quit().unwrap();
     assert!(d.wait());
+}
+
+/// The daemon's log on a full disk: every write to it fails.  Logging must
+/// never take the daemon down (on taso-test, 2026-10-18, a failed log write
+/// panicked a device thread holding the store, and the daemon could not
+/// quit).  /dev/full fails every write with ENOSPC.
+#[test]
+fn the_daemon_works_when_its_log_cannot_be_written() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (log, sock) = (dir.path().join("log"), dir.path().join("sock"));
+    let d = Daemon::spawn(
+        Command::new(env!("CARGO_BIN_EXE_taso-blkd"))
+            .arg(&log)
+            .arg(&sock)
+            .stderr(full),
+        &sock,
+    );
+    let mut c = Client::connect(&sock).unwrap();
+    let root = c.root().unwrap();
+    let a = c.branch(root, Some("tank/full")).unwrap();
+    std::fs::write(dir.path().join("in.blks"), stream(0x5a, 8)).unwrap();
+    c.import(a, &dir.path().join("in.blks")).unwrap();
+    c.reset(a).unwrap();
+    assert!(c.checkpoint().unwrap() > 0);
+    c.compact().unwrap();
+    c.quit().unwrap();
+    assert!(
+        d.wait(),
+        "quit exits cleanly although nothing could be logged"
+    );
 }

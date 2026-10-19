@@ -103,8 +103,9 @@
 //! ext4 is created by `mkfs` on a branch, then sealed.
 //!
 //! An I/O error while appending poisons the store: the map may be ahead
-//! of the file, so every later call fails until it is reopened, and
-//! reopening rebuilds the map from the log.
+//! of the file, so every later call (reads too) fails until it is
+//! reopened, and reopening rebuilds the map from the log.  A caller can
+//! poison it too ([`Store::poison`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -580,6 +581,7 @@ impl Store {
     /// Read `buf.len() / BLOCK` blocks from `lba` of `layer`.  Unwritten
     /// and discarded blocks read as zeros.
     pub fn read(&self, layer: LayerId, lba: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        self.check()?;
         if buf.is_empty() || !(buf.len() as u64).is_multiple_of(BLOCK) {
             return Err(StoreError::BadLength(buf.len()));
         }
@@ -931,6 +933,14 @@ impl Store {
         self.meta.seals.remove(&seal);
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
         self.append(K_DROP_SEAL, &seal.get().to_le_bytes())
+    }
+
+    /// Mark the store unusable until it is reopened, as a failed append
+    /// does: every later call fails with [`StoreError::Poisoned`].  For a
+    /// caller that cannot vouch for the store any more (a thread that held
+    /// it panicked half-way through a call).
+    pub fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     // ── internals ───────────────────────────────────────────────────

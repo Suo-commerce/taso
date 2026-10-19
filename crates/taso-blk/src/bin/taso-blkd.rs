@@ -122,7 +122,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
@@ -134,6 +134,37 @@ use taso_blk::store::{Compacted, Store};
 /// The ublk target name of this daemon's devices; it is how a later
 /// daemon recognises leftovers as its own.
 const TARGET: &str = "taso-blk";
+
+/// Write a line to stderr, the daemon's log.  Never panics: if the log
+/// cannot be written (a full disk), the line is lost and the daemon goes on.
+/// `eprintln!` panics on a failed write; on taso-test (2026-10-18) that
+/// panicked a device thread while it held the store, poisoned the lock, and
+/// left a daemon that could not quit.
+macro_rules! log {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
+/// The store, locked.  If a thread panicked while holding it, the store
+/// is not trusted any more: it is poisoned (every call fails until the log
+/// is reopened, as after a failed append) and the daemon goes on answering,
+/// so `quit` still works.
+fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
+    store.lock().unwrap_or_else(|p| {
+        let mut s = p.into_inner();
+        s.poison();
+        s
+    })
+}
+
+/// A plain table, locked, whether or not a thread panicked while holding
+/// it (the device table stays consistent: entries are inserted or removed
+/// whole).
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Largest discard or write-zeroes request the device takes: 1 GiB.
 const MAX_DISCARD: u64 = 1 << 30;
@@ -171,7 +202,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N]";
     if args.len() < 3 {
-        eprintln!("{usage}");
+        log!("{usage}");
         std::process::exit(64);
     }
     let (log, socket) = (PathBuf::from(&args[1]), PathBuf::from(&args[2]));
@@ -196,7 +227,7 @@ fn main() {
             ("--compact-pct", Some(v)) if v <= 99 => g.compact_pct = v,
             ("--compact-min-mib", Some(v)) if v <= 1 << 24 => g.compact_min = v << 20,
             _ => {
-                eprintln!("bad argument {flag}\n{usage}");
+                log!("bad argument {flag}\n{usage}");
                 std::process::exit(64);
             }
         }
@@ -205,7 +236,7 @@ fn main() {
     let store = if log.exists() {
         match Store::open(&log) {
             Ok((s, rec)) => {
-                eprintln!(
+                log!(
                     "taso-blkd: recovered {}: {} records, {} groups, {} bytes cut ({})",
                     log.display(),
                     rec.records,
@@ -227,13 +258,13 @@ fn main() {
 
     let (removed, failed) = reap_dead_devices();
     if removed + failed > 0 {
-        eprintln!("taso-blkd: removed {removed} leftover devices of dead daemons ({failed} could not be removed)");
+        log!("taso-blkd: removed {removed} leftover devices of dead daemons ({failed} could not be removed)");
     }
 
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)
         .unwrap_or_else(|e| fail(&format!("cannot bind {}: {e}", socket.display())));
-    eprintln!(
+    log!(
         "taso-blkd: serving {} on {} (open-file limit {})",
         log.display(),
         socket.display(),
@@ -262,11 +293,11 @@ fn main() {
                 d.stop_all();
                 // A clean shutdown loses nothing: end the last group, and
                 // leave a checkpoint so the next start is quick.
-                if let Err(e) = d.store.lock().unwrap().checkpoint() {
-                    eprintln!("taso-blkd: final checkpoint: {e}");
+                if let Err(e) = lock_store(&d.store).checkpoint() {
+                    log!("taso-blkd: final checkpoint: {e}");
                 }
                 let _ = std::fs::remove_file(&socket);
-                eprintln!("taso-blkd: quit");
+                log!("taso-blkd: quit");
                 std::process::exit(0);
             }
         });
@@ -306,12 +337,12 @@ fn raise_open_files() -> u64 {
 /// Runs for the daemon's life.
 fn upkeep(d: &Daemon) {
     let g = d.geometry;
-    let mut last = d.store.lock().unwrap().stats().log_bytes;
+    let mut last = lock_store(&d.store).stats().log_bytes;
     // Said once until there is room again, not every 5 s.
     let mut short_of_room = false;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
-        let stats = d.store.lock().unwrap().stats();
+        let stats = lock_store(&d.store).stats();
         let due = g.compact_pct > 0
             && stats.garbage_bytes >= g.compact_min
             && stats.garbage_bytes * 100 >= stats.log_bytes * g.compact_pct;
@@ -321,44 +352,44 @@ fn upkeep(d: &Daemon) {
             match d.room_to_compact() {
                 Err(why) => {
                     if !short_of_room {
-                        eprintln!("taso-blkd: compaction waits: {why}");
+                        log!("taso-blkd: compaction waits: {why}");
                         short_of_room = true;
                     }
                 }
                 Ok(()) => {
                     short_of_room = false;
-                    eprintln!(
+                    log!(
                         "taso-blkd: compacting: {} MiB of garbage in {} MiB of log",
                         stats.garbage_bytes >> 20,
                         stats.log_bytes >> 20
                     );
                     match d.compact() {
-                        Ok(c) => eprintln!("taso-blkd: compacted: {}", compacted(&c)),
+                        Ok(c) => log!("taso-blkd: compacted: {}", compacted(&c)),
                         Err(e) if e == BUSY => {}
                         Err(e) => {
-                            eprintln!("taso-blkd: compaction: {e}");
+                            log!("taso-blkd: compaction: {e}");
                             // Not again at once: what failed would likely
                             // fail the same way.
                             std::thread::sleep(std::time::Duration::from_secs(60));
                         }
                     }
                     // A compaction leaves a checkpoint of the new log.
-                    last = d.store.lock().unwrap().stats().log_bytes;
+                    last = lock_store(&d.store).stats().log_bytes;
                     continue;
                 }
             }
         }
         if g.checkpoint_every > 0 && stats.log_bytes.saturating_sub(last) >= g.checkpoint_every {
-            let mut s = d.store.lock().unwrap();
+            let mut s = lock_store(&d.store);
             match s.checkpoint() {
                 Ok(lsn) => {
                     last = s.stats().log_bytes;
-                    eprintln!(
+                    log!(
                         "taso-blkd: checkpoint at record {lsn} ({} MiB of log)",
                         last >> 20
                     );
                 }
-                Err(e) => eprintln!("taso-blkd: checkpoint: {e}"),
+                Err(e) => log!("taso-blkd: checkpoint: {e}"),
             }
         }
     }
@@ -427,7 +458,7 @@ fn unhex(s: &str) -> Result<Vec<u8>, String> {
 }
 
 fn fail(msg: &str) -> ! {
-    eprintln!("taso-blkd: {msg}");
+    log!("taso-blkd: {msg}");
     std::process::exit(1);
 }
 
@@ -496,14 +527,14 @@ impl Daemon {
             }
             "find" => {
                 let name = words.get(1).ok_or("missing name")?;
-                let found = self.store.lock().unwrap().find(name);
+                let found = lock_store(&self.store).find(name);
                 found
                     .map(|b| b.to_string())
                     .ok_or_else(|| format!("no branch named {name}"))
             }
             "seals" => {
                 let branch = layer(1)?;
-                let s = self.store.lock().unwrap();
+                let s = lock_store(&self.store);
                 let list: Vec<String> = s
                     .seals_of(branch)
                     .into_iter()
@@ -536,7 +567,7 @@ impl Daemon {
                 let branch = layer(1)?;
                 // Hold the device table so no attach can start in between;
                 // the table is always taken before the store, never after.
-                let devices = self.devices.lock().unwrap();
+                let devices = lock(&self.devices);
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -587,7 +618,7 @@ impl Daemon {
                     .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
                 let mut r = std::io::BufReader::with_capacity(1 << 20, file);
                 // As for reset: the device table first, so no attach starts.
-                let devices = self.devices.lock().unwrap();
+                let devices = lock(&self.devices);
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -612,7 +643,7 @@ impl Daemon {
                 Ok(compacted(&self.compact()?))
             }
             "names" => {
-                let names = self.store.lock().unwrap().names();
+                let names = lock_store(&self.store).names();
                 Ok(names
                     .into_iter()
                     .map(|(n, b)| format!("{n}:{b}"))
@@ -640,7 +671,7 @@ impl Daemon {
                         .drop_branch(l)
                         .map_err(store_err)?;
                 } else {
-                    self.store.lock().unwrap().drop_seal(l).map_err(store_err)?;
+                    lock_store(&self.store).drop_seal(l).map_err(store_err)?;
                 }
                 Ok(String::new())
             }
@@ -661,7 +692,7 @@ impl Daemon {
     /// first and the store lock is held throughout, so a bad or taken name
     /// makes no branch and appends nothing.
     fn branch(&self, seal: LayerId, name: Option<&str>) -> Result<LayerId, String> {
-        let mut s = self.store.lock().unwrap();
+        let mut s = lock_store(&self.store);
         if let Some(n) = name {
             s.check_name(n).map_err(|e| e.to_string())?;
         }
@@ -682,7 +713,7 @@ impl Daemon {
             .unwrap()
             .get(&l)
             .map(|d| format!("/dev/ublkb{}", d.dev_id));
-        let s = self.store.lock().unwrap();
+        let s = lock_store(&self.store);
         let kind = s.map().kind(l).map_err(|e| e.to_string())?;
         let parent = s.map().parent(l).map_err(|e| e.to_string())?;
         let or_dash = |o: Option<String>| o.unwrap_or_else(|| "-".to_string());
@@ -707,7 +738,7 @@ impl Daemon {
     /// MiB).  `Err` says how much is wanted and how much there is.
     fn room_to_compact(&self) -> Result<(), String> {
         let (live, path) = {
-            let s = self.store.lock().unwrap();
+            let s = lock_store(&self.store);
             let st = s.stats();
             (
                 st.log_bytes.saturating_sub(st.garbage_bytes),
@@ -743,7 +774,7 @@ impl Daemon {
         }
         let _done = Done(&self.compacting);
         let e = |e: taso_blk::store::StoreError| e.to_string();
-        let mut c = self.store.lock().unwrap().compaction().map_err(e)?;
+        let mut c = lock_store(&self.store).compaction().map_err(e)?;
         c.copy().map_err(e)?;
         // Catch up until a round finds little, so what finish copies with
         // the store held is short.
@@ -752,7 +783,7 @@ impl Daemon {
                 break;
             }
         }
-        let done = c.finish(&mut self.store.lock().unwrap()).map_err(e)?;
+        let done = c.finish(&mut lock_store(&self.store)).map_err(e)?;
         // The store is let go of here; the caller drops `done.old_log`,
         // whose close frees the old file's space and may take a while.
         Ok(done)
@@ -760,7 +791,7 @@ impl Daemon {
 
     /// The live layer with id number `n`, if any.
     fn find(&self, n: u64) -> Option<LayerId> {
-        self.store.lock().unwrap().map().live(n)
+        lock_store(&self.store).map().live(n)
     }
 
     /// Start a device for `branch`.  Returns its block device path.
@@ -776,7 +807,7 @@ impl Daemon {
         {
             return Err(format!("{branch} is a Seal; attach a branch"));
         }
-        let mut devices = self.devices.lock().unwrap();
+        let mut devices = lock(&self.devices);
         if let Some(d) = devices.get(&branch) {
             return Err(format!(
                 "{branch} is already attached as /dev/ublkb{}",
@@ -822,10 +853,10 @@ impl Daemon {
     }
 
     fn stop_all(&self) {
-        let branches: Vec<LayerId> = self.devices.lock().unwrap().keys().copied().collect();
+        let branches: Vec<LayerId> = lock(&self.devices).keys().copied().collect();
         for b in branches {
             if let Err(e) = self.detach(b) {
-                eprintln!("taso-blkd: {e}");
+                log!("taso-blkd: {e}");
             }
         }
     }
@@ -834,8 +865,8 @@ impl Daemon {
         // Never hold the store lock while waiting for the device table:
         // `attach` holds the table while a new device starts, and the
         // kernel's first reads of that device need the store.
-        let devices = self.devices.lock().unwrap().len();
-        let s = self.store.lock().unwrap();
+        let devices = lock(&self.devices).len();
+        let s = lock_store(&self.store);
         let st = s.stats();
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         let field = |k: &str| {
@@ -892,7 +923,7 @@ fn reap_dead_devices() -> (usize, usize) {
         match ctrl.del_dev_async() {
             Ok(_) => removed += 1,
             Err(e) => {
-                eprintln!("taso-blkd: cannot remove leftover device {id}: {e:?}");
+                log!("taso-blkd: cannot remove leftover device {id}: {e:?}");
                 failed += 1;
             }
         }
@@ -984,14 +1015,14 @@ fn serve_queue(qid: u16, dev: &UblkDev, store: &Mutex<Store>, branch: LayerId) {
         if let Err(e) =
             q.complete_io_cmd_unified(tag, BufDesc::Slice(&[]), Ok(UblkIORes::Result(res)))
         {
-            eprintln!("taso-blkd: {branch}: complete tag {tag}: {e:?}");
+            log!("taso-blkd: {branch}: complete tag {tag}: {e:?}");
         }
     };
     match UblkQueue::new(qid, dev)
         .and_then(|q| q.submit_fetch_commands_unified(BufDescList::Slices(None)))
     {
         Ok(q) => q.wait_and_handle_io(handler),
-        Err(e) => eprintln!("taso-blkd: {branch}: queue {qid}: {e:?}"),
+        Err(e) => log!("taso-blkd: {branch}: queue {qid}: {e:?}"),
     }
 }
 
@@ -1017,7 +1048,7 @@ fn handle(
     let (lba, n) = (off / BLOCK, bytes as usize);
     let pos = UblkIOCtx::ublk_user_copy_pos(qid, tag, 0);
     let io = |e: &dyn std::fmt::Display| {
-        eprintln!("taso-blkd: {branch}: op {op} at block {lba}: {e}");
+        log!("taso-blkd: {branch}: op {op} at block {lba}: {e}");
         -libc::EIO
     };
     match op {
@@ -1025,7 +1056,9 @@ fn handle(
             if n > buf.len() {
                 return -libc::EINVAL;
             }
-            if let Err(e) = store.lock().unwrap().read(branch, lba, &mut buf[..n]) {
+            // Bound first: the lock is let go of before any logging.
+            let r = lock_store(store).read(branch, lba, &mut buf[..n]);
+            if let Err(e) = r {
                 return io(&e);
             }
             match cdev.write_all_at(&buf[..n], pos) {
@@ -1041,17 +1074,22 @@ fn handle(
                 return io(&e);
             }
             let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
-            match store.lock().unwrap().write(branch, lba, &buf[..n], fua) {
+            let r = lock_store(store).write(branch, lba, &buf[..n], fua);
+            match r {
                 Ok(()) => n as i32,
                 Err(e) => io(&e),
             }
         }
-        sys::UBLK_IO_OP_FLUSH => match store.lock().unwrap().flush() {
-            Ok(_) => 0,
-            Err(e) => io(&e),
-        },
+        sys::UBLK_IO_OP_FLUSH => {
+            let r = lock_store(store).flush();
+            match r {
+                Ok(_) => 0,
+                Err(e) => io(&e),
+            }
+        }
         sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
-            match store.lock().unwrap().discard(branch, lba, bytes / BLOCK) {
+            let r = lock_store(store).discard(branch, lba, bytes / BLOCK);
+            match r {
                 Ok(()) => 0,
                 Err(e) => io(&e),
             }
