@@ -47,7 +47,8 @@
 #   (nothing changed) if apt would remove anything else.  Checked after:
 #   ls reports GNU coreutils, and gcc still compiles.
 # run touches, and nothing else:
-#   /var/lib/taso-blk/fst.log, fst.err, fst.log.ckpt   (removed at start)
+#   /var/lib/taso-blk/fst.log, fst.err, fst.log.ckpt, fst.log.compact*
+#                                       (removed at start, kept after)
 #   /var/lib/taso-blk/fst-loop-test.img, fst-loop-scratch.img (removed at end)
 #   /var/lib/taso-blk/fstests/<time>/   (results: summary.txt, the logs, the
 #                                        daemon's log and the kernel's lines
@@ -375,6 +376,9 @@ mkdir -p "$DIR" "$MNT"
 [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 [[ ! -S "$SOCK" ]] || die "$SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
 [[ ! -e "$LOOP_TEST_IMG" && ! -e "$LOOP_SCRATCH_IMG" ]] || die "loop images from an earlier run exist in $DIR (losetup -a; then remove them)"
+# The previous run's log is this script's own, and no daemon holds it (the
+# socket check above): removed before the space check, not after.
+rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.compact" "$LOG.compact.ckpt"
 free=$(free_gib)
 [[ "$free" -ge "$MIN_FREE" ]] || die "only $free GiB free under $DIR (want $MIN_FREE; FST_MIN_FREE_GIB overrides)"
 
