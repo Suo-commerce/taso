@@ -434,6 +434,6 @@ verdict("K6", f"seal p95 {p95s} ms", p95s < 2, p95s > 114, "the store's own Seal
 verdict("K6", f"with ext4 freeze+thaw p95 {p95} ms", p95 < 2, p95 > 114, "the freeze is ext4 writing its journal")
 d = float(k3["drop_total_s"])
 verdict("K7", f"dropped {n} branches in {d} s ({k3['attached']} detached first in {k3['detach_total_s']} s); log {k3['log_bytes_after_drop']} B", d < 5, False,
-        "space reclaim is not built in the spike: the log never shrinks")
+        "dropping frees map entries; the log shrinks when compacted (compact, --compact-pct)")
 PY
 say "results kept in $RESULTS"

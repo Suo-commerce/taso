@@ -88,6 +88,12 @@
 //!   durable; with them ext4 flushes at each journal commit and the store
 //!   commits a group there.  This is what makes the store's durability
 //!   rule (durable at flush) the disk's.
+//! - Requests of up to `--io-kib` (512 KiB by default); the device reports
+//!   that as its I/O size, which mkfs.ext4 and device-mapper build on.
+//! - Non-rotational, which it is (no seek cost).  ext4 allocates
+//!   differently on non-rotational devices; one effect: xfstests
+//!   generic/347 fails on any non-rotational device, ours and loop alike
+//!   (taso-test, 2026-10-19), and passes on both when marked rotational.
 //! - Discard and write-zeroes both become [`Store::discard`] (reads zeros),
 //!   up to 1 GiB per request.  Mount ext4 with `-o discard`: without it
 //!   ext4 never says which blocks it freed, so every block it ever wrote
@@ -209,7 +215,9 @@ fn main() {
     let mut g = Geometry {
         size: 4 << 30,
         depth: 32,
-        io_bytes: 128 << 10,
+        // 512 KiB: the geometry of common disks; on taso-test it measured
+        // the same as 128 KiB (blk-bench, 2026-10-19, within run noise).
+        io_bytes: 512 << 10,
         checkpoint_every: 256 << 20,
         compact_pct: 0,
         compact_min: 1 << 30,
