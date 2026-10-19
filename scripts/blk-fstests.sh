@@ -77,6 +77,10 @@
 # geometry).  FST_MKFS_OPTIONS passes mkfs options to xfstests
 # (MKFS_OPTIONS), e.g. "-E stride=128,stripe_width=128".
 #
+# FST_ROTATIONAL=0|1 sets the rotational flag of our two devices, and
+# FST_LOOP_ROTATIONAL=0|1 that of the loop devices, for the run (to test
+# whether ext4's allocation on non-rotational devices decides a result).
+#
 # FST_ONLY_XFSTESTS=1 skips raw and fsx, to look into single tests (with
 # FST_COMPACT_PCT=0 for one without compaction); the verdict then says
 # partial.
@@ -249,6 +253,15 @@ wait_dev() {
         sleep 0.1
     done
     die "device $1 did not appear in 5 s"
+}
+
+# A block device's rotational flag (what it tells the kernel it is), read
+# and set through sysfs.  Device-mapper devices made on it later inherit it.
+rotational() { cat "/sys/block/$(basename "$1")/queue/rotational"; }
+set_rotational() { # set_rotational DEVICE 0|1
+    [[ "$2" == 0 || "$2" == 1 ]] || die "rotational must be 0 or 1, not $2"
+    echo "$2" >"/sys/block/$(basename "$1")/queue/rotational"
+    [[ "$(rotational "$1")" == "$2" ]] || die "$1 did not take rotational=$2"
 }
 
 free_gib() { df --output=avail -BG "$DIR" | tail -n 1 | tr -dc 0-9; }
@@ -512,7 +525,11 @@ read -r TB TDEV <<<"$(blk fork "$ROOT" fst-test)"
 read -r SB SDEV <<<"$(blk fork "$ROOT" fst-scratch)"
 wait_dev "$TDEV"
 wait_dev "$SDEV"
-echo "our devices: TEST $TDEV ($TB), SCRATCH $SDEV ($SB)" | tee -a "$RES/summary.txt"
+if [[ -n "${FST_ROTATIONAL:-}" ]]; then
+    set_rotational "$TDEV" "$FST_ROTATIONAL"
+    set_rotational "$SDEV" "$FST_ROTATIONAL"
+fi
+echo "our devices: TEST $TDEV ($TB), SCRATCH $SDEV ($SB), rotational $(rotational "$TDEV")/$(rotational "$SDEV")" | tee -a "$RES/summary.txt"
 
 rc=0; xfstests ours "$TDEV" "$SDEV" "$RES/failed-ours.txt" "${TESTS[@]}" || rc=$?
 [[ $rc -eq 0 ]] || FAILS=$((FAILS + 1))
@@ -531,7 +548,11 @@ if [[ ${#FAILED[@]} -gt 0 && ! -e "$RES/.disk-stop" ]]; then
     truncate -s "${SIZE_GIB}G" "$LOOP_TEST_IMG" "$LOOP_SCRATCH_IMG"
     LT=$(losetup -f --show --sector-size 4096 "$LOOP_TEST_IMG"); LOOPS+=("$LT")
     LS=$(losetup -f --show --sector-size 4096 "$LOOP_SCRATCH_IMG"); LOOPS+=("$LS")
-    echo "loop devices: TEST $LT, SCRATCH $LS (4096-byte sectors)" | tee -a "$RES/summary.txt"
+    if [[ -n "${FST_LOOP_ROTATIONAL:-}" ]]; then
+        set_rotational "$LT" "$FST_LOOP_ROTATIONAL"
+        set_rotational "$LS" "$FST_LOOP_ROTATIONAL"
+    fi
+    echo "loop devices: TEST $LT, SCRATCH $LS (4096-byte sectors), rotational $(rotational "$LT")/$(rotational "$LS")" | tee -a "$RES/summary.txt"
     xfstests loop "$LT" "$LS" "$RES/failed-loop.txt" "${FAILED[@]}" || true
     for l in "${LOOPS[@]}"; do losetup -d "$l"; done
     LOOPS=()
