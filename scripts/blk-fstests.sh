@@ -71,6 +71,11 @@
 # testing anything (taso-test, 2026-10-18).  run refuses without GNU
 # coreutils; setup installs them.
 #
+# FST_IO_KIB=N runs the daemon with --io-kib N (largest request; it sets
+# the I/O sizes the device reports, which mkfs.ext4 turns into stripe
+# geometry).  FST_MKFS_OPTIONS passes mkfs options to xfstests
+# (MKFS_OPTIONS), e.g. "-E stride=128,stripe_width=128".
+#
 # FST_ONLY_XFSTESTS=1 skips raw and fsx, to look into single tests (with
 # FST_COMPACT_PCT=0 for one without compaction); the verdict then says
 # partial.
@@ -96,6 +101,7 @@ BLKD=${FST_BLKD:-target/release/taso-blkd}
 SIZE_GIB=8
 MIN_FREE=${FST_MIN_FREE_GIB:-20}
 COMPACT_PCT=${FST_COMPACT_PCT:-25}
+IO_KIB=${FST_IO_KIB:-}
 COMPACT_MIN=${FST_COMPACT_MIN_MIB:-256}
 STOP_FREE=${FST_STOP_FREE_GIB:-5}
 
@@ -219,7 +225,7 @@ blk() {
 }
 
 start_daemon() {
-    "$BLKD" "$LOG" "$SOCK" --size-gib "$SIZE_GIB" \
+    "$BLKD" "$LOG" "$SOCK" --size-gib "$SIZE_GIB" ${IO_KIB:+--io-kib "$IO_KIB"} \
         --compact-pct "$COMPACT_PCT" --compact-min-mib "$COMPACT_MIN" 2>>"$ERR" &
     DAEMON_PID=$!
     for _ in $(seq 100); do
@@ -315,6 +321,8 @@ export SCRATCH_MNT=$MNT/scratch
 export MOUNT_OPTIONS="-o discard"
 export TEST_FS_MOUNT_OPTS="-o discard"
 EOF
+    # Only when given: unset, xfstests keeps its own default.
+    [[ -z "${FST_MKFS_OPTIONS:-}" ]] || printf 'export MKFS_OPTIONS="%s"\n' "$FST_MKFS_OPTIONS" >>"$cfg"
     mkfs.ext4 -q -F "$tdev"
     say "xfstests ($name): $* (output in $out)"
     # In its own session (setsid execs in place: its pid is the session's
@@ -378,6 +386,7 @@ mkdir -p "$RES"
     echo "kernel $(uname -r); taso $(git rev-parse --short HEAD 2>/dev/null || echo ?); xfstests $XFS_TAG"
     echo "tests: ${TESTS[*]}; devices ${SIZE_GIB} GiB; $free GiB free at start"
     echo "automatic compaction at ${COMPACT_PCT}% garbage and ${COMPACT_MIN} MiB (0%: off)"
+    echo "device I/O size ${IO_KIB:-daemon default} KiB; mkfs options for xfstests: ${FST_MKFS_OPTIONS:-none}"
 } | tee "$RES/summary.txt"
 
 if [[ -z "${FST_BLKD:-}" ]]; then

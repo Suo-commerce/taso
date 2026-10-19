@@ -20,6 +20,8 @@
 #   the /dev/ublkb* devices the daemon creates for this run
 #
 # K3 stops early if MemAvailable drops below 1 GiB and reports how far it got.
+# BENCH_DAEMON_ARGS adds daemon flags, e.g. BENCH_DAEMON_ARGS="--io-kib 512"
+# (the results' first lines say which were used).
 # The pass/kill lines are the ones in the spike plan (section 2).
 
 set -euo pipefail
@@ -291,7 +293,7 @@ ratio() { python3 -c 'import sys; a, b = float(sys.argv[1]), float(sys.argv[2]);
 
 {
 echo "blk-bench $(date -u +%Y-%m-%dT%H:%M:%SZ) on $(hostname), kernel $(uname -r), $(nproc) CPUs, $(free -g | awk '/Mem:/{print $2}') GiB RAM"
-echo "daemon $BLKD, quick=$QUICK"
+echo "daemon $BLKD ${BENCH_DAEMON_ARGS:-}, quick=$QUICK"
 } | tee "$RESULTS"
 
 # ---- setup -----------------------------------------------------------------
@@ -307,7 +309,8 @@ rm -f "$SOCK"
 # and its io_uring); the default soft limit of 1024 stops K3 near 475.
 ulimit -n 1048576 2>/dev/null || ulimit -n "$(ulimit -Hn)"
 say "open-file limit for the daemon: $(ulimit -n)"
-"$BLKD" "$LOG" "$SOCK" 2>>"$ERR" &
+# shellcheck disable=SC2086  # BENCH_DAEMON_ARGS: extra daemon flags, split on purpose
+"$BLKD" "$LOG" "$SOCK" ${BENCH_DAEMON_ARGS:-} 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || die "daemon socket did not appear; see $ERR"
