@@ -252,7 +252,11 @@ impl Mounts for System {
     }
     fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        run(Command::new("mount").arg(dev).arg(dir))
+        // discard: ext4 tells the device each range it frees.  On the
+        // block log that is a cheap map change; without it every block
+        // ext4 ever wrote stays live, so compaction cannot drop it and
+        // Seals and shipped packs carry it.
+        run(Command::new("mount").args(["-o", "discard"]).arg(dev).arg(dir))
     }
     fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
         Ok(mount_source(&std::fs::read_to_string("/proc/self/mountinfo")?, dir))

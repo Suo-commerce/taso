@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use taso_warden::coordinator::{Coord, Coordinator};
 use taso_warden::daemon::{Config, DaemonError, Node, Report, Restart, Start, Stop, VesselConf};
 use taso_warden::source::{Guard, SourceError, VesselSource};
+use taso_warden::storage::Storage;
 use taso_warden::supervisor::{Event, Supervisor, Timing};
 use taso_warden::zfs::Zfs;
 
@@ -108,7 +109,7 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
     let node = |name: &str, warden: u64, takeover: bool| {
-        Node::new(config(tmp.path(), &base, name, warden, takeover), coord.clone(), Zfs::cli().batched()).unwrap()
+        Node::new(config(tmp.path(), &base, name, warden, takeover), coord.clone(), Storage::Zfs(Zfs::cli().batched())).unwrap()
     };
 
     // 1. Born on A.
@@ -237,7 +238,7 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
     let sim = ["--turns", "20", "--turn-sleep-ms", "50", "--txns", "1", "--rows", "1"];
-    let node = Arc::new(Node::new(config_with(tmp.path(), &base, "a", 1, false, &sim), coord, Zfs::cli().batched()).unwrap());
+    let node = Arc::new(Node::new(config_with(tmp.path(), &base, "a", 1, false, &sim), coord, Storage::Zfs(Zfs::cli().batched())).unwrap());
     let vessel = node.config.vessels[0].clone();
     let with = |restart: Restart| VesselConf { restart, ..vessel.clone() };
     let id = vessel.id();

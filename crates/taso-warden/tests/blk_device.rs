@@ -62,6 +62,20 @@ fn seal<L: Layers>(v: &mut taso_warden::vessel::Vessel<L>, turn: u64) -> taso_wa
     v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn)).unwrap().seal
 }
 
+/// The mount options of the file system mounted at `dir` (super options
+/// included), from /proc/self/mountinfo.
+fn mount_options(dir: &std::path::Path) -> String {
+    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    for line in info.lines() {
+        let f: Vec<&str> = line.split(' ').collect();
+        if f.get(4).map(std::path::Path::new) == Some(dir) {
+            let sep = f.iter().position(|x| *x == "-").unwrap();
+            return format!("{},{}", f[5], f.get(sep + 3).unwrap_or(&""));
+        }
+    }
+    panic!("{} is not mounted", dir.display());
+}
+
 #[test]
 #[ignore = "needs root, ublk and a running taso-blkd; run scripts/blk-warden-test.sh"]
 fn vessels_on_real_devices() {
@@ -83,6 +97,7 @@ fn vessels_on_real_devices() {
     let (mut v, _) = host.ensure(ns, b"user-1").unwrap();
     let mp = host.pool.info(v.dataset()).unwrap().unwrap().mountpoint.unwrap();
     assert!(mp.starts_with(&mounts));
+    assert!(mount_options(&mp).split(',').any(|o| o == "discard"), "mounted -o discard: {}", mount_options(&mp));
     let birth = v.seal_birth().unwrap().seal;
 
     // A file, then a Seal (ext4 frozen for it), then a change after it.
