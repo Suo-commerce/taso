@@ -20,6 +20,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pki-types = { version = "1", features = ["std"] }
 sha2 = "0.10"
 libc = "0.2"
+# Safe `SO_PEERCRED` for the coordinator's peer map (coordsrv.rs); the
+# crate forbids unsafe code.  Already in the tree through tempfile.
+rustix = { version = "1", features = ["net", "time"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
