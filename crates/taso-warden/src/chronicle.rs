@@ -34,14 +34,22 @@
 //!
 //! # Open
 //!
-//! Opening is a claim of ownership.  [`Chronicle::open`] first takes a new
-//! epoch with [`Coord::transfer`], so a previous incarnation still
-//! alive somewhere is fenced *before* anything is read; then recovers the
-//! segment against the anchored head; then destroys orphan snapshots and
-//! reports accepted Seals whose snapshot is missing
-//! ([`Recovery::missing_layers`]).  Those stay in the log, and `last_seal`
-//! still comes from the records, but nothing can build on their layer.
-//! Who may call `open` is decided above this module (rebirth, P2).
+//! Opening is a claim of ownership, and a Warden may claim only ownership
+//! it has read ([`Claim`]): a restart claims its own (`Mine`: the holder
+//! must be this Warden, at whatever epoch it is), a takeover claims the
+//! holder it means to fence (`TakeOver { from, epoch }`, what the operator
+//! or the daemon read when it decided).  [`Chronicle::open`] first takes a
+//! new epoch with [`Coord::transfer_if`] on that claim, so a previous
+//! incarnation still alive somewhere is fenced *before* anything is read
+//! — and a claim that no longer matches is refused
+//! ([`CoordError::OwnershipChanged`]) instead of taking the Vessel back
+//! from whoever took it over in the meantime (fencing review 2026-10-17,
+//! F1).  Then it recovers the segment against the anchored head; then
+//! destroys orphan snapshots and reports accepted Seals whose snapshot is
+//! missing ([`Recovery::missing_layers`]).  Those stay in the log, and
+//! `last_seal` still comes from the records, but nothing can build on
+//! their layer.  Who may take over is decided above this module (the
+//! daemon's `takeover`, P2).
 //!
 //! On one node, a lock file in the Chronicle's directory keeps two
 //! processes off the same segment: without it, a fenced writer's frame
@@ -72,6 +80,29 @@ use taso_core::record::{GapRecord, LayerRef, Payload, Record, SealRecord, Stream
 
 use crate::coordinator::{Coord, CoordError};
 use crate::segment::{self, Frame, Position, Segment, SegmentError};
+
+/// Which ownership an open claims (see the module docs, "Open").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Claim {
+    /// A restart: the Chronicle is this Warden's, at whatever epoch it is.
+    Mine,
+    /// A takeover of exactly this ownership, as read before deciding.
+    TakeOver {
+        /// The holder to fence.
+        from: WardenId,
+        /// Its epoch.
+        epoch: Epoch,
+    },
+}
+
+impl fmt::Display for Claim {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mine => f.write_str("mine"),
+            Self::TakeOver { from, epoch } => write!(f, "takeover from warden {} at epoch {}", from.get(), epoch.get()),
+        }
+    }
+}
 use crate::zfs::{Cli, Dataset, Runner, Zfs};
 
 /// File name of the first segment of a Chronicle (base lsn 0).
@@ -364,10 +395,13 @@ impl<L: Layers> Chronicle<L> {
         Self::open(dir, coord, id, warden, layers)
     }
 
-    /// Take ownership of an existing Chronicle and recover it.
+    /// Take ownership of an existing Chronicle and recover it, claiming
+    /// it as this Warden's own ([`Claim::Mine`]); [`Chronicle::open_as`]
+    /// takes any claim.
     ///
-    /// In order: lock `dir`; transfer ownership to `warden` (new epoch,
-    /// fences any previous holder); open the segment files, the newest one
+    /// In order: lock `dir`; transfer ownership to `warden` on the claim
+    /// (new epoch, fences any previous holder; refused if the claim is
+    /// stale); open the segment files, the newest one
     /// recovered against the anchored head and every older one read whole
     /// and verified (creating the first if the Chronicle has no records
     /// yet); check that the files join; destroy orphan layers.
@@ -382,7 +416,19 @@ impl<L: Layers> Chronicle<L> {
         warden: WardenId,
         layers: L,
     ) -> Result<(Self, Recovery), ChronicleError> {
-        Self::open_inner(dir.as_ref(), coord, id, warden, layers, false)
+        Self::open_inner(dir.as_ref(), coord, id, warden, layers, false, Claim::Mine)
+    }
+
+    /// [`Chronicle::open`] on `claim`.
+    pub fn open_as(
+        dir: impl AsRef<Path>,
+        coord: Arc<dyn Coord>,
+        id: ChronicleId,
+        warden: WardenId,
+        layers: L,
+        claim: Claim,
+    ) -> Result<(Self, Recovery), ChronicleError> {
+        Self::open_inner(dir.as_ref(), coord, id, warden, layers, false, claim)
     }
 
     /// Take ownership of a Chronicle whose local log may end before the
@@ -403,7 +449,28 @@ impl<L: Layers> Chronicle<L> {
         warden: WardenId,
         layers: L,
     ) -> Result<(Self, Recovery), ChronicleError> {
-        Self::open_inner(dir.as_ref(), coord, id, warden, layers, true)
+        Self::open_inner(dir.as_ref(), coord, id, warden, layers, true, Claim::Mine)
+    }
+
+    /// [`Chronicle::open_after_gap`] on `claim`.
+    pub fn open_after_gap_as(
+        dir: impl AsRef<Path>,
+        coord: Arc<dyn Coord>,
+        id: ChronicleId,
+        warden: WardenId,
+        layers: L,
+        claim: Claim,
+    ) -> Result<(Self, Recovery), ChronicleError> {
+        Self::open_inner(dir.as_ref(), coord, id, warden, layers, true, claim)
+    }
+
+    /// The ownership `claim` stands for, for [`Coord::transfer_if`]: a
+    /// takeover names it; `Mine` is this Warden at the epoch read now.
+    pub fn expected(coord: &dyn Coord, id: ChronicleId, warden: WardenId, claim: Claim) -> Result<(WardenId, Epoch), CoordError> {
+        Ok(match claim {
+            Claim::Mine => (warden, coord.ownership(id)?.epoch),
+            Claim::TakeOver { from, epoch } => (from, epoch),
+        })
     }
 
     fn open_inner(
@@ -413,10 +480,12 @@ impl<L: Layers> Chronicle<L> {
         warden: WardenId,
         layers: L,
         continue_gap: bool,
+        claim: Claim,
     ) -> Result<(Self, Recovery), ChronicleError> {
         let lock = lock_dir(dir)?;
 
-        let epoch = coord.transfer(id, warden).map_err(ChronicleError::Coord)?;
+        let expected = Self::expected(coord.as_ref(), id, warden, claim).map_err(ChronicleError::Coord)?;
+        let epoch = coord.transfer_if(id, warden, expected).map_err(ChronicleError::Coord)?;
         let head = coord.head(id).map_err(ChronicleError::Coord)?;
 
         let files = list_segments(dir)?;
@@ -1161,7 +1230,18 @@ mod tests {
             Chronicle::create(&self.dir, self.coord.clone(), cid(), A, self.layers.clone()).unwrap().0
         }
         fn open(&self, w: WardenId) -> (Chronicle<FakeLayers>, Recovery) {
-            Chronicle::open(&self.dir, self.coord.clone(), cid(), w, self.layers.clone()).unwrap()
+            Chronicle::open_as(&self.dir, self.coord.clone(), cid(), w, self.layers.clone(), claim(&*self.coord, w)).unwrap()
+        }
+    }
+
+    /// What a Warden deciding from a fresh read claims: its own, or a
+    /// takeover of the holder it read (as the daemon does).
+    fn claim(coord: &dyn Coord, w: WardenId) -> Claim {
+        let o = coord.ownership(cid()).unwrap();
+        if o.holder == w {
+            Claim::Mine
+        } else {
+            Claim::TakeOver { from: o.holder, epoch: o.epoch }
         }
     }
 
@@ -1374,7 +1454,7 @@ mod tests {
         drop(c);
         let files = list_segments(&e.dir).unwrap();
         std::fs::remove_file(&files[0]).unwrap();
-        let r = Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone());
+        let r = Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A));
         assert!(
             matches!(r, Err(ChronicleError::SegmentsDisagree { why, .. }) if why.contains("no Checkpoint")),
             "{:?}",
@@ -1386,7 +1466,7 @@ mod tests {
         drop(c);
         let files = list_segments(&e.dir).unwrap();
         std::fs::remove_file(&files[0]).unwrap();
-        let r = Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone());
+        let r = Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A));
         assert!(
             matches!(r, Err(ChronicleError::SegmentsDisagree { why, .. }) if why.contains("past what was shipped")),
             "{:?}",
@@ -1682,7 +1762,7 @@ mod tests {
         let e = env();
         let _c = e.create();
         assert!(matches!(
-            Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
+            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A)),
             Err(ChronicleError::Locked(_))
         ));
     }
@@ -1739,7 +1819,7 @@ mod tests {
         std::fs::copy(a.segment().path(), dir_b.join(SEGMENT_FILE)).unwrap();
         let layers_b = FakeLayers::default();
         let (mut b, _) =
-            Chronicle::open(&dir_b, e.coord.clone(), cid(), B, layers_b.clone()).unwrap();
+            Chronicle::open_as(&dir_b, e.coord.clone(), cid(), B, layers_b.clone(), claim(&*e.coord, B)).unwrap();
 
         assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
         assert!(a.is_fenced());
@@ -1750,6 +1830,60 @@ mod tests {
         assert_eq!(b.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
         seal(&mut b, 1).unwrap();
         assert_eq!(layers_b.snaps().len(), 1);
+    }
+
+    /// F1 (fencing review 2026-10-17): A reads the ownership and decides
+    /// to restart; B takes the Vessel over in between; A's open is refused
+    /// with the current ownership instead of taking the Vessel back, and
+    /// B keeps appending.  A takeover on a stale read is refused the same
+    /// way; one on the ownership B holds now succeeds.
+    #[test]
+    fn a_stale_claim_does_not_take_the_vessel_back() {
+        let e = env();
+        let mut a = e.create();
+        a.append(Stream::Fs, raw(1)).unwrap();
+        // Shipped, as a Warden does before anything that may need it.
+        let h = e.coord.head(cid()).unwrap();
+        e.coord.advance_shipped(A, cid(), h.epoch, Position { lsn: h.lsn, hash: h.hash }).unwrap();
+        drop(a);
+
+        // 1. A reads: it is the holder (its own restart).
+        let a_read = e.coord.ownership(cid()).unwrap();
+        assert_eq!(a_read.holder, A);
+        let e_b = a_read.epoch.next();
+
+        // 2. B takes over from what B read: the same ownership.
+        let dir_b = e.dir.with_file_name("vessel-b");
+        std::fs::create_dir(&dir_b).unwrap();
+        std::fs::copy(e.dir.join(SEGMENT_FILE), dir_b.join(SEGMENT_FILE)).unwrap();
+        let (mut b, _) = Chronicle::open_as(
+            &dir_b, e.coord.clone(), cid(), B, FakeLayers::default(),
+            Claim::TakeOver { from: a_read.holder, epoch: a_read.epoch },
+        ).unwrap();
+        assert_eq!(b.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
+
+        // 3. A acts on its read: refused, and nothing moved.
+        let r = Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()).err();
+        assert!(
+            matches!(r, Some(ChronicleError::Coord(CoordError::OwnershipChanged { holder, epoch })) if holder == B && epoch == e_b),
+            "{r:?}"
+        );
+        let o = e.coord.ownership(cid()).unwrap();
+        assert_eq!((o.holder, o.epoch), (B, e_b));
+        assert_eq!(b.append(Stream::Fs, raw(3)).unwrap().lsn, Lsn::new(3));
+
+        // A takeover on the stale read is refused too; on the current one it wins.
+        let stale = Claim::TakeOver { from: a_read.holder, epoch: a_read.epoch };
+        let r = Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), stale).err();
+        assert!(matches!(r, Some(ChronicleError::Coord(CoordError::OwnershipChanged { .. }))), "{r:?}");
+        drop(b);
+        let now = Claim::TakeOver { from: B, epoch: e_b };
+        // A's copy ends at lsn 1 while the head is 3: a takeover continues
+        // from the head after a gap (open_after_gap), as rebirth does.
+        let (mut a, r) = Chronicle::open_after_gap_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), now).unwrap();
+        assert_eq!(e.coord.ownership(cid()).unwrap().epoch, e_b.next());
+        assert!(r.gap.is_some());
+        assert!(a.append(Stream::Fs, raw(4)).unwrap().lsn > Lsn::new(3));
     }
 
     /// A Seal refused by the coordinator leaves neither a frame nor a
@@ -1888,7 +2022,7 @@ mod tests {
         drop(c);
         std::fs::remove_file(seg).unwrap();
         assert!(matches!(
-            Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
+            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A)),
             Err(ChronicleError::MissingSegment { .. })
         ));
     }
@@ -1916,7 +2050,7 @@ mod tests {
     }
 
     fn open_b(e: &Env, dir: &Path, layers: FakeLayers) -> Result<(Chronicle<FakeLayers>, Recovery), ChronicleError> {
-        Chronicle::open_after_gap(dir, e.coord.clone(), cid(), B, layers)
+        Chronicle::open_after_gap_as(dir, e.coord.clone(), cid(), B, layers, claim(&*e.coord, B))
     }
 
     fn lsns(c: &Chronicle<FakeLayers>) -> Vec<u64> {
@@ -1952,7 +2086,7 @@ mod tests {
 
         // Both opens read the joined files back the same way.
         drop(b);
-        let (b, r) = Chronicle::open(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default()).unwrap();
+        let (b, r) = Chronicle::open_as(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default(), claim(&*e.coord, B)).unwrap();
         assert_eq!((lsns(&b), r.gap), (vec![1, 2, 3, 6, 7], None));
         drop(b);
         let (b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
@@ -1974,7 +2108,7 @@ mod tests {
         restore_log(&c_dir, cid(), &frames).unwrap();
         assert!(c_dir.join(SEGMENT_FILE).exists() && c_dir.join(segment_name(Lsn::new(5))).exists());
         assert!(!c_dir.with_file_name("vessel-c.restore").exists());
-        let (c, r) = Chronicle::open_after_gap(&c_dir, e.coord.clone(), cid(), WardenId::new(3), FakeLayers::default()).unwrap();
+        let (c, r) = Chronicle::open_after_gap_as(&c_dir, e.coord.clone(), cid(), WardenId::new(3), FakeLayers::default(), claim(&*e.coord, WardenId::new(3))).unwrap();
         assert_eq!((c.frames().unwrap(), r.gap), (frames.clone(), None));
         drop(c);
         assert!(matches!(restore_log(&c_dir, cid(), &frames), Err(ChronicleError::StateExists(_))));
@@ -1998,7 +2132,7 @@ mod tests {
         // Crash after the continuation file was created, before its Gap record.
         Segment::create(b_dir.join(segment_name(head.lsn)), cid(), Position::from(head)).unwrap();
         assert!(matches!(
-            Chronicle::open(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default()),
+            Chronicle::open_as(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default(), claim(&*e.coord, B)),
             Err(ChronicleError::GapPending { kept, head: h }) if kept == Lsn::new(3) && h == head.lsn
         ));
         let (b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
@@ -2100,7 +2234,7 @@ mod tests {
         std::fs::remove_file(&seg0).unwrap();
         Segment::create(&seg0, ChronicleId::from_bytes([6; 16]), Position::GENESIS).unwrap();
         assert!(matches!(
-            Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
+            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A)),
             Err(ChronicleError::SegmentsDisagree { why: "another Chronicle's segment", .. })
         ));
     }
@@ -2111,7 +2245,7 @@ mod tests {
         drop(e.create());
         std::fs::write(e.dir.join("seg-12"), b"").unwrap();
         assert!(matches!(
-            Chronicle::open(&e.dir, e.coord.clone(), cid(), A, e.layers.clone()),
+            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A)),
             Err(ChronicleError::BadSegmentName(n)) if n == "seg-12"
         ));
     }
@@ -2248,7 +2382,7 @@ mod tests {
         assert!(layers.snaps().is_empty());
         drop(c);
 
-        let (mut c, r) = Chronicle::open(&dir, coord.clone(), cid(), A, layers).unwrap();
+        let (mut c, r) = { let cl = claim(&*coord, A); Chronicle::open_as(&dir, coord.clone(), cid(), A, layers, cl) }.unwrap();
         assert_eq!(r.segment.unaccepted_frames, 0);
         assert_eq!(c.tail().lsn, Lsn::new(2));
         assert_eq!(c.append(Stream::Fs, raw(3)).unwrap().lsn, Lsn::new(3));
@@ -2293,7 +2427,7 @@ mod tests {
         drop(c);
 
         let _server = spawn_server(&sock, &db);
-        let (mut c, r) = Chronicle::open(&dir, coord, cid(), A, layers).unwrap();
+        let (mut c, r) = { let cl = claim(&*coord, A); Chronicle::open_as(&dir, coord, cid(), A, layers, cl) }.unwrap();
         assert_eq!(r.segment.unaccepted_frames, 1);
         assert_eq!(c.tail().lsn, Lsn::new(1));
         assert_eq!(c.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
@@ -2315,7 +2449,7 @@ mod tests {
         let a_len = std::fs::metadata(a.segment().path()).unwrap().len();
 
         std::fs::copy(a.segment().path(), dir_b.join(SEGMENT_FILE)).unwrap();
-        let (mut b, rb) = Chronicle::open(&dir_b, remote(&sock), cid(), B, FakeLayers::default()).unwrap();
+        let (mut b, rb) = { let c = remote(&sock); let cl = claim(&*c, B); Chronicle::open_as(&dir_b, c, cid(), B, FakeLayers::default(), cl) }.unwrap();
         assert_eq!(rb.head.lsn, Lsn::new(1));
 
         assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
@@ -2399,7 +2533,7 @@ mod tests {
                 .unwrap();
 
             let layers = ZfsLayers::new(Zfs::cli(), s.ds.clone());
-            let (c, r) = Chronicle::open(root.path(), coord, cid(), A, layers).unwrap();
+            let (c, r) = { let cl = claim(&*coord, A); Chronicle::open_as(root.path(), coord, cid(), A, layers, cl) }.unwrap();
             assert_eq!(r.orphan_layers, vec![tail.lsn.next()]);
             assert_eq!(r.last_seal, Some(s2.seal));
             assert_eq!(c.layers().list().unwrap().len(), 2);

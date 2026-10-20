@@ -47,7 +47,7 @@ use std::fmt;
 use taso_core::envelope::{ChronicleId, Epoch, Lsn};
 use taso_core::record::{LineageRecord, Origin, ParentSeal, Payload};
 
-use crate::chronicle::{restore_log, ChronicleError, Layers};
+use crate::chronicle::{restore_log, Chronicle, ChronicleError, Claim, Layers};
 use crate::pack::{FsBase, Packs};
 use crate::segment::Position;
 use crate::ship::{ObjectStore, Sender};
@@ -89,14 +89,32 @@ impl fmt::Display for Reborn {
 
 impl<P: Pool> Host<P> {
     /// Continue the Vessel `id` on this node from what `packs` holds up to
-    /// the coordinator's shipped anchor (see the module docs).
+    /// the coordinator's shipped anchor (see the module docs), taking it
+    /// over from whoever holds it as read now.  A caller that decided from
+    /// its own read passes that read to [`Host::rebirth_as`] instead.
     pub fn rebirth<S: ObjectStore, X: Sender>(
         &self,
         id: ChronicleId,
         packs: &Packs<S, X>,
     ) -> Result<(Vessel<P::Layers>, Reborn), VesselError> {
-        // 1. Fence: from here on the anchor cannot move under us.
-        self.coord.transfer(id, self.warden).map_err(VesselError::Coord)?;
+        let o = self.coord.ownership(id).map_err(VesselError::Coord)?;
+        let claim = if o.holder == self.warden { Claim::Mine } else { Claim::TakeOver { from: o.holder, epoch: o.epoch } };
+        self.rebirth_as(id, packs, claim)
+    }
+
+    /// [`Host::rebirth`] on `claim`: the ownership the caller read when it
+    /// decided.  Refused ([`crate::coordinator::CoordError::OwnershipChanged`]) if it moved
+    /// since, before anything is fenced (fencing review F1).
+    pub fn rebirth_as<S: ObjectStore, X: Sender>(
+        &self,
+        id: ChronicleId,
+        packs: &Packs<S, X>,
+        claim: Claim,
+    ) -> Result<(Vessel<P::Layers>, Reborn), VesselError> {
+        // 1. Fence, on the claim: from here on the anchor cannot move
+        //    under us, and a stale decision changes nothing.
+        let expected = Chronicle::<P::Layers>::expected(self.coord.as_ref(), id, self.warden, claim).map_err(VesselError::Coord)?;
+        self.coord.transfer_if(id, self.warden, expected).map_err(VesselError::Coord)?;
 
         // 2. What was shipped and anchored.
         let anchor = self.coord.shipped(id).map_err(VesselError::Coord)?;

@@ -70,7 +70,7 @@ use taso_core::record::{
     Payload, StreamCut, SuccessionRecord, TurnId, Verdict,
 };
 
-use crate::chronicle::{Chronicle, ChronicleError, LayerError, Layers, Recovery, Sealed, ZfsLayers};
+use crate::chronicle::{Chronicle, ChronicleError, Claim, LayerError, Layers, Recovery, Sealed, ZfsLayers};
 use crate::coordinator::{Coord, CoordError};
 use crate::pack::{PackError, Packs};
 use crate::segment::{Frame, Position};
@@ -382,6 +382,18 @@ impl<P: Pool> Host<P> {
         namespace: Namespace,
         subject: &[u8],
     ) -> Result<(Vessel<P::Layers>, Ensured), VesselError> {
+        self.ensure_as(namespace, subject, Claim::Mine)
+    }
+
+    /// [`Host::ensure`] opening a found Vessel on `claim` (a takeover of
+    /// the ownership the caller read, or its own).  A birth, or the end
+    /// of an interrupted one, is always this Warden's own.
+    pub fn ensure_as(
+        &self,
+        namespace: Namespace,
+        subject: &[u8],
+        claim: Claim,
+    ) -> Result<(Vessel<P::Layers>, Ensured), VesselError> {
         let id = vessel_id(namespace, subject);
         match self.registered_head(id)? {
             None => {
@@ -393,15 +405,21 @@ impl<P: Pool> Host<P> {
                 Ok((v, Ensured::BirthFinished))
             }
             Some(_) => {
-                let (v, r) = self.open_in(id, Some(namespace))?;
+                let (v, r) = self.open_with(id, Some(namespace), false, claim)?;
                 Ok((v, Ensured::Opened(Box::new(r))))
             }
         }
     }
 
-    /// Open an existing Vessel by id, in whatever namespace it is.
+    /// Open an existing Vessel by id, in whatever namespace it is, as
+    /// this Warden's own.
     pub fn open(&self, id: ChronicleId) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
         self.open_in(id, None)
+    }
+
+    /// [`Host::open`] on `claim`.
+    pub fn open_as(&self, id: ChronicleId, claim: Claim) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
+        self.open_with(id, None, false, claim)
     }
 
     /// Fork a new Vessel for `subject` from an accepted Seal of `parent`,
@@ -538,7 +556,7 @@ impl<P: Pool> Host<P> {
     /// (rebirth): [`Chronicle::open_after_gap`], with every check of
     /// [`Host::open`].
     pub(crate) fn open_after_gap(&self, id: ChronicleId) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
-        self.open_with(id, None, true)
+        self.open_with(id, None, true, Claim::Mine)
     }
 
     fn open_in(
@@ -546,7 +564,7 @@ impl<P: Pool> Host<P> {
         id: ChronicleId,
         expected: Option<Namespace>,
     ) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
-        self.open_with(id, expected, false)
+        self.open_with(id, expected, false, Claim::Mine)
     }
 
     fn open_with(
@@ -554,14 +572,15 @@ impl<P: Pool> Host<P> {
         id: ChronicleId,
         expected: Option<Namespace>,
         after_gap: bool,
+        claim: Claim,
     ) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
         let dataset = self.dataset_for(id);
         let dir = self.dir_for(id);
         let layers = self.pool.layers(&dataset);
         let (chronicle, recovery) = if after_gap {
-            Chronicle::open_after_gap(&dir, self.coord.clone(), id, self.warden, layers)?
+            Chronicle::open_after_gap_as(&dir, self.coord.clone(), id, self.warden, layers, claim)?
         } else {
-            Chronicle::open(&dir, self.coord.clone(), id, self.warden, layers)?
+            Chronicle::open_as(&dir, self.coord.clone(), id, self.warden, layers, claim)?
         };
         if chronicle.tail().lsn == Lsn::new(0) {
             return Err(VesselError::IncompleteBirth(id));

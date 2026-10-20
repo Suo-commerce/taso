@@ -106,7 +106,7 @@ use taso_core::envelope::ChronicleId;
 use taso_core::record::{vessel_id, Namespace, Verdict};
 use taso_field::adapter::Registry;
 
-use crate::chronicle::{LayerError, Recovery};
+use crate::chronicle::{Claim, LayerError, Recovery};
 use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
 use crate::coordinator::{Coord, CoordError};
 use taso_core::model::WardenId;
@@ -1271,10 +1271,20 @@ impl Node {
     fn start(&self, vc: &VesselConf) -> Result<(Vessel<StorageLayers>, Start, Verdict), DaemonError> {
         let host = self.host();
         let id = vc.id();
+        // What was read is what may be claimed (fencing review F1): a
+        // takeover names the holder and epoch read here, so one that is
+        // stale by the time it acts is refused instead of taking the
+        // Vessel back from whoever took it over in between.
+        let mut claim = Claim::Mine;
         let known = match self.coord.ownership(id) {
             Ok(o) => match self.coord.head(id).map_err(DaemonError::Coord)? {
                 h if h.lsn.get() == 0 => Known::Unborn,
-                _ => Known::Held(o.holder),
+                _ => {
+                    if o.holder != self.config.warden {
+                        claim = Claim::TakeOver { from: o.holder, epoch: o.epoch };
+                    }
+                    Known::Held(o.holder)
+                }
             },
             Err(CoordError::UnknownChronicle(_)) => Known::No,
             Err(e) => return Err(DaemonError::Coord(e)),
@@ -1284,7 +1294,7 @@ impl Node {
         let (vessel, verdict) = match &start {
             Start::Refuse(why) => return Err(DaemonError::Refused(why.clone())),
             Start::Birth | Start::Open => {
-                let (v, how) = host.ensure(vc.namespace, vc.subject.as_bytes())?;
+                let (v, how) = host.ensure_as(vc.namespace, vc.subject.as_bytes(), claim)?;
                 let verdict = match &how {
                     Ensured::Opened(r) => verdict_after_open(r),
                     Ensured::Born | Ensured::BirthFinished => Verdict::Clean,
@@ -1293,7 +1303,7 @@ impl Node {
                 (v, verdict)
             }
             Start::Rebirth => {
-                let (v, reborn) = host.rebirth(id, &self.packs(id)?)?;
+                let (v, reborn) = host.rebirth_as(id, &self.packs(id)?, claim)?;
                 self.log(vc, &reborn);
                 let verdict = verdict_after_rebirth(&reborn);
                 (v, verdict)
