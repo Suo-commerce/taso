@@ -498,6 +498,9 @@ mod tests {
         fn append_batch(&self, w: WardenId, es: &[taso_core::envelope::Envelope]) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
             self.inner.append_batch(w, es)
         }
+        fn transfer_if(&self, c: ChronicleId, h: WardenId, e: (WardenId, Epoch)) -> Result<Epoch, crate::coordinator::CoordError> {
+            self.inner.transfer_if(c, h, e)
+        }
         fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, crate::coordinator::CoordError> {
             self.inner.transfer(c, h)
         }

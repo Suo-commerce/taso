@@ -1476,6 +1476,9 @@ pub(crate) mod tests {
             fn append_batch(&self, w: WardenId, es: &[Envelope]) -> Result<ChronicleHead, CoordError> {
                 self.inner.append_batch(w, es)
             }
+            fn transfer_if(&self, c: ChronicleId, h: WardenId, e: (WardenId, Epoch)) -> Result<Epoch, CoordError> {
+                self.inner.transfer_if(c, h, e)
+            }
             fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
                 self.inner.transfer(c, h)
             }

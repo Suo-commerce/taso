@@ -40,6 +40,7 @@
 //!   6 advance_shipped  warden (8) · chronicle (16) · epoch (8) · position (40)
 //!   7 shipped    chronicle (16)
 //!   8 append_batch  warden (8) · count (4) · count × envelope (137)
+//!   9 transfer_if  chronicle (16) · new_holder (8) · expected holder (8) · expected epoch (8)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
@@ -55,7 +56,9 @@
 //! Operations 6, 7 and 8 were added to version 1 before any server ran
 //! outside a test.  A batch holds at most 4096 envelopes.  Refusal reasons
 //! 11 (`NotYou`: claimed (8) · peer (8)) and 12 (`UnknownPeer`: uid (4))
-//! were added with the peer map, below.
+//! were added with the peer map, below; operation 9 and refusal 13
+//! (`OwnershipChanged`: holder (8) · epoch (8)) with the conditional
+//! transfer (fencing review F1).
 //!
 //! A malformed request gets status 3 and the server closes the connection,
 //! since it can no longer trust the framing.  The version byte lets a
@@ -125,6 +128,7 @@ const OP_HEAD: u8 = 5;
 const OP_ADVANCE_SHIPPED: u8 = 6;
 const OP_SHIPPED: u8 = 7;
 const OP_APPEND_BATCH: u8 = 8;
+const OP_TRANSFER_IF: u8 = 9;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -146,6 +150,7 @@ const R_SHIPPED_CONFLICT: u8 = 9;
 const R_BAD_BATCH: u8 = 10;
 const R_NOT_YOU: u8 = 11;
 const R_UNKNOWN_PEER: u8 = 12;
+const R_OWNERSHIP_CHANGED: u8 = 13;
 
 /// How often the accept loop checks whether it should stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
@@ -161,6 +166,7 @@ enum Request {
     Append { warden: WardenId, envelope: Envelope },
     AppendBatch { warden: WardenId, envelopes: Vec<Envelope> },
     Transfer { chronicle: ChronicleId, new_holder: WardenId },
+    TransferIf { chronicle: ChronicleId, new_holder: WardenId, expected: (WardenId, Epoch) },
     Ownership { chronicle: ChronicleId },
     Head { chronicle: ChronicleId },
     AdvanceShipped { warden: WardenId, chronicle: ChronicleId, epoch: Epoch, to: Position },
@@ -321,6 +327,12 @@ impl Request {
             Self::Transfer { chronicle, new_holder } => {
                 o.u8(OP_TRANSFER).bytes(chronicle.as_bytes()).u64(new_holder.get())
             }
+            Self::TransferIf { chronicle, new_holder, expected } => o
+                .u8(OP_TRANSFER_IF)
+                .bytes(chronicle.as_bytes())
+                .u64(new_holder.get())
+                .u64(expected.0.get())
+                .u64(expected.1.get()),
             Self::Ownership { chronicle } => o.u8(OP_OWNERSHIP).bytes(chronicle.as_bytes()),
             Self::Head { chronicle } => o.u8(OP_HEAD).bytes(chronicle.as_bytes()),
             Self::AdvanceShipped { warden, chronicle, epoch, to } => o
@@ -352,6 +364,11 @@ impl Request {
                 Self::AppendBatch { warden, envelopes }
             }
             OP_TRANSFER => Self::Transfer { chronicle: i.chronicle()?, new_holder: i.warden()? },
+            OP_TRANSFER_IF => Self::TransferIf {
+                chronicle: i.chronicle()?,
+                new_holder: i.warden()?,
+                expected: (i.warden()?, Epoch::new(i.u64()?)),
+            },
             OP_OWNERSHIP => Self::Ownership { chronicle: i.chronicle()? },
             OP_HEAD => Self::Head { chronicle: i.chronicle()? },
             OP_ADVANCE_SHIPPED => Self::AdvanceShipped {
@@ -374,7 +391,7 @@ impl Request {
         match self {
             Self::Register { holder, .. } => Some(*holder),
             Self::Append { warden, .. } | Self::AppendBatch { warden, .. } => Some(*warden),
-            Self::Transfer { new_holder, .. } => Some(*new_holder),
+            Self::Transfer { new_holder, .. } | Self::TransferIf { new_holder, .. } => Some(*new_holder),
             Self::AdvanceShipped { warden, .. } => Some(*warden),
             Self::Ownership { .. } | Self::Head { .. } | Self::Shipped { .. } => None,
         }
@@ -384,7 +401,7 @@ impl Request {
     fn ok_kind(&self) -> OkKind {
         match self {
             Self::Register { .. } | Self::Append { .. } | Self::AppendBatch { .. } | Self::Head { .. } => OkKind::Head,
-            Self::Transfer { .. } => OkKind::Epoch,
+            Self::Transfer { .. } | Self::TransferIf { .. } => OkKind::Epoch,
             Self::Ownership { .. } => OkKind::Ownership,
             Self::AdvanceShipped { .. } | Self::Shipped { .. } => OkKind::Position,
         }
@@ -477,6 +494,7 @@ fn encode_refusal(e: &CoordError) -> Option<Vec<u8>> {
         CoordError::BadBatch { lsn } => o.u8(R_BAD_BATCH).u64(lsn.get()),
         CoordError::NotYou { claimed, peer } => o.u8(R_NOT_YOU).u64(claimed.get()).u64(peer.get()),
         CoordError::UnknownPeer { uid } => o.u8(R_UNKNOWN_PEER).u32(*uid),
+        CoordError::OwnershipChanged { holder, epoch } => o.u8(R_OWNERSHIP_CHANGED).u64(holder.get()).u64(epoch.get()),
         CoordError::Corrupt { .. } | CoordError::Storage(_) | CoordError::Unavailable(_) => return None,
     };
     Some(o.0)
@@ -498,6 +516,7 @@ fn decode_refusal(i: &mut In<'_>) -> Result<CoordError, Malformed> {
         R_BAD_BATCH => CoordError::BadBatch { lsn: Lsn::new(i.u64()?) },
         R_NOT_YOU => CoordError::NotYou { claimed: i.warden()?, peer: i.warden()? },
         R_UNKNOWN_PEER => CoordError::UnknownPeer { uid: i.u32()? },
+        R_OWNERSHIP_CHANGED => CoordError::OwnershipChanged { holder: i.warden()?, epoch: Epoch::new(i.u64()?) },
         _ => return Err(Malformed("unknown refusal")),
     })
 }
@@ -511,6 +530,9 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
         Request::Append { warden, envelope } => coord.append(warden, &envelope).map(Reply::Head),
         Request::AppendBatch { warden, envelopes } => coord.append_batch(warden, &envelopes).map(Reply::Head),
         Request::Transfer { chronicle, new_holder } => coord.transfer(chronicle, new_holder).map(Reply::Epoch),
+        Request::TransferIf { chronicle, new_holder, expected } => {
+            coord.transfer_if(chronicle, new_holder, expected).map(Reply::Epoch)
+        }
         Request::Ownership { chronicle } => coord.ownership(chronicle).map(Reply::Ownership),
         Request::Head { chronicle } => coord.head(chronicle).map(Reply::Head),
         Request::AdvanceShipped { warden, chronicle, epoch, to } => {
@@ -880,6 +902,19 @@ impl Coord for RemoteCoord {
         }
     }
 
+    fn transfer_if(
+        &self,
+        chronicle: ChronicleId,
+        new_holder: WardenId,
+        expected: (WardenId, Epoch),
+    ) -> Result<Epoch, CoordError> {
+        match self.call(Request::TransferIf { chronicle, new_holder, expected })? {
+            Reply::Epoch(e) => Ok(e),
+            Reply::Err(e) => Err(e),
+            other => Err(unexpected(other)),
+        }
+    }
+
     fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
         match self.call(Request::Transfer { chronicle, new_holder })? {
             Reply::Epoch(e) => Ok(e),
@@ -1012,6 +1047,12 @@ mod tests {
         ));
         // A refusal does not close the connection.
         assert_eq!(c.head(chron(1)).unwrap().lsn, Lsn::new(0));
+        // The conditional transfer, both answers, through the socket.
+        assert_eq!(c.transfer_if(chron(1), B, (A, Epoch::FIRST)).unwrap(), Epoch::new(2));
+        assert!(matches!(
+            c.transfer_if(chron(1), A, (A, Epoch::FIRST)),
+            Err(CoordError::OwnershipChanged { holder, epoch }) if holder == B && epoch == Epoch::new(2)
+        ));
     }
 
     /// Every refusal survives encode → decode exactly; every failure is
@@ -1032,6 +1073,7 @@ mod tests {
             CoordError::BadBatch { lsn: Lsn::new(3) },
             CoordError::NotYou { claimed: B, peer: A },
             CoordError::UnknownPeer { uid: 30033 },
+            CoordError::OwnershipChanged { holder: B, epoch: Epoch::new(2) },
         ];
         for e in refusals {
             let body = Reply::Err(e).encode();
@@ -1058,6 +1100,7 @@ mod tests {
             Request::Register { chronicle: chron(1), holder: A },
             Request::Append { warden: A, envelope: record(&w, 1) },
             Request::Transfer { chronicle: chron(1), new_holder: B },
+            Request::TransferIf { chronicle: chron(1), new_holder: B, expected: (A, Epoch::new(3)) },
             Request::Ownership { chronicle: chron(1) },
             Request::Head { chronicle: chron(1) },
             Request::AdvanceShipped {
@@ -1163,6 +1206,7 @@ mod tests {
             (Request::Append { warden: A, envelope: record(&w, 1) }, Some(A)),
             (Request::AppendBatch { warden: B, envelopes: vec![] }, Some(B)),
             (Request::Transfer { chronicle: chron(1), new_holder: B }, Some(B)),
+            (Request::TransferIf { chronicle: chron(1), new_holder: B, expected: (A, Epoch::FIRST) }, Some(B)),
             (Request::AdvanceShipped { warden: A, chronicle: chron(1), epoch: Epoch::FIRST, to: pos }, Some(A)),
             (Request::Ownership { chronicle: chron(1) }, None),
             (Request::Head { chronicle: chron(1) }, None),
@@ -1324,6 +1368,9 @@ mod tests {
         }
         fn append_batch(&self, w: WardenId, e: &[Envelope]) -> Result<ChronicleHead, CoordError> {
             self.inner.append_batch(w, e)
+        }
+        fn transfer_if(&self, c: ChronicleId, h: WardenId, e: (WardenId, Epoch)) -> Result<Epoch, CoordError> {
+            self.inner.transfer_if(c, h, e)
         }
         fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
             self.inner.transfer(c, h)
