@@ -111,6 +111,11 @@ on() {   # $1 a|b, $2 command string: over ssh, or here
 to() {   # $1 a|b, $2 local file, $3 remote path: copy (or nothing if local and same path)
     local h; h=$(host_of "$1")
     if [ -n "$h" ]; then "${SSH[@]}" "$h" "cat > $3" < "$2"; elif [ "$2" != "$3" ]; then cp "$2" "$3"; fi
+    durable "$1"
+}
+durable() {   # $1 a|b: with KILL=power, node A may die any moment; what the
+              # harness wrote there must be on disk, not in its page cache
+    [ "$KILL" = power ] && [ "$1" = a ] && on a sync || true
 }
 umount_under() {   # $1 a|b: unmount everything under the node's mount root, innermost first
     on "$1" "awk -v r=$WORK/$1/mnt '\$5 == r || index(\$5, r \"/\") == 1 {print length(\$5), \$5}' /proc/self/mountinfo | sort -rn | cut -d' ' -f2- | while read -r m; do umount \"\$m\" 2>/dev/null || umount -l \"\$m\" 2>/dev/null; done; true"
@@ -151,8 +156,8 @@ cleanup() {
         on "$n" 'for d in '"$WORK"'/'"$n"'/run/runc; do [ -d "$d" ] && for c in $(runc --root "$d" list -q 2>/dev/null); do runc --root "$d" delete --force "$c" 2>/dev/null; done; done; true' 2>/dev/null
         umount_under "$n" 2>/dev/null
     done
-    if [ "$KEEP" = 1 ]; then
-        echo "kept: work dir $WORK on every node, branches under $ROOT in the block logs"
+    if [ "$KEEP" = 1 ] || [ "$KILL" = power ]; then
+        echo "kept (KEEP=1, or a power run keeps its evidence): work dir $WORK on every node, branches under $ROOT in the block logs"
     else
         drop_root a; drop_root b
         [ -n "$BLKD_B_PID" ] && { blk b quit >/dev/null 2>&1; sleep 0.5; kill "$BLKD_B_PID" 2>/dev/null; }
@@ -214,6 +219,7 @@ for n in a b; do
     [ -n "$(host_of "$n")" ] || continue
     echo "== copying binaries and rootfs to node $n"
     tar -C "$WORK" -cf - bin rootfs | on "$n" "tar -C $WORK -xf -"
+    durable "$n"
 done
 
 # ── coordinator and store ─────────────────────────────────────────────
@@ -235,6 +241,7 @@ fi
 if [ -n "${TASO_BLK_S3_ENDPOINT:-}" ]; then
     for n in a b; do
         on "$n" "umask 077; cat > $WORK/s3.secret" < "$SECRET_FILE"
+        durable "$n"
     done
     STORE_JSON=$(python3 -c "import json,os; print(json.dumps({'s3': {'endpoint': os.environ['TASO_BLK_S3_ENDPOINT'], 'region': os.environ.get('TASO_BLK_S3_REGION', 'garage'), 'bucket': os.environ['TASO_BLK_S3_BUCKET'], 'access_key_id': os.environ['TASO_BLK_S3_ACCESS_KEY_ID'], 'secret_key_file': '$WORK/s3.secret'}}))")
     PREFIX="gate-p2blk-$RUN"
@@ -281,8 +288,8 @@ json.dump({
 PY
 }
 
-vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset (branch name), as the daemon logged it
-    grep -o ': dataset [^ ]*$' "$1" | head -1 | sed 's/: dataset //'
+vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset (branch name), as the daemon logged it; empty if not there
+    { grep -o ': dataset [^ ]*$' "$1" 2>/dev/null || true; } | head -1 | sed 's/: dataset //'
 }
 tag_lsn() {   # $1 tag (hex: lsn little-endian 8 bytes, hash 32) -> lsn
     python3 -c "import sys; print(int.from_bytes(bytes.fromhex(sys.argv[1][:16]), 'little'))" "$1"
@@ -393,13 +400,22 @@ for k in $(seq 1 "$N"); do
         # S2.4: A's own log after the cut, as its daemon reported at boot.
         on a "systemctl is-active -q taso-blkd || systemctl start taso-blkd; sleep 1; journalctl -u taso-blkd -b --no-pager -o cat" >"$OUT/a-$k.recovery.txt" 2>&1 || true
         echo "  A's taso-blkd at boot: $(tail -3 "$OUT/a-$k.recovery.txt" | tr '\n' ' ')"
+        # What of the harness survived on A (its files were synced before
+        # the Vessel ran; anything missing here is a finding).
+        on a "ls -la $WORK $WORK/a $WORK/a/state 2>&1; test -x $WORK/bin/taso-wardend && echo 'bin ok' || echo 'BIN MISSING'" >"$OUT/a-$k.after-boot.txt" 2>&1 || true
+        grep -q 'bin ok' "$OUT/a-$k.after-boot.txt" || { echo "  A's work dir is not intact after the boot: $(tail -1 "$OUT/a-$k.after-boot.txt")"; }
     fi
-    on a "cat $WORK/a-$k.err" >"$OUT/a-$k.err" 2>/dev/null || : >"$OUT/a-$k.err"
+    on a "cat $WORK/a-$k.err" >"$OUT/a-$k.err" 2>"$OUT/a-$k.cat.err" || echo "  cat A's log: exit $? ($(cat "$OUT/a-$k.cat.err"))"
     on a "cat $WORK/a-$k.out" >"$OUT/a-$k.out" 2>/dev/null || : >"$OUT/a-$k.out"
 
     # The last Seal both nodes have: same tag (lsn + hash of the Seal
-    # record), then the same bytes two ways.
-    dsa=$(vessel_ds "$OUT/a-$k.err"); dsb=$(vessel_ds "$OUT/b-$k.err")
+    # record), then the same bytes two ways.  A's stderr file may have
+    # died with A's page cache (KILL=power): its dataset name is derived
+    # from the id read before the kill; the Chronicle itself is fsynced.
+    dsb=$(vessel_ds "$OUT/b-$k.err")
+    dsa=$(vessel_ds "$OUT/a-$k.err")
+    [ -n "$dsa" ] || { dsa="$ROOT/a/v-$id"; echo "  A's Warden log did not survive the cut; dataset taken as $dsa"; }
+    [ -n "$dsb" ] || { echo "round $k: B's log names no dataset; B's log:" >&2; tail -8 "$OUT/b-$k.err" | sed 's/^/    /' >&2; exit 1; }
     ba_id=$(branch_of a "$dsa" 2>"$OUT/blk-$k.err") || { ba_id=; echo "  node A: find $dsa: $(cat "$OUT/blk-$k.err")"; }
     bb_id=$(branch_of b "$dsb" 2>"$OUT/blk-$k.err") || { bb_id=; echo "  node B: find $dsb: $(cat "$OUT/blk-$k.err")"; }
     tags_a=; tags_b=
@@ -425,8 +441,10 @@ for k in $(seq 1 "$N"); do
 
     # Losses reported in ctl: both logs, read as files, judged against what
     # the coordinator recorded at the takeover.
-    id=${dsb##*/v-}
-    on a "$WORK/bin/taso-logcheck $SOCK $WORK/a/state $id" >"$OUT/a-$k.log.json" 2>>"$OUT/a-$k.err" || echo '{}' >"$OUT/a-$k.log.json"
+    [ "${dsb##*/v-}" = "$id" ] || { echo "round $k: B's dataset ${dsb##*/v-} is not the Vessel $id A ran" >&2; exit 1; }
+    on a "$WORK/bin/taso-logcheck $SOCK $WORK/a/state $id" >"$OUT/a-$k.log.json" 2>"$OUT/a-$k.logcheck.err" \
+        || { echo "  logcheck on A: exit $? ($(head -c 200 "$OUT/a-$k.logcheck.err"))"; echo '{}' >"$OUT/a-$k.log.json"; }
+    [ -s "$OUT/a-$k.log.json" ] || { echo "  logcheck on A printed nothing"; echo '{}' >"$OUT/a-$k.log.json"; }
     on b "$WORK/bin/taso-logcheck $SOCK $WORK/b/state $id" >"$OUT/b-$k.log.json" 2>>"$OUT/b-$k.err" || echo '{}' >"$OUT/b-$k.log.json"
     logv=$(python3 "$WORK/bin/logjudge.py" "$OUT/a-$k.log.json" "$OUT/b-$k.log.json" 2>&1 || echo '{"ok": false, "lost": null, "why": "logjudge failed"}')
     echo "$logv" >"$OUT/judge-$k.json"
