@@ -71,6 +71,12 @@ usage() { die "usage: $0 hub|vessel <hub private ip>  |  $0 coord <name>=<warden
 
 export DEBIAN_FRONTEND=noninteractive
 
+# build-essential only when there is no C toolchain: on Ubuntu 26.04 it
+# depends on coreutils-from-uutils, which a machine moved to GNU coreutils
+# (taso-test, 2026-10-18) cannot install, and a machine that has built the
+# repo already has the toolchain.
+toolchain() { if command -v gcc >/dev/null && command -v make >/dev/null; then echo; else echo build-essential; fi; }
+
 rust() {
     if ! command -v cargo >/dev/null && [ ! -x /root/.cargo/bin/cargo ]; then
         curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -112,7 +118,8 @@ if [ "$ROLE" = coord ]; then
         PEERS+=("$arg")
     done
     apt-get update -q
-    apt-get install -y -q git build-essential pkg-config python3 curl chrony openssh-server
+    # shellcheck disable=SC2046
+    apt-get install -y -q git $(toolchain) pkg-config python3 curl chrony openssh-server
     rust
     (cd "$REPO" && cargo build --release -q -p taso-warden --bin taso-coordd)
     install -m 755 "$REPO/target/release/taso-coordd" /usr/local/bin/taso-coordd
@@ -169,7 +176,8 @@ if [ "$ROLE" = vessel-blk ]; then
     COORD=${2:-}; NAME=${3:-}
     [ -n "$COORD" ] && [[ "$NAME" =~ ^[a-z][a-z0-9-]{0,15}$ ]] || usage
     apt-get update -q
-    apt-get install -y -q git build-essential pkg-config python3 jq curl chrony runc e2fsprogs openssh-client
+    # shellcheck disable=SC2046
+    apt-get install -y -q git $(toolchain) pkg-config python3 jq curl chrony runc e2fsprogs openssh-client
     rust
     [ -x "$(command -v runc)" ] || die "runc missing"
     modprobe ublk_drv || die "no ublk module on this kernel ($(uname -r)); the block log needs it"
