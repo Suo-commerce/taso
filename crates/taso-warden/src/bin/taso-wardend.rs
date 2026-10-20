@@ -1,4 +1,13 @@
-//! `taso-wardend <config.json>`: run a node's Vessels ([`taso_warden::daemon`]).
+//! `taso-wardend <config.json> [--takeover <subject>=<warden>@<epoch>]...`:
+//! run a node's Vessels ([`taso_warden::daemon`]).
+//!
+//! `--takeover` is the one-shot form of a static entry's `"takeover"`
+//! (`{"holder": <warden>, "epoch": <n>}`): for this run only, the Vessel
+//! with that subject is taken over from exactly that ownership, as the
+//! operator read it (`taso-logcheck`, or the daemon's refusal line).
+//! Nothing is left in the config to fence anyone on a later restart
+//! (fencing review F2).  A subject not in `"vessels"` is an error; with a
+//! kubernetes source the flag is refused (the cluster names takeovers).
 //!
 //! The Vessels come from the config's `"source"` and run under the
 //! [`taso_warden::supervisor`], each through the guard, each restarted (or
@@ -74,18 +83,25 @@ fn main() -> ExitCode {
         });
     }
 
-    let args: Vec<String> = std::env::args().collect();
-    let [_, path] = &args[..] else {
-        eprintln!("usage: taso-wardend <config.json>");
-        return ExitCode::from(2);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let (path, takeovers) = match cli::parse(&argv) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("taso-wardend: {e}\n{}", cli::USAGE);
+            return ExitCode::from(2);
+        }
     };
-    let config = match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| Config::parse(&t).map_err(|e| e.to_string())) {
+    let mut config = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Config::parse(&t).map_err(|e| e.to_string())) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("taso-wardend: {path}: {e}");
             return ExitCode::from(2);
         }
     };
+    if let Err(e) = cli::apply_takeovers(&mut config, &takeovers) {
+        eprintln!("taso-wardend: {e}");
+        return ExitCode::from(2);
+    }
     // The cluster's API, before anything else is touched.
     let kube = match &config.source {
         SourceConf::Static => None,
@@ -249,6 +265,103 @@ fn report(node: &Node, event: &Event<Result<Report, DaemonError>>, last: &mut BT
 }
 
 /// SIGTERM and SIGINT, taken by one thread (see "Stopping").
+/// The command line: the config path and the one-shot takeovers.
+mod cli {
+    use taso_core::envelope::Epoch;
+    use taso_core::model::WardenId;
+    use taso_warden::daemon::{Config, SourceConf, TakeOver};
+
+    pub const USAGE: &str = "usage: taso-wardend <config.json> [--takeover <subject>=<warden>@<epoch>]...";
+
+    /// `(path, [(subject, takeover)])`.
+    pub fn parse(args: &[String]) -> Result<(String, Vec<(String, TakeOver)>), String> {
+        let mut path = None;
+        let mut takeovers = Vec::new();
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--takeover" => {
+                    let v = it.next().ok_or("--takeover needs <subject>=<warden>@<epoch>")?;
+                    let (subject, rest) = v.split_once('=').ok_or_else(|| format!("--takeover {v}: expected <subject>=<warden>@<epoch>"))?;
+                    let (warden, epoch) = rest.split_once('@').ok_or_else(|| format!("--takeover {v}: expected <subject>=<warden>@<epoch>"))?;
+                    let num = |what: &str, s: &str| -> Result<u64, String> {
+                        s.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| format!("--takeover {v}: {what} is not a positive number"))
+                    };
+                    if subject.is_empty() {
+                        return Err(format!("--takeover {v}: empty subject"));
+                    }
+                    if takeovers.iter().any(|(s, _)| s == subject) {
+                        return Err(format!("--takeover {v}: subject given twice"));
+                    }
+                    takeovers.push((
+                        subject.to_string(),
+                        TakeOver { holder: WardenId::new(num("warden", warden)?), epoch: Epoch::new(num("epoch", epoch)?) },
+                    ));
+                }
+                s if s.starts_with("--") => return Err(format!("unknown option {s}")),
+                _ if path.is_none() => path = Some(a.clone()),
+                _ => return Err(format!("unexpected argument {a}")),
+            }
+        }
+        Ok((path.ok_or("missing <config.json>")?, takeovers))
+    }
+
+    /// Put each one-shot takeover on its entry.
+    pub fn apply_takeovers(config: &mut Config, takeovers: &[(String, TakeOver)]) -> Result<(), String> {
+        if takeovers.is_empty() {
+            return Ok(());
+        }
+        if !matches!(config.source, SourceConf::Static) {
+            return Err("--takeover needs a static \"vessels\" list; with a kubernetes source the Vessel resource names the takeover".into());
+        }
+        for (subject, t) in takeovers {
+            let vc = config
+                .vessels
+                .iter_mut()
+                .find(|v| &v.subject == subject)
+                .ok_or_else(|| format!("--takeover {subject}: no such subject in \"vessels\""))?;
+            vc.takeover = Some(*t);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn p(args: &[&str]) -> Result<(String, Vec<(String, TakeOver)>), String> {
+            parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        }
+
+        #[test]
+        fn path_and_takeovers() {
+            assert_eq!(p(&["c.json"]).unwrap(), ("c.json".to_string(), vec![]));
+            let (path, t) = p(&["--takeover", "sim-1=2@7", "c.json", "--takeover", "x=1@1"]).unwrap();
+            assert_eq!(path, "c.json");
+            assert_eq!(t[0], ("sim-1".to_string(), TakeOver { holder: WardenId::new(2), epoch: Epoch::new(7) }));
+            assert_eq!(t[1].0, "x");
+        }
+
+        #[test]
+        fn mistakes_are_named() {
+            for (args, want) in [
+                (&[][..], "missing <config.json>"),
+                (&["a", "b"], "unexpected argument b"),
+                (&["c", "--takeover"], "--takeover needs <subject>=<warden>@<epoch>"),
+                (&["c", "--takeover", "s"], "--takeover s: expected <subject>=<warden>@<epoch>"),
+                (&["c", "--takeover", "s=2"], "--takeover s=2: expected <subject>=<warden>@<epoch>"),
+                (&["c", "--takeover", "=2@3"], "--takeover =2@3: empty subject"),
+                (&["c", "--takeover", "s=x@3"], "--takeover s=x@3: warden is not a positive number"),
+                (&["c", "--takeover", "s=2@0"], "--takeover s=2@0: epoch is not a positive number"),
+                (&["c", "--takeover", "s=2@3", "--takeover", "s=2@4"], "--takeover s=2@4: subject given twice"),
+                (&["c", "--tls"], "unknown option --tls"),
+            ] {
+                assert_eq!(p(args).unwrap_err(), want, "{args:?}");
+            }
+        }
+    }
+}
+
 mod signals {
     use std::io;
     use std::thread::JoinHandle;

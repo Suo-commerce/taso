@@ -51,11 +51,13 @@ impl Drop for Cleanup {
     }
 }
 
-fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool) -> Config {
+/// `takeover`: the ownership to take over, `(holder, epoch)` as read from
+/// the coordinator (F2: a takeover names what it replaces).
+fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: Option<(u64, u64)>) -> Config {
     config_with(tmp, base, node, warden, takeover, &["--turns", "5", "--txns", "2", "--rows", "3"])
 }
 
-fn config_with(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool, sim_args: &[&str]) -> Config {
+fn config_with(tmp: &Path, base: &str, node: &str, warden: u64, takeover: Option<(u64, u64)>, sim_args: &[&str]) -> Config {
     let mut args = vec!["/usr/bin/taso-sim"];
     args.extend_from_slice(sim_args);
     let v = json!({
@@ -72,7 +74,8 @@ fn config_with(tmp: &Path, base: &str, node: &str, warden: u64, takeover: bool, 
             "memory_bytes": 268435456,
             "pids": 64
         },
-        "vessels": [{ "namespace": "07070707070707070707070707070707", "subject": "sim-1", "takeover": takeover, "uid_slot": 3 }]
+        "vessels": [{ "namespace": "07070707070707070707070707070707", "subject": "sim-1",
+                      "takeover": takeover.map(|(h, e)| json!({"holder": h, "epoch": e})), "uid_slot": 3 }]
     });
     Config::parse(&v.to_string()).unwrap()
 }
@@ -108,12 +111,12 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
-    let node = |name: &str, warden: u64, takeover: bool| {
+    let node = |name: &str, warden: u64, takeover: Option<(u64, u64)>| {
         Node::new(config(tmp.path(), &base, name, warden, takeover), coord.clone(), Storage::Zfs(Zfs::cli().batched())).unwrap()
     };
 
     // 1. Born on A.
-    let a = node("a", 1, false);
+    let a = node("a", 1, None);
     let r = a.run_vessel(&a.config.vessels[0]).unwrap();
     println!("A, first: {r:?}\n{}", stats(&a));
     assert_eq!(r.start, Start::Birth);
@@ -141,7 +144,9 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     assert_eq!((s["resumed_after"].clone(), s["turns"].clone(), s["rows_in_db"].clone()), (json!(5), json!([6, 10]), json!(60)));
 
     // 3. Reborn on B: resumes after turn 10 with the database of turn 10.
-    let b = node("b", 2, true);
+    //    B's operator read who holds it and names exactly that.
+    let o = coord.ownership(a.config.vessels[0].id()).unwrap();
+    let b = node("b", 2, Some((o.holder.get(), o.epoch.get())));
     let r = b.run_vessel(&b.config.vessels[0]).unwrap();
     println!("B, takeover: {r:?}\n{}", stats(&b));
     assert_eq!(r.start, Start::Rebirth);
@@ -238,7 +243,7 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
     let sim = ["--turns", "20", "--turn-sleep-ms", "50", "--txns", "1", "--rows", "1"];
-    let node = Arc::new(Node::new(config_with(tmp.path(), &base, "a", 1, false, &sim), coord, Storage::Zfs(Zfs::cli().batched())).unwrap());
+    let node = Arc::new(Node::new(config_with(tmp.path(), &base, "a", 1, None, &sim), coord, Storage::Zfs(Zfs::cli().batched())).unwrap());
     let vessel = node.config.vessels[0].clone();
     let with = |restart: Restart| VesselConf { restart, ..vessel.clone() };
     let id = vessel.id();

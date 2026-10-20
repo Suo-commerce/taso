@@ -14,10 +14,11 @@
 #
 # Each of $N rounds uses a fresh Vessel: node A (Warden 1) runs taso-sim, a
 # turn every $SLEEP_MS ms, each sealed and published; after $RUN_S s A is
-# killed; node B (Warden 2, "takeover": true) starts, fences A, rebuilds the
-# Vessel from the store and runs the agent, which must resume right after
-# the last sealed turn; timed from the kill to B's "reborn" line, on the
-# driver's clock.
+# killed; node B (Warden 2) starts with a takeover naming exactly A's
+# ownership as read just before the kill ("takeover": {"holder", "epoch"},
+# fencing review F2), fences A, rebuilds the Vessel from the store and runs
+# the agent, which must resume right after the last sealed turn; timed from
+# the kill to B's "reborn" line, on the driver's clock.
 #
 # Nodes: A_HOST and B_HOST are each empty (this machine) or root@<host>
 # (ssh, key from this machine).  The driver is wherever this runs; it must
@@ -245,10 +246,11 @@ if [ "$KILL" = power ]; then
     fi
 fi
 
-config() {   # $1 node, $2 warden, $3 takeover, $4 subject, $5 turns, $6 out file
+config() {   # $1 node, $2 warden, $3 takeover ("" or <holder>@<epoch>), $4 subject, $5 turns, $6 out file
     python3 - "$@" <<PY
 import json, sys
 node, warden, takeover, subject, turns, out = sys.argv[1:]
+takeover = {"holder": int(takeover.split("@")[0]), "epoch": int(takeover.split("@")[1])} if takeover else None
 json.dump({
     "warden": int(warden),
     "coordinator": {"remote": "$SOCK"},
@@ -267,7 +269,7 @@ json.dump({
         "memory_bytes": 268435456,
         "pids": 64,
     },
-    "vessels": [{"namespace": "7a" * 16, "subject": subject, "takeover": takeover == "true", "uid_slot": 0}],
+    "vessels": [{"namespace": "7a" * 16, "subject": subject, "takeover": takeover, "uid_slot": 0}],
 }, open(out, "w"), indent=1)
 PY
 }
@@ -314,10 +316,8 @@ files_hash() {   # $1 node -> hash of every file's path and bytes on the scratch
 : > "$OUT/rounds.tsv"
 for k in $(seq 1 "$N"); do
     subject="gate-p2blk-$RUN-$k"
-    config a 1 false "$subject" 100000 "$WORK/a-$k.json"
-    config b 2 true "$subject" 5 "$WORK/b-$k.json"
+    config a 1 "" "$subject" 100000 "$WORK/a-$k.json"
     to a "$WORK/a-$k.json" "$WORK/a-$k.json"
-    to b "$WORK/b-$k.json" "$WORK/b-$k.json"
 
     # A's Warden runs on node A, detached, its output in $WORK there.
     A_PID=$(on a "nohup $WORK/bin/taso-wardend $WORK/a-$k.json >$WORK/a-$k.out 2>$WORK/a-$k.err </dev/null & echo \$!")
@@ -327,6 +327,16 @@ for k in $(seq 1 "$N"); do
         on a "tail -8 $WORK/a-$k.err" | sed 's/^/    /' >&2
         exit 1
     fi
+    # B takes over exactly the ownership A holds now, as an operator
+    # would read it with taso-logcheck (the holder cannot change before
+    # the kill: only a takeover moves it).
+    dsa=$(on a "grep -o ': dataset [^ ]*$' $WORK/a-$k.err | head -1 | sed 's/: dataset //'")
+    id=${dsa##*/v-}
+    owner=$(on a "$WORK/bin/taso-logcheck $SOCK $WORK/a/state $id" 2>/dev/null \
+        | python3 -c "import json,sys; o=json.load(sys.stdin)['ownership']; print('%d@%d' % (o['holder'], o['epoch']))") \
+        || { echo "round $k: could not read A's ownership of $id" >&2; exit 1; }
+    config b 2 "$owner" "$subject" 5 "$WORK/b-$k.json"
+    to b "$WORK/b-$k.json" "$WORK/b-$k.json"
     if [ "$KILL" = stop ]; then
         on a "kill -STOP $A_PID"
     else

@@ -315,7 +315,7 @@ mod tests {
         VesselConf {
             namespace: Namespace::from_bytes([7; 16]),
             subject: subject.into(),
-            takeover: false,
+            takeover: None,
             uid_slot: slot,
             restart: Restart::Never,
             runtime: None,
