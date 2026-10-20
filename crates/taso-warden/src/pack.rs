@@ -298,6 +298,13 @@ pub enum PackError {
         /// The anchor.
         anchor: Position,
     },
+    /// A log ship would pass a Seal record whose `fs` is not shipped: the
+    /// anchor would then let a rebirth resume after a turn whose files
+    /// are not there (fencing review F4).  Ship the Seal first.
+    SealNotShipped {
+        /// The Seal.
+        seal: Lsn,
+    },
     /// The request contradicts the local segment or what is shipped.
     Refused(String),
 }
@@ -321,6 +328,9 @@ impl fmt::Display for PackError {
             }
             Self::NotAnchored { anchor } => {
                 write!(f, "the shipped chain does not contain lsn {} with hash {}", anchor.lsn.get(), anchor.hash)
+            }
+            Self::SealNotShipped { seal } => {
+                write!(f, "the log cannot be shipped past Seal {}: its fs is not shipped yet", seal.get())
             }
             Self::Refused(why) => write!(f, "refused: {why}"),
         }
@@ -701,6 +711,11 @@ fn names(r: &FsShippedRecord, fs: &FsRef) -> bool {
     r.seal == fs.to.lsn && r.seal_hash == fs.to.hash && r.guid == fs.guid && r.base == stream_base(fs.base)
 }
 
+/// Whether a frame is a Seal record.
+fn is_seal(f: &Frame) -> bool {
+    f.envelope.stream == Stream::Ctl && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_)))
+}
+
 /// The `FsShipped` record a frame holds, if it is one.
 fn fs_shipped_of(f: &Frame) -> Option<FsShippedRecord> {
     if f.envelope.stream != Stream::Ctl {
@@ -1005,8 +1020,14 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     /// frame by frame back from the tail and stops at the first: it sits
     /// after the last published Seal, a turn or two back.
     fn newest_named(segments: &[&Segment]) -> Result<Option<FsShippedRecord>, PackError> {
+        Self::named_upto(segments, Lsn::new(u64::MAX))
+    }
+
+    /// The newest `FsShipped` record at or below `upto` in the local log,
+    /// if any (as [`Packs::newest_named`], from `upto` down).
+    fn named_upto(segments: &[&Segment], upto: Lsn) -> Result<Option<FsShippedRecord>, PackError> {
         for seg in segments.iter().rev() {
-            let mut lsn = seg.tail().lsn;
+            let mut lsn = seg.tail().lsn.min(upto);
             while lsn > seg.base().lsn {
                 if let Some(f) = seg.frame(lsn)? {
                     if let Some(r) = fs_shipped_of(&f) {
@@ -1109,6 +1130,14 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     /// must be accepted: at or below the anchored head), as one pack.
     /// `segments` are the Chronicle's local segments, oldest first.
     /// `None` if there is nothing new.
+    ///
+    /// Refused ([`PackError::SealNotShipped`]) if the frames to ship hold
+    /// a Seal record that no `FsShipped` record at or below `upto` covers
+    /// — a named Seal covers every Seal before it, since `fs` sections
+    /// chain.  Otherwise the anchor could pass a Seal whose files were
+    /// never shipped, and a rebirth would resume after a turn whose files
+    /// are not there (fencing review F4).  [`Packs::ship_seal`] ships the
+    /// Seal's log and `fs` together and is not subject to this.
     pub fn ship_log(&self, segments: &[&Segment], upto: Position) -> Result<Option<PackHeader>, PackError> {
         let t = crate::timing::span("pack.shipped");
         let end = self.log_end()?;
@@ -1122,6 +1151,12 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         let t = crate::timing::span("pack.local");
         let base = self.log_base(segments, end)?;
         let frames = self.frames_after(segments, base, upto)?;
+        if let Some(seal) = frames.iter().filter(|f| is_seal(f)).map(|f| f.envelope.lsn).max() {
+            let covered = Self::named_upto(segments, upto.lsn)?.map_or(Lsn::new(0), |r| r.seal);
+            if covered < seal {
+                return Err(PackError::SealNotShipped { seal });
+            }
+        }
         drop(t);
         let _t = crate::timing::span("pack.put");
         self.put_pack(PackHeader { chronicle: self.chronicle, base, end: upto, fs: None }, &frames, None).map(Some)
@@ -1863,20 +1898,38 @@ mod tests {
         assert_eq!(c.seals.iter().map(|f| f.fs.to.lsn.get()).collect::<Vec<_>>(), vec![6, 9]);
     }
 
-    /// The log was shipped past the Seal by a dispatch flush: the Seal
-    /// pack's log section is empty, its key is still unique.
+    /// F4 (fencing review 2026-10-17): a dispatch flush cannot ship the
+    /// log past a Seal whose fs is not shipped — before it, the Seal pack
+    /// would have had an empty log section and the anchor could pass the
+    /// Seal, so a rebirth would resume after a turn whose files are not
+    /// there.  The log ships up to the Seal's predecessor, the Seal pack
+    /// carries the Seal's record, and after the FsShipped record the log
+    /// ships on; a later named Seal covers an earlier unnamed one.
     #[test]
-    fn seal_pack_with_an_empty_log_section() {
+    fn the_log_is_never_shipped_past_an_unshipped_seal() {
         let e = env();
         let mut log = Log::new();
         log.fill(8, &[6]);
-        e.packs.ship_log(&log.segs(), log.at(8)).unwrap();
+        assert!(matches!(e.packs.ship_log(&log.segs(), log.at(8)), Err(PackError::SealNotShipped { seal }) if seal == Lsn::new(6)));
+        assert!(matches!(e.packs.ship_log(&log.segs(), log.at(6)), Err(PackError::SealNotShipped { seal }) if seal == Lsn::new(6)));
+        assert!(e.keys().is_empty(), "a refusal puts nothing");
+        e.packs.ship_log(&log.segs(), log.at(5)).unwrap();
         let h = log.publish(&e, 6, 5, None).unwrap();
-        assert_eq!((h.header.base, h.header.end), (log.at(8), log.at(8)));
-        assert_eq!(e.keys().len(), 3, "log, Seal, log with the record");
+        assert_eq!((h.header.base, h.header.end), (log.at(5), log.at(6)), "the Seal pack carries the Seal's record");
+        // publish appended the FsShipped record (lsn 9) and shipped to it.
+        assert_eq!(e.packs.log_end().unwrap(), log.at(9));
         let c = e.packs.chain(None).unwrap();
-        assert_eq!((c.end, c.seals.len()), (log.at(9), 1));
-        assert_eq!(e.read_fs(6).unwrap(), body(None, Lsn::new(6), 0));
+        assert_eq!(c.seals.iter().map(|f| f.fs.to.lsn.get()).collect::<Vec<_>>(), vec![6]);
+
+        // Seal 10 unnamed, Seal 12 named: the log may ship past 10 only
+        // once 12's FsShipped record is in it.
+        log.fill(13, &[10, 12]);
+        assert!(matches!(e.packs.ship_log(&log.segs(), log.at(13)), Err(PackError::SealNotShipped { seal }) if seal == Lsn::new(12)));
+        log.publish(&e, 12, 7, None).unwrap();
+        assert_eq!(e.packs.log_end().unwrap(), log.at(14));
+        log.fill(16, &[]);
+        e.packs.ship_log(&log.segs(), log.at(16)).unwrap();
+        assert_eq!(e.packs.log_end().unwrap(), log.at(16));
     }
 
     #[test]
@@ -2481,7 +2534,7 @@ mod tests {
     #[test]
     fn the_writer_refuses_a_store_it_does_not_hold() {
         let mut old = Log::new();
-        old.fill(5, &[2, 4]);
+        old.fill(5, &[]);
         let mut b = Log::takeover(&old, 3);
         b.fill(8, &[8]);
         // The store ends at B's segment base (5), but with another record.
