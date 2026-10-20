@@ -281,8 +281,8 @@ json.dump({
 PY
 }
 
-vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset (branch name), as the daemon logged it
-    grep -o ': dataset [^ ]*$' "$1" | head -1 | sed 's/: dataset //'
+vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset (branch name), as the daemon logged it; empty if not there
+    { grep -o ': dataset [^ ]*$' "$1" 2>/dev/null || true; } | head -1 | sed 's/: dataset //'
 }
 tag_lsn() {   # $1 tag (hex: lsn little-endian 8 bytes, hash 32) -> lsn
     python3 -c "import sys; print(int.from_bytes(bytes.fromhex(sys.argv[1][:16]), 'little'))" "$1"
@@ -398,8 +398,13 @@ for k in $(seq 1 "$N"); do
     on a "cat $WORK/a-$k.out" >"$OUT/a-$k.out" 2>/dev/null || : >"$OUT/a-$k.out"
 
     # The last Seal both nodes have: same tag (lsn + hash of the Seal
-    # record), then the same bytes two ways.
-    dsa=$(vessel_ds "$OUT/a-$k.err"); dsb=$(vessel_ds "$OUT/b-$k.err")
+    # record), then the same bytes two ways.  A's stderr file may have
+    # died with A's page cache (KILL=power): its dataset name is derived
+    # from the id read before the kill; the Chronicle itself is fsynced.
+    dsb=$(vessel_ds "$OUT/b-$k.err")
+    dsa=$(vessel_ds "$OUT/a-$k.err")
+    [ -n "$dsa" ] || { dsa="$ROOT/a/v-$id"; echo "  A's Warden log did not survive the cut; dataset taken as $dsa"; }
+    [ -n "$dsb" ] || { echo "round $k: B's log names no dataset; B's log:" >&2; tail -8 "$OUT/b-$k.err" | sed 's/^/    /' >&2; exit 1; }
     ba_id=$(branch_of a "$dsa" 2>"$OUT/blk-$k.err") || { ba_id=; echo "  node A: find $dsa: $(cat "$OUT/blk-$k.err")"; }
     bb_id=$(branch_of b "$dsb" 2>"$OUT/blk-$k.err") || { bb_id=; echo "  node B: find $dsb: $(cat "$OUT/blk-$k.err")"; }
     tags_a=; tags_b=
@@ -425,7 +430,7 @@ for k in $(seq 1 "$N"); do
 
     # Losses reported in ctl: both logs, read as files, judged against what
     # the coordinator recorded at the takeover.
-    id=${dsb##*/v-}
+    [ "${dsb##*/v-}" = "$id" ] || { echo "round $k: B's dataset ${dsb##*/v-} is not the Vessel $id A ran" >&2; exit 1; }
     on a "$WORK/bin/taso-logcheck $SOCK $WORK/a/state $id" >"$OUT/a-$k.log.json" 2>>"$OUT/a-$k.err" || echo '{}' >"$OUT/a-$k.log.json"
     on b "$WORK/bin/taso-logcheck $SOCK $WORK/b/state $id" >"$OUT/b-$k.log.json" 2>>"$OUT/b-$k.err" || echo '{}' >"$OUT/b-$k.log.json"
     logv=$(python3 "$WORK/bin/logjudge.py" "$OUT/a-$k.log.json" "$OUT/b-$k.log.json" 2>&1 || echo '{"ok": false, "lost": null, "why": "logjudge failed"}')
