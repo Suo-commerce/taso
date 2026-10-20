@@ -83,7 +83,13 @@ for t in runc ldd python3 cargo sha256sum; do command -v "$t" >/dev/null || die 
 
 cd "$(dirname "$0")/.."
 echo "== building (release)"
-cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock -p taso-blk --bin taso-blkd
+# (--bin narrows the targets of every package named, so taso-blkd gets
+# its own command.)
+cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock --bins
+cargo build --release -q -p taso-blk --bin taso-blkd
+for b in taso-wardend taso-logcheck taso-sim taso-landlock taso-blkd taso-coordd; do
+    [ -x "target/release/$b" ] || die "target/release/$b was not built"
+done
 BIN=$PWD/target/release
 
 mkdir -p "$OUT"
