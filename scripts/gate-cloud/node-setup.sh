@@ -23,12 +23,13 @@
 # A Warden on the coordinator's own host (one machine; node B in the
 # two-server layout) connects to the socket directly as root: give the
 # coord role "local=<id>" for it and the vessel-blk role "local" as the
-# coordinator host.  (A forward on the same host would take the
-# coordinator's socket path from it.)
+# coordinator host.  Every Warden config uses /run/taso/coord.sock: on a
+# node it is the ssh forward's socket, on the coordinator's host a symlink
+# to /run/taso-coord/coord.sock.
 #
 # coord       taso-coordd with a peer map: one Unix user "warden-<name>"
 #             per Warden (no shell, key only, forwarding only), group
-#             taso-wardens, socket /run/taso/coord.sock 0660.  Reads each
+#             taso-wardens, socket /run/taso-coord/coord.sock 0660.  Reads each
 #             node's public key from /root/taso-keys/<name>.pub if it is
 #             there: run the role again after copying keys in.  No Garage,
 #             no socat: packs go to Scaleway (the secret stays in
@@ -172,18 +173,27 @@ if [ "$ROLE" = coord ]; then
         echo "warden $wid: user $user (uid $(id -u "$user")), $keystate"
     done
 
-    # /run/taso 0750 root:taso-wardens so the peers can reach the socket
-    # and nothing else can; the socket itself 0660 by taso-coordd.
-    unit taso-coordd "/usr/local/bin/taso-coordd /var/lib/taso/coord.redb /run/taso/coord.sock ${peer_flags[*]} --socket-group $GID" \
-        "" "RuntimeDirectoryMode=0750
+    # The coordinator's own runtime directory, /run/taso-coord, 0750
+    # root:taso-wardens: the peers reach the socket, nothing else does.
+    # Its own, because systemd re-owns a unit's runtime directory to the
+    # unit's user and group, recursively, when the unit starts; a
+    # directory shared with root:root units (taso-blkd, the forward) lost
+    # the socket's group that way (taso-test, 2026-10-20).  The socket
+    # itself is 0660 by taso-coordd.
+    unit taso-coordd "/usr/local/bin/taso-coordd /var/lib/taso/coord.redb /run/taso-coord/coord.sock ${peer_flags[*]} --socket-group $GID" \
+        "" "RuntimeDirectory=
+RuntimeDirectory=taso-coord
+RuntimeDirectoryMode=0750
 Group=taso-wardens"
+    systemctl restart taso-coordd      # the flags may have changed
     systemctl disable --now taso-coord-tcp 2>/dev/null || true   # never both
-    sleep 1
+    for _ in $(seq 50); do [ -S /run/taso-coord/coord.sock ] && break; sleep 0.2; done
     systemctl is-active -q taso-coordd || { journalctl -u taso-coordd -n 20 --no-pager; die "taso-coordd is not running"; }
-    [ "$(stat -c '%a %G' /run/taso/coord.sock)" = "660 taso-wardens" ] || die "socket is $(stat -c '%a %G' /run/taso/coord.sock), expected 660 taso-wardens"
+    [ "$(stat -c '%a %U:%G' /run/taso-coord)" = "750 root:taso-wardens" ] || die "/run/taso-coord is $(stat -c '%a %U:%G' /run/taso-coord), expected 750 root:taso-wardens"
+    [ "$(stat -c '%a %G' /run/taso-coord/coord.sock)" = "660 taso-wardens" ] || die "socket is $(stat -c '%a %G' /run/taso-coord/coord.sock), expected 660 taso-wardens"
     echo
     echo "coordinator ready: $(journalctl -u taso-coordd -n 1 --no-pager -o cat)"
-    echo "socket /run/taso/coord.sock, group taso-wardens; sshd is the only way in."
+    echo "socket /run/taso-coord/coord.sock, group taso-wardens; sshd is the only way in."
     exit 0
 fi
 
@@ -220,15 +230,18 @@ if [ "$ROLE" = vessel-blk ]; then
         systemctl disable --now taso-coord-fwd 2>/dev/null || true
         rm -f /etc/systemd/system/taso-coord-fwd.service; systemctl daemon-reload
         systemctl is-active -q taso-coordd || die "coordinator 'local' but taso-coordd is not running here: run the coord role first"
+        # One path for every Warden config in every layout.
+        ln -sfn /run/taso-coord/coord.sock /run/taso/coord.sock
         echo
-        echo "coordinator on this host: no forward, root is the Warden (coord role: local=<id>)"
+        echo "coordinator on this host: /run/taso/coord.sock -> /run/taso-coord/coord.sock, no forward, root is the Warden (coord role: local=<id>)"
     else
         # The coordinator, through ssh.  ExitOnForwardFailure makes a refused
         # forward a failed unit (visible, restarted), not a silent dead socket.
         if systemctl is-active -q taso-coordd 2>/dev/null; then
-            die "taso-coordd runs on this host; a forward to $COORD would replace its socket.  Use: $0 vessel-blk local $NAME"
+            die "taso-coordd runs on this host; use: $0 vessel-blk local $NAME"
         fi
-        unit taso-coord-fwd "/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o StreamLocalBindMask=0177 -o StreamLocalBindUnlink=yes -i /root/.ssh/taso-coord -L /run/taso/coord.sock:/run/taso/coord.sock warden-$NAME@$COORD" \
+        [ -L /run/taso/coord.sock ] && rm -f /run/taso/coord.sock   # a 'local' symlink from before
+        unit taso-coord-fwd "/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o StreamLocalBindMask=0177 -o StreamLocalBindUnlink=yes -i /root/.ssh/taso-coord -L /run/taso/coord.sock:/run/taso-coord/coord.sock warden-$NAME@$COORD" \
             "After=taso-blkd.service" "RestartSec=5"
         echo
         echo "== this node's public key: copy it to the coordinator host as /root/taso-keys/$NAME.pub, then run 'coord' there again"
