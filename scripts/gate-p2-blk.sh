@@ -50,7 +50,7 @@
 #   B_HOST=root@10.x.y.z scripts/gate-p2-blk.sh                    # A here, B there
 #   A_HOST=root@10.x.y.z KILL=power N=5 scripts/gate-p2-blk.sh     # driver on B
 #
-# Environment: N (20; 5 with KILL=power)  RUN_S (3)  SLEEP_MS (100)
+# Environment: N (20; 5 with KILL=power)  RUN_S (3)  MIN_TURNS (1)  SLEEP_MS (100)
 #              LANDLOCK (1)  KILL (stop|power)  A_HOST  B_HOST
 #              OUT (/root/taso-gate-p2blk-<time>)  KEEP (0)
 #              TASO_BLK_S3_ENDPOINT, _REGION, _BUCKET, _ACCESS_KEY_ID,
@@ -66,6 +66,7 @@ set -euo pipefail
 
 N=${N:-}
 RUN_S=${RUN_S:-3}
+MIN_TURNS=${MIN_TURNS:-1}   # A is killed only once this many turn Seals are shipped and anchored
 SLEEP_MS=${SLEEP_MS:-100}
 LANDLOCK=${LANDLOCK:-1}
 KILL=${KILL:-stop}
@@ -83,7 +84,13 @@ for t in runc ldd python3 cargo sha256sum; do command -v "$t" >/dev/null || die 
 
 cd "$(dirname "$0")/.."
 echo "== building (release)"
-cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock -p taso-blk --bin taso-blkd
+# (--bin narrows the targets of every package named, so taso-blkd gets
+# its own command.)
+cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock --bins
+cargo build --release -q -p taso-blk --bin taso-blkd
+for b in taso-wardend taso-logcheck taso-sim taso-landlock taso-blkd taso-coordd; do
+    [ -x "target/release/$b" ] || die "target/release/$b was not built"
+done
 BIN=$PWD/target/release
 
 mkdir -p "$OUT"
@@ -327,11 +334,23 @@ for k in $(seq 1 "$N"); do
         on a "tail -8 $WORK/a-$k.err" | sed 's/^/    /' >&2
         exit 1
     fi
+    # A is killed only once at least MIN_TURNS turn Seals are shipped and
+    # anchored (with packs over the internet, RUN_S alone may cover only
+    # the birth Seal, and then there is nothing to resume after).
+    dsa=$(on a "grep -o ': dataset [^ ]*$' $WORK/a-$k.err | head -1 | sed 's/: dataset //'")
+    id=${dsa##*/v-}
+    turns=0
+    for _ in $(seq 120); do
+        turns=$(on a "$WORK/bin/taso-logcheck $SOCK $WORK/a/state $id" 2>/dev/null \
+            | python3 -c "import json,sys; j=json.load(sys.stdin); s=j['shipped']['lsn']; print(sum(1 for f in j['frames'] if f['kind'] == 'seal' and f.get('turn', 0) >= 1 and f['lsn'] <= s))" 2>/dev/null || echo 0)
+        [ "$turns" -ge "$MIN_TURNS" ] && break
+        on a "kill -0 $A_PID" 2>/dev/null || break
+        sleep 0.5
+    done
+    [ "$turns" -ge "$MIN_TURNS" ] || { echo "round $k: A shipped only $turns turn Seal(s) in $((RUN_S + 60)) s (MIN_TURNS=$MIN_TURNS); its log:" >&2; on a "tail -5 $WORK/a-$k.err" | sed 's/^/    /' >&2; exit 1; }
     # B takes over exactly the ownership A holds now, as an operator
     # would read it with taso-logcheck (the holder cannot change before
     # the kill: only a takeover moves it).
-    dsa=$(on a "grep -o ': dataset [^ ]*$' $WORK/a-$k.err | head -1 | sed 's/: dataset //'")
-    id=${dsa##*/v-}
     owner=$(on a "$WORK/bin/taso-logcheck $SOCK $WORK/a/state $id" 2>/dev/null \
         | python3 -c "import json,sys; o=json.load(sys.stdin)['ownership']; print('%d@%d' % (o['holder'], o['epoch']))") \
         || { echo "round $k: could not read A's ownership of $id" >&2; exit 1; }
