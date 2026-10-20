@@ -152,6 +152,14 @@ pub enum CoordError {
         /// Where.
         lsn: Lsn,
     },
+    /// A conditional transfer named an ownership that is not the current
+    /// one: the caller's read is stale (fencing review F1).  Nothing changed.
+    OwnershipChanged {
+        /// Who holds the Chronicle now.
+        holder: WardenId,
+        /// At which epoch.
+        epoch: Epoch,
+    },
     /// The connection is authenticated as one Warden and the request named
     /// another (v0.4 §10: the network cannot forge an identity).  Only a
     /// served coordinator with a peer map refuses this; see `coordsrv`.
@@ -196,7 +204,8 @@ impl CoordError {
             | Self::ShippedAhead { .. }
             | Self::ShippedConflict { .. }
             | Self::NotYou { .. }
-            | Self::UnknownPeer { .. } => false,
+            | Self::UnknownPeer { .. }
+            | Self::OwnershipChanged { .. } => false,
         }
     }
 }
@@ -235,6 +244,12 @@ impl fmt::Display for CoordError {
                 write!(f, "shipped lsn {} is past the anchored head {}", to.get(), head.get())
             }
             Self::ShippedConflict { lsn } => write!(f, "shipped position at lsn {} names another record", lsn.get()),
+            Self::OwnershipChanged { holder, epoch } => write!(
+                f,
+                "ownership is not what was read: warden {} holds it at epoch {}",
+                holder.get(),
+                epoch.get()
+            ),
             Self::NotYou { claimed, peer } => write!(
                 f,
                 "request names warden {} but the connection is warden {}",
@@ -280,8 +295,24 @@ pub trait Coord: Send + Sync {
     /// new anchored head.
     fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError>;
 
-    /// Atomic ownership transfer: `sealed_prefix = head`, `epoch += 1`,
-    /// `holder = new_holder`.  Returns the new epoch.
+    /// Atomic ownership transfer, conditional on the ownership being
+    /// exactly `expected` (holder, epoch) — what the caller read before
+    /// deciding: `sealed_prefix = head`, `epoch += 1`, `holder =
+    /// new_holder`; returns the new epoch.  Otherwise refused with
+    /// [`CoordError::OwnershipChanged`] naming the current ownership, and
+    /// nothing changed.  A Warden takes only ownership it has read
+    /// (fencing review F1): the one for every open and takeover.
+    fn transfer_if(
+        &self,
+        chronicle: ChronicleId,
+        new_holder: WardenId,
+        expected: (WardenId, Epoch),
+    ) -> Result<Epoch, CoordError>;
+
+    /// Atomic ownership transfer, unconditional.  For tests and tooling
+    /// only: a Warden deciding from what it read uses
+    /// [`Coord::transfer_if`], since this takes a Vessel back from whoever
+    /// took it over in the meantime.
     fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError>;
 
     /// Current ownership of a Chronicle.
@@ -700,6 +731,27 @@ impl Coord for Coordinator {
     /// Transferring to the current holder is allowed: a restarted Warden
     /// takes a new epoch so that anything its previous incarnation still
     /// has in flight is fenced.
+    fn transfer_if(
+        &self,
+        chronicle: ChronicleId,
+        new_holder: WardenId,
+        expected: (WardenId, Epoch),
+    ) -> Result<Epoch, CoordError> {
+        self.write(move |rows| {
+            let mut state =
+                load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+            if (state.holder, state.epoch) != expected {
+                return Err(CoordError::OwnershipChanged { holder: state.holder, epoch: state.epoch });
+            }
+            state.sealed_prefix = state.head;
+            state.epoch = state.epoch.next();
+            state.holder = new_holder;
+            state.head.epoch = state.epoch;
+            store(rows, chronicle, &state)?;
+            Ok(state.epoch)
+        })
+    }
+
     fn transfer(
         &self,
         chronicle: ChronicleId,
@@ -1320,6 +1372,42 @@ mod tests {
     // ── classification of failures ──────────────────────────────────
 
     /// Every variant, classified: refusals are certain, failures are not.
+    /// F1 against redb: A reads, B takes over on its read, A's stale claim
+    /// is refused with the current ownership and nothing moves; B keeps
+    /// appending; the same claim cannot win twice.
+    #[test]
+    fn transfer_if_takes_only_what_was_read() {
+        let (_dir, _path, coord) = fresh();
+        let g = coord.register(chron(1), A).unwrap();
+        let a = chain_after(chron(1), g, 1);
+        coord.append(A, &a[0]).unwrap();
+        let o = coord.ownership(chron(1)).unwrap();
+        let read = (o.holder, o.epoch);
+        assert_eq!(read, (A, Epoch::FIRST));
+
+        assert_eq!(coord.transfer_if(chron(1), B, read).unwrap(), Epoch::new(2));
+        let h = coord.head(chron(1)).unwrap();
+        let b = chain_after(chron(1), h, 1);
+        coord.append(B, &b[0]).unwrap();
+
+        let before = coord.head(chron(1)).unwrap();
+        assert!(matches!(
+            coord.transfer_if(chron(1), A, read),
+            Err(CoordError::OwnershipChanged { holder, epoch }) if holder == B && epoch == Epoch::new(2)
+        ));
+        let o = coord.ownership(chron(1)).unwrap();
+        assert_eq!((o.holder, o.epoch), (B, Epoch::new(2)));
+        assert_eq!(coord.head(chron(1)).unwrap(), before);
+        let b2 = chain_after(chron(1), before, 1);
+        coord.append(B, &b2[0]).unwrap();
+
+        let now = (B, Epoch::new(2));
+        assert_eq!(coord.transfer_if(chron(1), B, now).unwrap(), Epoch::new(3));
+        assert!(matches!(coord.transfer_if(chron(1), B, now), Err(CoordError::OwnershipChanged { epoch, .. }) if epoch == Epoch::new(3)));
+        assert!(matches!(coord.transfer_if(chron(9), B, now), Err(CoordError::UnknownChronicle(_))));
+        assert!(!CoordError::OwnershipChanged { holder: B, epoch: Epoch::new(3) }.outcome_unknown());
+    }
+
     #[test]
     fn outcome_unknown_classifies_every_variant() {
         let h = HashVal::from_bytes([1; 32]);
@@ -1335,6 +1423,7 @@ mod tests {
             CoordError::ShippedConflict { lsn: Lsn::new(4) },
             CoordError::NotYou { claimed: A, peer: B },
             CoordError::UnknownPeer { uid: 1000 },
+            CoordError::OwnershipChanged { holder: B, epoch: Epoch::new(2) },
         ];
         for e in &refusals {
             assert!(!e.outcome_unknown(), "{e:?} is a refusal");
@@ -1388,6 +1477,11 @@ pub(crate) mod conformance {
         Append(usize),
         /// Ownership moves to Warden `i`.
         Transfer(usize),
+        /// Warden `i` claims the Chronicle on the ownership it last read
+        /// (`Resume`, or the start): `fresh` true re-reads first and wins,
+        /// false uses the stale read, which is refused once the ownership
+        /// moved.
+        TransferIf(usize, bool),
         /// Warden `i` re-reads epoch and head from the coordinator.
         Resume(usize),
         /// Drop the coordinator and open it again (reopen the file,
@@ -1404,6 +1498,7 @@ pub(crate) mod conformance {
         prop_oneof![
             5 => (0..2usize).prop_map(Op::Append),
             1 => (0..2usize).prop_map(Op::Transfer),
+            2 => (0..2usize, any::<bool>()).prop_map(|(i, f)| Op::TransferIf(i, f)),
             2 => (0..2usize).prop_map(Op::Resume),
             1 => Just(Op::Reopen),
             3 => (0..2usize, 0..12u8).prop_map(|(i, p)| Op::Ship(i, p)),
@@ -1491,6 +1586,8 @@ pub(crate) mod conformance {
         let mut model = Model::new(c, IDS[0]);
         // Both start at genesis believing they hold epoch 1.
         let mut wardens = [WardenModel::new(IDS[0], c, Epoch::FIRST), WardenModel::new(IDS[1], c, Epoch::FIRST)];
+        // What each Warden last read of the ownership (holder, epoch).
+        let mut read = [(IDS[0], Epoch::FIRST); 2];
 
         for (n, op) in ops.into_iter().enumerate() {
             match op {
@@ -1515,8 +1612,25 @@ pub(crate) mod conformance {
                     let er = coord.as_ref().unwrap().transfer(c, IDS[i]).unwrap();
                     prop_assert_eq!(em, er);
                 }
+                Op::TransferIf(i, fresh) => {
+                    if fresh {
+                        let o = coord.as_ref().unwrap().ownership(c).unwrap();
+                        read[i] = (o.holder, o.epoch);
+                    }
+                    let m = model.transfer_if(IDS[i], read[i]);
+                    let r = coord.as_ref().unwrap().transfer_if(c, IDS[i], read[i]);
+                    match (m, r) {
+                        (Ok(em), Ok(er)) => prop_assert_eq!(em, er),
+                        (Err(em), Err(CoordError::OwnershipChanged { holder, epoch })) => {
+                            prop_assert_eq!((em.holder, em.epoch), (holder, epoch));
+                        }
+                        (m, r) => prop_assert!(false, "model {:?} vs coordinator {:?}", m, r),
+                    }
+                }
                 Op::Resume(i) => {
                     wardens[i] = resumed(IDS[i], c, coord.as_deref().unwrap());
+                    let o = coord.as_ref().unwrap().ownership(c).unwrap();
+                    read[i] = (o.holder, o.epoch);
                 }
                 Op::Reopen => {
                     drop(coord.take());

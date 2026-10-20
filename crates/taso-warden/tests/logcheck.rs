@@ -10,7 +10,7 @@ use serde_json::Value;
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::{Payload, StreamCut, TurnId, Verdict};
-use taso_warden::chronicle::{restore_log, Chronicle, LayerError, Layers};
+use taso_warden::chronicle::{restore_log, Chronicle, Claim, LayerError, Layers};
 use taso_warden::coordinator::{Coord, Coordinator};
 use taso_warden::coordsrv::Server;
 use taso_warden::segment::Position;
@@ -74,7 +74,9 @@ fn takeover(e: &Env, n: u8, shipped: u64, extra: u64, verdict: Verdict) -> Chron
     }
     std::fs::create_dir_all(b_dir.parent().unwrap()).unwrap();
     restore_log(&b_dir, id, &frames[..shipped as usize]).unwrap();
-    let (mut b, _) = Chronicle::open_after_gap(&b_dir, e.coord.clone(), id, B, Mem::default()).unwrap();
+    let o = e.coord.ownership(id).unwrap();
+    let claim = Claim::TakeOver { from: o.holder, epoch: o.epoch };
+    let (mut b, _) = Chronicle::open_after_gap_as(&b_dir, e.coord.clone(), id, B, Mem::default(), claim).unwrap();
     b.append(Stream::Fs, Payload::Raw(vec![4])).unwrap();
     b.seal(StreamCut::EMPTY, verdict, Lsn::new(0), TurnId::new(2)).unwrap();
     id
