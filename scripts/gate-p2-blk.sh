@@ -51,6 +51,8 @@
 #   A_HOST=root@10.x.y.z KILL=power N=5 scripts/gate-p2-blk.sh     # driver on B
 #
 # Environment: N (20; 5 with KILL=power)  RUN_S (3)  MIN_TURNS (1)  SLEEP_MS (100)
+#              A_WARDEN (1)  B_WARDEN (2): the Warden id each host is known
+#              as to the coordinator (its key; swap them with the hosts)
 #              LANDLOCK (1)  KILL (stop|power)  A_HOST  B_HOST
 #              OUT (/root/taso-gate-p2blk-<time>)  KEEP (0)
 #              TASO_BLK_S3_ENDPOINT, _REGION, _BUCKET, _ACCESS_KEY_ID,
@@ -73,6 +75,8 @@ KILL=${KILL:-stop}
 KEEP=${KEEP:-0}
 A_HOST=${A_HOST:-}
 B_HOST=${B_HOST:-}
+A_WARDEN=${A_WARDEN:-1}
+B_WARDEN=${B_WARDEN:-2}
 OUT=${OUT:-/root/taso-gate-p2blk-$(date +%Y%m%d-%H%M%S)}
 RUN=$(date +%Y%m%d%H%M%S)-$$
 SECRET_FILE=${TASO_BLK_S3_SECRET_KEY_FILE:-/root/s3-secret}
@@ -331,15 +335,15 @@ files_hash() {   # $1 node -> hash of every file's path and bytes on the scratch
 : > "$OUT/rounds.tsv"
 for k in $(seq 1 "$N"); do
     subject="gate-p2blk-$RUN-$k"
-    config a 1 "" "$subject" 100000 "$WORK/a-$k.json"
+    config a "$A_WARDEN" "" "$subject" 100000 "$WORK/a-$k.json"
     to a "$WORK/a-$k.json" "$WORK/a-$k.json"
 
     # A's Warden runs on node A, detached, its output in $WORK there.
     A_PID=$(on a "nohup $WORK/bin/taso-wardend $WORK/a-$k.json >$WORK/a-$k.out 2>$WORK/a-$k.err </dev/null & echo \$!")
     sleep "$RUN_S"
     if ! on a "kill -0 $A_PID" 2>/dev/null; then
-        echo "round $k: A's Warden exited before the kill; its log:" >&2
-        on a "tail -8 $WORK/a-$k.err" | sed 's/^/    /' >&2
+        echo "round $k: A's Warden exited before the kill; its log and summary:" >&2
+        on a "tail -8 $WORK/a-$k.err; tail -3 $WORK/a-$k.out" | sed 's/^/    /' >&2
         exit 1
     fi
     # A is killed only once at least MIN_TURNS turn Seals are shipped and
@@ -362,7 +366,7 @@ for k in $(seq 1 "$N"); do
     owner=$(on a "$WORK/bin/taso-logcheck $SOCK $WORK/a/state $id" 2>/dev/null \
         | python3 -c "import json,sys; o=json.load(sys.stdin)['ownership']; print('%d@%d' % (o['holder'], o['epoch']))") \
         || { echo "round $k: could not read A's ownership of $id" >&2; exit 1; }
-    config b 2 "$owner" "$subject" 5 "$WORK/b-$k.json"
+    config b "$B_WARDEN" "$owner" "$subject" 5 "$WORK/b-$k.json"
     to b "$WORK/b-$k.json" "$WORK/b-$k.json"
     if [ "$KILL" = stop ]; then
         on a "kill -STOP $A_PID"
