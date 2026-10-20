@@ -118,6 +118,16 @@ pub enum ShipError {
     },
 }
 
+/// Why the coordinator refused a conditional transfer: the ownership is
+/// not the one the caller read.  Nothing changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnershipChanged {
+    /// Who holds the Chronicle now.
+    pub holder: WardenId,
+    /// At which epoch.
+    pub epoch: Epoch,
+}
+
 // ── Coordinator ─────────────────────────────────────────────────────
 
 /// In-memory coordinator: ownership + anchored head + accepted log.
@@ -214,7 +224,24 @@ impl Coordinator {
         Ok(self.head)
     }
 
-    /// Atomic ownership transfer (v0.4 §8.2).
+    /// Atomic ownership transfer (v0.4 §8.2), conditional: it happens
+    /// only if the ownership is exactly `expected` (holder, epoch) — the
+    /// one the caller read before deciding.  A Warden may take only
+    /// ownership it has read: a restart claims `(me, epoch)`, a takeover
+    /// claims the holder it means to fence.  Two Wardens racing for the
+    /// same ownership cannot both win, and a stale decision refuses
+    /// itself (fencing review 2026-10-17, F1).
+    ///
+    /// On success as [`Coordinator::transfer`]; on refusal nothing changed
+    /// and the current ownership is returned.
+    pub fn transfer_if(&mut self, new_holder: WardenId, expected: (WardenId, Epoch)) -> Result<Epoch, OwnershipChanged> {
+        if (self.ownership.holder, self.ownership.epoch) != expected {
+            return Err(OwnershipChanged { holder: self.ownership.holder, epoch: self.ownership.epoch });
+        }
+        Ok(self.transfer(new_holder))
+    }
+
+    /// Atomic ownership transfer (v0.4 §8.2), unconditional.
     ///
     /// In one transaction:
     /// 1. `sealed_prefix = current head`,
@@ -223,6 +250,10 @@ impl Coordinator {
     ///
     /// Returns the new epoch.  The anchored head stays; it now belongs
     /// to the new epoch's Warden.
+    ///
+    /// For tests and tooling: a Warden deciding from what it read uses
+    /// [`Coordinator::transfer_if`], since an unconditional transfer takes
+    /// a Vessel back from whoever took it over in the meantime.
     pub fn transfer(&mut self, new_holder: WardenId) -> Epoch {
         self.ownership.sealed_prefix = self.head;
         self.ownership.epoch = self.ownership.epoch.next();
@@ -494,6 +525,41 @@ mod tests {
             coord.ownership().sealed_prefix.hash,
             head_before.hash,
         );
+    }
+
+    /// F1: A reads the ownership, B takes over in between, A's claim is
+    /// refused with the current ownership and changes nothing; B keeps
+    /// appending.  A claim on the current ownership wins, once.
+    #[test]
+    fn transfer_if_takes_only_what_was_read() {
+        let (mut coord, mut a, _b) = setup();
+        a.append(&mut coord, Stream::Fs, raw(b"one")).unwrap();
+        let read = (coord.ownership().holder, coord.ownership().epoch);
+        assert_eq!(read, (warden_a(), Epoch::FIRST));
+
+        // B takes over (as the operator asked), from what B read.
+        let e2 = coord.transfer_if(warden_b(), read).unwrap();
+        assert_eq!(e2, Epoch::new(2));
+        let mut b = WardenModel::resume(warden_b(), cid(), e2, coord.head(), Lsn::new(coord.head().lsn.get() + 1));
+        b.append(&mut coord, Stream::Fs, raw(b"two")).unwrap();
+
+        // A restarts on its stale read: refused, nothing moved.
+        let head_before = coord.head();
+        assert_eq!(
+            coord.transfer_if(warden_a(), read),
+            Err(OwnershipChanged { holder: warden_b(), epoch: Epoch::new(2) })
+        );
+        assert_eq!(coord.ownership().holder, warden_b());
+        assert_eq!(coord.ownership().epoch, Epoch::new(2));
+        assert_eq!(coord.head(), head_before);
+        b.append(&mut coord, Stream::Fs, raw(b"three")).unwrap();
+
+        // The same claim cannot win twice: B's own restart moves the epoch.
+        let now = (warden_b(), Epoch::new(2));
+        assert_eq!(coord.transfer_if(warden_b(), now), Ok(Epoch::new(3)));
+        assert_eq!(coord.transfer_if(warden_b(), now), Err(OwnershipChanged { holder: warden_b(), epoch: Epoch::new(3) }));
+        // Equal to transfer in effect: sealed prefix at the head.
+        assert_eq!(coord.ownership().sealed_prefix.lsn, coord.head().lsn);
     }
 
     #[test]
