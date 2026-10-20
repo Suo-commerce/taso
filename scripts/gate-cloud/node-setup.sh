@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Set up a gate machine (Hetzner Cloud, Ubuntu).  Run as root, once per
-# node, from a clone of the repo at /root/taso:
+# Set up a gate machine (Ubuntu).  Run as root, once per node, from a clone
+# of the repo at /root/taso.  Rerunning any role is safe.
+#
+# Hetzner, ZFS (the P2 gate of 2026-10-17; unchanged):
 #
 #   scripts/gate-cloud/node-setup.sh hub    <hub private ip>
 #   scripts/gate-cloud/node-setup.sh vessel <hub private ip>
@@ -13,33 +15,74 @@
 #         NVMe, runc, Rust, and /run/taso/coord.sock forwarded to the hub's
 #         coordinator.
 #
-# The vessel nodes are created with growpart off (cloud-init-vessel.yaml),
-# so the root partition does not take the whole disk.  This script grows
-# root to $ROOT_GB and gives the rest of the disk to ZFS.  It prints the
-# layout before changing it and stops if the layout is not what it
-# expects; nothing is changed twice (rerunning is safe).
+# UpCloud, block log (S2, 2026-10-20):
 #
-# The coordinator crosses the private network unauthenticated and in
-# clear text (socat).  That is for the gate only; production needs a TCP
-# coordinator with TLS.  Keep the Hetzner firewall closed except ssh.
+#   scripts/gate-cloud/node-setup.sh coord      <name>=<warden id>...
+#   scripts/gate-cloud/node-setup.sh vessel-blk <coordinator host>|local <name>
+#
+# A Warden on the coordinator's own host (one machine; node B in the
+# two-server layout) connects to the socket directly as root: give the
+# coord role "local=<id>" for it and the vessel-blk role "local" as the
+# coordinator host.  Every Warden config uses /run/taso/coord.sock: on a
+# node it is the ssh forward's socket, on the coordinator's host a symlink
+# to /run/taso-coord/coord.sock.
+#
+# coord       taso-coordd with a peer map: one Unix user "warden-<name>"
+#             per Warden (no shell, key only, forwarding only), group
+#             taso-wardens, socket /run/taso-coord/coord.sock 0660.  Reads each
+#             node's public key from /root/taso-keys/<name>.pub if it is
+#             there: run the role again after copying keys in.  No Garage,
+#             no socat: packs go to Scaleway (the secret stays in
+#             /root/s3-secret on each node).  The coordinator may run on a
+#             vessel node too (two-server layout) or on its own (three).
+# vessel-blk  runc, Rust, the ublk module, taso-blkd as a systemd unit on
+#             /var/lib/taso/blk.log and /run/taso/blk.sock, and
+#             /run/taso/coord.sock forwarded to the coordinator over ssh as
+#             user warden-<name>.  Prints the node's public key to copy to
+#             the coordinator's /root/taso-keys/<name>.pub.  No disk changes.
+#             Ends with a check through the forward that says whether the
+#             coordinator knows this node.
+#
+# How the coordinator is authenticated across machines (F3 step 1): the
+# node forwards its socket over ssh; on the coordinator host sshd opens
+# the connection to the coordinator's socket as the login user, so the
+# coordinator reads that uid (SO_PEERCRED) and lets the connection act only
+# as the Warden mapped to it (taso-coordd --peer).  The node's ssh key is
+# the Warden's identity; the wire is ssh.  Measured 2026-10-20 (the
+# forward, a nologin account with restrict,port-forwarding, the uid seen).
+# Nothing but ssh needs to be open on the coordinator host.  The hub's host
+# key is trusted on first use (StrictHostKeyChecking=accept-new).
+#
+# The Hetzner vessel nodes are created with growpart off
+# (cloud-init-vessel.yaml), so the root partition does not take the whole
+# disk.  The vessel role grows root to $ROOT_GB and gives the rest of the
+# disk to ZFS.  It prints the layout before changing it and stops if the
+# layout is not what it expects; nothing is changed twice.
+#
+# The Hetzner hub's coordinator crosses the private network
+# unauthenticated and in clear text (socat).  That was for that gate only;
+# the UpCloud roles replace it.  Keep every firewall closed except ssh.
 
 set -euo pipefail
 
 ROLE=${1:-}
-HUB=${2:-}
 ROOT_GB=${ROOT_GB:-100}
 GARAGE_VERSION=${GARAGE_VERSION:-v2.1.0}
 REPO=${REPO:-/root/taso}
+BLKD_ARGS=${BLKD_ARGS:-}      # extra taso-blkd flags for the vessel-blk unit
 
 die() { echo "error: $*" >&2; exit 1; }
+usage() { die "usage: $0 hub|vessel <hub private ip>  |  $0 coord <name>=<warden id>...  |  $0 vessel-blk <coordinator host>|local <name>"; }
 [ "$(id -u)" = 0 ] || die "run as root"
-case "$ROLE" in hub|vessel) ;; *) die "usage: $0 hub|vessel <hub private ip>" ;; esac
-[[ "$HUB" =~ ^10\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "give the hub's private IP (10.x.x.x)"
 [ -d "$REPO/.git" ] || die "clone the repo to $REPO first"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q
-apt-get install -y -q git build-essential pkg-config python3 socat jq curl openssl chrony
+
+# build-essential only when there is no C toolchain: on Ubuntu 26.04 it
+# depends on coreutils-from-uutils, which a machine moved to GNU coreutils
+# (taso-test, 2026-10-18) cannot install, and a machine that has built the
+# repo already has the toolchain.
+toolchain() { if command -v gcc >/dev/null && command -v make >/dev/null; then echo; else echo build-essential; fi; }
 
 rust() {
     if ! command -v cargo >/dev/null && [ ! -x /root/.cargo/bin/cargo ]; then
@@ -49,7 +92,7 @@ rust() {
     . /root/.cargo/env
 }
 
-unit() {   # $1 name, $2 ExecStart, [$3 extra [Unit] lines]
+unit() {   # $1 name, $2 ExecStart, [$3 extra [Unit] lines], [$4 extra [Service] lines]
     cat > "/etc/systemd/system/$1.service" <<EOF
 [Unit]
 Description=$1
@@ -63,6 +106,7 @@ Restart=always
 RestartSec=1
 RuntimeDirectory=taso
 RuntimeDirectoryPreserve=yes
+${4:-}
 
 [Install]
 WantedBy=multi-user.target
@@ -70,6 +114,178 @@ EOF
     systemctl daemon-reload
     systemctl enable --now "$1"
 }
+
+# ── coord (UpCloud, block log) ──────────────────────────────────────────
+if [ "$ROLE" = coord ]; then
+    shift
+    [ $# -ge 1 ] || usage
+    PEERS=()   # name=id, checked
+    for arg in "$@"; do
+        [[ "$arg" =~ ^([a-z][a-z0-9-]{0,15})=([1-9][0-9]{0,9})$ ]] || die "coord: expected <name>=<warden id> (name [a-z][a-z0-9-]*, id a positive number), got '$arg'"
+        PEERS+=("$arg")
+    done
+    for p in "${PEERS[@]}"; do for q in "${PEERS[@]}"; do
+        [ "$p" = "$q" ] || { [ "${p%%=*}" != "${q%%=*}" ] && [ "${p#*=}" != "${q#*=}" ]; } || die "coord: '$p' and '$q' repeat a name or an id"
+    done; done
+    apt-get update -q
+    # shellcheck disable=SC2046
+    apt-get install -y -q git $(toolchain) pkg-config python3 curl chrony openssh-server
+    rust
+    (cd "$REPO" && cargo build --release -q -p taso-warden --bin taso-coordd)
+    install -m 755 "$REPO/target/release/taso-coordd" /usr/local/bin/taso-coordd
+    mkdir -p /var/lib/taso /root/taso-keys
+    chmod 700 /root/taso-keys
+
+    # sshd must allow Unix-socket forwarding (the default), or the nodes
+    # cannot reach the socket at all.
+    allow=$(sshd -T 2>/dev/null | awk '$1 == "allowstreamlocalforwarding" {print $2}')
+    case "$allow" in yes|all|local) ;; *) die "sshd AllowStreamLocalForwarding is '$allow'; it must be yes, all or local" ;; esac
+
+    getent group taso-wardens >/dev/null || groupadd --system taso-wardens
+    GID=$(getent group taso-wardens | cut -d: -f3)
+    peer_flags=()
+    for p in "${PEERS[@]}"; do
+        name=${p%%=*}; wid=${p#*=}; user="warden-$name"; home="/var/lib/taso/peers/$user"
+        if [ "$name" = local ]; then
+            # The Warden on this host: it connects to the socket directly,
+            # as root, so uid 0 is its identity.  No user, no key.
+            peer_flags+=(--peer "0=$wid")
+            echo "warden $wid: root on this host (local), no forward"
+            continue
+        fi
+        if ! id "$user" >/dev/null 2>&1; then
+            useradd --system -M -s /usr/sbin/nologin -g taso-wardens -d "$home" "$user"
+        fi
+        usermod -p '*' "$user"     # not locked (sshd refuses locked accounts), no password
+        install -d -m 700 -o "$user" -g taso-wardens "$home" "$home/.ssh"
+        if [ -f "/root/taso-keys/$name.pub" ]; then
+            key=$(head -1 "/root/taso-keys/$name.pub")
+            [[ "$key" =~ ^ssh-(ed25519|rsa)\ [A-Za-z0-9+/=]+ ]] || die "/root/taso-keys/$name.pub is not a public key line"
+            printf 'restrict,port-forwarding %s\n' "$key" > "$home/.ssh/authorized_keys"
+            chown "$user:taso-wardens" "$home/.ssh/authorized_keys"
+            chmod 600 "$home/.ssh/authorized_keys"
+            keystate="key installed"
+        else
+            rm -f "$home/.ssh/authorized_keys"
+            keystate="NO KEY YET: copy the node's key to /root/taso-keys/$name.pub and run this role again"
+        fi
+        peer_flags+=(--peer "$(id -u "$user")=$wid")
+        echo "warden $wid: user $user (uid $(id -u "$user")), $keystate"
+    done
+
+    # The coordinator's own runtime directory, /run/taso-coord, 0750
+    # root:taso-wardens: the peers reach the socket, nothing else does.
+    # Its own, because systemd re-owns a unit's runtime directory to the
+    # unit's user and group, recursively, when the unit starts; a
+    # directory shared with root:root units (taso-blkd, the forward) lost
+    # the socket's group that way (taso-test, 2026-10-20).  The socket
+    # itself is 0660 by taso-coordd.
+    unit taso-coordd "/usr/local/bin/taso-coordd /var/lib/taso/coord.redb /run/taso-coord/coord.sock ${peer_flags[*]} --socket-group $GID" \
+        "" "RuntimeDirectory=
+RuntimeDirectory=taso-coord
+RuntimeDirectoryMode=0750
+Group=taso-wardens"
+    systemctl restart taso-coordd      # the flags may have changed
+    systemctl disable --now taso-coord-tcp 2>/dev/null || true   # never both
+    for _ in $(seq 50); do [ -S /run/taso-coord/coord.sock ] && break; sleep 0.2; done
+    systemctl is-active -q taso-coordd || { journalctl -u taso-coordd -n 20 --no-pager; die "taso-coordd is not running"; }
+    [ "$(stat -c '%a %U:%G' /run/taso-coord)" = "750 root:taso-wardens" ] || die "/run/taso-coord is $(stat -c '%a %U:%G' /run/taso-coord), expected 750 root:taso-wardens"
+    [ "$(stat -c '%a %G' /run/taso-coord/coord.sock)" = "660 taso-wardens" ] || die "socket is $(stat -c '%a %G' /run/taso-coord/coord.sock), expected 660 taso-wardens"
+    echo
+    echo "coordinator ready: $(journalctl -u taso-coordd -n 1 --no-pager -o cat)"
+    echo "socket /run/taso-coord/coord.sock, group taso-wardens; sshd is the only way in."
+    exit 0
+fi
+
+# ── vessel-blk (UpCloud, block log) ─────────────────────────────────────
+if [ "$ROLE" = vessel-blk ]; then
+    COORD=${2:-}; NAME=${3:-}
+    [ -n "$COORD" ] && [[ "$NAME" =~ ^[a-z][a-z0-9-]{0,15}$ ]] || usage
+    apt-get update -q
+    # shellcheck disable=SC2046
+    apt-get install -y -q git $(toolchain) pkg-config python3 jq curl chrony runc e2fsprogs openssh-client
+    rust
+    [ -x "$(command -v runc)" ] || die "runc missing"
+    modprobe ublk_drv || die "no ublk module on this kernel ($(uname -r)); the block log needs it"
+    echo ublk_drv > /etc/modules-load.d/taso-ublk.conf
+    (cd "$REPO" && cargo build --release -q -p taso-blk --bin taso-blkd -p taso-warden --bin taso-wardend --bin taso-logcheck)
+    install -m 755 "$REPO/target/release/taso-blkd" "$REPO/target/release/taso-wardend" "$REPO/target/release/taso-logcheck" /usr/local/bin/
+    mkdir -p /var/lib/taso
+
+    # The node's identity toward the coordinator: one ed25519 key, made here,
+    # never leaving this machine except as its public half.
+    if [ ! -f /root/.ssh/taso-coord ]; then
+        install -d -m 700 /root/.ssh
+        ssh-keygen -q -t ed25519 -N '' -C "warden-$NAME@$(hostname)" -f /root/.ssh/taso-coord
+    fi
+
+    # The block log daemon.  The gate script (gate-p2-blk.sh) uses this one
+    # in the two-node layout and starts its own in the one-machine layout.
+    unit taso-blkd "/usr/local/bin/taso-blkd /var/lib/taso/blk.log /run/taso/blk.sock $BLKD_ARGS"
+
+    if [ "$COORD" = local ]; then
+        # The coordinator runs on this host: the Warden connects to its
+        # socket directly, as root (coord ... local=<id>).  A forward here
+        # would unlink the coordinator's own socket (same path), so none.
+        systemctl disable --now taso-coord-fwd 2>/dev/null || true
+        rm -f /etc/systemd/system/taso-coord-fwd.service; systemctl daemon-reload
+        systemctl is-active -q taso-coordd || die "coordinator 'local' but taso-coordd is not running here: run the coord role first"
+        # One path for every Warden config in every layout.
+        ln -sfn /run/taso-coord/coord.sock /run/taso/coord.sock
+        echo
+        echo "coordinator on this host: /run/taso/coord.sock -> /run/taso-coord/coord.sock, no forward, root is the Warden (coord role: local=<id>)"
+    else
+        # The coordinator, through ssh.  ExitOnForwardFailure makes a refused
+        # forward a failed unit (visible, restarted), not a silent dead socket.
+        if systemctl is-active -q taso-coordd 2>/dev/null; then
+            die "taso-coordd runs on this host; use: $0 vessel-blk local $NAME"
+        fi
+        [ -L /run/taso/coord.sock ] && rm -f /run/taso/coord.sock   # a 'local' symlink from before
+        unit taso-coord-fwd "/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o StreamLocalBindMask=0177 -o StreamLocalBindUnlink=yes -i /root/.ssh/taso-coord -L /run/taso/coord.sock:/run/taso-coord/coord.sock warden-$NAME@$COORD" \
+            "After=taso-blkd.service" "RestartSec=5"
+        echo
+        echo "== this node's public key: copy it to the coordinator host as /root/taso-keys/$NAME.pub, then run 'coord' there again"
+        cat /root/.ssh/taso-coord.pub
+        echo
+        for _ in $(seq 50); do systemctl is-active -q taso-coord-fwd && [ -S /run/taso/coord.sock ] && break; sleep 0.2; done
+        if ! systemctl is-active -q taso-coord-fwd || [ ! -S /run/taso/coord.sock ]; then
+            echo "forward not up yet (the coordinator does not know this key, or is not reachable): $(systemctl is-active taso-coord-fwd)"
+            journalctl -u taso-coord-fwd -n 5 --no-pager -o cat
+            echo "vessel-blk node ready except the coordinator; install the key on the coordinator and: systemctl restart taso-coord-fwd"
+            exit 0
+        fi
+    fi
+    # One `head` request for a Chronicle that does not exist, through the
+    # forward.  A mapped peer gets "unknown chronicle" (refusal 1); an
+    # unmapped one "unknown peer" (refusal 12).  Either proves the forward.
+    python3 - <<'PY'
+import socket, struct, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect("/run/taso/coord.sock")
+body = bytes([1, 5]) + bytes(16)
+s.sendall(struct.pack(">I", len(body)) + body)
+def exactly(k):
+    b = b""
+    while len(b) < k:
+        c = s.recv(k - len(b))
+        if not c: sys.exit("coordinator check: connection closed without a reply")
+        b += c
+    return b
+n = struct.unpack(">I", exactly(4))[0]; r = exactly(n)
+if r[:2] == bytes([1, 1]):   print("coordinator check: this node is a known Warden (refusal: unknown chronicle, as expected)")
+elif r[:2] == bytes([1, 12]): print("coordinator check: reached the coordinator, but it has no --peer for uid %d as seen on its host (0 = root: give the coord role local=<id>)" % struct.unpack(">I", r[2:6])[0], file=sys.stderr); sys.exit(1)
+else:                          print("coordinator check: unexpected reply %r" % r, file=sys.stderr); sys.exit(1)
+PY
+    echo "vessel-blk node ready: taso-blkd on /run/taso/blk.sock (log /var/lib/taso/blk.log), coordinator at /run/taso/coord.sock"
+    exit 0
+fi
+
+# ── Hetzner roles ───────────────────────────────────────────────────────
+HUB=${2:-}
+case "$ROLE" in hub|vessel) ;; *) usage ;; esac
+[[ "$HUB" =~ ^10\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "give the hub's private IP (10.x.x.x)"
+
+apt-get update -q
+apt-get install -y -q git build-essential pkg-config python3 socat jq curl openssl chrony
 
 # ── hub ─────────────────────────────────────────────────────────────────
 if [ "$ROLE" = hub ]; then
