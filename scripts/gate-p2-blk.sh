@@ -177,7 +177,7 @@ drop_root() {
     for pair in $names; do
         [[ "$pair" == "$ROOT/"* ]] || continue
         b=${pair#*:}
-        seals=$(blk "$n" seals "$b" 2>/dev/null || true)
+        seals=$(blk "$n" seals "$b" 2>&1) || { echo "  node $n: seals $b: $seals" >&2; seals=; }
         first=${seals%% *}; first=${first%%:*}
         parent=; [ -n "$first" ] && parent=$(blk "$n" info "$first" 2>/dev/null | tr ' ' '\n' | sed -n 's/^parent=//p')
         blk "$n" drop "$b" >/dev/null 2>&1 || echo "  node $n: drop branch $b refused" >&2
@@ -278,9 +278,17 @@ vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset (branch name), as the
 tag_lsn() {   # $1 tag (hex: lsn little-endian 8 bytes, hash 32) -> lsn
     python3 -c "import sys; print(int.from_bytes(bytes.fromhex(sys.argv[1][:16]), 'little'))" "$1"
 }
-# The Seal of node $1's branch $2 whose tag is $3 (prints the layer id).
+# The live branch named $2 on node $1 (prints the layer id).
+branch_of() {
+    blk "$1" find "$2"
+}
+# The Seals of branch id $2 on node $1, "<seal>:<tag>" per line, oldest first.
+seals_of() {
+    blk "$1" seals "$2" | tr ' ' '\n'
+}
+# The Seal of node $1's branch id $2 whose tag is $3 (prints the layer id).
 seal_by_tag() {
-    blk "$1" seals "$2" | tr ' ' '\n' | awk -F: -v t="$3" '$2 == t {print $1; exit}'
+    seals_of "$1" "$2" | awk -F: -v t="$3" '$2 == t {print $1; exit}'
 }
 # The full export of Seal $2 on node $1, hashed.
 export_hash() {
@@ -363,8 +371,11 @@ for k in $(seq 1 "$N"); do
     # The last Seal both nodes have: same tag (lsn + hash of the Seal
     # record), then the same bytes two ways.
     dsa=$(vessel_ds "$OUT/a-$k.err"); dsb=$(vessel_ds "$OUT/b-$k.err")
-    tags_a=$(blk a seals "$dsa" 2>/dev/null | tr ' ' '\n' | cut -d: -f2 | sort || true)
-    tags_b=$(blk b seals "$dsb" 2>/dev/null | tr ' ' '\n' | cut -d: -f2 | sort || true)
+    ba_id=$(branch_of a "$dsa" 2>"$OUT/blk-$k.err") || { ba_id=; echo "  node A: find $dsa: $(cat "$OUT/blk-$k.err")"; }
+    bb_id=$(branch_of b "$dsb" 2>"$OUT/blk-$k.err") || { bb_id=; echo "  node B: find $dsb: $(cat "$OUT/blk-$k.err")"; }
+    tags_a=; tags_b=
+    [ -n "$ba_id" ] && { tags_a=$(seals_of a "$ba_id" 2>"$OUT/blk-$k.err" | cut -d: -f2 | sort) || echo "  node A: seals $ba_id: $(cat "$OUT/blk-$k.err")"; }
+    [ -n "$bb_id" ] && { tags_b=$(seals_of b "$bb_id" 2>"$OUT/blk-$k.err" | cut -d: -f2 | sort) || echo "  node B: seals $bb_id: $(cat "$OUT/blk-$k.err")"; }
     last_tag=; last=none
     for t in $(comm -12 <(echo "$tags_a") <(echo "$tags_b")); do
         [ -n "$t" ] || continue
@@ -373,7 +384,7 @@ for k in $(seq 1 "$N"); do
     done
     same=0 blockeq=0 fileeq=0 dbok=0
     if [ -n "$last_tag" ]; then
-        sa=$(seal_by_tag a "$dsa" "$last_tag"); sb=$(seal_by_tag b "$dsb" "$last_tag")
+        sa=$(seal_by_tag a "$ba_id" "$last_tag"); sb=$(seal_by_tag b "$bb_id" "$last_tag")
         ea=$(export_hash a "$sa"); eb=$(export_hash b "$sb")
         [ -n "$ea" ] && [ "$ea" = "$eb" ] && blockeq=1
         ba=$(scratch_mount a "$sa" "$k"); bb=$(scratch_mount b "$sb" "$k")
