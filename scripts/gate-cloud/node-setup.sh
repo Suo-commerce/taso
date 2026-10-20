@@ -18,7 +18,13 @@
 # UpCloud, block log (S2, 2026-10-20):
 #
 #   scripts/gate-cloud/node-setup.sh coord      <name>=<warden id>...
-#   scripts/gate-cloud/node-setup.sh vessel-blk <coordinator host> <name>
+#   scripts/gate-cloud/node-setup.sh vessel-blk <coordinator host>|local <name>
+#
+# A Warden on the coordinator's own host (one machine; node B in the
+# two-server layout) connects to the socket directly as root: give the
+# coord role "local=<id>" for it and the vessel-blk role "local" as the
+# coordinator host.  (A forward on the same host would take the
+# coordinator's socket path from it.)
 #
 # coord       taso-coordd with a peer map: one Unix user "warden-<name>"
 #             per Warden (no shell, key only, forwarding only), group
@@ -65,7 +71,7 @@ REPO=${REPO:-/root/taso}
 BLKD_ARGS=${BLKD_ARGS:-}      # extra taso-blkd flags for the vessel-blk unit
 
 die() { echo "error: $*" >&2; exit 1; }
-usage() { die "usage: $0 hub|vessel <hub private ip>  |  $0 coord <name>=<warden id>...  |  $0 vessel-blk <coordinator host> <name>"; }
+usage() { die "usage: $0 hub|vessel <hub private ip>  |  $0 coord <name>=<warden id>...  |  $0 vessel-blk <coordinator host>|local <name>"; }
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -d "$REPO/.git" ] || die "clone the repo to $REPO first"
 
@@ -117,6 +123,9 @@ if [ "$ROLE" = coord ]; then
         [[ "$arg" =~ ^([a-z][a-z0-9-]{0,15})=([1-9][0-9]{0,9})$ ]] || die "coord: expected <name>=<warden id> (name [a-z][a-z0-9-]*, id a positive number), got '$arg'"
         PEERS+=("$arg")
     done
+    for p in "${PEERS[@]}"; do for q in "${PEERS[@]}"; do
+        [ "$p" = "$q" ] || { [ "${p%%=*}" != "${q%%=*}" ] && [ "${p#*=}" != "${q#*=}" ]; } || die "coord: '$p' and '$q' repeat a name or an id"
+    done; done
     apt-get update -q
     # shellcheck disable=SC2046
     apt-get install -y -q git $(toolchain) pkg-config python3 curl chrony openssh-server
@@ -136,6 +145,13 @@ if [ "$ROLE" = coord ]; then
     peer_flags=()
     for p in "${PEERS[@]}"; do
         name=${p%%=*}; wid=${p#*=}; user="warden-$name"; home="/var/lib/taso/peers/$user"
+        if [ "$name" = local ]; then
+            # The Warden on this host: it connects to the socket directly,
+            # as root, so uid 0 is its identity.  No user, no key.
+            peer_flags+=(--peer "0=$wid")
+            echo "warden $wid: root on this host (local), no forward"
+            continue
+        fi
         if ! id "$user" >/dev/null 2>&1; then
             useradd --system -M -s /usr/sbin/nologin -g taso-wardens -d "$home" "$user"
         fi
@@ -197,21 +213,34 @@ if [ "$ROLE" = vessel-blk ]; then
     # in the two-node layout and starts its own in the one-machine layout.
     unit taso-blkd "/usr/local/bin/taso-blkd /var/lib/taso/blk.log /run/taso/blk.sock $BLKD_ARGS"
 
-    # The coordinator, through ssh.  ExitOnForwardFailure makes a refused
-    # forward a failed unit (visible, restarted), not a silent dead socket.
-    unit taso-coord-fwd "/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o StreamLocalBindMask=0177 -o StreamLocalBindUnlink=yes -i /root/.ssh/taso-coord -L /run/taso/coord.sock:/run/taso/coord.sock warden-$NAME@$COORD" \
-        "After=taso-blkd.service" "RestartSec=5"
-
-    echo
-    echo "== this node's public key: copy it to the coordinator host as /root/taso-keys/$NAME.pub, then run 'coord' there again"
-    cat /root/.ssh/taso-coord.pub
-    echo
-    for _ in $(seq 50); do [ -S /run/taso/coord.sock ] && break; sleep 0.2; done
-    if [ ! -S /run/taso/coord.sock ]; then
-        echo "forward not up yet (the coordinator does not know this key, or is not reachable): $(systemctl is-active taso-coord-fwd)"
-        journalctl -u taso-coord-fwd -n 5 --no-pager -o cat
-        echo "vessel-blk node ready except the coordinator; install the key on the coordinator and: systemctl restart taso-coord-fwd"
-        exit 0
+    if [ "$COORD" = local ]; then
+        # The coordinator runs on this host: the Warden connects to its
+        # socket directly, as root (coord ... local=<id>).  A forward here
+        # would unlink the coordinator's own socket (same path), so none.
+        systemctl disable --now taso-coord-fwd 2>/dev/null || true
+        rm -f /etc/systemd/system/taso-coord-fwd.service; systemctl daemon-reload
+        systemctl is-active -q taso-coordd || die "coordinator 'local' but taso-coordd is not running here: run the coord role first"
+        echo
+        echo "coordinator on this host: no forward, root is the Warden (coord role: local=<id>)"
+    else
+        # The coordinator, through ssh.  ExitOnForwardFailure makes a refused
+        # forward a failed unit (visible, restarted), not a silent dead socket.
+        if systemctl is-active -q taso-coordd 2>/dev/null; then
+            die "taso-coordd runs on this host; a forward to $COORD would replace its socket.  Use: $0 vessel-blk local $NAME"
+        fi
+        unit taso-coord-fwd "/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o StreamLocalBindMask=0177 -o StreamLocalBindUnlink=yes -i /root/.ssh/taso-coord -L /run/taso/coord.sock:/run/taso/coord.sock warden-$NAME@$COORD" \
+            "After=taso-blkd.service" "RestartSec=5"
+        echo
+        echo "== this node's public key: copy it to the coordinator host as /root/taso-keys/$NAME.pub, then run 'coord' there again"
+        cat /root/.ssh/taso-coord.pub
+        echo
+        for _ in $(seq 50); do systemctl is-active -q taso-coord-fwd && [ -S /run/taso/coord.sock ] && break; sleep 0.2; done
+        if ! systemctl is-active -q taso-coord-fwd || [ ! -S /run/taso/coord.sock ]; then
+            echo "forward not up yet (the coordinator does not know this key, or is not reachable): $(systemctl is-active taso-coord-fwd)"
+            journalctl -u taso-coord-fwd -n 5 --no-pager -o cat
+            echo "vessel-blk node ready except the coordinator; install the key on the coordinator and: systemctl restart taso-coord-fwd"
+            exit 0
+        fi
     fi
     # One `head` request for a Chronicle that does not exist, through the
     # forward.  A mapped peer gets "unknown chronicle" (refusal 1); an
@@ -230,7 +259,7 @@ def exactly(k):
     return b
 n = struct.unpack(">I", exactly(4))[0]; r = exactly(n)
 if r[:2] == bytes([1, 1]):   print("coordinator check: this node is a known Warden (refusal: unknown chronicle, as expected)")
-elif r[:2] == bytes([1, 12]): print("coordinator check: forward works but the coordinator has no --peer for this uid; check the coord role's output", file=sys.stderr); sys.exit(1)
+elif r[:2] == bytes([1, 12]): print("coordinator check: reached the coordinator, but it has no --peer for uid %d as seen on its host (0 = root: give the coord role local=<id>)" % struct.unpack(">I", r[2:6])[0], file=sys.stderr); sys.exit(1)
 else:                          print("coordinator check: unexpected reply %r" % r, file=sys.stderr); sys.exit(1)
 PY
     echo "vessel-blk node ready: taso-blkd on /run/taso/blk.sock (log /var/lib/taso/blk.log), coordinator at /run/taso/coord.sock"
