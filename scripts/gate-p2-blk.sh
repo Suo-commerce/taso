@@ -111,6 +111,11 @@ on() {   # $1 a|b, $2 command string: over ssh, or here
 to() {   # $1 a|b, $2 local file, $3 remote path: copy (or nothing if local and same path)
     local h; h=$(host_of "$1")
     if [ -n "$h" ]; then "${SSH[@]}" "$h" "cat > $3" < "$2"; elif [ "$2" != "$3" ]; then cp "$2" "$3"; fi
+    durable "$1"
+}
+durable() {   # $1 a|b: with KILL=power, node A may die any moment; what the
+              # harness wrote there must be on disk, not in its page cache
+    [ "$KILL" = power ] && [ "$1" = a ] && on a sync || true
 }
 umount_under() {   # $1 a|b: unmount everything under the node's mount root, innermost first
     on "$1" "awk -v r=$WORK/$1/mnt '\$5 == r || index(\$5, r \"/\") == 1 {print length(\$5), \$5}' /proc/self/mountinfo | sort -rn | cut -d' ' -f2- | while read -r m; do umount \"\$m\" 2>/dev/null || umount -l \"\$m\" 2>/dev/null; done; true"
@@ -213,11 +218,9 @@ cp "$BIN/taso-wardend" "$BIN/taso-logcheck" "$BIN/taso-blkd" scripts/gate-cloud/
 for n in a b; do
     [ -n "$(host_of "$n")" ] || continue
     echo "== copying binaries and rootfs to node $n"
-    tar -C "$WORK" -cf - bin rootfs | on "$n" "tar -C $WORK -xf - && sync"
+    tar -C "$WORK" -cf - bin rootfs | on "$n" "tar -C $WORK -xf -"
+    durable "$n"
 done
-# A power cut (KILL=power) loses whatever is only in A's page cache: the
-# harness's own files must be on disk before the Vessel runs.
-[ "$KILL" = power ] && on a "sync"
 
 # ── coordinator and store ─────────────────────────────────────────────
 if [ "$ONE_MACHINE" = 1 ]; then
@@ -238,6 +241,7 @@ fi
 if [ -n "${TASO_BLK_S3_ENDPOINT:-}" ]; then
     for n in a b; do
         on "$n" "umask 077; cat > $WORK/s3.secret" < "$SECRET_FILE"
+        durable "$n"
     done
     STORE_JSON=$(python3 -c "import json,os; print(json.dumps({'s3': {'endpoint': os.environ['TASO_BLK_S3_ENDPOINT'], 'region': os.environ.get('TASO_BLK_S3_REGION', 'garage'), 'bucket': os.environ['TASO_BLK_S3_BUCKET'], 'access_key_id': os.environ['TASO_BLK_S3_ACCESS_KEY_ID'], 'secret_key_file': '$WORK/s3.secret'}}))")
     PREFIX="gate-p2blk-$RUN"
