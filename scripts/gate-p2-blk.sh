@@ -142,31 +142,10 @@ if [ "$ONE_MACHINE" = 0 ]; then
     [ -n "${TASO_BLK_S3_ENDPOINT:-}" ] && [ -n "${TASO_BLK_S3_BUCKET:-}" ] && [ -n "${TASO_BLK_S3_ACCESS_KEY_ID:-}" ] && [ -f "$SECRET_FILE" ] \
         || die "two nodes need TASO_BLK_S3_ENDPOINT, _BUCKET, _ACCESS_KEY_ID and the secret in $SECRET_FILE"
 fi
+mkdir -p "$WORK/bin"   # the driver's own, whether or not a node is local
 for n in a b; do
     on "$n" "mkdir -p $WORK/$n/mnt $WORK/$n/spool $WORK/$n/state $WORK/$n/run $WORK/bin && chmod 755 $WORK"
 done
-
-COORD_PID=
-BLKD_B_PID=
-cleanup() {
-    local rc=$?
-    set +e
-    [ -n "$COORD_PID" ] && kill "$COORD_PID" 2>/dev/null
-    for n in a b; do
-        on "$n" 'for d in '"$WORK"'/'"$n"'/run/runc; do [ -d "$d" ] && for c in $(runc --root "$d" list -q 2>/dev/null); do runc --root "$d" delete --force "$c" 2>/dev/null; done; done; true' 2>/dev/null
-        umount_under "$n" 2>/dev/null
-    done
-    if [ "$KEEP" = 1 ] || [ "$KILL" = power ]; then
-        echo "kept (KEEP=1, or a power run keeps its evidence): work dir $WORK on every node, branches under $ROOT in the block logs"
-    else
-        drop_root a; drop_root b
-        [ -n "$BLKD_B_PID" ] && { blk b quit >/dev/null 2>&1; sleep 0.5; kill "$BLKD_B_PID" 2>/dev/null; }
-        for n in a b; do on "$n" "rm -rf $WORK" 2>/dev/null; done
-    fi
-    for n in a b; do ssh_reset "$n"; done
-    exit $rc
-}
-trap cleanup EXIT
 
 # ── the daemon's socket, from the driver ──────────────────────────────
 cat > "$WORK/bin/blkcmd.py" <<'PY'
@@ -203,6 +182,28 @@ drop_root() {
     done
     return 0
 }
+
+COORD_PID=
+BLKD_B_PID=
+cleanup() {
+    local rc=$?
+    set +e
+    [ -n "$COORD_PID" ] && kill "$COORD_PID" 2>/dev/null
+    for n in a b; do
+        on "$n" 'for d in '"$WORK"'/'"$n"'/run/runc; do [ -d "$d" ] && for c in $(runc --root "$d" list -q 2>/dev/null); do runc --root "$d" delete --force "$c" 2>/dev/null; done; done; true' 2>/dev/null
+        umount_under "$n" 2>/dev/null
+    done
+    if [ "$KEEP" = 1 ] || [ "$KILL" = power ]; then
+        echo "kept (KEEP=1, or a power run keeps its evidence): work dir $WORK on every node, branches under $ROOT in the block logs"
+    else
+        drop_root a; drop_root b
+        [ -n "$BLKD_B_PID" ] && { blk b quit >/dev/null 2>&1; sleep 0.5; kill "$BLKD_B_PID" 2>/dev/null; }
+        for n in a b; do on "$n" "rm -rf $WORK" 2>/dev/null; done
+    fi
+    for n in a b; do ssh_reset "$n"; done
+    exit $rc
+}
+trap cleanup EXIT
 
 # ── rootfs and binaries ───────────────────────────────────────────────
 ROOTFS=$WORK/rootfs
