@@ -88,6 +88,9 @@ BIN=$PWD/target/release
 mkdir -p "$OUT"
 WORK=$(mktemp -d /var/tmp/taso-p2blk.XXXXXX)
 chmod 755 "$WORK"
+# Until the full cleanup below is in place: a preflight failure leaves
+# nothing behind here (the nodes' copies are made after their checks).
+trap 'rm -rf "$WORK"' EXIT
 ROOT="gate-p2blk-$RUN"
 
 # ── nodes ─────────────────────────────────────────────────────────────
@@ -118,10 +121,7 @@ ONE_MACHINE=0
 SOCK_A=/run/taso/blk.sock
 if [ "$ONE_MACHINE" = 1 ]; then SOCK_B=$WORK/b-blk.sock; else SOCK_B=/run/taso/blk.sock; fi
 sock_of() { if [ "$1" = a ]; then echo "$SOCK_A"; else echo "$SOCK_B"; fi; }
-for n in a b; do
-    on "$n" "mkdir -p $WORK/$n/mnt $WORK/$n/spool $WORK/$n/state $WORK/$n/run $WORK/bin && chmod 755 $WORK"
-    on "$n" "command -v runc >/dev/null" || die "node $n: runc missing"
-done
+for n in a b; do on "$n" "command -v runc >/dev/null" || die "node $n: runc missing"; done
 on a "test -S $SOCK_A" || die "node A: no taso-blkd on $SOCK_A (node-setup.sh vessel-blk)"
 if [ "$ONE_MACHINE" = 0 ]; then
     on b "test -S $SOCK_B" || die "node B: no taso-blkd on $SOCK_B (node-setup.sh vessel-blk)"
@@ -129,6 +129,9 @@ if [ "$ONE_MACHINE" = 0 ]; then
     [ -n "${TASO_BLK_S3_ENDPOINT:-}" ] && [ -n "${TASO_BLK_S3_BUCKET:-}" ] && [ -n "${TASO_BLK_S3_ACCESS_KEY_ID:-}" ] && [ -f "$SECRET_FILE" ] \
         || die "two nodes need TASO_BLK_S3_ENDPOINT, _BUCKET, _ACCESS_KEY_ID and the secret in $SECRET_FILE"
 fi
+for n in a b; do
+    on "$n" "mkdir -p $WORK/$n/mnt $WORK/$n/spool $WORK/$n/state $WORK/$n/run $WORK/bin && chmod 755 $WORK"
+done
 
 COORD_PID=
 BLKD_B_PID=
