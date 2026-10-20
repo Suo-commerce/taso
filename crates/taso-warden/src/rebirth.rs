@@ -3,14 +3,19 @@
 //!
 //! # Order
 //!
-//! 1. **Fence.**  Take ownership ([`crate::coordinator::Coord::transfer`]) before reading
-//!    anything.  A previous holder still alive can then no longer append
-//!    or move the shipped anchor, so the anchor read next stays the anchor
-//!    for the whole rebirth, and a retry reads the same one.
-//! 2. **Chain.**  The shipped anchor, and [`Packs::chain`] up to it: the
-//!    verified frames, and the `fs` sections an `FsShipped` record names.
-//!    Records the anchor does not cover are lost, and so is any Seal whose
-//!    section was never named.
+//! 1. **Verify.**  The shipped anchor (something must be shipped),
+//!    [`Packs::chain`] up to it — the verified frames, and the `fs`
+//!    sections an `FsShipped` record names — its Lineage record, this
+//!    node's state, and the parents the sections need.  Records the
+//!    anchor does not cover are lost, and so is any Seal whose section
+//!    was never named.  Nothing has been changed yet: a rebirth that
+//!    cannot succeed stops here and fences nobody (fencing review F5).
+//! 2. **Fence.**  Take ownership on the claim the caller read
+//!    ([`crate::coordinator::Coord::transfer_if`]).  A previous holder
+//!    still alive can then no longer append or move the shipped anchor.
+//!    If the anchor moved between step 1 and the fence (the holder
+//!    shipped more), step 1 runs again against the anchor as it is now;
+//!    that is the check that counts, and a retry reads the same anchor.
 //! 3. **Dataset.**  Receive the sections in order: the first is a full
 //!    stream (born from the void) or an incremental from the parent's Seal
 //!    snapshot, which must already be on this node (a Template); each
@@ -48,7 +53,7 @@ use taso_core::envelope::{ChronicleId, Epoch, Lsn};
 use taso_core::record::{LineageRecord, Origin, ParentSeal, Payload};
 
 use crate::chronicle::{restore_log, Chronicle, ChronicleError, Claim, Layers};
-use crate::pack::{FsBase, Packs};
+use crate::pack::{Chain, FsBase, Packs};
 use crate::segment::Position;
 use crate::ship::{ObjectStore, Sender};
 use crate::vessel::{Host, Pool, Vessel, VesselError};
@@ -111,33 +116,27 @@ impl<P: Pool> Host<P> {
         packs: &Packs<S, X>,
         claim: Claim,
     ) -> Result<(Vessel<P::Layers>, Reborn), VesselError> {
-        // 1. Fence, on the claim: from here on the anchor cannot move
+        // 1. Verify before fencing (fencing review F5): what was shipped
+        //    and anchored, the chain, the lineage, this node's state and
+        //    the parents it needs.  A rebirth that cannot succeed then
+        //    fences nobody and the Vessel keeps running where it is.
+        let dataset = self.dataset_for(id);
+        let (anchor, chain, lineage) = self.verify(id, packs, &dataset)?;
+
+        // 2. Fence, on the claim: from here on the anchor cannot move
         //    under us, and a stale decision changes nothing.
         let expected = Chronicle::<P::Layers>::expected(self.coord.as_ref(), id, self.warden, claim).map_err(VesselError::Coord)?;
         self.coord.transfer_if(id, self.warden, expected).map_err(VesselError::Coord)?;
 
-        // 2. What was shipped and anchored.
-        let anchor = self.coord.shipped(id).map_err(VesselError::Coord)?;
-        if anchor.lsn == Lsn::new(0) {
-            return Err(VesselError::NothingShipped(id));
-        }
-        let chain = packs.chain(Some(anchor)).map_err(VesselError::Pack)?;
-        let lineage = match chain.frames.first().map(|f| Payload::decode(&f.payload)) {
-            Some(Ok(Payload::Lineage(l))) => l,
-            _ => return Err(VesselError::NotAVessel("lsn 1 of the shipped chain is not a Lineage record")),
-        };
+        // 3. The anchor may have moved between the check and the fence
+        //    (the holder shipped more): verify again against what is
+        //    anchored now.  This second check is the one that counts.
+        let anchored_now = self.coord.shipped(id).map_err(VesselError::Coord)?;
+        let (anchor, chain, lineage) =
+            if anchored_now == anchor { (anchor, chain, lineage) } else { self.verify(id, packs, &dataset)? };
 
-        // 3. The dataset.
-        let dataset = self.dataset_for(id);
+        // 4. The dataset.
         let here = self.seals_here(&dataset)?;
-        let named: Vec<(Lsn, taso_core::envelope::HashVal)> =
-            chain.seals.iter().map(|s| (s.fs.to.lsn, s.fs.to.hash)).collect();
-        if let Some(stray) = here.iter().find(|s| !named.contains(s)) {
-            return Err(VesselError::LocalState(format!(
-                "{dataset} has Seal {} that the shipped chain does not name",
-                stray.0.get()
-            )));
-        }
         let parent_ds = |p: &ParentSeal| self.dataset_for(p.chronicle);
         let mut received = Vec::new();
         for s in &chain.seals {
@@ -169,14 +168,14 @@ impl<P: Pool> Host<P> {
             self.as_born(&lineage, &dataset)?;
         }
 
-        // 4. The log, unless an interrupted rebirth already restored it
+        // 5. The log, unless an interrupted rebirth already restored it
         //    (the open below checks that it ends at the anchor).
         let dir = self.dir_for(id);
         if !dir.exists() {
             restore_log(&dir, id, &chain.frames).map_err(VesselError::Chronicle)?;
         }
 
-        // 5. Open: a new epoch, the Gap, every check of an ordinary open.
+        // 6. Open: a new epoch, the Gap, every check of an ordinary open.
         let (vessel, recovery) = self.open_after_gap(id).map_err(|e| match e {
             VesselError::Chronicle(ChronicleError::SegmentsDisagree { at, why }) => VesselError::LocalState(format!(
                 "the state directory {} does not end at the shipped anchor (lsn {}; at lsn {}: {why})",
@@ -195,6 +194,48 @@ impl<P: Pool> Host<P> {
             missing_layers: recovery.missing_layers,
         };
         Ok((vessel, reborn))
+    }
+
+    /// Everything a rebirth reads and checks before it changes anything:
+    /// the shipped anchor (something must be shipped), the chain up to it
+    /// (verified pack by pack), its Lineage record, that this node holds
+    /// no Seal of the dataset the chain does not name, and that every
+    /// parent a received clone or a void-less birth needs is here.
+    fn verify<S: ObjectStore, X: Sender>(
+        &self,
+        id: ChronicleId,
+        packs: &Packs<S, X>,
+        dataset: &crate::zfs::Dataset,
+    ) -> Result<(Position, Chain, LineageRecord), VesselError> {
+        let anchor = self.coord.shipped(id).map_err(VesselError::Coord)?;
+        if anchor.lsn == Lsn::new(0) {
+            return Err(VesselError::NothingShipped(id));
+        }
+        let chain = packs.chain(Some(anchor)).map_err(VesselError::Pack)?;
+        let lineage = match chain.frames.first().map(|f| Payload::decode(&f.payload)) {
+            Some(Ok(Payload::Lineage(l))) => l,
+            _ => return Err(VesselError::NotAVessel("lsn 1 of the shipped chain is not a Lineage record")),
+        };
+        let here = self.seals_here(dataset)?;
+        let named: Vec<(Lsn, taso_core::envelope::HashVal)> =
+            chain.seals.iter().map(|s| (s.fs.to.lsn, s.fs.to.hash)).collect();
+        if let Some(stray) = here.iter().find(|s| !named.contains(s)) {
+            return Err(VesselError::LocalState(format!(
+                "{dataset} has Seal {} that the shipped chain does not name",
+                stray.0.get()
+            )));
+        }
+        for s in &chain.seals {
+            if let FsBase::Origin { chronicle, seal, .. } = s.fs.base {
+                self.parent_present(&ParentSeal { chronicle, seal: seal.lsn, seal_hash: seal.hash })?;
+            }
+        }
+        if chain.seals.is_empty() && self.pool.info(dataset).map_err(VesselError::Pool)?.is_none() {
+            if let Origin::Fork { parent } | Origin::Succession { parent, .. } = lineage.origin {
+                self.parent_present(&parent)?;
+            }
+        }
+        Ok((anchor, chain, lineage))
     }
 
     /// The Seal snapshots of `dataset` on this node; none if the dataset is
@@ -541,28 +582,50 @@ mod tests {
     }
 
     /// The old holder is still alive and moves the shipped anchor just
-    /// after the rebirth read it.  Because the rebirth took ownership
-    /// first, that move is refused and the anchor it read stays true.
+    /// after the rebirth's first read (it had shipped the pack; the report
+    /// lands late).  The rebirth verifies before it fences (F5), so that
+    /// move is allowed and seen: the fence comes next, the anchor is read
+    /// again, and the rebirth continues from the anchor as it is now.
+    /// After the fence the old holder can move nothing.
     #[test]
-    fn the_old_holder_cannot_move_the_anchor_during_a_rebirth() {
+    fn an_anchor_moved_before_the_fence_is_seen_and_after_it_refused() {
         let n = Nodes::new();
         let a = n.host(1);
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
         v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
-        // Accepted but not yet anchored as shipped; A is about to report it.
+        // Shipped, not yet anchored: A is about to report it.
         v.append(Stream::Fs, raw(2)).unwrap();
         let (id, epoch, tail) = (v.id(), v.chronicle().epoch(), v.tail());
+        n.packs(id).ship_log(&v.chronicle().segments(), tail).unwrap();
+        let before = n.coord.shipped(id).unwrap();
+        assert!(before.lsn < tail.lsn);
         let coord = Arc::new(AfterShipped {
             inner: n.coord.clone(),
             then: std::sync::Mutex::new(Some(Box::new(move |c: &Coordinator| {
-                let moved = c.advance_shipped(WardenId::new(1), id, epoch, tail);
-                assert!(moved.is_err(), "the old holder moved the anchor: {moved:?}");
+                c.advance_shipped(WardenId::new(1), id, epoch, tail).unwrap();
             }))),
         });
         let b = Host { coord, ..n.host(2) };
         let (_, r) = b.rebirth(id, &n.packs(id)).unwrap();
+        assert_eq!(r.anchor, tail, "the second check counted");
         assert_eq!(r.dataset_at, Some(s1));
+        // Fenced now: A's next report is refused.
+        assert!(n.coord.advance_shipped(WardenId::new(1), id, epoch, tail).is_err());
+    }
+
+    /// A rebirth that cannot succeed fences nobody (F5): nothing shipped,
+    /// a parent missing, a stray local Seal — the holder keeps appending.
+    #[test]
+    fn a_rebirth_that_cannot_succeed_fences_nobody() {
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
+        let before = n.coord.ownership(v.id()).unwrap();
+        assert!(matches!(b.rebirth(v.id(), &n.packs(v.id())), Err(VesselError::NothingShipped(_))));
+        let after = n.coord.ownership(v.id()).unwrap();
+        assert_eq!((after.holder, after.epoch), (before.holder, before.epoch), "not fenced");
+        assert!(v.append(Stream::Fs, raw(1)).is_ok(), "A keeps appending");
     }
 
     /// The chain names the snapshot the Seal was taken from by its guid;
