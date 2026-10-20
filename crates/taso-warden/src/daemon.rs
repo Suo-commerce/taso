@@ -36,9 +36,14 @@
 //! 1. **Find it** ([`decide`]): born from the void if the coordinator does
 //!    not know it; opened if this node has its state; reborn from the
 //!    store if not ([`crate::rebirth`]).  A Vessel held by another Warden
-//!    is taken over only if its entry says `"takeover": true`: taking
-//!    over fences the other Warden, so it is the operator's call, never
-//!    the daemon's.
+//!    is taken over only if its entry names that ownership,
+//!    `"takeover": {"holder": <warden>, "epoch": <n>}` (read from
+//!    `taso-logcheck` or from the refusal line): taking over fences the
+//!    other Warden, so it is the operator's call, never the daemon's, and
+//!    it is one call — once the ownership moved, the instruction no
+//!    longer matches and refuses itself, so a daemon restarted with it
+//!    left in cannot fence anyone again (fencing review F2).  An entry
+//!    naming this Warden as the holder is spent and ignored.
 //! 2. **Settle the state** ([`settle`]).  A Vessel with no Seal takes its
 //!    birth Seal (turn 0, [`Vessel::seal_birth`]) before anything else:
 //!    every Vessel has a Seal before its agent first runs.  Then the
@@ -102,7 +107,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use taso_core::envelope::ChronicleId;
+use taso_core::envelope::{ChronicleId, Epoch};
 use taso_core::record::{vessel_id, Namespace, Verdict};
 use taso_field::adapter::Registry;
 
@@ -282,6 +287,27 @@ pub fn check_quiescence(dbs: &[String]) -> Result<(), String> {
     }
 }
 
+/// The ownership a takeover replaces: what the operator read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeOver {
+    /// The Warden to fence.
+    pub holder: WardenId,
+    /// Its epoch.
+    pub epoch: Epoch,
+}
+
+impl TakeOver {
+    /// `{"holder": <warden>, "epoch": <n>}`.
+    fn parse(v: &Value) -> Result<Self, ConfigError> {
+        let Value::Object(_) = v else {
+            return Err(bad("\"takeover\" must be {\"holder\": <warden>, \"epoch\": <n>}: the ownership to replace, as read (true/false is no longer accepted)"));
+        };
+        only_keys(v, "takeover", &["holder", "epoch"])?;
+        let n = |k: &str| field(v, k)?.as_u64().filter(|n| *n > 0).ok_or_else(|| bad(format!("\"takeover.{k}\" must be a positive integer")));
+        Ok(Self { holder: WardenId::new(n("holder")?), epoch: Epoch::new(n("epoch")?) })
+    }
+}
+
 /// One Vessel to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VesselConf {
@@ -289,8 +315,9 @@ pub struct VesselConf {
     pub namespace: Namespace,
     /// Its subject (the id is derived from both).
     pub subject: String,
-    /// Take it over if another Warden holds it.
-    pub takeover: bool,
+    /// Take it over from exactly this ownership, if another Warden holds
+    /// it (none: never).
+    pub takeover: Option<TakeOver>,
     /// Its host uid/gid range: slot `n` is
     /// `host_uid_base + n·65536 ..+65536`.  No two Vessels on a node share
     /// one, so one Vessel's processes cannot touch another's files or
@@ -770,7 +797,10 @@ impl Config {
                     Ok(VesselConf {
                         namespace: namespace(&string(x, "namespace")?)?,
                         subject: string(x, "subject")?,
-                        takeover: bool_or(x, "takeover", false)?,
+                        takeover: match x.get("takeover") {
+                            None | Some(Value::Null) => None,
+                            Some(t) => Some(TakeOver::parse(t)?),
+                        },
                         uid_slot: u32::try_from(
                             field(x, "uid_slot")?.as_u64().ok_or_else(|| bad("\"uid_slot\" must be an integer"))?,
                         )
@@ -865,20 +895,35 @@ pub enum Known {
     No,
     /// Registered, no record yet: an interrupted birth.
     Unborn,
-    /// Registered and held by this Warden.
-    Held(WardenId),
+    /// Registered and held by a Warden at an epoch.
+    Held(WardenId, Epoch),
 }
 
-/// How the Vessel starts (see the module docs).
-pub fn decide(known: Known, local_state: bool, me: WardenId, takeover: bool) -> Start {
+/// How the Vessel starts (see the module docs).  A takeover must name
+/// the ownership read, exactly; one that names this Warden is spent.
+pub fn decide(known: Known, local_state: bool, me: WardenId, takeover: Option<TakeOver>) -> Start {
     match known {
         Known::No | Known::Unborn => Start::Birth,
-        Known::Held(holder) if holder != me && !takeover => Start::Refuse(format!(
-            "held by Warden {}; set \"takeover\": true to fence it and take the Vessel over",
-            holder.get()
-        )),
-        Known::Held(_) if local_state => Start::Open,
-        Known::Held(_) => Start::Rebirth,
+        Known::Held(holder, epoch) if holder != me => match takeover {
+            None => Start::Refuse(format!(
+                "held by Warden {} at epoch {}; to fence it and take the Vessel over, set \"takeover\": {{\"holder\": {}, \"epoch\": {}}}",
+                holder.get(),
+                epoch.get(),
+                holder.get(),
+                epoch.get()
+            )),
+            Some(t) if (t.holder, t.epoch) != (holder, epoch) => Start::Refuse(format!(
+                "takeover names Warden {} at epoch {}, but Warden {} holds the Vessel at epoch {}: not what was read, nothing fenced",
+                t.holder.get(),
+                t.epoch.get(),
+                holder.get(),
+                epoch.get()
+            )),
+            Some(_) if local_state => Start::Open,
+            Some(_) => Start::Rebirth,
+        },
+        Known::Held(..) if local_state => Start::Open,
+        Known::Held(..) => Start::Rebirth,
     }
 }
 
@@ -1272,22 +1317,21 @@ impl Node {
         let host = self.host();
         let id = vc.id();
         // What was read is what may be claimed (fencing review F1): a
-        // takeover names the holder and epoch read here, so one that is
-        // stale by the time it acts is refused instead of taking the
-        // Vessel back from whoever took it over in between.
-        let mut claim = Claim::Mine;
+        // takeover claims the ownership the config names, which `decide`
+        // has checked against the read; one stale by the time it acts is
+        // refused by the coordinator instead of taking the Vessel back
+        // from whoever took it over in between.
         let known = match self.coord.ownership(id) {
             Ok(o) => match self.coord.head(id).map_err(DaemonError::Coord)? {
                 h if h.lsn.get() == 0 => Known::Unborn,
-                _ => {
-                    if o.holder != self.config.warden {
-                        claim = Claim::TakeOver { from: o.holder, epoch: o.epoch };
-                    }
-                    Known::Held(o.holder)
-                }
+                _ => Known::Held(o.holder, o.epoch),
             },
             Err(CoordError::UnknownChronicle(_)) => Known::No,
             Err(e) => return Err(DaemonError::Coord(e)),
+        };
+        let claim = match (known, vc.takeover) {
+            (Known::Held(holder, _), Some(t)) if holder != self.config.warden => Claim::TakeOver { from: t.holder, epoch: t.epoch },
+            _ => Claim::Mine,
         };
         let local = host.dir_for(id).exists();
         let start = decide(known, local, self.config.warden, vc.takeover);
@@ -1677,7 +1721,7 @@ mod tests {
         "quiescence": ["state.db"],
         "vessels": [
             { "namespace": "01010101010101010101010101010101", "subject": "a", "uid_slot": 0 },
-            { "namespace": "01010101010101010101010101010101", "subject": "b", "takeover": true, "uid_slot": 7 }
+            { "namespace": "01010101010101010101010101010101", "subject": "b", "takeover": {"holder": 2, "epoch": 5}, "uid_slot": 7 }
         ]
     }"#;
 
@@ -1721,7 +1765,8 @@ mod tests {
         assert_eq!((c.runtime.memory_bytes, c.runtime.pids), (Some(256 << 20), Some(64)));
         assert_eq!(c.vessels.len(), 2);
         assert_eq!(c.vessels[0].namespace, Namespace::from_bytes([1; 16]));
-        assert!(!c.vessels[0].takeover && c.vessels[1].takeover);
+        assert_eq!(c.vessels[0].takeover, None);
+        assert_eq!(c.vessels[1].takeover, Some(TakeOver { holder: WardenId::new(2), epoch: Epoch::new(5) }));
         let uids: Vec<_> = c.vessels.iter().map(|v| v.host_uid(&c.runtime)).collect();
         assert_eq!(uids, vec![Some(200_000), Some(200_000 + 7 * 65_536)], "one 65536-id range per slot");
         assert_eq!(c.quiescence, vec!["state.db".to_string()]);
@@ -1823,7 +1868,11 @@ mod tests {
             ("a vessel twice", Box::new(|v| v["vessels"][1]["subject"] = "a".into())),
             ("absolute db", Box::new(|v| v["quiescence"] = serde_json::json!(["/etc/passwd"]))),
             ("db outside", Box::new(|v| v["quiescence"] = serde_json::json!(["../x.db"]))),
-            ("takeover not bool", Box::new(|v| v["vessels"][0]["takeover"] = "yes".into())),
+            ("takeover a bool", Box::new(|v| v["vessels"][0]["takeover"] = true.into())),
+            ("takeover false", Box::new(|v| v["vessels"][0]["takeover"] = false.into())),
+            ("takeover without epoch", Box::new(|v| v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2}))),
+            ("takeover epoch 0", Box::new(|v| v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2, "epoch": 0}))),
+            ("takeover extra key", Box::new(|v| v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2, "epoch": 1, "from": 3}))),
             ("huge uid base", Box::new(|v| v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) + 1).into())),
             ("no uid slot", Box::new(|v| { v["vessels"][0].as_object_mut().unwrap().remove("uid_slot"); })),
             ("uid slot not a number", Box::new(|v| v["vessels"][0]["uid_slot"] = "1".into())),
@@ -1907,7 +1956,7 @@ mod tests {
         let vc = |landlock| VesselConf {
             namespace: Namespace::from_bytes([1; 16]),
             subject: "a".into(),
-            takeover: false,
+            takeover: None,
             uid_slot: 0,
             restart: Restart::Never,
             runtime: Some(Box::new(VesselRuntime { landlock, ..Default::default() })),
@@ -2139,18 +2188,34 @@ mod tests {
     #[test]
     fn how_a_vessel_starts() {
         let (me, other) = (WardenId::new(1), WardenId::new(2));
+        let (e3, e4) = (Epoch::new(3), Epoch::new(4));
+        let exact = Some(TakeOver { holder: other, epoch: e3 });
+        let stale = Some(TakeOver { holder: other, epoch: e4 });
+        let wrong = Some(TakeOver { holder: WardenId::new(9), epoch: e3 });
+        let spent = Some(TakeOver { holder: me, epoch: e3 });
         for local in [false, true] {
-            for takeover in [false, true] {
+            for takeover in [None, exact, stale] {
                 assert_eq!(decide(Known::No, local, me, takeover), Start::Birth);
                 assert_eq!(decide(Known::Unborn, local, me, takeover), Start::Birth);
             }
         }
-        assert_eq!(decide(Known::Held(me), true, me, false), Start::Open);
-        assert_eq!(decide(Known::Held(me), false, me, false), Start::Rebirth, "ours, local state lost");
-        assert!(matches!(decide(Known::Held(other), true, me, false), Start::Refuse(_)));
-        assert!(matches!(decide(Known::Held(other), false, me, false), Start::Refuse(_)));
-        assert_eq!(decide(Known::Held(other), true, me, true), Start::Open);
-        assert_eq!(decide(Known::Held(other), false, me, true), Start::Rebirth);
+        // Mine: any takeover entry is spent or irrelevant.
+        for takeover in [None, exact, stale, spent] {
+            assert_eq!(decide(Known::Held(me, e3), true, me, takeover), Start::Open);
+            assert_eq!(decide(Known::Held(me, e3), false, me, takeover), Start::Rebirth, "ours, local state lost");
+        }
+        // Another Warden's: only a takeover naming exactly what was read.
+        for takeover in [None, stale, wrong, spent] {
+            for local in [false, true] {
+                let Start::Refuse(why) = decide(Known::Held(other, e3), local, me, takeover) else { panic!("{takeover:?}") };
+                assert!(why.contains("epoch 3") && why.contains("Warden 2"), "{why}");
+                if takeover.is_some() {
+                    assert!(why.contains("nothing fenced"), "{why}");
+                }
+            }
+        }
+        assert_eq!(decide(Known::Held(other, e3), true, me, exact), Start::Open);
+        assert_eq!(decide(Known::Held(other, e3), false, me, exact), Start::Rebirth);
     }
 
     fn pos(n: u64) -> Position {

@@ -322,7 +322,7 @@ mod tests {
     }
 
     fn vc(subject: &str, slot: u32, restart: Restart) -> VesselConf {
-        VesselConf { namespace: Namespace::from_bytes([7; 16]), subject: subject.into(), takeover: false, uid_slot: slot, restart, runtime: None }
+        VesselConf { namespace: Namespace::from_bytes([7; 16]), subject: subject.into(), takeover: None, uid_slot: slot, restart, runtime: None }
     }
 
     fn timing() -> Timing {

@@ -297,7 +297,7 @@ impl<L: ListVessels> KubeSource<L> {
         let vc = VesselConf {
             namespace: tenant,
             subject: subject.to_string(),
-            takeover: false,
+            takeover: None,
             uid_slot,
             restart: Restart::Always,
             runtime: Some(Box::new(VesselRuntime {
@@ -557,7 +557,7 @@ mod tests {
         let f = fixture();
         let vc = one(&f, json!({ "env": ["A=1"], "quiescence": ["db.sqlite"], "resources": { "memory": "128Mi", "pids": 32 } })).unwrap();
         assert_eq!(vc.namespace, hex16(TA).unwrap());
-        assert_eq!((vc.subject.as_str(), vc.uid_slot, vc.takeover, vc.restart), ("v1", 1, false, Restart::Always));
+        assert_eq!((vc.subject.as_str(), vc.uid_slot, vc.takeover, vc.restart), ("v1", 1, None, Restart::Always));
         let rt = *vc.runtime.clone().unwrap();
         assert_eq!(
             rt,

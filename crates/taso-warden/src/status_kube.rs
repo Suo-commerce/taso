@@ -286,7 +286,7 @@ mod tests {
     use taso_core::record::Namespace;
 
     fn vc(subject: &str) -> VesselConf {
-        VesselConf { namespace: Namespace::from_bytes([0x0a; 16]), subject: subject.into(), takeover: false, uid_slot: 1, restart: Restart::Always, runtime: None }
+        VesselConf { namespace: Namespace::from_bytes([0x0a; 16]), subject: subject.into(), takeover: None, uid_slot: 1, restart: Restart::Always, runtime: None }
     }
 
     fn key(subject: &str) -> VesselKey {
