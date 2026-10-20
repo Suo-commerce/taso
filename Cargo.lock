@@ -1531,6 +1531,7 @@ dependencies = [
  "libc",
  "proptest",
  "redb",
+ "rustix 1.1.5",
  "rustls",
  "rustls-pki-types",
  "serde_json",

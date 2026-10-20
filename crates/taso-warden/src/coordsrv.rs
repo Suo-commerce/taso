@@ -53,26 +53,54 @@
 //! ```
 //!
 //! Operations 6, 7 and 8 were added to version 1 before any server ran
-//! outside a test.  A batch holds at most 4096 envelopes.
+//! outside a test.  A batch holds at most 4096 envelopes.  Refusal reasons
+//! 11 (`NotYou`: claimed (8) · peer (8)) and 12 (`UnknownPeer`: uid (4))
+//! were added with the peer map, below.
 //!
 //! A malformed request gets status 3 and the server closes the connection,
 //! since it can no longer trust the framing.  The version byte lets a
 //! later version add operations without guessing.
 //!
-//! # Scope
+//! # Who is asking
 //!
-//! Unix socket only: two Wardens on one host.  The socket is created mode
-//! 0600; put it in a directory only the Warden user can enter, since the
-//! mode is applied just after `bind`.  TCP for a second machine comes with
-//! authentication — a coordinator reachable without it would let anyone
-//! transfer ownership.
+//! Every request carries the `WardenId` it acts as, and the coordinator
+//! has no way to check it from the bytes: the hash chain is integrity, not
+//! authentication (v0.4 §10).  A server given a **peer map**
+//! ([`ServerOptions::peers`], uid → `WardenId`) reads the connecting
+//! process's uid (`SO_PEERCRED`) once per connection and refuses, before
+//! the coordinator sees it, every request that names another Warden than
+//! the one the uid stands for ([`CoordError::NotYou`]) — for `register`
+//! the holder, for `transfer` the new holder (ownership can only be taken
+//! for oneself), for appends and `advance_shipped` the warden.  The reads
+//! (`ownership`, `head`, `shipped`) are open to any mapped peer.  A uid
+//! not in the map is nobody: everything on that connection is refused
+//! ([`CoordError::UnknownPeer`]).  If the uid cannot be read, the
+//! connection is dropped unanswered (the client sees `Unavailable`).
 //!
-//! Normative references: v0.4 §8.1–8.3, §8.7; v1.0 §1 (P2).
+//! This binds an identity to a *local* uid.  It reaches across machines
+//! when the socket is forwarded by something that connects as a distinct
+//! local user per remote Warden — an ssh socket forward does exactly that
+//! (sshd opens the forwarded connection as the login user; measured
+//! 2026-10-20), so one ssh user and key per node makes the node's key the
+//! Warden's identity.  Root on a node can still only act as that node's
+//! Warden.  Without a peer map the server is as before: unauthenticated,
+//! for tests and for Wardens that share one uid on one host.  Mutual TLS
+//! with the identity in the certificate stays the production answer.
+//!
+//! # The socket file
+//!
+//! The socket is created mode 0600, or 0660 owned by
+//! [`ServerOptions::group`] so a forwarding user in that group can connect.
+//! It is bound in a private 0700 staging directory beside the final path,
+//! given its mode and group there, and renamed into place, so it is never
+//! reachable with a wider mode than its final one.
+//!
+//! Normative references: v0.4 §8.1–8.3, §8.7, §10; v1.0 §1 (P2).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +144,8 @@ const R_LSN_NOT_NEXT: u8 = 7;
 const R_SHIPPED_AHEAD: u8 = 8;
 const R_SHIPPED_CONFLICT: u8 = 9;
 const R_BAD_BATCH: u8 = 10;
+const R_NOT_YOU: u8 = 11;
+const R_UNKNOWN_PEER: u8 = 12;
 
 /// How often the accept loop checks whether it should stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
@@ -337,6 +367,19 @@ impl Request {
         Ok(req)
     }
 
+    /// The Warden this request acts as, if it acts as one.  Exhaustive on
+    /// purpose: a new operation does not compile until it says whether it
+    /// names a Warden, so the peer check cannot be forgotten.
+    fn claimed(&self) -> Option<WardenId> {
+        match self {
+            Self::Register { holder, .. } => Some(*holder),
+            Self::Append { warden, .. } | Self::AppendBatch { warden, .. } => Some(*warden),
+            Self::Transfer { new_holder, .. } => Some(*new_holder),
+            Self::AdvanceShipped { warden, .. } => Some(*warden),
+            Self::Ownership { .. } | Self::Head { .. } | Self::Shipped { .. } => None,
+        }
+    }
+
     /// What kind of reply body an `Ok` carries.
     fn ok_kind(&self) -> OkKind {
         match self {
@@ -432,6 +475,8 @@ fn encode_refusal(e: &CoordError) -> Option<Vec<u8>> {
         CoordError::ShippedAhead { to, head } => o.u8(R_SHIPPED_AHEAD).u64(to.get()).u64(head.get()),
         CoordError::ShippedConflict { lsn } => o.u8(R_SHIPPED_CONFLICT).u64(lsn.get()),
         CoordError::BadBatch { lsn } => o.u8(R_BAD_BATCH).u64(lsn.get()),
+        CoordError::NotYou { claimed, peer } => o.u8(R_NOT_YOU).u64(claimed.get()).u64(peer.get()),
+        CoordError::UnknownPeer { uid } => o.u8(R_UNKNOWN_PEER).u32(*uid),
         CoordError::Corrupt { .. } | CoordError::Storage(_) | CoordError::Unavailable(_) => return None,
     };
     Some(o.0)
@@ -451,6 +496,8 @@ fn decode_refusal(i: &mut In<'_>) -> Result<CoordError, Malformed> {
         R_SHIPPED_AHEAD => CoordError::ShippedAhead { to: Lsn::new(i.u64()?), head: Lsn::new(i.u64()?) },
         R_SHIPPED_CONFLICT => CoordError::ShippedConflict { lsn: Lsn::new(i.u64()?) },
         R_BAD_BATCH => CoordError::BadBatch { lsn: Lsn::new(i.u64()?) },
+        R_NOT_YOU => CoordError::NotYou { claimed: i.warden()?, peer: i.warden()? },
+        R_UNKNOWN_PEER => CoordError::UnknownPeer { uid: i.u32()? },
         _ => return Err(Malformed("unknown refusal")),
     })
 }
@@ -474,8 +521,40 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
     r.unwrap_or_else(Reply::Err)
 }
 
+/// Who a connection is, decided once when it is accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Peer {
+    /// No peer map: the request's own claim is taken as it is.
+    Anyone,
+    /// A mapped uid: the connection may act only as this Warden.
+    Warden(WardenId),
+    /// A uid the map does not know: nobody; every request is refused.
+    Unknown(u32),
+}
+
+/// The uid of the process at the other end of a Unix socket
+/// (`SO_PEERCRED`).  For a connection forwarded by sshd this is the ssh
+/// login user, not the remote process.
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let cred = rustix::net::sockopt::socket_peercred(stream)?;
+    Ok(cred.uid.as_raw())
+}
+
+/// The refusal a peer earns for `req` before the coordinator sees it, if
+/// any.
+fn peer_refusal(peer: Peer, req: &Request) -> Option<CoordError> {
+    match peer {
+        Peer::Anyone => None,
+        Peer::Unknown(uid) => Some(CoordError::UnknownPeer { uid }),
+        Peer::Warden(me) => match req.claimed() {
+            Some(claimed) if claimed != me => Some(CoordError::NotYou { claimed, peer: me }),
+            _ => None,
+        },
+    }
+}
+
 /// Serve one connection until it closes, breaks, or sends garbage.
-fn serve_conn(coord: &dyn Coord, mut stream: UnixStream) {
+fn serve_conn(coord: &dyn Coord, mut stream: UnixStream, peer: Peer) {
     loop {
         let body = match read_frame(&mut stream) {
             Ok(Some(b)) => b,
@@ -487,7 +566,10 @@ fn serve_conn(coord: &dyn Coord, mut stream: UnixStream) {
             }
         };
         let reply = match Request::decode(&body) {
-            Ok(req) => handle(coord, req),
+            Ok(req) => match peer_refusal(peer, &req) {
+                Some(e) => Reply::Err(e),
+                None => handle(coord, req),
+            },
             Err(m) => {
                 let _ = write_frame(&mut stream, &Reply::Bad(m.to_string()).encode());
                 return;
@@ -497,6 +579,17 @@ fn serve_conn(coord: &dyn Coord, mut stream: UnixStream) {
             return;
         }
     }
+}
+
+/// How a [`Server`] is set up.  The default is a private socket (mode
+/// 0600) and no peer map: unauthenticated.
+#[derive(Clone, Debug, Default)]
+pub struct ServerOptions {
+    /// uid → the only `WardenId` a connection from that uid may act as.
+    /// `None` takes every request's claim as it is (see the module docs).
+    pub peers: Option<HashMap<u32, WardenId>>,
+    /// Give the socket this group and mode 0660, so members can connect.
+    pub group: Option<u32>,
 }
 
 /// A coordinator served on a Unix socket.  Stops (and removes the socket)
@@ -511,11 +604,50 @@ pub struct Server {
     accept: Option<JoinHandle<()>>,
 }
 
+/// Bind the socket in a private staging directory beside `path`, set its
+/// mode and group there, then rename it to `path`.  The directory is
+/// removed on every exit.
+fn bind_private(path: &Path, group: Option<u32>) -> io::Result<UnixListener> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path has no file name"))?;
+    let mut staging_name = std::ffi::OsString::from(".");
+    staging_name.push(name);
+    staging_name.push(format!(".bind-{}", std::process::id()));
+    let staging = parent.join(staging_name);
+
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let _cleanup = Cleanup(staging.clone());
+
+    let tmp = staging.join("s");
+    let listener = UnixListener::bind(&tmp)?;
+    let mode = if group.is_some() { 0o660 } else { 0o600 };
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    if let Some(gid) = group {
+        std::os::unix::fs::chown(&tmp, None, Some(gid))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(listener)
+}
+
 impl Server {
-    /// Bind `path` (mode 0600) and serve `coord` on it, one thread per
-    /// connection.  A stale socket file is replaced; a socket another
-    /// server is still answering on is refused (`AddrInUse`).
+    /// Bind `path` (mode 0600, no peer map: unauthenticated) and serve
+    /// `coord` on it, one thread per connection.  A stale socket file is
+    /// replaced; a socket another server is still answering on is refused
+    /// (`AddrInUse`).
     pub fn spawn(path: impl AsRef<Path>, coord: Arc<dyn Coord>) -> io::Result<Self> {
+        Self::spawn_with(path, coord, ServerOptions::default())
+    }
+
+    /// [`Server::spawn`] with a peer map and socket group
+    /// ([`ServerOptions`]).
+    pub fn spawn_with(path: impl AsRef<Path>, coord: Arc<dyn Coord>, options: ServerOptions) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.file_type().is_socket() => {
@@ -536,11 +668,11 @@ impl Server {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = bind_private(&path, options.group)?;
         // The accept loop polls, so stopping never depends on the socket
         // file still being there to connect to.
         listener.set_nonblocking(true)?;
+        let peers = options.peers;
 
         let stop = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<HashMap<u64, UnixStream>>> = Arc::default();
@@ -562,13 +694,22 @@ impl Server {
                     if stream.set_nonblocking(false).is_err() {
                         continue;
                     }
+                    // With a peer map, a uid that cannot be read is a
+                    // dropped connection, never an unchecked one.
+                    let peer = match &peers {
+                        None => Peer::Anyone,
+                        Some(map) => match peer_uid(&stream) {
+                            Ok(uid) => map.get(&uid).map_or(Peer::Unknown(uid), |w| Peer::Warden(*w)),
+                            Err(_) => continue,
+                        },
+                    };
                     let Ok(handle) = stream.try_clone() else { continue };
                     let id = next_id;
                     next_id += 1;
                     conns.lock().expect("conns").insert(id, handle);
                     let (coord, conns_w) = (coord.clone(), conns.clone());
                     let w = std::thread::spawn(move || {
-                        serve_conn(coord.as_ref(), stream);
+                        serve_conn(coord.as_ref(), stream, peer);
                         conns_w.lock().expect("conns").remove(&id);
                     });
                     let mut ws = workers.lock().expect("workers");
@@ -888,6 +1029,9 @@ mod tests {
             CoordError::LsnNotNext { lsn: Lsn::new(9), expected: Lsn::new(2) },
             CoordError::ShippedAhead { to: Lsn::new(6), head: Lsn::new(5) },
             CoordError::ShippedConflict { lsn: Lsn::new(5) },
+            CoordError::BadBatch { lsn: Lsn::new(3) },
+            CoordError::NotYou { claimed: B, peer: A },
+            CoordError::UnknownPeer { uid: 30033 },
         ];
         for e in refusals {
             let body = Reply::Err(e).encode();
@@ -989,6 +1133,141 @@ mod tests {
 
         let after = c.ownership(chron(1)).unwrap();
         assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
+    }
+
+    // ── who is asking ───────────────────────────────────────────────
+
+    fn my_uid() -> u32 {
+        let (a, _b) = UnixStream::pair().unwrap();
+        peer_uid(&a).unwrap()
+    }
+
+    fn my_gid() -> u32 {
+        let (a, _b) = UnixStream::pair().unwrap();
+        rustix::net::sockopt::socket_peercred(&a).unwrap().gid.as_raw()
+    }
+
+    fn spawn_mapped(dir: &Path, peers: &[(u32, WardenId)]) -> Server {
+        let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(dir.join("coord.redb")).unwrap());
+        let options = ServerOptions { peers: Some(peers.iter().copied().collect()), group: None };
+        Server::spawn_with(dir.join("coord.sock"), coord, options).unwrap()
+    }
+
+    /// Every request says whether it names a Warden, and which field.
+    #[test]
+    fn every_request_declares_whom_it_acts_as() {
+        let w = WardenModel::new(A, chron(1), Epoch::FIRST);
+        let pos = Position { lsn: Lsn::new(1), hash: HashVal::GENESIS };
+        let cases = [
+            (Request::Register { chronicle: chron(1), holder: A }, Some(A)),
+            (Request::Append { warden: A, envelope: record(&w, 1) }, Some(A)),
+            (Request::AppendBatch { warden: B, envelopes: vec![] }, Some(B)),
+            (Request::Transfer { chronicle: chron(1), new_holder: B }, Some(B)),
+            (Request::AdvanceShipped { warden: A, chronicle: chron(1), epoch: Epoch::FIRST, to: pos }, Some(A)),
+            (Request::Ownership { chronicle: chron(1) }, None),
+            (Request::Head { chronicle: chron(1) }, None),
+            (Request::Shipped { chronicle: chron(1) }, None),
+        ];
+        for (req, want) in cases {
+            assert_eq!(req.claimed(), want, "{req:?}");
+        }
+    }
+
+    /// A mapped peer may act only as its own Warden: every request naming
+    /// another is refused before the coordinator sees it, reads are open,
+    /// and the state is exactly what the peer's own requests made.
+    #[test]
+    fn mapped_peer_acts_only_as_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let _server = spawn_mapped(dir.path(), &[(my_uid(), A)]);
+        let c = RemoteCoord::with_timeout(dir.path().join("coord.sock"), Duration::from_secs(5));
+
+        // As A: everything works as without a map.
+        let g = c.register(chron(1), A).unwrap();
+        let w = WardenModel::resume(A, chron(1), Epoch::FIRST, g, Lsn::new(1));
+        let env = record(&w, 1);
+        let h = c.append(A, &env).unwrap();
+        let shipped = c.advance_shipped(A, chron(1), Epoch::FIRST, Position { lsn: h.lsn, hash: h.hash }).unwrap();
+        assert_eq!(shipped.lsn, Lsn::new(1));
+
+        // As B, on the same connection: refused, field for field.
+        let not_you = |r: Result<_, CoordError>| match r {
+            Err(CoordError::NotYou { claimed, peer }) => assert_eq!((claimed, peer), (B, A)),
+            other => panic!("expected NotYou, got {other:?}"),
+        };
+        not_you(c.register(chron(2), B).map(|_| ()));
+        not_you(c.transfer(chron(1), B).map(|_| ()));
+        not_you(c.append(B, &env).map(|_| ()));
+        not_you(c.append_batch(B, &[env]).map(|_| ()));
+        not_you(c.advance_shipped(B, chron(1), Epoch::FIRST, shipped).map(|_| ()));
+        // A refusal is a refusal: nothing changed, and the connection lives.
+        let o = c.ownership(chron(1)).unwrap();
+        assert_eq!((o.epoch, o.holder), (Epoch::FIRST, A));
+        assert_eq!(c.head(chron(1)).unwrap(), h);
+        assert_eq!(c.shipped(chron(1)).unwrap(), shipped);
+        assert!(matches!(c.head(chron(2)), Err(CoordError::UnknownChronicle(_))), "B's register never happened");
+        assert!(!CoordError::NotYou { claimed: B, peer: A }.outcome_unknown());
+    }
+
+    /// A uid the map does not know gets nothing, not even a read, and the
+    /// refusal names the uid so the operator can map it.
+    #[test]
+    fn unmapped_peer_is_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let _server = spawn_mapped(dir.path(), &[(my_uid().wrapping_add(1), A)]);
+        let c = RemoteCoord::with_timeout(dir.path().join("coord.sock"), Duration::from_secs(5));
+        let unknown = |r: Result<(), CoordError>| match r {
+            Err(CoordError::UnknownPeer { uid }) => assert_eq!(uid, my_uid()),
+            other => panic!("expected UnknownPeer, got {other:?}"),
+        };
+        unknown(c.register(chron(1), A).map(|_| ()));
+        unknown(c.head(chron(1)).map(|_| ()));
+        unknown(c.ownership(chron(1)).map(|_| ()));
+        unknown(c.shipped(chron(1)).map(|_| ()));
+        // Nothing was registered: a server without a map on the same file
+        // still knows no Chronicle.
+        drop(c);
+        drop(_server);
+        let e = Env { server: None, dir };
+        let mut e = e;
+        e.start();
+        assert!(matches!(e.client().head(chron(1)), Err(CoordError::UnknownChronicle(_))));
+    }
+
+    /// The socket arrives with its final mode and group, and the staging
+    /// directory is gone — for both the private and the group case.
+    #[test]
+    fn socket_is_born_with_its_final_mode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let no_staging = |dir: &Path| {
+            let left: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".bind-"))
+                .collect();
+            assert!(left.is_empty(), "staging left behind: {left:?}");
+        };
+
+        let e = Env { server: None, dir };
+        let mut e = e;
+        e.start();
+        let m = std::fs::metadata(e.sock()).unwrap();
+        assert_eq!(m.mode() & 0o777, 0o600);
+        no_staging(e.dir.path());
+        e.stop();
+
+        let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(e.db()).unwrap());
+        let options = ServerOptions { peers: None, group: Some(my_gid()) };
+        let s = Server::spawn_with(e.sock(), coord, options).unwrap();
+        let m = std::fs::metadata(e.sock()).unwrap();
+        assert_eq!(m.mode() & 0o777, 0o660);
+        assert_eq!(m.gid(), my_gid());
+        no_staging(e.dir.path());
+        assert!(RemoteCoord::new(e.sock()).register(chron(1), A).is_ok(), "serves after the rename");
+        s.stop();
+        assert!(!e.sock().exists());
+        no_staging(e.dir.path());
     }
 
     /// The server goes away: calls fail as unavailable (unknown outcome);

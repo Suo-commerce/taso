@@ -152,6 +152,21 @@ pub enum CoordError {
         /// Where.
         lsn: Lsn,
     },
+    /// The connection is authenticated as one Warden and the request named
+    /// another (v0.4 §10: the network cannot forge an identity).  Only a
+    /// served coordinator with a peer map refuses this; see `coordsrv`.
+    NotYou {
+        /// The Warden the request named.
+        claimed: WardenId,
+        /// The Warden the connection is authenticated as.
+        peer: WardenId,
+    },
+    /// The connection's uid is in no peer map: it is nobody to the
+    /// coordinator, and every request on it is refused.
+    UnknownPeer {
+        /// The peer's uid.
+        uid: u32,
+    },
     /// The coordinator could not be reached, or the connection broke before
     /// an answer arrived.  The request may or may not have been applied.
     Unavailable(std::io::Error),
@@ -179,7 +194,9 @@ impl CoordError {
             | Self::LsnNotNext { .. }
             | Self::BadBatch { .. }
             | Self::ShippedAhead { .. }
-            | Self::ShippedConflict { .. } => false,
+            | Self::ShippedConflict { .. }
+            | Self::NotYou { .. }
+            | Self::UnknownPeer { .. } => false,
         }
     }
 }
@@ -218,6 +235,13 @@ impl fmt::Display for CoordError {
                 write!(f, "shipped lsn {} is past the anchored head {}", to.get(), head.get())
             }
             Self::ShippedConflict { lsn } => write!(f, "shipped position at lsn {} names another record", lsn.get()),
+            Self::NotYou { claimed, peer } => write!(
+                f,
+                "request names warden {} but the connection is warden {}",
+                claimed.get(),
+                peer.get()
+            ),
+            Self::UnknownPeer { uid } => write!(f, "peer uid {uid} is not a known warden"),
             Self::Unavailable(e) => write!(f, "coordinator unavailable: {e}"),
         }
     }
@@ -1309,6 +1333,8 @@ mod tests {
             CoordError::LsnNotNext { lsn: Lsn::new(5), expected: Lsn::new(1) },
             CoordError::ShippedAhead { to: Lsn::new(5), head: Lsn::new(4) },
             CoordError::ShippedConflict { lsn: Lsn::new(4) },
+            CoordError::NotYou { claimed: A, peer: B },
+            CoordError::UnknownPeer { uid: 1000 },
         ];
         for e in &refusals {
             assert!(!e.outcome_unknown(), "{e:?} is a refusal");
