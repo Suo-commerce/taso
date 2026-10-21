@@ -62,6 +62,7 @@ fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: Option<(u64
         node,
         warden,
         takeover,
+        "sim-1",
         &["--turns", "5", "--txns", "2", "--rows", "3"],
     )
 }
@@ -72,6 +73,7 @@ fn config_with(
     node: &str,
     warden: u64,
     takeover: Option<(u64, u64)>,
+    subject: &str,
     sim_args: &[&str],
 ) -> Config {
     let mut args = vec!["/usr/bin/taso-sim"];
@@ -90,7 +92,7 @@ fn config_with(
             "memory_bytes": 268435456,
             "pids": 64
         },
-        "vessels": [{ "namespace": "07070707070707070707070707070707", "subject": "sim-1",
+        "vessels": [{ "namespace": "07070707070707070707070707070707", "subject": subject,
                       "takeover": takeover.map(|(h, e)| json!({"holder": h, "epoch": e})), "uid_slot": 3 }]
     });
     Config::parse(&v.to_string()).unwrap()
@@ -156,9 +158,10 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     // 1. Born on A.
     let a = node("a", 1, None);
     let r = a.run_vessel(&a.config.vessels[0]).unwrap();
+    // The agent's result first: a failed agent wrote no stats.
+    assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
     println!("A, first: {r:?}\n{}", stats(&a));
     assert_eq!(r.start, Start::Birth);
-    assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
     let birth = r.settled.birth.expect("a birth Seal");
     assert_eq!(birth.lsn.get(), 2, "right after the Lineage record");
     assert_eq!(
@@ -185,6 +188,7 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     let stray = mount(&a).join("stray-from-a-crashed-turn");
     std::fs::write(&stray, b"written after the last Seal").unwrap();
     let r = a.run_vessel(&a.config.vessels[0]).unwrap();
+    assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
     println!("A, again: {r:?}\n{}", stats(&a));
     assert_eq!(r.start, Start::Open);
     assert!(
@@ -218,9 +222,9 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     let o = coord.ownership(a.config.vessels[0].id()).unwrap();
     let b = node("b", 2, Some((o.holder.get(), o.epoch.get())));
     let r = b.run_vessel(&b.config.vessels[0]).unwrap();
+    assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
     println!("B, takeover: {r:?}\n{}", stats(&b));
     assert_eq!(r.start, Start::Rebirth);
-    assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
     assert_eq!(r.settled.birth, None);
     assert!(r.settled.rolled_back_to.is_some());
     assert_eq!(
@@ -358,7 +362,10 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     ];
     let node = Arc::new(
         Node::new(
-            config_with(tmp.path(), &base, "a", 1, None, &sim),
+            // Its own Vessel (and so its own runc container id and cgroup):
+            // the tests of this file run in parallel, and one container id
+            // in two of them is refused by runc ("cgroup is not empty").
+            config_with(tmp.path(), &base, "a", 1, None, "sim-2", &sim),
             coord,
             Storage::Zfs(Zfs::cli().batched()),
         )
