@@ -39,9 +39,14 @@
 #             /var/lib/taso/blk.log and /run/taso/blk.sock, and
 #             /run/taso/coord.sock forwarded to the coordinator over ssh as
 #             user warden-<name>.  Prints the node's public key to copy to
-#             the coordinator's /root/taso-keys/<name>.pub.  No disk changes.
-#             Ends with a check through the forward that says whether the
-#             coordinator knows this node.
+#             the coordinator's /root/taso-keys/<name>.pub.  Sets the
+#             hostname to taso-<name>.  No disk changes.  Ends with a check
+#             through the forward that says whether the coordinator knows
+#             this node.
+#
+# Every role waits for the apt locks of a fresh node's first-boot updates,
+# and writes its cargo build to /root/taso-build.log, shown only if it
+# fails.
 #
 # How the coordinator is authenticated across machines (F3 step 1): the
 # node forwards its socket over ssh; on the coordinator host sshd opens
@@ -78,6 +83,40 @@ usage() { die "usage: $0 hub|vessel <hub private ip>  |  $0 coord <name>=<warden
 
 export DEBIAN_FRONTEND=noninteractive
 
+# A fresh cloud node runs apt-daily and unattended-upgrades in its first
+# minutes, and they hold the apt locks: a role started then fails at once
+# with "Could not get lock".  apt-get waits for the dpkg frontend lock
+# itself (DPkg::Lock::Timeout) but not for the lists lock that `apt-get
+# update` takes (measured on apt 2.8.3, 2026-10-21: the timeout has no
+# effect there), so the locks are waited for here first, with the same
+# non-blocking fcntl lock apt uses.  python3 is on every Ubuntu cloud image
+# (cloud-init needs it).  Ten minutes, then the role stops and says which
+# lock is held.
+apt_wait() {
+    python3 - <<'PY' || die "apt is still locked after 10 minutes; see above"
+import fcntl, sys, time
+locks = ["/var/lib/apt/lists/lock", "/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"]
+said = False
+for _ in range(600):
+    held = None
+    for path in locks:
+        try:
+            f = open(path, "w")
+            fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.lockf(f, fcntl.LOCK_UN); f.close()
+        except OSError:
+            held = path; break
+    if held is None:
+        sys.exit(0)
+    if not said:
+        print("waiting for the apt lock (%s is held, a first-boot apt-daily or unattended-upgrades run)" % held, flush=True)
+        said = True
+    time.sleep(1)
+sys.exit("apt lock %s still held" % held)
+PY
+}
+apt_get() { apt_wait; apt-get -o DPkg::Lock::Timeout=600 "$@"; }
+
 # build-essential only when there is no C toolchain: on Ubuntu 26.04 it
 # depends on coreutils-from-uutils, which a machine moved to GNU coreutils
 # (taso-test, 2026-10-18) cannot install, and a machine that has built the
@@ -90,6 +129,23 @@ rust() {
     fi
     # shellcheck disable=SC1091
     . /root/.cargo/env
+    # The minimal profile has no rustfmt, and libublk-rs-sys's bindgen then
+    # dumps its generated binding into the build output (the first builds on
+    # the UpCloud nodes, 2026-10-20).  Rerunnable: "is up to date" after.
+    rustup component add rustfmt >/dev/null
+}
+
+# cargo build --release of the given -p/--bin arguments.  A release build
+# of the workspace is minutes with nothing to show, and its output is of
+# use only when it fails: it goes to a log, and the log's tail is shown
+# only then.
+build() {
+    local log=/root/taso-build.log
+    echo "== cargo build --release $* (minutes; log $log)"
+    if ! (cd "$REPO" && cargo build --release "$@" >"$log" 2>&1); then
+        tail -n 40 "$log"
+        die "cargo build failed; the full log is $log"
+    fi
 }
 
 unit() {   # $1 name, $2 ExecStart, [$3 extra [Unit] lines], [$4 extra [Service] lines]
@@ -127,11 +183,11 @@ if [ "$ROLE" = coord ]; then
     for p in "${PEERS[@]}"; do for q in "${PEERS[@]}"; do
         [ "$p" = "$q" ] || { [ "${p%%=*}" != "${q%%=*}" ] && [ "${p#*=}" != "${q#*=}" ]; } || die "coord: '$p' and '$q' repeat a name or an id"
     done; done
-    apt-get update -q
+    apt_get update -q
     # shellcheck disable=SC2046
-    apt-get install -y -q git $(toolchain) pkg-config python3 curl chrony openssh-server
+    apt_get install -y -q git $(toolchain) pkg-config python3 curl chrony openssh-server
     rust
-    (cd "$REPO" && cargo build --release -q -p taso-warden --bin taso-coordd)
+    build -p taso-warden --bin taso-coordd
     install -m 755 "$REPO/target/release/taso-coordd" /usr/local/bin/taso-coordd
     mkdir -p /var/lib/taso /root/taso-keys
     chmod 700 /root/taso-keys
@@ -201,14 +257,29 @@ fi
 if [ "$ROLE" = vessel-blk ]; then
     COORD=${2:-}; NAME=${3:-}
     [ -n "$COORD" ] && [[ "$NAME" =~ ^[a-z][a-z0-9-]{0,15}$ ]] || usage
-    apt-get update -q
+
+    # The hostname is taso-<name>, so that a shell prompt says which node it
+    # is: two nodes created from the same image got the same hostname, and
+    # commands ran on the wrong one (2026-10-20).  Set before anything else,
+    # kept over reboots (cloud-init would put the image's name back), and
+    # in /etc/hosts so the name resolves locally.
+    host="taso-$NAME"
+    if [ "$(hostname)" != "$host" ]; then
+        echo "== hostname $(hostname) -> $host"
+        hostnamectl set-hostname "$host"
+        [ -d /etc/cloud/cloud.cfg.d ] && echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-taso-hostname.cfg
+    fi
+    sed -i '/^127\.0\.1\.1[[:space:]]/d' /etc/hosts
+    echo "127.0.1.1 $host" >> /etc/hosts
+
+    apt_get update -q
     # shellcheck disable=SC2046
-    apt-get install -y -q git $(toolchain) pkg-config python3 jq curl chrony runc e2fsprogs openssh-client
+    apt_get install -y -q git $(toolchain) pkg-config python3 jq curl chrony runc e2fsprogs openssh-client
     rust
     [ -x "$(command -v runc)" ] || die "runc missing"
     modprobe ublk_drv || die "no ublk module on this kernel ($(uname -r)); the block log needs it"
     echo ublk_drv > /etc/modules-load.d/taso-ublk.conf
-    (cd "$REPO" && cargo build --release -q -p taso-blk --bin taso-blkd -p taso-warden --bin taso-wardend --bin taso-logcheck)
+    build -p taso-blk --bin taso-blkd -p taso-warden --bin taso-wardend --bin taso-logcheck
     install -m 755 "$REPO/target/release/taso-blkd" "$REPO/target/release/taso-wardend" "$REPO/target/release/taso-logcheck" /usr/local/bin/
     mkdir -p /var/lib/taso
 
@@ -284,14 +355,14 @@ HUB=${2:-}
 case "$ROLE" in hub|vessel) ;; *) usage ;; esac
 [[ "$HUB" =~ ^10\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "give the hub's private IP (10.x.x.x)"
 
-apt-get update -q
-apt-get install -y -q git build-essential pkg-config python3 socat jq curl openssl chrony
+apt_get update -q
+apt_get install -y -q git build-essential pkg-config python3 socat jq curl openssl chrony
 
 # ── hub ─────────────────────────────────────────────────────────────────
 if [ "$ROLE" = hub ]; then
     ip -4 addr | grep -q "inet $HUB/" || die "$HUB is not an address of this machine"
     rust
-    (cd "$REPO" && cargo build --release -q -p taso-warden --bin taso-coordd)
+    build -p taso-warden --bin taso-coordd
     install -m 755 "$REPO/target/release/taso-coordd" /usr/local/bin/taso-coordd
     mkdir -p /var/lib/taso
     unit taso-coordd "/usr/local/bin/taso-coordd /var/lib/taso/coord.redb /run/taso/coord.sock"
@@ -346,7 +417,7 @@ EOF
 fi
 
 # ── vessel ──────────────────────────────────────────────────────────────
-apt-get install -y -q zfsutils-linux runc
+apt_get install -y -q zfsutils-linux runc
 rust
 
 if ! zpool list taso >/dev/null 2>&1; then
