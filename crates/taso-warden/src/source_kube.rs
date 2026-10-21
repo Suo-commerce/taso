@@ -25,8 +25,13 @@
 //! - **D2, rootfs.**  `spec.rootfs.path` must resolve (symlinks followed)
 //!   to a directory strictly inside the node's `rootfs_dir`; the resolved
 //!   path is what runs.
-//! - **D3, takeover.**  `spec.takeover` is refused until the conditional
-//!   transfer exists (fencing review F1/F2).
+//! - **D3, takeover.**  `spec.takeover` is `{holder, epoch}`, positive
+//!   integers and nothing else, copied by the operator from the resource's
+//!   status.  It goes to the daemon as the Vessel's takeover, and the
+//!   daemon's conditional transfer (fencing review F1/F2) decides: it
+//!   fences only if that holder still holds the Vessel at that epoch, so a
+//!   stale takeover refuses itself and a standing one cannot exist.  This
+//!   source checks the shape only; it never decides a takeover.
 //! - **Limits.**  Memory and pids at most the node's maxima; a Vessel that
 //!   asks for none gets the node's runtime default, or else the maximum.
 //! - **Landlock** may be turned off only if the node allows it.
@@ -57,11 +62,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
+use taso_core::envelope::Epoch;
+use taso_core::model::WardenId;
 use taso_core::record::Namespace;
 
 use crate::daemon::{
     check_env, check_quiescence, valid_kube_namespace, KubeSourceConf, Restart, RuntimeConf,
-    VesselConf, VesselRuntime,
+    TakeOver, VesselConf, VesselRuntime,
 };
 use crate::kube::{valid_name, Kube, KubeError, Resource};
 use crate::source::{SourceError, VesselKey, VesselSource};
@@ -318,9 +325,10 @@ impl<L: ListVessels> KubeSource<L> {
                 .ok_or("spec.uidSlot must be an integer from 0 to 65000")? as u32;
 
         // D3.
-        if spec.get("takeover").is_some_and(|t| !t.is_null()) {
-            return Err("spec.takeover is refused: taking a Vessel over needs a conditional transfer (fencing review F1/F2), not built yet".into());
-        }
+        let takeover = match spec.get("takeover") {
+            None | Some(Value::Null) => None,
+            Some(t) => Some(takeover(t)?),
+        };
 
         // D2.
         let rootfs = spec
@@ -391,7 +399,7 @@ impl<L: ListVessels> KubeSource<L> {
         let vc = VesselConf {
             namespace: tenant,
             subject: subject.to_string(),
-            takeover: None,
+            takeover,
             uid_slot,
             restart: Restart::Always,
             runtime: Some(Box::new(VesselRuntime {
@@ -466,6 +474,25 @@ fn object_ref(item: &Value) -> Result<ObjectRef, String> {
         name: name.into(),
         uid: uid.into(),
         generation,
+    })
+}
+
+/// `spec.takeover`: `{"holder": <warden>, "epoch": <n>}`, both positive
+/// (the daemon's own config takes the same shape and refuses the same).
+fn takeover(v: &Value) -> Result<TakeOver, String> {
+    let o = v
+        .as_object()
+        .ok_or("spec.takeover must be {holder, epoch}, copied from status")?;
+    known_keys(o, "spec.takeover", &["holder", "epoch"])?;
+    let n = |k: &str| {
+        o.get(k)
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("spec.takeover.{k} must be a positive integer"))
+    };
+    Ok(TakeOver {
+        holder: WardenId::new(n("holder")?),
+        epoch: Epoch::new(n("epoch")?),
     })
 }
 
@@ -793,11 +820,41 @@ mod tests {
         );
     }
 
+    /// D3: the shape is checked here; the daemon's conditional transfer
+    /// decides whether it fences.
     #[test]
-    fn takeover_is_refused_for_now() {
+    fn takeover_passes_to_the_daemon_as_read() {
         let f = fixture();
-        let e = one(&f, json!({ "takeover": { "holder": 2, "epoch": 5 } })).unwrap_err();
-        assert!(e.contains("F1/F2"), "{e}");
+        let vc = one(&f, json!({ "takeover": { "holder": 2, "epoch": 5 } })).unwrap();
+        assert_eq!(
+            vc.takeover,
+            Some(TakeOver {
+                holder: WardenId::new(2),
+                epoch: Epoch::new(5)
+            })
+        );
+        assert_eq!(one(&f, json!({ "takeover": null })).unwrap().takeover, None);
+    }
+
+    #[test]
+    fn a_malformed_takeover_is_refused() {
+        let f = fixture();
+        for (t, why) in [
+            (json!(true), "must be {holder, epoch}"),
+            (json!({ "holder": 2 }), "spec.takeover.epoch"),
+            (json!({ "epoch": 5 }), "spec.takeover.holder"),
+            (json!({ "holder": 0, "epoch": 5 }), "spec.takeover.holder"),
+            (json!({ "holder": 2, "epoch": 0 }), "spec.takeover.epoch"),
+            (json!({ "holder": -1, "epoch": 5 }), "spec.takeover.holder"),
+            (json!({ "holder": "2", "epoch": 5 }), "spec.takeover.holder"),
+            (
+                json!({ "holder": 2, "epoch": 5, "force": true }),
+                "unknown field \"force\"",
+            ),
+        ] {
+            let e = one(&f, json!({ "takeover": t })).unwrap_err();
+            assert!(e.contains(why), "{t}: {e}");
+        }
     }
 
     #[test]
