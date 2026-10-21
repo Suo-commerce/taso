@@ -366,6 +366,7 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     );
     let vessel = node.config.vessels[0].clone();
     let with = |restart: Restart| VesselConf {
+        fork: None,
         restart,
         ..vessel.clone()
     };

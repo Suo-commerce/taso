@@ -397,6 +397,7 @@ impl<L: ListVessels> KubeSource<L> {
         }
 
         let vc = VesselConf {
+            fork: None, // Kubernetes forks: not yet (the CRD has no field)
             namespace: tenant,
             subject: subject.to_string(),
             takeover,

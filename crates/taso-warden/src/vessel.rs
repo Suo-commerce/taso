@@ -224,6 +224,9 @@ pub enum VesselError {
     SealNotLocal(Position),
     /// The Seal is accepted but its layer is not on this node.
     LayerMissing(Position),
+    /// A fork from a parent's local log ([`Host::fork_from_log`]): the
+    /// Seal cannot be proven accepted from that log (why).
+    ParentNotProven(String),
     /// Succession needs a Seal, and the Vessel has none.
     NoSeal,
     /// Succession needs the tail to be the last Seal.
@@ -292,6 +295,7 @@ impl fmt::Display for VesselError {
             Self::NotASeal(p) => write!(f, "lsn {} is not an accepted Seal", p.lsn.get()),
             Self::SealNotLocal(p) => write!(f, "the Seal at lsn {} was pruned from the local log", p.lsn.get()),
             Self::LayerMissing(p) => write!(f, "the layer of Seal {} is not on this node", p.lsn.get()),
+            Self::ParentNotProven(why) => write!(f, "cannot fork: {why}"),
             Self::NoSeal => write!(f, "vessel has no Seal"),
             Self::AlreadySealed(p) => write!(f, "vessel already has a Seal (lsn {}): no birth Seal", p.lsn.get()),
             Self::NotPristine(tail) => write!(
@@ -363,6 +367,15 @@ pub enum Ensured {
     Born,
     /// A void birth had been interrupted; it was finished.
     BirthFinished,
+}
+
+/// Which of a parent's accepted Seals a fork starts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealAt {
+    /// The newest one.
+    Last,
+    /// The one at this lsn.
+    At(Lsn),
 }
 
 impl<P: Pool> Host<P> {
@@ -439,10 +452,127 @@ impl<P: Pool> Host<P> {
     ) -> Result<Vessel<P::Layers>, VesselError> {
         let ledger_pos = seal_ledger_pos(&parent.frames()?, seal)?;
         parent.layer_present(seal)?;
-        let namespace = parent.namespace();
+        self.fork_at(
+            parent.id(),
+            &parent.dataset,
+            parent.namespace(),
+            seal,
+            ledger_pos,
+            subject,
+        )
+    }
+
+    /// [`Host::fork`] without opening the parent: from its local log, read
+    /// without writing and without claiming it ([`crate::chronicle::read_log`]),
+    /// so a parent running on this node is not disturbed (fencing review F6
+    /// step 3c: the daemon forks from a config entry).  Calling it again
+    /// with the same arguments finishes an interrupted fork.
+    ///
+    /// The Seal ([`SealAt`]) must be **proven accepted**: the local log must
+    /// run from its record, record by record (each `prev` the hash before
+    /// it, consecutive lsns, the parent's id), to exactly the coordinator's
+    /// anchored head.  A log that is behind the head, that has a jump (a
+    /// Gap) between the Seal and the head, or that disagrees with the head
+    /// is refused ([`VesselError::ParentNotProven`]): nothing unaccepted is
+    /// forked.  The Seal's layer must be on this node (the clone refuses
+    /// otherwise).
+    pub fn fork_from_log(
+        &self,
+        parent: ChronicleId,
+        at: SealAt,
+        subject: &[u8],
+    ) -> Result<Vessel<P::Layers>, VesselError> {
+        let not = |why: String| VesselError::ParentNotProven(why);
+        let dir = self.dir_for(parent);
+        if !dir.exists() {
+            return Err(not(format!(
+                "the parent {} has no local log on this node",
+                hex(&parent)
+            )));
+        }
+        let frames = crate::chronicle::read_log(&dir)?;
+        if frames.is_empty() {
+            return Err(not(format!(
+                "the parent {} has no local log on this node",
+                hex(&parent)
+            )));
+        }
+        let (lineage, _) = read_lineage(&frames)?;
+        let head = self.coord.head(parent).map_err(VesselError::Coord)?;
+        let mut seals = Vec::new();
+        for f in &frames {
+            if f.envelope.stream == Stream::Ctl && f.envelope.lsn <= head.lsn {
+                if let Payload::Seal(_) = decode(f)? {
+                    seals.push(Position {
+                        lsn: f.envelope.lsn,
+                        hash: f.envelope.hash,
+                    });
+                }
+            }
+        }
+        let seal = match at {
+            SealAt::Last => seals.last().copied(),
+            SealAt::At(lsn) => seals.iter().copied().find(|p| p.lsn == lsn),
+        }
+        .ok_or_else(|| match at {
+            SealAt::Last => not("the parent has no accepted Seal in its local log".into()),
+            SealAt::At(lsn) => not(format!(
+                "lsn {} is not an accepted Seal in the parent's local log",
+                lsn.get()
+            )),
+        })?;
+        let from = frames
+            .iter()
+            .position(|f| f.envelope.lsn == seal.lsn)
+            .expect("the Seal was found among these frames");
+        let mut last = &frames[from];
+        for f in &frames[from + 1..] {
+            if last.envelope.lsn == head.lsn {
+                break;
+            }
+            let joins = f.envelope.chronicle == parent
+                && f.envelope.lsn.get() == last.envelope.lsn.get() + 1
+                && f.envelope.prev == last.envelope.hash;
+            if !joins {
+                return Err(not(format!(
+                    "the parent's local log does not join at lsn {} (after {}): the Seal cannot be proven up to the anchored head",
+                    f.envelope.lsn.get(),
+                    last.envelope.lsn.get()
+                )));
+            }
+            last = f;
+        }
+        if last.envelope.lsn != head.lsn || last.envelope.hash != head.hash {
+            return Err(not(format!(
+                "the parent's local log ends at lsn {}, not at its anchored head (lsn {}, that hash)",
+                last.envelope.lsn.get(),
+                head.lsn.get()
+            )));
+        }
+        let ledger_pos = seal_ledger_pos(&frames, seal)?;
+        self.fork_at(
+            parent,
+            &self.dataset_for(parent),
+            lineage.namespace,
+            seal,
+            ledger_pos,
+            subject,
+        )
+    }
+
+    /// The common end of [`Host::fork`] and [`Host::fork_from_log`].
+    fn fork_at(
+        &self,
+        parent: ChronicleId,
+        parent_dataset: &Dataset,
+        namespace: Namespace,
+        seal: Position,
+        ledger_pos: Lsn,
+        subject: &[u8],
+    ) -> Result<Vessel<P::Layers>, VesselError> {
         let id = vessel_id(namespace, subject);
         let ps = ParentSeal {
-            chronicle: parent.id(),
+            chronicle: parent,
             seal: seal.lsn,
             seal_hash: seal.hash,
         };
@@ -451,7 +581,7 @@ impl<P: Pool> Host<P> {
             namespace,
             ledger_pos,
         };
-        let mut chronicle = self.unborn(id, Some((&parent.dataset, ps)))?;
+        let mut chronicle = self.unborn(id, Some((parent_dataset, ps)))?;
         chronicle.append(Stream::Ctl, Payload::Lineage(lineage.clone()))?;
         Ok(Vessel {
             id,
@@ -2316,6 +2446,87 @@ pub(crate) mod tests {
         assert_eq!(l.origin, Origin::Void);
         let nobody = vessel_id(ns(1), b"nobody");
         assert_eq!(lineage_in(&e.host.dir_for(nobody)).unwrap(), None);
+    }
+
+    // ── fork from a parent's local log (F6 step 3c) ─────────────────
+
+    /// The same child as `Host::fork` from the open parent, with the parent
+    /// untouched: no claim, no new epoch.
+    #[test]
+    fn fork_from_log_makes_the_same_child_without_opening_the_parent() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut p);
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let s2 = seal(&mut p);
+        p.append(Stream::Fs, raw(3)).unwrap(); // unsealed work after the last Seal
+        let pid = p.id();
+        let owner = e.host.coord.ownership(pid).unwrap();
+        for (at, want, subject) in [
+            (SealAt::Last, s2, &b"last"[..]),
+            (SealAt::At(s1.lsn), s1, &b"first"[..]),
+        ] {
+            let c = e.host.fork_from_log(pid, at, subject).unwrap();
+            let Origin::Fork { parent } = c.lineage().origin else {
+                panic!("not a fork")
+            };
+            assert_eq!(
+                (parent.chronicle, parent.seal, parent.seal_hash),
+                (pid, want.lsn, want.hash)
+            );
+            assert_eq!(c.namespace(), ns(1));
+            assert_eq!(c.id(), vessel_id(ns(1), subject));
+        }
+        // The parent was not claimed: same holder and epoch, still writable.
+        let now = e.host.coord.ownership(pid).unwrap();
+        assert_eq!((now.holder, now.epoch), (owner.holder, owner.epoch));
+        p.append(Stream::Fs, raw(4)).unwrap();
+    }
+
+    #[test]
+    fn fork_from_log_refuses_what_it_cannot_prove() {
+        let e = env();
+        // No local log of the parent on this node.
+        let ghost = vessel_id(ns(1), b"ghost");
+        assert!(matches!(
+            e.host.fork_from_log(ghost, SealAt::Last, b"c"),
+            Err(VesselError::ParentNotProven(_))
+        ));
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        let pid = p.id();
+        // No Seal yet.
+        assert!(matches!(
+            e.host.fork_from_log(pid, SealAt::Last, b"c"),
+            Err(VesselError::ParentNotProven(w)) if w.contains("no accepted Seal")
+        ));
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s = seal(&mut p);
+        // An lsn that is not a Seal.
+        assert!(matches!(
+            e.host.fork_from_log(pid, SealAt::At(Lsn::new(s.lsn.get() - 1)), b"c"),
+            Err(VesselError::ParentNotProven(w)) if w.contains("not an accepted Seal")
+        ));
+        // A local log behind the anchored head (an older copy of it).
+        let dir = e.host.dir_for(pid);
+        let old = dir.with_extension("old");
+        std::fs::create_dir_all(&old).unwrap();
+        for f in std::fs::read_dir(&dir).unwrap() {
+            let f = f.unwrap().path();
+            if f.is_file() {
+                std::fs::copy(&f, old.join(f.file_name().unwrap())).unwrap();
+            }
+        }
+        p.append(Stream::Fs, raw(2)).unwrap();
+        drop(p);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::rename(&old, &dir).unwrap();
+        assert!(matches!(
+            e.host.fork_from_log(pid, SealAt::Last, b"c"),
+            Err(VesselError::ParentNotProven(w)) if w.contains("not at its anchored head")
+        ));
+        // Nothing was made for the refused child.
+        assert!(e.host.coord.head(vessel_id(ns(1), b"c")).is_err());
     }
 
     // ── fork ────────────────────────────────────────────────────────
