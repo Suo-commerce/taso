@@ -197,12 +197,9 @@ impl Kube {
                 format!("the API server must be https://…, not {api:?}"),
             ));
         }
-        let mut agent = ureq::AgentBuilder::new().timeout(timeout);
-        if let Some(ca) = &config.ca_file {
-            agent = agent.tls_config(std::sync::Arc::new(crate::s3::tls_trusting(ca)?));
-        }
+        let agent = crate::s3::http_agent(timeout, config.ca_file.as_deref())?;
         Ok(Self {
-            agent: agent.build(),
+            agent,
             api: api.to_string(),
             token_file: config.token_file.clone(),
         })
@@ -247,28 +244,33 @@ impl Kube {
         Ok(p)
     }
 
-    fn send(&self, req: ureq::Request, body: Option<&Value>) -> Result<Value, KubeError> {
-        let req = req
-            .set("Authorization", &format!("Bearer {}", self.token()?))
-            .set("Accept", "application/json");
-        let answer = match body {
-            None => req.call(),
-            Some(b) => req
-                .set("Content-Type", "application/merge-patch+json")
-                .send_string(&b.to_string()),
-        };
-        match answer {
-            Ok(resp) => {
-                let text = resp
-                    .into_string()
-                    .map_err(|e| KubeError::Body(e.to_string()))?;
-                serde_json::from_str(&text).map_err(|e| KubeError::Body(format!("not JSON: {e}")))
-            }
-            Err(ureq::Error::Status(code, resp)) => {
-                Err(status_error(code, &resp.into_string().unwrap_or_default()))
-            }
-            Err(ureq::Error::Transport(t)) => Err(KubeError::Transport(t.to_string())),
+    /// `req` with the token and `Accept: application/json`.
+    fn authorized<B>(
+        &self,
+        req: ureq::RequestBuilder<B>,
+    ) -> Result<ureq::RequestBuilder<B>, KubeError> {
+        Ok(req
+            .header("Authorization", &format!("Bearer {}", self.token()?))
+            .header("Accept", "application/json"))
+    }
+
+    /// The JSON of a success (2xx); an error answer as its `Status`; no
+    /// answer as a transport error.
+    fn answer(
+        &self,
+        answer: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Value, KubeError> {
+        let mut resp = answer.map_err(|e| KubeError::Transport(e.to_string()))?;
+        let code = resp.status().as_u16();
+        if !(200..300).contains(&code) {
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            return Err(status_error(code, &body));
         }
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| KubeError::Body(e.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| KubeError::Body(format!("not JSON: {e}")))
     }
 
     /// List `r` in `namespace` (all namespaces if `None`), with a field
@@ -285,13 +287,13 @@ impl Kube {
         if let Some(fs) = field_selector {
             req = req.query("fieldSelector", fs);
         }
-        self.send(req, None)
+        self.answer(self.authorized(req)?.call())
     }
 
     /// One object.
     pub fn get(&self, r: Resource, namespace: &str, name: &str) -> Result<Value, KubeError> {
         let url = format!("{}{}", self.api, self.path(r, Some(namespace), Some(name))?);
-        self.send(self.agent.get(&url), None)
+        self.answer(self.authorized(self.agent.get(&url))?.call())
     }
 
     /// Merge `status` into the object's status (the `status` subresource,
@@ -331,7 +333,10 @@ impl Kube {
             }
             body["metadata"] = serde_json::json!({ "resourceVersion": rv });
         }
-        self.send(self.agent.request("PATCH", &url), Some(&body))
+        let req = self
+            .authorized(self.agent.patch(&url))?
+            .header("Content-Type", "application/merge-patch+json");
+        self.answer(req.send(body.to_string()))
     }
 }
 

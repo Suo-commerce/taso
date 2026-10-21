@@ -14,10 +14,12 @@ taso-blk = { path = "../taso-blk", default-features = false }
 redb = { workspace = true }
 blake3 = { workspace = true }
 serde_json = { workspace = true }
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# HTTP for S3 (s3.rs) and the Kubernetes API (kube.rs).  Its "rustls"
+# feature is rustls with ring and the webpki-roots root store (1.x); a
+# private CA is given through ureq::tls (s3::tls_trusting).  No gzip, no
+# native TLS.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 hmac = "0.12"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pki-types = { version = "1", features = ["std"] }
 sha2 = "0.10"
 libc = "0.2"
 # Safe `SO_PEERCRED` for the coordinator's peer map (coordsrv.rs); the

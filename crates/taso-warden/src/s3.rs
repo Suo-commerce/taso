@@ -28,6 +28,7 @@
 use std::fmt::Write as _;
 use std::io::{self, Read};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use ureq::http;
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -114,14 +115,11 @@ impl S3Store {
                 format!("invalid bucket name {:?}", config.bucket),
             ));
         }
-        let mut agent = ureq::AgentBuilder::new().timeout(timeout);
-        if let Some(ca) = &config.ca_file {
-            agent = agent.tls_config(std::sync::Arc::new(tls_trusting(ca)?));
-        }
+        let agent = http_agent(timeout, config.ca_file.as_deref())?;
         Ok(Self {
             config,
             host,
-            agent: agent.build(),
+            agent,
         })
     }
 
@@ -138,7 +136,7 @@ impl S3Store {
         query: &[(&str, &str)],
         payload_hash: &str,
         extra: &[(&str, String)],
-    ) -> ureq::Request {
+    ) -> http::request::Builder {
         let amz_date = amz_date(SystemTime::now());
         let mut headers: Vec<(String, String)> = vec![
             ("host".into(), self.host.clone()),
@@ -164,42 +162,76 @@ impl S3Store {
             url.push('?');
             url.push_str(&canonical_query(query));
         }
-        let mut req = self.agent.request(method, &url).set("authorization", &auth);
+        let mut req = http::Request::builder()
+            .method(method)
+            .uri(&url)
+            .header("authorization", &auth);
         for (k, v) in &headers {
             if k != "host" {
-                req = req.set(k, v);
+                req = req.header(k, v);
             }
         }
         req
     }
+
+    /// Send `req` with `body`.  Any answer is `Ok` (the caller reads the
+    /// status); `Err` is a request that got no answer.
+    fn send(
+        &self,
+        what: &str,
+        req: http::request::Builder,
+        body: impl ureq::AsSendBody,
+    ) -> io::Result<http::Response<ureq::Body>> {
+        let req = req
+            .body(body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{what}: {e}")))?;
+        self.agent
+            .run(req)
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, format!("{what}: {e}")))
+    }
 }
 
-/// A TLS client configuration that trusts exactly the CA certificates in
-/// the PEM file `ca`.
-pub(crate) fn tls_trusting(ca: &std::path::Path) -> io::Result<rustls::ClientConfig> {
-    use rustls_pki_types::pem::PemObject;
-    use rustls_pki_types::CertificateDer;
+/// The HTTP client for S3 and the Kubernetes API: every request times out
+/// after `timeout`; with `ca`, TLS trusts exactly the certificates in that
+/// file, else the public roots.  Every status is an answer, not an error
+/// (`http_status_as_error(false)`): an error's body carries the server's
+/// reason, which the callers report.
+pub(crate) fn http_agent(
+    timeout: Duration,
+    ca: Option<&std::path::Path>,
+) -> io::Result<ureq::Agent> {
+    let mut config = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false);
+    if let Some(ca) = ca {
+        config = config.tls_config(tls_trusting(ca)?);
+    }
+    Ok(config.build().into())
+}
+
+/// A TLS configuration that trusts exactly the CA certificates in the PEM
+/// file `ca` (and not the public roots).
+pub(crate) fn tls_trusting(ca: &std::path::Path) -> io::Result<ureq::tls::TlsConfig> {
+    use ureq::tls::{parse_pem, PemItem, RootCerts, TlsConfig};
     let bad = |why: String| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("CA file {}: {why}", ca.display()),
         )
     };
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(ca).map_err(|e| bad(e.to_string()))? {
-        roots
-            .add(cert.map_err(|e| bad(e.to_string()))?)
-            .map_err(|e| bad(e.to_string()))?;
+    let pem = std::fs::read(ca).map_err(|e| bad(e.to_string()))?;
+    let mut certs = Vec::new();
+    for item in parse_pem(&pem) {
+        if let PemItem::Certificate(c) = item.map_err(|e| bad(e.to_string()))? {
+            certs.push(c.to_owned());
+        }
     }
-    if roots.is_empty() {
+    if certs.is_empty() {
         return Err(bad("no certificate in it".into()));
     }
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| bad(e.to_string()))?
-        .with_root_certificates(roots)
-        .with_no_client_auth())
+    Ok(TlsConfig::builder()
+        .root_certs(RootCerts::Specific(std::sync::Arc::new(certs)))
+        .build())
 }
 
 fn bad_key(key: &str) -> io::Error {
@@ -209,18 +241,19 @@ fn bad_key(key: &str) -> io::Error {
     )
 }
 
-/// A failed request as an `io::Error`, with the store's answer.
-fn http_error(what: &str, e: ureq::Error) -> io::Error {
-    match e {
-        ureq::Error::Status(code, resp) => {
-            let body = resp.into_string().unwrap_or_default();
-            let code_text = between(&body, "<Code>", "</Code>").unwrap_or_default();
-            io::Error::other(format!("{what}: HTTP {code} {code_text}"))
-        }
-        ureq::Error::Transport(t) => {
-            io::Error::new(io::ErrorKind::ConnectionAborted, format!("{what}: {t}"))
-        }
+/// The answer if it is a success (2xx), else an `io::Error` with the
+/// status and the store's `<Code>`.
+fn success(
+    what: &str,
+    mut resp: http::Response<ureq::Body>,
+) -> io::Result<http::Response<ureq::Body>> {
+    let code = resp.status().as_u16();
+    if (200..300).contains(&code) {
+        return Ok(resp);
     }
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    let code_text = between(&body, "<Code>", "</Code>").unwrap_or_default();
+    Err(io::Error::other(format!("{what}: HTTP {code} {code_text}")))
 }
 
 impl ObjectStore for S3Store {
@@ -233,9 +266,9 @@ impl ObjectStore for S3Store {
         let digest = Sha256::digest(&body);
         let hash = hex(&digest);
         let extra = [("x-amz-checksum-sha256", base64(&digest))];
-        self.request("PUT", &self.path(key), &[], &hash, &extra)
-            .send_bytes(&body)
-            .map_err(|e| http_error(&format!("put {key}"), e))?;
+        let what = format!("put {key}");
+        let req = self.request("PUT", &self.path(key), &[], &hash, &extra);
+        success(&what, self.send(&what, req, &body[..])?)?;
         Ok(body.len() as u64)
     }
 
@@ -243,28 +276,28 @@ impl ObjectStore for S3Store {
         if !valid_key(key) {
             return Err(bad_key(key));
         }
-        match self
-            .request("GET", &self.path(key), &[], EMPTY_SHA256, &[])
-            .call()
-        {
-            Ok(resp) => Ok(Some(Box::new(resp.into_reader()))),
-            Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(http_error(&format!("get {key}"), e)),
+        let what = format!("get {key}");
+        let req = self.request("GET", &self.path(key), &[], EMPTY_SHA256, &[]);
+        let resp = self.send(&what, req, ())?;
+        if resp.status() == http::StatusCode::NOT_FOUND {
+            return Ok(None);
         }
+        let resp = success(&what, resp)?;
+        Ok(Some(Box::new(resp.into_body().into_reader())))
     }
 
     fn exists(&self, key: &str) -> io::Result<bool> {
         if !valid_key(key) {
             return Err(bad_key(key));
         }
-        match self
-            .request("HEAD", &self.path(key), &[], EMPTY_SHA256, &[])
-            .call()
-        {
-            Ok(_) => Ok(true),
-            Err(ureq::Error::Status(404, _)) => Ok(false),
-            Err(e) => Err(http_error(&format!("head {key}"), e)),
+        let what = format!("head {key}");
+        let req = self.request("HEAD", &self.path(key), &[], EMPTY_SHA256, &[]);
+        let resp = self.send(&what, req, ())?;
+        if resp.status() == http::StatusCode::NOT_FOUND {
+            return Ok(false);
         }
+        success(&what, resp)?;
+        Ok(true)
     }
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
@@ -280,11 +313,12 @@ impl ObjectStore for S3Store {
                 query.push(("continuation-token", t.as_str()));
             }
             let path = format!("/{}", self.config.bucket);
-            let body = self
-                .request("GET", &path, &query, EMPTY_SHA256, &[])
-                .call()
-                .map_err(|e| http_error(&format!("list {prefix}"), e))?
-                .into_string()?;
+            let what = format!("list {prefix}");
+            let req = self.request("GET", &path, &query, EMPTY_SHA256, &[]);
+            let body = success(&what, self.send(&what, req, ())?)?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{what}: {e}")))?;
             let page = parse_list(&body)?;
             keys.extend(
                 page.keys

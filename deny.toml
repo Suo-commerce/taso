@@ -14,9 +14,6 @@ all-features = true
 unmaintained = "all"
 unsound = "all"
 ignore = [
-    # Same as .cargo/audit.toml: webpki-roots 0.26.11 is a shim over the
-    # fixed 1.0.10; closes with ureq 3.
-    "RUSTSEC-2026-0381",
     # bitmaps 3.2.1, inside libublk: unmaintained, and an unsound
     # Bitmap::try_from(&[u8]) that neither libublk's ublk path nor Taso
     # calls.  Closes when libublk drops or replaces it.
