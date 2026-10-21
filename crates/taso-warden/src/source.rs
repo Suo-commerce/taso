@@ -446,6 +446,7 @@ mod tests {
 
     fn vc(subject: &str, slot: u32) -> VesselConf {
         VesselConf {
+            fork: None,
             namespace: Namespace::from_bytes([7; 16]),
             subject: subject.into(),
             takeover: None,

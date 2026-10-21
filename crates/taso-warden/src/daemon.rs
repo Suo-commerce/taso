@@ -94,11 +94,10 @@
 //!
 //! # Not yet
 //!
-//! - Forks and successions under another `uid_slot`: their dataset is a
-//!   clone of the parent's, so its files belong to the parent's range.
-//!   The daemon only births from the void today; a child in its own slot
-//!   needs its files moved into its range (a chown pass, or an idmapped
-//!   mount) before it runs.
+//! - Successions from a config entry (forks are: [`ForkConf`]), and forks
+//!   asked for by a running prime agent over its Field (P3: both will go
+//!   through [`Host::fork_from_log`]).  Kubernetes Vessels cannot be forks
+//!   yet: the CRD has no `fork` field.
 //!
 //! - A coordinator on another node: `remote` is a Unix socket, so across
 //!   nodes it is forwarded (e.g. `ssh -L local.sock:remote.sock`).
@@ -112,7 +111,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use taso_core::envelope::{ChronicleId, Epoch};
+use taso_core::envelope::{ChronicleId, Epoch, Lsn};
 use taso_core::record::{vessel_id, Namespace, Verdict};
 use taso_field::adapter::Registry;
 
@@ -125,14 +124,14 @@ use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
 use crate::runtime::{
-    prepare_work_dir, write_bundle, Runc, RuncCli, RuncRunner, Swept, VesselSpec, ID_RANGE,
+    work_dir_range, write_bundle, Runc, RuncCli, RuncRunner, Swept, VesselSpec, ID_RANGE,
 };
 use crate::s3::{S3Config, S3Store};
 use crate::segment::Position;
 use crate::ship::{LocalStore, SharedStore};
 use crate::source::Held;
 use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
-use crate::vessel::{Ensured, Host, Pool, Vessel, VesselError};
+use crate::vessel::{Ensured, Host, Pool, SealAt, Vessel, VesselError};
 use crate::zfs::{Dataset, Snapshot};
 use taso_core::model::WardenId;
 
@@ -356,15 +355,41 @@ pub struct VesselConf {
     /// Its host uid/gid range: slot `n` is
     /// `host_uid_base + n·65536 ..+65536`.  No two Vessels on a node share
     /// one, so one Vessel's processes cannot touch another's files or
-    /// signal its processes.  The dataset's files are owned by host ids
-    /// in this range and `zfs send` keeps them, so a Vessel keeps its slot
-    /// on every node it runs on.
+    /// signal its processes.  A Vessel born from the void owns its
+    /// dataset's files with host ids in this range and `zfs send` keeps
+    /// them, so it keeps its slot on every node it runs on.  A fork in
+    /// another slot runs over its lineage's files through an idmapped mount
+    /// (F6): its files stay in that range, and its slot is this entry's.
     pub uid_slot: u32,
     /// What to do when its agent exits ([`Restart`]); `never` by default.
     pub restart: Restart,
     /// Its own runtime, over the node's; `None` runs it with the node's.
     /// (Boxed: most Vessels have none, and a `VesselConf` is moved a lot.)
     pub runtime: Option<Box<VesselRuntime>>,
+    /// Forked from another Vessel on this node instead of born from the
+    /// void ([`ForkConf`]); `None`: a birth.
+    pub fork: Option<ForkConf>,
+}
+
+/// A Vessel forked from another on this node (fencing review F6 step 3c,
+/// decision D1 of 2026-10-21; config: `"fork": {"parent": "<subject>",
+/// "seal": "last" | <lsn>}`, `seal` defaulting to `"last"`).
+///
+/// Its first start forks it from the parent's accepted Seal, read from the
+/// parent's local log without opening or claiming the parent
+/// ([`Host::fork_from_log`]): a running parent is not disturbed.  The child
+/// is in the parent's namespace (the entry's `namespace`, which names the
+/// parent too), runs in its own `uid_slot`, and over the parent's files
+/// through an idmapped `/work` when its slot is another
+/// ([`crate::runtime::work_dir_range`]).  After that it opens like any
+/// Vessel; an entry that names another parent than its Chronicle's
+/// Lineage record is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkConf {
+    /// The parent's subject (same namespace).
+    pub parent: String,
+    /// Which of its accepted Seals.
+    pub seal: SealAt,
 }
 
 /// When a long-running Warden starts a Vessel's agent again after it
@@ -728,6 +753,34 @@ fn opt_strings(v: &Value, key: &str) -> Result<Option<Vec<String>>, ConfigError>
     strings(v, key).map(Some)
 }
 
+/// A Vessel's `"fork"` ([`ForkConf`]).  Unknown keys are refused: a
+/// misspelt `seal` must not quietly fork from the newest Seal.
+fn fork_conf(f: &Value) -> Result<ForkConf, ConfigError> {
+    only_keys(f, "fork", &["parent", "seal"])?;
+    let parent = string(f, "parent")?;
+    if parent.is_empty() {
+        return Err(bad("\"fork\": \"parent\" must not be empty"));
+    }
+    let seal = match f.get("seal") {
+        None => SealAt::Last,
+        Some(Value::String(s)) if s == "last" => SealAt::Last,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(l) if l >= 1 => SealAt::At(Lsn::new(l)),
+            _ => {
+                return Err(bad(
+                    "\"fork\": \"seal\" must be \"last\" or an lsn of at least 1",
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(bad(
+                "\"fork\": \"seal\" must be \"last\" or an lsn of at least 1",
+            ))
+        }
+    };
+    Ok(ForkConf { parent, seal })
+}
+
 /// A Vessel's own `"runtime"` in a static config.
 fn vessel_runtime(r: &Value) -> Result<VesselRuntime, ConfigError> {
     only_keys(
@@ -976,6 +1029,10 @@ impl Config {
                             None => None,
                             Some(r) => Some(Box::new(vessel_runtime(r)?)),
                         },
+                        fork: match x.get("fork") {
+                            None | Some(Value::Null) => None,
+                            Some(f) => Some(fork_conf(f)?),
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, ConfigError>>()?,
@@ -1003,6 +1060,12 @@ impl Config {
             }
             vc.effective(&runtime, &quiescence)
                 .map_err(|e| bad(format!("vessel {:?}: {e}", vc.subject)))?;
+            if vc.fork.as_ref().is_some_and(|f| f.parent == vc.subject) {
+                return Err(bad(format!(
+                    "vessel {:?} cannot be forked from itself",
+                    vc.subject
+                )));
+            }
         }
         Ok(Self {
             warden: WardenId::new(warden),
@@ -1496,6 +1559,17 @@ pub fn held_on<H: Holdings>(
     Ok((held, warnings))
 }
 
+/// The disk range a fork may inherit, from its top directory's owner
+/// `(uid, gid)`: a whole slot's range above `host_uid_base`, the same for
+/// both; anything else (root's 0:0 for a fresh one, a stray or half owner)
+/// is no range, and [`work_dir_range`] then decides as for a birth.
+fn inherited_range((uid, gid): (u32, u32), host_uid_base: u32) -> Option<u32> {
+    let aligned = uid
+        .checked_sub(host_uid_base)
+        .is_some_and(|off| off % ID_RANGE == 0);
+    (uid == gid && uid != 0 && aligned).then_some(uid)
+}
+
 /// A Vessel key from 32 lowercase hex digits.
 fn key_of_hex(s: &str) -> Option<[u8; 16]> {
     if s.len() != 32
@@ -1640,6 +1714,29 @@ impl Node {
         let start = decide(known, local, self.config.warden, vc.takeover);
         let (vessel, verdict) = match &start {
             Start::Refuse(why) => return Err(DaemonError::Refused(why.clone())),
+            Start::Birth if vc.fork.is_some() => {
+                let f = vc.fork.as_ref().expect("matched");
+                let parent = vessel_id(vc.namespace, f.parent.as_bytes());
+                let v = host
+                    .fork_from_log(parent, f.seal, vc.subject.as_bytes())
+                    .map_err(|e| {
+                        DaemonError::Refused(format!(
+                            "fork from {:?} ({:?}): {e}",
+                            f.parent, f.seal
+                        ))
+                    })?;
+                let at = v
+                    .lineage()
+                    .origin
+                    .parent()
+                    .map(|p| p.seal.get())
+                    .unwrap_or(0);
+                self.log(
+                    vc,
+                    format_args!("Forked from {:?} at Seal lsn {at}", f.parent),
+                );
+                (v, Verdict::Clean)
+            }
             Start::Birth | Start::Open => {
                 let (v, how) = host.ensure_as(vc.namespace, vc.subject.as_bytes(), claim)?;
                 let verdict = match &how {
@@ -1656,6 +1753,18 @@ impl Node {
                 (v, verdict)
             }
         };
+        // An entry that says it is a fork must agree with the Chronicle: one
+        // that names another parent (or a Vessel born from the void) is a
+        // wrong entry, not a reason to run it.
+        if let Some(f) = &vc.fork {
+            let want = vessel_id(vc.namespace, f.parent.as_bytes());
+            if vessel.lineage().origin.parent().map(|p| p.chronicle) != Some(want) {
+                return Err(DaemonError::Refused(format!(
+                    "the entry forks it from {:?}, but its Lineage record says otherwise",
+                    f.parent
+                )));
+            }
+        }
         Ok((vessel, start, verdict))
     }
 
@@ -1756,7 +1865,26 @@ impl Node {
         let uid = vc
             .host_uid(&self.config.runtime)
             .ok_or_else(|| DaemonError::Io(format!("uid_slot {} does not fit", vc.uid_slot)))?;
-        prepare_work_dir(&mount, uid).map_err(io("preparing the dataset"))?;
+        // The range its files are owned by on disk (F6): its own, or for a
+        // fork or succession its lineage's, which the top directory has
+        // carried since it was first prepared; the mount is then idmapped.
+        // Which lineage a range may belong to on this node is the source
+        // guard's to check (`held_on`, `Guard::seeded`).
+        let inherited = match vessel.lineage().origin.parent() {
+            None => None,
+            Some(_) => {
+                use std::os::unix::fs::MetadataExt;
+                let m = std::fs::symlink_metadata(&mount).map_err(io("reading the dataset"))?;
+                inherited_range((m.uid(), m.gid()), self.config.runtime.host_uid_base)
+            }
+        };
+        let disk = work_dir_range(&mount, uid, inherited).map_err(io("preparing the dataset"))?;
+        if disk != uid {
+            self.log(
+                vc,
+                format_args!("its files are its lineage's range ({disk}): /work is idmapped"),
+            );
+        }
 
         let dir = self.config.run_dir.join(format!("v-{}", id_hex(id)));
         std::fs::create_dir_all(&dir).map_err(io("run dir"))?;
@@ -1770,8 +1898,7 @@ impl Node {
             work: mount.clone(),
             socket: socket.path().to_path_buf(),
             host_uid_base: uid,
-            // Births only (F6 step 3 sets the parent's range for cross-slot forks).
-            disk_uid_base: None,
+            disk_uid_base: Some(disk),
             args: rt.args.clone(),
             env: rt.env.clone(),
             landlock_shim: rt.landlock_shim.clone(),
@@ -2293,6 +2420,91 @@ mod tests {
         Config::parse(&v.to_string())
     }
 
+    // ── fork entries (F6 step 3c) ────────────────────────────────────
+
+    #[test]
+    fn a_fork_entry_is_parsed_and_defaults_to_the_last_seal() {
+        let c = Config::parse(GOOD).unwrap();
+        assert!(
+            c.vessels.iter().all(|v| v.fork.is_none()),
+            "no \"fork\": a birth"
+        );
+        for (fork, want) in [
+            (serde_json::json!({"parent": "a"}), SealAt::Last),
+            (
+                serde_json::json!({"parent": "a", "seal": "last"}),
+                SealAt::Last,
+            ),
+            (
+                serde_json::json!({"parent": "a", "seal": 7}),
+                SealAt::At(Lsn::new(7)),
+            ),
+        ] {
+            let c = with(|v| v["vessels"][1]["fork"] = fork.clone()).unwrap();
+            assert_eq!(
+                c.vessels[1].fork,
+                Some(ForkConf {
+                    parent: "a".into(),
+                    seal: want
+                }),
+                "{fork}"
+            );
+        }
+        // null is no fork, as for "takeover".
+        let c = with(|v| v["vessels"][1]["fork"] = Value::Null).unwrap();
+        assert_eq!(c.vessels[1].fork, None);
+    }
+
+    #[test]
+    fn bad_fork_entries_are_refused() {
+        for (fork, says) in [
+            (serde_json::json!("a"), "must be an object"),
+            (serde_json::json!({"seal": "last"}), "missing \"parent\""),
+            (serde_json::json!({"parent": ""}), "must not be empty"),
+            (serde_json::json!({"parent": 1}), "must be a string"),
+            (serde_json::json!({"parent": "a", "seal": 0}), "at least 1"),
+            (
+                serde_json::json!({"parent": "a", "seal": "first"}),
+                "\"last\" or an lsn",
+            ),
+            (
+                serde_json::json!({"parent": "a", "seal": -3}),
+                "\"last\" or an lsn",
+            ),
+            (
+                serde_json::json!({"parent": "a", "sael": 3}),
+                "unknown key \"sael\"",
+            ),
+            (
+                serde_json::json!({"parent": "b"}),
+                "cannot be forked from itself",
+            ),
+        ] {
+            let e = with(|v| v["vessels"][1]["fork"] = fork.clone()).unwrap_err();
+            assert!(e.0.contains(says), "{fork}: {}", e.0);
+        }
+    }
+
+    #[test]
+    fn a_fork_inherits_only_a_whole_slots_range() {
+        let base = 200_000;
+        for (owner, want) in [
+            ((base + ID_RANGE, base + ID_RANGE), Some(base + ID_RANGE)),
+            ((base, base), Some(base)),
+            (
+                (base + 3 * ID_RANGE, base + 3 * ID_RANGE),
+                Some(base + 3 * ID_RANGE),
+            ),
+            ((0, 0), None),                                 // fresh: becomes its own
+            ((base + ID_RANGE, 0), None),                   // half
+            ((base + ID_RANGE, base + 2 * ID_RANGE), None), // mixed
+            ((base + ID_RANGE + 1000, base + ID_RANGE + 1000), None), // not a range's root
+            ((1000, 1000), None),                           // below the base
+        ] {
+            assert_eq!(inherited_range(owner, base), want, "{owner:?}");
+        }
+    }
+
     #[test]
     fn restart_is_parsed_and_defaults_to_never() {
         let c = Config::parse(GOOD).unwrap();
@@ -2541,6 +2753,7 @@ mod tests {
         let mut rt = Config::parse(GOOD).unwrap().runtime;
         rt.landlock_shim = None;
         let vc = |landlock| VesselConf {
+            fork: None,
             namespace: Namespace::from_bytes([1; 16]),
             subject: "a".into(),
             takeover: None,
@@ -2566,6 +2779,7 @@ mod tests {
             },
         ] {
             let e = VesselConf {
+                fork: None,
                 runtime: Some(Box::new(own)),
                 ..vc(None)
             }
