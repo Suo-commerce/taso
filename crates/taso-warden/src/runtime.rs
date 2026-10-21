@@ -32,7 +32,10 @@
 //!   the agent on a kernel without Landlock.
 //!
 //! The dataset must be owned by the mapped root so the agent can write it:
-//! [`prepare_work_dir`].
+//! [`prepare_work_dir`].  A fork or succession into another uid slot keeps
+//! its parent's files untouched on disk; its `/work` is an idmapped mount
+//! that shows the parent's range as its own ([`VesselSpec::disk_uid_base`],
+//! fencing review F6).
 //!
 //! The image must already contain every mount target ([`check_rootfs`]):
 //! inside a user namespace runc creates mount targets as the Vessel's
@@ -124,6 +127,13 @@ pub struct VesselSpec {
     pub socket: PathBuf,
     /// First host uid/gid of the Vessel's range.
     pub host_uid_base: u32,
+    /// First host uid/gid of the range that owns the files of `work` on
+    /// disk, when it is not the Vessel's own: a fork or succession into
+    /// another `uid_slot` keeps its parent's files as they are, and the
+    /// work mount is idmapped to show them in this Vessel's range
+    /// ([`oci_config`]).  `None`, or `Some(host_uid_base)`: the files are
+    /// already the Vessel's own; no idmapping.
+    pub disk_uid_base: Option<u32>,
     /// The agent's command line.
     pub args: Vec<String>,
     /// Extra environment, `KEY=value`.  Never the Warden's own.
@@ -186,9 +196,22 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
     if spec.args.is_empty() {
         return Err(SpecError::NoArgs);
     }
-    if spec.host_uid_base == 0 || spec.host_uid_base.checked_add(ID_RANGE).is_none() {
+    let usable = |base: u32| base != 0 && base.checked_add(ID_RANGE).is_some();
+    if !usable(spec.host_uid_base) {
         return Err(SpecError::BadUidRange(spec.host_uid_base));
     }
+    // The range the work directory's files are owned by on disk, if not the
+    // Vessel's own.  It must be a whole other range: one that partly
+    // overlaps the Vessel's would show some of its own ids as other ids.
+    let disk_uid_base = match spec.disk_uid_base {
+        Some(d) if d != spec.host_uid_base => {
+            if !usable(d) || d.abs_diff(spec.host_uid_base) < ID_RANGE {
+                return Err(SpecError::BadUidRange(d));
+            }
+            Some(d)
+        }
+        _ => None,
+    };
     for e in &spec.env {
         let key = e.split_once('=').map(|(k, _)| k);
         let ok = key.is_some_and(|k| {
@@ -214,6 +237,27 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
         format!("TASO_FIELD={FIELD_SOCKET}"),
     ];
     env.extend(spec.env.iter().cloned());
+
+    let mut work_mount = json!({ "destination": WORK_DIR, "type": "bind", "source": spec.work,
+                                 "options": ["rbind", "rw", "nosuid", "nodev"] });
+    if let Some(disk) = disk_uid_base {
+        // Show the disk's range as the Vessel's, nothing on disk changed
+        // (fencing review F6).  In a mount mapping `containerID` is the id
+        // on disk and `hostID` the id the mount shows: the kernel's
+        // idmappings.rst ("u1000:k1125" shows disk 1000 as 1125) and runc,
+        // which puts both fields unchanged into the namespace it hands to
+        // `mount_setattr(MOUNT_ATTR_IDMAP)`.  Ids outside the disk range
+        // (e.g. host root's) stay unmapped: shown as the overflow id, not
+        // writable as.  `ridmap`: recursive like the `rbind`, and named so a
+        // runtime without idmapped mounts fails instead of ignoring it.
+        let map = json!([{ "containerID": disk, "hostID": spec.host_uid_base, "size": ID_RANGE }]);
+        work_mount["options"]
+            .as_array_mut()
+            .expect("options is an array")
+            .push(json!("ridmap"));
+        work_mount["uidMappings"] = map.clone();
+        work_mount["gidMappings"] = map;
+    }
 
     let no_caps = json!([]);
     let mut resources = json!({ "devices": [{ "allow": false, "access": "rwm" }] });
@@ -255,8 +299,7 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
               "options": ["rbind", "nosuid", "noexec", "nodev", "ro"] },
             { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
               "options": ["nosuid", "nodev", "mode=1777", "size=1g"] },
-            { "destination": WORK_DIR, "type": "bind", "source": spec.work,
-              "options": ["rbind", "rw", "nosuid", "nodev"] },
+            work_mount,
             { "destination": FIELD_SOCKET, "type": "bind", "source": spec.socket,
               "options": ["bind", "rw", "nosuid", "nodev", "noexec"] }
         ],
@@ -603,6 +646,7 @@ mod tests {
             work: "/tasotest/vessel/v-ab12cd34".into(),
             socket: "/run/taso/v/ab12cd34.sock".into(),
             host_uid_base: 200_000,
+            disk_uid_base: None,
             args: vec!["/usr/bin/hermes".into(), "--serve".into()],
             env: vec!["HERMES_MODE=agent".into()],
             landlock_shim: None,
@@ -768,6 +812,91 @@ mod tests {
             mutate(&mut sp);
             let err = oci_config(&sp).unwrap_err();
             assert!(is(&err), "case {i}: {err:?}");
+        }
+    }
+
+    /// Slot 1 (the parent, owner of the files on disk) and slot 2 (the
+    /// child) over the deploy base 200000, as in `f6-idmap-probe.sh`.
+    const SLOT_A: u32 = 200_000 + ID_RANGE;
+    const SLOT_B: u32 = 200_000 + 2 * ID_RANGE;
+
+    fn forked() -> VesselSpec {
+        let mut sp = spec();
+        sp.host_uid_base = SLOT_B;
+        sp.disk_uid_base = Some(SLOT_A);
+        sp
+    }
+
+    #[test]
+    fn work_mount_is_idmapped_across_slots() {
+        let c = oci_config(&forked()).unwrap();
+        let w = mount(&c, WORK_DIR);
+        // Direction, from the sources (verified 2026-10-21, not assumed):
+        // - kernel Documentation/filesystems/idmappings.rst: the mount
+        //   idmapping u1000:k1125:r1 shows a file owned by 1000 on disk as
+        //   1125 — the namespace side is the disk, the kernel side is what
+        //   the mount shows;
+        // - runc v1.4.0 specconv toConfigIDMap + internal/userns: the OCI
+        //   containerID/hostID go unchanged into that namespace's uid_map.
+        // So containerID = the disk's range (A), hostID = the shown range (B).
+        let want = json!([{ "containerID": SLOT_A, "hostID": SLOT_B, "size": ID_RANGE }]);
+        assert_eq!(w["uidMappings"], want);
+        assert_eq!(w["gidMappings"], want);
+        // Explicit and recursive, matching rbind (runc applies mappings
+        // without the option non-recursively; the spec says SHOULD name it).
+        let opts = w["options"].as_array().unwrap();
+        assert!(opts.contains(&json!("ridmap")), "{opts:?}");
+        assert!(!opts.contains(&json!("idmap")), "{opts:?}");
+        // Still a bind mount (runc refuses idmapping on anything else),
+        // still nosuid,nodev.
+        for o in ["rbind", "rw", "nosuid", "nodev"] {
+            assert!(opts.contains(&json!(o)), "{o}: {opts:?}");
+        }
+        // The container's own user namespace is unchanged: the child's range.
+        assert_eq!(c["linux"]["uidMappings"][0]["hostID"], SLOT_B);
+        assert_eq!(c["linux"]["gidMappings"][0]["hostID"], SLOT_B);
+        // Nothing else is idmapped.
+        for m in c["mounts"].as_array().unwrap() {
+            if m["destination"] != WORK_DIR {
+                assert!(m.get("uidMappings").is_none(), "{m}");
+                assert!(m.get("gidMappings").is_none(), "{m}");
+            }
+        }
+    }
+
+    #[test]
+    fn work_mount_is_plain_within_a_slot() {
+        // None and Some(own base) both mean "the files are mine": the config
+        // is byte-for-byte what it was before F6.
+        let plain = oci_config(&spec()).unwrap();
+        let mut same = spec();
+        same.disk_uid_base = Some(same.host_uid_base);
+        assert_eq!(oci_config(&same).unwrap(), plain);
+        let w = mount(&plain, WORK_DIR);
+        assert!(w.get("uidMappings").is_none());
+        assert!(w.get("gidMappings").is_none());
+        assert_eq!(w["options"], json!(["rbind", "rw", "nosuid", "nodev"]));
+    }
+
+    #[test]
+    fn bad_disk_ranges_are_refused() {
+        // 0 (host root's files), a wrapping range, and a range that partly
+        // overlaps the Vessel's own (not a slot apart: a misconfiguration
+        // that would show some of the child's own ids as other ids).
+        for disk in [0, u32::MAX - 10, SLOT_B - 1, SLOT_B + ID_RANGE - 1] {
+            let mut sp = forked();
+            sp.disk_uid_base = Some(disk);
+            assert_eq!(
+                oci_config(&sp).unwrap_err(),
+                SpecError::BadUidRange(disk),
+                "disk base {disk}"
+            );
+        }
+        // Exactly one slot apart either way is fine.
+        for disk in [SLOT_B - ID_RANGE, SLOT_B + ID_RANGE] {
+            let mut sp = forked();
+            sp.disk_uid_base = Some(disk);
+            assert!(oci_config(&sp).is_ok(), "disk base {disk}");
         }
     }
 
@@ -1151,6 +1280,7 @@ while read l; do echo "$l"; done < /proc/self/status > /work/status
                 work: work.clone(),
                 socket: sock,
                 host_uid_base: base,
+                disk_uid_base: None,
                 args: vec!["/bin/sh".into(), "-c".into(), AGENT.into()],
                 env: vec![],
                 landlock_shim: None,
@@ -1240,6 +1370,7 @@ while read l; do echo "$l"; done < /proc/self/status > /work/status
                 work,
                 socket: sock,
                 host_uid_base: 200_000,
+                disk_uid_base: None,
                 // Never exits by itself; pid 1 ignores SIGTERM.
                 args: vec!["/bin/sh".into(), "-c".into(), "while :; do :; done".into()],
                 env: vec![],
