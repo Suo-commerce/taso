@@ -1444,7 +1444,11 @@ pub fn sweep_stale<R: RuncRunner>(runc: &Runc<R>) -> io::Result<Swept> {
 /// What the node's pool holds of each Vessel under `root`, for
 /// [`crate::source::Guard::seeded`]: for every `v-<id>` dataset, the uid
 /// slots whose ranges own files in it (`zfs userspace`, mounted or not;
-/// on the block log, a walk of the mounted file system).
+/// on the block log, a walk of the mounted file system), and its parent
+/// from the Lineage record of its local Chronicle under `state_dir`
+/// ([`crate::vessel::lineage_in`]; F6: a fork's files are its lineage's).
+/// A log that cannot be read gives a warning and no parent: that can only
+/// keep the Vessel apart from a lineage (blocked, never let in).
 /// Root (uid 0) owns a fresh dataset's top directory and counts for no
 /// slot.  Also returns warnings: datasets that are not a Vessel's, and uids
 /// in no slot's range (they count for none).  Any failure to read the pool
@@ -1453,6 +1457,7 @@ pub fn held_on<H: Holdings>(
     pool: &H,
     root: &Dataset,
     host_uid_base: u32,
+    state_dir: &Path,
 ) -> Result<(Vec<Held>, Vec<String>), LayerError> {
     let mut held = Vec::new();
     let mut warnings = Vec::new();
@@ -1476,7 +1481,17 @@ pub fn held_on<H: Holdings>(
                 )),
             }
         }
-        held.push(Held { key, slots });
+        let hex = name.strip_prefix("v-").unwrap_or_default();
+        let parent = match crate::vessel::lineage_in(&state_dir.join(hex)) {
+            Ok(l) => l.and_then(|l| l.origin.parent().map(|p| *p.chronicle.as_bytes())),
+            Err(e) => {
+                warnings.push(format!(
+                    "{ds}: its local Chronicle's Lineage cannot be read ({e}): taken as no parent"
+                ));
+                None
+            }
+        };
+        held.push(Held { key, slots, parent });
     }
     Ok((held, warnings))
 }
@@ -1532,10 +1547,15 @@ impl Node {
             );
         }
         // After the sweep: nothing writes into a dataset now.
-        let (held, warnings) = held_on(&storage, &config.root, config.runtime.host_uid_base)
-            .map_err(|e| {
-                io::Error::other(format!("reading the uid slots of the pool's Vessels: {e}"))
-            })?;
+        let (held, warnings) = held_on(
+            &storage,
+            &config.root,
+            config.runtime.host_uid_base,
+            &config.state_dir,
+        )
+        .map_err(|e| {
+            io::Error::other(format!("reading the uid slots of the pool's Vessels: {e}"))
+        })?;
         for w in &warnings {
             eprintln!("taso-wardend[{}]: {w}", config.warden.get());
         }
@@ -2924,12 +2944,18 @@ mod tests {
             ]
             .into(),
         );
+        let no_state = tempfile::tempdir().unwrap();
         let (held, warnings) = held_on(
             &Zfs::with_runner(pool),
             &Dataset::new("t/v").unwrap(),
             200_000,
+            no_state.path(),
         )
         .unwrap();
+        assert!(
+            held.iter().all(|h| h.parent.is_none()),
+            "no local logs: no parents"
+        );
         let got: Vec<(u8, Vec<u32>)> = held
             .iter()
             .map(|h| (h.key[0], h.slots.iter().copied().collect()))
@@ -2951,9 +2977,73 @@ mod tests {
         assert!(held_on(
             &Zfs::with_runner(broken),
             &Dataset::new("t/v").unwrap(),
-            200_000
+            200_000,
+            no_state.path(),
         )
         .is_err());
+    }
+
+    /// Holdings from a table: datasets and the uids owning files in each.
+    struct HoldTable(Vec<(Dataset, Vec<u32>)>);
+    impl Holdings for HoldTable {
+        fn children(&self, _: &Dataset) -> Result<Vec<Dataset>, LayerError> {
+            Ok(self.0.iter().map(|(d, _)| d.clone()).collect())
+        }
+        fn owner_uids(&self, ds: &Dataset) -> Result<std::collections::BTreeSet<u32>, LayerError> {
+            Ok(self
+                .0
+                .iter()
+                .find(|(d, _)| d == ds)
+                .map(|(_, u)| u.iter().copied().collect())
+                .unwrap_or_default())
+        }
+    }
+
+    /// F6 step 3b: the parent edge a fork's local Chronicle names reaches
+    /// the guard's seed; a void birth has none; a log that cannot be read
+    /// is a warning and no parent (it can only block, never let in).
+    #[test]
+    fn held_on_reads_each_forks_parent_from_its_local_chronicle() {
+        let e = vessel_env();
+        let (mut p, _) = e.host.ensure(ns(1), b"parent").unwrap();
+        let s = p.seal_birth().unwrap().seal;
+        let c = e.host.fork(&p, s, b"child").unwrap();
+        let (pid, cid) = (p.id(), c.id());
+        drop(c);
+        drop(p);
+        let state = e.host.dir_for(pid).parent().unwrap().to_path_buf();
+        let range1 = 200_000 + ID_RANGE;
+        let pool = HoldTable(vec![
+            (e.host.dataset_for(pid), vec![0, range1]),
+            (e.host.dataset_for(cid), vec![range1, range1 + 1000]),
+        ]);
+        let root = Dataset::new("tank/vessels").unwrap();
+        let (held, warnings) = held_on(&pool, &root, 200_000, &state).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let by = |k: ChronicleId| held.iter().find(|h| h.key == *k.as_bytes()).unwrap();
+        assert_eq!(by(pid).parent, None);
+        assert_eq!(by(cid).parent, Some(*pid.as_bytes()));
+        assert_eq!(by(cid).slots, [1].into());
+
+        // A local log that cannot be read: a warning, no parent.
+        let cdir = e.host.dir_for(cid);
+        for f in std::fs::read_dir(&cdir).unwrap() {
+            let f = f.unwrap().path();
+            if f.is_file() {
+                std::fs::write(&f, b"not a segment").unwrap();
+            }
+        }
+        let (held, warnings) = held_on(&pool, &root, 200_000, &state).unwrap();
+        let child = held.iter().find(|h| h.key == *cid.as_bytes()).unwrap();
+        if child.parent.is_some() {
+            panic!("an unreadable log must not name a parent");
+        }
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Lineage cannot be read")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
