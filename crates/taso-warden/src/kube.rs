@@ -197,12 +197,9 @@ impl Kube {
                 format!("the API server must be https://…, not {api:?}"),
             ));
         }
-        let mut agent = ureq::AgentBuilder::new().timeout(timeout);
-        if let Some(ca) = &config.ca_file {
-            agent = agent.tls_config(std::sync::Arc::new(crate::s3::tls_trusting(ca)?));
-        }
+        let agent = crate::s3::http_agent(timeout, config.ca_file.as_deref())?;
         Ok(Self {
-            agent: agent.build(),
+            agent,
             api: api.to_string(),
             token_file: config.token_file.clone(),
         })
@@ -247,28 +244,33 @@ impl Kube {
         Ok(p)
     }
 
-    fn send(&self, req: ureq::Request, body: Option<&Value>) -> Result<Value, KubeError> {
-        let req = req
-            .set("Authorization", &format!("Bearer {}", self.token()?))
-            .set("Accept", "application/json");
-        let answer = match body {
-            None => req.call(),
-            Some(b) => req
-                .set("Content-Type", "application/merge-patch+json")
-                .send_string(&b.to_string()),
-        };
-        match answer {
-            Ok(resp) => {
-                let text = resp
-                    .into_string()
-                    .map_err(|e| KubeError::Body(e.to_string()))?;
-                serde_json::from_str(&text).map_err(|e| KubeError::Body(format!("not JSON: {e}")))
-            }
-            Err(ureq::Error::Status(code, resp)) => {
-                Err(status_error(code, &resp.into_string().unwrap_or_default()))
-            }
-            Err(ureq::Error::Transport(t)) => Err(KubeError::Transport(t.to_string())),
+    /// `req` with the token and `Accept: application/json`.
+    fn authorized<B>(
+        &self,
+        req: ureq::RequestBuilder<B>,
+    ) -> Result<ureq::RequestBuilder<B>, KubeError> {
+        Ok(req
+            .header("Authorization", &format!("Bearer {}", self.token()?))
+            .header("Accept", "application/json"))
+    }
+
+    /// The JSON of a success (2xx); an error answer as its `Status`; no
+    /// answer as a transport error.
+    fn answer(
+        &self,
+        answer: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    ) -> Result<Value, KubeError> {
+        let mut resp = answer.map_err(|e| KubeError::Transport(e.to_string()))?;
+        let code = resp.status().as_u16();
+        if !(200..300).contains(&code) {
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            return Err(status_error(code, &body));
         }
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| KubeError::Body(e.to_string()))?;
+        serde_json::from_str(&text).map_err(|e| KubeError::Body(format!("not JSON: {e}")))
     }
 
     /// List `r` in `namespace` (all namespaces if `None`), with a field
@@ -285,13 +287,13 @@ impl Kube {
         if let Some(fs) = field_selector {
             req = req.query("fieldSelector", fs);
         }
-        self.send(req, None)
+        self.answer(self.authorized(req)?.call())
     }
 
     /// One object.
     pub fn get(&self, r: Resource, namespace: &str, name: &str) -> Result<Value, KubeError> {
         let url = format!("{}{}", self.api, self.path(r, Some(namespace), Some(name))?);
-        self.send(self.agent.get(&url), None)
+        self.answer(self.authorized(self.agent.get(&url))?.call())
     }
 
     /// Merge `status` into the object's status (the `status` subresource,
@@ -331,7 +333,10 @@ impl Kube {
             }
             body["metadata"] = serde_json::json!({ "resourceVersion": rv });
         }
-        self.send(self.agent.request("PATCH", &url), Some(&body))
+        let req = self
+            .authorized(self.agent.patch(&url))?
+            .header("Content-Type", "application/merge-patch+json");
+        self.answer(req.send(body.to_string()))
     }
 }
 
@@ -517,6 +522,104 @@ mod tests {
         assert!(matches!(
             k.list(VESSELS, None, None),
             Err(KubeError::Transport(_))
+        ));
+    }
+
+    /// List, get and a conditional status patch against a local HTTPS API
+    /// server (private CA): the token, the field selector and the merge
+    /// patch type arrive as sent, and error answers keep the server's
+    /// `Status` reason and message.  What the ignored test checks against a
+    /// real API server, here on every run.
+    #[test]
+    fn talks_to_a_local_api_server() {
+        use crate::s3::tests::{have_tools, TestServer};
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = TestServer::start(
+            true,
+            r#"
+import json, urllib.parse
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def reply(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def status(self, code, reason, message):
+        self.reply(code, {"kind": "Status", "status": "Failure", "reason": reason, "message": message, "code": code})
+    def authorized(self):
+        if self.headers.get("Authorization") != "Bearer t0ken":
+            self.status(401, "Unauthorized", "bad token"); return False
+        return True
+    def do_GET(self):
+        if not self.authorized(): return
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        if u.path == "/apis/taso.suocommerce.com/v1alpha1/vessels":
+            return self.reply(200, {"kind": "VesselList", "items": [], "selector": q.get("fieldSelector", [""])[0]})
+        if u.path == "/apis/taso.suocommerce.com/v1alpha1/namespaces/team-a/vessels/v1":
+            return self.reply(200, {"kind": "Vessel", "metadata": {"name": "v1", "resourceVersion": "7"}})
+        self.status(404, "NotFound", 'vessels "nope" not found')
+    def do_PATCH(self):
+        if not self.authorized(): return
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.headers.get("Content-Type") != "application/merge-patch+json":
+            return self.status(415, "UnsupportedMediaType", self.headers.get("Content-Type", ""))
+        if body.get("metadata", {}).get("resourceVersion") not in (None, "7"):
+            return self.status(409, "Conflict", "the object has been modified")
+        self.reply(200, {"kind": "Vessel", "metadata": {"name": "v1", "resourceVersion": "8"}, "status": body["status"]})
+    def log_message(self, *a): pass
+"#,
+        );
+        std::fs::write(srv.dir.path().join("token"), "t0ken\n").unwrap();
+        let k = Kube::new(
+            &KubeConfig {
+                api: format!("https://localhost:{}", srv.port),
+                token_file: srv.dir.path().join("token"),
+                ca_file: Some(srv.dir.path().join("ca.pem")),
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let list = k.list(VESSELS, None, Some("spec.node=node-a")).unwrap();
+        assert_eq!(list["kind"], "VesselList");
+        assert_eq!(
+            list["selector"], "spec.node=node-a",
+            "the field selector arrived"
+        );
+        assert_eq!(
+            k.get(VESSELS, "team-a", "v1").unwrap()["metadata"]["resourceVersion"],
+            "7"
+        );
+        match k.get(VESSELS, "team-a", "nope") {
+            Err(KubeError::Status {
+                code: 404,
+                reason,
+                message,
+            }) => {
+                assert_eq!(reason, "NotFound");
+                assert!(message.contains("not found"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let st = serde_json::json!({ "holder": 1 });
+        let after = k
+            .patch_status_at(VESSELS, "team-a", "v1", Some("7"), &st)
+            .unwrap();
+        assert_eq!(after["status"], st);
+        assert!(matches!(
+            k.patch_status_at(VESSELS, "team-a", "v1", Some("6"), &st),
+            Err(KubeError::Status { code: 409, .. })
+        ));
+        std::fs::write(srv.dir.path().join("token"), "wrong\n").unwrap();
+        assert!(matches!(
+            k.get(VESSELS, "team-a", "v1"),
+            Err(KubeError::Status { code: 401, .. })
         ));
     }
 
