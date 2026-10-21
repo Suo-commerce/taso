@@ -47,17 +47,33 @@ fn rootfs(root: &Path) {
 struct Cleanup(String);
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        let _ = Command::new("zfs").args(["destroy", "-R", &self.0]).status();
+        let _ = Command::new("zfs")
+            .args(["destroy", "-R", &self.0])
+            .status();
     }
 }
 
 /// `takeover`: the ownership to take over, `(holder, epoch)` as read from
 /// the coordinator (F2: a takeover names what it replaces).
 fn config(tmp: &Path, base: &str, node: &str, warden: u64, takeover: Option<(u64, u64)>) -> Config {
-    config_with(tmp, base, node, warden, takeover, &["--turns", "5", "--txns", "2", "--rows", "3"])
+    config_with(
+        tmp,
+        base,
+        node,
+        warden,
+        takeover,
+        &["--turns", "5", "--txns", "2", "--rows", "3"],
+    )
 }
 
-fn config_with(tmp: &Path, base: &str, node: &str, warden: u64, takeover: Option<(u64, u64)>, sim_args: &[&str]) -> Config {
+fn config_with(
+    tmp: &Path,
+    base: &str,
+    node: &str,
+    warden: u64,
+    takeover: Option<(u64, u64)>,
+    sim_args: &[&str],
+) -> Config {
     let mut args = vec!["/usr/bin/taso-sim"];
     args.extend_from_slice(sim_args);
     let v = json!({
@@ -84,7 +100,10 @@ fn mount(node: &Node) -> PathBuf {
     let id = node.config.vessels[0].id();
     let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     let ds = format!("{}/v-{hex}", node.config.root);
-    let mount = Command::new("zfs").args(["get", "-H", "-o", "value", "mountpoint", &ds]).output().unwrap();
+    let mount = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", "mountpoint", &ds])
+        .output()
+        .unwrap();
     PathBuf::from(String::from_utf8(mount.stdout).unwrap().trim())
 }
 
@@ -93,17 +112,31 @@ fn stats(node: &Node) -> Value {
     let mount = mount.to_str().unwrap();
     // The dataset belongs to this Vessel's own uid range (slot 3), on every node.
     let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(mount.trim()).unwrap());
-    assert_eq!(Some(owner), node.config.vessels[0].host_uid(&node.config.runtime));
+    assert_eq!(
+        Some(owner),
+        node.config.vessels[0].host_uid(&node.config.runtime)
+    );
     assert_eq!(owner, 200_000 + 3 * 65_536);
-    serde_json::from_str(&std::fs::read_to_string(Path::new(mount.trim()).join("sim-stats.json")).unwrap()).unwrap()
+    serde_json::from_str(
+        &std::fs::read_to_string(Path::new(mount.trim()).join("sim-stats.json")).unwrap(),
+    )
+    .unwrap()
 }
 
 #[test]
 #[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
 fn born_reopened_reborn_elsewhere_and_refused() {
-    let base = format!("{}/daemon-{}", std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"), std::process::id());
+    let base = format!(
+        "{}/daemon-{}",
+        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
+        std::process::id()
+    );
     for ds in [base.clone(), format!("{base}/a"), format!("{base}/b")] {
-        assert!(Command::new("zfs").args(["create", &ds]).status().unwrap().success());
+        assert!(Command::new("zfs")
+            .args(["create", &ds])
+            .status()
+            .unwrap()
+            .success());
     }
     let _c = Cleanup(base.clone());
     let tmp = tempfile::tempdir().unwrap();
@@ -112,7 +145,12 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
     let node = |name: &str, warden: u64, takeover: Option<(u64, u64)>| {
-        Node::new(config(tmp.path(), &base, name, warden, takeover), coord.clone(), Storage::Zfs(Zfs::cli().batched())).unwrap()
+        Node::new(
+            config(tmp.path(), &base, name, warden, takeover),
+            coord.clone(),
+            Storage::Zfs(Zfs::cli().batched()),
+        )
+        .unwrap()
     };
 
     // 1. Born on A.
@@ -123,10 +161,24 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
     let birth = r.settled.birth.expect("a birth Seal");
     assert_eq!(birth.lsn.get(), 2, "right after the Lineage record");
-    assert_eq!((r.settled.rolled_back_to, r.settled.last_seal), (Some(birth), Some(birth)));
-    assert_eq!((r.published, r.publish_failures, r.prune_failures.0), (6, 0, 0), "the birth Seal and 5 turns");
+    assert_eq!(
+        (r.settled.rolled_back_to, r.settled.last_seal),
+        (Some(birth), Some(birth))
+    );
+    assert_eq!(
+        (r.published, r.publish_failures, r.prune_failures.0),
+        (6, 0, 0),
+        "the birth Seal and 5 turns"
+    );
     let s = stats(&a);
-    assert_eq!((s["turns"].clone(), s["sealed"].clone(), s["rows_in_db"].clone()), (json!([1, 5]), json!(5), json!(30)));
+    assert_eq!(
+        (
+            s["turns"].clone(),
+            s["sealed"].clone(),
+            s["rows_in_db"].clone()
+        ),
+        (json!([1, 5]), json!(5), json!(30))
+    );
 
     // 2. Reopened on A after a crashed turn left a file behind: the state
     //    is rolled back to the last Seal, then the agent resumes after turn 5.
@@ -135,13 +187,31 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     let r = a.run_vessel(&a.config.vessels[0]).unwrap();
     println!("A, again: {r:?}\n{}", stats(&a));
     assert_eq!(r.start, Start::Open);
-    assert!(!stray.exists(), "a file written after the last Seal is gone");
+    assert!(
+        !stray.exists(),
+        "a file written after the last Seal is gone"
+    );
     assert_eq!(r.settled.birth, None, "a birth Seal only once");
-    assert!(r.settled.rolled_back_to.is_some_and(|s| s.lsn.get() > 2), "{:?}", r.settled);
+    assert!(
+        r.settled.rolled_back_to.is_some_and(|s| s.lsn.get() > 2),
+        "{:?}",
+        r.settled
+    );
     assert_eq!(r.settled.rolled_back_to, r.settled.last_seal);
-    assert_eq!((r.published, r.publish_failures), (5, 0), "the last Seal was already published: no extra");
+    assert_eq!(
+        (r.published, r.publish_failures),
+        (5, 0),
+        "the last Seal was already published: no extra"
+    );
     let s = stats(&a);
-    assert_eq!((s["resumed_after"].clone(), s["turns"].clone(), s["rows_in_db"].clone()), (json!(5), json!([6, 10]), json!(60)));
+    assert_eq!(
+        (
+            s["resumed_after"].clone(),
+            s["turns"].clone(),
+            s["rows_in_db"].clone()
+        ),
+        (json!(5), json!([6, 10]), json!(60))
+    );
 
     // 3. Reborn on B: resumes after turn 10 with the database of turn 10.
     //    B's operator read who holds it and names exactly that.
@@ -153,10 +223,27 @@ fn born_reopened_reborn_elsewhere_and_refused() {
     assert!(r.agent.as_ref().unwrap().0, "agent failed: {:?}", r.agent);
     assert_eq!(r.settled.birth, None);
     assert!(r.settled.rolled_back_to.is_some());
-    assert_eq!(r.settled.rolled_back_to, r.settled.last_seal, "a reborn dataset is at its last Seal");
+    assert_eq!(
+        r.settled.rolled_back_to, r.settled.last_seal,
+        "a reborn dataset is at its last Seal"
+    );
     let s = stats(&b);
-    assert_eq!((s["resumed_after"].clone(), s["turns"].clone(), s["rows_in_db"].clone()), (json!(10), json!([11, 15]), json!(90)));
-    assert_eq!(coord.ownership(a.config.vessels[0].id()).unwrap().holder.get(), 2);
+    assert_eq!(
+        (
+            s["resumed_after"].clone(),
+            s["turns"].clone(),
+            s["rows_in_db"].clone()
+        ),
+        (json!(10), json!([11, 15]), json!(90))
+    );
+    assert_eq!(
+        coord
+            .ownership(a.config.vessels[0].id())
+            .unwrap()
+            .holder
+            .get(),
+        2
+    );
 
     // 4. A may not take it back unasked.
     let e = a.run_vessel(&a.config.vessels[0]).unwrap_err();
@@ -200,19 +287,28 @@ struct Seen {
 }
 
 fn taso_sim_processes() -> usize {
-    let out = Command::new("pgrep").args(["-f", "^/usr/bin/taso-sim --turns 20 --turn-sleep-ms"]).output().unwrap();
+    let out = Command::new("pgrep")
+        .args(["-f", "^/usr/bin/taso-sim --turns 20 --turn-sleep-ms"])
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).lines().count()
 }
 
 fn snapshots(dataset: &str) -> usize {
-    let out = Command::new("zfs").args(["list", "-H", "-t", "snapshot", "-o", "name", "-r", dataset]).output().unwrap();
+    let out = Command::new("zfs")
+        .args(["list", "-H", "-t", "snapshot", "-o", "name", "-r", dataset])
+        .output()
+        .unwrap();
     String::from_utf8_lossy(&out.stdout).lines().count()
 }
 
 fn wait_until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
     let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     while !cond() {
-        assert!(std::time::Instant::now() < end, "timed out after {secs} s waiting for {what}");
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out after {secs} s waiting for {what}"
+        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
@@ -232,9 +328,17 @@ fn wait_until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
 #[test]
 #[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
 fn supervisor_stops_relists_and_restarts_on_a_real_node() {
-    let base = format!("{}/w1-{}", std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"), std::process::id());
+    let base = format!(
+        "{}/w1-{}",
+        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
+        std::process::id()
+    );
     for ds in [base.clone(), format!("{base}/a")] {
-        assert!(Command::new("zfs").args(["create", &ds]).status().unwrap().success());
+        assert!(Command::new("zfs")
+            .args(["create", &ds])
+            .status()
+            .unwrap()
+            .success());
     }
     let _c = Cleanup(base.clone());
     let tmp = tempfile::tempdir().unwrap();
@@ -242,10 +346,29 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
-    let sim = ["--turns", "20", "--turn-sleep-ms", "50", "--txns", "1", "--rows", "1"];
-    let node = Arc::new(Node::new(config_with(tmp.path(), &base, "a", 1, None, &sim), coord, Storage::Zfs(Zfs::cli().batched())).unwrap());
+    let sim = [
+        "--turns",
+        "20",
+        "--turn-sleep-ms",
+        "50",
+        "--txns",
+        "1",
+        "--rows",
+        "1",
+    ];
+    let node = Arc::new(
+        Node::new(
+            config_with(tmp.path(), &base, "a", 1, None, &sim),
+            coord,
+            Storage::Zfs(Zfs::cli().batched()),
+        )
+        .unwrap(),
+    );
     let vessel = node.config.vessels[0].clone();
-    let with = |restart: Restart| VesselConf { restart, ..vessel.clone() };
+    let with = |restart: Restart| VesselConf {
+        restart,
+        ..vessel.clone()
+    };
     let id = vessel.id();
     let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     let dataset = format!("{base}/a/v-{hex}");
@@ -255,36 +378,65 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
     let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sup = {
-        let (node, mut source, shutdown, seen, starts) = (node.clone(), source.clone(), shutdown.clone(), seen.clone(), starts.clone());
-        let timing = Timing { tick: std::time::Duration::from_millis(50), backoff_first: std::time::Duration::from_millis(200), backoff_max: std::time::Duration::from_secs(1), healthy: std::time::Duration::from_secs(600) };
+        let (node, mut source, shutdown, seen, starts) = (
+            node.clone(),
+            source.clone(),
+            shutdown.clone(),
+            seen.clone(),
+            starts.clone(),
+        );
+        let timing = Timing {
+            tick: std::time::Duration::from_millis(50),
+            backoff_first: std::time::Duration::from_millis(200),
+            backoff_max: std::time::Duration::from_secs(1),
+            healthy: std::time::Duration::from_secs(600),
+        };
         std::thread::spawn(move || {
             let guard = Guard::new(node.config.runtime.clone());
             let stats_of = |node: &Node| -> Option<Value> {
-                std::fs::read_to_string(mount(node).join("sim-stats.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+                std::fs::read_to_string(mount(node).join("sim-stats.json"))
+                    .ok()
+                    .and_then(|t| serde_json::from_str(&t).ok())
             };
-            Supervisor::new(node.clone(), guard, timing).run(&mut source, &shutdown, |e: Event<Result<Report, DaemonError>>| match e {
-                Event::Started(_) => {
-                    starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Event::Exited { out, stopped, restart_in, .. } => {
-                    let r = out.expect("the run itself must not fail");
-                    println!("run ended: stopped={stopped} restart_in={restart_in:?} {r:?}");
-                    // Read before any next start rolls the state back.
-                    let stats = if stopped { None } else { stats_of(&node) };
-                    seen.lock().unwrap().push(Seen { stopped: r.stopped, agent_ok: r.agent.as_ref().map(|a| a.0), restarting: restart_in.is_some(), stats });
-                }
-                Event::Panicked { .. } => panic!("a run panicked"),
-                Event::Refused(r) => panic!("refused: {r:?}"),
-                Event::SourceFailed(e) => panic!("{e}"),
-                Event::Stopping(_) => {}
-            })
+            Supervisor::new(node.clone(), guard, timing).run(
+                &mut source,
+                &shutdown,
+                |e: Event<Result<Report, DaemonError>>| match e {
+                    Event::Started(_) => {
+                        starts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Event::Exited {
+                        out,
+                        stopped,
+                        restart_in,
+                        ..
+                    } => {
+                        let r = out.expect("the run itself must not fail");
+                        println!("run ended: stopped={stopped} restart_in={restart_in:?} {r:?}");
+                        // Read before any next start rolls the state back.
+                        let stats = if stopped { None } else { stats_of(&node) };
+                        seen.lock().unwrap().push(Seen {
+                            stopped: r.stopped,
+                            agent_ok: r.agent.as_ref().map(|a| a.0),
+                            restarting: restart_in.is_some(),
+                            stats,
+                        });
+                    }
+                    Event::Panicked { .. } => panic!("a run panicked"),
+                    Event::Refused(r) => panic!("refused: {r:?}"),
+                    Event::SourceFailed(e) => panic!("{e}"),
+                    Event::Stopping(_) => {}
+                },
+            )
         })
     };
     let runs = || seen.lock().unwrap().len();
 
     // 1. Run, then remove mid-run: stopped at once.
     source.push(vec![with(Restart::Never)]);
-    wait_until("3 sealed turns (birth Seal + 3 snapshots)", 60, || snapshots(&dataset) >= 4);
+    wait_until("3 sealed turns (birth Seal + 3 snapshots)", 60, || {
+        snapshots(&dataset) >= 4
+    });
     assert_eq!(taso_sim_processes(), 1, "the agent runs");
     let asked = std::time::Instant::now();
     source.push(vec![]);
@@ -293,9 +445,17 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     {
         let s = &seen.lock().unwrap()[0];
         assert!(s.stopped, "the run reports it was stopped: {s:?}");
-        assert_ne!(s.agent_ok, Some(true), "a killed agent did not exit ok: {s:?}");
+        assert_ne!(
+            s.agent_ok,
+            Some(true),
+            "a killed agent did not exit ok: {s:?}"
+        );
     }
-    assert_eq!(taso_sim_processes(), 0, "no agent process outlives its stop");
+    assert_eq!(
+        taso_sim_processes(),
+        0,
+        "no agent process outlives its stop"
+    );
 
     // 2. Listed again: resumes after its last sealed turn, runs to the end,
     //    and the database holds exactly one row per turn.
@@ -303,13 +463,32 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     wait_until("the second run to end by itself", 120, || runs() == 2);
     let (resumed, last) = {
         let s = &seen.lock().unwrap()[1];
-        assert!(!s.stopped && s.agent_ok == Some(true) && !s.restarting, "{s:?}");
+        assert!(
+            !s.stopped && s.agent_ok == Some(true) && !s.restarting,
+            "{s:?}"
+        );
         let st = s.stats.as_ref().expect("stats of a finished run");
-        let resumed = st["resumed_after"].as_u64().expect("it resumed after a sealed turn");
-        let (first, last) = (st["turns"][0].as_u64().unwrap(), st["turns"][1].as_u64().unwrap());
-        assert!(resumed >= 3, "at least the 3 turns sealed before the stop: {st}");
-        assert_eq!(first, resumed + 1, "resumes right after its last sealed turn: {st}");
-        assert_eq!(st["rows_in_db"].as_u64(), Some(last), "one row per turn, none twice and none lost: {st}");
+        let resumed = st["resumed_after"]
+            .as_u64()
+            .expect("it resumed after a sealed turn");
+        let (first, last) = (
+            st["turns"][0].as_u64().unwrap(),
+            st["turns"][1].as_u64().unwrap(),
+        );
+        assert!(
+            resumed >= 3,
+            "at least the 3 turns sealed before the stop: {st}"
+        );
+        assert_eq!(
+            first,
+            resumed + 1,
+            "resumes right after its last sealed turn: {st}"
+        );
+        assert_eq!(
+            st["rows_in_db"].as_u64(),
+            Some(last),
+            "one row per turn, none twice and none lost: {st}"
+        );
         (resumed, last)
     };
     println!("second run: resumed after {resumed}, ran to {last}");
@@ -325,22 +504,42 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     // its backoff (nothing runs, nothing starts again): either way, every
     // run started has ended.
     let all_ended = || runs() == starts.load(std::sync::atomic::Ordering::SeqCst);
-    wait_until("every started run to end after the removal", 30, || all_ended() && taso_sim_processes() == 0);
+    wait_until("every started run to end after the removal", 30, || {
+        all_ended() && taso_sim_processes() == 0
+    });
     let starts_at_removal = starts.load(std::sync::atomic::Ordering::SeqCst);
     std::thread::sleep(std::time::Duration::from_millis(1500)); // past any backoff
-    assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), starts_at_removal, "never started again once removed");
+    assert_eq!(
+        starts.load(std::sync::atomic::Ordering::SeqCst),
+        starts_at_removal,
+        "never started again once removed"
+    );
     assert_eq!(taso_sim_processes(), 0);
     {
         let seen = seen.lock().unwrap();
-        let finished: Vec<&Value> = seen[2..].iter().filter(|s| !s.stopped).map(|s| s.stats.as_ref().unwrap()).collect();
+        let finished: Vec<&Value> = seen[2..]
+            .iter()
+            .filter(|s| !s.stopped)
+            .map(|s| s.stats.as_ref().unwrap())
+            .collect();
         assert!(finished.len() >= 2, "{seen:?}");
         let mut prev_last = last;
         for st in finished {
-            assert_eq!(st["resumed_after"].as_u64(), Some(prev_last), "each run resumes where the one before ended: {st}");
+            assert_eq!(
+                st["resumed_after"].as_u64(),
+                Some(prev_last),
+                "each run resumes where the one before ended: {st}"
+            );
             prev_last = st["turns"][1].as_u64().unwrap();
             assert_eq!(st["rows_in_db"].as_u64(), Some(prev_last), "{st}");
         }
-        assert!(seen[2..].iter().filter(|s| !s.stopped).all(|s| s.restarting), "always: every run that ended by itself was restarted");
+        assert!(
+            seen[2..]
+                .iter()
+                .filter(|s| !s.stopped)
+                .all(|s| s.restarting),
+            "always: every run that ended by itself was restarted"
+        );
     }
 
     shutdown.request();

@@ -129,7 +129,12 @@ pub trait Blkd {
     fn reset(&mut self, branch: LayerId) -> Result<(), LayerError>;
     /// Write Seal `to` (incremental from the Seal `from`, or full) as a
     /// stream into the new file `path`.
-    fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64, LayerError>;
+    fn export(
+        &mut self,
+        to: LayerId,
+        from: Option<LayerId>,
+        path: &Path,
+    ) -> Result<u64, LayerError>;
     /// Apply the stream in `path` to a detached, clean `branch`.
     fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError>;
     /// Every named branch.
@@ -149,10 +154,16 @@ pub struct Daemon {
 impl Daemon {
     /// The daemon listening on `socket`.
     pub fn new(socket: impl Into<PathBuf>) -> Self {
-        Self { socket: socket.into(), client: None }
+        Self {
+            socket: socket.into(),
+            client: None,
+        }
     }
 
-    fn call<T>(&mut self, f: impl FnOnce(&mut Client) -> Result<T, ClientError>) -> Result<T, LayerError> {
+    fn call<T>(
+        &mut self,
+        f: impl FnOnce(&mut Client) -> Result<T, ClientError>,
+    ) -> Result<T, LayerError> {
         if self.client.is_none() {
             self.client = Some(Client::connect(&self.socket)?);
         }
@@ -200,7 +211,12 @@ impl Blkd for Daemon {
     fn reset(&mut self, branch: LayerId) -> Result<(), LayerError> {
         self.call(|c| c.reset(branch))
     }
-    fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64, LayerError> {
+    fn export(
+        &mut self,
+        to: LayerId,
+        from: Option<LayerId>,
+        path: &Path,
+    ) -> Result<u64, LayerError> {
         self.call(|c| c.export(to, from, path))
     }
     fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError> {
@@ -240,7 +256,10 @@ fn run(cmd: &mut Command) -> io::Result<()> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(io::Error::other(format!("{cmd:?}: {}", String::from_utf8_lossy(&out.stderr).trim())))
+        Err(io::Error::other(format!(
+            "{cmd:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
     }
 }
 
@@ -248,7 +267,9 @@ impl Mounts for System {
     fn mkfs(&self, dev: &Path) -> io::Result<()> {
         // nodiscard: a fresh branch reads zeros already; discarding the
         // whole device would only write records.
-        run(Command::new("mkfs.ext4").args(["-q", "-F", "-E", "nodiscard"]).arg(dev))
+        run(Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-E", "nodiscard"])
+            .arg(dev))
     }
     fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
@@ -256,10 +277,16 @@ impl Mounts for System {
         // block log that is a cheap map change; without it every block
         // ext4 ever wrote stays live, so compaction cannot drop it and
         // Seals and shipped packs carry it.
-        run(Command::new("mount").args(["-o", "discard"]).arg(dev).arg(dir))
+        run(Command::new("mount")
+            .args(["-o", "discard"])
+            .arg(dev)
+            .arg(dir))
     }
     fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
-        Ok(mount_source(&std::fs::read_to_string("/proc/self/mountinfo")?, dir))
+        Ok(mount_source(
+            &std::fs::read_to_string("/proc/self/mountinfo")?,
+            dir,
+        ))
     }
     fn umount(&self, dir: &Path) -> io::Result<()> {
         run(Command::new("umount").arg(dir))
@@ -276,7 +303,12 @@ impl Mounts for System {
 /// (`proc(5)`: field 5 is the mount point, the field after `-` and the
 /// file-system type is the source; spaces are written as `\040`).
 fn mount_source(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
-    let unescape = |s: &str| s.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\");
+    let unescape = |s: &str| {
+        s.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    };
     let want = dir.to_str()?;
     mountinfo
         .lines()
@@ -301,7 +333,12 @@ pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
 
 impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
     fn clone(&self) -> Self {
-        Self { blkd: self.blkd.clone(), mounts: self.mounts.clone(), mount_root: self.mount_root.clone(), spool: self.spool.clone() }
+        Self {
+            blkd: self.blkd.clone(),
+            mounts: self.mounts.clone(),
+            mount_root: self.mount_root.clone(),
+            spool: self.spool.clone(),
+        }
     }
 }
 
@@ -309,27 +346,46 @@ impl BlkPool<Daemon, System> {
     /// The pool served by the daemon on `socket`; dataset `a/b` is mounted
     /// on `<mount_root>/a/b`; shipped streams pass through files in
     /// `spool` (a directory the daemon can write and read, on this host).
-    pub fn new(socket: impl Into<PathBuf>, mount_root: impl Into<PathBuf>, spool: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        socket: impl Into<PathBuf>,
+        mount_root: impl Into<PathBuf>,
+        spool: impl Into<PathBuf>,
+    ) -> Self {
         Self::with(Daemon::new(socket), System, mount_root, spool)
     }
 }
 
 impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// A pool over any daemon and mounts (tests use fakes).
-    pub fn with(blkd: D, mounts: M, mount_root: impl Into<PathBuf>, spool: impl Into<PathBuf>) -> Self {
-        Self { blkd: Arc::new(Mutex::new(blkd)), mounts: Arc::new(mounts), mount_root: mount_root.into(), spool: spool.into() }
+    pub fn with(
+        blkd: D,
+        mounts: M,
+        mount_root: impl Into<PathBuf>,
+        spool: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            blkd: Arc::new(Mutex::new(blkd)),
+            mounts: Arc::new(mounts),
+            mount_root: mount_root.into(),
+            spool: spool.into(),
+        }
     }
 
     /// The [`Sender`] for this pool's Seals.
     pub fn sender(&self) -> BlkSend<D> {
-        BlkSend { blkd: self.blkd.clone(), spool: self.spool.clone() }
+        BlkSend {
+            blkd: self.blkd.clone(),
+            spool: self.spool.clone(),
+        }
     }
 
     /// The Seal layer of `dataset` at `lsn`, as the publisher wants it
     /// (the shape of a ZFS snapshot), or `None` if there is none.
     pub fn snapshot(&self, dataset: &Dataset, lsn: Lsn) -> Result<Option<Snapshot>, LayerError> {
         let mut d = self.blkd.lock().unwrap();
-        let Some(b) = d.find(dataset.as_str())? else { return Ok(None) };
+        let Some(b) = d.find(dataset.as_str())? else {
+            return Ok(None);
+        };
         Ok(seal_at(&mut *d, b, lsn)?.map(|(_, hash)| Snapshot {
             dataset: dataset.clone(),
             seal: lsn,
@@ -345,14 +401,21 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
         let names = self.blkd.lock().unwrap().names()?;
         Ok(names
             .into_iter()
-            .filter_map(|(n, _)| n.strip_prefix(&prefix).filter(|rest| !rest.contains('/')).map(|_| n.clone()))
+            .filter_map(|(n, _)| {
+                n.strip_prefix(&prefix)
+                    .filter(|rest| !rest.contains('/'))
+                    .map(|_| n.clone())
+            })
             .filter_map(|n| Dataset::new(&n).ok())
             .collect())
     }
 
     /// The uids owning files in `dataset` (it is mounted for the walk if
     /// it is not).  What `zfs userspace` answers for ZFS.
-    pub fn owner_uids(&self, dataset: &Dataset) -> Result<std::collections::BTreeSet<u32>, LayerError> {
+    pub fn owner_uids(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<std::collections::BTreeSet<u32>, LayerError> {
         use std::os::unix::fs::MetadataExt;
         self.ensure_mounted(dataset)?;
         let mut uids = std::collections::BTreeSet::new();
@@ -380,7 +443,12 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// returned guard drops.
     fn spool_in(&self, stream: &mut dyn io::Read) -> Result<SpoolFile, LayerError> {
         let f = SpoolFile::new(&self.spool, "recv")?;
-        let mut out = std::io::BufWriter::new(std::fs::OpenOptions::new().write(true).create_new(true).open(&f.0)?);
+        let mut out = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&f.0)?,
+        );
         io::copy(stream, &mut out)?;
         let file = out.into_inner().map_err(|e| e.into_error())?;
         file.sync_all()?;
@@ -388,7 +456,12 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     }
 
     /// Import the spooled stream into `b`, then Seal it with `to`'s tag.
-    fn import_and_seal(d: &mut D, b: LayerId, file: &SpoolFile, to: (Lsn, HashVal)) -> Result<u64, LayerError> {
+    fn import_and_seal(
+        d: &mut D,
+        b: LayerId,
+        file: &SpoolFile,
+        to: (Lsn, HashVal),
+    ) -> Result<u64, LayerError> {
         d.import(b, &file.0)?;
         d.seal(b, &tag(to.0, to.1))?;
         d.flush()?;
@@ -404,31 +477,58 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// mounted (after a daemon restart devices are gone: they are lazy).
     pub fn ensure_mounted(&self, dataset: &Dataset) -> Result<PathBuf, LayerError> {
         let mut d = self.blkd.lock().unwrap();
-        let b = d.find(dataset.as_str())?.ok_or_else(|| format!("no dataset {dataset}"))?;
+        let b = d
+            .find(dataset.as_str())?
+            .ok_or_else(|| format!("no dataset {dataset}"))?;
         self.mount_branch(&mut *d, b, dataset)
     }
 
-    fn mount_branch(&self, d: &mut D, b: LayerId, dataset: &Dataset) -> Result<PathBuf, LayerError> {
+    fn mount_branch(
+        &self,
+        d: &mut D,
+        b: LayerId,
+        dataset: &Dataset,
+    ) -> Result<PathBuf, LayerError> {
         mount_branch(d, &*self.mounts, b, &self.mountpoint(dataset))
     }
 
     fn info_locked(&self, d: &mut D, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
-        let Some(b) = d.find(dataset.as_str())? else { return Ok(None) };
+        let Some(b) = d.find(dataset.as_str())? else {
+            return Ok(None);
+        };
         let (origin, parent) = lineage(d, b)?;
-        Ok(Some(DatasetInfo { dataset: dataset.clone(), mountpoint: Some(self.mountpoint(dataset)), origin, parent }))
+        Ok(Some(DatasetInfo {
+            dataset: dataset.clone(),
+            mountpoint: Some(self.mountpoint(dataset)),
+            origin,
+            parent,
+        }))
     }
 }
 
 /// Give branch `b` a device if it has none and mount it on `mp` if nothing
 /// is mounted there; refuse if something else is.  Returns the device.
-fn mount_branch<D: Blkd, M: Mounts>(d: &mut D, m: &M, b: LayerId, mp: &Path) -> Result<PathBuf, LayerError> {
+fn mount_branch<D: Blkd, M: Mounts>(
+    d: &mut D,
+    m: &M,
+    b: LayerId,
+    mp: &Path,
+) -> Result<PathBuf, LayerError> {
     let dev = match d.info(b)?.dev {
         Some(dev) => dev,
         None => d.attach(b)?,
     };
     match m.source(mp)? {
         Some(src) if src == dev => {}
-        Some(other) => return Err(format!("{} is mounted from {}, not {}", mp.display(), other.display(), dev.display()).into()),
+        Some(other) => {
+            return Err(format!(
+                "{} is mounted from {}, not {}",
+                mp.display(),
+                other.display(),
+                dev.display()
+            )
+            .into())
+        }
         None => m.mount(&dev, mp)?,
     }
     Ok(dev)
@@ -436,7 +536,10 @@ fn mount_branch<D: Blkd, M: Mounts>(d: &mut D, m: &M, b: LayerId, mp: &Path) -> 
 
 /// A clone's origin (`source@taso-seal-<lsn>`) and parent hash, read from
 /// the ancestry of branch `b`: `(None, None)` for a void birth.
-fn lineage<D: Blkd>(d: &mut D, b: LayerId) -> Result<(Option<String>, Option<HashVal>), LayerError> {
+fn lineage<D: Blkd>(
+    d: &mut D,
+    b: LayerId,
+) -> Result<(Option<String>, Option<HashVal>), LayerError> {
     let mut cur = d.info(b)?.parent;
     while let Some(l) = cur {
         let i = d.info(l)?;
@@ -444,9 +547,18 @@ fn lineage<D: Blkd>(d: &mut D, b: LayerId) -> Result<(Option<String>, Option<Has
             cur = i.parent; // a Seal this branch made: keep walking
             continue;
         }
-        let Some(src) = i.origin else { return Ok((None, None)) }; // a root Seal: void birth
-        let (lsn, hash) = i.tag.as_deref().and_then(untag).ok_or_else(|| format!("{b}'s origin Seal {l} has no Taso tag"))?;
-        let name = d.info(src)?.name.ok_or_else(|| format!("{b}'s origin branch {src} has no name"))?;
+        let Some(src) = i.origin else {
+            return Ok((None, None));
+        }; // a root Seal: void birth
+        let (lsn, hash) = i
+            .tag
+            .as_deref()
+            .and_then(untag)
+            .ok_or_else(|| format!("{b}'s origin Seal {l} has no Taso tag"))?;
+        let name = d
+            .info(src)?
+            .name
+            .ok_or_else(|| format!("{b}'s origin branch {src} has no name"))?;
         let source = Dataset::new(&name).map_err(|e| e.to_string())?;
         return Ok((Some(source.seal_snapshot(lsn)), Some(hash)));
     }
@@ -454,8 +566,14 @@ fn lineage<D: Blkd>(d: &mut D, b: LayerId) -> Result<(Option<String>, Option<Has
 }
 
 /// The Seal of `branch` bound to `lsn`: `Ok(None)` if there is none.
-fn seal_at<D: Blkd>(d: &mut D, branch: LayerId, lsn: Lsn) -> Result<Option<(LayerId, HashVal)>, LayerError> {
-    Ok(d.seals(branch)?.into_iter().find_map(|(l, t)| untag(&t).filter(|(n, _)| *n == lsn).map(|(_, h)| (l, h))))
+fn seal_at<D: Blkd>(
+    d: &mut D,
+    branch: LayerId,
+    lsn: Lsn,
+) -> Result<Option<(LayerId, HashVal)>, LayerError> {
+    Ok(d.seals(branch)?
+        .into_iter()
+        .find_map(|(l, t)| untag(&t).filter(|(n, _)| *n == lsn).map(|(_, h)| (l, h))))
 }
 
 impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
@@ -486,12 +604,25 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
         Ok(self.info_locked(&mut *d, dataset)?.expect("just made"))
     }
 
-    fn clone(&self, source: &Dataset, seal: Lsn, seal_hash: HashVal, target: &Dataset) -> Result<DatasetInfo, LayerError> {
+    fn clone(
+        &self,
+        source: &Dataset,
+        seal: Lsn,
+        seal_hash: HashVal,
+        target: &Dataset,
+    ) -> Result<DatasetInfo, LayerError> {
         let mut d = self.blkd.lock().unwrap();
-        let src = d.find(source.as_str())?.ok_or_else(|| format!("no dataset {source}"))?;
-        let (layer, hash) = seal_at(&mut *d, src, seal)?.ok_or_else(|| format!("no Seal layer {}", source.seal_snapshot(seal)))?;
+        let src = d
+            .find(source.as_str())?
+            .ok_or_else(|| format!("no dataset {source}"))?;
+        let (layer, hash) = seal_at(&mut *d, src, seal)?
+            .ok_or_else(|| format!("no Seal layer {}", source.seal_snapshot(seal)))?;
         if hash != seal_hash {
-            return Err(format!("Seal layer {} is bound to another record", source.seal_snapshot(seal)).into());
+            return Err(format!(
+                "Seal layer {} is bound to another record",
+                source.seal_snapshot(seal)
+            )
+            .into());
         }
         if d.find(target.as_str())?.is_some() {
             return Err(format!("dataset {target} already exists").into());
@@ -536,7 +667,15 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
             let mut d = self.blkd.lock().unwrap();
             if let Some(b) = d.find(dataset.as_str())? {
                 if let Some((_, h)) = seal_at(&mut *d, b, to.0)? {
-                    return if h == to.1 { Ok(guid(to.0, to.1)) } else { Err(format!("Seal layer {} is bound to another record", dataset.seal_snapshot(to.0)).into()) };
+                    return if h == to.1 {
+                        Ok(guid(to.0, to.1))
+                    } else {
+                        Err(format!(
+                            "Seal layer {} is bound to another record",
+                            dataset.seal_snapshot(to.0)
+                        )
+                        .into())
+                    };
                 }
             }
         }
@@ -545,7 +684,9 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
         match from {
             None => {
                 if d.find(dataset.as_str())?.is_some() {
-                    return Err(format!("dataset {dataset} exists; a full stream needs a new one").into());
+                    return Err(
+                        format!("dataset {dataset} exists; a full stream needs a new one").into(),
+                    );
                 }
                 let root = d.root()?;
                 let b = d.branch(root, dataset.as_str())?;
@@ -556,17 +697,34 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
                 })
             }
             Some((lsn, hash)) => {
-                let b = d.find(dataset.as_str())?.ok_or_else(|| format!("no dataset {dataset} to receive into"))?;
-                let (layer, bound) = seal_at(&mut *d, b, lsn)?.ok_or_else(|| format!("no Seal layer {} to receive onto", dataset.seal_snapshot(lsn)))?;
+                let b = d
+                    .find(dataset.as_str())?
+                    .ok_or_else(|| format!("no dataset {dataset} to receive into"))?;
+                let (layer, bound) = seal_at(&mut *d, b, lsn)?.ok_or_else(|| {
+                    format!(
+                        "no Seal layer {} to receive onto",
+                        dataset.seal_snapshot(lsn)
+                    )
+                })?;
                 if bound != hash {
-                    return Err(format!("Seal layer {} is bound to another record", dataset.seal_snapshot(lsn)).into());
+                    return Err(format!(
+                        "Seal layer {} is bound to another record",
+                        dataset.seal_snapshot(lsn)
+                    )
+                    .into());
                 }
                 let info = d.info(b)?;
                 if info.parent != Some(layer) {
-                    return Err(format!("{dataset} does not stand on {}", dataset.seal_snapshot(lsn)).into());
+                    return Err(format!(
+                        "{dataset} does not stand on {}",
+                        dataset.seal_snapshot(lsn)
+                    )
+                    .into());
                 }
                 if info.dev.is_some() {
-                    return Err(format!("{dataset} is attached; a received dataset is not in use").into());
+                    return Err(
+                        format!("{dataset} is attached; a received dataset is not in use").into(),
+                    );
                 }
                 d.reset(b)?; // whatever an interrupted receive left
                 Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
@@ -588,20 +746,43 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
             let mut d = self.blkd.lock().unwrap();
             if let Some(b) = d.find(dataset.as_str())? {
                 if let Some((_, h)) = seal_at(&mut *d, b, to.0)? {
-                    return if h == to.1 { Ok(guid(to.0, to.1)) } else { Err(format!("Seal layer {} is bound to another record", dataset.seal_snapshot(to.0)).into()) };
+                    return if h == to.1 {
+                        Ok(guid(to.0, to.1))
+                    } else {
+                        Err(format!(
+                            "Seal layer {} is bound to another record",
+                            dataset.seal_snapshot(to.0)
+                        )
+                        .into())
+                    };
                 }
                 return Err(format!("dataset {dataset} exists without Seal {}", to.0.get()).into());
             }
         }
         if base.guid != guid(base.seal, base.hash) {
-            return Err(format!("the base {} has another guid", base.dataset.seal_snapshot(base.seal)).into());
+            return Err(format!(
+                "the base {} has another guid",
+                base.dataset.seal_snapshot(base.seal)
+            )
+            .into());
         }
         let file = self.spool_in(stream)?;
         let mut d = self.blkd.lock().unwrap();
-        let src = d.find(base.dataset.as_str())?.ok_or_else(|| format!("no base dataset {}", base.dataset))?;
-        let (layer, bound) = seal_at(&mut *d, src, base.seal)?.ok_or_else(|| format!("no base Seal layer {}", base.dataset.seal_snapshot(base.seal)))?;
+        let src = d
+            .find(base.dataset.as_str())?
+            .ok_or_else(|| format!("no base dataset {}", base.dataset))?;
+        let (layer, bound) = seal_at(&mut *d, src, base.seal)?.ok_or_else(|| {
+            format!(
+                "no base Seal layer {}",
+                base.dataset.seal_snapshot(base.seal)
+            )
+        })?;
         if bound != base.hash {
-            return Err(format!("base Seal layer {} is bound to another record", base.dataset.seal_snapshot(base.seal)).into());
+            return Err(format!(
+                "base Seal layer {} is bound to another record",
+                base.dataset.seal_snapshot(base.seal)
+            )
+            .into());
         }
         let b = d.branch(layer, dataset.as_str())?;
         Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
@@ -626,16 +807,26 @@ impl<D: Blkd> Sender for BlkSend<D> {
         let file = SpoolFile::new(&self.spool, "send")?;
         {
             let mut d = self.blkd.lock().unwrap();
-            let b = d.find(dataset.as_str()).map_err(err)?.ok_or_else(|| io::Error::other(format!("no dataset {dataset}")))?;
-            let (to_layer, _) = seal_at(&mut *d, b, to)
+            let b = d
+                .find(dataset.as_str())
                 .map_err(err)?
-                .ok_or_else(|| io::Error::other(format!("no Seal layer {}", dataset.seal_snapshot(to))))?;
+                .ok_or_else(|| io::Error::other(format!("no dataset {dataset}")))?;
+            let (to_layer, _) = seal_at(&mut *d, b, to).map_err(err)?.ok_or_else(|| {
+                io::Error::other(format!("no Seal layer {}", dataset.seal_snapshot(to)))
+            })?;
             let from_layer = match from {
                 None => None,
                 Some(name) => {
-                    let (fds, flsn) = parse_seal_name(name).ok_or_else(|| io::Error::other(format!("{name:?} is not a Seal snapshot name")))?;
-                    let fb = d.find(fds.as_str()).map_err(err)?.ok_or_else(|| io::Error::other(format!("no dataset {fds}")))?;
-                    let (l, _) = seal_at(&mut *d, fb, flsn).map_err(err)?.ok_or_else(|| io::Error::other(format!("no Seal layer {name}")))?;
+                    let (fds, flsn) = parse_seal_name(name).ok_or_else(|| {
+                        io::Error::other(format!("{name:?} is not a Seal snapshot name"))
+                    })?;
+                    let fb = d
+                        .find(fds.as_str())
+                        .map_err(err)?
+                        .ok_or_else(|| io::Error::other(format!("no dataset {fds}")))?;
+                    let (l, _) = seal_at(&mut *d, fb, flsn)
+                        .map_err(err)?
+                        .ok_or_else(|| io::Error::other(format!("no Seal layer {name}")))?;
                     Some(l)
                 }
             };
@@ -660,8 +851,13 @@ impl SpoolFile {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         std::fs::create_dir_all(dir)?;
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        Ok(Self(dir.join(format!("{kind}-{}-{n}-{nanos}.blks", std::process::id()))))
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        Ok(Self(dir.join(format!(
+            "{kind}-{}-{n}-{nanos}.blks",
+            std::process::id()
+        ))))
     }
 }
 
@@ -683,7 +879,8 @@ pub struct BlkLayers<D: Blkd = Daemon, M: Mounts = System> {
 
 impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
     fn branch(&self, d: &mut D) -> Result<LayerId, LayerError> {
-        Ok(d.find(self.dataset.as_str())?.ok_or_else(|| format!("no dataset {}", self.dataset))?)
+        Ok(d.find(self.dataset.as_str())?
+            .ok_or_else(|| format!("no dataset {}", self.dataset))?)
     }
 }
 
@@ -706,7 +903,13 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 thawed?;
             }
             (_, Some(src)) => {
-                return Err(format!("{} is mounted from {}, not from {}'s device; not freezing it", self.mountpoint.display(), src.display(), self.dataset).into());
+                return Err(format!(
+                    "{} is mounted from {}, not from {}'s device; not freezing it",
+                    self.mountpoint.display(),
+                    src.display(),
+                    self.dataset
+                )
+                .into());
             }
             (_, None) => {
                 d.seal(b, &t)?; // nothing mounted: the device is quiet
@@ -718,7 +921,11 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
         let mut d = self.blkd.lock().unwrap();
         let b = self.branch(&mut *d)?;
-        let by_lsn: BTreeMap<Lsn, HashVal> = d.seals(b)?.into_iter().filter_map(|(_, t)| untag(&t)).collect();
+        let by_lsn: BTreeMap<Lsn, HashVal> = d
+            .seals(b)?
+            .into_iter()
+            .filter_map(|(_, t)| untag(&t))
+            .collect();
         Ok(by_lsn.into_iter().collect())
     }
 
@@ -741,21 +948,45 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
         let mut d = self.blkd.lock().unwrap();
         let b = self.branch(&mut *d)?;
         let own = d.seals(b)?;
-        let (layer, bound) = seal_at(&mut *d, b, lsn)?.ok_or_else(|| format!("no Seal layer {}", self.dataset.seal_snapshot(lsn)))?;
+        let (layer, bound) = seal_at(&mut *d, b, lsn)?
+            .ok_or_else(|| format!("no Seal layer {}", self.dataset.seal_snapshot(lsn)))?;
         if bound != hash {
-            return Err(format!("Seal layer {} is bound to another record", self.dataset.seal_snapshot(lsn)).into());
+            return Err(format!(
+                "Seal layer {} is bound to another record",
+                self.dataset.seal_snapshot(lsn)
+            )
+            .into());
         }
-        if let Some(later) = own.iter().filter_map(|(_, t)| untag(t)).map(|(n, _)| n).find(|n| *n > lsn) {
-            return Err(format!("a later layer exists ({}); not rolling back", self.dataset.seal_snapshot(later)).into());
+        if let Some(later) = own
+            .iter()
+            .filter_map(|(_, t)| untag(t))
+            .map(|(n, _)| n)
+            .find(|n| *n > lsn)
+        {
+            return Err(format!(
+                "a later layer exists ({}); not rolling back",
+                self.dataset.seal_snapshot(later)
+            )
+            .into());
         }
         let info = d.info(b)?;
         if info.parent != Some(layer) {
-            return Err(format!("{} does not stand on its newest layer; not rolling back", self.dataset).into());
+            return Err(format!(
+                "{} does not stand on its newest layer; not rolling back",
+                self.dataset
+            )
+            .into());
         }
         let was_mounted = match (info.dev.as_ref(), self.mounts.source(&self.mountpoint)?) {
             (Some(dev), Some(src)) if &src == dev => true,
             (_, Some(src)) => {
-                return Err(format!("{} is mounted from {}, not from {}'s device", self.mountpoint.display(), src.display(), self.dataset).into())
+                return Err(format!(
+                    "{} is mounted from {}, not from {}'s device",
+                    self.mountpoint.display(),
+                    src.display(),
+                    self.dataset
+                )
+                .into())
             }
             (_, None) => false,
         };
@@ -805,7 +1036,12 @@ mod tests {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::create(&dir.path().join("log")).unwrap();
-            Self { _dir: dir, store, devs: HashMap::new(), fail_seal: false }
+            Self {
+                _dir: dir,
+                store,
+                devs: HashMap::new(),
+                fail_seal: false,
+            }
         }
     }
 
@@ -837,12 +1073,21 @@ mod tests {
             Ok(self.store.find(name))
         }
         fn seals(&mut self, branch: LayerId) -> Result<Vec<(LayerId, Vec<u8>)>, LayerError> {
-            Ok(self.store.seals_of(branch).into_iter().map(|l| (l, self.store.tag(l).unwrap().to_vec())).collect())
+            Ok(self
+                .store
+                .seals_of(branch)
+                .into_iter()
+                .map(|l| (l, self.store.tag(l).unwrap().to_vec()))
+                .collect())
         }
         fn info(&mut self, l: LayerId) -> Result<Info, LayerError> {
             let kind = self.store.map().kind(l)?;
             Ok(Info {
-                kind: if kind == Kind::Branch { LayerKind::Branch } else { LayerKind::Seal },
+                kind: if kind == Kind::Branch {
+                    LayerKind::Branch
+                } else {
+                    LayerKind::Seal
+                },
                 parent: self.store.map().parent(l)?,
                 name: self.store.name_of(l).map(str::to_string),
                 tag: self.store.tag(l).map(<[u8]>::to_vec),
@@ -860,7 +1105,10 @@ mod tests {
             Ok(())
         }
         fn detach(&mut self, branch: LayerId) -> Result<(), LayerError> {
-            self.devs.remove(&branch).map(|_| ()).ok_or_else(|| format!("{branch} is not attached").into())
+            self.devs
+                .remove(&branch)
+                .map(|_| ())
+                .ok_or_else(|| format!("{branch} is not attached").into())
         }
         fn reset(&mut self, branch: LayerId) -> Result<(), LayerError> {
             if self.devs.contains_key(&branch) {
@@ -868,8 +1116,16 @@ mod tests {
             }
             Ok(self.store.reset(branch)?)
         }
-        fn export(&mut self, to: LayerId, from: Option<LayerId>, path: &Path) -> Result<u64, LayerError> {
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        fn export(
+            &mut self,
+            to: LayerId,
+            from: Option<LayerId>,
+            path: &Path,
+        ) -> Result<u64, LayerError> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
             Ok(self.store.export(to, from, &mut f)?)
         }
         fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError> {
@@ -899,35 +1155,55 @@ mod tests {
 
     impl Mounts for FakeMounts {
         fn mkfs(&self, dev: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push(format!("mkfs {}", dev.display()));
+            self.calls
+                .borrow_mut()
+                .push(format!("mkfs {}", dev.display()));
             if *self.fail_mkfs.borrow() {
                 return Err(io::Error::other("mkfs failed"));
             }
             Ok(())
         }
         fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push(format!("mount {} {}", dev.display(), dir.display()));
-            self.table.borrow_mut().insert(dir.to_path_buf(), dev.to_path_buf());
+            self.calls
+                .borrow_mut()
+                .push(format!("mount {} {}", dev.display(), dir.display()));
+            self.table
+                .borrow_mut()
+                .insert(dir.to_path_buf(), dev.to_path_buf());
             Ok(())
         }
         fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
             Ok(self.table.borrow().get(dir).cloned())
         }
         fn umount(&self, dir: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push(format!("umount {}", dir.display()));
+            self.calls
+                .borrow_mut()
+                .push(format!("umount {}", dir.display()));
             if *self.busy.borrow() {
                 return Err(io::Error::other("target is busy"));
             }
-            self.table.borrow_mut().remove(dir).map(|_| ()).ok_or_else(|| io::Error::other("not mounted"))
+            self.table
+                .borrow_mut()
+                .remove(dir)
+                .map(|_| ())
+                .ok_or_else(|| io::Error::other("not mounted"))
         }
         fn freeze(&self, dir: &Path) -> io::Result<()> {
-            assert!(self.table.borrow().contains_key(dir), "froze {} which is not a mount", dir.display());
-            self.calls.borrow_mut().push(format!("freeze {}", dir.display()));
+            assert!(
+                self.table.borrow().contains_key(dir),
+                "froze {} which is not a mount",
+                dir.display()
+            );
+            self.calls
+                .borrow_mut()
+                .push(format!("freeze {}", dir.display()));
             self.frozen.borrow_mut().push(dir.to_path_buf());
             Ok(())
         }
         fn thaw(&self, dir: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push(format!("thaw {}", dir.display()));
+            self.calls
+                .borrow_mut()
+                .push(format!("thaw {}", dir.display()));
             self.frozen.borrow_mut().retain(|d| d != dir);
             Ok(())
         }
@@ -969,9 +1245,20 @@ mod tests {
 92 22 0:50 / /mnt/with\\040space rw - tmpfs tmp\\040fs rw
 93 90 259:9 / /mnt/taso/tank/v-1 rw - ext4 /dev/ublkb9 rw
 ";
-        assert_eq!(mount_source(mi, Path::new("/mnt/taso/tank/v-1")), Some("/dev/ublkb9".into()), "the last mount on top wins");
-        assert_eq!(mount_source(mi, Path::new("/mnt/with space")), Some("tmp fs".into()));
-        assert_eq!(mount_source(mi, Path::new("/mnt/taso/tank")), None, "a directory under / is not a mount point");
+        assert_eq!(
+            mount_source(mi, Path::new("/mnt/taso/tank/v-1")),
+            Some("/dev/ublkb9".into()),
+            "the last mount on top wins"
+        );
+        assert_eq!(
+            mount_source(mi, Path::new("/mnt/with space")),
+            Some("tmp fs".into())
+        );
+        assert_eq!(
+            mount_source(mi, Path::new("/mnt/taso/tank")),
+            None,
+            "a directory under / is not a mount point"
+        );
         assert_eq!(mount_source(mi, Path::new("/")), Some("/dev/vda2".into()));
     }
 
@@ -987,7 +1274,13 @@ mod tests {
             let b = d.find("tank/v-a").unwrap().unwrap();
             d.info(b).unwrap().dev.unwrap()
         };
-        assert_eq!(calls(&p), [format!("mkfs {}", dev.display()), format!("mount {} /mnt/taso/tank/v-a", dev.display())]);
+        assert_eq!(
+            calls(&p),
+            [
+                format!("mkfs {}", dev.display()),
+                format!("mount {} /mnt/taso/tank/v-a", dev.display())
+            ]
+        );
         assert!(p.layers(&a).list().unwrap().is_empty());
         assert!(p.create(&a).is_err(), "a dataset is created once");
         assert_eq!(p.info(&ds("tank/none")).unwrap(), None);
@@ -998,7 +1291,11 @@ mod tests {
         let p = pool();
         *p.mounts.fail_mkfs.borrow_mut() = true;
         assert!(p.create(&ds("tank/v-a")).is_err());
-        assert_eq!(p.info(&ds("tank/v-a")).unwrap(), None, "no half-made dataset");
+        assert_eq!(
+            p.info(&ds("tank/v-a")).unwrap(),
+            None,
+            "no half-made dataset"
+        );
         *p.mounts.fail_mkfs.borrow_mut() = false;
         p.create(&ds("tank/v-a")).unwrap();
     }
@@ -1012,8 +1309,19 @@ mod tests {
         let mut l = p.layers(&a);
         l.snapshot(Lsn::new(2), h(2)).unwrap();
         l.snapshot(Lsn::new(5), h(5)).unwrap();
-        assert_eq!(calls(&p), ["freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a", "freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a"]);
-        assert_eq!(l.list().unwrap(), [(Lsn::new(2), h(2)), (Lsn::new(5), h(5))]);
+        assert_eq!(
+            calls(&p),
+            [
+                "freeze /mnt/taso/tank/v-a",
+                "thaw /mnt/taso/tank/v-a",
+                "freeze /mnt/taso/tank/v-a",
+                "thaw /mnt/taso/tank/v-a"
+            ]
+        );
+        assert_eq!(
+            l.list().unwrap(),
+            [(Lsn::new(2), h(2)), (Lsn::new(5), h(5))]
+        );
         assert!(l.snapshot(Lsn::new(5), h(6)).is_err(), "one layer per lsn");
         assert_eq!(l.list().unwrap().len(), 2);
     }
@@ -1023,7 +1331,10 @@ mod tests {
         let p = pool();
         let a = ds("tank/v-a");
         p.create(&a).unwrap();
-        p.mounts.table.borrow_mut().insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
+        p.mounts
+            .table
+            .borrow_mut()
+            .insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
         calls(&p);
         assert!(p.layers(&a).snapshot(Lsn::new(2), h(2)).is_err());
         assert!(calls(&p).is_empty(), "no freeze, no seal");
@@ -1038,7 +1349,10 @@ mod tests {
         calls(&p);
         p.blkd.lock().unwrap().fail_seal = true;
         assert!(p.layers(&a).snapshot(Lsn::new(2), h(2)).is_err());
-        assert_eq!(calls(&p), ["freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a"]);
+        assert_eq!(
+            calls(&p),
+            ["freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a"]
+        );
         assert!(p.mounts.frozen.borrow().is_empty());
     }
 
@@ -1061,22 +1375,45 @@ mod tests {
         p.create(&a).unwrap();
         p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
         p.layers(&a).snapshot(Lsn::new(4), h(4)).unwrap();
-        assert!(Pool::clone(&p, &a, Lsn::new(2), h(9), &c).is_err(), "bound to another record");
-        assert!(Pool::clone(&p, &a, Lsn::new(3), h(3), &c).is_err(), "no such layer");
+        assert!(
+            Pool::clone(&p, &a, Lsn::new(2), h(9), &c).is_err(),
+            "bound to another record"
+        );
+        assert!(
+            Pool::clone(&p, &a, Lsn::new(3), h(3), &c).is_err(),
+            "no such layer"
+        );
         assert_eq!(p.info(&c).unwrap(), None, "refusals make nothing");
         calls(&p);
         let info = Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
-        assert_eq!(info.origin.as_deref(), Some(a.seal_snapshot(Lsn::new(2)).as_str()));
+        assert_eq!(
+            info.origin.as_deref(),
+            Some(a.seal_snapshot(Lsn::new(2)).as_str())
+        );
         assert_eq!(info.parent, Some(h(2)));
         assert_eq!(info.origin_seal(), Some((a.clone(), Lsn::new(2))));
         let mounted = calls(&p);
         assert_eq!(mounted.len(), 1, "mounted, not formatted: {mounted:?}");
         assert!(mounted[0].starts_with("mount ") && mounted[0].ends_with(" /mnt/taso/tank/v-c"));
-        assert!(p.layers(&c).list().unwrap().is_empty(), "a clone has no layers of its own");
+        assert!(
+            p.layers(&c).list().unwrap().is_empty(),
+            "a clone has no layers of its own"
+        );
         p.layers(&c).snapshot(Lsn::new(3), h(33)).unwrap();
-        assert_eq!(p.info(&c).unwrap().unwrap().origin_seal(), Some((a.clone(), Lsn::new(2))), "own Seals do not change the origin");
-        assert_eq!(p.layers(&a).list().unwrap().len(), 2, "the source keeps its layers");
-        assert!(Pool::clone(&p, &a, Lsn::new(2), h(2), &c).is_err(), "a target is made once");
+        assert_eq!(
+            p.info(&c).unwrap().unwrap().origin_seal(),
+            Some((a.clone(), Lsn::new(2))),
+            "own Seals do not change the origin"
+        );
+        assert_eq!(
+            p.layers(&a).list().unwrap().len(),
+            2,
+            "the source keeps its layers"
+        );
+        assert!(
+            Pool::clone(&p, &a, Lsn::new(2), h(2), &c).is_err(),
+            "a target is made once"
+        );
     }
 
     #[test]
@@ -1102,7 +1439,10 @@ mod tests {
         p.mounts.table.borrow_mut().clear();
         calls(&p);
         let dev = p.ensure_mounted(&a).unwrap();
-        assert_eq!(calls(&p), [format!("mount {} /mnt/taso/tank/v-a", dev.display())]);
+        assert_eq!(
+            calls(&p),
+            [format!("mount {} /mnt/taso/tank/v-a", dev.display())]
+        );
         assert_eq!(p.ensure_mounted(&a).unwrap(), dev);
         assert!(calls(&p).is_empty(), "already mounted: nothing to do");
     }
@@ -1113,7 +1453,10 @@ mod tests {
         assert_ne!(guid(Lsn::new(3), h(1)), guid(Lsn::new(4), h(1)));
         assert_ne!(guid(Lsn::new(3), h(1)), guid(Lsn::new(3), h(2)));
         let a = ds("tank/v-a");
-        assert_eq!(parse_seal_name(&a.seal_snapshot(Lsn::new(7))), Some((a, Lsn::new(7))));
+        assert_eq!(
+            parse_seal_name(&a.seal_snapshot(Lsn::new(7))),
+            Some((a, Lsn::new(7)))
+        );
         assert_eq!(parse_seal_name("tank/v-a@other-7"), None);
         assert_eq!(parse_seal_name("tank/v-a"), None);
     }
@@ -1121,7 +1464,12 @@ mod tests {
     #[test]
     fn snapshots_children_and_owner_uids() {
         let mounts = tempfile::tempdir().unwrap();
-        let p = BlkPool::with(StoreBlkd::new(), FakeMounts::default(), mounts.path(), mounts.path().join("spool"));
+        let p = BlkPool::with(
+            StoreBlkd::new(),
+            FakeMounts::default(),
+            mounts.path(),
+            mounts.path().join("spool"),
+        );
         let (a, c) = (ds("tank/vessels/v-a"), ds("tank/vessels/v-c"));
         p.create(&a).unwrap();
         p.create(&c).unwrap();
@@ -1129,16 +1477,32 @@ mod tests {
         p.create(&ds("tank/vessels/v-a/deeper")).unwrap();
         p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
         let snap = p.snapshot(&a, Lsn::new(2)).unwrap().unwrap();
-        assert_eq!((snap.name(), snap.guid, snap.seal_hash), (a.seal_snapshot(Lsn::new(2)), guid(Lsn::new(2), h(2)), Some(h(2))));
+        assert_eq!(
+            (snap.name(), snap.guid, snap.seal_hash),
+            (
+                a.seal_snapshot(Lsn::new(2)),
+                guid(Lsn::new(2), h(2)),
+                Some(h(2))
+            )
+        );
         assert_eq!(p.snapshot(&a, Lsn::new(3)).unwrap(), None);
         assert_eq!(p.snapshot(&ds("tank/none"), Lsn::new(2)).unwrap(), None);
-        assert_eq!(p.children(&ds("tank/vessels")).unwrap(), [a.clone(), c.clone()], "direct children only");
+        assert_eq!(
+            p.children(&ds("tank/vessels")).unwrap(),
+            [a.clone(), c.clone()],
+            "direct children only"
+        );
         // owner_uids walks the mounted tree (here a plain directory).
         let mp = p.mountpoint(&a);
         std::fs::create_dir_all(mp.join("d")).unwrap();
         std::fs::write(mp.join("d/f"), b"x").unwrap();
-        let me = std::fs::metadata(&mp).map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap();
-        assert_eq!(p.owner_uids(&a).unwrap().into_iter().collect::<Vec<_>>(), [me]);
+        let me = std::fs::metadata(&mp)
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+            .unwrap();
+        assert_eq!(
+            p.owner_uids(&a).unwrap().into_iter().collect::<Vec<_>>(),
+            [me]
+        );
     }
 
     /// A stream of `to`, from node `src` (incremental from `from`).
@@ -1159,31 +1523,84 @@ mod tests {
         na.layers(&a).snapshot(Lsn::new(5), h(5)).unwrap();
 
         // Full, then incremental, as rebirth does.
-        let g = nb.receive(&a, None, (Lsn::new(2), h(2)), &mut &sent(&na, &a, None, Lsn::new(2))[..]).unwrap();
+        let g = nb
+            .receive(
+                &a,
+                None,
+                (Lsn::new(2), h(2)),
+                &mut &sent(&na, &a, None, Lsn::new(2))[..],
+            )
+            .unwrap();
         assert_eq!(g, guid(Lsn::new(2), h(2)));
         assert_eq!(block0(&nb, &a), 1);
         let inc = sent(&na, &a, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(5));
-        nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut &inc[..]).unwrap();
+        nb.receive(
+            &a,
+            Some((Lsn::new(2), h(2))),
+            (Lsn::new(5), h(5)),
+            &mut &inc[..],
+        )
+        .unwrap();
         assert_eq!(block0(&nb, &a), 2);
         assert_eq!(nb.layers(&a).list().unwrap(), na.layers(&a).list().unwrap());
         // Again: already there, bound: returns the guid, changes nothing.
-        assert_eq!(nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut io::empty()).unwrap(), guid(Lsn::new(5), h(5)));
-        assert!(nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(6)), &mut io::empty()).is_err(), "bound to another record");
+        assert_eq!(
+            nb.receive(
+                &a,
+                Some((Lsn::new(2), h(2))),
+                (Lsn::new(5), h(5)),
+                &mut io::empty()
+            )
+            .unwrap(),
+            guid(Lsn::new(5), h(5))
+        );
+        assert!(
+            nb.receive(
+                &a,
+                Some((Lsn::new(2), h(2))),
+                (Lsn::new(5), h(6)),
+                &mut io::empty()
+            )
+            .is_err(),
+            "bound to another record"
+        );
 
         // A clone of a's first Seal, received as a clone on the other node.
         Pool::clone(&na, &a, Lsn::new(2), h(2), &c).unwrap();
         write0(&na, &c, 9);
         na.layers(&c).snapshot(Lsn::new(3), h(33)).unwrap();
         let first = sent(&na, &c, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(3));
-        let base = CloneBase { dataset: a.clone(), seal: Lsn::new(2), hash: h(2), guid: guid(Lsn::new(2), h(2)) };
-        let wrong = CloneBase { guid: 1, ..base.clone() };
-        assert!(nb.receive_clone(&c, &wrong, (Lsn::new(3), h(33)), &mut &first[..]).is_err(), "base guid checked");
+        let base = CloneBase {
+            dataset: a.clone(),
+            seal: Lsn::new(2),
+            hash: h(2),
+            guid: guid(Lsn::new(2), h(2)),
+        };
+        let wrong = CloneBase {
+            guid: 1,
+            ..base.clone()
+        };
+        assert!(
+            nb.receive_clone(&c, &wrong, (Lsn::new(3), h(33)), &mut &first[..])
+                .is_err(),
+            "base guid checked"
+        );
         assert_eq!(nb.info(&c).unwrap(), None);
-        nb.receive_clone(&c, &base, (Lsn::new(3), h(33)), &mut &first[..]).unwrap();
+        nb.receive_clone(&c, &base, (Lsn::new(3), h(33)), &mut &first[..])
+            .unwrap();
         assert_eq!(block0(&nb, &c), 9);
-        assert_eq!(nb.info(&c).unwrap().unwrap().origin_seal(), Some((a.clone(), Lsn::new(2))));
-        assert!(std::fs::read_dir(&nb.spool).unwrap().next().is_none(), "the spool is left empty");
-        assert!(std::fs::read_dir(&na.spool).unwrap().next().is_none(), "the spool is left empty");
+        assert_eq!(
+            nb.info(&c).unwrap().unwrap().origin_seal(),
+            Some((a.clone(), Lsn::new(2)))
+        );
+        assert!(
+            std::fs::read_dir(&nb.spool).unwrap().next().is_none(),
+            "the spool is left empty"
+        );
+        assert!(
+            std::fs::read_dir(&na.spool).unwrap().next().is_none(),
+            "the spool is left empty"
+        );
     }
 
     #[test]
@@ -1196,16 +1613,41 @@ mod tests {
         write0(&na, &a, 2);
         na.layers(&a).snapshot(Lsn::new(5), h(5)).unwrap();
         let full = sent(&na, &a, None, Lsn::new(2));
-        assert!(nb.receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..full.len() - 1][..]).is_err());
+        assert!(nb
+            .receive(
+                &a,
+                None,
+                (Lsn::new(2), h(2)),
+                &mut &full[..full.len() - 1][..]
+            )
+            .is_err());
         assert_eq!(nb.info(&a).unwrap(), None, "no half-received dataset");
-        nb.receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..]).unwrap();
+        nb.receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..])
+            .unwrap();
         let inc = sent(&na, &a, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(5));
         let mut bad = inc.clone();
         bad[20] ^= 1;
-        assert!(nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut &bad[..]).is_err());
-        assert_eq!(nb.layers(&a).list().unwrap(), [(Lsn::new(2), h(2))], "no Seal from a bad stream");
+        assert!(nb
+            .receive(
+                &a,
+                Some((Lsn::new(2), h(2))),
+                (Lsn::new(5), h(5)),
+                &mut &bad[..]
+            )
+            .is_err());
+        assert_eq!(
+            nb.layers(&a).list().unwrap(),
+            [(Lsn::new(2), h(2))],
+            "no Seal from a bad stream"
+        );
         assert_eq!(block0(&nb, &a), 1, "and none of its blocks");
-        nb.receive(&a, Some((Lsn::new(2), h(2))), (Lsn::new(5), h(5)), &mut &inc[..]).unwrap();
+        nb.receive(
+            &a,
+            Some((Lsn::new(2), h(2))),
+            (Lsn::new(5), h(5)),
+            &mut &inc[..],
+        )
+        .unwrap();
         assert_eq!(block0(&nb, &a), 2);
     }
 
@@ -1239,7 +1681,10 @@ mod tests {
         let c = calls(&p);
         assert_eq!(c.len(), 2, "{c:?}");
         assert_eq!(c[0], "umount /mnt/taso/tank/v-a");
-        assert!(c[1].starts_with("mount ") && c[1].ends_with(" /mnt/taso/tank/v-a"), "{c:?}");
+        assert!(
+            c[1].starts_with("mount ") && c[1].ends_with(" /mnt/taso/tank/v-a"),
+            "{c:?}"
+        );
         assert_eq!(l.list().unwrap(), [(Lsn::new(2), h(2))], "the layer stays");
         assert_eq!(p.info(&a).unwrap().unwrap().origin, None);
     }
@@ -1254,16 +1699,32 @@ mod tests {
         l.snapshot(Lsn::new(4), h(4)).unwrap();
         write0(&p, &a, 9);
         calls(&p);
-        assert!(l.rollback(Lsn::new(2), h(2)).unwrap_err().to_string().contains("later layer"));
-        assert!(l.rollback(Lsn::new(4), h(5)).is_err(), "bound to another record");
+        assert!(l
+            .rollback(Lsn::new(2), h(2))
+            .unwrap_err()
+            .to_string()
+            .contains("later layer"));
+        assert!(
+            l.rollback(Lsn::new(4), h(5)).is_err(),
+            "bound to another record"
+        );
         assert!(l.rollback(Lsn::new(3), h(3)).is_err(), "no such layer");
         *p.mounts.busy.borrow_mut() = true;
         assert!(l.rollback(Lsn::new(4), h(4)).is_err(), "busy mount");
         *p.mounts.busy.borrow_mut() = false;
-        p.mounts.table.borrow_mut().insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
-        assert!(l.rollback(Lsn::new(4), h(4)).is_err(), "mounted from elsewhere");
+        p.mounts
+            .table
+            .borrow_mut()
+            .insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
+        assert!(
+            l.rollback(Lsn::new(4), h(4)).is_err(),
+            "mounted from elsewhere"
+        );
         assert_eq!(block0(&p, &a), 9, "nothing was discarded");
-        assert!(calls(&p).iter().all(|c| c.starts_with("umount")), "only the refused unmount was tried");
+        assert!(
+            calls(&p).iter().all(|c| c.starts_with("umount")),
+            "only the refused unmount was tried"
+        );
     }
 
     // ── Vessels on the block log ────────────────────────────────────
@@ -1279,7 +1740,14 @@ mod tests {
     }
 
     fn seal<L: Layers>(v: &mut Vessel<L>, turn: u64) -> Position {
-        v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn)).unwrap().seal
+        v.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(turn),
+        )
+        .unwrap()
+        .seal
     }
 
     #[test]
@@ -1291,11 +1759,18 @@ mod tests {
         let birth = v.seal_birth().unwrap().seal;
         let s1 = seal(&mut v, 1);
         let layers = host.pool.layers(v.dataset()).list().unwrap();
-        assert_eq!(layers, [(birth.lsn, birth.hash), (s1.lsn, s1.hash)], "a block-log Seal per Seal record");
+        assert_eq!(
+            layers,
+            [(birth.lsn, birth.hash), (s1.lsn, s1.hash)],
+            "a block-log Seal per Seal record"
+        );
 
         let child = host.fork(&v, s1, b"child-1").unwrap();
         let info = host.pool.info(child.dataset()).unwrap().unwrap();
-        assert_eq!((info.origin_seal(), info.parent), (Some((v.dataset().clone(), s1.lsn)), Some(s1.hash)));
+        assert_eq!(
+            (info.origin_seal(), info.parent),
+            (Some((v.dataset().clone(), s1.lsn)), Some(s1.hash))
+        );
         drop(child);
 
         let id = v.id();
@@ -1306,7 +1781,11 @@ mod tests {
         // A Vessel rollback goes back to the last Seal's blocks.
         write0(&host.pool, v.dataset(), 7);
         assert_eq!(v.rollback().unwrap(), Some(s1));
-        assert_eq!(block0(&host.pool, v.dataset()), 0, "the write after the last Seal is gone");
+        assert_eq!(
+            block0(&host.pool, v.dataset()),
+            0,
+            "the write after the last Seal is gone"
+        );
     }
 
     #[test]
@@ -1324,41 +1803,86 @@ mod tests {
             warden: WardenId::new(n),
         };
         let (a, b) = (node(1), node(2));
-        let packs = |h: &Host<TestPool>, id| Packs::new(LocalStore::new(tmp.path().join("store")), h.pool.sender(), "vessels", id).unwrap();
+        let packs = |h: &Host<TestPool>, id| {
+            Packs::new(
+                LocalStore::new(tmp.path().join("store")),
+                h.pool.sender(),
+                "vessels",
+                id,
+            )
+            .unwrap()
+        };
         let ns = Namespace::from_bytes([3; 16]);
 
         // Node A: a Vessel with two published Seals, and a fork of the first.
         let (mut v, _) = a.ensure(ns, b"user").unwrap();
         let pa = packs(&a, v.id());
         let birth = v.seal_birth().unwrap().seal;
-        v.publish_seal(&pa, &a.pool.snapshot(v.dataset(), birth.lsn).unwrap().unwrap(), None).unwrap();
+        v.publish_seal(
+            &pa,
+            &a.pool.snapshot(v.dataset(), birth.lsn).unwrap().unwrap(),
+            None,
+        )
+        .unwrap();
         write0(&a.pool, v.dataset(), 1);
         let s1 = seal(&mut v, 1);
-        v.publish_seal(&pa, &a.pool.snapshot(v.dataset(), s1.lsn).unwrap().unwrap(), None).unwrap();
+        v.publish_seal(
+            &pa,
+            &a.pool.snapshot(v.dataset(), s1.lsn).unwrap().unwrap(),
+            None,
+        )
+        .unwrap();
         write0(&a.pool, v.dataset(), 2);
         let s2 = seal(&mut v, 2);
-        v.publish_seal(&pa, &a.pool.snapshot(v.dataset(), s2.lsn).unwrap().unwrap(), None).unwrap();
+        v.publish_seal(
+            &pa,
+            &a.pool.snapshot(v.dataset(), s2.lsn).unwrap().unwrap(),
+            None,
+        )
+        .unwrap();
 
         let mut child = a.fork(&v, s1, b"child").unwrap();
         let pc = packs(&a, child.id());
         let cb = child.seal_birth().unwrap().seal;
         let origin = a.pool.snapshot(v.dataset(), s1.lsn).unwrap().unwrap();
-        child.publish_seal(&pc, &a.pool.snapshot(child.dataset(), cb.lsn).unwrap().unwrap(), Some(&origin)).unwrap();
+        child
+            .publish_seal(
+                &pc,
+                &a.pool.snapshot(child.dataset(), cb.lsn).unwrap().unwrap(),
+                Some(&origin),
+            )
+            .unwrap();
         write0(&a.pool, child.dataset(), 7);
         let c1 = seal(&mut child, 1);
-        child.publish_seal(&pc, &a.pool.snapshot(child.dataset(), c1.lsn).unwrap().unwrap(), None).unwrap();
+        child
+            .publish_seal(
+                &pc,
+                &a.pool.snapshot(child.dataset(), c1.lsn).unwrap().unwrap(),
+                None,
+            )
+            .unwrap();
 
         // Node B: rebirth from the packs alone.
         let (w, r) = b.rebirth(v.id(), &packs(&b, v.id())).unwrap();
         assert_eq!(r.received, vec![birth.lsn, s1.lsn, s2.lsn]);
         assert_eq!(w.last_seal(), Some(s2));
-        assert_eq!(block0(&b.pool, w.dataset()), 2, "the state of the last Seal");
-        assert_eq!(b.pool.layers(w.dataset()).list().unwrap(), a.pool.layers(v.dataset()).list().unwrap());
+        assert_eq!(
+            block0(&b.pool, w.dataset()),
+            2,
+            "the state of the last Seal"
+        );
+        assert_eq!(
+            b.pool.layers(w.dataset()).list().unwrap(),
+            a.pool.layers(v.dataset()).list().unwrap()
+        );
 
         let (wc, rc) = b.rebirth(child.id(), &packs(&b, child.id())).unwrap();
         assert_eq!(rc.received, vec![cb.lsn, c1.lsn]);
         assert_eq!(block0(&b.pool, wc.dataset()), 7);
         let info = b.pool.info(wc.dataset()).unwrap().unwrap();
-        assert_eq!((info.origin_seal(), info.parent), (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash)));
+        assert_eq!(
+            (info.origin_seal(), info.parent),
+            (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash))
+        );
     }
 }

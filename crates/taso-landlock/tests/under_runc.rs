@@ -6,7 +6,9 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use taso_warden::runtime::{check_rootfs, prepare_work_dir, write_bundle, Runc, RuncCli, VesselSpec};
+use taso_warden::runtime::{
+    check_rootfs, prepare_work_dir, write_bundle, Runc, RuncCli, VesselSpec,
+};
 
 const SHIM: &str = env!("CARGO_BIN_EXE_taso-landlock");
 const SHIM_IN_ROOTFS: &str = "/usr/lib/taso/landlock";
@@ -14,8 +16,10 @@ const SHIM_IN_ROOTFS: &str = "/usr/lib/taso/landlock";
 /// A root filesystem with `/bin/sh`, the shim, and their libraries.
 fn tiny_rootfs(root: &Path) {
     let sh = std::fs::canonicalize("/bin/sh").unwrap();
-    let mut files: Vec<(PathBuf, PathBuf)> =
-        vec![(sh.clone(), PathBuf::from("bin/sh")), (PathBuf::from(SHIM), PathBuf::from(&SHIM_IN_ROOTFS[1..]))];
+    let mut files: Vec<(PathBuf, PathBuf)> = vec![
+        (sh.clone(), PathBuf::from("bin/sh")),
+        (PathBuf::from(SHIM), PathBuf::from(&SHIM_IN_ROOTFS[1..])),
+    ];
     for bin in [sh.as_path(), Path::new(SHIM)] {
         let ldd = Command::new("ldd").arg(bin).output().unwrap();
         for tok in String::from_utf8_lossy(&ldd.stdout).split_whitespace() {
@@ -92,7 +96,13 @@ fn the_shim_confines_writes_in_a_vessel() {
         assert!(with.lines().any(|l| l == want), "{want:?} with the shim");
     }
     for blocked in ["dev_shm", "dev_new", "proc_oom"] {
-        assert!(without.lines().any(|l| l == format!("{blocked} yes")), "{blocked}: allowed without the shim (control)");
-        assert!(with.lines().any(|l| l == format!("{blocked} no")), "{blocked}: refused with the shim");
+        assert!(
+            without.lines().any(|l| l == format!("{blocked} yes")),
+            "{blocked}: allowed without the shim (control)"
+        );
+        assert!(
+            with.lines().any(|l| l == format!("{blocked} no")),
+            "{blocked}: refused with the shim"
+        );
     }
 }

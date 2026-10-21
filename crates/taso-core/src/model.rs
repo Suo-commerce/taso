@@ -10,9 +10,7 @@
 //!
 //! Normative references: v0.4 §8, v1.0 §9.2, §12 P0.
 
-use crate::envelope::{
-    BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, Lsn, Stream,
-};
+use crate::envelope::{BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, Lsn, Stream};
 use crate::record::{Payload, Record};
 
 // ── WardenId ────────────────────────────────────────────────────────
@@ -23,9 +21,13 @@ pub struct WardenId(u64);
 
 impl WardenId {
     /// Wrap a raw value.
-    pub const fn new(v: u64) -> Self { Self(v) }
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
     /// The raw value.
-    pub const fn get(self) -> u64 { self.0 }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 // ── Ownership ───────────────────────────────────────────────────────
@@ -82,7 +84,10 @@ pub struct Anchor {
 
 impl Anchor {
     /// Before the first record.
-    pub const GENESIS: Self = Self { lsn: Lsn::new(0), hash: HashVal::GENESIS };
+    pub const GENESIS: Self = Self {
+        lsn: Lsn::new(0),
+        hash: HashVal::GENESIS,
+    };
 }
 
 /// Why the coordinator refused to advance the shipped anchor.
@@ -168,16 +173,24 @@ impl Coordinator {
     }
 
     /// The Chronicle this coordinator manages.
-    pub fn chronicle(&self) -> ChronicleId { self.chronicle }
+    pub fn chronicle(&self) -> ChronicleId {
+        self.chronicle
+    }
 
     /// Current ownership state.
-    pub fn ownership(&self) -> &Ownership { &self.ownership }
+    pub fn ownership(&self) -> &Ownership {
+        &self.ownership
+    }
 
     /// The anchored head (the authority, not a cache).
-    pub fn head(&self) -> ChronicleHead { self.head }
+    pub fn head(&self) -> ChronicleHead {
+        self.head
+    }
 
     /// The full accepted log.
-    pub fn log(&self) -> &[Record] { &self.log }
+    pub fn log(&self) -> &[Record] {
+        &self.log
+    }
 
     /// CAS append (v0.4 §8.3).
     ///
@@ -234,9 +247,16 @@ impl Coordinator {
     ///
     /// On success as [`Coordinator::transfer`]; on refusal nothing changed
     /// and the current ownership is returned.
-    pub fn transfer_if(&mut self, new_holder: WardenId, expected: (WardenId, Epoch)) -> Result<Epoch, OwnershipChanged> {
+    pub fn transfer_if(
+        &mut self,
+        new_holder: WardenId,
+        expected: (WardenId, Epoch),
+    ) -> Result<Epoch, OwnershipChanged> {
         if (self.ownership.holder, self.ownership.epoch) != expected {
-            return Err(OwnershipChanged { holder: self.ownership.holder, epoch: self.ownership.epoch });
+            return Err(OwnershipChanged {
+                holder: self.ownership.holder,
+                epoch: self.ownership.epoch,
+            });
         }
         Ok(self.transfer(new_holder))
     }
@@ -269,7 +289,9 @@ impl Coordinator {
     }
 
     /// How far the log is known to be shipped.
-    pub fn shipped(&self) -> Anchor { self.shipped }
+    pub fn shipped(&self) -> Anchor {
+        self.shipped
+    }
 
     /// The holder reports that the log up to `to` is durable in the
     /// object store.  The anchor only moves forward; a report at or below
@@ -280,15 +302,29 @@ impl Coordinator {
     /// hash.  Below the head the coordinator holds no record bodies, so
     /// it cannot check other hashes; the real one cannot either, and the
     /// model must not be stricter than the system it describes.
-    pub fn advance_shipped(&mut self, warden: WardenId, epoch: Epoch, to: Anchor) -> Result<Anchor, ShipError> {
+    pub fn advance_shipped(
+        &mut self,
+        warden: WardenId,
+        epoch: Epoch,
+        to: Anchor,
+    ) -> Result<Anchor, ShipError> {
         if warden != self.ownership.holder {
-            return Err(ShipError::NotHolder { warden, holder: self.ownership.holder });
+            return Err(ShipError::NotHolder {
+                warden,
+                holder: self.ownership.holder,
+            });
         }
         if epoch != self.ownership.epoch {
-            return Err(ShipError::EpochMismatch { epoch, current: self.ownership.epoch });
+            return Err(ShipError::EpochMismatch {
+                epoch,
+                current: self.ownership.epoch,
+            });
         }
         if to.lsn > self.head.lsn {
-            return Err(ShipError::Ahead { to: to.lsn, head: self.head.lsn });
+            return Err(ShipError::Ahead {
+                to: to.lsn,
+                head: self.head.lsn,
+            });
         }
         if (to.lsn == self.head.lsn && to.hash != self.head.hash)
             || (to.lsn == self.shipped.lsn && to.hash != self.shipped.hash)
@@ -358,14 +394,25 @@ impl WardenModel {
         head: ChronicleHead,
         next_lsn: Lsn,
     ) -> Self {
-        Self { id, chronicle, branch: BranchId::TRUNK, epoch, head, next_lsn }
+        Self {
+            id,
+            chronicle,
+            branch: BranchId::TRUNK,
+            epoch,
+            head,
+            next_lsn,
+        }
     }
 
     /// This Warden's identity.
-    pub fn id(&self) -> WardenId { self.id }
+    pub fn id(&self) -> WardenId {
+        self.id
+    }
 
     /// The epoch this Warden believes it is operating under.
-    pub fn epoch(&self) -> Epoch { self.epoch }
+    pub fn epoch(&self) -> Epoch {
+        self.epoch
+    }
 
     /// Build a record locally and submit it through the coordinator.
     ///
@@ -396,11 +443,7 @@ impl WardenModel {
     ///
     /// Used to model the interleaving where a Warden builds a record,
     /// then a transfer happens, then it tries to submit the stale record.
-    pub fn build_record(
-        &self,
-        stream: Stream,
-        payload: Payload,
-    ) -> Record {
+    pub fn build_record(&self, stream: Stream, payload: Payload) -> Record {
         Record::new(
             self.chronicle,
             self.branch,
@@ -419,11 +462,19 @@ impl WardenModel {
 mod tests {
     use super::*;
 
-    fn cid() -> ChronicleId { ChronicleId::from_bytes([1; 16]) }
-    fn warden_a() -> WardenId { WardenId::new(1) }
-    fn warden_b() -> WardenId { WardenId::new(2) }
+    fn cid() -> ChronicleId {
+        ChronicleId::from_bytes([1; 16])
+    }
+    fn warden_a() -> WardenId {
+        WardenId::new(1)
+    }
+    fn warden_b() -> WardenId {
+        WardenId::new(2)
+    }
 
-    fn raw(data: &[u8]) -> Payload { Payload::Raw(data.to_vec()) }
+    fn raw(data: &[u8]) -> Payload {
+        Payload::Raw(data.to_vec())
+    }
 
     /// Helper: set up a coordinator and two Wardens.
     fn setup() -> (Coordinator, WardenModel, WardenModel) {
@@ -517,14 +568,8 @@ mod tests {
         assert_eq!(coord.ownership().holder, warden_b());
         assert_eq!(coord.ownership().epoch, Epoch::new(2));
         // Sealed prefix is where the old holder left off.
-        assert_eq!(
-            coord.ownership().sealed_prefix.lsn,
-            head_before.lsn,
-        );
-        assert_eq!(
-            coord.ownership().sealed_prefix.hash,
-            head_before.hash,
-        );
+        assert_eq!(coord.ownership().sealed_prefix.lsn, head_before.lsn,);
+        assert_eq!(coord.ownership().sealed_prefix.hash, head_before.hash,);
     }
 
     /// F1: A reads the ownership, B takes over in between, A's claim is
@@ -540,14 +585,23 @@ mod tests {
         // B takes over (as the operator asked), from what B read.
         let e2 = coord.transfer_if(warden_b(), read).unwrap();
         assert_eq!(e2, Epoch::new(2));
-        let mut b = WardenModel::resume(warden_b(), cid(), e2, coord.head(), Lsn::new(coord.head().lsn.get() + 1));
+        let mut b = WardenModel::resume(
+            warden_b(),
+            cid(),
+            e2,
+            coord.head(),
+            Lsn::new(coord.head().lsn.get() + 1),
+        );
         b.append(&mut coord, Stream::Fs, raw(b"two")).unwrap();
 
         // A restarts on its stale read: refused, nothing moved.
         let head_before = coord.head();
         assert_eq!(
             coord.transfer_if(warden_a(), read),
-            Err(OwnershipChanged { holder: warden_b(), epoch: Epoch::new(2) })
+            Err(OwnershipChanged {
+                holder: warden_b(),
+                epoch: Epoch::new(2)
+            })
         );
         assert_eq!(coord.ownership().holder, warden_b());
         assert_eq!(coord.ownership().epoch, Epoch::new(2));
@@ -557,7 +611,13 @@ mod tests {
         // The same claim cannot win twice: B's own restart moves the epoch.
         let now = (warden_b(), Epoch::new(2));
         assert_eq!(coord.transfer_if(warden_b(), now), Ok(Epoch::new(3)));
-        assert_eq!(coord.transfer_if(warden_b(), now), Err(OwnershipChanged { holder: warden_b(), epoch: Epoch::new(3) }));
+        assert_eq!(
+            coord.transfer_if(warden_b(), now),
+            Err(OwnershipChanged {
+                holder: warden_b(),
+                epoch: Epoch::new(3)
+            })
+        );
         // Equal to transfer in effect: sealed prefix at the head.
         assert_eq!(coord.ownership().sealed_prefix.lsn, coord.head().lsn);
     }
@@ -566,7 +626,8 @@ mod tests {
     fn old_warden_cas_after_transfer_rejected() {
         let (mut coord, mut a, _b) = setup();
         // A writes a record.
-        a.append(&mut coord, Stream::Fs, raw(b"before transfer")).unwrap();
+        a.append(&mut coord, Stream::Fs, raw(b"before transfer"))
+            .unwrap();
 
         // Transfer to B.
         coord.transfer(warden_b());
@@ -637,13 +698,7 @@ mod tests {
         let new_epoch = coord.transfer(warden_b());
 
         // B writes 2 more records.
-        let mut b = WardenModel::resume(
-            warden_b(),
-            cid(),
-            new_epoch,
-            coord.head(),
-            Lsn::new(4),
-        );
+        let mut b = WardenModel::resume(warden_b(), cid(), new_epoch, coord.head(), Lsn::new(4));
         b.append(&mut coord, Stream::Fs, raw(b"four")).unwrap();
         b.append(&mut coord, Stream::Fs, raw(b"five")).unwrap();
 
@@ -680,9 +735,7 @@ mod tests {
         let _sealed_after_first = coord.ownership().sealed_prefix;
 
         // B writes 1 record.
-        let mut b = WardenModel::resume(
-            warden_b(), cid(), epoch2, coord.head(), Lsn::new(3),
-        );
+        let mut b = WardenModel::resume(warden_b(), cid(), epoch2, coord.head(), Lsn::new(3));
         b.append(&mut coord, Stream::Fs, raw(b"three")).unwrap();
 
         // Transfer B → A.
@@ -693,9 +746,7 @@ mod tests {
         assert_eq!(coord.ownership().sealed_prefix.lsn, Lsn::new(3));
 
         // A resumes.
-        let mut a2 = WardenModel::resume(
-            warden_a(), cid(), epoch3, coord.head(), Lsn::new(4),
-        );
+        let mut a2 = WardenModel::resume(warden_a(), cid(), epoch3, coord.head(), Lsn::new(4));
         a2.append(&mut coord, Stream::Fs, raw(b"four")).unwrap();
 
         // Rebirth log includes all 3 records up to second sealed prefix.
@@ -715,10 +766,15 @@ mod tests {
                 &mut coord,
                 Stream::Fs,
                 raw(format!("record-{i}").as_bytes()),
-            ).unwrap();
+            )
+            .unwrap();
         }
         for r in coord.log() {
-            assert!(r.verify(), "record at lsn {} failed verify", r.envelope.lsn.get());
+            assert!(
+                r.verify(),
+                "record at lsn {} failed verify",
+                r.envelope.lsn.get()
+            );
         }
     }
 

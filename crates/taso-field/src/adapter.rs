@@ -213,7 +213,12 @@ pub struct FakeProvider {
 impl FakeProvider {
     /// A fake provider named `name`.
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), applied: BTreeMap::new(), dedup: BTreeSet::new(), next_fault: Fault::None }
+        Self {
+            name: name.to_string(),
+            applied: BTreeMap::new(),
+            dedup: BTreeSet::new(),
+            next_fault: Fault::None,
+        }
     }
 
     /// Make the next `send` misbehave.
@@ -261,7 +266,12 @@ impl Adapter for FakeProvider {
                 Consequence::Irreversible,
                 RetryPolicy::ProviderDeduplicated { key: Self::key(op) },
             ),
-            "put" => (Consequence::Irreversible, RetryPolicy::Queryable { probe: Self::key(op) }),
+            "put" => (
+                Consequence::Irreversible,
+                RetryPolicy::Queryable {
+                    probe: Self::key(op),
+                },
+            ),
             "fire" => (Consequence::Irreversible, RetryPolicy::UnsafeToRetry),
             "read" => (
                 Consequence::NoExternalMutation,
@@ -282,23 +292,27 @@ impl Adapter for FakeProvider {
     fn send(&mut self, op: OpId, plan: &Plan) -> Sent {
         match std::mem::replace(&mut self.next_fault, Fault::None) {
             Fault::Lost => Sent::Unknown,
-            Fault::Decline => Sent::NotApplied { reason: "declined".into() },
+            Fault::Decline => Sent::NotApplied {
+                reason: "declined".into(),
+            },
             Fault::ReplyLost => {
                 self.apply(plan);
                 Sent::Unknown
             }
             Fault::None => {
                 self.apply(plan);
-                Sent::Applied { receipt: Self::key(op) }
+                Sent::Applied {
+                    receipt: Self::key(op),
+                }
             }
         }
     }
 
     fn probe(&mut self, op: OpId, plan: &Plan) -> Probed {
         match &plan.retry {
-            RetryPolicy::Queryable { .. } if self.applied(&plan.request) > 0 => {
-                Probed::Applied { receipt: Self::key(op) }
-            }
+            RetryPolicy::Queryable { .. } if self.applied(&plan.request) > 0 => Probed::Applied {
+                receipt: Self::key(op),
+            },
             RetryPolicy::Queryable { .. } => Probed::NotApplied,
             _ => Probed::Unknown,
         }
@@ -312,7 +326,10 @@ mod tests {
     use super::*;
 
     fn call(op: &str, args: &str) -> Call {
-        Call { operation: op.into(), args: args.as_bytes().to_vec() }
+        Call {
+            operation: op.into(),
+            args: args.as_bytes().to_vec(),
+        }
     }
 
     #[test]
@@ -323,7 +340,12 @@ mod tests {
         assert_eq!(a.consequence, Consequence::Irreversible);
         assert_eq!(a.retry, RetryPolicy::UnsafeToRetry);
         // The operation decides; there is no way to say "this is harmless".
-        let claimed = p.plan(OpId::new(1), &call("fire", "bob {\"consequence\":\"none\"}")).unwrap();
+        let claimed = p
+            .plan(
+                OpId::new(1),
+                &call("fire", "bob {\"consequence\":\"none\"}"),
+            )
+            .unwrap();
         assert_eq!(claimed.consequence, Consequence::Irreversible);
     }
 
@@ -340,10 +362,22 @@ mod tests {
     #[test]
     fn refusals_happen_at_planning() {
         let p = FakeProvider::new("mail");
-        assert!(matches!(p.plan(OpId::new(1), &call("format-disk", "x")), Err(Refusal::UnknownOperation(_))));
-        assert!(matches!(p.plan(OpId::new(1), &call("send", "")), Err(Refusal::BadArgs(_))));
-        let bad = Call { operation: "send".into(), args: vec![0xFF] };
-        assert!(matches!(p.plan(OpId::new(1), &bad), Err(Refusal::BadArgs(_))));
+        assert!(matches!(
+            p.plan(OpId::new(1), &call("format-disk", "x")),
+            Err(Refusal::UnknownOperation(_))
+        ));
+        assert!(matches!(
+            p.plan(OpId::new(1), &call("send", "")),
+            Err(Refusal::BadArgs(_))
+        ));
+        let bad = Call {
+            operation: "send".into(),
+            args: vec![0xFF],
+        };
+        assert!(matches!(
+            p.plan(OpId::new(1), &bad),
+            Err(Refusal::BadArgs(_))
+        ));
     }
 
     #[test]
@@ -366,7 +400,10 @@ mod tests {
         assert_eq!(p.applied(&plan.request), 0, "probing did not apply it");
         p.fail_next(Fault::ReplyLost);
         assert_eq!(p.send(OpId::new(3), &plan), Sent::Unknown);
-        assert!(matches!(p.probe(OpId::new(3), &plan), Probed::Applied { .. }));
+        assert!(matches!(
+            p.probe(OpId::new(3), &plan),
+            Probed::Applied { .. }
+        ));
         // Not queryable: the probe cannot say.
         let fire = p.plan(OpId::new(4), &call("fire", "k")).unwrap();
         assert_eq!(p.probe(OpId::new(4), &fire), Probed::Unknown);
@@ -379,7 +416,10 @@ mod tests {
         p.fail_next(Fault::ReplyLost);
         assert_eq!(p.send(OpId::new(1), &plan), Sent::Unknown);
         p.send(OpId::new(1), &plan);
-        assert!(!p.no_duplicates(), "the fake shows the harm a blind retry does");
+        assert!(
+            !p.no_duplicates(),
+            "the fake shows the harm a blind retry does"
+        );
     }
 
     #[test]
@@ -389,7 +429,10 @@ mod tests {
         p.fail_next(Fault::Lost);
         assert_eq!(p.send(OpId::new(1), &plan), Sent::Unknown);
         p.fail_next(Fault::Decline);
-        assert!(matches!(p.send(OpId::new(1), &plan), Sent::NotApplied { .. }));
+        assert!(matches!(
+            p.send(OpId::new(1), &plan),
+            Sent::NotApplied { .. }
+        ));
         assert_eq!(p.applied(&plan.request), 0);
     }
 

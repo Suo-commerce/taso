@@ -1,0 +1,51 @@
+# cargo deny: licences, advisories, duplicate versions and sources of
+# every crate in Cargo.lock.  CI runs `cargo deny check`.  The licence
+# list is every licence in the lockfile on 2026-10-21, each one
+# permissive; a new dependency with another licence fails CI until it is
+# judged and added here.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]   # Taso runs on Linux only (ublk, ZFS, runc)
+all-features = true
+
+[advisories]
+# Every unmaintained or unsound crate fails, transitive ones too, unless it
+# is listed here by id with its reason.
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    # Same as .cargo/audit.toml: webpki-roots 0.26.11 is a shim over the
+    # fixed 1.0.10; closes with ureq 3.
+    "RUSTSEC-2026-0381",
+    # bitmaps 3.2.1, inside libublk: unmaintained, and an unsound
+    # Bitmap::try_from(&[u8]) that neither libublk's ublk path nor Taso
+    # calls.  Closes when libublk drops or replaces it.
+    "RUSTSEC-2026-0247",
+    "RUSTSEC-2025-0167",
+]
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",   # webpki-roots (Mozilla's root store, data only)
+    "MPL-2.0",               # bitmaps, via libublk: file-level copyleft, unchanged here
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"   # seven duplicates today (syn, rustix, thiserror…): noise, not a fault
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

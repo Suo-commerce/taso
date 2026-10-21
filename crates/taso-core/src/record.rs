@@ -26,8 +26,7 @@
 
 use crate::canon::{Canon, Canonical};
 use crate::envelope::{
-    BranchId, ChronicleId, ChronicleHead, Envelope, Epoch, HashVal, Lsn,
-    Stream, payload_hash,
+    payload_hash, BranchId, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream,
 };
 
 // ── Identity newtypes ───────────────────────────────────────────────
@@ -38,13 +37,19 @@ pub struct GroupId(u64);
 
 impl GroupId {
     /// Wrap a raw value.
-    pub const fn new(v: u64) -> Self { Self(v) }
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
     /// The raw value.
-    pub const fn get(self) -> u64 { self.0 }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl Canonical for GroupId {
-    fn canon(&self, out: &mut Canon) { out.u64(self.0); }
+    fn canon(&self, out: &mut Canon) {
+        out.u64(self.0);
+    }
 }
 
 /// A stable logical identity for an effect operation.
@@ -56,13 +61,19 @@ pub struct OpId(u64);
 
 impl OpId {
     /// Wrap a raw value.
-    pub const fn new(v: u64) -> Self { Self(v) }
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
     /// The raw value.
-    pub const fn get(self) -> u64 { self.0 }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl Canonical for OpId {
-    fn canon(&self, out: &mut Canon) { out.u64(self.0); }
+    fn canon(&self, out: &mut Canon) {
+        out.u64(self.0);
+    }
 }
 
 /// A monotone identifier for an intent whose consequence is irreversible
@@ -75,13 +86,19 @@ pub struct BarrierId(u64);
 
 impl BarrierId {
     /// Wrap a raw value.
-    pub const fn new(v: u64) -> Self { Self(v) }
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
     /// The raw value.
-    pub const fn get(self) -> u64 { self.0 }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl Canonical for BarrierId {
-    fn canon(&self, out: &mut Canon) { out.u64(self.0); }
+    fn canon(&self, out: &mut Canon) {
+        out.u64(self.0);
+    }
 }
 
 /// A turn boundary identifier.
@@ -90,13 +107,19 @@ pub struct TurnId(u64);
 
 impl TurnId {
     /// Wrap a raw value.
-    pub const fn new(v: u64) -> Self { Self(v) }
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
     /// The raw value.
-    pub const fn get(self) -> u64 { self.0 }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl Canonical for TurnId {
-    fn canon(&self, out: &mut Canon) { out.u64(self.0); }
+    fn canon(&self, out: &mut Canon) {
+        out.u64(self.0);
+    }
 }
 
 /// A reference to a copy-on-write layer.
@@ -105,13 +128,19 @@ pub struct LayerRef(u64);
 
 impl LayerRef {
     /// Wrap a raw value.
-    pub const fn new(v: u64) -> Self { Self(v) }
+    pub const fn new(v: u64) -> Self {
+        Self(v)
+    }
     /// The raw value.
-    pub const fn get(self) -> u64 { self.0 }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl Canonical for LayerRef {
-    fn canon(&self, out: &mut Canon) { out.u64(self.0); }
+    fn canon(&self, out: &mut Canon) {
+        out.u64(self.0);
+    }
 }
 
 // ── StreamCut ───────────────────────────────────────────────────────
@@ -198,7 +227,9 @@ pub enum Verdict {
 impl Canonical for Verdict {
     fn canon(&self, out: &mut Canon) {
         match self {
-            Self::Clean => { out.tag(0); }
+            Self::Clean => {
+                out.tag(0);
+            }
             Self::Unverified(reason) => {
                 out.tag(1);
                 out.str(reason);
@@ -279,12 +310,16 @@ pub enum Consequence {
 impl Canonical for Consequence {
     fn canon(&self, out: &mut Canon) {
         match self {
-            Self::Irreversible => { out.tag(0); }
+            Self::Irreversible => {
+                out.tag(0);
+            }
             Self::Compensatable { by } => {
                 out.tag(1);
                 by.canon(out);
             }
-            Self::NoExternalMutation => { out.tag(2); }
+            Self::NoExternalMutation => {
+                out.tag(2);
+            }
         }
     }
 }
@@ -442,13 +477,19 @@ pub struct Namespace([u8; 16]);
 
 impl Namespace {
     /// Wrap raw bytes.
-    pub const fn from_bytes(b: [u8; 16]) -> Self { Self(b) }
+    pub const fn from_bytes(b: [u8; 16]) -> Self {
+        Self(b)
+    }
     /// The raw bytes.
-    pub const fn as_bytes(&self) -> &[u8; 16] { &self.0 }
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
 }
 
 impl Canonical for Namespace {
-    fn canon(&self, out: &mut Canon) { out.fixed(&self.0); }
+    fn canon(&self, out: &mut Canon) {
+        out.fixed(&self.0);
+    }
 }
 
 /// A Seal in another Chronicle: the point a Vessel was born from.
@@ -521,7 +562,9 @@ impl Origin {
 impl Canonical for Origin {
     fn canon(&self, out: &mut Canon) {
         match self {
-            Self::Void => { out.tag(0); }
+            Self::Void => {
+                out.tag(0);
+            }
             Self::Fork { parent } => {
                 out.tag(1);
                 parent.canon(out);
@@ -832,16 +875,46 @@ pub enum Payload {
 impl Canonical for Payload {
     fn canon(&self, out: &mut Canon) {
         match self {
-            Self::Seal(r)    => { out.tag(0); r.canon(out); }
-            Self::Group(r)   => { out.tag(1); r.canon(out); }
-            Self::Intent(r)  => { out.tag(2); r.canon(out); }
-            Self::Outcome(r) => { out.tag(3); r.canon(out); }
-            Self::Raw(b)     => { out.tag(4); out.bytes(b); }
-            Self::Lineage(r) => { out.tag(5); r.canon(out); }
-            Self::Succession(r) => { out.tag(6); r.canon(out); }
-            Self::Gap(r) => { out.tag(7); r.canon(out); }
-            Self::FsShipped(r) => { out.tag(8); r.canon(out); }
-            Self::Checkpoint(r) => { out.tag(9); r.canon(out); }
+            Self::Seal(r) => {
+                out.tag(0);
+                r.canon(out);
+            }
+            Self::Group(r) => {
+                out.tag(1);
+                r.canon(out);
+            }
+            Self::Intent(r) => {
+                out.tag(2);
+                r.canon(out);
+            }
+            Self::Outcome(r) => {
+                out.tag(3);
+                r.canon(out);
+            }
+            Self::Raw(b) => {
+                out.tag(4);
+                out.bytes(b);
+            }
+            Self::Lineage(r) => {
+                out.tag(5);
+                r.canon(out);
+            }
+            Self::Succession(r) => {
+                out.tag(6);
+                r.canon(out);
+            }
+            Self::Gap(r) => {
+                out.tag(7);
+                r.canon(out);
+            }
+            Self::FsShipped(r) => {
+                out.tag(8);
+                r.canon(out);
+            }
+            Self::Checkpoint(r) => {
+                out.tag(9);
+                r.canon(out);
+            }
         }
     }
 }
@@ -872,9 +945,7 @@ impl Record {
         payload: Payload,
     ) -> Self {
         let ph = payload_hash(&payload.canon_bytes());
-        let envelope = Envelope::new(
-            chronicle, branch, epoch, stream, lsn, prev, ph,
-        );
+        let envelope = Envelope::new(chronicle, branch, epoch, stream, lsn, prev, ph);
         Self { envelope, payload }
     }
 
@@ -919,8 +990,14 @@ mod tests {
         Payload::Group(GroupRecord {
             gid: GroupId::new(1),
             members: vec![
-                Member { stream: Stream::Fs, lsn: Lsn::new(4) },
-                Member { stream: Stream::Db, lsn: Lsn::new(3) },
+                Member {
+                    stream: Stream::Fs,
+                    lsn: Lsn::new(4),
+                },
+                Member {
+                    stream: Stream::Db,
+                    lsn: Lsn::new(3),
+                },
             ],
             depends_on: vec![],
             commit: true,
@@ -1020,8 +1097,7 @@ mod tests {
             outcome_payload(),
             raw_payload(),
         ];
-        let enc: Vec<Vec<u8>> =
-            payloads.iter().map(|p| p.canon_bytes()).collect();
+        let enc: Vec<Vec<u8>> = payloads.iter().map(|p| p.canon_bytes()).collect();
         for i in 0..enc.len() {
             for j in (i + 1)..enc.len() {
                 assert_ne!(enc[i], enc[j], "types {i} and {j} collide");
@@ -1087,8 +1163,7 @@ mod tests {
             OutcomeState::ConfirmedApplied,
             OutcomeState::ConfirmedNotApplied,
         ];
-        let enc: Vec<Vec<u8>> =
-            states.iter().map(|s| s.canon_bytes()).collect();
+        let enc: Vec<Vec<u8>> = states.iter().map(|s| s.canon_bytes()).collect();
         for i in 0..enc.len() {
             for j in (i + 1)..enc.len() {
                 assert_ne!(enc[i], enc[j]);
@@ -1116,10 +1191,17 @@ mod tests {
             "ac080516e89c43165f8ac222bc801ef16cac440f376eb498fb40c4ef5a1e9a4f",
             "bddb5d242e86cf985daac1bc2525b6a951c3a7a116cf35d24adb7cca17ac2dba",
         ];
-        let payloads =
-            [seal_payload(), group_payload(), intent_payload(), outcome_payload(), raw_payload()];
-        let got: Vec<String> =
-            payloads.into_iter().map(|p| make_record(p).envelope.hash.to_string()).collect();
+        let payloads = [
+            seal_payload(),
+            group_payload(),
+            intent_payload(),
+            outcome_payload(),
+            raw_payload(),
+        ];
+        let got: Vec<String> = payloads
+            .into_iter()
+            .map(|p| make_record(p).envelope.hash.to_string())
+            .collect();
         assert_eq!(got, pins);
     }
 
@@ -1146,7 +1228,10 @@ mod tests {
         let payloads = [
             gap,
             fs(StreamBase::Full),
-            fs(StreamBase::Seal { lsn: Lsn::new(7), hash: HashVal::from_bytes([7; 32]) }),
+            fs(StreamBase::Seal {
+                lsn: Lsn::new(7),
+                hash: HashVal::from_bytes([7; 32]),
+            }),
             fs(StreamBase::Origin {
                 parent: ParentSeal {
                     chronicle: ChronicleId::from_bytes([3; 16]),
@@ -1156,8 +1241,10 @@ mod tests {
                 guid: 77,
             }),
         ];
-        let got: Vec<String> =
-            payloads.into_iter().map(|p| make_record(p).envelope.hash.to_string()).collect();
+        let got: Vec<String> = payloads
+            .into_iter()
+            .map(|p| make_record(p).envelope.hash.to_string())
+            .collect();
         assert_eq!(got, PINS_NEW);
     }
 
@@ -1165,7 +1252,11 @@ mod tests {
     /// encoding changes every hash after the first checkpoint.
     #[test]
     fn checkpoint_hash_is_pinned() {
-        let lineage = LineageRecord { origin: Origin::Void, namespace: Namespace::from_bytes([1; 16]), ledger_pos: Lsn::new(0) };
+        let lineage = LineageRecord {
+            origin: Origin::Void,
+            namespace: Namespace::from_bytes([1; 16]),
+            ledger_pos: Lsn::new(0),
+        };
         let intent = IntentRecord {
             op: OpId::new(4),
             provider: "mail".into(),
@@ -1181,9 +1272,18 @@ mod tests {
             lineage,
             transcript: Lsn::new(41),
             effect: Lsn::new(31),
-            seal: Some(CheckpointSeal { lsn: Lsn::new(40), hash: HashVal::from_bytes([40; 32]), turn: TurnId::new(9), ledger_pos: Lsn::new(31) }),
+            seal: Some(CheckpointSeal {
+                lsn: Lsn::new(40),
+                hash: HashVal::from_bytes([40; 32]),
+                turn: TurnId::new(9),
+                ledger_pos: Lsn::new(31),
+            }),
             fs_shipped: None,
-            open: vec![OpenEffect { lsn: Lsn::new(30), intent, state: Some(OutcomeState::OutcomeUnknown) }],
+            open: vec![OpenEffect {
+                lsn: Lsn::new(30),
+                intent,
+                state: Some(OutcomeState::OutcomeUnknown),
+            }],
             next_op: 5,
         }));
         assert_eq!(make_record(cp).envelope.hash.to_string(), PIN_CHECKPOINT);
@@ -1213,11 +1313,18 @@ mod tests {
     }
 
     fn authority() -> Authority {
-        Authority { actor: "jarmo".into(), reason: "account merge".into() }
+        Authority {
+            actor: "jarmo".into(),
+            reason: "account merge".into(),
+        }
     }
 
     fn lineage(origin: Origin, namespace: Namespace) -> Payload {
-        Payload::Lineage(LineageRecord { origin, namespace, ledger_pos: Lsn::new(0) })
+        Payload::Lineage(LineageRecord {
+            origin,
+            namespace,
+            ledger_pos: Lsn::new(0),
+        })
     }
 
     fn succession_payload() -> Payload {
@@ -1235,7 +1342,13 @@ mod tests {
         for p in [
             lineage(Origin::Void, ns(1)),
             lineage(Origin::Fork { parent: parent() }, ns(1)),
-            lineage(Origin::Succession { parent: parent(), authority: authority() }, ns(1)),
+            lineage(
+                Origin::Succession {
+                    parent: parent(),
+                    authority: authority(),
+                },
+                ns(1),
+            ),
             succession_payload(),
         ] {
             assert!(make_record(p).verify());
@@ -1252,7 +1365,13 @@ mod tests {
             raw_payload(),
             lineage(Origin::Void, ns(1)),
             lineage(Origin::Fork { parent: parent() }, ns(1)),
-            lineage(Origin::Succession { parent: parent(), authority: authority() }, ns(1)),
+            lineage(
+                Origin::Succession {
+                    parent: parent(),
+                    authority: authority(),
+                },
+                ns(1),
+            ),
             succession_payload(),
         ];
         let enc: Vec<Vec<u8>> = payloads.iter().map(|p| p.canon_bytes()).collect();
@@ -1266,7 +1385,10 @@ mod tests {
     #[test]
     fn every_lineage_field_is_bound_by_the_hash() {
         let base = LineageRecord {
-            origin: Origin::Succession { parent: parent(), authority: authority() },
+            origin: Origin::Succession {
+                parent: parent(),
+                authority: authority(),
+            },
             namespace: ns(1),
             ledger_pos: Lsn::new(4),
         };
@@ -1290,7 +1412,10 @@ mod tests {
                 _ => a.reason = "another reason".into(),
             }
             let mut r = base.clone();
-            r.origin = Origin::Succession { parent: p, authority: a };
+            r.origin = Origin::Succession {
+                parent: p,
+                authority: a,
+            };
             changed.push(r);
         }
         for r in &changed {
@@ -1301,8 +1426,14 @@ mod tests {
     #[test]
     fn authority_strings_are_length_prefixed() {
         // ("ab", "c") and ("a", "bc") must not collide.
-        let a = Authority { actor: "ab".into(), reason: "c".into() };
-        let b = Authority { actor: "a".into(), reason: "bc".into() };
+        let a = Authority {
+            actor: "ab".into(),
+            reason: "c".into(),
+        };
+        let b = Authority {
+            actor: "a".into(),
+            reason: "bc".into(),
+        };
         assert_ne!(a.canon_bytes(), b.canon_bytes());
     }
 
@@ -1310,7 +1441,10 @@ mod tests {
     fn origin_parent() {
         assert_eq!(Origin::Void.parent(), None);
         assert_eq!(Origin::Fork { parent: parent() }.parent(), Some(&parent()));
-        let s = Origin::Succession { parent: parent(), authority: authority() };
+        let s = Origin::Succession {
+            parent: parent(),
+            authority: authority(),
+        };
         assert_eq!(s.parent(), Some(&parent()));
     }
 
@@ -1318,7 +1452,11 @@ mod tests {
     fn vessel_id_is_deterministic_and_namespaced() {
         let a = vessel_id(ns(1), b"user-0001");
         assert_eq!(a, vessel_id(ns(1), b"user-0001"));
-        assert_ne!(a, vessel_id(ns(2), b"user-0001"), "namespaces must not share ids");
+        assert_ne!(
+            a,
+            vessel_id(ns(2), b"user-0001"),
+            "namespaces must not share ids"
+        );
         assert_ne!(a, vessel_id(ns(1), b"user-0002"));
         // Subject bytes are length-prefixed: no boundary ambiguity with the
         // namespace.

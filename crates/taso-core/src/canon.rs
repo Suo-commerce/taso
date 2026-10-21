@@ -123,10 +123,7 @@ impl Canon {
         T: Canonical + 'a,
         I: IntoIterator<Item = &'a T>,
     {
-        let mut encoded: Vec<Vec<u8>> = items
-            .into_iter()
-            .map(|x| x.canon_bytes())
-            .collect();
+        let mut encoded: Vec<Vec<u8>> = items.into_iter().map(|x| x.canon_bytes()).collect();
         encoded.sort();
         self.u64(encoded.len() as u64);
         for e in encoded {
@@ -248,10 +245,7 @@ mod tests {
     fn integers_are_fixed_width_little_endian() {
         let mut c = Canon::new();
         c.u8(0x01).u32(0x0403_0201).u64(0x0807_0605_0403_0201);
-        assert_eq!(
-            c.as_bytes(),
-            &[1, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8]
-        );
+        assert_eq!(c.as_bytes(), &[1, 1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

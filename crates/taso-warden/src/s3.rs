@@ -79,10 +79,16 @@ impl S3Store {
         let bad_endpoint = || {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("endpoint {:?} must be http://host[:port] or https://host[:port]", config.endpoint),
+                format!(
+                    "endpoint {:?} must be http://host[:port] or https://host[:port]",
+                    config.endpoint
+                ),
             )
         };
-        let (tls, rest) = match (config.endpoint.strip_prefix("https://"), config.endpoint.strip_prefix("http://")) {
+        let (tls, rest) = match (
+            config.endpoint.strip_prefix("https://"),
+            config.endpoint.strip_prefix("http://"),
+        ) {
             (Some(rest), _) => (true, rest),
             (None, Some(rest)) => (false, rest),
             (None, None) => return Err(bad_endpoint()),
@@ -92,16 +98,31 @@ impl S3Store {
         }
         let host = rest.to_string();
         if config.ca_file.is_some() && !tls {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "a CA file needs an https:// endpoint"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a CA file needs an https:// endpoint",
+            ));
         }
-        if config.bucket.is_empty() || !config.bucket.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.') {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid bucket name {:?}", config.bucket)));
+        if config.bucket.is_empty()
+            || !config
+                .bucket
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid bucket name {:?}", config.bucket),
+            ));
         }
         let mut agent = ureq::AgentBuilder::new().timeout(timeout);
         if let Some(ca) = &config.ca_file {
             agent = agent.tls_config(std::sync::Arc::new(tls_trusting(ca)?));
         }
-        Ok(Self { config, host, agent: agent.build() })
+        Ok(Self {
+            config,
+            host,
+            agent: agent.build(),
+        })
     }
 
     fn path(&self, key: &str) -> String {
@@ -110,15 +131,34 @@ impl S3Store {
 
     /// A signed request for `method` on `path` with `query` (unencoded
     /// pairs) and `payload_hash`, plus extra signed headers.
-    fn request(&self, method: &str, path: &str, query: &[(&str, &str)], payload_hash: &str, extra: &[(&str, String)]) -> ureq::Request {
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        payload_hash: &str,
+        extra: &[(&str, String)],
+    ) -> ureq::Request {
         let amz_date = amz_date(SystemTime::now());
         let mut headers: Vec<(String, String)> = vec![
             ("host".into(), self.host.clone()),
             ("x-amz-content-sha256".into(), payload_hash.to_string()),
             ("x-amz-date".into(), amz_date.clone()),
         ];
-        headers.extend(extra.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())));
-        let auth = authorization(&self.config, method, path, query, &headers, payload_hash, &amz_date);
+        headers.extend(
+            extra
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.clone())),
+        );
+        let auth = authorization(
+            &self.config,
+            method,
+            path,
+            query,
+            &headers,
+            payload_hash,
+            &amz_date,
+        );
         let mut url = format!("{}{}", self.config.endpoint, uri_encode(path, false));
         if !query.is_empty() {
             url.push('?');
@@ -139,10 +179,17 @@ impl S3Store {
 pub(crate) fn tls_trusting(ca: &std::path::Path) -> io::Result<rustls::ClientConfig> {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::CertificateDer;
-    let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("CA file {}: {why}", ca.display()));
+    let bad = |why: String| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CA file {}: {why}", ca.display()),
+        )
+    };
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_file_iter(ca).map_err(|e| bad(e.to_string()))? {
-        roots.add(cert.map_err(|e| bad(e.to_string()))?).map_err(|e| bad(e.to_string()))?;
+        roots
+            .add(cert.map_err(|e| bad(e.to_string()))?)
+            .map_err(|e| bad(e.to_string()))?;
     }
     if roots.is_empty() {
         return Err(bad("no certificate in it".into()));
@@ -156,7 +203,10 @@ pub(crate) fn tls_trusting(ca: &std::path::Path) -> io::Result<rustls::ClientCon
 }
 
 fn bad_key(key: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid object key {key:?}"))
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid object key {key:?}"),
+    )
 }
 
 /// A failed request as an `io::Error`, with the store's answer.
@@ -167,7 +217,9 @@ fn http_error(what: &str, e: ureq::Error) -> io::Error {
             let code_text = between(&body, "<Code>", "</Code>").unwrap_or_default();
             io::Error::other(format!("{what}: HTTP {code} {code_text}"))
         }
-        ureq::Error::Transport(t) => io::Error::new(io::ErrorKind::ConnectionAborted, format!("{what}: {t}")),
+        ureq::Error::Transport(t) => {
+            io::Error::new(io::ErrorKind::ConnectionAborted, format!("{what}: {t}"))
+        }
     }
 }
 
@@ -191,7 +243,10 @@ impl ObjectStore for S3Store {
         if !valid_key(key) {
             return Err(bad_key(key));
         }
-        match self.request("GET", &self.path(key), &[], EMPTY_SHA256, &[]).call() {
+        match self
+            .request("GET", &self.path(key), &[], EMPTY_SHA256, &[])
+            .call()
+        {
             Ok(resp) => Ok(Some(Box::new(resp.into_reader()))),
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(e) => Err(http_error(&format!("get {key}"), e)),
@@ -202,7 +257,10 @@ impl ObjectStore for S3Store {
         if !valid_key(key) {
             return Err(bad_key(key));
         }
-        match self.request("HEAD", &self.path(key), &[], EMPTY_SHA256, &[]).call() {
+        match self
+            .request("HEAD", &self.path(key), &[], EMPTY_SHA256, &[])
+            .call()
+        {
             Ok(_) => Ok(true),
             Err(ureq::Error::Status(404, _)) => Ok(false),
             Err(e) => Err(http_error(&format!("head {key}"), e)),
@@ -228,7 +286,11 @@ impl ObjectStore for S3Store {
                 .map_err(|e| http_error(&format!("list {prefix}"), e))?
                 .into_string()?;
             let page = parse_list(&body)?;
-            keys.extend(page.keys.into_iter().filter(|k| k.starts_with(&dir) && valid_key(k)));
+            keys.extend(
+                page.keys
+                    .into_iter()
+                    .filter(|k| k.starts_with(&dir) && valid_key(k)),
+            );
             match page.next {
                 Some(t) => token = Some(t),
                 None => break,
@@ -253,7 +315,11 @@ fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
 }
 
 fn xml_unescape(s: &str) -> String {
-    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// The keys and the continuation token of one `ListObjectsV2` page.  Keys
@@ -261,23 +327,36 @@ fn xml_unescape(s: &str) -> String {
 /// them needs unescaping; the token may.
 fn parse_list(body: &str) -> io::Result<Page> {
     if !body.contains("<ListBucketResult") {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a ListBucketResult"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a ListBucketResult",
+        ));
     }
     let mut keys = Vec::new();
     let mut rest = body;
     while let Some(i) = rest.find("<Contents>") {
         let tail = &rest[i..];
-        let end = tail.find("</Contents>").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unclosed <Contents>"))?;
+        let end = tail
+            .find("</Contents>")
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unclosed <Contents>"))?;
         let item = &tail[..end];
-        let key = between(item, "<Key>", "</Key>").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "a <Contents> without <Key>"))?;
+        let key = between(item, "<Key>", "</Key>").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "a <Contents> without <Key>")
+        })?;
         keys.push(xml_unescape(key));
         rest = &tail[end..];
     }
     let truncated = between(body, "<IsTruncated>", "</IsTruncated>") == Some("true");
     let next = if truncated {
         Some(xml_unescape(
-            between(body, "<NextContinuationToken>", "</NextContinuationToken>")
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated without a continuation token"))?,
+            between(body, "<NextContinuationToken>", "</NextContinuationToken>").ok_or_else(
+                || {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "truncated without a continuation token",
+                    )
+                },
+            )?,
         ))
     } else {
         None
@@ -310,7 +389,10 @@ fn base64(b: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in b.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &x)| n | (u32::from(x) << (16 - 8 * i)));
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &x)| n | (u32::from(x) << (16 - 8 * i)));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
@@ -327,7 +409,10 @@ fn base64(b: &[u8]) -> String {
 fn uri_encode(s: &str, slash: bool) -> String {
     let mut out = String::new();
     for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') || (b == b'/' && !slash) {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'~')
+            || (b == b'/' && !slash)
+        {
             out.push(b as char);
         } else {
             let _ = write!(out, "%{b:02X}");
@@ -337,14 +422,24 @@ fn uri_encode(s: &str, slash: bool) -> String {
 }
 
 fn canonical_query(query: &[(&str, &str)]) -> String {
-    let mut pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (uri_encode(k, true), uri_encode(v, true))).collect();
+    let mut pairs: Vec<(String, String)> = query
+        .iter()
+        .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
+        .collect();
     pairs.sort();
-    pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// `YYYYMMDDTHHMMSSZ` in UTC.
 fn amz_date(t: SystemTime) -> String {
-    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
@@ -356,7 +451,12 @@ fn amz_date(t: SystemTime) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    format!(
+        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 /// The `Authorization` header for a request.  `headers` are lowercase
@@ -371,10 +471,17 @@ fn authorization(
     payload_hash: &str,
     amz_date: &str,
 ) -> String {
-    let mut hs: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string())).collect();
+    let mut hs: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
     hs.sort();
     let canonical_headers: String = hs.iter().map(|(k, v)| format!("{k}:{v}\n")).collect();
-    let signed: String = hs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(";");
+    let signed: String = hs
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
     let canonical_request = format!(
         "{method}\n{}\n{}\n{canonical_headers}\n{signed}\n{payload_hash}",
         uri_encode(path, false),
@@ -382,13 +489,19 @@ fn authorization(
     );
     let date = &amz_date[..8];
     let scope = format!("{date}/{}/s3/aws4_request", c.region);
-    let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", hex(&Sha256::digest(canonical_request.as_bytes())));
+    let to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex(&Sha256::digest(canonical_request.as_bytes()))
+    );
     let k = hmac(format!("AWS4{}", c.secret_key).as_bytes(), date.as_bytes());
     let k = hmac(&k, c.region.as_bytes());
     let k = hmac(&k, b"s3");
     let k = hmac(&k, b"aws4_request");
     let signature = hex(&hmac(&k, to_sign.as_bytes()));
-    format!("AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}", c.access_key_id)
+    format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={signature}",
+        c.access_key_id
+    )
 }
 
 #[cfg(test)]
@@ -411,12 +524,23 @@ mod tests {
     #[test]
     fn signs_the_aws_documentation_example() {
         let headers = vec![
-            ("host".to_string(), "examplebucket.s3.amazonaws.com".to_string()),
+            (
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            ),
             ("range".to_string(), "bytes=0-9".to_string()),
             ("x-amz-content-sha256".to_string(), EMPTY_SHA256.to_string()),
             ("x-amz-date".to_string(), "20130524T000000Z".to_string()),
         ];
-        let auth = authorization(&aws_example(), "GET", "/test.txt", &[], &headers, EMPTY_SHA256, "20130524T000000Z");
+        let auth = authorization(
+            &aws_example(),
+            "GET",
+            "/test.txt",
+            &[],
+            &headers,
+            EMPTY_SHA256,
+            "20130524T000000Z",
+        );
         assert_eq!(
             auth,
             "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
@@ -437,9 +561,15 @@ mod tests {
     #[test]
     fn encodings() {
         assert_eq!(uri_encode("/b/pack/a-b_c.d~", false), "/b/pack/a-b_c.d~");
-        assert_eq!(uri_encode("vessels/ab/pack/", true), "vessels%2Fab%2Fpack%2F");
+        assert_eq!(
+            uri_encode("vessels/ab/pack/", true),
+            "vessels%2Fab%2Fpack%2F"
+        );
         assert_eq!(uri_encode("a b+c", false), "a%20b%2Bc");
-        assert_eq!(canonical_query(&[("prefix", "x/"), ("list-type", "2")]), "list-type=2&prefix=x%2F");
+        assert_eq!(
+            canonical_query(&[("prefix", "x/"), ("list-type", "2")]),
+            "list-type=2&prefix=x%2F"
+        );
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
         assert_eq!(base64(b"fo"), "Zm8=");
@@ -459,29 +589,85 @@ mod tests {
         .unwrap();
         assert_eq!(page.keys, vec!["v/a/pack/1", "v/a/pack/2"]);
         assert_eq!(page.next.as_deref(), Some("tok&en"));
-        let last = parse_list("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>").unwrap();
+        let last =
+            parse_list("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
+                .unwrap();
         assert!(last.keys.is_empty() && last.next.is_none());
         assert!(parse_list("<Error><Code>AccessDenied</Code></Error>").is_err());
-        assert!(parse_list("<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>").is_err());
-        assert!(parse_list("<ListBucketResult><Contents><Size>1</Size></Contents></ListBucketResult>").is_err());
+        assert!(
+            parse_list("<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>")
+                .is_err()
+        );
+        assert!(parse_list(
+            "<ListBucketResult><Contents><Size>1</Size></Contents></ListBucketResult>"
+        )
+        .is_err());
     }
 
     #[test]
     fn bad_endpoints_and_buckets_are_refused() {
-        let ok = S3Config { endpoint: "http://127.0.0.1:3900".into(), region: "garage".into(), bucket: "taso".into(), ..aws_example() };
+        let ok = S3Config {
+            endpoint: "http://127.0.0.1:3900".into(),
+            region: "garage".into(),
+            bucket: "taso".into(),
+            ..aws_example()
+        };
         assert!(S3Store::new(ok.clone(), Duration::from_secs(1)).is_ok());
-        assert!(S3Store::new(S3Config { endpoint: "https://garage.example:3900".into(), ..ok.clone() }, Duration::from_secs(1)).is_ok());
+        assert!(S3Store::new(
+            S3Config {
+                endpoint: "https://garage.example:3900".into(),
+                ..ok.clone()
+            },
+            Duration::from_secs(1)
+        )
+        .is_ok());
         assert!(
-            S3Store::new(S3Config { ca_file: Some("/nonexistent.pem".into()), ..ok.clone() }, Duration::from_secs(1)).is_err(),
+            S3Store::new(
+                S3Config {
+                    ca_file: Some("/nonexistent.pem".into()),
+                    ..ok.clone()
+                },
+                Duration::from_secs(1)
+            )
+            .is_err(),
             "a CA file with http://"
         );
-        for endpoint in ["ftp://x", "127.0.0.1:3900", "http://", "https://", "http://h/path"] {
-            assert!(S3Store::new(S3Config { endpoint: endpoint.into(), ..ok.clone() }, Duration::from_secs(1)).is_err(), "{endpoint}");
+        for endpoint in [
+            "ftp://x",
+            "127.0.0.1:3900",
+            "http://",
+            "https://",
+            "http://h/path",
+        ] {
+            assert!(
+                S3Store::new(
+                    S3Config {
+                        endpoint: endpoint.into(),
+                        ..ok.clone()
+                    },
+                    Duration::from_secs(1)
+                )
+                .is_err(),
+                "{endpoint}"
+            );
         }
         for bucket in ["", "Taso", "a/b"] {
-            assert!(S3Store::new(S3Config { bucket: bucket.into(), ..ok.clone() }, Duration::from_secs(1)).is_err(), "{bucket}");
+            assert!(
+                S3Store::new(
+                    S3Config {
+                        bucket: bucket.into(),
+                        ..ok.clone()
+                    },
+                    Duration::from_secs(1)
+                )
+                .is_err(),
+                "{bucket}"
+            );
         }
-        assert!(!format!("{ok:?}").contains("EXAMPLEKEY"), "the secret is never printed");
+        assert!(
+            !format!("{ok:?}").contains("EXAMPLEKEY"),
+            "the secret is never printed"
+        );
     }
 
     /// HTTPS against a local server whose certificate is signed by a
@@ -491,23 +677,82 @@ mod tests {
     #[test]
     fn https_trusts_exactly_the_given_ca() {
         use std::process::{Command, Stdio};
-        let have = |c: &str| Command::new(c).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+        let have = |c: &str| {
+            Command::new(c)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok()
+        };
         if !have("openssl") || !have("python3") {
             eprintln!("skipped: needs openssl and python3");
             return;
         }
         let dir = tempfile::tempdir().unwrap();
         let p = |n: &str| dir.path().join(n).to_string_lossy().into_owned();
-        let sh = |args: &[&str]| assert!(Command::new("openssl").args(args).stderr(Stdio::null()).status().unwrap().success(), "{args:?}");
+        let sh = |args: &[&str]| {
+            assert!(
+                Command::new("openssl")
+                    .args(args)
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "{args:?}"
+            )
+        };
         for ca in ["ca", "other"] {
-            sh(&["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "2",
-                 "-subj", &format!("/CN=taso test {ca}"), "-keyout", &p(&format!("{ca}.key")), "-out", &p(&format!("{ca}.pem"))]);
+            sh(&[
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:P-256",
+                "-nodes",
+                "-days",
+                "2",
+                "-subj",
+                &format!("/CN=taso test {ca}"),
+                "-keyout",
+                &p(&format!("{ca}.key")),
+                "-out",
+                &p(&format!("{ca}.pem")),
+            ]);
         }
-        sh(&["req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-subj", "/CN=localhost",
-             "-keyout", &p("srv.key"), "-out", &p("srv.csr")]);
+        sh(&[
+            "req",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+            "-keyout",
+            &p("srv.key"),
+            "-out",
+            &p("srv.csr"),
+        ]);
         std::fs::write(p("ext"), "subjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
-        sh(&["x509", "-req", "-in", &p("srv.csr"), "-CA", &p("ca.pem"), "-CAkey", &p("ca.key"), "-CAcreateserial",
-             "-days", "2", "-extfile", &p("ext"), "-out", &p("srv.pem")]);
+        sh(&[
+            "x509",
+            "-req",
+            "-in",
+            &p("srv.csr"),
+            "-CA",
+            &p("ca.pem"),
+            "-CAkey",
+            &p("ca.key"),
+            "-CAcreateserial",
+            "-days",
+            "2",
+            "-extfile",
+            &p("ext"),
+            "-out",
+            &p("srv.pem"),
+        ]);
         // A server that answers every HEAD with 404 (the key does not exist).
         let server = format!(
             r#"
@@ -525,9 +770,17 @@ s.serve_forever()
             p("srv.pem"),
             p("srv.key")
         );
-        let mut child = Command::new("python3").args(["-c", &server]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut child = Command::new("python3")
+            .args(["-c", &server])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
         let mut port = String::new();
-        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.as_mut().unwrap()), &mut port).unwrap();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+            &mut port,
+        )
+        .unwrap();
         let store = |ca: Option<&str>| {
             S3Store::new(
                 S3Config {
@@ -546,12 +799,21 @@ s.serve_forever()
         let other = store(Some("other.pem")).exists("a/b");
         let _ = child.kill();
         let _ = child.wait();
-        assert!(!trusted.unwrap(), "with its CA: a 404 answer, so the key does not exist");
-        assert!(public_roots.is_err(), "the public roots do not know a private CA");
+        assert!(
+            !trusted.unwrap(),
+            "with its CA: a 404 answer, so the key does not exist"
+        );
+        assert!(
+            public_roots.is_err(),
+            "the public roots do not know a private CA"
+        );
         assert!(other.is_err(), "another CA is not trusted");
         let empty = dir.path().join("empty.pem");
         std::fs::write(&empty, "").unwrap();
-        assert!(tls_trusting(&empty).is_err(), "a CA file with no certificate");
+        assert!(
+            tls_trusting(&empty).is_err(),
+            "a CA file with no certificate"
+        );
     }
 
     /// The same contract tests as `LocalStore`, against a real Garage:
@@ -583,21 +845,36 @@ s.serve_forever()
         store.put(&k("sub/b"), &mut &big[..]).unwrap();
         assert!(store.exists(&k("a")).unwrap());
         let mut got = Vec::new();
-        store.get(&k("sub/b")).unwrap().unwrap().read_to_end(&mut got).unwrap();
+        store
+            .get(&k("sub/b"))
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
         assert_eq!(got, big);
         store.put(&k("a"), &mut &b"again"[..]).unwrap();
         let mut a = String::new();
-        store.get(&k("a")).unwrap().unwrap().read_to_string(&mut a).unwrap();
+        store
+            .get(&k("a"))
+            .unwrap()
+            .unwrap()
+            .read_to_string(&mut a)
+            .unwrap();
         assert_eq!(a, "again");
         assert_eq!(store.list(&dir).unwrap(), vec![k("a"), k("sub/b")]);
         // More keys than one page (Garage pages at 1000).
         for i in 0..1005 {
-            store.put(&k(&format!("many/{i:05}")), &mut &b"x"[..]).unwrap();
+            store
+                .put(&k(&format!("many/{i:05}")), &mut &b"x"[..])
+                .unwrap();
         }
         assert_eq!(store.list(&format!("{dir}/many")).unwrap().len(), 1005);
         assert!(store.put("../x", &mut &b""[..]).is_err());
         let wrong = S3Store::new(
-            S3Config { secret_key: "wrong".into(), ..store.config.clone() },
+            S3Config {
+                secret_key: "wrong".into(),
+                ..store.config.clone()
+            },
             Duration::from_secs(10),
         )
         .unwrap();

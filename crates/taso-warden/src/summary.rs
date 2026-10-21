@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use taso_core::decode::DecodeError;
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{
-    CheckpointRecord, CheckpointSeal, FsShippedRecord, LineageRecord, OpId, OpenEffect, OutcomeState, Payload,
-    SuccessionRecord,
+    CheckpointRecord, CheckpointSeal, FsShippedRecord, LineageRecord, OpId, OpenEffect,
+    OutcomeState, Payload, SuccessionRecord,
 };
 
 use crate::segment::Frame;
@@ -65,7 +65,10 @@ impl Default for Summary {
 }
 
 fn terminal(s: OutcomeState) -> bool {
-    matches!(s, OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied)
+    matches!(
+        s,
+        OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied
+    )
 }
 
 impl Summary {
@@ -75,7 +78,8 @@ impl Summary {
         let start = frames
             .iter()
             .rposition(|f| {
-                f.envelope.stream == Stream::Ctl && matches!(Payload::decode(&f.payload), Ok(Payload::Checkpoint(_)))
+                f.envelope.stream == Stream::Ctl
+                    && matches!(Payload::decode(&f.payload), Ok(Payload::Checkpoint(_)))
             })
             .unwrap_or(0);
         let mut s = Summary::default();
@@ -96,7 +100,14 @@ impl Summary {
                 match decode()? {
                     Payload::Intent(intent) => {
                         self.next_op = self.next_op.max(intent.op.get().saturating_add(1));
-                        self.open.insert(intent.op, OpenEffect { lsn, intent, state: None });
+                        self.open.insert(
+                            intent.op,
+                            OpenEffect {
+                                lsn,
+                                intent,
+                                state: None,
+                            },
+                        );
                     }
                     Payload::Outcome(o) if terminal(o.state) => {
                         self.open.remove(&o.op);
@@ -166,8 +177,8 @@ mod tests {
     use taso_core::canon::Canonical;
     use taso_core::envelope::{BranchId, ChronicleId, Epoch, HashVal};
     use taso_core::record::{
-        BarrierId, Consequence, Dispatch, IntentRecord, LayerRef, Namespace, Origin, OutcomeRecord, Record,
-        RetryPolicy, SealRecord, StreamBase, StreamCut, TurnId, Verdict,
+        BarrierId, Consequence, Dispatch, IntentRecord, LayerRef, Namespace, Origin, OutcomeRecord,
+        Record, RetryPolicy, SealRecord, StreamBase, StreamCut, TurnId, Verdict,
     };
 
     /// What a test log is made of.
@@ -226,7 +237,11 @@ mod tests {
             let mut l = Log { frames: Vec::new() };
             l.push(
                 Stream::Ctl,
-                Payload::Lineage(LineageRecord { origin: Origin::Void, namespace: Namespace::from_bytes([1; 16]), ledger_pos: Lsn::new(0) }),
+                Payload::Lineage(LineageRecord {
+                    origin: Origin::Void,
+                    namespace: Namespace::from_bytes([1; 16]),
+                    ledger_pos: Lsn::new(0),
+                }),
             );
             l
         }
@@ -235,9 +250,22 @@ mod tests {
             let (lsn, prev) = self
                 .frames
                 .last()
-                .map_or((Lsn::new(1), HashVal::GENESIS), |f| (f.envelope.lsn.next(), f.envelope.hash));
-            let r = Record::new(ChronicleId::from_bytes([7; 16]), BranchId::TRUNK, Epoch::FIRST, stream, lsn, prev, payload);
-            self.frames.push(Frame { envelope: r.envelope, payload: r.payload.canon_bytes() });
+                .map_or((Lsn::new(1), HashVal::GENESIS), |f| {
+                    (f.envelope.lsn.next(), f.envelope.hash)
+                });
+            let r = Record::new(
+                ChronicleId::from_bytes([7; 16]),
+                BranchId::TRUNK,
+                Epoch::FIRST,
+                stream,
+                lsn,
+                prev,
+                payload,
+            );
+            self.frames.push(Frame {
+                envelope: r.envelope,
+                payload: r.payload.canon_bytes(),
+            });
         }
 
         fn step(&mut self, s: &Step) {
@@ -247,7 +275,11 @@ mod tests {
                 Step::Intent(op) => self.push(Stream::Effect, Payload::Intent(intent(*op))),
                 Step::Outcome(op, s) => self.push(
                     Stream::Effect,
-                    Payload::Outcome(OutcomeRecord { op: OpId::new(u64::from(*op)), state: state(*s), evidence: None }),
+                    Payload::Outcome(OutcomeRecord {
+                        op: OpId::new(u64::from(*op)),
+                        state: state(*s),
+                        evidence: None,
+                    }),
                 ),
                 Step::Seal(turn) => self.push(
                     Stream::Ctl,
@@ -288,7 +320,10 @@ mod tests {
     /// without chained hashes (the two logs chain differently by
     /// construction; that the hash is the record's is checked below).
     fn seen(s: &Summary) -> Summary {
-        let mut s = Summary { from_checkpoint: None, ..s.clone() };
+        let mut s = Summary {
+            from_checkpoint: None,
+            ..s.clone()
+        };
         if let Some(seal) = &mut s.seal {
             seal.hash = HashVal::GENESIS;
         }
@@ -343,14 +378,33 @@ mod tests {
     #[test]
     fn open_effects_follow_their_latest_outcome() {
         let mut l = Log::new();
-        for s in [Step::Intent(1), Step::Intent(2), Step::Outcome(1, 1), Step::Outcome(2, 3), Step::Intent(3), Step::Outcome(1, 2)] {
+        for s in [
+            Step::Intent(1),
+            Step::Intent(2),
+            Step::Outcome(1, 1),
+            Step::Outcome(2, 3),
+            Step::Intent(3),
+            Step::Outcome(1, 2),
+        ] {
             l.step(&s);
         }
         let s = Summary::of(&l.frames).unwrap();
-        let open: Vec<(u64, Option<OutcomeState>)> = s.open.values().map(|e| (e.intent.op.get(), e.state)).collect();
-        assert_eq!(open, vec![(1, Some(OutcomeState::OutcomeUnknown)), (3, None)], "2 is terminal");
+        let open: Vec<(u64, Option<OutcomeState>)> = s
+            .open
+            .values()
+            .map(|e| (e.intent.op.get(), e.state))
+            .collect();
+        assert_eq!(
+            open,
+            vec![(1, Some(OutcomeState::OutcomeUnknown)), (3, None)],
+            "2 is terminal"
+        );
         assert_eq!(s.next_op, 4);
         assert!(s.lineage.is_some() && s.checkpoint().is_some());
-        assert_eq!(Summary::default().checkpoint(), None, "no Lineage, no Checkpoint");
+        assert_eq!(
+            Summary::default().checkpoint(),
+            None,
+            "no Lineage, no Checkpoint"
+        );
     }
 }

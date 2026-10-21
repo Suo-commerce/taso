@@ -103,9 +103,17 @@ impl fmt::Display for NotQuiescent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HotJournal(db) => write!(f, "{}: rollback journal is hot", db.display()),
-            Self::WalChanged(db) => write!(f, "{}: WAL changed since the quiescence signal", db.display()),
+            Self::WalChanged(db) => write!(
+                f,
+                "{}: WAL changed since the quiescence signal",
+                db.display()
+            ),
             Self::JournalChanged(db) => {
-                write!(f, "{}: journal changed since the quiescence signal", db.display())
+                write!(
+                    f,
+                    "{}: journal changed since the quiescence signal",
+                    db.display()
+                )
             }
             Self::NotAFile(db, c) => {
                 write!(f, "{}{} is not a regular file", db.display(), c.suffix())
@@ -133,7 +141,8 @@ impl Watch {
         for db in dbs {
             let p = Path::new(db);
             let inside = !db.is_empty()
-                && p.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+                && p.components()
+                    .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
             if !inside {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -142,7 +151,10 @@ impl Watch {
             }
             out.push(p.to_path_buf());
         }
-        Ok(Self { mount: mount.into(), dbs: out })
+        Ok(Self {
+            mount: mount.into(),
+            dbs: out,
+        })
     }
 
     /// `lstat` every companion of every watched database.
@@ -184,7 +196,12 @@ pub fn verify(before: &Sample, after: &Sample) -> Result<(), NotQuiescent> {
         if b.db != a.db {
             return Err(NotQuiescent::Mismatched);
         }
-        for (seen, c) in [(&b.wal, Companion::Wal), (&a.wal, Companion::Wal), (&b.journal, Companion::Journal), (&a.journal, Companion::Journal)] {
+        for (seen, c) in [
+            (&b.wal, Companion::Wal),
+            (&a.wal, Companion::Wal),
+            (&b.journal, Companion::Journal),
+            (&a.journal, Companion::Journal),
+        ] {
             if *seen == Seen::NotAFile {
                 return Err(NotQuiescent::NotAFile(b.db.clone(), c));
             }
@@ -220,7 +237,13 @@ mod tests {
     }
 
     fn append(path: &Path, bytes: &[u8]) {
-        fs::OpenOptions::new().create(true).append(true).open(path).unwrap().write_all(bytes).unwrap();
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
     }
 
     #[test]
@@ -243,7 +266,10 @@ mod tests {
         append(&wal, &[0; 4096]);
         let before = w.sample().unwrap();
         append(&wal, &[1; 4120]);
-        assert_eq!(verify(&before, &w.sample().unwrap()), Err(NotQuiescent::WalChanged("state.db".into())));
+        assert_eq!(
+            verify(&before, &w.sample().unwrap()),
+            Err(NotQuiescent::WalChanged("state.db".into()))
+        );
     }
 
     #[test]
@@ -252,11 +278,17 @@ mod tests {
         let wal = dir.path().join("state.db-wal");
         let before = w.sample().unwrap();
         append(&wal, &[0; 32]);
-        assert!(matches!(verify(&before, &w.sample().unwrap()), Err(NotQuiescent::WalChanged(_))));
+        assert!(matches!(
+            verify(&before, &w.sample().unwrap()),
+            Err(NotQuiescent::WalChanged(_))
+        ));
 
         let before = w.sample().unwrap();
         fs::remove_file(&wal).unwrap();
-        assert!(matches!(verify(&before, &w.sample().unwrap()), Err(NotQuiescent::WalChanged(_))));
+        assert!(matches!(
+            verify(&before, &w.sample().unwrap()),
+            Err(NotQuiescent::WalChanged(_))
+        ));
 
         // Same size, new inode (checkpoint + reset that recreates it).
         append(&wal, &[0; 32]);
@@ -264,7 +296,10 @@ mod tests {
         let tmp = dir.path().join("tmp");
         fs::write(&tmp, [0; 32]).unwrap();
         fs::rename(&tmp, &wal).unwrap();
-        assert!(matches!(verify(&before, &w.sample().unwrap()), Err(NotQuiescent::WalChanged(_))));
+        assert!(matches!(
+            verify(&before, &w.sample().unwrap()),
+            Err(NotQuiescent::WalChanged(_))
+        ));
     }
 
     #[test]
@@ -273,9 +308,16 @@ mod tests {
         let journal = dir.path().join("state.db-journal");
         append(&journal, &[0; 512]);
         let a = w.sample().unwrap();
-        assert_eq!(verify(&a, &w.sample().unwrap()), Err(NotQuiescent::HotJournal("state.db".into())));
+        assert_eq!(
+            verify(&a, &w.sample().unwrap()),
+            Err(NotQuiescent::HotJournal("state.db".into()))
+        );
         // An empty journal (journal_mode=TRUNCATE after commit) is fine.
-        fs::OpenOptions::new().write(true).truncate(true).open(&journal).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&journal)
+            .unwrap();
         let a = w.sample().unwrap();
         assert_eq!(verify(&a, &w.sample().unwrap()), Ok(()));
     }
@@ -298,7 +340,10 @@ mod tests {
         let a = w.sample().unwrap();
         assert_eq!(
             verify(&a, &w.sample().unwrap()),
-            Err(NotQuiescent::NotAFile("state.db".into(), Companion::Journal))
+            Err(NotQuiescent::NotAFile(
+                "state.db".into(),
+                Companion::Journal
+            ))
         );
     }
 
@@ -311,7 +356,10 @@ mod tests {
         append(&dir.path().join("sub/b.db-wal"), &[0; 8]);
         let before = w.sample().unwrap();
         append(&dir.path().join("sub/b.db-wal"), &[1; 8]);
-        assert_eq!(verify(&before, &w.sample().unwrap()), Err(NotQuiescent::WalChanged("sub/b.db".into())));
+        assert_eq!(
+            verify(&before, &w.sample().unwrap()),
+            Err(NotQuiescent::WalChanged("sub/b.db".into()))
+        );
     }
 
     #[test]
@@ -326,7 +374,13 @@ mod tests {
     fn samples_of_different_watches_do_not_compare() {
         let (_d, w) = setup();
         let other = Watch::new("/nonexistent", &["x.db"]).unwrap();
-        assert_eq!(verify(&w.sample().unwrap(), &other.sample().unwrap()), Err(NotQuiescent::Mismatched));
-        assert_eq!(verify(&w.sample().unwrap(), &Sample(vec![])), Err(NotQuiescent::Mismatched));
+        assert_eq!(
+            verify(&w.sample().unwrap(), &other.sample().unwrap()),
+            Err(NotQuiescent::Mismatched)
+        );
+        assert_eq!(
+            verify(&w.sample().unwrap(), &Sample(vec![])),
+            Err(NotQuiescent::Mismatched)
+        );
     }
 }

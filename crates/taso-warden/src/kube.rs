@@ -50,9 +50,18 @@ impl KubeConfig {
     /// and `KUBERNETES_SERVICE_PORT`, the service account's token and CA.
     pub fn in_cluster() -> io::Result<Self> {
         let var = |k: &str| {
-            std::env::var(k).map_err(|_| io::Error::new(io::ErrorKind::NotFound, format!("{k} is not set: not running in a pod?")))
+            std::env::var(k).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{k} is not set: not running in a pod?"),
+                )
+            })
         };
-        Self::from_parts(&var("KUBERNETES_SERVICE_HOST")?, &var("KUBERNETES_SERVICE_PORT")?, Path::new(SERVICE_ACCOUNT_DIR))
+        Self::from_parts(
+            &var("KUBERNETES_SERVICE_HOST")?,
+            &var("KUBERNETES_SERVICE_PORT")?,
+            Path::new(SERVICE_ACCOUNT_DIR),
+        )
     }
 
     /// The configuration for `host:port` with the service account files in
@@ -62,10 +71,21 @@ impl KubeConfig {
         if host.is_empty() || host.contains(['/', '?', '#', '@', ' ']) {
             return Err(bad(format!("bad API host {host:?}")));
         }
-        port.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| bad(format!("bad API port {port:?}")))?;
+        port.parse::<u16>()
+            .ok()
+            .filter(|p| *p != 0)
+            .ok_or_else(|| bad(format!("bad API port {port:?}")))?;
         // An IPv6 address goes in brackets.
-        let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() };
-        Ok(Self { api: format!("https://{host}:{port}"), token_file: dir.join("token"), ca_file: Some(dir.join("ca.crt")) })
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        Ok(Self {
+            api: format!("https://{host}:{port}"),
+            token_file: dir.join("token"),
+            ca_file: Some(dir.join("ca.crt")),
+        })
     }
 }
 
@@ -101,7 +121,11 @@ impl KubeError {
 impl fmt::Display for KubeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Status { code, reason, message } => write!(f, "API server: {code} {reason}: {message}"),
+            Self::Status {
+                code,
+                reason,
+                message,
+            } => write!(f, "API server: {code} {reason}: {message}"),
             Self::Transport(e) => write!(f, "API server unreachable: {e}"),
             Self::Body(e) => write!(f, "API server answer: {e}"),
             Self::Token(e) => write!(f, "service account token: {e}"),
@@ -119,7 +143,11 @@ impl std::error::Error for KubeError {}
 pub fn valid_name(s: &str) -> bool {
     let ok_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.';
     let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    !s.is_empty() && s.len() <= 253 && s.chars().all(ok_char) && edge(s.chars().next()) && edge(s.chars().last())
+    !s.is_empty()
+        && s.len() <= 253
+        && s.chars().all(ok_char)
+        && edge(s.chars().next())
+        && edge(s.chars().last())
 }
 
 /// A resource type served by the API: the path prefix of its collection.
@@ -152,7 +180,10 @@ pub struct Kube {
 
 impl fmt::Debug for Kube {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Kube").field("api", &self.api).field("token_file", &self.token_file).finish()
+        f.debug_struct("Kube")
+            .field("api", &self.api)
+            .field("token_file", &self.token_file)
+            .finish()
     }
 }
 
@@ -161,27 +192,43 @@ impl Kube {
     pub fn new(config: &KubeConfig, timeout: Duration) -> io::Result<Self> {
         let api = config.api.trim_end_matches('/');
         if !api.starts_with("https://") || api.len() <= "https://".len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("the API server must be https://…, not {api:?}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the API server must be https://…, not {api:?}"),
+            ));
         }
         let mut agent = ureq::AgentBuilder::new().timeout(timeout);
         if let Some(ca) = &config.ca_file {
             agent = agent.tls_config(std::sync::Arc::new(crate::s3::tls_trusting(ca)?));
         }
-        Ok(Self { agent: agent.build(), api: api.to_string(), token_file: config.token_file.clone() })
+        Ok(Self {
+            agent: agent.build(),
+            api: api.to_string(),
+            token_file: config.token_file.clone(),
+        })
     }
 
     fn token(&self) -> Result<String, KubeError> {
-        let t = std::fs::read_to_string(&self.token_file).map_err(|e| KubeError::Token(format!("{}: {e}", self.token_file.display())))?;
+        let t = std::fs::read_to_string(&self.token_file)
+            .map_err(|e| KubeError::Token(format!("{}: {e}", self.token_file.display())))?;
         let t = t.trim();
         if t.is_empty() || t.contains(['\r', '\n']) {
-            return Err(KubeError::Token(format!("{} holds no single token", self.token_file.display())));
+            return Err(KubeError::Token(format!(
+                "{} holds no single token",
+                self.token_file.display()
+            )));
         }
         Ok(t.to_string())
     }
 
     /// The path of a namespaced object, or of the whole collection (across
     /// namespaces when `namespace` is `None`).
-    fn path(&self, r: Resource, namespace: Option<&str>, name: Option<&str>) -> Result<String, KubeError> {
+    fn path(
+        &self,
+        r: Resource,
+        namespace: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<String, KubeError> {
         let mut p = r.prefix();
         if let Some(ns) = namespace {
             if !valid_name(ns) {
@@ -201,17 +248,25 @@ impl Kube {
     }
 
     fn send(&self, req: ureq::Request, body: Option<&Value>) -> Result<Value, KubeError> {
-        let req = req.set("Authorization", &format!("Bearer {}", self.token()?)).set("Accept", "application/json");
+        let req = req
+            .set("Authorization", &format!("Bearer {}", self.token()?))
+            .set("Accept", "application/json");
         let answer = match body {
             None => req.call(),
-            Some(b) => req.set("Content-Type", "application/merge-patch+json").send_string(&b.to_string()),
+            Some(b) => req
+                .set("Content-Type", "application/merge-patch+json")
+                .send_string(&b.to_string()),
         };
         match answer {
             Ok(resp) => {
-                let text = resp.into_string().map_err(|e| KubeError::Body(e.to_string()))?;
+                let text = resp
+                    .into_string()
+                    .map_err(|e| KubeError::Body(e.to_string()))?;
                 serde_json::from_str(&text).map_err(|e| KubeError::Body(format!("not JSON: {e}")))
             }
-            Err(ureq::Error::Status(code, resp)) => Err(status_error(code, &resp.into_string().unwrap_or_default())),
+            Err(ureq::Error::Status(code, resp)) => {
+                Err(status_error(code, &resp.into_string().unwrap_or_default()))
+            }
             Err(ureq::Error::Transport(t)) => Err(KubeError::Transport(t.to_string())),
         }
     }
@@ -219,7 +274,12 @@ impl Kube {
     /// List `r` in `namespace` (all namespaces if `None`), with a field
     /// selector if given (e.g. `spec.node=node-a`, for fields the CRD
     /// declares selectable).  Returns the `List` object.
-    pub fn list(&self, r: Resource, namespace: Option<&str>, field_selector: Option<&str>) -> Result<Value, KubeError> {
+    pub fn list(
+        &self,
+        r: Resource,
+        namespace: Option<&str>,
+        field_selector: Option<&str>,
+    ) -> Result<Value, KubeError> {
         let url = format!("{}{}", self.api, self.path(r, namespace, None)?);
         let mut req = self.agent.get(&url);
         if let Some(fs) = field_selector {
@@ -236,7 +296,13 @@ impl Kube {
 
     /// Merge `status` into the object's status (the `status` subresource,
     /// JSON merge patch).  Returns the object as the server now has it.
-    pub fn patch_status(&self, r: Resource, namespace: &str, name: &str, status: &Value) -> Result<Value, KubeError> {
+    pub fn patch_status(
+        &self,
+        r: Resource,
+        namespace: &str,
+        name: &str,
+        status: &Value,
+    ) -> Result<Value, KubeError> {
         self.patch_status_at(r, namespace, name, None, status)
     }
 
@@ -253,7 +319,11 @@ impl Kube {
         resource_version: Option<&str>,
         status: &Value,
     ) -> Result<Value, KubeError> {
-        let url = format!("{}{}/status", self.api, self.path(r, Some(namespace), Some(name))?);
+        let url = format!(
+            "{}{}/status",
+            self.api,
+            self.path(r, Some(namespace), Some(name))?
+        );
         let mut body = serde_json::json!({ "status": status });
         if let Some(rv) = resource_version {
             if rv.is_empty() {
@@ -281,14 +351,32 @@ fn status_error(code: u16, body: &str) -> KubeError {
 mod tests {
     use super::*;
 
-    const VESSELS: Resource = Resource { group: "taso.suocommerce.com", version: "v1alpha1", plural: "vessels" };
+    const VESSELS: Resource = Resource {
+        group: "taso.suocommerce.com",
+        version: "v1alpha1",
+        plural: "vessels",
+    };
 
     #[test]
     fn names_are_checked_before_they_reach_a_path() {
         for ok in ["default", "a", "vessel-1", "a.b-c.d", &"a".repeat(253)] {
             assert!(valid_name(ok), "{ok}");
         }
-        for bad in ["", "A", "a/b", "../x", "a?b", "a b", "-a", "a-", ".a", "a.", "ä", "a%2fb", &"a".repeat(254)] {
+        for bad in [
+            "",
+            "A",
+            "a/b",
+            "../x",
+            "a?b",
+            "a b",
+            "-a",
+            "a-",
+            ".a",
+            "a.",
+            "ä",
+            "a%2fb",
+            &"a".repeat(254),
+        ] {
             assert!(!valid_name(bad), "{bad:?}");
         }
     }
@@ -296,30 +384,67 @@ mod tests {
     fn client() -> (tempfile::TempDir, Kube) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("token"), "t0ken\n").unwrap();
-        let cfg = KubeConfig { api: "https://127.0.0.1:1".into(), token_file: dir.path().join("token"), ca_file: None };
+        let cfg = KubeConfig {
+            api: "https://127.0.0.1:1".into(),
+            token_file: dir.path().join("token"),
+            ca_file: None,
+        };
         (dir, Kube::new(&cfg, Duration::from_secs(1)).unwrap())
     }
 
     #[test]
     fn paths_are_built_from_valid_names_only() {
         let (_d, k) = client();
-        assert_eq!(k.path(VESSELS, None, None).unwrap(), "/apis/taso.suocommerce.com/v1alpha1/vessels");
-        assert_eq!(k.path(VESSELS, Some("team-a"), Some("v1")).unwrap(), "/apis/taso.suocommerce.com/v1alpha1/namespaces/team-a/vessels/v1");
-        let core = Resource { group: "", version: "v1", plural: "namespaces" };
-        assert_eq!(k.path(core, None, Some("team-a")).unwrap(), "/api/v1/namespaces/team-a");
-        for (ns, name) in [(Some("../kube-system"), None), (Some("a"), Some("x/../../secrets")), (Some("A"), None)] {
-            assert!(matches!(k.path(VESSELS, ns, name), Err(KubeError::BadName(_))), "{ns:?} {name:?}");
+        assert_eq!(
+            k.path(VESSELS, None, None).unwrap(),
+            "/apis/taso.suocommerce.com/v1alpha1/vessels"
+        );
+        assert_eq!(
+            k.path(VESSELS, Some("team-a"), Some("v1")).unwrap(),
+            "/apis/taso.suocommerce.com/v1alpha1/namespaces/team-a/vessels/v1"
+        );
+        let core = Resource {
+            group: "",
+            version: "v1",
+            plural: "namespaces",
+        };
+        assert_eq!(
+            k.path(core, None, Some("team-a")).unwrap(),
+            "/api/v1/namespaces/team-a"
+        );
+        for (ns, name) in [
+            (Some("../kube-system"), None),
+            (Some("a"), Some("x/../../secrets")),
+            (Some("A"), None),
+        ] {
+            assert!(
+                matches!(k.path(VESSELS, ns, name), Err(KubeError::BadName(_))),
+                "{ns:?} {name:?}"
+            );
         }
         // And a bad name is refused before any request (no network needed).
-        assert!(matches!(k.get(VESSELS, "a", "b/c"), Err(KubeError::BadName(_))));
-        assert!(matches!(k.patch_status(VESSELS, "ns/x", "b", &Value::Null), Err(KubeError::BadName(_))));
-        assert!(matches!(k.patch_status_at(VESSELS, "a", "b", Some(""), &Value::Null), Err(KubeError::BadName(_))));
+        assert!(matches!(
+            k.get(VESSELS, "a", "b/c"),
+            Err(KubeError::BadName(_))
+        ));
+        assert!(matches!(
+            k.patch_status(VESSELS, "ns/x", "b", &Value::Null),
+            Err(KubeError::BadName(_))
+        ));
+        assert!(matches!(
+            k.patch_status_at(VESSELS, "a", "b", Some(""), &Value::Null),
+            Err(KubeError::BadName(_))
+        ));
     }
 
     #[test]
     fn only_https_is_accepted() {
         for api in ["http://10.0.0.1:443", "10.0.0.1:443", "https://", "ftp://x"] {
-            let cfg = KubeConfig { api: api.into(), token_file: "/t".into(), ca_file: None };
+            let cfg = KubeConfig {
+                api: api.into(),
+                token_file: "/t".into(),
+                ca_file: None,
+            };
             assert!(Kube::new(&cfg, Duration::from_secs(1)).is_err(), "{api}");
         }
     }
@@ -328,9 +453,26 @@ mod tests {
     fn in_cluster_parts() {
         let dir = Path::new("/sa");
         let c = KubeConfig::from_parts("10.96.0.1", "443", dir).unwrap();
-        assert_eq!(c, KubeConfig { api: "https://10.96.0.1:443".into(), token_file: "/sa/token".into(), ca_file: Some("/sa/ca.crt".into()) });
-        assert_eq!(KubeConfig::from_parts("fd00::1", "443", dir).unwrap().api, "https://[fd00::1]:443");
-        for (h, p) in [("", "443"), ("a/b", "443"), ("x@y", "443"), ("h", "0"), ("h", "99999"), ("h", "x")] {
+        assert_eq!(
+            c,
+            KubeConfig {
+                api: "https://10.96.0.1:443".into(),
+                token_file: "/sa/token".into(),
+                ca_file: Some("/sa/ca.crt".into())
+            }
+        );
+        assert_eq!(
+            KubeConfig::from_parts("fd00::1", "443", dir).unwrap().api,
+            "https://[fd00::1]:443"
+        );
+        for (h, p) in [
+            ("", "443"),
+            ("a/b", "443"),
+            ("x@y", "443"),
+            ("h", "0"),
+            ("h", "99999"),
+            ("h", "x"),
+        ] {
             assert!(KubeConfig::from_parts(h, p, dir).is_err(), "{h:?}:{p:?}");
         }
     }
@@ -340,7 +482,11 @@ mod tests {
         let (dir, k) = client();
         assert_eq!(k.token().unwrap(), "t0ken");
         std::fs::write(dir.path().join("token"), "rotated").unwrap();
-        assert_eq!(k.token().unwrap(), "rotated", "a rotated token is used at once");
+        assert_eq!(
+            k.token().unwrap(),
+            "rotated",
+            "a rotated token is used at once"
+        );
         for bad in ["", "\n", "two\nlines"] {
             std::fs::write(dir.path().join("token"), bad).unwrap();
             assert!(matches!(k.token(), Err(KubeError::Token(_))), "{bad:?}");
@@ -351,11 +497,16 @@ mod tests {
 
     #[test]
     fn error_answers_keep_the_servers_reason() {
-        let e = status_error(404, r#"{"kind":"Status","status":"Failure","reason":"NotFound","message":"vessels.taso.suocommerce.com \"x\" not found","code":404}"#);
+        let e = status_error(
+            404,
+            r#"{"kind":"Status","status":"Failure","reason":"NotFound","message":"vessels.taso.suocommerce.com \"x\" not found","code":404}"#,
+        );
         assert!(e.is_not_found());
         assert!(e.to_string().contains("404 NotFound"), "{e}");
         let e = status_error(502, "<html>bad gateway</html>");
-        assert!(matches!(&e, KubeError::Status { code: 502, reason, message } if reason.is_empty() && message.contains("bad gateway")));
+        assert!(
+            matches!(&e, KubeError::Status { code: 502, reason, message } if reason.is_empty() && message.contains("bad gateway"))
+        );
         assert!(!e.is_not_found());
     }
 
@@ -363,7 +514,10 @@ mod tests {
     fn no_answer_is_a_transport_error() {
         // Port 1 on localhost: nothing listens.
         let (_d, k) = client();
-        assert!(matches!(k.list(VESSELS, None, None), Err(KubeError::Transport(_))));
+        assert!(matches!(
+            k.list(VESSELS, None, None),
+            Err(KubeError::Transport(_))
+        ));
     }
 
     /// Against a real API server with the Vessel CRD applied: set
@@ -385,14 +539,28 @@ mod tests {
 
         let all = k.list(VESSELS, None, None).unwrap();
         assert_eq!(all["kind"], "VesselList");
-        assert!(all["items"].as_array().unwrap().iter().any(|v| v["metadata"]["name"] == name), "{all}");
+        assert!(
+            all["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["metadata"]["name"] == name),
+            "{all}"
+        );
         let in_ns = k.list(VESSELS, Some(ns), None).unwrap();
         assert!(!in_ns["items"].as_array().unwrap().is_empty());
 
         let v = k.get(VESSELS, ns, name).unwrap();
         assert_eq!(v["metadata"]["name"], name);
 
-        let after = k.patch_status(VESSELS, ns, name, &serde_json::json!({ "phase": "Pending", "message": "from the kube client test" })).unwrap();
+        let after = k
+            .patch_status(
+                VESSELS,
+                ns,
+                name,
+                &serde_json::json!({ "phase": "Pending", "message": "from the kube client test" }),
+            )
+            .unwrap();
         assert_eq!(after["status"]["phase"], "Pending");
         assert_eq!(after["status"]["message"], "from the kube client test");
         assert_eq!(after["spec"], v["spec"], "a status patch leaves spec alone");
@@ -400,24 +568,80 @@ mod tests {
         let missing = k.get(VESSELS, ns, "no-such-vessel").unwrap_err();
         assert!(missing.is_not_found(), "{missing}");
         // At a resourceVersion: applied while it is current, refused after.
-        let rv = after["metadata"]["resourceVersion"].as_str().unwrap().to_string();
-        let at = k.patch_status_at(VESSELS, ns, name, Some(&rv), &serde_json::json!({ "message": "at rv" })).unwrap();
+        let rv = after["metadata"]["resourceVersion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let at = k
+            .patch_status_at(
+                VESSELS,
+                ns,
+                name,
+                Some(&rv),
+                &serde_json::json!({ "message": "at rv" }),
+            )
+            .unwrap();
         assert_eq!(at["status"]["message"], "at rv");
-        let stale = k.patch_status_at(VESSELS, ns, name, Some(&rv), &serde_json::json!({ "message": "stale" })).unwrap_err();
-        assert!(matches!(stale, KubeError::Status { code: 409, .. }), "{stale}");
-        assert_eq!(k.get(VESSELS, ns, name).unwrap()["status"]["message"], "at rv", "a stale patch writes nothing");
-        let bad_phase = k.patch_status(VESSELS, ns, name, &serde_json::json!({ "phase": "Sleeping" })).unwrap_err();
-        assert!(matches!(bad_phase, KubeError::Status { code: 422, .. }), "the CRD's enum is enforced: {bad_phase}");
+        let stale = k
+            .patch_status_at(
+                VESSELS,
+                ns,
+                name,
+                Some(&rv),
+                &serde_json::json!({ "message": "stale" }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(stale, KubeError::Status { code: 409, .. }),
+            "{stale}"
+        );
+        assert_eq!(
+            k.get(VESSELS, ns, name).unwrap()["status"]["message"],
+            "at rv",
+            "a stale patch writes nothing"
+        );
+        let bad_phase = k
+            .patch_status(
+                VESSELS,
+                ns,
+                name,
+                &serde_json::json!({ "phase": "Sleeping" }),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(bad_phase, KubeError::Status { code: 422, .. }),
+            "the CRD's enum is enforced: {bad_phase}"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("t"), "not-a-token").unwrap();
-        let wrong = Kube::new(&KubeConfig { token_file: dir.path().join("t"), ..cfg.clone() }, Duration::from_secs(10)).unwrap();
-        assert!(matches!(wrong.list(VESSELS, None, None), Err(KubeError::Status { code: 401, .. })));
+        let wrong = Kube::new(
+            &KubeConfig {
+                token_file: dir.path().join("t"),
+                ..cfg.clone()
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(matches!(
+            wrong.list(VESSELS, None, None),
+            Err(KubeError::Status { code: 401, .. })
+        ));
 
         // The cluster's CA is private: the public roots alone do not trust it.
         if cfg.ca_file.is_some() {
-            let public = Kube::new(&KubeConfig { ca_file: None, ..cfg.clone() }, Duration::from_secs(10)).unwrap();
-            assert!(matches!(public.list(VESSELS, None, None), Err(KubeError::Transport(_))));
+            let public = Kube::new(
+                &KubeConfig {
+                    ca_file: None,
+                    ..cfg.clone()
+                },
+                Duration::from_secs(10),
+            )
+            .unwrap();
+            assert!(matches!(
+                public.list(VESSELS, None, None),
+                Err(KubeError::Transport(_))
+            ));
         }
     }
 }

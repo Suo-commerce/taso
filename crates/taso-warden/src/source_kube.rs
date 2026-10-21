@@ -59,12 +59,19 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value};
 use taso_core::record::Namespace;
 
-use crate::daemon::{check_env, check_quiescence, valid_kube_namespace, KubeSourceConf, Restart, RuntimeConf, VesselConf, VesselRuntime};
+use crate::daemon::{
+    check_env, check_quiescence, valid_kube_namespace, KubeSourceConf, Restart, RuntimeConf,
+    VesselConf, VesselRuntime,
+};
 use crate::kube::{valid_name, Kube, KubeError, Resource};
 use crate::source::{SourceError, VesselKey, VesselSource};
 
 /// The `Vessel` resource (`deploy/k8s/vessel-crd.yaml`).
-pub const VESSELS: Resource = Resource { group: "taso.suocommerce.com", version: "v1alpha1", plural: "vessels" };
+pub const VESSELS: Resource = Resource {
+    group: "taso.suocommerce.com",
+    version: "v1alpha1",
+    plural: "vessels",
+};
 
 /// How often the cluster is listed, at most.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(2);
@@ -141,7 +148,16 @@ impl<L: ListVessels> KubeSource<L> {
     /// A source listing with `lister` at most every `tick`, under the
     /// node's `conf` and `runtime`.
     pub fn new(lister: L, conf: KubeSourceConf, runtime: RuntimeConf, tick: Duration) -> Self {
-        Self { lister, conf, runtime, tick, next_list: None, last: None, last_good: BTreeMap::new(), view: SharedView::default() }
+        Self {
+            lister,
+            conf,
+            runtime,
+            tick,
+            next_list: None,
+            last: None,
+            last_good: BTreeMap::new(),
+            view: SharedView::default(),
+        }
     }
 
     /// The view the status writer reads.
@@ -152,9 +168,15 @@ impl<L: ListVessels> KubeSource<L> {
     /// Read a list into the set to run and its view (see the module docs).
     fn read(&mut self, list: &Value) -> Result<(Vec<VesselConf>, View), SourceError> {
         if list.get("kind").and_then(Value::as_str) != Some("VesselList") {
-            return Err(SourceError(format!("expected a VesselList, got kind {:?}", list.get("kind"))));
+            return Err(SourceError(format!(
+                "expected a VesselList, got kind {:?}",
+                list.get("kind")
+            )));
         }
-        let items = list.get("items").and_then(Value::as_array).ok_or_else(|| SourceError("a VesselList without items".into()))?;
+        let items = list
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| SourceError("a VesselList without items".into()))?;
 
         let mut parsed: Vec<(ObjectRef, Result<VesselConf, String>)> = Vec::new();
         let mut refused = Vec::new();
@@ -162,14 +184,27 @@ impl<L: ListVessels> KubeSource<L> {
             let object = match object_ref(item) {
                 Ok(o) => o,
                 Err(reason) => {
-                    refused.push(KubeRefused { object: None, reason, kept_previous: false });
+                    refused.push(KubeRefused {
+                        object: None,
+                        reason,
+                        kept_previous: false,
+                    });
                     continue;
                 }
             };
-            if item.get("metadata").and_then(|m| m.get("deletionTimestamp")).is_some_and(|d| !d.is_null()) {
+            if item
+                .get("metadata")
+                .and_then(|m| m.get("deletionTimestamp"))
+                .is_some_and(|d| !d.is_null())
+            {
                 continue; // being deleted: stopped
             }
-            if item.get("spec").and_then(|s| s.get("node")).and_then(Value::as_str) != Some(self.conf.node.as_str()) {
+            if item
+                .get("spec")
+                .and_then(|s| s.get("node"))
+                .and_then(Value::as_str)
+                != Some(self.conf.node.as_str())
+            {
                 continue; // another node's (see the module docs)
             }
             let entry = self.vessel(&object, item);
@@ -191,7 +226,10 @@ impl<L: ListVessels> KubeSource<L> {
                 let key = *vc.id().as_bytes();
                 match count[&key] {
                     1 => Ok((key, vc)),
-                    n => Err(format!("{n} Vessel resources name tenant and subject {:?}: none of them is run", vc.subject)),
+                    n => Err(format!(
+                        "{n} Vessel resources name tenant and subject {:?}: none of them is run",
+                        vc.subject
+                    )),
                 }
             });
             match entry {
@@ -212,7 +250,11 @@ impl<L: ListVessels> KubeSource<L> {
                         }
                         _ => false,
                     };
-                    refused.push(KubeRefused { object: Some(object), reason, kept_previous: kept });
+                    refused.push(KubeRefused {
+                        object: Some(object),
+                        reason,
+                        kept_previous: kept,
+                    });
                 }
             }
         }
@@ -222,28 +264,58 @@ impl<L: ListVessels> KubeSource<L> {
 
     /// One resource's entry, or why it is refused.
     fn vessel(&self, object: &ObjectRef, item: &Value) -> Result<VesselConf, String> {
-        let spec = item.get("spec").and_then(Value::as_object).ok_or("no spec")?;
-        known_keys(spec, "spec", &["tenant", "subject", "uidSlot", "node", "takeover", "rootfs", "args", "env", "landlock", "resources", "quiescence"])?;
+        let spec = item
+            .get("spec")
+            .and_then(Value::as_object)
+            .ok_or("no spec")?;
+        known_keys(
+            spec,
+            "spec",
+            &[
+                "tenant",
+                "subject",
+                "uidSlot",
+                "node",
+                "takeover",
+                "rootfs",
+                "args",
+                "env",
+                "landlock",
+                "resources",
+                "quiescence",
+            ],
+        )?;
 
         // D1.
-        let tenant = hex16(spec.get("tenant").and_then(Value::as_str).ok_or("spec.tenant must be a string")?)?;
-        let mine = self
-            .conf
-            .tenants
-            .get(&object.namespace)
-            .ok_or_else(|| format!("namespace {:?} is not mapped to a tenant on node {}", object.namespace, self.conf.node))?;
+        let tenant = hex16(
+            spec.get("tenant")
+                .and_then(Value::as_str)
+                .ok_or("spec.tenant must be a string")?,
+        )?;
+        let mine = self.conf.tenants.get(&object.namespace).ok_or_else(|| {
+            format!(
+                "namespace {:?} is not mapped to a tenant on node {}",
+                object.namespace, self.conf.node
+            )
+        })?;
         if *mine != tenant {
-            return Err(format!("spec.tenant is not the tenant of namespace {:?}", object.namespace));
+            return Err(format!(
+                "spec.tenant is not the tenant of namespace {:?}",
+                object.namespace
+            ));
         }
-        let subject = spec.get("subject").and_then(Value::as_str).ok_or("spec.subject must be a string")?;
+        let subject = spec
+            .get("subject")
+            .and_then(Value::as_str)
+            .ok_or("spec.subject must be a string")?;
         if subject.is_empty() || subject.len() > 256 {
             return Err("spec.subject must be 1 to 256 bytes".into());
         }
-        let uid_slot = spec
-            .get("uidSlot")
-            .and_then(Value::as_u64)
-            .filter(|s| *s <= 65_000)
-            .ok_or("spec.uidSlot must be an integer from 0 to 65000")? as u32;
+        let uid_slot =
+            spec.get("uidSlot")
+                .and_then(Value::as_u64)
+                .filter(|s| *s <= 65_000)
+                .ok_or("spec.uidSlot must be an integer from 0 to 65000")? as u32;
 
         // D3.
         if spec.get("takeover").is_some_and(|t| !t.is_null()) {
@@ -251,9 +323,15 @@ impl<L: ListVessels> KubeSource<L> {
         }
 
         // D2.
-        let rootfs = spec.get("rootfs").and_then(Value::as_object).ok_or("spec.rootfs must be an object")?;
+        let rootfs = spec
+            .get("rootfs")
+            .and_then(Value::as_object)
+            .ok_or("spec.rootfs must be an object")?;
         known_keys(rootfs, "spec.rootfs", &["path"])?;
-        let path = rootfs.get("path").and_then(Value::as_str).ok_or("spec.rootfs.path must be a string")?;
+        let path = rootfs
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("spec.rootfs.path must be a string")?;
         let rootfs = inside(&self.conf.rootfs_dir, Path::new(path))?;
 
         let args = strings(spec, "args")?.ok_or("spec.args is required")?;
@@ -279,19 +357,35 @@ impl<L: ListVessels> KubeSource<L> {
         if let Some(r) = spec.get("resources").filter(|r| !r.is_null()) {
             let r = r.as_object().ok_or("spec.resources must be an object")?;
             known_keys(r, "spec.resources", &["memory", "pids"])?;
-            memory = r.get("memory").filter(|m| !m.is_null()).map(memory_bytes).transpose()?;
+            memory = r
+                .get("memory")
+                .filter(|m| !m.is_null())
+                .map(memory_bytes)
+                .transpose()?;
             pids = match r.get("pids").filter(|p| !p.is_null()) {
                 None => None,
-                Some(p) => Some(p.as_u64().filter(|p| *p >= 1).ok_or("spec.resources.pids must be an integer of at least 1")?),
+                Some(p) => Some(
+                    p.as_u64()
+                        .filter(|p| *p >= 1)
+                        .ok_or("spec.resources.pids must be an integer of at least 1")?,
+                ),
             };
         }
-        let memory = memory.or(self.runtime.memory_bytes).unwrap_or(self.conf.max_memory_bytes);
+        let memory = memory
+            .or(self.runtime.memory_bytes)
+            .unwrap_or(self.conf.max_memory_bytes);
         let pids = pids.or(self.runtime.pids).unwrap_or(self.conf.max_pids);
         if memory == 0 || memory > self.conf.max_memory_bytes {
-            return Err(format!("spec.resources.memory: {memory} bytes; this node allows 1 to {}", self.conf.max_memory_bytes));
+            return Err(format!(
+                "spec.resources.memory: {memory} bytes; this node allows 1 to {}",
+                self.conf.max_memory_bytes
+            ));
         }
         if pids > self.conf.max_pids {
-            return Err(format!("spec.resources.pids: {pids}; this node allows at most {}", self.conf.max_pids));
+            return Err(format!(
+                "spec.resources.pids: {pids}; this node allows at most {}",
+                self.conf.max_pids
+            ));
         }
 
         let vc = VesselConf {
@@ -330,7 +424,10 @@ impl<L: ListVessels> VesselSource for KubeSource<L> {
             }
         }
         self.next_list = Some(Instant::now() + self.tick);
-        let list = self.lister.list(&self.conf.node).map_err(|e| SourceError(e.to_string()))?;
+        let list = self
+            .lister
+            .list(&self.conf.node)
+            .map_err(|e| SourceError(e.to_string()))?;
         let (set, view) = self.read(&list)?;
         *self.view.lock().unwrap_or_else(|p| p.into_inner()) = view;
         if self.last.as_ref() == Some(&set) {
@@ -349,16 +446,27 @@ impl<L: ListVessels> VesselSource for KubeSource<L> {
 
 fn object_ref(item: &Value) -> Result<ObjectRef, String> {
     let m = item.get("metadata").ok_or("an item without metadata")?;
-    let s = |k: &str| m.get(k).and_then(Value::as_str).ok_or_else(|| format!("an item without metadata.{k}"));
+    let s = |k: &str| {
+        m.get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("an item without metadata.{k}"))
+    };
     let (namespace, name, uid) = (s("namespace")?, s("name")?, s("uid")?);
     if !valid_kube_namespace(namespace) || !valid_name(name) {
-        return Err(format!("an item named {namespace:?}/{name:?}: not valid Kubernetes names"));
+        return Err(format!(
+            "an item named {namespace:?}/{name:?}: not valid Kubernetes names"
+        ));
     }
     if uid.is_empty() {
         return Err(format!("{namespace}/{name}: an empty metadata.uid"));
     }
     let generation = m.get("generation").and_then(Value::as_u64).unwrap_or(0);
-    Ok(ObjectRef { namespace: namespace.into(), name: name.into(), uid: uid.into(), generation })
+    Ok(ObjectRef {
+        namespace: namespace.into(),
+        name: name.into(),
+        uid: uid.into(),
+        generation,
+    })
 }
 
 fn known_keys(o: &Map<String, Value>, what: &str, keys: &[&str]) -> Result<(), String> {
@@ -373,7 +481,11 @@ fn strings(o: &Map<String, Value>, key: &str) -> Result<Option<Vec<String>>, Str
         None | Some(Value::Null) => Ok(None),
         Some(Value::Array(a)) => a
             .iter()
-            .map(|x| x.as_str().map(str::to_string).ok_or_else(|| format!("spec.{key} must be strings")))
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("spec.{key} must be strings"))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
         Some(_) => Err(format!("spec.{key} must be an array of strings")),
@@ -382,7 +494,11 @@ fn strings(o: &Map<String, Value>, key: &str) -> Result<Option<Vec<String>>, Str
 
 fn hex16(s: &str) -> Result<Namespace, String> {
     let err = || "spec.tenant must be 32 lowercase hex digits".to_string();
-    if s.len() != 32 || !s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+    if s.len() != 32
+        || !s
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
         return Err(err());
     }
     let mut b = [0u8; 16];
@@ -395,15 +511,28 @@ fn hex16(s: &str) -> Result<Namespace, String> {
 /// D2: `path`, resolved, as a directory strictly inside `dir` (resolved).
 pub fn inside(dir: &Path, path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
-        return Err(format!("spec.rootfs.path {} must be absolute", path.display()));
+        return Err(format!(
+            "spec.rootfs.path {} must be absolute",
+            path.display()
+        ));
     }
-    let base = dir.canonicalize().map_err(|e| format!("the node's rootfs_dir {}: {e}", dir.display()))?;
-    let real = path.canonicalize().map_err(|e| format!("spec.rootfs.path {}: {e}", path.display()))?;
+    let base = dir
+        .canonicalize()
+        .map_err(|e| format!("the node's rootfs_dir {}: {e}", dir.display()))?;
+    let real = path
+        .canonicalize()
+        .map_err(|e| format!("spec.rootfs.path {}: {e}", path.display()))?;
     if real == base || !real.starts_with(&base) {
-        return Err(format!("spec.rootfs.path {} is not inside this node's rootfs directory", path.display()));
+        return Err(format!(
+            "spec.rootfs.path {} is not inside this node's rootfs directory",
+            path.display()
+        ));
     }
     if !real.is_dir() {
-        return Err(format!("spec.rootfs.path {} is not a directory", path.display()));
+        return Err(format!(
+            "spec.rootfs.path {} is not a directory",
+            path.display()
+        ));
     }
     Ok(real)
 }
@@ -418,7 +547,9 @@ pub fn memory_bytes(v: &Value) -> Result<u64, String> {
         Value::String(s) => s.as_str(),
         _ => return Err(bad()),
     };
-    let digits_end = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let digits_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
     let (num, suffix) = s.split_at(digits_end);
     let mult: u128 = match suffix {
         "" => 1,
@@ -433,7 +564,12 @@ pub fn memory_bytes(v: &Value) -> Result<u64, String> {
         _ => return Err(bad()),
     };
     let (int, frac) = num.split_once('.').unwrap_or((num, ""));
-    if int.is_empty() || num.ends_with('.') || frac.len() > 9 || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit()) || int.len() > 20 {
+    if int.is_empty()
+        || num.ends_with('.')
+        || frac.len() > 9
+        || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_digit())
+        || int.len() > 20
+    {
         return Err(bad());
     }
     let scale = 10u128.pow(frac.len() as u32);
@@ -468,7 +604,11 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
         let conf = KubeSourceConf {
             node: "node-a".into(),
-            tenants: [("team-a".to_string(), hex16(TA).unwrap()), ("team-b".to_string(), hex16(TB).unwrap())].into(),
+            tenants: [
+                ("team-a".to_string(), hex16(TA).unwrap()),
+                ("team-b".to_string(), hex16(TB).unwrap()),
+            ]
+            .into(),
             rootfs_dir: rootfs_dir.clone(),
             max_memory_bytes: 1 << 30,
             max_pids: 512,
@@ -484,7 +624,12 @@ mod tests {
             memory_bytes: Some(256 << 20),
             pids: None,
         };
-        Fixture { _dir: dir, rootfs_dir, conf, runtime }
+        Fixture {
+            _dir: dir,
+            rootfs_dir,
+            conf,
+            runtime,
+        }
     }
 
     fn item(f: &Fixture, ns: &str, name: &str, uid: &str, spec: Value) -> Value {
@@ -537,7 +682,10 @@ mod tests {
     fn source(f: &Fixture) -> (Fake, KubeSource<Fake>) {
         let fake = Fake::default();
         fake.set(list(vec![]));
-        (fake.clone(), KubeSource::new(fake, f.conf.clone(), f.runtime.clone(), Duration::ZERO))
+        (
+            fake.clone(),
+            KubeSource::new(fake, f.conf.clone(), f.runtime.clone(), Duration::ZERO),
+        )
     }
 
     fn one(f: &Fixture, spec: Value) -> Result<VesselConf, String> {
@@ -557,7 +705,10 @@ mod tests {
         let f = fixture();
         let vc = one(&f, json!({ "env": ["A=1"], "quiescence": ["db.sqlite"], "resources": { "memory": "128Mi", "pids": 32 } })).unwrap();
         assert_eq!(vc.namespace, hex16(TA).unwrap());
-        assert_eq!((vc.subject.as_str(), vc.uid_slot, vc.takeover, vc.restart), ("v1", 1, None, Restart::Always));
+        assert_eq!(
+            (vc.subject.as_str(), vc.uid_slot, vc.takeover, vc.restart),
+            ("v1", 1, None, Restart::Always)
+        );
         let rt = *vc.runtime.clone().unwrap();
         assert_eq!(
             rt,
@@ -572,9 +723,20 @@ mod tests {
             }
         );
         let e = vc.effective(&f.runtime, &["node.db".into()]).unwrap();
-        assert_eq!(e.landlock_shim.as_deref(), Some("/usr/lib/taso/landlock"), "Landlock by default");
-        assert_eq!(e.env, vec!["A=1".to_string()], "the node's env is not inherited");
-        assert!(e.quiescence == vec!["db.sqlite".to_string()], "nor the node's quiescence");
+        assert_eq!(
+            e.landlock_shim.as_deref(),
+            Some("/usr/lib/taso/landlock"),
+            "Landlock by default"
+        );
+        assert_eq!(
+            e.env,
+            vec!["A=1".to_string()],
+            "the node's env is not inherited"
+        );
+        assert!(
+            e.quiescence == vec!["db.sqlite".to_string()],
+            "nor the node's quiescence"
+        );
 
         // Without limits: the node's default, else its maximum.
         let vc = one(&f, json!({})).unwrap();
@@ -595,7 +757,10 @@ mod tests {
         assert!(r[0].reason.contains("\"team-c\" is not mapped"), "{r:?}");
         assert_eq!(r[0].object.as_ref().unwrap().name, "v1");
         // Each namespace with its own tenant is fine.
-        fake.set(list(vec![item(&f, "team-a", "a", "u1", json!({})), item(&f, "team-b", "b", "u2", json!({ "uidSlot": 2 }))]));
+        fake.set(list(vec![
+            item(&f, "team-a", "a", "u1", json!({})),
+            item(&f, "team-b", "b", "u2", json!({ "uidSlot": 2 })),
+        ]));
         assert_eq!(s.poll(Duration::ZERO).unwrap().unwrap().len(), 2);
     }
 
@@ -621,7 +786,11 @@ mod tests {
             assert!(e.contains(why), "{}: {e}", path.display());
         }
         let vc = one(&f, json!({ "rootfs": { "path": base.join("alias") } })).unwrap();
-        assert_eq!(vc.runtime.unwrap().rootfs, Some(base.join("agent").canonicalize().unwrap()), "the resolved path runs");
+        assert_eq!(
+            vc.runtime.unwrap().rootfs,
+            Some(base.join("agent").canonicalize().unwrap()),
+            "the resolved path runs"
+        );
     }
 
     #[test]
@@ -634,7 +803,14 @@ mod tests {
     #[test]
     fn limits_are_bounded_by_the_node_and_never_clamped() {
         let f = fixture();
-        assert_eq!(one(&f, json!({ "resources": { "memory": "1Gi" } })).unwrap().runtime.unwrap().memory_bytes, Some(1 << 30));
+        assert_eq!(
+            one(&f, json!({ "resources": { "memory": "1Gi" } }))
+                .unwrap()
+                .runtime
+                .unwrap()
+                .memory_bytes,
+            Some(1 << 30)
+        );
         for (res, why) in [
             (json!({ "memory": "2Gi" }), "allows 1 to"),
             (json!({ "memory": 0 }), "allows 1 to"),
@@ -642,7 +818,10 @@ mod tests {
             (json!({ "memory": "1Ei" }), "whole bytes"),
             (json!({ "memory": -1 }), "whole bytes"),
             (json!({ "pids": 513 }), "at most 512"),
-            (json!({ "pids": 0 }), "spec.resources.pids must be an integer of at least 1"),
+            (
+                json!({ "pids": 0 }),
+                "spec.resources.pids must be an integer of at least 1",
+            ),
             (json!({ "cpu": 1 }), "unknown field"),
         ] {
             let e = one(&f, json!({ "resources": res })).unwrap_err();
@@ -650,16 +829,31 @@ mod tests {
         }
         let mut f2 = fixture();
         f2.runtime.memory_bytes = None;
-        assert_eq!(one(&f2, json!({})).unwrap().runtime.unwrap().memory_bytes, Some(1 << 30), "no node default: the maximum");
+        assert_eq!(
+            one(&f2, json!({})).unwrap().runtime.unwrap().memory_bytes,
+            Some(1 << 30),
+            "no node default: the maximum"
+        );
     }
 
     #[test]
     fn landlock_off_only_where_the_node_allows_it() {
         let mut f = fixture();
-        assert!(one(&f, json!({ "landlock": false })).unwrap_err().contains("does not allow"));
-        assert!(one(&f, json!({ "landlock": "no" })).unwrap_err().contains("true or false"));
+        assert!(one(&f, json!({ "landlock": false }))
+            .unwrap_err()
+            .contains("does not allow"));
+        assert!(one(&f, json!({ "landlock": "no" }))
+            .unwrap_err()
+            .contains("true or false"));
         f.conf.allow_without_landlock = true;
-        assert_eq!(one(&f, json!({ "landlock": false })).unwrap().runtime.unwrap().landlock, Some(false));
+        assert_eq!(
+            one(&f, json!({ "landlock": false }))
+                .unwrap()
+                .runtime
+                .unwrap()
+                .landlock,
+            Some(false)
+        );
         // On, but the node has no shim: the daemon's own check refuses it.
         f.runtime.landlock_shim = None;
         assert!(one(&f, json!({})).unwrap_err().contains("landlock_shim"));
@@ -670,7 +864,10 @@ mod tests {
         let f = fixture();
         for (spec, why) in [
             (json!({ "restart": "never" }), "unknown field \"restart\""),
-            (json!({ "rootfs": { "path": "/x", "image": "y" } }), "unknown field \"image\""),
+            (
+                json!({ "rootfs": { "path": "/x", "image": "y" } }),
+                "unknown field \"image\"",
+            ),
             (json!({ "tenant": TA.to_uppercase() }), "lowercase hex"),
             (json!({ "tenant": "0a" }), "lowercase hex"),
             (json!({ "subject": "" }), "1 to 256"),
@@ -682,9 +879,15 @@ mod tests {
             (json!({ "args": [] }), "name the agent"),
             (json!({ "args": null }), "args is required"),
             (json!({ "args": [1] }), "must be strings"),
-            (json!({ "env": ["1=x"] }), "spec.env \"1=x\": \"1\" is not a valid variable name"),
+            (
+                json!({ "env": ["1=x"] }),
+                "spec.env \"1=x\": \"1\" is not a valid variable name",
+            ),
             (json!({ "env": "A=1" }), "array of strings"),
-            (json!({ "quiescence": ["../x"] }), "spec: quiescence path \"../x\" must be relative"),
+            (
+                json!({ "quiescence": ["../x"] }),
+                "spec: quiescence path \"../x\" must be relative",
+            ),
             (json!({ "rootfs": "/x" }), "rootfs must be an object"),
             (json!({ "resources": 5 }), "resources must be an object"),
         ] {
@@ -701,15 +904,36 @@ mod tests {
         let mut deleting = item(&f, "team-a", "d", "u8", json!({ "uidSlot": 4 }));
         deleting["metadata"]["deletionTimestamp"] = "2026-10-17T12:00:00Z".into();
         let nameless = json!({ "metadata": { "namespace": "team-a", "uid": "u7" }, "spec": {} });
-        let bad_name = json!({ "metadata": { "namespace": "Team-A", "name": "x", "uid": "u6" }, "spec": {} });
-        fake.set(list(vec![other_node, deleting, nameless, bad_name, item(&f, "team-a", "v1", "u1", json!({}))]));
+        let bad_name =
+            json!({ "metadata": { "namespace": "Team-A", "name": "x", "uid": "u6" }, "spec": {} });
+        fake.set(list(vec![
+            other_node,
+            deleting,
+            nameless,
+            bad_name,
+            item(&f, "team-a", "v1", "u1", json!({})),
+        ]));
         let set = s.poll(Duration::ZERO).unwrap().unwrap();
-        assert_eq!(set.iter().map(|v| v.subject.as_str()).collect::<Vec<_>>(), vec!["v1"]);
+        assert_eq!(
+            set.iter().map(|v| v.subject.as_str()).collect::<Vec<_>>(),
+            vec!["v1"]
+        );
         let view = s.view().lock().unwrap().clone();
         assert_eq!(view.objects.len(), 1);
-        assert_eq!(view.objects.values().next().unwrap(), &ObjectRef { namespace: "team-a".into(), name: "v1".into(), uid: "u1".into(), generation: 3 });
+        assert_eq!(
+            view.objects.values().next().unwrap(),
+            &ObjectRef {
+                namespace: "team-a".into(),
+                name: "v1".into(),
+                uid: "u1".into(),
+                generation: 3
+            }
+        );
         assert_eq!(view.refused.len(), 2, "{view:?}");
-        assert!(view.refused.iter().all(|r| r.object.is_none()), "unaddressable: logged, no status");
+        assert!(
+            view.refused.iter().all(|r| r.object.is_none()),
+            "unaddressable: logged, no status"
+        );
     }
 
     #[test]
@@ -717,18 +941,32 @@ mod tests {
         let f = fixture();
         let (fake, mut s) = source(&f);
         let a = item(&f, "team-a", "v1", "u1", json!({ "subject": "same" }));
-        let b = item(&f, "team-a", "v2", "u2", json!({ "subject": "same", "uidSlot": 2 }));
+        let b = item(
+            &f,
+            "team-a",
+            "v2",
+            "u2",
+            json!({ "subject": "same", "uidSlot": 2 }),
+        );
         fake.set(list(vec![a.clone(), b]));
         assert_eq!(s.poll(Duration::ZERO).unwrap(), Some(vec![]));
         let r = s.view().lock().unwrap().refused.clone();
         assert_eq!(r.len(), 2);
-        assert!(r.iter().all(|r| r.reason.contains("2 Vessel resources") && !r.kept_previous));
+        assert!(r
+            .iter()
+            .all(|r| r.reason.contains("2 Vessel resources") && !r.kept_previous));
 
         // A running one is not kept when a second resource claims its Vessel:
         // neither decides.
         fake.set(list(vec![a.clone()]));
         assert_eq!(s.poll(Duration::ZERO).unwrap().unwrap().len(), 1);
-        let b = item(&f, "team-a", "v2", "u2", json!({ "subject": "same", "uidSlot": 2 }));
+        let b = item(
+            &f,
+            "team-a",
+            "v2",
+            "u2",
+            json!({ "subject": "same", "uidSlot": 2 }),
+        );
         fake.set(list(vec![a, b]));
         assert_eq!(s.poll(Duration::ZERO).unwrap(), Some(vec![]));
     }
@@ -740,7 +978,13 @@ mod tests {
         fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({}))]));
         let first = s.poll(Duration::ZERO).unwrap().unwrap();
         // Edited past the node's limit: refused, but it runs on as it was.
-        fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({ "resources": { "pids": 9999 } }))]));
+        fake.set(list(vec![item(
+            &f,
+            "team-a",
+            "v1",
+            "u1",
+            json!({ "resources": { "pids": 9999 } }),
+        )]));
         assert_eq!(s.poll(Duration::ZERO).unwrap(), None, "unchanged set");
         let view = s.view().lock().unwrap().clone();
         assert!(view.refused[0].kept_previous && view.refused[0].reason.contains("at most 512"));
@@ -748,12 +992,24 @@ mod tests {
         // Still refused on the next list: still kept.
         assert_eq!(s.poll(Duration::ZERO).unwrap(), None);
         // A good edit applies.
-        fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({ "resources": { "pids": 8 } }))]));
+        fake.set(list(vec![item(
+            &f,
+            "team-a",
+            "v1",
+            "u1",
+            json!({ "resources": { "pids": 8 } }),
+        )]));
         let edited = s.poll(Duration::ZERO).unwrap().unwrap();
         assert_ne!(edited, first);
         assert_eq!(edited[0].runtime.as_ref().unwrap().pids, Some(8));
         // A new resource (new uid) with a bad spec has nothing to keep.
-        fake.set(list(vec![item(&f, "team-a", "v1", "u2", json!({ "resources": { "pids": 9999 } }))]));
+        fake.set(list(vec![item(
+            &f,
+            "team-a",
+            "v1",
+            "u2",
+            json!({ "resources": { "pids": 9999 } }),
+        )]));
         assert_eq!(s.poll(Duration::ZERO).unwrap(), Some(vec![]));
         assert!(!s.view().lock().unwrap().refused[0].kept_previous);
         // Deleted: stopped.
@@ -770,12 +1026,25 @@ mod tests {
         fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({}))]));
         assert_eq!(s.poll(Duration::ZERO).unwrap().unwrap().len(), 1);
         fake.fail("connection refused");
-        assert!(s.poll(Duration::ZERO).unwrap_err().to_string().contains("connection refused"));
-        for strange in [json!({ "kind": "Status", "items": [] }), json!({ "kind": "VesselList" }), json!([]), Value::Null] {
+        assert!(s
+            .poll(Duration::ZERO)
+            .unwrap_err()
+            .to_string()
+            .contains("connection refused"));
+        for strange in [
+            json!({ "kind": "Status", "items": [] }),
+            json!({ "kind": "VesselList" }),
+            json!([]),
+            Value::Null,
+        ] {
             fake.set(strange.clone());
             assert!(s.poll(Duration::ZERO).is_err(), "{strange}");
         }
-        assert_eq!(s.view().lock().unwrap().objects.len(), 1, "the view stays as the last good list left it");
+        assert_eq!(
+            s.view().lock().unwrap().objects.len(),
+            1,
+            "the view stays as the last good list left it"
+        );
         // Back with the same set: nothing to change.
         fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({}))]));
         assert_eq!(s.poll(Duration::ZERO).unwrap(), None);
@@ -790,13 +1059,29 @@ mod tests {
         let f = fixture();
         let fake = Fake::default();
         fake.set(list(vec![]));
-        let mut s = KubeSource::new(fake.clone(), f.conf.clone(), f.runtime.clone(), Duration::from_millis(300));
-        assert_eq!(s.poll(Duration::ZERO).unwrap(), Some(vec![]), "even an empty first answer");
+        let mut s = KubeSource::new(
+            fake.clone(),
+            f.conf.clone(),
+            f.runtime.clone(),
+            Duration::from_millis(300),
+        );
+        assert_eq!(
+            s.poll(Duration::ZERO).unwrap(),
+            Some(vec![]),
+            "even an empty first answer"
+        );
         assert_eq!(s.poll(Duration::from_millis(10)).unwrap(), None);
-        assert_eq!(fake.1.load(Ordering::SeqCst), 1, "not listed again before the tick");
+        assert_eq!(
+            fake.1.load(Ordering::SeqCst),
+            1,
+            "not listed again before the tick"
+        );
         let t = Instant::now();
         assert_eq!(s.poll(Duration::from_secs(5)).unwrap(), None);
-        assert!(t.elapsed() >= Duration::from_millis(250), "waited for the tick");
+        assert!(
+            t.elapsed() >= Duration::from_millis(250),
+            "waited for the tick"
+        );
         assert_eq!(fake.1.load(Ordering::SeqCst), 2);
     }
 
@@ -818,7 +1103,24 @@ mod tests {
         for (v, want) in ok {
             assert_eq!(memory_bytes(&v), Ok(want), "{v}");
         }
-        for v in [json!("0.1"), json!("1.5"), json!("1m"), json!("1Ei"), json!("1e3"), json!("."), json!("1."), json!(".5Gi"), json!("1..5"), json!(""), json!("Mi"), json!("-1"), json!(" 1"), json!(1.5), json!(true), json!("99999999999999999999Ti")] {
+        for v in [
+            json!("0.1"),
+            json!("1.5"),
+            json!("1m"),
+            json!("1Ei"),
+            json!("1e3"),
+            json!("."),
+            json!("1."),
+            json!(".5Gi"),
+            json!("1..5"),
+            json!(""),
+            json!("Mi"),
+            json!("-1"),
+            json!(" 1"),
+            json!(1.5),
+            json!(true),
+            json!("99999999999999999999Ti"),
+        ] {
             assert!(memory_bytes(&v).is_err(), "{v}");
         }
     }
@@ -827,9 +1129,26 @@ mod tests {
     fn the_kube_lister_filters_by_a_checked_node_name() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("t"), "tok").unwrap();
-        let k = Kube::new(&crate::kube::KubeConfig { api: "https://127.0.0.1:1".into(), token_file: dir.path().join("t"), ca_file: None }, Duration::from_secs(1)).unwrap();
-        assert!(matches!(ListVessels::list(&k, "a,spec.node!=a"), Err(KubeError::BadName(_))));
-        assert!(matches!(ListVessels::list(&k, "node-a"), Err(KubeError::Transport(_))), "a good name gets to the network");
+        let k = Kube::new(
+            &crate::kube::KubeConfig {
+                api: "https://127.0.0.1:1".into(),
+                token_file: dir.path().join("t"),
+                ca_file: None,
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(matches!(
+            ListVessels::list(&k, "a,spec.node!=a"),
+            Err(KubeError::BadName(_))
+        ));
+        assert!(
+            matches!(
+                ListVessels::list(&k, "node-a"),
+                Err(KubeError::Transport(_))
+            ),
+            "a good name gets to the network"
+        );
     }
 
     /// Against a real API server with the Vessel CRD.  Set TASO_KUBE_API,
@@ -873,7 +1192,10 @@ mod tests {
         let name = |o: &ObjectRef| format!("{}/{}", o.namespace, o.name);
         let mut run: Vec<String> = view.objects.values().map(name).collect();
         run.sort();
-        let mut want_run: Vec<String> = env("TASO_KUBE_RUN").split(',').map(str::to_string).collect();
+        let mut want_run: Vec<String> = env("TASO_KUBE_RUN")
+            .split(',')
+            .map(str::to_string)
+            .collect();
         want_run.sort();
         assert_eq!(run, want_run, "{view:#?}");
         assert_eq!(set.len(), want_run.len());
@@ -886,12 +1208,23 @@ mod tests {
             .collect();
         assert_eq!(view.refused.len(), want_refused.len(), "{view:#?}");
         for (n, part) in want_refused {
-            let r = view.refused.iter().find(|r| r.object.as_ref().map(name).as_deref() == Some(n.as_str())).unwrap_or_else(|| panic!("{n} not refused: {view:#?}"));
+            let r = view
+                .refused
+                .iter()
+                .find(|r| r.object.as_ref().map(name).as_deref() == Some(n.as_str()))
+                .unwrap_or_else(|| panic!("{n} not refused: {view:#?}"));
             assert!(r.reason.contains(&part), "{n}: {}", r.reason);
             eprintln!("refused {n}: {}", r.reason);
         }
-        assert!(view.objects.values().all(|o| o.generation >= 1 && !o.uid.is_empty()));
-        assert_eq!(s.poll(Duration::ZERO).unwrap(), None, "unchanged on the next list");
+        assert!(view
+            .objects
+            .values()
+            .all(|o| o.generation >= 1 && !o.uid.is_empty()));
+        assert_eq!(
+            s.poll(Duration::ZERO).unwrap(),
+            None,
+            "unchanged on the next list"
+        );
     }
 
     #[test]

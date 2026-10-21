@@ -78,12 +78,18 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut val = || it.next().cloned().ok_or(format!("{a} needs a value"));
-        let num = |v: String| v.parse::<u64>().map_err(|_| format!("{a}: {v:?} is not a number"));
+        let num = |v: String| {
+            v.parse::<u64>()
+                .map_err(|_| format!("{a}: {v:?} is not a number"))
+        };
         match a.as_str() {
             "--turns" => o.turns = num(val()?)?,
             "--txns" => o.txns = u32::try_from(num(val()?)?).map_err(|_| "--txns is too large")?,
             "--rows" => o.rows = u32::try_from(num(val()?)?).map_err(|_| "--rows is too large")?,
-            "--row-bytes" => o.row_bytes = usize::try_from(num(val()?)?).map_err(|_| "--row-bytes is too large")?,
+            "--row-bytes" => {
+                o.row_bytes =
+                    usize::try_from(num(val()?)?).map_err(|_| "--row-bytes is too large")?
+            }
             "--db" => o.db = val()?.into(),
             "--stats" => o.stats = val()?.into(),
             "--bare" => o.bare = true,
@@ -123,10 +129,14 @@ struct Field(Option<UnixStream>);
 
 impl Field {
     fn ask(&mut self, req: Request) -> Result<Option<Reply>, String> {
-        let Some(s) = self.0.as_mut() else { return Ok(None) };
+        let Some(s) = self.0.as_mut() else {
+            return Ok(None);
+        };
         send_request(s, &req).map_err(|e| format!("send: {e}"))?;
         match recv_reply(s).map_err(|e| format!("receive: {e}"))? {
-            Some(Reply::Error { code, message }) => Err(format!("the Warden refused: {code:?}: {message}")),
+            Some(Reply::Error { code, message }) => {
+                Err(format!("the Warden refused: {code:?}: {message}"))
+            }
             Some(r) => Ok(Some(r)),
             None => Err("the Warden closed the connection".into()),
         }
@@ -137,19 +147,27 @@ impl Field {
 fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, String> {
     let mut field = match field {
         None => Field(None),
-        Some(path) => Field(Some(UnixStream::connect(path).map_err(|e| format!("connect {}: {e}", path.display()))?)),
+        Some(path) => Field(Some(
+            UnixStream::connect(path).map_err(|e| format!("connect {}: {e}", path.display()))?,
+        )),
     };
     let resumed_after = match field.ask(Request::Hello { version: VERSION })? {
         None => None,
-        Some(Reply::Hello { last_sealed_turn, .. }) => last_sealed_turn,
+        Some(Reply::Hello {
+            last_sealed_turn, ..
+        }) => last_sealed_turn,
         Some(r) => return Err(format!("unexpected answer to Hello: {r:?}")),
     };
     let first = resumed_after.map_or(1, |t| t + 1);
 
-    let db = rusqlite::Connection::open(&o.db).map_err(|e| format!("open {}: {e}", o.db.display()))?;
-    db.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
-    db.pragma_update(None, "synchronous", &o.synchronous).map_err(|e| e.to_string())?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS events (turn INTEGER, n INTEGER, body BLOB)").map_err(|e| e.to_string())?;
+    let db =
+        rusqlite::Connection::open(&o.db).map_err(|e| format!("open {}: {e}", o.db.display()))?;
+    db.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| e.to_string())?;
+    db.pragma_update(None, "synchronous", &o.synchronous)
+        .map_err(|e| e.to_string())?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS events (turn INTEGER, n INTEGER, body BLOB)")
+        .map_err(|e| e.to_string())?;
 
     let body = vec![0x5au8; o.row_bytes];
     let mut writes = Vec::new();
@@ -161,19 +179,29 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
             let t = Instant::now();
             let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
             {
-                let mut ins = tx.prepare_cached("INSERT INTO events VALUES (?1, ?2, ?3)").map_err(|e| e.to_string())?;
+                let mut ins = tx
+                    .prepare_cached("INSERT INTO events VALUES (?1, ?2, ?3)")
+                    .map_err(|e| e.to_string())?;
                 for n in 0..o.rows {
-                    ins.execute(rusqlite::params![turn as i64, n, &body]).map_err(|e| e.to_string())?;
+                    ins.execute(rusqlite::params![turn as i64, n, &body])
+                        .map_err(|e| e.to_string())?;
                 }
             }
             tx.commit().map_err(|e| e.to_string())?;
             writes.push(t.elapsed());
         }
-        field.ask(Request::Transcript { entry: format!("turn {turn}: {} transactions", o.txns).into_bytes() })?;
+        field.ask(Request::Transcript {
+            entry: format!("turn {turn}: {} transactions", o.txns).into_bytes(),
+        })?;
         let t = Instant::now();
-        match field.ask(Request::TurnEnd { turn, quiescent: true })? {
+        match field.ask(Request::TurnEnd {
+            turn,
+            quiescent: true,
+        })? {
             None => {}
-            Some(Reply::TurnEnd { sealed: Some(_), .. }) => sealed += 1,
+            Some(Reply::TurnEnd {
+                sealed: Some(_), ..
+            }) => sealed += 1,
             Some(Reply::TurnEnd { sealed: None, .. }) => not_sealed += 1,
             Some(r) => return Err(format!("unexpected answer to TurnEnd: {r:?}")),
         }
@@ -190,7 +218,9 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
             std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
         }
     }
-    let rows: i64 = db.query_row("SELECT count(*) FROM events", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let rows: i64 = db
+        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
     Ok(json!({
         "bare": o.bare,
         "resumed_after": resumed_after,
@@ -227,7 +257,9 @@ fn main() -> ExitCode {
     match run(&o, field.as_deref()) {
         Ok(stats) => {
             let text = serde_json::to_string_pretty(&stats).expect("JSON");
-            if let Err(e) = std::fs::File::create(&o.stats).and_then(|mut f| f.write_all(text.as_bytes())) {
+            if let Err(e) =
+                std::fs::File::create(&o.stats).and_then(|mut f| f.write_all(text.as_bytes()))
+            {
                 eprintln!("taso-sim: writing {}: {e}", o.stats.display());
                 return ExitCode::FAILURE;
             }
@@ -252,10 +284,32 @@ mod tests {
     #[test]
     fn options() {
         assert_eq!(parse(&[]).unwrap(), Opts::default());
-        let o = parse(&s(&["--turns", "3", "--txns", "2", "--rows", "5", "--row-bytes", "64", "--bare", "--synchronous", "full"])).unwrap();
-        assert_eq!((o.turns, o.txns, o.rows, o.row_bytes, o.bare), (3, 2, 5, 64, true));
+        let o = parse(&s(&[
+            "--turns",
+            "3",
+            "--txns",
+            "2",
+            "--rows",
+            "5",
+            "--row-bytes",
+            "64",
+            "--bare",
+            "--synchronous",
+            "full",
+        ]))
+        .unwrap();
+        assert_eq!(
+            (o.turns, o.txns, o.rows, o.row_bytes, o.bare),
+            (3, 2, 5, 64, true)
+        );
         assert_eq!(o.synchronous, "full");
-        for bad in [&["--turns"][..], &["--turns", "x"], &["--turns", "0"], &["--synchronous", "maybe"], &["--what"]] {
+        for bad in [
+            &["--turns"][..],
+            &["--turns", "x"],
+            &["--turns", "0"],
+            &["--synchronous", "maybe"],
+            &["--what"],
+        ] {
             assert!(parse(&s(bad)).is_err(), "{bad:?}");
         }
     }
@@ -300,10 +354,16 @@ mod tests {
             let mut seen = Vec::new();
             while let Some(req) = recv_request(&mut c).unwrap() {
                 let reply = match &req {
-                    Request::Hello { .. } => Reply::Hello { version: VERSION, last_sealed_turn: Some(5) },
+                    Request::Hello { .. } => Reply::Hello {
+                        version: VERSION,
+                        last_sealed_turn: Some(5),
+                    },
                     Request::Transcript { .. } => Reply::Recorded { lsn: 1 },
                     // Every other turn is not sealed.
-                    Request::TurnEnd { turn, .. } => Reply::TurnEnd { turn: *turn, sealed: (turn % 2 == 0).then_some(*turn) },
+                    Request::TurnEnd { turn, .. } => Reply::TurnEnd {
+                        turn: *turn,
+                        sealed: (turn % 2 == 0).then_some(*turn),
+                    },
                     Request::Effect { .. } => unreachable!(),
                 };
                 seen.push(req);
@@ -311,20 +371,46 @@ mod tests {
             }
             seen
         });
-        let o = Opts { turns: 3, txns: 1, rows: 1, row_bytes: 8, db: dir.path().join("s.db"), stats: dir.path().join("x"), bare: false, synchronous: "normal".into(), samples: None, turn_samples: Some(dir.path().join("turns")), turn_sleep_ms: 0 };
+        let o = Opts {
+            turns: 3,
+            txns: 1,
+            rows: 1,
+            row_bytes: 8,
+            db: dir.path().join("s.db"),
+            stats: dir.path().join("x"),
+            bare: false,
+            synchronous: "normal".into(),
+            samples: None,
+            turn_samples: Some(dir.path().join("turns")),
+            turn_sleep_ms: 0,
+        };
         let st = run(&o, Some(&sock)).unwrap();
         let seen = warden.join().unwrap();
         assert_eq!(st["resumed_after"], 5);
         assert_eq!(st["turns"], json!([6, 8]));
-        assert_eq!((st["sealed"].clone(), st["not_sealed"].clone()), (json!(2), json!(1)));
+        assert_eq!(
+            (st["sealed"].clone(), st["not_sealed"].clone()),
+            (json!(2), json!(1))
+        );
         assert_eq!(st["turn_end"]["n"], 3);
         let turns = std::fs::read_to_string(dir.path().join("turns")).unwrap();
-        assert_eq!(turns.lines().filter(|l| l.parse::<u64>().is_ok()).count(), 3);
+        assert_eq!(
+            turns.lines().filter(|l| l.parse::<u64>().is_ok()).count(),
+            3
+        );
         let turn_ends: Vec<(u64, bool)> = seen
             .iter()
-            .filter_map(|r| match r { Request::TurnEnd { turn, quiescent } => Some((*turn, *quiescent)), _ => None })
+            .filter_map(|r| match r {
+                Request::TurnEnd { turn, quiescent } => Some((*turn, *quiescent)),
+                _ => None,
+            })
             .collect();
         assert_eq!(turn_ends, vec![(6, true), (7, true), (8, true)]);
-        assert_eq!(seen.iter().filter(|r| matches!(r, Request::Transcript { .. })).count(), 3);
+        assert_eq!(
+            seen.iter()
+                .filter(|r| matches!(r, Request::Transcript { .. }))
+                .count(),
+            3
+        );
     }
 }

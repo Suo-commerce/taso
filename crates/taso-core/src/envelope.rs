@@ -300,7 +300,16 @@ impl Envelope {
         payload_hash: HashVal,
     ) -> Self {
         let hash = record_hash(chronicle, branch, epoch, stream, lsn, prev, payload_hash);
-        Self { chronicle, branch, epoch, stream, lsn, prev, payload_hash, hash }
+        Self {
+            chronicle,
+            branch,
+            epoch,
+            stream,
+            lsn,
+            prev,
+            payload_hash,
+            hash,
+        }
     }
 
     /// Recompute the hash and check it matches.
@@ -319,7 +328,11 @@ impl Envelope {
 
     /// The [`ChronicleHead`] this record would advance to.
     pub fn head(&self) -> ChronicleHead {
-        ChronicleHead { lsn: self.lsn, hash: self.hash, epoch: self.epoch }
+        ChronicleHead {
+            lsn: self.lsn,
+            hash: self.hash,
+            epoch: self.epoch,
+        }
     }
 }
 
@@ -380,7 +393,11 @@ mod tests {
     fn genesis_chain_verifies() {
         let chain = make_chain(3);
         for env in &chain {
-            assert!(env.verify(), "record at lsn {} failed verify", env.lsn.get());
+            assert!(
+                env.verify(),
+                "record at lsn {} failed verify",
+                env.lsn.get()
+            );
         }
         // Chain is linked: each record's prev is the prior's hash.
         assert_eq!(chain[0].prev, HashVal::GENESIS);
@@ -461,7 +478,10 @@ mod tests {
             HashVal::GENESIS,
             HashVal::GENESIS,
         );
-        assert_ne!(as_payload, as_record, "domain separation must prevent collisions");
+        assert_ne!(
+            as_payload, as_record,
+            "domain separation must prevent collisions"
+        );
     }
 
     #[test]

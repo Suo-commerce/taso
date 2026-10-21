@@ -48,7 +48,9 @@ use std::time::Duration;
 
 use taso_warden::coordinator::{Coord, Coordinator};
 use taso_warden::coordsrv::{RemoteCoord, Server};
-use taso_warden::daemon::{Config, CoordConf, DaemonError, KubeSourceConf, Node, Report, SourceConf, Stop};
+use taso_warden::daemon::{
+    Config, CoordConf, DaemonError, KubeSourceConf, Node, Report, SourceConf, Stop,
+};
 use taso_warden::kube::{Kube, KubeConfig};
 use taso_warden::source::{Guard, StaticSource};
 use taso_warden::source_kube::{KubeSource, DEFAULT_TICK};
@@ -91,7 +93,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut config = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Config::parse(&t).map_err(|e| e.to_string())) {
+    let mut config = match std::fs::read_to_string(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|t| Config::parse(&t).map_err(|e| e.to_string()))
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("taso-wardend: {path}: {e}");
@@ -131,7 +136,10 @@ fn main() -> ExitCode {
                 match Server::spawn(sock, c.clone()) {
                     Ok(s) => _server = Some(s),
                     Err(e) => {
-                        eprintln!("taso-wardend: serving the coordinator on {}: {e}", sock.display());
+                        eprintln!(
+                            "taso-wardend: serving the coordinator on {}: {e}",
+                            sock.display()
+                        );
                         return ExitCode::FAILURE;
                     }
                 }
@@ -141,7 +149,11 @@ fn main() -> ExitCode {
         CoordConf::Remote { socket } => Arc::new(RemoteCoord::new(socket)),
     };
     let storage = config.storage.open(config.batched_snapshots);
-    eprintln!("taso-wardend[{}]: storage {}", config.warden.get(), storage.kind());
+    eprintln!(
+        "taso-wardend[{}]: storage {}",
+        config.warden.get(),
+        storage.kind()
+    );
     let node = match Node::new(config, coord, storage) {
         Ok(n) => Arc::new(n),
         Err(e) => {
@@ -164,13 +176,22 @@ fn main() -> ExitCode {
             // A static source is finite: the loop ends once every Vessel is
             // done and none waits to restart.
             let mut source = StaticSource::new(node.config.vessels.clone());
-            supervisor.run(&mut source, &shutdown, |event| report(&node, &event, &mut last));
+            supervisor.run(&mut source, &shutdown, |event| {
+                report(&node, &event, &mut last)
+            });
             last.values().all(|well| *well)
         }
         Some((k, (list, status))) => {
-            eprintln!("taso-wardend[{}]: Vessels of node {} from Kubernetes ({} namespaces)", warden.get(), k.node, k.tenants.len());
-            let mut source = KubeSource::new(list, k.clone(), node.config.runtime.clone(), DEFAULT_TICK);
-            let writer = StatusWriter::spawn(status, source.view(), k.node.clone(), warden, STATUS_TICK);
+            eprintln!(
+                "taso-wardend[{}]: Vessels of node {} from Kubernetes ({} namespaces)",
+                warden.get(),
+                k.node,
+                k.tenants.len()
+            );
+            let mut source =
+                KubeSource::new(list, k.clone(), node.config.runtime.clone(), DEFAULT_TICK);
+            let writer =
+                StatusWriter::spawn(status, source.view(), k.node.clone(), warden, STATUS_TICK);
             // Infinite: the loop returns only once a stop was asked for and
             // every run has ended.
             supervisor.run(&mut source, &shutdown, |event| {
@@ -193,7 +214,10 @@ fn main() -> ExitCode {
                 }
             }
             if let Err(e) = std::fs::write(&path, text) {
-                eprintln!("taso-wardend: writing {}: {e}", std::path::Path::new(&path).display());
+                eprintln!(
+                    "taso-wardend: writing {}: {e}",
+                    std::path::Path::new(&path).display()
+                );
                 ok = false;
             }
         }
@@ -210,8 +234,13 @@ fn main() -> ExitCode {
 /// account.
 fn kube_clients(k: &KubeSourceConf) -> Result<(Kube, Kube), String> {
     let cfg = match &k.api {
-        Some(a) => KubeConfig { api: a.url.clone(), token_file: a.token_file.clone(), ca_file: a.ca_file.clone() },
-        None => KubeConfig::in_cluster().map_err(|e| format!("in-cluster configuration: {e} (or set kubernetes.api)"))?,
+        Some(a) => KubeConfig {
+            api: a.url.clone(),
+            token_file: a.token_file.clone(),
+            ca_file: a.ca_file.clone(),
+        },
+        None => KubeConfig::in_cluster()
+            .map_err(|e| format!("in-cluster configuration: {e} (or set kubernetes.api)"))?,
     };
     let client = || Kube::new(&cfg, KUBE_TIMEOUT).map_err(|e| format!("{}: {e}", cfg.api));
     Ok((client()?, client()?))
@@ -219,12 +248,21 @@ fn kube_clients(k: &KubeSourceConf) -> Result<(Kube, Kube), String> {
 
 /// Log an event; record how each Vessel's last run went.  The line for an
 /// ended run is the one the gate scripts match: keep its form.
-fn report(node: &Node, event: &Event<Result<Report, DaemonError>>, last: &mut BTreeMap<String, bool>) {
+fn report(
+    node: &Node,
+    event: &Event<Result<Report, DaemonError>>,
+    last: &mut BTreeMap<String, bool>,
+) {
     let w = node.config.warden.get();
     match event {
         Event::Started(vc) => eprintln!("taso-wardend[{w}] {}: starting", vc.subject),
         Event::Stopping(vc) => eprintln!("taso-wardend[{w}] {}: stopping", vc.subject),
-        Event::Exited { vc, out, restart_in, .. } => {
+        Event::Exited {
+            vc,
+            out,
+            restart_in,
+            ..
+        } => {
             let well = match out {
                 Ok(r) => {
                     let agent_ok = r.agent.as_ref().is_some_and(|(ok, _)| *ok);
@@ -253,7 +291,15 @@ fn report(node: &Node, event: &Event<Result<Report, DaemonError>>, last: &mut BT
             last.insert(vc.subject.clone(), well);
         }
         Event::Panicked { vc, restart_in } => {
-            println!("{}: the run panicked{}", vc.subject, if restart_in.is_some() { ", restarting" } else { "" });
+            println!(
+                "{}: the run panicked{}",
+                vc.subject,
+                if restart_in.is_some() {
+                    ", restarting"
+                } else {
+                    ""
+                }
+            );
             last.insert(vc.subject.clone(), false);
         }
         Event::Refused(r) => {
@@ -271,7 +317,8 @@ mod cli {
     use taso_core::model::WardenId;
     use taso_warden::daemon::{Config, SourceConf, TakeOver};
 
-    pub const USAGE: &str = "usage: taso-wardend <config.json> [--takeover <subject>=<warden>@<epoch>]...";
+    pub const USAGE: &str =
+        "usage: taso-wardend <config.json> [--takeover <subject>=<warden>@<epoch>]...";
 
     /// `(path, [(subject, takeover)])`.
     pub fn parse(args: &[String]) -> Result<(String, Vec<(String, TakeOver)>), String> {
@@ -281,11 +328,19 @@ mod cli {
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--takeover" => {
-                    let v = it.next().ok_or("--takeover needs <subject>=<warden>@<epoch>")?;
-                    let (subject, rest) = v.split_once('=').ok_or_else(|| format!("--takeover {v}: expected <subject>=<warden>@<epoch>"))?;
-                    let (warden, epoch) = rest.split_once('@').ok_or_else(|| format!("--takeover {v}: expected <subject>=<warden>@<epoch>"))?;
+                    let v = it
+                        .next()
+                        .ok_or("--takeover needs <subject>=<warden>@<epoch>")?;
+                    let (subject, rest) = v.split_once('=').ok_or_else(|| {
+                        format!("--takeover {v}: expected <subject>=<warden>@<epoch>")
+                    })?;
+                    let (warden, epoch) = rest.split_once('@').ok_or_else(|| {
+                        format!("--takeover {v}: expected <subject>=<warden>@<epoch>")
+                    })?;
                     let num = |what: &str, s: &str| -> Result<u64, String> {
-                        s.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| format!("--takeover {v}: {what} is not a positive number"))
+                        s.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                            format!("--takeover {v}: {what} is not a positive number")
+                        })
                     };
                     if subject.is_empty() {
                         return Err(format!("--takeover {v}: empty subject"));
@@ -295,7 +350,10 @@ mod cli {
                     }
                     takeovers.push((
                         subject.to_string(),
-                        TakeOver { holder: WardenId::new(num("warden", warden)?), epoch: Epoch::new(num("epoch", epoch)?) },
+                        TakeOver {
+                            holder: WardenId::new(num("warden", warden)?),
+                            epoch: Epoch::new(num("epoch", epoch)?),
+                        },
                     ));
                 }
                 s if s.starts_with("--") => return Err(format!("unknown option {s}")),
@@ -307,7 +365,10 @@ mod cli {
     }
 
     /// Put each one-shot takeover on its entry.
-    pub fn apply_takeovers(config: &mut Config, takeovers: &[(String, TakeOver)]) -> Result<(), String> {
+    pub fn apply_takeovers(
+        config: &mut Config,
+        takeovers: &[(String, TakeOver)],
+    ) -> Result<(), String> {
         if takeovers.is_empty() {
             return Ok(());
         }
@@ -336,9 +397,19 @@ mod cli {
         #[test]
         fn path_and_takeovers() {
             assert_eq!(p(&["c.json"]).unwrap(), ("c.json".to_string(), vec![]));
-            let (path, t) = p(&["--takeover", "sim-1=2@7", "c.json", "--takeover", "x=1@1"]).unwrap();
+            let (path, t) =
+                p(&["--takeover", "sim-1=2@7", "c.json", "--takeover", "x=1@1"]).unwrap();
             assert_eq!(path, "c.json");
-            assert_eq!(t[0], ("sim-1".to_string(), TakeOver { holder: WardenId::new(2), epoch: Epoch::new(7) }));
+            assert_eq!(
+                t[0],
+                (
+                    "sim-1".to_string(),
+                    TakeOver {
+                        holder: WardenId::new(2),
+                        epoch: Epoch::new(7)
+                    }
+                )
+            );
             assert_eq!(t[1].0, "x");
         }
 
@@ -347,13 +418,34 @@ mod cli {
             for (args, want) in [
                 (&[][..], "missing <config.json>"),
                 (&["a", "b"], "unexpected argument b"),
-                (&["c", "--takeover"], "--takeover needs <subject>=<warden>@<epoch>"),
-                (&["c", "--takeover", "s"], "--takeover s: expected <subject>=<warden>@<epoch>"),
-                (&["c", "--takeover", "s=2"], "--takeover s=2: expected <subject>=<warden>@<epoch>"),
-                (&["c", "--takeover", "=2@3"], "--takeover =2@3: empty subject"),
-                (&["c", "--takeover", "s=x@3"], "--takeover s=x@3: warden is not a positive number"),
-                (&["c", "--takeover", "s=2@0"], "--takeover s=2@0: epoch is not a positive number"),
-                (&["c", "--takeover", "s=2@3", "--takeover", "s=2@4"], "--takeover s=2@4: subject given twice"),
+                (
+                    &["c", "--takeover"],
+                    "--takeover needs <subject>=<warden>@<epoch>",
+                ),
+                (
+                    &["c", "--takeover", "s"],
+                    "--takeover s: expected <subject>=<warden>@<epoch>",
+                ),
+                (
+                    &["c", "--takeover", "s=2"],
+                    "--takeover s=2: expected <subject>=<warden>@<epoch>",
+                ),
+                (
+                    &["c", "--takeover", "=2@3"],
+                    "--takeover =2@3: empty subject",
+                ),
+                (
+                    &["c", "--takeover", "s=x@3"],
+                    "--takeover s=x@3: warden is not a positive number",
+                ),
+                (
+                    &["c", "--takeover", "s=2@0"],
+                    "--takeover s=2@0: epoch is not a positive number",
+                ),
+                (
+                    &["c", "--takeover", "s=2@3", "--takeover", "s=2@4"],
+                    "--takeover s=2@4: subject given twice",
+                ),
                 (&["c", "--tls"], "unknown option --tls"),
             ] {
                 assert_eq!(p(args).unwrap_err(), want, "{args:?}");
@@ -393,7 +485,10 @@ mod signals {
 
     /// A thread that waits for the signals in `set` (blocked: [`block`])
     /// and calls `on(n)` for the n-th one (1, 2, ...).
-    pub fn spawn_waiter(set: libc::sigset_t, mut on: impl FnMut(u32) + Send + 'static) -> JoinHandle<()> {
+    pub fn spawn_waiter(
+        set: libc::sigset_t,
+        mut on: impl FnMut(u32) + Send + 'static,
+    ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             let mut n = 0;
             loop {
@@ -425,8 +520,15 @@ mod tests {
     fn children_start_with_the_signals_unblocked() {
         std::thread::spawn(|| {
             signals::block().unwrap();
-            let status = std::process::Command::new("sh").args(["-c", "kill -TERM $$; sleep 5"]).status().unwrap();
-            assert_eq!(status.signal(), Some(libc::SIGTERM), "the child ignored SIGTERM: {status:?}");
+            let status = std::process::Command::new("sh")
+                .args(["-c", "kill -TERM $$; sleep 5"])
+                .status()
+                .unwrap();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGTERM),
+                "the child ignored SIGTERM: {status:?}"
+            );
         })
         .join()
         .unwrap();
@@ -451,6 +553,10 @@ mod tests {
             assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(want));
         }
         assert_eq!(unsafe { libc::pthread_kill(waiter, libc::SIGINT) }, 0);
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(3), "SIGINT counts too");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(3),
+            "SIGINT counts too"
+        );
     }
 }

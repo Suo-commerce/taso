@@ -42,8 +42,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use taso_core::canon::Canonical;
 use taso_core::envelope::{ChronicleId, Epoch, Stream};
 use taso_core::record::{
-    Authority, BarrierId, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord, OutcomeState, Payload,
-    RetryPolicy,
+    Authority, BarrierId, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord, OutcomeState,
+    Payload, RetryPolicy,
 };
 
 use crate::chronicle::{ChronicleError, Layers};
@@ -101,7 +101,13 @@ pub(crate) struct AlwaysPublish;
 
 #[cfg(test)]
 impl Publish for AlwaysPublish {
-    fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], _: Position) -> Result<(), PublishError> {
+    fn publish(
+        &mut self,
+        _: ChronicleId,
+        _: Epoch,
+        _: &[&Segment],
+        _: Position,
+    ) -> Result<(), PublishError> {
         Ok(())
     }
 }
@@ -195,9 +201,18 @@ impl Ledger {
     ) -> Result<(Self, Reconciled), VesselError>
     where
         L: Layers,
-        F: FnMut(&mut Self, &mut Vessel<L>, &IntentRecord, Option<OutcomeState>) -> Result<bool, VesselError>,
+        F: FnMut(
+            &mut Self,
+            &mut Vessel<L>,
+            &IntentRecord,
+            Option<OutcomeState>,
+        ) -> Result<bool, VesselError>,
     {
-        let mut l = Self { publisher, next_op: 1, open: BTreeSet::new() };
+        let mut l = Self {
+            publisher,
+            next_op: 1,
+            open: BTreeSet::new(),
+        };
         let r = l.reconcile(vessel, &mut settle)?;
         Ok((l, r))
     }
@@ -221,12 +236,19 @@ impl Ledger {
 
     /// Record the intent and its authorization together: one write, one
     /// fsync, one CAS.  A crash during it leaves both or neither accepted.
-    pub fn authorize<L: Layers>(&mut self, vessel: &mut Vessel<L>, p: &Proposed) -> Result<Authorized, VesselError> {
+    pub fn authorize<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        p: &Proposed,
+    ) -> Result<Authorized, VesselError> {
         let a = self.assign(vessel, p);
         let t = crate::timing::span("effect.authorize");
         vessel.append_batch(vec![
             (Stream::Effect, Payload::Intent(intent(a, p))),
-            (Stream::Effect, outcome(a.op, OutcomeState::DispatchAuthorized, None)),
+            (
+                Stream::Effect,
+                outcome(a.op, OutcomeState::DispatchAuthorized, None),
+            ),
         ])?;
         drop(t);
         Ok(a)
@@ -266,7 +288,11 @@ impl Ledger {
                 let reason = format!("ledger not shipped: {e}");
                 vessel.append(
                     Stream::Effect,
-                    outcome(a.op, OutcomeState::ConfirmedNotApplied, Some(reason.clone().into_bytes())),
+                    outcome(
+                        a.op,
+                        OutcomeState::ConfirmedNotApplied,
+                        Some(reason.clone().into_bytes()),
+                    ),
                 )?;
                 Ok(Err(reason))
             }
@@ -279,7 +305,8 @@ impl Ledger {
     /// have happened.
     pub fn ship<L: Layers>(&mut self, vessel: &Vessel<L>) -> Result<(), PublishError> {
         let c = vessel.chronicle();
-        self.publisher.publish(c.id(), c.epoch(), &c.segments(), c.tail())
+        self.publisher
+            .publish(c.id(), c.epoch(), &c.segments(), c.tail())
     }
 
     /// Record what the provider said about `op`.  A terminal answer closes
@@ -293,18 +320,28 @@ impl Ledger {
     ) -> Result<(), VesselError> {
         match answer {
             Answer::Applied { receipt } => {
-                vessel.append(Stream::Effect, outcome(op, OutcomeState::ConfirmedApplied, Some(receipt.clone())))?;
+                vessel.append(
+                    Stream::Effect,
+                    outcome(op, OutcomeState::ConfirmedApplied, Some(receipt.clone())),
+                )?;
                 self.open.remove(&op);
             }
             Answer::NotApplied { reason } => {
                 vessel.append(
                     Stream::Effect,
-                    outcome(op, OutcomeState::ConfirmedNotApplied, Some(reason.clone().into_bytes())),
+                    outcome(
+                        op,
+                        OutcomeState::ConfirmedNotApplied,
+                        Some(reason.clone().into_bytes()),
+                    ),
                 )?;
                 self.open.remove(&op);
             }
             Answer::Unknown => {
-                vessel.append(Stream::Effect, outcome(op, OutcomeState::OutcomeUnknown, None))?;
+                vessel.append(
+                    Stream::Effect,
+                    outcome(op, OutcomeState::OutcomeUnknown, None),
+                )?;
                 if barrier.is_some() {
                     self.open.insert(op);
                 }
@@ -323,7 +360,10 @@ impl Ledger {
         state: Option<OutcomeState>,
     ) -> Result<bool, VesselError> {
         if state != Some(OutcomeState::OutcomeUnknown) {
-            vessel.append(Stream::Effect, outcome(op, OutcomeState::OutcomeUnknown, None))?;
+            vessel.append(
+                Stream::Effect,
+                outcome(op, OutcomeState::OutcomeUnknown, None),
+            )?;
         }
         Ok(false)
     }
@@ -344,9 +384,16 @@ impl Ledger {
         if !self.open.contains(&op) {
             return Err(ResolveError::NotOpen(op));
         }
-        let state = if applied { OutcomeState::ConfirmedApplied } else { OutcomeState::ConfirmedNotApplied };
+        let state = if applied {
+            OutcomeState::ConfirmedApplied
+        } else {
+            OutcomeState::ConfirmedNotApplied
+        };
         vessel
-            .append(Stream::Effect, outcome(op, state, Some(authority.canon_bytes())))
+            .append(
+                Stream::Effect,
+                outcome(op, state, Some(authority.canon_bytes())),
+            )
             .map_err(ResolveError::Vessel)?;
         self.open.remove(&op);
         Ok(())
@@ -359,39 +406,62 @@ impl Ledger {
         let op = OpId::new(self.next_op);
         self.next_op += 1;
         let lsn = vessel.tail().lsn.next();
-        let barrier = (p.consequence != Consequence::NoExternalMutation).then(|| BarrierId::new(lsn.get()));
+        let barrier =
+            (p.consequence != Consequence::NoExternalMutation).then(|| BarrierId::new(lsn.get()));
         Authorized { op, barrier }
     }
 
-    fn reconcile<L, F>(&mut self, vessel: &mut Vessel<L>, settle: &mut F) -> Result<Reconciled, VesselError>
+    fn reconcile<L, F>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        settle: &mut F,
+    ) -> Result<Reconciled, VesselError>
     where
         L: Layers,
-        F: FnMut(&mut Self, &mut Vessel<L>, &IntentRecord, Option<OutcomeState>) -> Result<bool, VesselError>,
+        F: FnMut(
+            &mut Self,
+            &mut Vessel<L>,
+            &IntentRecord,
+            Option<OutcomeState>,
+        ) -> Result<bool, VesselError>,
     {
         let frames = vessel
             .chronicle()
             .frames()
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
         // From the newest Checkpoint on: older segments may be gone.
-        let summary =
-            crate::summary::Summary::of(&frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+        let summary = crate::summary::Summary::of(&frames)
+            .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
         self.next_op = self.next_op.max(summary.next_op);
-        let intents: BTreeMap<OpId, IntentRecord> =
-            summary.open.iter().map(|(op, e)| (*op, e.intent.clone())).collect();
-        let latest: BTreeMap<OpId, OutcomeState> =
-            summary.open.iter().filter_map(|(op, e)| e.state.map(|s| (*op, s))).collect();
+        let intents: BTreeMap<OpId, IntentRecord> = summary
+            .open
+            .iter()
+            .map(|(op, e)| (*op, e.intent.clone()))
+            .collect();
+        let latest: BTreeMap<OpId, OutcomeState> = summary
+            .open
+            .iter()
+            .filter_map(|(op, e)| e.state.map(|s| (*op, s)))
+            .collect();
 
         let mut report = Reconciled::default();
         for (op, i) in intents {
             let state = latest.get(&op).copied();
-            if matches!(state, Some(OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied)) {
+            if matches!(
+                state,
+                Some(OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied)
+            ) {
                 continue;
             }
             let settled = match state {
                 None | Some(OutcomeState::Prepared) => {
                     vessel.append(
                         Stream::Effect,
-                        outcome(op, OutcomeState::ConfirmedNotApplied, Some(b"reconcile: never authorized".to_vec())),
+                        outcome(
+                            op,
+                            OutcomeState::ConfirmedNotApplied,
+                            Some(b"reconcile: never authorized".to_vec()),
+                        ),
                     )?;
                     true
                 }
@@ -423,7 +493,11 @@ fn intent(a: Authorized, p: &Proposed) -> IntentRecord {
 }
 
 fn outcome(op: OpId, state: OutcomeState, evidence: Option<Vec<u8>>) -> Payload {
-    Payload::Outcome(OutcomeRecord { op, state, evidence })
+    Payload::Outcome(OutcomeRecord {
+        op,
+        state,
+        evidence,
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -441,7 +515,13 @@ mod tests {
     struct NeverPublish;
 
     impl Publish for NeverPublish {
-        fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], _: Position) -> Result<(), PublishError> {
+        fn publish(
+            &mut self,
+            _: ChronicleId,
+            _: Epoch,
+            _: &[&Segment],
+            _: Position,
+        ) -> Result<(), PublishError> {
             Err(PublishError("store unavailable".into()))
         }
     }
@@ -508,7 +588,10 @@ mod tests {
     }
 
     fn auth() -> Authority {
-        Authority { actor: "jarmo".into(), reason: "checked the provider by hand".into() }
+        Authority {
+            actor: "jarmo".into(),
+            reason: "checked the provider by hand".into(),
+        }
     }
 
     #[test]
@@ -520,12 +603,22 @@ mod tests {
         assert_eq!(l.next_op(), OpId::new(1));
         let intent_lsn = v.tail().lsn.next();
 
-        let a = l.authorize(&mut v, &proposed("send bob", Consequence::Irreversible)).unwrap();
-        assert_eq!(a, Authorized { op: OpId::new(1), barrier: Some(BarrierId::new(intent_lsn.get())) });
+        let a = l
+            .authorize(&mut v, &proposed("send bob", Consequence::Irreversible))
+            .unwrap();
+        assert_eq!(
+            a,
+            Authorized {
+                op: OpId::new(1),
+                barrier: Some(BarrierId::new(intent_lsn.get()))
+            }
+        );
         assert_eq!(l.next_op(), OpId::new(2));
         let recs = records(&v);
         assert_eq!(recs.len(), 2);
-        let Payload::Intent(i) = &recs[0] else { panic!("intent first") };
+        let Payload::Intent(i) = &recs[0] else {
+            panic!("intent first")
+        };
         assert_eq!(i.request, b"send bob");
         assert_eq!(i.barrier, a.barrier);
         assert_eq!(outcomes(&v), vec![(1, OutcomeState::DispatchAuthorized)]);
@@ -536,7 +629,9 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
-        let a = l.authorize(&mut v, &proposed("read", Consequence::NoExternalMutation)).unwrap();
+        let a = l
+            .authorize(&mut v, &proposed("read", Consequence::NoExternalMutation))
+            .unwrap();
         assert_eq!(a.barrier, None);
         // An unknown answer without a barrier opens no obligation.
         l.record(&mut v, a.op, a.barrier, &Answer::Unknown).unwrap();
@@ -548,14 +643,22 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = Ledger::open(Box::new(NeverPublish), &mut v, cannot_settle).unwrap();
-        let a = l.authorize(&mut v, &proposed("send bob", Consequence::Irreversible)).unwrap();
+        let a = l
+            .authorize(&mut v, &proposed("send bob", Consequence::Irreversible))
+            .unwrap();
         let reason = l.ship_before_send(&mut v, &a).unwrap().unwrap_err();
         assert_eq!(reason, "ledger not shipped: store unavailable");
         assert_eq!(
             outcomes(&v),
-            vec![(1, OutcomeState::DispatchAuthorized), (1, OutcomeState::ConfirmedNotApplied)]
+            vec![
+                (1, OutcomeState::DispatchAuthorized),
+                (1, OutcomeState::ConfirmedNotApplied)
+            ]
         );
-        assert!(l.authorized(), "a refused send is terminal, not an obligation");
+        assert!(
+            l.authorized(),
+            "a refused send is terminal, not an obligation"
+        );
     }
 
     #[test]
@@ -563,7 +666,9 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
-        let a = l.authorize(&mut v, &proposed("send bob", Consequence::Irreversible)).unwrap();
+        let a = l
+            .authorize(&mut v, &proposed("send bob", Consequence::Irreversible))
+            .unwrap();
         let tail = v.tail();
         assert_eq!(l.ship_before_send(&mut v, &a).unwrap(), Ok(()));
         assert_eq!(v.tail(), tail);
@@ -574,12 +679,22 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
-        let a = l.authorize(&mut v, &proposed("a", Consequence::Irreversible)).unwrap();
+        let a = l
+            .authorize(&mut v, &proposed("a", Consequence::Irreversible))
+            .unwrap();
         l.record(&mut v, a.op, a.barrier, &Answer::Unknown).unwrap();
         assert_eq!(l.open_obligations(), vec![a.op]);
         assert!(!l.authorized());
         // A later terminal answer for it (a probe) closes it.
-        l.record(&mut v, a.op, a.barrier, &Answer::Applied { receipt: b"r".to_vec() }).unwrap();
+        l.record(
+            &mut v,
+            a.op,
+            a.barrier,
+            &Answer::Applied {
+                receipt: b"r".to_vec(),
+            },
+        )
+        .unwrap();
         assert!(l.authorized());
     }
 
@@ -588,12 +703,19 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
-        l.append_intent_alone(&mut v, &proposed("send bob", Consequence::Irreversible)).unwrap();
+        l.append_intent_alone(&mut v, &proposed("send bob", Consequence::Irreversible))
+            .unwrap();
         drop((l, v));
 
         let mut v = vessel(&e);
         let (l, r) = Ledger::open(Box::new(AlwaysPublish), &mut v, no_settle).unwrap();
-        assert_eq!(r, Reconciled { settled: vec![OpId::new(1)], open: vec![] });
+        assert_eq!(
+            r,
+            Reconciled {
+                settled: vec![OpId::new(1)],
+                open: vec![]
+            }
+        );
         assert!(l.authorized());
         assert_eq!(outcomes(&v), vec![(1, OutcomeState::ConfirmedNotApplied)]);
         assert_eq!(l.next_op(), OpId::new(2), "the op id is not reused");
@@ -604,14 +726,28 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
-        let a = l.authorize(&mut v, &proposed("fire", Consequence::Irreversible)).unwrap();
+        let a = l
+            .authorize(&mut v, &proposed("fire", Consequence::Irreversible))
+            .unwrap();
         drop((l, v));
 
         let mut v = vessel(&e);
         let (l, r) = open(&mut v);
-        assert_eq!(r, Reconciled { settled: vec![], open: vec![a.op] });
+        assert_eq!(
+            r,
+            Reconciled {
+                settled: vec![],
+                open: vec![a.op]
+            }
+        );
         assert!(!l.authorized());
-        assert_eq!(outcomes(&v), vec![(1, OutcomeState::DispatchAuthorized), (1, OutcomeState::OutcomeUnknown)]);
+        assert_eq!(
+            outcomes(&v),
+            vec![
+                (1, OutcomeState::DispatchAuthorized),
+                (1, OutcomeState::OutcomeUnknown)
+            ]
+        );
 
         // Opening again does not record a second unknown.
         drop((l, v));
@@ -621,12 +757,24 @@ mod tests {
         assert_eq!(outcomes(&v).len(), 2);
 
         // Only an operator with a name and a reason closes it.
-        let empty = Authority { actor: " ".into(), reason: "x".into() };
-        assert!(matches!(l.resolve(&mut v, a.op, true, empty), Err(ResolveError::EmptyAuthority)));
-        assert!(matches!(l.resolve(&mut v, OpId::new(9), true, auth()), Err(ResolveError::NotOpen(_))));
+        let empty = Authority {
+            actor: " ".into(),
+            reason: "x".into(),
+        };
+        assert!(matches!(
+            l.resolve(&mut v, a.op, true, empty),
+            Err(ResolveError::EmptyAuthority)
+        ));
+        assert!(matches!(
+            l.resolve(&mut v, OpId::new(9), true, auth()),
+            Err(ResolveError::NotOpen(_))
+        ));
         l.resolve(&mut v, a.op, false, auth()).unwrap();
         assert!(l.authorized());
-        assert_eq!(outcomes(&v).last(), Some(&(1, OutcomeState::ConfirmedNotApplied)));
+        assert_eq!(
+            outcomes(&v).last(),
+            Some(&(1, OutcomeState::ConfirmedNotApplied))
+        );
     }
 
     #[test]
@@ -634,8 +782,18 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
-        let a = l.authorize(&mut v, &proposed("a", Consequence::Irreversible)).unwrap();
-        l.record(&mut v, a.op, a.barrier, &Answer::NotApplied { reason: "no".into() }).unwrap();
+        let a = l
+            .authorize(&mut v, &proposed("a", Consequence::Irreversible))
+            .unwrap();
+        l.record(
+            &mut v,
+            a.op,
+            a.barrier,
+            &Answer::NotApplied {
+                reason: "no".into(),
+            },
+        )
+        .unwrap();
         drop((l, v));
         let mut v = vessel(&e);
         let (l, r) = Ledger::open(Box::new(AlwaysPublish), &mut v, no_settle).unwrap();

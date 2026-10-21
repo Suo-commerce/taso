@@ -51,23 +51,40 @@ fn env() -> Env {
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
     let sock = tmp.path().join("coord.sock");
     let server = Server::spawn(&sock, coord.clone()).unwrap();
-    Env { tmp, coord, sock, _server: server }
+    Env {
+        tmp,
+        coord,
+        sock,
+        _server: server,
+    }
 }
 
 /// A runs and ships up to `shipped` records out of `accepted`, then B takes
 /// over from what was shipped and takes one Seal with `verdict`.
 fn takeover(e: &Env, n: u8, shipped: u64, extra: u64, verdict: Verdict) -> ChronicleId {
     let id = ChronicleId::from_bytes([n; 16]);
-    let (a_dir, b_dir) = (e.tmp.path().join("a").join(hex(id)), e.tmp.path().join("b").join(hex(id)));
+    let (a_dir, b_dir) = (
+        e.tmp.path().join("a").join(hex(id)),
+        e.tmp.path().join("b").join(hex(id)),
+    );
     std::fs::create_dir_all(&a_dir).unwrap();
     let (mut a, _) = Chronicle::create(&a_dir, e.coord.clone(), id, A, Mem::default()).unwrap();
     a.append(Stream::Fs, Payload::Raw(vec![1])).unwrap();
-    a.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(1)).unwrap();
+    a.seal(
+        StreamCut::EMPTY,
+        Verdict::Clean,
+        Lsn::new(0),
+        TurnId::new(1),
+    )
+    .unwrap();
     while a.tail().lsn.get() < shipped {
         a.append(Stream::Fs, Payload::Raw(vec![2])).unwrap();
     }
     let frames = a.frames().unwrap();
-    let to = Position { lsn: Lsn::new(shipped), hash: frames[shipped as usize - 1].envelope.hash };
+    let to = Position {
+        lsn: Lsn::new(shipped),
+        hash: frames[shipped as usize - 1].envelope.hash,
+    };
     e.coord.advance_shipped(A, id, a.epoch(), to).unwrap();
     for _ in 0..extra {
         a.append(Stream::Fs, Payload::Raw(vec![3])).unwrap(); // accepted, never shipped
@@ -75,10 +92,16 @@ fn takeover(e: &Env, n: u8, shipped: u64, extra: u64, verdict: Verdict) -> Chron
     std::fs::create_dir_all(b_dir.parent().unwrap()).unwrap();
     restore_log(&b_dir, id, &frames[..shipped as usize]).unwrap();
     let o = e.coord.ownership(id).unwrap();
-    let claim = Claim::TakeOver { from: o.holder, epoch: o.epoch };
-    let (mut b, _) = Chronicle::open_after_gap_as(&b_dir, e.coord.clone(), id, B, Mem::default(), claim).unwrap();
+    let claim = Claim::TakeOver {
+        from: o.holder,
+        epoch: o.epoch,
+    };
+    let (mut b, _) =
+        Chronicle::open_after_gap_as(&b_dir, e.coord.clone(), id, B, Mem::default(), claim)
+            .unwrap();
     b.append(Stream::Fs, Payload::Raw(vec![4])).unwrap();
-    b.seal(StreamCut::EMPTY, verdict, Lsn::new(0), TurnId::new(2)).unwrap();
+    b.seal(StreamCut::EMPTY, verdict, Lsn::new(0), TurnId::new(2))
+        .unwrap();
     id
 }
 
@@ -89,7 +112,11 @@ fn logcheck(e: &Env, node: &str, id: ChronicleId) -> Value {
         .arg(hex(id))
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
@@ -98,8 +125,17 @@ fn judge(dir: &Path, a: &Value, b: &Value) -> Value {
     std::fs::write(&pa, a.to_string()).unwrap();
     std::fs::write(&pb, b.to_string()).unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/gate-cloud/logjudge.py");
-    let out = Command::new("python3").arg(script).arg(&pa).arg(&pb).output().expect("python3");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new("python3")
+        .arg(script)
+        .arg(&pa)
+        .arg(&pb)
+        .output()
+        .expect("python3");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
@@ -110,13 +146,39 @@ fn frames_mut(v: &mut Value) -> &mut Vec<Value> {
 #[test]
 fn a_takeover_that_loses_records_is_reported_and_judged() {
     let e = env();
-    let id = takeover(&e, 1, 4, 2, Verdict::Unverified("reborn: records 5..6 were never shipped".into()));
+    let id = takeover(
+        &e,
+        1,
+        4,
+        2,
+        Verdict::Unverified("reborn: records 5..6 were never shipped".into()),
+    );
     let (a, b) = (logcheck(&e, "a", id), logcheck(&e, "b", id));
-    assert_eq!(b["ownership"]["sealed_prefix"]["lsn"], 6, "the head when B took over");
-    let gap = b["frames"].as_array().unwrap().iter().find(|f| f["kind"] == "gap").unwrap().clone();
-    assert_eq!((gap["kept"].clone(), gap["resumes"].clone(), gap["lsn"].clone()), (4.into(), 6.into(), 7.into()));
+    assert_eq!(
+        b["ownership"]["sealed_prefix"]["lsn"], 6,
+        "the head when B took over"
+    );
+    let gap = b["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["kind"] == "gap")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (
+            gap["kept"].clone(),
+            gap["resumes"].clone(),
+            gap["lsn"].clone()
+        ),
+        (4.into(), 6.into(), 7.into())
+    );
     let v = judge(e.tmp.path(), &a, &b);
-    assert_eq!((v["ok"].clone(), v["lost"].clone()), (true.into(), 2.into()), "{v}");
+    assert_eq!(
+        (v["ok"].clone(), v["lost"].clone()),
+        (true.into(), 2.into()),
+        "{v}"
+    );
 
     // Each way the evidence can be wrong fails.
     let fails = |a: &Value, b: &Value, what: &str| {
@@ -159,9 +221,17 @@ fn a_takeover_that_loses_nothing_is_judged() {
     let e = env();
     let id = takeover(&e, 2, 4, 0, Verdict::Clean);
     let (a, b) = (logcheck(&e, "a", id), logcheck(&e, "b", id));
-    assert!(b["frames"].as_array().unwrap().iter().all(|f| f["kind"] != "gap"));
+    assert!(b["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|f| f["kind"] != "gap"));
     let v = judge(e.tmp.path(), &a, &b);
-    assert_eq!((v["ok"].clone(), v["lost"].clone()), (true.into(), 0.into()), "{v}");
+    assert_eq!(
+        (v["ok"].clone(), v["lost"].clone()),
+        (true.into(), 0.into()),
+        "{v}"
+    );
 
     let mut b2 = b.clone();
     for f in frames_mut(&mut b2) {
@@ -170,5 +240,8 @@ fn a_takeover_that_loses_nothing_is_judged() {
         }
     }
     let v = judge(e.tmp.path(), &a, &b2);
-    assert_eq!(v["ok"], false, "an Unverified first Seal with nothing lost passed: {v}");
+    assert_eq!(
+        v["ok"], false,
+        "an Unverified first Seal with nothing lost passed: {v}"
+    );
 }

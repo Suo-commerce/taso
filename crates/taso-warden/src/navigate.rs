@@ -20,17 +20,31 @@ use crate::segment::Frame;
 /// Judge resuming from the Seal at `seal`, given the Chronicle `id`'s
 /// log as `frames` and the coordinator's anchor.  A frame whose payload
 /// does not decode breaks the chain there.
-pub fn navigate_frames(coord: &dyn Coord, id: ChronicleId, frames: &[Frame], seal: Lsn) -> Result<Navigation, CoordError> {
+pub fn navigate_frames(
+    coord: &dyn Coord,
+    id: ChronicleId,
+    frames: &[Frame],
+    seal: Lsn,
+) -> Result<Navigation, CoordError> {
     let head = coord.head(id)?;
-    let anchor = Anchor { chronicle: id, head, ownership: coord.ownership(id)? };
+    let anchor = Anchor {
+        chronicle: id,
+        head,
+        ownership: coord.ownership(id)?,
+    };
     let mut records = Vec::with_capacity(frames.len());
     for f in frames {
         match Payload::decode(&f.payload) {
-            Ok(payload) => records.push(Record { envelope: f.envelope, payload }),
+            Ok(payload) => records.push(Record {
+                envelope: f.envelope,
+                payload,
+            }),
             Err(_) => {
-                return Ok(Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::ChainBroken {
-                    lsn: f.envelope.lsn,
-                })]))
+                return Ok(Navigation::Inconsistent(vec![Mode::IncompleteState(
+                    StateFault::ChainBroken {
+                        lsn: f.envelope.lsn,
+                    },
+                )]))
             }
         }
     }

@@ -111,23 +111,25 @@ use taso_core::envelope::{ChronicleId, Epoch};
 use taso_core::record::{vessel_id, Namespace, Verdict};
 use taso_field::adapter::Registry;
 
+use crate::chronicle::Layers;
 use crate::chronicle::{Claim, LayerError, Recovery};
-use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
 use crate::coordinator::{Coord, CoordError};
-use taso_core::model::WardenId;
 use crate::effects::Effects;
 use crate::field::{serve, AfterSeal, FieldSocket, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
-use crate::runtime::{prepare_work_dir, write_bundle, Runc, RuncCli, RuncRunner, Swept, VesselSpec, ID_RANGE};
-use crate::segment::Position;
+use crate::runtime::{
+    prepare_work_dir, write_bundle, Runc, RuncCli, RuncRunner, Swept, VesselSpec, ID_RANGE,
+};
 use crate::s3::{S3Config, S3Store};
+use crate::segment::Position;
 use crate::ship::{LocalStore, SharedStore};
-use crate::chronicle::Layers;
-use crate::vessel::{Ensured, Host, Vessel, VesselError, Pool};
-use crate::zfs::{Dataset, Snapshot};
 use crate::source::Held;
+use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
+use crate::vessel::{Ensured, Host, Pool, Vessel, VesselError};
+use crate::zfs::{Dataset, Snapshot};
+use taso_core::model::WardenId;
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -177,9 +179,17 @@ impl StoreConf {
     pub fn open(&self) -> std::io::Result<SharedStore> {
         Ok(match self {
             Self::Local(dir) => Arc::new(LocalStore::new(dir)),
-            Self::S3 { endpoint, region, bucket, access_key_id, secret_key_file, ca_file } => {
-                let secret = std::fs::read_to_string(secret_key_file)
-                    .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", secret_key_file.display())))?;
+            Self::S3 {
+                endpoint,
+                region,
+                bucket,
+                access_key_id,
+                secret_key_file,
+                ca_file,
+            } => {
+                let secret = std::fs::read_to_string(secret_key_file).map_err(|e| {
+                    std::io::Error::new(e.kind(), format!("{}: {e}", secret_key_file.display()))
+                })?;
                 Arc::new(S3Store::new(
                     S3Config {
                         endpoint: endpoint.clone(),
@@ -266,9 +276,14 @@ pub struct Effective {
 /// no NUL anywhere.
 pub fn check_env(env: &[String]) -> Result<(), String> {
     for e in env {
-        let name = e.split_once('=').map(|(n, _)| n).ok_or_else(|| format!("env {e:?} must be NAME=value"))?;
+        let name = e
+            .split_once('=')
+            .map(|(n, _)| n)
+            .ok_or_else(|| format!("env {e:?} must be NAME=value"))?;
         let mut chars = name.chars();
-        let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        let first_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
         if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!("env {e:?}: {name:?} is not a valid variable name"));
         }
@@ -281,8 +296,15 @@ pub fn check_env(env: &[String]) -> Result<(), String> {
 
 /// Check quiescence paths: relative to the dataset, not empty, no `..`.
 pub fn check_quiescence(dbs: &[String]) -> Result<(), String> {
-    match dbs.iter().find(|q| q.is_empty() || q.contains('\0') || Path::new(q).is_absolute() || q.split('/').any(|c| c == "..")) {
-        Some(q) => Err(format!("quiescence path {q:?} must be relative to the dataset, without \"..\"")),
+    match dbs.iter().find(|q| {
+        q.is_empty()
+            || q.contains('\0')
+            || Path::new(q).is_absolute()
+            || q.split('/').any(|c| c == "..")
+    }) {
+        Some(q) => Err(format!(
+            "quiescence path {q:?} must be relative to the dataset, without \"..\""
+        )),
         None => Ok(()),
     }
 }
@@ -303,8 +325,16 @@ impl TakeOver {
             return Err(bad("\"takeover\" must be {\"holder\": <warden>, \"epoch\": <n>}: the ownership to replace, as read (true/false is no longer accepted)"));
         };
         only_keys(v, "takeover", &["holder", "epoch"])?;
-        let n = |k: &str| field(v, k)?.as_u64().filter(|n| *n > 0).ok_or_else(|| bad(format!("\"takeover.{k}\" must be a positive integer")));
-        Ok(Self { holder: WardenId::new(n("holder")?), epoch: Epoch::new(n("epoch")?) })
+        let n = |k: &str| {
+            field(v, k)?
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| bad(format!("\"takeover.{k}\" must be a positive integer")))
+        };
+        Ok(Self {
+            holder: WardenId::new(n("holder")?),
+            epoch: Epoch::new(n("epoch")?),
+        })
     }
 }
 
@@ -392,7 +422,10 @@ impl VesselConf {
 
     /// The first host uid/gid of its range, if the range fits in a u32.
     pub fn host_uid(&self, rt: &RuntimeConf) -> Option<u32> {
-        let base = self.uid_slot.checked_mul(ID_RANGE)?.checked_add(rt.host_uid_base)?;
+        let base = self
+            .uid_slot
+            .checked_mul(ID_RANGE)?
+            .checked_add(rt.host_uid_base)?;
         base.checked_add(ID_RANGE - 1)?;
         Some(base)
     }
@@ -407,7 +440,10 @@ impl VesselConf {
             .or_else(|| rt.rootfs.clone())
             .ok_or("no rootfs: neither the Vessel nor the node's runtime names one")?;
         if !rootfs.is_absolute() || rootfs.as_os_str().as_encoded_bytes().contains(&0) {
-            return Err(format!("rootfs {} must be an absolute path", rootfs.display()));
+            return Err(format!(
+                "rootfs {} must be an absolute path",
+                rootfs.display()
+            ));
         }
         let args = own.args.unwrap_or_else(|| rt.args.clone());
         if args.is_empty() {
@@ -421,7 +457,11 @@ impl VesselConf {
         let landlock_shim = match own.landlock {
             None => rt.landlock_shim.clone(),
             Some(false) => None,
-            Some(true) => Some(rt.landlock_shim.clone().ok_or("Landlock asked for, but the node has no runtime.landlock_shim")?),
+            Some(true) => Some(
+                rt.landlock_shim
+                    .clone()
+                    .ok_or("Landlock asked for, but the node has no runtime.landlock_shim")?,
+            ),
         };
         let memory_bytes = own.memory_bytes.or(rt.memory_bytes);
         let pids = own.pids.or(rt.pids);
@@ -430,7 +470,15 @@ impl VesselConf {
         }
         let quiescence = own.quiescence.unwrap_or_else(|| quiescence.to_vec());
         check_quiescence(&quiescence)?;
-        Ok(Effective { rootfs, args, env, landlock_shim, memory_bytes, pids, quiescence })
+        Ok(Effective {
+            rootfs,
+            args,
+            env,
+            landlock_shim,
+            memory_bytes,
+            pids,
+            quiescence,
+        })
     }
 }
 
@@ -545,9 +593,11 @@ impl StorageConf {
                 let z = crate::zfs::Zfs::cli();
                 crate::storage::Storage::Zfs(if batched { z.batched() } else { z })
             }
-            Self::Blk { socket, mounts, spool } => {
-                crate::storage::Storage::Blk(crate::blk::BlkPool::new(socket, mounts, spool))
-            }
+            Self::Blk {
+                socket,
+                mounts,
+                spool,
+            } => crate::storage::Storage::Blk(crate::blk::BlkPool::new(socket, mounts, spool)),
         }
     }
 }
@@ -564,9 +614,15 @@ fn storage_conf(v: &Value) -> Result<StorageConf, ConfigError> {
             if mounts == Path::new("/") {
                 return Err(bad("\"storage.blk.mounts\" must not be /"));
             }
-            Ok(StorageConf::Blk { socket: abs_path(b, "socket")?, mounts, spool: abs_path(b, "spool")? })
+            Ok(StorageConf::Blk {
+                socket: abs_path(b, "socket")?,
+                mounts,
+                spool: abs_path(b, "spool")?,
+            })
         }
-        Some(_) => Err(bad("\"storage\" must be \"zfs\" or {\"blk\": {\"socket\", \"mounts\", \"spool\"}}")),
+        Some(_) => Err(bad(
+            "\"storage\" must be \"zfs\" or {\"blk\": {\"socket\", \"mounts\", \"spool\"}}",
+        )),
     }
 }
 
@@ -591,7 +647,10 @@ fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, ConfigError> {
 }
 
 fn string(v: &Value, key: &str) -> Result<String, ConfigError> {
-    field(v, key)?.as_str().map(str::to_string).ok_or_else(|| bad(format!("{key:?} must be a string")))
+    field(v, key)?
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| bad(format!("{key:?} must be a string")))
 }
 
 fn abs_path(v: &Value, key: &str) -> Result<PathBuf, ConfigError> {
@@ -605,7 +664,10 @@ fn abs_path(v: &Value, key: &str) -> Result<PathBuf, ConfigError> {
 fn opt_u64(v: &Value, key: &str) -> Result<Option<u64>, ConfigError> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(x) => x.as_u64().map(Some).ok_or_else(|| bad(format!("{key:?} must be a non-negative integer"))),
+        Some(x) => x
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| bad(format!("{key:?} must be a non-negative integer"))),
     }
 }
 
@@ -614,7 +676,11 @@ fn strings(v: &Value, key: &str) -> Result<Vec<String>, ConfigError> {
         None => Ok(Vec::new()),
         Some(Value::Array(a)) => a
             .iter()
-            .map(|x| x.as_str().map(str::to_string).ok_or_else(|| bad(format!("{key:?} must be strings"))))
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| bad(format!("{key:?} must be strings")))
+            })
             .collect(),
         Some(_) => Err(bad(format!("{key:?} must be an array of strings"))),
     }
@@ -623,14 +689,18 @@ fn strings(v: &Value, key: &str) -> Result<Vec<String>, ConfigError> {
 fn bool_or(v: &Value, key: &str, default: bool) -> Result<bool, ConfigError> {
     match v.get(key) {
         None => Ok(default),
-        Some(x) => x.as_bool().ok_or_else(|| bad(format!("{key:?} must be true or false"))),
+        Some(x) => x
+            .as_bool()
+            .ok_or_else(|| bad(format!("{key:?} must be true or false"))),
     }
 }
 
 /// Refuse keys of `v` not in `keys`: in objects where a misspelt key
 /// would quietly loosen a bound.
 fn only_keys(v: &Value, what: &str, keys: &[&str]) -> Result<(), ConfigError> {
-    let o = v.as_object().ok_or_else(|| bad(format!("{what:?} must be an object")))?;
+    let o = v
+        .as_object()
+        .ok_or_else(|| bad(format!("{what:?} must be an object")))?;
     match o.keys().find(|k| !keys.contains(&k.as_str())) {
         Some(k) => Err(bad(format!("{what:?}: unknown key {k:?}"))),
         None => Ok(()),
@@ -655,14 +725,33 @@ fn opt_strings(v: &Value, key: &str) -> Result<Option<Vec<String>>, ConfigError>
 
 /// A Vessel's own `"runtime"` in a static config.
 fn vessel_runtime(r: &Value) -> Result<VesselRuntime, ConfigError> {
-    only_keys(r, "runtime", &["rootfs", "args", "env", "landlock", "memory_bytes", "pids", "quiescence"])?;
+    only_keys(
+        r,
+        "runtime",
+        &[
+            "rootfs",
+            "args",
+            "env",
+            "landlock",
+            "memory_bytes",
+            "pids",
+            "quiescence",
+        ],
+    )?;
     Ok(VesselRuntime {
-        rootfs: if r.get("rootfs").is_some() { Some(abs_path(r, "rootfs")?) } else { None },
+        rootfs: if r.get("rootfs").is_some() {
+            Some(abs_path(r, "rootfs")?)
+        } else {
+            None
+        },
         args: opt_strings(r, "args")?,
         env: opt_strings(r, "env")?,
         landlock: match r.get("landlock") {
             None => None,
-            Some(x) => Some(x.as_bool().ok_or_else(|| bad("\"landlock\" must be true or false"))?),
+            Some(x) => Some(
+                x.as_bool()
+                    .ok_or_else(|| bad("\"landlock\" must be true or false"))?,
+            ),
         },
         memory_bytes: opt_positive(r, "memory_bytes")?,
         pids: opt_positive(r, "pids")?,
@@ -672,10 +761,24 @@ fn vessel_runtime(r: &Value) -> Result<VesselRuntime, ConfigError> {
 
 /// The `"kubernetes"` source.
 fn kube_source(k: &Value, rt: &RuntimeConf) -> Result<KubeSourceConf, ConfigError> {
-    only_keys(k, "kubernetes", &["node", "tenants", "rootfs_dir", "max_memory_bytes", "max_pids", "allow_without_landlock", "api"])?;
+    only_keys(
+        k,
+        "kubernetes",
+        &[
+            "node",
+            "tenants",
+            "rootfs_dir",
+            "max_memory_bytes",
+            "max_pids",
+            "allow_without_landlock",
+            "api",
+        ],
+    )?;
     let node = string(k, "node")?;
     if !crate::kube::valid_name(&node) {
-        return Err(bad(format!("kubernetes.node {node:?} is not a valid node name")));
+        return Err(bad(format!(
+            "kubernetes.node {node:?} is not a valid node name"
+        )));
     }
     let mut tenants = std::collections::BTreeMap::new();
     let mut owner: std::collections::BTreeMap<[u8; 16], String> = std::collections::BTreeMap::new();
@@ -683,9 +786,13 @@ fn kube_source(k: &Value, rt: &RuntimeConf) -> Result<KubeSourceConf, ConfigErro
         Value::Object(o) if !o.is_empty() => {
             for (ns, t) in o {
                 if !valid_kube_namespace(ns) {
-                    return Err(bad(format!("kubernetes.tenants: {ns:?} is not a valid namespace name")));
+                    return Err(bad(format!(
+                        "kubernetes.tenants: {ns:?} is not a valid namespace name"
+                    )));
                 }
-                let t = t.as_str().ok_or_else(|| bad(format!("kubernetes.tenants.{ns}: must be 32 hex digits")))?;
+                let t = t.as_str().ok_or_else(|| {
+                    bad(format!("kubernetes.tenants.{ns}: must be 32 hex digits"))
+                })?;
                 let tenant = namespace(t)?;
                 if let Some(other) = owner.insert(*tenant.as_bytes(), ns.clone()) {
                     return Err(bad(format!("kubernetes.tenants: {other:?} and {ns:?} map to the same tenant (one namespace per tenant)")));
@@ -693,18 +800,32 @@ fn kube_source(k: &Value, rt: &RuntimeConf) -> Result<KubeSourceConf, ConfigErro
                 tenants.insert(ns.clone(), tenant);
             }
         }
-        _ => return Err(bad("kubernetes.tenants must map at least one namespace to its tenant")),
+        _ => {
+            return Err(bad(
+                "kubernetes.tenants must map at least one namespace to its tenant",
+            ))
+        }
     }
     let max = |key: &str| -> Result<u64, ConfigError> {
-        opt_positive(k, key)?.ok_or_else(|| bad(format!("kubernetes.{key} is required (no unbounded agents from a cluster)")))
+        opt_positive(k, key)?.ok_or_else(|| {
+            bad(format!(
+                "kubernetes.{key} is required (no unbounded agents from a cluster)"
+            ))
+        })
     };
     let (max_memory_bytes, max_pids) = (max("max_memory_bytes")?, max("max_pids")?);
-    if rt.memory_bytes.is_some_and(|m| m > max_memory_bytes) || rt.pids.is_some_and(|p| p > max_pids) {
-        return Err(bad("the node's runtime memory_bytes/pids are above kubernetes.max_memory_bytes/max_pids"));
+    if rt.memory_bytes.is_some_and(|m| m > max_memory_bytes)
+        || rt.pids.is_some_and(|p| p > max_pids)
+    {
+        return Err(bad(
+            "the node's runtime memory_bytes/pids are above kubernetes.max_memory_bytes/max_pids",
+        ));
     }
     let allow_without_landlock = bool_or(k, "allow_without_landlock", false)?;
     if rt.landlock_shim.is_none() && !allow_without_landlock {
-        return Err(bad("kubernetes needs runtime.landlock_shim (or allow_without_landlock: true)"));
+        return Err(bad(
+            "kubernetes needs runtime.landlock_shim (or allow_without_landlock: true)",
+        ));
     }
     let api = match k.get("api") {
         None => None,
@@ -712,12 +833,18 @@ fn kube_source(k: &Value, rt: &RuntimeConf) -> Result<KubeSourceConf, ConfigErro
             only_keys(a, "api", &["url", "token_file", "ca_file"])?;
             let url = string(a, "url")?;
             if !url.starts_with("https://") {
-                return Err(bad("kubernetes.api.url must be https:// (the token goes with every request)"));
+                return Err(bad(
+                    "kubernetes.api.url must be https:// (the token goes with every request)",
+                ));
             }
             Some(KubeApiConf {
                 url,
                 token_file: abs_path(a, "token_file")?,
-                ca_file: if a.get("ca_file").is_some() { Some(abs_path(a, "ca_file")?) } else { None },
+                ca_file: if a.get("ca_file").is_some() {
+                    Some(abs_path(a, "ca_file")?)
+                } else {
+                    None
+                },
             })
         }
     };
@@ -740,7 +867,8 @@ fn namespace(s: &str) -> Result<Namespace, ConfigError> {
     }
     let mut b = [0u8; 16];
     for (i, byte) in b.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(s.get(2 * i..2 * i + 2).ok_or_else(err)?, 16).map_err(|_| err())?;
+        *byte =
+            u8::from_str_radix(s.get(2 * i..2 * i + 2).ok_or_else(err)?, 16).map_err(|_| err())?;
     }
     Ok(Namespace::from_bytes(b))
 }
@@ -749,22 +877,43 @@ impl Config {
     /// Parse and check a configuration.
     pub fn parse(json: &str) -> Result<Self, ConfigError> {
         let v: Value = serde_json::from_str(json).map_err(|e| bad(format!("not JSON: {e}")))?;
-        let warden = field(&v, "warden")?.as_u64().filter(|w| *w > 0).ok_or_else(|| bad("\"warden\" must be a positive integer"))?;
+        let warden = field(&v, "warden")?
+            .as_u64()
+            .filter(|w| *w > 0)
+            .ok_or_else(|| bad("\"warden\" must be a positive integer"))?;
         let c = field(&v, "coordinator")?;
         let coordinator = match (c.get("local"), c.get("remote")) {
             (Some(_), None) => CoordConf::Local {
                 path: abs_path(c, "local")?,
-                serve: if c.get("serve").is_some() { Some(abs_path(c, "serve")?) } else { None },
+                serve: if c.get("serve").is_some() {
+                    Some(abs_path(c, "serve")?)
+                } else {
+                    None
+                },
             },
-            (None, Some(_)) => CoordConf::Remote { socket: abs_path(c, "remote")? },
-            _ => return Err(bad("\"coordinator\" needs exactly one of \"local\" or \"remote\"")),
+            (None, Some(_)) => CoordConf::Remote {
+                socket: abs_path(c, "remote")?,
+            },
+            _ => {
+                return Err(bad(
+                    "\"coordinator\" needs exactly one of \"local\" or \"remote\"",
+                ))
+            }
         };
         let root = Dataset::new(&string(&v, "root")?).map_err(|e| bad(e.to_string()))?;
         let r = field(&v, "runtime")?;
         let runtime = RuntimeConf {
-            rootfs: if r.get("rootfs").is_some() { Some(abs_path(r, "rootfs")?) } else { None },
-            host_uid_base: u32::try_from(field(r, "host_uid_base")?.as_u64().ok_or_else(|| bad("\"host_uid_base\" must be an integer"))?)
-                .map_err(|_| bad("\"host_uid_base\" is too large"))?,
+            rootfs: if r.get("rootfs").is_some() {
+                Some(abs_path(r, "rootfs")?)
+            } else {
+                None
+            },
+            host_uid_base: u32::try_from(
+                field(r, "host_uid_base")?
+                    .as_u64()
+                    .ok_or_else(|| bad("\"host_uid_base\" must be an integer"))?,
+            )
+            .map_err(|_| bad("\"host_uid_base\" is too large"))?,
             landlock_shim: match r.get("landlock_shim") {
                 None | Some(Value::Null) => None,
                 Some(_) => Some(abs_path(r, "landlock_shim")?.to_string_lossy().into_owned()),
@@ -782,7 +931,11 @@ impl Config {
                 only_keys(s, "source", &["kubernetes"])?;
                 SourceConf::Kubernetes(kube_source(&o["kubernetes"], &runtime)?)
             }
-            Some(_) => return Err(bad("\"source\" must be \"static\" or {\"kubernetes\": {...}}")),
+            Some(_) => {
+                return Err(bad(
+                    "\"source\" must be \"static\" or {\"kubernetes\": {...}}",
+                ))
+            }
         };
         let vessels = match (v.get("vessels"), &source) {
             (None, SourceConf::Kubernetes(_)) => Vec::new(),
@@ -832,12 +985,19 @@ impl Config {
                 return Err(bad(format!("vessel {:?} is listed twice", vc.subject)));
             }
             if vc.host_uid(&runtime).is_none() {
-                return Err(bad(format!("vessel {:?}: uid_slot {} does not fit above host_uid_base", vc.subject, vc.uid_slot)));
+                return Err(bad(format!(
+                    "vessel {:?}: uid_slot {} does not fit above host_uid_base",
+                    vc.subject, vc.uid_slot
+                )));
             }
             if let Some(other) = slots.insert(vc.uid_slot, vc.subject.clone()) {
-                return Err(bad(format!("vessels {other:?} and {:?} share uid_slot {}", vc.subject, vc.uid_slot)));
+                return Err(bad(format!(
+                    "vessels {other:?} and {:?} share uid_slot {}",
+                    vc.subject, vc.uid_slot
+                )));
             }
-            vc.effective(&runtime, &quiescence).map_err(|e| bad(format!("vessel {:?}: {e}", vc.subject)))?;
+            vc.effective(&runtime, &quiescence)
+                .map_err(|e| bad(format!("vessel {:?}: {e}", vc.subject)))?;
         }
         Ok(Self {
             warden: WardenId::new(warden),
@@ -852,16 +1012,28 @@ impl Config {
                     let s = &o["s3"];
                     StoreConf::S3 {
                         endpoint: string(s, "endpoint")?,
-                        region: s.get("region").and_then(Value::as_str).unwrap_or("garage").to_string(),
+                        region: s
+                            .get("region")
+                            .and_then(Value::as_str)
+                            .unwrap_or("garage")
+                            .to_string(),
                         bucket: string(s, "bucket")?,
                         access_key_id: string(s, "access_key_id")?,
                         secret_key_file: abs_path(s, "secret_key_file")?,
-                        ca_file: if s.get("ca_file").is_some() { Some(abs_path(s, "ca_file")?) } else { None },
+                        ca_file: if s.get("ca_file").is_some() {
+                            Some(abs_path(s, "ca_file")?)
+                        } else {
+                            None
+                        },
                     }
                 }
                 _ => return Err(bad("\"store\" must be a directory or {\"s3\": {...}}")),
             },
-            prefix: v.get("prefix").and_then(Value::as_str).unwrap_or("vessels").to_string(),
+            prefix: v
+                .get("prefix")
+                .and_then(Value::as_str)
+                .unwrap_or("vessels")
+                .to_string(),
             run_dir: abs_path(&v, "run_dir")?,
             runtime,
             quiescence,
@@ -932,16 +1104,29 @@ pub fn decide(known: Known, local_state: bool, me: WardenId, takeover: Option<Ta
 pub fn verdict_after_open(r: &Recovery) -> Verdict {
     let mut lost = Vec::new();
     if r.segment.unaccepted_frames > 0 {
-        lost.push(format!("{} unaccepted records dropped", r.segment.unaccepted_frames));
+        lost.push(format!(
+            "{} unaccepted records dropped",
+            r.segment.unaccepted_frames
+        ));
     }
     if r.segment.invalid_bytes > 0 {
-        lost.push(format!("a torn tail of {} bytes cut", r.segment.invalid_bytes));
+        lost.push(format!(
+            "a torn tail of {} bytes cut",
+            r.segment.invalid_bytes
+        ));
     }
     if let Some((kept, resumes)) = r.gap {
-        lost.push(format!("records {}..{} lost in a takeover", kept.lsn.get() + 1, resumes.lsn.get()));
+        lost.push(format!(
+            "records {}..{} lost in a takeover",
+            kept.lsn.get() + 1,
+            resumes.lsn.get()
+        ));
     }
     if !r.missing_layers.is_empty() {
-        lost.push(format!("{} Seals without their layer", r.missing_layers.len()));
+        lost.push(format!(
+            "{} Seals without their layer",
+            r.missing_layers.len()
+        ));
     }
     if lost.is_empty() {
         Verdict::Clean
@@ -954,10 +1139,17 @@ pub fn verdict_after_open(r: &Recovery) -> Verdict {
 pub fn verdict_after_rebirth(r: &Reborn) -> Verdict {
     let mut lost = Vec::new();
     if let Some((kept, resumes)) = r.gap {
-        lost.push(format!("records {}..{} were never shipped", kept.lsn.get() + 1, resumes.lsn.get()));
+        lost.push(format!(
+            "records {}..{} were never shipped",
+            kept.lsn.get() + 1,
+            resumes.lsn.get()
+        ));
     }
     if !r.missing_layers.is_empty() {
-        lost.push(format!("{} Seals without their layer", r.missing_layers.len()));
+        lost.push(format!(
+            "{} Seals without their layer",
+            r.missing_layers.len()
+        ));
     }
     if lost.is_empty() {
         Verdict::Clean
@@ -1012,20 +1204,30 @@ impl SealPublisher {
     /// Publish `seal` of `vessel`.  `Ok(true)` if this call shipped it,
     /// `Ok(false)` if an earlier one had (a retry: only the log and the
     /// anchor were brought up to date).
-    pub fn publish(&mut self, vessel: &mut Vessel<StorageLayers>, seal: Position) -> Result<bool, String> {
+    pub fn publish(
+        &mut self,
+        vessel: &mut Vessel<StorageLayers>,
+        seal: Position,
+    ) -> Result<bool, String> {
         let snap = self
             .storage
             .snapshot(vessel.dataset(), seal.lsn)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("Seal {} has no snapshot", seal.lsn.get()))?;
-        let published = vessel.publish_seal(&self.packs, &snap, self.origin.as_ref()).map_err(|e| e.to_string())?;
+        let published = vessel
+            .publish_seal(&self.packs, &snap, self.origin.as_ref())
+            .map_err(|e| e.to_string())?;
         self.origin = None;
         Ok(published.record.is_some())
     }
 }
 
 impl AfterSeal<StorageLayers> for SealPublisher {
-    fn after_seal(&mut self, vessel: &mut Vessel<StorageLayers>, seal: Position) -> Result<(), String> {
+    fn after_seal(
+        &mut self,
+        vessel: &mut Vessel<StorageLayers>,
+        seal: Position,
+    ) -> Result<(), String> {
         self.publish(vessel, seal)?;
         self.published += 1;
         // What is shipped need not stay on local disk.  A failed prune
@@ -1043,8 +1245,13 @@ impl AfterSeal<StorageLayers> for SealPublisher {
 
 /// Whether the log already names a shipped `fs` section.
 fn has_fs_shipped(vessel: &Vessel<StorageLayers>) -> Result<bool, DaemonError> {
-    let frames = vessel.chronicle().frames().map_err(|e| DaemonError::Io(format!("reading the log: {e}")))?;
-    let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, e)| DaemonError::Io(format!("reading the log at lsn {}: {e}", lsn.get())))?;
+    let frames = vessel
+        .chronicle()
+        .frames()
+        .map_err(|e| DaemonError::Io(format!("reading the log: {e}")))?;
+    let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, e)| {
+        DaemonError::Io(format!("reading the log at lsn {}: {e}", lsn.get()))
+    })?;
     Ok(summary.fs_shipped.is_some())
 }
 
@@ -1105,7 +1312,11 @@ pub fn settle<L: Layers>(vessel: &mut Vessel<L>) -> Result<Settled, VesselError>
         Some(_) => None,
     };
     let rolled_back_to = vessel.rollback()?;
-    Ok(Settled { birth, rolled_back_to, last_seal: vessel.last_seal() })
+    Ok(Settled {
+        birth,
+        rolled_back_to,
+        last_seal: vessel.last_seal(),
+    })
 }
 
 /// Why a Vessel could not run.
@@ -1174,12 +1385,19 @@ impl RunDirLock {
 pub fn claim_run_dir(run_dir: &Path) -> io::Result<RunDirLock> {
     std::fs::create_dir_all(run_dir)?;
     let path = run_dir.join(RUN_LOCK);
-    let file = OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
     match file.try_lock() {
         Ok(()) => Ok(RunDirLock { _file: file, path }),
         Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
-            format!("{} is held by another taso-wardend (one daemon per run_dir)", path.display()),
+            format!(
+                "{} is held by another taso-wardend (one daemon per run_dir)",
+                path.display()
+            ),
         )),
         Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
@@ -1194,8 +1412,15 @@ pub fn sweep_stale<R: RuncRunner>(runc: &Runc<R>) -> io::Result<Swept> {
     if swept.failed.is_empty() {
         return Ok(swept);
     }
-    let failed: Vec<String> = swept.failed.iter().map(|(id, why)| format!("{id} ({})", why.trim())).collect();
-    Err(io::Error::other(format!("stale containers could not be removed: {}", failed.join(", "))))
+    let failed: Vec<String> = swept
+        .failed
+        .iter()
+        .map(|(id, why)| format!("{id} ({})", why.trim()))
+        .collect();
+    Err(io::Error::other(format!(
+        "stale containers could not be removed: {}",
+        failed.join(", ")
+    )))
 }
 
 /// What the node's pool holds of each Vessel under `root`, for
@@ -1206,7 +1431,11 @@ pub fn sweep_stale<R: RuncRunner>(runc: &Runc<R>) -> io::Result<Swept> {
 /// slot.  Also returns warnings: datasets that are not a Vessel's, and uids
 /// in no slot's range (they count for none).  Any failure to read the pool
 /// is an error: without it, a slot could be given to a second Vessel.
-pub fn held_on<H: Holdings>(pool: &H, root: &Dataset, host_uid_base: u32) -> Result<(Vec<Held>, Vec<String>), LayerError> {
+pub fn held_on<H: Holdings>(
+    pool: &H,
+    root: &Dataset,
+    host_uid_base: u32,
+) -> Result<(Vec<Held>, Vec<String>), LayerError> {
     let mut held = Vec::new();
     let mut warnings = Vec::new();
     for ds in pool.children(root)? {
@@ -1224,7 +1453,9 @@ pub fn held_on<H: Holdings>(pool: &H, root: &Dataset, host_uid_base: u32) -> Res
                 Some(off) => {
                     slots.insert(off / ID_RANGE);
                 }
-                None => warnings.push(format!("{ds} has files of uid {uid}, below host_uid_base {host_uid_base}: in no slot")),
+                None => warnings.push(format!(
+                    "{ds} has files of uid {uid}, below host_uid_base {host_uid_base}: in no slot"
+                )),
             }
         }
         held.push(Held { key, slots });
@@ -1234,7 +1465,11 @@ pub fn held_on<H: Holdings>(pool: &H, root: &Dataset, host_uid_base: u32) -> Res
 
 /// A Vessel key from 32 lowercase hex digits.
 fn key_of_hex(s: &str) -> Option<[u8; 16]> {
-    if s.len() != 32 || !s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+    if s.len() != 32
+        || !s
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
         return None;
     }
     let mut k = [0u8; 16];
@@ -1266,21 +1501,35 @@ impl Node {
     /// incarnation left in its runc root (see "Starting" in the module
     /// docs), then opens the store.  Each error says which step failed.
     pub fn new(config: Config, coord: Arc<dyn Coord>, storage: Storage) -> std::io::Result<Self> {
-        let ctx = |what: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"));
+        let ctx = |what: &'static str| {
+            move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"))
+        };
         let run_lock = claim_run_dir(&config.run_dir).map_err(ctx("claiming the run directory"))?;
         let swept = sweep_stale(&Runc::new(RuncCli::new(config.run_dir.join("runc"))))
             .map_err(ctx("sweeping stale containers"))?;
         for id in &swept.deleted {
-            eprintln!("taso-wardend[{}]: deleted stale container {id}", config.warden.get());
+            eprintln!(
+                "taso-wardend[{}]: deleted stale container {id}",
+                config.warden.get()
+            );
         }
         // After the sweep: nothing writes into a dataset now.
         let (held, warnings) = held_on(&storage, &config.root, config.runtime.host_uid_base)
-            .map_err(|e| io::Error::other(format!("reading the uid slots of the pool's Vessels: {e}")))?;
+            .map_err(|e| {
+                io::Error::other(format!("reading the uid slots of the pool's Vessels: {e}"))
+            })?;
         for w in &warnings {
             eprintln!("taso-wardend[{}]: {w}", config.warden.get());
         }
         let store = config.store.open().map_err(ctx("opening the store"))?;
-        Ok(Self { config, coord, storage, store, run_lock, held })
+        Ok(Self {
+            config,
+            coord,
+            storage,
+            store,
+            run_lock,
+            held,
+        })
     }
 
     /// What the pool held of each Vessel when the node started: the seed of
@@ -1305,15 +1554,28 @@ impl Node {
     }
 
     fn packs(&self, id: ChronicleId) -> Result<Packs<SharedStore, StorageSend>, DaemonError> {
-        Packs::new(self.store.clone(), self.storage.sender(), &self.config.prefix, id).map_err(io("packs"))
+        Packs::new(
+            self.store.clone(),
+            self.storage.sender(),
+            &self.config.prefix,
+            id,
+        )
+        .map_err(io("packs"))
     }
 
     fn log(&self, vc: &VesselConf, msg: impl fmt::Display) {
-        eprintln!("taso-wardend[{}] {}: {msg}", self.config.warden.get(), vc.subject);
+        eprintln!(
+            "taso-wardend[{}] {}: {msg}",
+            self.config.warden.get(),
+            vc.subject
+        );
     }
 
     /// Find, open or rebirth the Vessel (step 1).
-    fn start(&self, vc: &VesselConf) -> Result<(Vessel<StorageLayers>, Start, Verdict), DaemonError> {
+    fn start(
+        &self,
+        vc: &VesselConf,
+    ) -> Result<(Vessel<StorageLayers>, Start, Verdict), DaemonError> {
         let host = self.host();
         let id = vc.id();
         // What was read is what may be claimed (fencing review F1): a
@@ -1330,7 +1592,10 @@ impl Node {
             Err(e) => return Err(DaemonError::Coord(e)),
         };
         let claim = match (known, vc.takeover) {
-            (Known::Held(holder, _), Some(t)) if holder != self.config.warden => Claim::TakeOver { from: t.holder, epoch: t.epoch },
+            (Known::Held(holder, _), Some(t)) if holder != self.config.warden => Claim::TakeOver {
+                from: t.holder,
+                epoch: t.epoch,
+            },
             _ => Claim::Mine,
         };
         let local = host.dir_for(id).exists();
@@ -1362,10 +1627,14 @@ impl Node {
         if has_fs_shipped(vessel)? {
             return Ok(None);
         }
-        let info = Pool::info(&self.storage, vessel.dataset()).map_err(|e| DaemonError::Io(e.to_string()))?;
+        let info = Pool::info(&self.storage, vessel.dataset())
+            .map_err(|e| DaemonError::Io(e.to_string()))?;
         match info.and_then(|i| i.origin_seal()) {
             None => Ok(None),
-            Some((ds, lsn)) => self.storage.snapshot(&ds, lsn).map_err(|e| DaemonError::Io(e.to_string())),
+            Some((ds, lsn)) => self
+                .storage
+                .snapshot(&ds, lsn)
+                .map_err(|e| DaemonError::Io(e.to_string())),
         }
     }
 
@@ -1381,7 +1650,9 @@ impl Node {
     /// [`Report::stopped`] set.
     pub fn run_vessel_until(&self, vc: &VesselConf, stop: &Stop) -> Result<Report, DaemonError> {
         // Before anything touches the coordinator or the dataset.
-        let rt = vc.effective(&self.config.runtime, &self.config.quiescence).map_err(DaemonError::Runtime)?;
+        let rt = vc
+            .effective(&self.config.runtime, &self.config.quiescence)
+            .map_err(DaemonError::Runtime)?;
         let (mut vessel, start, mut verdict) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
@@ -1390,7 +1661,10 @@ impl Node {
             self.log(vc, format_args!("birth Seal at lsn {}", b.lsn.get()));
         }
         match settled.rolled_back_to {
-            Some(s) => self.log(vc, format_args!("state rolled back to the Seal at lsn {}", s.lsn.get())),
+            Some(s) => self.log(
+                vc,
+                format_args!("state rolled back to the Seal at lsn {}", s.lsn.get()),
+            ),
             None => self.log(vc, "no Seal layer here: state not rolled back"),
         }
         if settled.behind() {
@@ -1402,8 +1676,15 @@ impl Node {
                 ),
             );
         }
-        let mut publisher =
-            SealPublisher { storage: Clone::clone(&self.storage), packs: self.packs(id)?, origin: self.origin(&vessel)?, published: 0, pruned: 0, prune_failures: 0, prune_error: None };
+        let mut publisher = SealPublisher {
+            storage: Clone::clone(&self.storage),
+            packs: self.packs(id)?,
+            origin: self.origin(&vessel)?,
+            published: 0,
+            pruned: 0,
+            prune_failures: 0,
+            prune_error: None,
+        };
         // A crash between taking a Seal and publishing it, or the birth
         // Seal just taken: publish now.  Counted only if this shipped it (a
         // Seal published before the restart is not published again).
@@ -1411,20 +1692,32 @@ impl Node {
             match publisher.publish(&mut vessel, seal) {
                 Ok(true) => publisher.published += 1,
                 Ok(false) => {}
-                Err(e) => self.log(vc, format_args!("publishing the last Seal (lsn {}) failed: {e}", seal.lsn.get())),
+                Err(e) => self.log(
+                    vc,
+                    format_args!(
+                        "publishing the last Seal (lsn {}) failed: {e}",
+                        seal.lsn.get()
+                    ),
+                ),
             }
         }
-        let effects_publisher = PackPublisher::new(self.packs(id)?, self.coord.clone(), self.config.warden);
-        let (mut effects, reconciled) = Effects::open(Registry::new(), Box::new(effects_publisher), &mut vessel)?;
+        let effects_publisher =
+            PackPublisher::new(self.packs(id)?, self.coord.clone(), self.config.warden);
+        let (mut effects, reconciled) =
+            Effects::open(Registry::new(), Box::new(effects_publisher), &mut vessel)?;
         self.log(vc, format_args!("effects reconciled: {reconciled:?}"));
 
         // A reborn dataset was received unmounted.
-        self.storage.ensure_mounted(vessel.dataset()).map_err(|e| DaemonError::Io(format!("mount: {e}")))?;
+        self.storage
+            .ensure_mounted(vessel.dataset())
+            .map_err(|e| DaemonError::Io(format!("mount: {e}")))?;
         let mount = Pool::info(&self.storage, vessel.dataset())
             .map_err(|e| DaemonError::Io(e.to_string()))?
             .and_then(|i| i.mountpoint)
             .ok_or_else(|| DaemonError::Io(format!("{} is not mounted", vessel.dataset())))?;
-        let uid = vc.host_uid(&self.config.runtime).ok_or_else(|| DaemonError::Io(format!("uid_slot {} does not fit", vc.uid_slot)))?;
+        let uid = vc
+            .host_uid(&self.config.runtime)
+            .ok_or_else(|| DaemonError::Io(format!("uid_slot {} does not fit", vc.uid_slot)))?;
         prepare_work_dir(&mount, uid).map_err(io("preparing the dataset"))?;
 
         let dir = self.config.run_dir.join(format!("v-{}", id_hex(id)));
@@ -1445,8 +1738,12 @@ impl Node {
             memory_bytes: rt.memory_bytes,
             pids: rt.pids,
         };
-        let bundle = write_bundle(&dir.join("bundle"), &spec).map_err(|e| DaemonError::Io(format!("bundle: {e:?}")))?;
-        let bundle_dir = bundle.parent().map(Path::to_path_buf).unwrap_or(dir.join("bundle"));
+        let bundle = write_bundle(&dir.join("bundle"), &spec)
+            .map_err(|e| DaemonError::Io(format!("bundle: {e:?}")))?;
+        let bundle_dir = bundle
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(dir.join("bundle"));
         let runc = Runc::new(RuncCli::new(self.config.run_dir.join("runc")));
         if runc.state(&spec.id).map_err(io("runc state"))?.is_some() {
             self.log(vc, "deleting a stale container");
@@ -1503,7 +1800,10 @@ impl Node {
         let mut connections = 0;
         let mut failures = 0;
         let stop = || exited.load(Ordering::SeqCst);
-        while let Some(mut stream) = socket.accept_until(&stop, Duration::from_millis(20)).map_err(io("accept"))? {
+        while let Some(mut stream) = socket
+            .accept_until(&stop, Duration::from_millis(20))
+            .map_err(io("accept"))?
+        {
             connections += 1;
             let watch = if rt.quiescence.is_empty() {
                 None
@@ -1511,7 +1811,9 @@ impl Node {
                 let dbs: Vec<&str> = rt.quiescence.iter().map(String::as_str).collect();
                 Some(Watch::new(&mount, &dbs).map_err(io("quiescence watch"))?)
             };
-            let mut session = Session::new(&mut vessel, verdict.clone())?.with_effects(&mut effects).with_after_seal(&mut publisher);
+            let mut session = Session::new(&mut vessel, verdict.clone())?
+                .with_effects(&mut effects)
+                .with_after_seal(&mut publisher);
             if let Some(w) = watch {
                 session = session.with_watch(w);
             }
@@ -1523,19 +1825,45 @@ impl Node {
             let (f, last) = session.after_seal_failures();
             if f > 0 {
                 failures += f;
-                self.log(vc, format_args!("{f} Seal publishes failed, last: {}", last.unwrap_or("?")));
+                self.log(
+                    vc,
+                    format_args!("{f} Seal publishes failed, last: {}", last.unwrap_or("?")),
+                );
             }
             self.log(vc, format_args!("connection ended: {ended:?}"));
         }
-        let agent = agent.join().map_err(|_| DaemonError::Io("the runc thread panicked".into()))?.ok();
+        let agent = agent
+            .join()
+            .map_err(|_| DaemonError::Io("the runc thread panicked".into()))?
+            .ok();
         if let Some((ok, err)) = &agent {
-            self.log(vc, format_args!("agent exited {}{}", if *ok { "ok" } else { "with failure: " }, if *ok { "" } else { err.trim() }));
+            self.log(
+                vc,
+                format_args!(
+                    "agent exited {}{}",
+                    if *ok { "ok" } else { "with failure: " },
+                    if *ok { "" } else { err.trim() }
+                ),
+            );
         }
-        let stopped = stopper.join().map_err(|_| DaemonError::Io("the stop thread panicked".into()))?;
+        let stopped = stopper
+            .join()
+            .map_err(|_| DaemonError::Io("the stop thread panicked".into()))?;
         if stopped {
             self.log(vc, "stopped on request: the agent's container was killed");
         }
-        Ok(Report { subject: vc.subject.clone(), start, connections, published: publisher.published, publish_failures: failures, pruned: publisher.pruned, prune_failures: (publisher.prune_failures, publisher.prune_error.clone()), agent, settled, stopped })
+        Ok(Report {
+            subject: vc.subject.clone(),
+            start,
+            connections,
+            published: publisher.published,
+            publish_failures: failures,
+            pruned: publisher.pruned,
+            prune_failures: (publisher.prune_failures, publisher.prune_error.clone()),
+            agent,
+            settled,
+            stopped,
+        })
     }
 }
 
@@ -1552,7 +1880,14 @@ mod tests {
     use taso_core::record::{Payload, StreamCut, TurnId};
 
     fn turn<L: Layers>(v: &mut Vessel<L>, t: u64) -> Position {
-        v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(t)).unwrap().seal
+        v.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(t),
+        )
+        .unwrap()
+        .seal
     }
 
     /// A new Vessel: the birth Seal, then the state is at it.  Settling
@@ -1567,7 +1902,14 @@ mod tests {
         assert_eq!((s.rolled_back_to, s.last_seal), (Some(b), Some(b)));
         assert!(!s.behind());
         let again = settle(&mut v).unwrap();
-        assert_eq!(again, Settled { birth: None, rolled_back_to: Some(b), last_seal: Some(b) });
+        assert_eq!(
+            again,
+            Settled {
+                birth: None,
+                rolled_back_to: Some(b),
+                last_seal: Some(b)
+            }
+        );
     }
 
     /// A Vessel with turns: no birth Seal, the state goes back to the last
@@ -1581,7 +1923,14 @@ mod tests {
         let s2 = turn(&mut v, 2);
         v.append(Stream::Transcript, Payload::Raw(vec![3])).unwrap(); // turn 3, cut short
         let s = settle(&mut v).unwrap();
-        assert_eq!(s, Settled { birth: None, rolled_back_to: Some(s2), last_seal: Some(s2) });
+        assert_eq!(
+            s,
+            Settled {
+                birth: None,
+                rolled_back_to: Some(s2),
+                last_seal: Some(s2)
+            }
+        );
     }
 
     /// No Seal but records after Lineage: no birth Seal over unsealed work.
@@ -1603,20 +1952,49 @@ mod tests {
         let b = settle(&mut v).unwrap().birth.unwrap();
         let s1 = turn(&mut v, 1);
         drop(v);
-        e.host.pool.layers(&e.host.dataset_for(vessel_id(ns(1), b"u"))).destroy(s1.lsn).unwrap();
+        e.host
+            .pool
+            .layers(&e.host.dataset_for(vessel_id(ns(1), b"u")))
+            .destroy(s1.lsn)
+            .unwrap();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let s = settle(&mut v).unwrap();
-        assert_eq!(s, Settled { birth: None, rolled_back_to: Some(b), last_seal: Some(s1) });
+        assert_eq!(
+            s,
+            Settled {
+                birth: None,
+                rolled_back_to: Some(b),
+                last_seal: Some(s1)
+            }
+        );
         assert!(s.behind());
     }
 
     #[test]
     fn behind_is_only_when_a_seal_exists_and_differs() {
-        let p = |n| Position { lsn: Lsn::new(n), hash: taso_core::envelope::HashVal::from_bytes([n as u8; 32]) };
+        let p = |n| Position {
+            lsn: Lsn::new(n),
+            hash: taso_core::envelope::HashVal::from_bytes([n as u8; 32]),
+        };
         assert!(!Settled::default().behind());
-        assert!(!Settled { birth: None, rolled_back_to: Some(p(3)), last_seal: Some(p(3)) }.behind());
-        assert!(Settled { birth: None, rolled_back_to: Some(p(2)), last_seal: Some(p(3)) }.behind());
-        assert!(Settled { birth: None, rolled_back_to: None, last_seal: Some(p(3)) }.behind());
+        assert!(!Settled {
+            birth: None,
+            rolled_back_to: Some(p(3)),
+            last_seal: Some(p(3))
+        }
+        .behind());
+        assert!(Settled {
+            birth: None,
+            rolled_back_to: Some(p(2)),
+            last_seal: Some(p(3))
+        }
+        .behind());
+        assert!(Settled {
+            birth: None,
+            rolled_back_to: None,
+            last_seal: Some(p(3))
+        }
+        .behind());
     }
 
     // ── Starting: run directory and sweep ───────────────────────────
@@ -1629,7 +2007,10 @@ mod tests {
         assert_eq!(first.path(), run.join(RUN_LOCK));
         let e = claim_run_dir(&run).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
-        assert!(e.to_string().contains("held by another taso-wardend"), "{e}");
+        assert!(
+            e.to_string().contains("held by another taso-wardend"),
+            "{e}"
+        );
         // Still refused while the first is held; free once it is dropped.
         assert!(claim_run_dir(&run).is_err());
         drop(first);
@@ -1658,17 +2039,26 @@ mod tests {
         v["run_dir"] = run.to_string_lossy().into();
         v["store"] = store.to_string_lossy().into();
         let config = Config::parse(&v.to_string()).unwrap();
-        let coord: Arc<dyn Coord> = Arc::new(crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap());
+        let coord: Arc<dyn Coord> =
+            Arc::new(crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap());
         let _held = claim_run_dir(&run).unwrap();
-        let e = Node::new(config, coord, Storage::Zfs(Zfs::cli())).err().expect("a held run directory is refused");
+        let e = Node::new(config, coord, Storage::Zfs(Zfs::cli()))
+            .err()
+            .expect("a held run directory is refused");
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
-        assert!(e.to_string().starts_with("claiming the run directory: "), "{e}");
+        assert!(
+            e.to_string().starts_with("claiming the run directory: "),
+            "{e}"
+        );
         // Refused before the sweep (no runc root) and before the store.
         assert!(!run.join("runc").exists());
         assert!(!store.exists());
     }
 
-    struct Scripted(std::cell::RefCell<Vec<(bool, String, String)>>, std::cell::RefCell<Vec<Vec<String>>>);
+    struct Scripted(
+        std::cell::RefCell<Vec<(bool, String, String)>>,
+        std::cell::RefCell<Vec<Vec<String>>>,
+    );
     impl RuncRunner for Scripted {
         fn run(&self, args: &[String]) -> io::Result<(bool, String, String)> {
             self.1.borrow_mut().push(args.to_vec());
@@ -1677,30 +2067,51 @@ mod tests {
     }
     fn scripted(replies: &[(bool, &str, &str)]) -> Runc<Scripted> {
         Runc::new(Scripted(
-            std::cell::RefCell::new(replies.iter().map(|(a, b, c)| (*a, b.to_string(), c.to_string())).collect()),
+            std::cell::RefCell::new(
+                replies
+                    .iter()
+                    .map(|(a, b, c)| (*a, b.to_string(), c.to_string()))
+                    .collect(),
+            ),
             Default::default(),
         ))
     }
 
     #[test]
     fn sweep_stale_removes_everything_or_refuses_naming_what_stayed() {
-        let clean = scripted(&[(true, r#"[{"id":"taso-a","status":"running"}]"#, ""), (true, "", "")]);
-        assert_eq!(sweep_stale(&clean).unwrap().deleted, vec!["taso-a".to_string()]);
+        let clean = scripted(&[
+            (true, r#"[{"id":"taso-a","status":"running"}]"#, ""),
+            (true, "", ""),
+        ]);
+        assert_eq!(
+            sweep_stale(&clean).unwrap().deleted,
+            vec!["taso-a".to_string()]
+        );
 
         let empty = scripted(&[(true, "null", "")]);
         assert_eq!(sweep_stale(&empty).unwrap(), Swept::default());
 
         let stuck = scripted(&[
-            (true, r#"[{"id":"taso-a","status":"running"},{"id":"taso-b","status":"running"}]"#, ""),
+            (
+                true,
+                r#"[{"id":"taso-a","status":"running"},{"id":"taso-b","status":"running"}]"#,
+                "",
+            ),
             (false, "", "unable to kill: device busy\n"),
             (true, "", ""),
         ]);
         let e = sweep_stale(&stuck).unwrap_err().to_string();
-        assert!(e.contains("taso-a (runc delete --force taso-a: unable to kill: device busy)"), "{e}");
+        assert!(
+            e.contains("taso-a (runc delete --force taso-a: unable to kill: device busy)"),
+            "{e}"
+        );
         assert!(!e.contains("taso-b"), "{e}");
 
         let unreadable = scripted(&[(false, "", "permission denied")]);
-        assert!(sweep_stale(&unreadable).unwrap_err().to_string().contains("permission denied"));
+        assert!(sweep_stale(&unreadable)
+            .unwrap_err()
+            .to_string()
+            .contains("permission denied"));
     }
 
     const GOOD: &str = r#"{
@@ -1732,11 +2143,18 @@ mod tests {
             v["storage"] = storage;
             Config::parse(&v.to_string())
         };
-        assert_eq!(with(serde_json::json!("zfs")).unwrap().storage, StorageConf::Zfs);
+        assert_eq!(
+            with(serde_json::json!("zfs")).unwrap().storage,
+            StorageConf::Zfs
+        );
         let blk = serde_json::json!({"blk": {"socket": "/run/taso-blk.sock", "mounts": "/srv/taso", "spool": "/var/lib/taso-blk/spool"}});
         assert_eq!(
             with(blk).unwrap().storage,
-            StorageConf::Blk { socket: "/run/taso-blk.sock".into(), mounts: "/srv/taso".into(), spool: "/var/lib/taso-blk/spool".into() }
+            StorageConf::Blk {
+                socket: "/run/taso-blk.sock".into(),
+                mounts: "/srv/taso".into(),
+                spool: "/var/lib/taso-blk/spool".into()
+            }
         );
         for bad in [
             serde_json::json!("btrfs"),
@@ -1756,19 +2174,38 @@ mod tests {
         assert_eq!(c.warden, WardenId::new(1));
         assert_eq!(
             c.coordinator,
-            CoordConf::Local { path: "/var/lib/taso/coord.redb".into(), serve: Some("/run/taso/coord.sock".into()) }
+            CoordConf::Local {
+                path: "/var/lib/taso/coord.redb".into(),
+                serve: Some("/run/taso/coord.sock".into())
+            }
         );
         assert!(c.batched_snapshots, "batched by default");
         assert_eq!(c.storage, StorageConf::Zfs, "ZFS by default");
         assert_eq!(c.prefix, "vessels");
-        assert_eq!(c.runtime.landlock_shim.as_deref(), Some("/usr/lib/taso/landlock"));
-        assert_eq!((c.runtime.memory_bytes, c.runtime.pids), (Some(256 << 20), Some(64)));
+        assert_eq!(
+            c.runtime.landlock_shim.as_deref(),
+            Some("/usr/lib/taso/landlock")
+        );
+        assert_eq!(
+            (c.runtime.memory_bytes, c.runtime.pids),
+            (Some(256 << 20), Some(64))
+        );
         assert_eq!(c.vessels.len(), 2);
         assert_eq!(c.vessels[0].namespace, Namespace::from_bytes([1; 16]));
         assert_eq!(c.vessels[0].takeover, None);
-        assert_eq!(c.vessels[1].takeover, Some(TakeOver { holder: WardenId::new(2), epoch: Epoch::new(5) }));
+        assert_eq!(
+            c.vessels[1].takeover,
+            Some(TakeOver {
+                holder: WardenId::new(2),
+                epoch: Epoch::new(5)
+            })
+        );
         let uids: Vec<_> = c.vessels.iter().map(|v| v.host_uid(&c.runtime)).collect();
-        assert_eq!(uids, vec![Some(200_000), Some(200_000 + 7 * 65_536)], "one 65536-id range per slot");
+        assert_eq!(
+            uids,
+            vec![Some(200_000), Some(200_000 + 7 * 65_536)],
+            "one 65536-id range per slot"
+        );
         assert_eq!(c.quiescence, vec!["state.db".to_string()]);
         assert_eq!(c.store, StoreConf::Local("/srv/taso/store".into()));
         let s3 = with(|v| {
@@ -1802,7 +2239,10 @@ mod tests {
             secret_key_file: file,
             ca_file: None,
         };
-        assert!(s3(dir.path().join("missing")).open().is_err(), "no secret file, no store");
+        assert!(
+            s3(dir.path().join("missing")).open().is_err(),
+            "no secret file, no store"
+        );
         std::fs::write(dir.path().join("secret"), "s3cr3t\n").unwrap();
         assert!(s3(dir.path().join("secret")).open().is_ok());
     }
@@ -1816,12 +2256,23 @@ mod tests {
     #[test]
     fn restart_is_parsed_and_defaults_to_never() {
         let c = Config::parse(GOOD).unwrap();
-        assert!(c.vessels.iter().all(|v| v.restart == Restart::Never), "no \"restart\": never");
-        for (text, want) in [("never", Restart::Never), ("on-failure", Restart::OnFailure), ("always", Restart::Always)] {
+        assert!(
+            c.vessels.iter().all(|v| v.restart == Restart::Never),
+            "no \"restart\": never"
+        );
+        for (text, want) in [
+            ("never", Restart::Never),
+            ("on-failure", Restart::OnFailure),
+            ("always", Restart::Always),
+        ] {
             let c = with(|v| v["vessels"][0]["restart"] = text.into()).unwrap();
             assert_eq!(c.vessels[0].restart, want, "{text}");
         }
-        for bad in [serde_json::json!("sometimes"), serde_json::json!(true), serde_json::json!("Always")] {
+        for bad in [
+            serde_json::json!("sometimes"),
+            serde_json::json!(true),
+            serde_json::json!("Always"),
+        ] {
             let e = with(|v| v["vessels"][0]["restart"] = bad.clone()).unwrap_err();
             assert!(e.to_string().contains("\"restart\" must be"), "{bad}: {e}");
         }
@@ -1831,9 +2282,17 @@ mod tests {
     fn restart_policies() {
         use Restart::*;
         //                     exited ok      failed         never ran
-        let table = [(Never, [false, false, false]), (OnFailure, [false, true, true]), (Always, [true, true, true])];
+        let table = [
+            (Never, [false, false, false]),
+            (OnFailure, [false, true, true]),
+            (Always, [true, true, true]),
+        ];
         for (policy, want) in table {
-            let got = [policy.again(Some(true)), policy.again(Some(false)), policy.again(None)];
+            let got = [
+                policy.again(Some(true)),
+                policy.again(Some(false)),
+                policy.again(None),
+            ];
             assert_eq!(got, want, "{policy:?}");
         }
     }
@@ -1855,43 +2314,127 @@ mod tests {
         type Edit = Box<dyn FnOnce(&mut Value)>;
         let cases: Vec<(&str, Edit)> = vec![
             ("warden 0", Box::new(|v| v["warden"] = 0.into())),
-            ("both coordinators", Box::new(|v| v["coordinator"]["remote"] = "/x.sock".into())),
-            ("no coordinator", Box::new(|v| v["coordinator"] = serde_json::json!({}))),
+            (
+                "both coordinators",
+                Box::new(|v| v["coordinator"]["remote"] = "/x.sock".into()),
+            ),
+            (
+                "no coordinator",
+                Box::new(|v| v["coordinator"] = serde_json::json!({})),
+            ),
             ("relative store", Box::new(|v| v["store"] = "store".into())),
-            ("s3 without bucket", Box::new(|v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "access_key_id": "a", "secret_key_file": "/s"}}))),
-            ("s3 relative secret", Box::new(|v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "bucket": "b", "access_key_id": "a", "secret_key_file": "s"}}))),
+            (
+                "s3 without bucket",
+                Box::new(
+                    |v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "access_key_id": "a", "secret_key_file": "/s"}}),
+                ),
+            ),
+            (
+                "s3 relative secret",
+                Box::new(
+                    |v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "bucket": "b", "access_key_id": "a", "secret_key_file": "s"}}),
+                ),
+            ),
             ("store number", Box::new(|v| v["store"] = 3.into())),
             ("bad dataset", Box::new(|v| v["root"] = "tank//v".into())),
-            ("no agent", Box::new(|v| v["runtime"]["args"] = serde_json::json!([]))),
-            ("short namespace", Box::new(|v| v["vessels"][0]["namespace"] = "0101".into())),
-            ("non-hex namespace", Box::new(|v| v["vessels"][0]["namespace"] = "zz".repeat(16).into())),
-            ("a vessel twice", Box::new(|v| v["vessels"][1]["subject"] = "a".into())),
-            ("absolute db", Box::new(|v| v["quiescence"] = serde_json::json!(["/etc/passwd"]))),
-            ("db outside", Box::new(|v| v["quiescence"] = serde_json::json!(["../x.db"]))),
-            ("takeover a bool", Box::new(|v| v["vessels"][0]["takeover"] = true.into())),
-            ("takeover false", Box::new(|v| v["vessels"][0]["takeover"] = false.into())),
-            ("takeover without epoch", Box::new(|v| v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2}))),
-            ("takeover epoch 0", Box::new(|v| v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2, "epoch": 0}))),
-            ("takeover extra key", Box::new(|v| v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2, "epoch": 1, "from": 3}))),
-            ("huge uid base", Box::new(|v| v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) + 1).into())),
-            ("no uid slot", Box::new(|v| { v["vessels"][0].as_object_mut().unwrap().remove("uid_slot"); })),
-            ("uid slot not a number", Box::new(|v| v["vessels"][0]["uid_slot"] = "1".into())),
-            ("uid slot shared", Box::new(|v| v["vessels"][1]["uid_slot"] = 0.into())),
-            ("uid slot huge", Box::new(|v| v["vessels"][1]["uid_slot"] = (u64::from(u32::MAX) + 1).into())),
+            (
+                "no agent",
+                Box::new(|v| v["runtime"]["args"] = serde_json::json!([])),
+            ),
+            (
+                "short namespace",
+                Box::new(|v| v["vessels"][0]["namespace"] = "0101".into()),
+            ),
+            (
+                "non-hex namespace",
+                Box::new(|v| v["vessels"][0]["namespace"] = "zz".repeat(16).into()),
+            ),
+            (
+                "a vessel twice",
+                Box::new(|v| v["vessels"][1]["subject"] = "a".into()),
+            ),
+            (
+                "absolute db",
+                Box::new(|v| v["quiescence"] = serde_json::json!(["/etc/passwd"])),
+            ),
+            (
+                "db outside",
+                Box::new(|v| v["quiescence"] = serde_json::json!(["../x.db"])),
+            ),
+            (
+                "takeover a bool",
+                Box::new(|v| v["vessels"][0]["takeover"] = true.into()),
+            ),
+            (
+                "takeover false",
+                Box::new(|v| v["vessels"][0]["takeover"] = false.into()),
+            ),
+            (
+                "takeover without epoch",
+                Box::new(|v| v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2})),
+            ),
+            (
+                "takeover epoch 0",
+                Box::new(|v| {
+                    v["vessels"][0]["takeover"] = serde_json::json!({"holder": 2, "epoch": 0})
+                }),
+            ),
+            (
+                "takeover extra key",
+                Box::new(|v| {
+                    v["vessels"][0]["takeover"] =
+                        serde_json::json!({"holder": 2, "epoch": 1, "from": 3})
+                }),
+            ),
+            (
+                "huge uid base",
+                Box::new(|v| v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) + 1).into()),
+            ),
+            (
+                "no uid slot",
+                Box::new(|v| {
+                    v["vessels"][0].as_object_mut().unwrap().remove("uid_slot");
+                }),
+            ),
+            (
+                "uid slot not a number",
+                Box::new(|v| v["vessels"][0]["uid_slot"] = "1".into()),
+            ),
+            (
+                "uid slot shared",
+                Box::new(|v| v["vessels"][1]["uid_slot"] = 0.into()),
+            ),
+            (
+                "uid slot huge",
+                Box::new(|v| v["vessels"][1]["uid_slot"] = (u64::from(u32::MAX) + 1).into()),
+            ),
             // 200000 + 65535·65536 overflows a u32; so does the end of the
             // last range that would start below u32::MAX.
-            ("uid slot past u32", Box::new(|v| v["vessels"][1]["uid_slot"] = 65_535.into())),
-            ("range end past u32", Box::new(|v| {
-                v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) - 65_536).into();
-                v["vessels"][1]["uid_slot"] = 1.into();
-            })),
+            (
+                "uid slot past u32",
+                Box::new(|v| v["vessels"][1]["uid_slot"] = 65_535.into()),
+            ),
+            (
+                "range end past u32",
+                Box::new(|v| {
+                    v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) - 65_536).into();
+                    v["vessels"][1]["uid_slot"] = 1.into();
+                }),
+            ),
         ];
         for (name, edit) in cases {
             assert!(with(edit).is_err(), "{name} was accepted");
         }
         assert!(Config::parse("not json").is_err());
-        let remote = with(|v| v["coordinator"] = serde_json::json!({ "remote": "/run/taso/coord.sock" })).unwrap();
-        assert_eq!(remote.coordinator, CoordConf::Remote { socket: "/run/taso/coord.sock".into() });
+        let remote =
+            with(|v| v["coordinator"] = serde_json::json!({ "remote": "/run/taso/coord.sock" }))
+                .unwrap();
+        assert_eq!(
+            remote.coordinator,
+            CoordConf::Remote {
+                socket: "/run/taso/coord.sock".into()
+            }
+        );
     }
 
     // ── Per-Vessel runtime ──────────────────────────────────────────
@@ -1945,7 +2488,11 @@ mod tests {
         );
         let b = effective_of(&c, 1).unwrap();
         assert_eq!(b.pids, Some(9));
-        assert_eq!((b.rootfs.as_path(), b.memory_bytes), (Path::new("/srv/taso/rootfs"), Some(256 << 20)), "the rest is the node's");
+        assert_eq!(
+            (b.rootfs.as_path(), b.memory_bytes),
+            (Path::new("/srv/taso/rootfs"), Some(256 << 20)),
+            "the rest is the node's"
+        );
         assert_eq!(b.landlock_shim.as_deref(), Some("/usr/lib/taso/landlock"));
     }
 
@@ -1959,18 +2506,38 @@ mod tests {
             takeover: None,
             uid_slot: 0,
             restart: Restart::Never,
-            runtime: Some(Box::new(VesselRuntime { landlock, ..Default::default() })),
+            runtime: Some(Box::new(VesselRuntime {
+                landlock,
+                ..Default::default()
+            })),
         };
         let e = vc(Some(true)).effective(&rt, &[]).unwrap_err();
         assert!(e.contains("no runtime.landlock_shim"), "{e}");
         // Checked here too, not only by the parser: other sources build a
         // VesselRuntime themselves.
-        for own in [VesselRuntime { memory_bytes: Some(0), ..Default::default() }, VesselRuntime { pids: Some(0), ..Default::default() }] {
-            let e = VesselConf { runtime: Some(Box::new(own)), ..vc(None) }.effective(&rt, &[]).unwrap_err();
+        for own in [
+            VesselRuntime {
+                memory_bytes: Some(0),
+                ..Default::default()
+            },
+            VesselRuntime {
+                pids: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let e = VesselConf {
+                runtime: Some(Box::new(own)),
+                ..vc(None)
+            }
+            .effective(&rt, &[])
+            .unwrap_err();
             assert!(e.contains("at least 1"), "{e}");
         }
         assert_eq!(vc(None).effective(&rt, &[]).unwrap().landlock_shim, None);
-        assert_eq!(vc(Some(false)).effective(&rt, &[]).unwrap().landlock_shim, None);
+        assert_eq!(
+            vc(Some(false)).effective(&rt, &[]).unwrap().landlock_shim,
+            None
+        );
     }
 
     #[test]
@@ -2005,7 +2572,10 @@ mod tests {
     #[test]
     fn bad_vessel_runtimes_are_refused() {
         let cases: Vec<(&str, Value)> = vec![
-            ("relative rootfs", serde_json::json!({ "rootfs": "images/a" })),
+            (
+                "relative rootfs",
+                serde_json::json!({ "rootfs": "images/a" }),
+            ),
             ("empty args", serde_json::json!({ "args": [] })),
             ("args not strings", serde_json::json!({ "args": [1] })),
             ("NUL in args", serde_json::json!({ "args": ["/a\0b"] })),
@@ -2018,17 +2588,32 @@ mod tests {
             ("zero memory", serde_json::json!({ "memory_bytes": 0 })),
             ("zero pids", serde_json::json!({ "pids": 0 })),
             ("negative pids", serde_json::json!({ "pids": -1 })),
-            ("absolute db", serde_json::json!({ "quiescence": ["/etc/passwd"] })),
-            ("db outside", serde_json::json!({ "quiescence": ["a/../../x"] })),
+            (
+                "absolute db",
+                serde_json::json!({ "quiescence": ["/etc/passwd"] }),
+            ),
+            (
+                "db outside",
+                serde_json::json!({ "quiescence": ["a/../../x"] }),
+            ),
             ("empty db", serde_json::json!({ "quiescence": [""] })),
             ("misspelt key", serde_json::json!({ "memory_byte": 1 })),
             ("not an object", serde_json::json!(["/r"])),
         ];
         for (name, rt) in cases {
-            assert!(with(|v| v["vessels"][0]["runtime"] = rt.clone()).is_err(), "{name} was accepted");
+            assert!(
+                with(|v| v["vessels"][0]["runtime"] = rt.clone()).is_err(),
+                "{name} was accepted"
+            );
         }
-        assert!(with(|v| v["runtime"]["env"] = serde_json::json!(["bad name=1"])).is_err(), "the node's env is checked too");
-        assert!(with(|v| v["runtime"]["env"] = serde_json::json!(["OK_1=a=b"])).is_ok(), "= in the value is fine");
+        assert!(
+            with(|v| v["runtime"]["env"] = serde_json::json!(["bad name=1"])).is_err(),
+            "the node's env is checked too"
+        );
+        assert!(
+            with(|v| v["runtime"]["env"] = serde_json::json!(["OK_1=a=b"])).is_ok(),
+            "= in the value is fine"
+        );
     }
 
     // ── The Kubernetes source ───────────────────────────────────────
@@ -2053,14 +2638,19 @@ mod tests {
     #[test]
     fn a_kubernetes_source_parses_with_safe_defaults() {
         let c = kube(|_| {}).unwrap();
-        let SourceConf::Kubernetes(k) = &c.source else { panic!("{:?}", c.source) };
+        let SourceConf::Kubernetes(k) = &c.source else {
+            panic!("{:?}", c.source)
+        };
         assert_eq!(k.node, "worker-3");
         assert_eq!(k.tenants.len(), 2);
         assert_eq!(k.tenants["team-a"], Namespace::from_bytes([0x0a; 16]));
         assert_eq!(k.tenants["team-b"], Namespace::from_bytes([0x0b; 16]));
         assert_eq!(k.rootfs_dir, PathBuf::from("/srv/taso/rootfs"));
         assert_eq!((k.max_memory_bytes, k.max_pids), (1 << 30, 512));
-        assert!(!k.allow_without_landlock, "Landlock stays on unless the node allows otherwise");
+        assert!(
+            !k.allow_without_landlock,
+            "Landlock stays on unless the node allows otherwise"
+        );
         assert_eq!(k.api, None, "in-cluster by default");
         assert!(c.vessels.is_empty());
 
@@ -2071,11 +2661,17 @@ mod tests {
                 serde_json::json!({ "url": "https://127.0.0.1:16443", "token_file": "/t", "ca_file": "/ca.crt" });
         })
         .unwrap();
-        let SourceConf::Kubernetes(k) = &c.source else { panic!() };
+        let SourceConf::Kubernetes(k) = &c.source else {
+            panic!()
+        };
         assert!(k.allow_without_landlock);
         assert_eq!(
             k.api,
-            Some(KubeApiConf { url: "https://127.0.0.1:16443".into(), token_file: "/t".into(), ca_file: Some("/ca.crt".into()) })
+            Some(KubeApiConf {
+                url: "https://127.0.0.1:16443".into(),
+                token_file: "/t".into(),
+                ca_file: Some("/ca.crt".into())
+            })
         );
         assert!(with(|v| v["source"] = "static".into()).is_ok());
     }
@@ -2083,47 +2679,175 @@ mod tests {
     #[test]
     fn bad_kubernetes_sources_are_refused() {
         type Edit = Box<dyn FnOnce(&mut Value)>;
-        let k = |f: fn(&mut Value)| -> Edit { Box::new(move |v: &mut Value| f(&mut v["source"]["kubernetes"])) };
+        let k = |f: fn(&mut Value)| -> Edit {
+            Box::new(move |v: &mut Value| f(&mut v["source"]["kubernetes"]))
+        };
         let cases: Vec<(&str, &str, Edit)> = vec![
-            ("vessels too", "exclude each other", Box::new(|v| v["vessels"] = serde_json::json!([{ "namespace": TENANT_A, "subject": "a", "uid_slot": 0 }]))),
-            ("one tenant, two namespaces", "same tenant", k(|k| k["tenants"]["team-c"] = TENANT_A.into())),
-            ("no tenants", "at least one", k(|k| k["tenants"] = serde_json::json!({}))),
-            ("tenants not a map", "at least one", k(|k| k["tenants"] = serde_json::json!([TENANT_A]))),
-            ("bad tenant", "32 hex", k(|k| k["tenants"]["team-a"] = "0a".into())),
-            ("tenant not a string", "32 hex", k(|k| k["tenants"]["team-a"] = 1.into())),
-            ("namespace upper case", "namespace name", k(|k| k["tenants"]["Team-A"] = TENANT_A.into())),
-            ("namespace with a dot", "namespace name", k(|k| k["tenants"]["team.c"] = "0c".repeat(16).into())),
-            ("namespace too long", "namespace name", k(|k| k["tenants"]["n".repeat(64)] = "0c".repeat(16).into())),
-            ("no node", "missing \"node\"", k(|k| { k.as_object_mut().unwrap().remove("node"); })),
-            ("bad node", "node name", k(|k| k["node"] = "worker/3".into())),
-            ("relative rootfs_dir", "absolute", k(|k| k["rootfs_dir"] = "rootfs".into())),
-            ("no memory max", "max_memory_bytes is required", k(|k| { k.as_object_mut().unwrap().remove("max_memory_bytes"); })),
-            ("no pids max", "max_pids is required", k(|k| { k.as_object_mut().unwrap().remove("max_pids"); })),
-            ("zero pids max", "at least 1", k(|k| k["max_pids"] = 0.into())),
-            ("node default above max", "above", k(|k| k["max_pids"] = 63.into())),
-            ("plain http", "https://", k(|k| k["api"] = serde_json::json!({ "url": "http://10.0.0.1:6443", "token_file": "/t" }))),
-            ("relative token", "absolute", k(|k| k["api"] = serde_json::json!({ "url": "https://h:1", "token_file": "t" }))),
-            ("misspelt key", "unknown key", k(|k| k["allow_without_landlok"] = true.into())),
-            ("misspelt api key", "unknown key", k(|k| k["api"] = serde_json::json!({ "url": "https://h:1", "token_file": "/t", "ca": "/c" }))),
-            ("landlock not bool", "true or false", k(|k| k["allow_without_landlock"] = "yes".into())),
-            ("no shim", "landlock_shim", Box::new(|v| { v["runtime"].as_object_mut().unwrap().remove("landlock_shim"); })),
-            ("other source", "\"source\" must be", Box::new(|v| v["source"] = "etcd".into())),
-            ("extra source key", "unknown key", Box::new(|v| v["source"]["static"] = true.into())),
+            (
+                "vessels too",
+                "exclude each other",
+                Box::new(|v| {
+                    v["vessels"] = serde_json::json!([{ "namespace": TENANT_A, "subject": "a", "uid_slot": 0 }])
+                }),
+            ),
+            (
+                "one tenant, two namespaces",
+                "same tenant",
+                k(|k| k["tenants"]["team-c"] = TENANT_A.into()),
+            ),
+            (
+                "no tenants",
+                "at least one",
+                k(|k| k["tenants"] = serde_json::json!({})),
+            ),
+            (
+                "tenants not a map",
+                "at least one",
+                k(|k| k["tenants"] = serde_json::json!([TENANT_A])),
+            ),
+            (
+                "bad tenant",
+                "32 hex",
+                k(|k| k["tenants"]["team-a"] = "0a".into()),
+            ),
+            (
+                "tenant not a string",
+                "32 hex",
+                k(|k| k["tenants"]["team-a"] = 1.into()),
+            ),
+            (
+                "namespace upper case",
+                "namespace name",
+                k(|k| k["tenants"]["Team-A"] = TENANT_A.into()),
+            ),
+            (
+                "namespace with a dot",
+                "namespace name",
+                k(|k| k["tenants"]["team.c"] = "0c".repeat(16).into()),
+            ),
+            (
+                "namespace too long",
+                "namespace name",
+                k(|k| k["tenants"]["n".repeat(64)] = "0c".repeat(16).into()),
+            ),
+            (
+                "no node",
+                "missing \"node\"",
+                k(|k| {
+                    k.as_object_mut().unwrap().remove("node");
+                }),
+            ),
+            (
+                "bad node",
+                "node name",
+                k(|k| k["node"] = "worker/3".into()),
+            ),
+            (
+                "relative rootfs_dir",
+                "absolute",
+                k(|k| k["rootfs_dir"] = "rootfs".into()),
+            ),
+            (
+                "no memory max",
+                "max_memory_bytes is required",
+                k(|k| {
+                    k.as_object_mut().unwrap().remove("max_memory_bytes");
+                }),
+            ),
+            (
+                "no pids max",
+                "max_pids is required",
+                k(|k| {
+                    k.as_object_mut().unwrap().remove("max_pids");
+                }),
+            ),
+            (
+                "zero pids max",
+                "at least 1",
+                k(|k| k["max_pids"] = 0.into()),
+            ),
+            (
+                "node default above max",
+                "above",
+                k(|k| k["max_pids"] = 63.into()),
+            ),
+            (
+                "plain http",
+                "https://",
+                k(|k| {
+                    k["api"] =
+                        serde_json::json!({ "url": "http://10.0.0.1:6443", "token_file": "/t" })
+                }),
+            ),
+            (
+                "relative token",
+                "absolute",
+                k(|k| k["api"] = serde_json::json!({ "url": "https://h:1", "token_file": "t" })),
+            ),
+            (
+                "misspelt key",
+                "unknown key",
+                k(|k| k["allow_without_landlok"] = true.into()),
+            ),
+            (
+                "misspelt api key",
+                "unknown key",
+                k(|k| {
+                    k["api"] =
+                        serde_json::json!({ "url": "https://h:1", "token_file": "/t", "ca": "/c" })
+                }),
+            ),
+            (
+                "landlock not bool",
+                "true or false",
+                k(|k| k["allow_without_landlock"] = "yes".into()),
+            ),
+            (
+                "no shim",
+                "landlock_shim",
+                Box::new(|v| {
+                    v["runtime"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("landlock_shim");
+                }),
+            ),
+            (
+                "other source",
+                "\"source\" must be",
+                Box::new(|v| v["source"] = "etcd".into()),
+            ),
+            (
+                "extra source key",
+                "unknown key",
+                Box::new(|v| v["source"]["static"] = true.into()),
+            ),
         ];
         for (name, want, edit) in cases {
             match kube(edit) {
                 Ok(_) => panic!("{name} was accepted"),
-                Err(e) => assert!(e.to_string().contains(want), "{name}: {e} (wanted {want:?})"),
+                Err(e) => assert!(
+                    e.to_string().contains(want),
+                    "{name}: {e} (wanted {want:?})"
+                ),
             }
         }
         // Without a shim, a node that allows it may still take a cluster's Vessels.
         assert!(kube(|v| {
-            v["runtime"].as_object_mut().unwrap().remove("landlock_shim");
+            v["runtime"]
+                .as_object_mut()
+                .unwrap()
+                .remove("landlock_shim");
             v["source"]["kubernetes"]["allow_without_landlock"] = true.into();
         })
         .is_ok());
         // A static config still needs its list.
-        assert!(with(|v| { v.as_object_mut().unwrap().remove("vessels"); }).unwrap_err().to_string().contains("missing \"vessels\""));
+        assert!(with(|v| {
+            v.as_object_mut().unwrap().remove("vessels");
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("missing \"vessels\""));
     }
 
     #[test]
@@ -2141,10 +2865,22 @@ mod tests {
     impl Runner for ZfsTable {
         fn run(&self, args: &[String]) -> Result<crate::zfs::Output, ZfsError> {
             let key = format!("{} {}", args[0], args.last().unwrap());
-            let out = |stdout: &str| crate::zfs::Output { success: true, code: Some(0), stdout: stdout.into(), stderr: String::new() };
-            self.0.get(&key).map(|s| out(s)).ok_or_else(|| ZfsError::Spawn(format!("unexpected: {key}")))
+            let out = |stdout: &str| crate::zfs::Output {
+                success: true,
+                code: Some(0),
+                stdout: stdout.into(),
+                stderr: String::new(),
+            };
+            self.0
+                .get(&key)
+                .map(|s| out(s))
+                .ok_or_else(|| ZfsError::Spawn(format!("unexpected: {key}")))
         }
-        fn run_input(&self, _: &[String], _: &mut dyn std::io::Read) -> Result<crate::zfs::Output, ZfsError> {
+        fn run_input(
+            &self,
+            _: &[String],
+            _: &mut dyn std::io::Read,
+        ) -> Result<crate::zfs::Output, ZfsError> {
             unreachable!()
         }
     }
@@ -2155,29 +2891,61 @@ mod tests {
         let (a, b, c) = ("aa".repeat(16), "bb".repeat(16), "cc".repeat(16));
         let pool = ZfsTable(
             [
-                ("list t/v".to_string(), format!("t/v\nt/v/v-{a}\nt/v/v-{b}\nt/v/v-{c}\nt/v/scratch\nt/v/v-XYZ\n")),
+                (
+                    "list t/v".to_string(),
+                    format!("t/v\nt/v/v-{a}\nt/v/v-{b}\nt/v/v-{c}\nt/v/scratch\nt/v/v-XYZ\n"),
+                ),
                 (format!("userspace t/v/v-{a}"), "0\n265536\n265537\n".into()),
                 (format!("userspace t/v/v-{b}"), "0\n".into()),
-                (format!("userspace t/v/v-{c}"), "331072\n265536\n1000\n".into()),
+                (
+                    format!("userspace t/v/v-{c}"),
+                    "331072\n265536\n1000\n".into(),
+                ),
             ]
             .into(),
         );
-        let (held, warnings) = held_on(&Zfs::with_runner(pool), &Dataset::new("t/v").unwrap(), 200_000).unwrap();
-        let got: Vec<(u8, Vec<u32>)> = held.iter().map(|h| (h.key[0], h.slots.iter().copied().collect())).collect();
-        assert_eq!(got, vec![(0xaa, vec![1]), (0xbb, vec![]), (0xcc, vec![1, 2])]);
+        let (held, warnings) = held_on(
+            &Zfs::with_runner(pool),
+            &Dataset::new("t/v").unwrap(),
+            200_000,
+        )
+        .unwrap();
+        let got: Vec<(u8, Vec<u32>)> = held
+            .iter()
+            .map(|h| (h.key[0], h.slots.iter().copied().collect()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0xaa, vec![1]), (0xbb, vec![]), (0xcc, vec![1, 2])]
+        );
         assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("scratch is not a Vessel")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("scratch is not a Vessel")));
         assert!(warnings.iter().any(|w| w.contains("v-XYZ is not a Vessel")));
-        assert!(warnings.iter().any(|w| w.contains("uid 1000, below host_uid_base")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("uid 1000, below host_uid_base")));
         // A pool that cannot be read is an error, never "nothing held".
         let broken = ZfsTable([("list t/v".to_string(), format!("t/v\nt/v/v-{a}\n"))].into());
-        assert!(held_on(&Zfs::with_runner(broken), &Dataset::new("t/v").unwrap(), 200_000).is_err());
+        assert!(held_on(
+            &Zfs::with_runner(broken),
+            &Dataset::new("t/v").unwrap(),
+            200_000
+        )
+        .is_err());
     }
 
     #[test]
     fn vessel_keys_from_hex() {
         assert_eq!(key_of_hex(&"0a".repeat(16)), Some([0x0a; 16]));
-        for bad in ["0A".repeat(16), "0a".repeat(15), "0a".repeat(17), "zz".repeat(16), String::new()] {
+        for bad in [
+            "0A".repeat(16),
+            "0a".repeat(15),
+            "0a".repeat(17),
+            "zz".repeat(16),
+            String::new(),
+        ] {
             assert_eq!(key_of_hex(&bad), None, "{bad}");
         }
         // The name the Vessel layer gives a dataset parses back to its id.
@@ -2189,10 +2957,22 @@ mod tests {
     fn how_a_vessel_starts() {
         let (me, other) = (WardenId::new(1), WardenId::new(2));
         let (e3, e4) = (Epoch::new(3), Epoch::new(4));
-        let exact = Some(TakeOver { holder: other, epoch: e3 });
-        let stale = Some(TakeOver { holder: other, epoch: e4 });
-        let wrong = Some(TakeOver { holder: WardenId::new(9), epoch: e3 });
-        let spent = Some(TakeOver { holder: me, epoch: e3 });
+        let exact = Some(TakeOver {
+            holder: other,
+            epoch: e3,
+        });
+        let stale = Some(TakeOver {
+            holder: other,
+            epoch: e4,
+        });
+        let wrong = Some(TakeOver {
+            holder: WardenId::new(9),
+            epoch: e3,
+        });
+        let spent = Some(TakeOver {
+            holder: me,
+            epoch: e3,
+        });
         for local in [false, true] {
             for takeover in [None, exact, stale] {
                 assert_eq!(decide(Known::No, local, me, takeover), Start::Birth);
@@ -2202,12 +2982,18 @@ mod tests {
         // Mine: any takeover entry is spent or irrelevant.
         for takeover in [None, exact, stale, spent] {
             assert_eq!(decide(Known::Held(me, e3), true, me, takeover), Start::Open);
-            assert_eq!(decide(Known::Held(me, e3), false, me, takeover), Start::Rebirth, "ours, local state lost");
+            assert_eq!(
+                decide(Known::Held(me, e3), false, me, takeover),
+                Start::Rebirth,
+                "ours, local state lost"
+            );
         }
         // Another Warden's: only a takeover naming exactly what was read.
         for takeover in [None, stale, wrong, spent] {
             for local in [false, true] {
-                let Start::Refuse(why) = decide(Known::Held(other, e3), local, me, takeover) else { panic!("{takeover:?}") };
+                let Start::Refuse(why) = decide(Known::Held(other, e3), local, me, takeover) else {
+                    panic!("{takeover:?}")
+                };
                 assert!(why.contains("epoch 3") && why.contains("Warden 2"), "{why}");
                 if takeover.is_some() {
                     assert!(why.contains("nothing fenced"), "{why}");
@@ -2215,11 +3001,17 @@ mod tests {
             }
         }
         assert_eq!(decide(Known::Held(other, e3), true, me, exact), Start::Open);
-        assert_eq!(decide(Known::Held(other, e3), false, me, exact), Start::Rebirth);
+        assert_eq!(
+            decide(Known::Held(other, e3), false, me, exact),
+            Start::Rebirth
+        );
     }
 
     fn pos(n: u64) -> Position {
-        Position { lsn: taso_core::envelope::Lsn::new(n), hash: taso_core::envelope::HashVal::from_bytes([n as u8; 32]) }
+        Position {
+            lsn: taso_core::envelope::Lsn::new(n),
+            hash: taso_core::envelope::HashVal::from_bytes([n as u8; 32]),
+        }
     }
 
     #[test]
@@ -2231,18 +3023,30 @@ mod tests {
                 hash: taso_core::envelope::HashVal::GENESIS,
                 epoch: taso_core::envelope::Epoch::FIRST,
             },
-            segment: crate::segment::Recovery { unaccepted_frames: 0, invalid_bytes: 0 },
+            segment: crate::segment::Recovery {
+                unaccepted_frames: 0,
+                invalid_bytes: 0,
+            },
             orphan_layers: vec![taso_core::envelope::Lsn::new(4)],
             last_seal: None,
             missing_layers: vec![],
             gap: None,
         };
-        assert_eq!(verdict_after_open(&clean), Verdict::Clean, "an orphan layer loses nothing accepted");
+        assert_eq!(
+            verdict_after_open(&clean),
+            Verdict::Clean,
+            "an orphan layer loses nothing accepted"
+        );
         let mut lossy = clean.clone();
-        lossy.segment = crate::segment::Recovery { unaccepted_frames: 2, invalid_bytes: 7 };
+        lossy.segment = crate::segment::Recovery {
+            unaccepted_frames: 2,
+            invalid_bytes: 7,
+        };
         lossy.gap = Some((pos(3), pos(6)));
         lossy.missing_layers = vec![pos(4)];
-        let Verdict::Unverified(why) = verdict_after_open(&lossy) else { panic!() };
+        let Verdict::Unverified(why) = verdict_after_open(&lossy) else {
+            panic!()
+        };
         for part in ["2 unaccepted", "7 bytes", "records 4..6", "1 Seals without"] {
             assert!(why.contains(part), "{why:?} lacks {part:?}");
         }
@@ -2256,9 +3060,18 @@ mod tests {
             missing_layers: vec![],
         };
         assert_eq!(verdict_after_rebirth(&reborn), Verdict::Clean);
-        let lossy = Reborn { gap: Some((pos(9), pos(12))), missing_layers: vec![pos(11)], ..reborn };
-        let Verdict::Unverified(why) = verdict_after_rebirth(&lossy) else { panic!() };
-        assert!(why.contains("records 10..12") && why.contains("1 Seals without"), "{why}");
+        let lossy = Reborn {
+            gap: Some((pos(9), pos(12))),
+            missing_layers: vec![pos(11)],
+            ..reborn
+        };
+        let Verdict::Unverified(why) = verdict_after_rebirth(&lossy) else {
+            panic!()
+        };
+        assert!(
+            why.contains("records 10..12") && why.contains("1 Seals without"),
+            "{why}"
+        );
     }
 
     #[test]
@@ -2268,7 +3081,10 @@ mod tests {
         assert_eq!(a, format!("taso-{}-w1", "ab".repeat(16)));
         assert_ne!(a, container_id(ChronicleId::from_bytes([0xac; 16]), w));
         let b = container_id(v, WardenId::new(2));
-        assert_ne!(a, b, "a new holder never reuses the old holder's container (cgroup)");
+        assert_ne!(
+            a, b,
+            "a new holder never reuses the old holder's container (cgroup)"
+        );
         assert_eq!(a[..12], b[..12], "the hostname part is the Vessel's");
         assert!(a.len() <= 128 && a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
     }

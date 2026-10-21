@@ -111,9 +111,11 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream};
-use taso_core::model::{Ownership, WardenId};
+use taso_core::envelope::{
+    BranchId, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream,
+};
 use taso_core::frame::{read_frame, write_frame, FrameError};
+use taso_core::model::{Ownership, WardenId};
 
 use crate::coordinator::{Coord, CoordError};
 use crate::segment::Position;
@@ -162,15 +164,42 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Request {
-    Register { chronicle: ChronicleId, holder: WardenId },
-    Append { warden: WardenId, envelope: Envelope },
-    AppendBatch { warden: WardenId, envelopes: Vec<Envelope> },
-    Transfer { chronicle: ChronicleId, new_holder: WardenId },
-    TransferIf { chronicle: ChronicleId, new_holder: WardenId, expected: (WardenId, Epoch) },
-    Ownership { chronicle: ChronicleId },
-    Head { chronicle: ChronicleId },
-    AdvanceShipped { warden: WardenId, chronicle: ChronicleId, epoch: Epoch, to: Position },
-    Shipped { chronicle: ChronicleId },
+    Register {
+        chronicle: ChronicleId,
+        holder: WardenId,
+    },
+    Append {
+        warden: WardenId,
+        envelope: Envelope,
+    },
+    AppendBatch {
+        warden: WardenId,
+        envelopes: Vec<Envelope>,
+    },
+    Transfer {
+        chronicle: ChronicleId,
+        new_holder: WardenId,
+    },
+    TransferIf {
+        chronicle: ChronicleId,
+        new_holder: WardenId,
+        expected: (WardenId, Epoch),
+    },
+    Ownership {
+        chronicle: ChronicleId,
+    },
+    Head {
+        chronicle: ChronicleId,
+    },
+    AdvanceShipped {
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        to: Position,
+    },
+    Shipped {
+        chronicle: ChronicleId,
+    },
 }
 
 #[derive(Debug)]
@@ -217,7 +246,9 @@ impl Out {
         self
     }
     fn head(&mut self, h: &ChronicleHead) -> &mut Self {
-        self.u64(h.lsn.get()).bytes(h.hash.as_bytes()).u64(h.epoch.get())
+        self.u64(h.lsn.get())
+            .bytes(h.hash.as_bytes())
+            .u64(h.epoch.get())
     }
     fn pos(&mut self, p: &Position) -> &mut Self {
         self.u64(p.lsn.get()).bytes(p.hash.as_bytes())
@@ -252,25 +283,40 @@ impl<'a> In<'a> {
         Ok(self.take(1)?[0])
     }
     fn u64(&mut self) -> Result<u64, Malformed> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().expect("8 bytes")))
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("8 bytes"),
+        ))
     }
     fn u32(&mut self) -> Result<u32, Malformed> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().expect("4 bytes")))
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("4 bytes"),
+        ))
     }
     fn hash(&mut self) -> Result<HashVal, Malformed> {
-        Ok(HashVal::from_bytes(self.take(32)?.try_into().expect("32 bytes")))
+        Ok(HashVal::from_bytes(
+            self.take(32)?.try_into().expect("32 bytes"),
+        ))
     }
     fn chronicle(&mut self) -> Result<ChronicleId, Malformed> {
-        Ok(ChronicleId::from_bytes(self.take(16)?.try_into().expect("16 bytes")))
+        Ok(ChronicleId::from_bytes(
+            self.take(16)?.try_into().expect("16 bytes"),
+        ))
     }
     fn warden(&mut self) -> Result<WardenId, Malformed> {
         Ok(WardenId::new(self.u64()?))
     }
     fn head(&mut self) -> Result<ChronicleHead, Malformed> {
-        Ok(ChronicleHead { lsn: Lsn::new(self.u64()?), hash: self.hash()?, epoch: Epoch::new(self.u64()?) })
+        Ok(ChronicleHead {
+            lsn: Lsn::new(self.u64()?),
+            hash: self.hash()?,
+            epoch: Epoch::new(self.u64()?),
+        })
     }
     fn pos(&mut self) -> Result<Position, Malformed> {
-        Ok(Position { lsn: Lsn::new(self.u64()?), hash: self.hash()? })
+        Ok(Position {
+            lsn: Lsn::new(self.u64()?),
+            hash: self.hash()?,
+        })
     }
     fn envelope(&mut self) -> Result<Envelope, Malformed> {
         let chronicle = self.chronicle()?;
@@ -315,19 +361,34 @@ impl Request {
         let mut o = Out(Vec::with_capacity(2 + 8 + 137));
         o.u8(WIRE_V1);
         match self {
-            Self::Register { chronicle, holder } => o.u8(OP_REGISTER).bytes(chronicle.as_bytes()).u64(holder.get()),
-            Self::Append { warden, envelope } => o.u8(OP_APPEND).u64(warden.get()).envelope(envelope),
+            Self::Register { chronicle, holder } => o
+                .u8(OP_REGISTER)
+                .bytes(chronicle.as_bytes())
+                .u64(holder.get()),
+            Self::Append { warden, envelope } => {
+                o.u8(OP_APPEND).u64(warden.get()).envelope(envelope)
+            }
             Self::AppendBatch { warden, envelopes } => {
-                o.u8(OP_APPEND_BATCH).u64(warden.get()).u32(envelopes.len() as u32);
+                o.u8(OP_APPEND_BATCH)
+                    .u64(warden.get())
+                    .u32(envelopes.len() as u32);
                 for e in envelopes {
                     o.envelope(e);
                 }
                 &mut o
             }
-            Self::Transfer { chronicle, new_holder } => {
-                o.u8(OP_TRANSFER).bytes(chronicle.as_bytes()).u64(new_holder.get())
-            }
-            Self::TransferIf { chronicle, new_holder, expected } => o
+            Self::Transfer {
+                chronicle,
+                new_holder,
+            } => o
+                .u8(OP_TRANSFER)
+                .bytes(chronicle.as_bytes())
+                .u64(new_holder.get()),
+            Self::TransferIf {
+                chronicle,
+                new_holder,
+                expected,
+            } => o
                 .u8(OP_TRANSFER_IF)
                 .bytes(chronicle.as_bytes())
                 .u64(new_holder.get())
@@ -335,7 +396,12 @@ impl Request {
                 .u64(expected.1.get()),
             Self::Ownership { chronicle } => o.u8(OP_OWNERSHIP).bytes(chronicle.as_bytes()),
             Self::Head { chronicle } => o.u8(OP_HEAD).bytes(chronicle.as_bytes()),
-            Self::AdvanceShipped { warden, chronicle, epoch, to } => o
+            Self::AdvanceShipped {
+                warden,
+                chronicle,
+                epoch,
+                to,
+            } => o
                 .u8(OP_ADVANCE_SHIPPED)
                 .u64(warden.get())
                 .bytes(chronicle.as_bytes())
@@ -352,8 +418,14 @@ impl Request {
             return Err(Malformed("unknown protocol version"));
         }
         let req = match i.u8()? {
-            OP_REGISTER => Self::Register { chronicle: i.chronicle()?, holder: i.warden()? },
-            OP_APPEND => Self::Append { warden: i.warden()?, envelope: i.envelope()? },
+            OP_REGISTER => Self::Register {
+                chronicle: i.chronicle()?,
+                holder: i.warden()?,
+            },
+            OP_APPEND => Self::Append {
+                warden: i.warden()?,
+                envelope: i.envelope()?,
+            },
             OP_APPEND_BATCH => {
                 let warden = i.warden()?;
                 let count = i.u32()?;
@@ -363,21 +435,30 @@ impl Request {
                 let envelopes = (0..count).map(|_| i.envelope()).collect::<Result<_, _>>()?;
                 Self::AppendBatch { warden, envelopes }
             }
-            OP_TRANSFER => Self::Transfer { chronicle: i.chronicle()?, new_holder: i.warden()? },
+            OP_TRANSFER => Self::Transfer {
+                chronicle: i.chronicle()?,
+                new_holder: i.warden()?,
+            },
             OP_TRANSFER_IF => Self::TransferIf {
                 chronicle: i.chronicle()?,
                 new_holder: i.warden()?,
                 expected: (i.warden()?, Epoch::new(i.u64()?)),
             },
-            OP_OWNERSHIP => Self::Ownership { chronicle: i.chronicle()? },
-            OP_HEAD => Self::Head { chronicle: i.chronicle()? },
+            OP_OWNERSHIP => Self::Ownership {
+                chronicle: i.chronicle()?,
+            },
+            OP_HEAD => Self::Head {
+                chronicle: i.chronicle()?,
+            },
             OP_ADVANCE_SHIPPED => Self::AdvanceShipped {
                 warden: i.warden()?,
                 chronicle: i.chronicle()?,
                 epoch: Epoch::new(i.u64()?),
                 to: i.pos()?,
             },
-            OP_SHIPPED => Self::Shipped { chronicle: i.chronicle()? },
+            OP_SHIPPED => Self::Shipped {
+                chronicle: i.chronicle()?,
+            },
             _ => return Err(Malformed("unknown operation")),
         };
         i.end()?;
@@ -391,7 +472,9 @@ impl Request {
         match self {
             Self::Register { holder, .. } => Some(*holder),
             Self::Append { warden, .. } | Self::AppendBatch { warden, .. } => Some(*warden),
-            Self::Transfer { new_holder, .. } | Self::TransferIf { new_holder, .. } => Some(*new_holder),
+            Self::Transfer { new_holder, .. } | Self::TransferIf { new_holder, .. } => {
+                Some(*new_holder)
+            }
             Self::AdvanceShipped { warden, .. } => Some(*warden),
             Self::Ownership { .. } | Self::Head { .. } | Self::Shipped { .. } => None,
         }
@@ -400,7 +483,10 @@ impl Request {
     /// What kind of reply body an `Ok` carries.
     fn ok_kind(&self) -> OkKind {
         match self {
-            Self::Register { .. } | Self::Append { .. } | Self::AppendBatch { .. } | Self::Head { .. } => OkKind::Head,
+            Self::Register { .. }
+            | Self::Append { .. }
+            | Self::AppendBatch { .. }
+            | Self::Head { .. } => OkKind::Head,
             Self::Transfer { .. } | Self::TransferIf { .. } => OkKind::Epoch,
             Self::Ownership { .. } => OkKind::Ownership,
             Self::AdvanceShipped { .. } | Self::Shipped { .. } => OkKind::Position,
@@ -427,7 +513,10 @@ impl Reply {
                 o.u8(ST_OK).u64(e.get());
             }
             Self::Ownership(w) => {
-                o.u8(ST_OK).u64(w.epoch.get()).u64(w.holder.get()).head(&w.sealed_prefix);
+                o.u8(ST_OK)
+                    .u64(w.epoch.get())
+                    .u64(w.holder.get())
+                    .head(&w.sealed_prefix);
             }
             Self::Position(p) => {
                 o.u8(ST_OK).pos(p);
@@ -481,21 +570,36 @@ fn encode_refusal(e: &CoordError) -> Option<Vec<u8>> {
         CoordError::UnknownChronicle(c) => o.u8(R_UNKNOWN_CHRONICLE).bytes(c.as_bytes()),
         CoordError::AlreadyRegistered(c) => o.u8(R_ALREADY_REGISTERED).bytes(c.as_bytes()),
         CoordError::BadHash { lsn } => o.u8(R_BAD_HASH).u64(lsn.get()),
-        CoordError::NotHolder { warden, holder } => o.u8(R_NOT_HOLDER).u64(warden.get()).u64(holder.get()),
-        CoordError::EpochMismatch { record_epoch, current } => {
-            o.u8(R_EPOCH_MISMATCH).u64(record_epoch.get()).u64(current.get())
+        CoordError::NotHolder { warden, holder } => {
+            o.u8(R_NOT_HOLDER).u64(warden.get()).u64(holder.get())
         }
-        CoordError::HeadMismatch { prev, anchored } => {
-            o.u8(R_HEAD_MISMATCH).bytes(prev.as_bytes()).bytes(anchored.as_bytes())
+        CoordError::EpochMismatch {
+            record_epoch,
+            current,
+        } => o
+            .u8(R_EPOCH_MISMATCH)
+            .u64(record_epoch.get())
+            .u64(current.get()),
+        CoordError::HeadMismatch { prev, anchored } => o
+            .u8(R_HEAD_MISMATCH)
+            .bytes(prev.as_bytes())
+            .bytes(anchored.as_bytes()),
+        CoordError::LsnNotNext { lsn, expected } => {
+            o.u8(R_LSN_NOT_NEXT).u64(lsn.get()).u64(expected.get())
         }
-        CoordError::LsnNotNext { lsn, expected } => o.u8(R_LSN_NOT_NEXT).u64(lsn.get()).u64(expected.get()),
-        CoordError::ShippedAhead { to, head } => o.u8(R_SHIPPED_AHEAD).u64(to.get()).u64(head.get()),
+        CoordError::ShippedAhead { to, head } => {
+            o.u8(R_SHIPPED_AHEAD).u64(to.get()).u64(head.get())
+        }
         CoordError::ShippedConflict { lsn } => o.u8(R_SHIPPED_CONFLICT).u64(lsn.get()),
         CoordError::BadBatch { lsn } => o.u8(R_BAD_BATCH).u64(lsn.get()),
         CoordError::NotYou { claimed, peer } => o.u8(R_NOT_YOU).u64(claimed.get()).u64(peer.get()),
         CoordError::UnknownPeer { uid } => o.u8(R_UNKNOWN_PEER).u32(*uid),
-        CoordError::OwnershipChanged { holder, epoch } => o.u8(R_OWNERSHIP_CHANGED).u64(holder.get()).u64(epoch.get()),
-        CoordError::Corrupt { .. } | CoordError::Storage(_) | CoordError::Unavailable(_) => return None,
+        CoordError::OwnershipChanged { holder, epoch } => {
+            o.u8(R_OWNERSHIP_CHANGED).u64(holder.get()).u64(epoch.get())
+        }
+        CoordError::Corrupt { .. } | CoordError::Storage(_) | CoordError::Unavailable(_) => {
+            return None
+        }
     };
     Some(o.0)
 }
@@ -504,19 +608,44 @@ fn decode_refusal(i: &mut In<'_>) -> Result<CoordError, Malformed> {
     Ok(match i.u8()? {
         R_UNKNOWN_CHRONICLE => CoordError::UnknownChronicle(i.chronicle()?),
         R_ALREADY_REGISTERED => CoordError::AlreadyRegistered(i.chronicle()?),
-        R_BAD_HASH => CoordError::BadHash { lsn: Lsn::new(i.u64()?) },
-        R_NOT_HOLDER => CoordError::NotHolder { warden: i.warden()?, holder: i.warden()? },
-        R_EPOCH_MISMATCH => {
-            CoordError::EpochMismatch { record_epoch: Epoch::new(i.u64()?), current: Epoch::new(i.u64()?) }
-        }
-        R_HEAD_MISMATCH => CoordError::HeadMismatch { prev: i.hash()?, anchored: i.hash()? },
-        R_LSN_NOT_NEXT => CoordError::LsnNotNext { lsn: Lsn::new(i.u64()?), expected: Lsn::new(i.u64()?) },
-        R_SHIPPED_AHEAD => CoordError::ShippedAhead { to: Lsn::new(i.u64()?), head: Lsn::new(i.u64()?) },
-        R_SHIPPED_CONFLICT => CoordError::ShippedConflict { lsn: Lsn::new(i.u64()?) },
-        R_BAD_BATCH => CoordError::BadBatch { lsn: Lsn::new(i.u64()?) },
-        R_NOT_YOU => CoordError::NotYou { claimed: i.warden()?, peer: i.warden()? },
+        R_BAD_HASH => CoordError::BadHash {
+            lsn: Lsn::new(i.u64()?),
+        },
+        R_NOT_HOLDER => CoordError::NotHolder {
+            warden: i.warden()?,
+            holder: i.warden()?,
+        },
+        R_EPOCH_MISMATCH => CoordError::EpochMismatch {
+            record_epoch: Epoch::new(i.u64()?),
+            current: Epoch::new(i.u64()?),
+        },
+        R_HEAD_MISMATCH => CoordError::HeadMismatch {
+            prev: i.hash()?,
+            anchored: i.hash()?,
+        },
+        R_LSN_NOT_NEXT => CoordError::LsnNotNext {
+            lsn: Lsn::new(i.u64()?),
+            expected: Lsn::new(i.u64()?),
+        },
+        R_SHIPPED_AHEAD => CoordError::ShippedAhead {
+            to: Lsn::new(i.u64()?),
+            head: Lsn::new(i.u64()?),
+        },
+        R_SHIPPED_CONFLICT => CoordError::ShippedConflict {
+            lsn: Lsn::new(i.u64()?),
+        },
+        R_BAD_BATCH => CoordError::BadBatch {
+            lsn: Lsn::new(i.u64()?),
+        },
+        R_NOT_YOU => CoordError::NotYou {
+            claimed: i.warden()?,
+            peer: i.warden()?,
+        },
         R_UNKNOWN_PEER => CoordError::UnknownPeer { uid: i.u32()? },
-        R_OWNERSHIP_CHANGED => CoordError::OwnershipChanged { holder: i.warden()?, epoch: Epoch::new(i.u64()?) },
+        R_OWNERSHIP_CHANGED => CoordError::OwnershipChanged {
+            holder: i.warden()?,
+            epoch: Epoch::new(i.u64()?),
+        },
         _ => return Err(Malformed("unknown refusal")),
     })
 }
@@ -526,18 +655,34 @@ fn decode_refusal(i: &mut In<'_>) -> Result<CoordError, Malformed> {
 /// Answer one request.
 fn handle(coord: &dyn Coord, req: Request) -> Reply {
     let r = match req {
-        Request::Register { chronicle, holder } => coord.register(chronicle, holder).map(Reply::Head),
-        Request::Append { warden, envelope } => coord.append(warden, &envelope).map(Reply::Head),
-        Request::AppendBatch { warden, envelopes } => coord.append_batch(warden, &envelopes).map(Reply::Head),
-        Request::Transfer { chronicle, new_holder } => coord.transfer(chronicle, new_holder).map(Reply::Epoch),
-        Request::TransferIf { chronicle, new_holder, expected } => {
-            coord.transfer_if(chronicle, new_holder, expected).map(Reply::Epoch)
+        Request::Register { chronicle, holder } => {
+            coord.register(chronicle, holder).map(Reply::Head)
         }
+        Request::Append { warden, envelope } => coord.append(warden, &envelope).map(Reply::Head),
+        Request::AppendBatch { warden, envelopes } => {
+            coord.append_batch(warden, &envelopes).map(Reply::Head)
+        }
+        Request::Transfer {
+            chronicle,
+            new_holder,
+        } => coord.transfer(chronicle, new_holder).map(Reply::Epoch),
+        Request::TransferIf {
+            chronicle,
+            new_holder,
+            expected,
+        } => coord
+            .transfer_if(chronicle, new_holder, expected)
+            .map(Reply::Epoch),
         Request::Ownership { chronicle } => coord.ownership(chronicle).map(Reply::Ownership),
         Request::Head { chronicle } => coord.head(chronicle).map(Reply::Head),
-        Request::AdvanceShipped { warden, chronicle, epoch, to } => {
-            coord.advance_shipped(warden, chronicle, epoch, to).map(Reply::Position)
-        }
+        Request::AdvanceShipped {
+            warden,
+            chronicle,
+            epoch,
+            to,
+        } => coord
+            .advance_shipped(warden, chronicle, epoch, to)
+            .map(Reply::Position),
         Request::Shipped { chronicle } => coord.shipped(chronicle).map(Reply::Position),
     };
     r.unwrap_or_else(Reply::Err)
@@ -630,8 +775,13 @@ pub struct Server {
 /// mode and group there, then rename it to `path`.  The directory is
 /// removed on every exit.
 fn bind_private(path: &Path, group: Option<u32>) -> io::Result<UnixListener> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket path has no file name"))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "socket path has no file name")
+    })?;
     let mut staging_name = std::ffi::OsString::from(".");
     staging_name.push(name);
     staging_name.push(format!(".bind-{}", std::process::id()));
@@ -669,7 +819,11 @@ impl Server {
 
     /// [`Server::spawn`] with a peer map and socket group
     /// ([`ServerOptions`]).
-    pub fn spawn_with(path: impl AsRef<Path>, coord: Arc<dyn Coord>, options: ServerOptions) -> io::Result<Self> {
+    pub fn spawn_with(
+        path: impl AsRef<Path>,
+        coord: Arc<dyn Coord>,
+        options: ServerOptions,
+    ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.file_type().is_socket() => {
@@ -721,11 +875,15 @@ impl Server {
                     let peer = match &peers {
                         None => Peer::Anyone,
                         Some(map) => match peer_uid(&stream) {
-                            Ok(uid) => map.get(&uid).map_or(Peer::Unknown(uid), |w| Peer::Warden(*w)),
+                            Ok(uid) => map
+                                .get(&uid)
+                                .map_or(Peer::Unknown(uid), |w| Peer::Warden(*w)),
                             Err(_) => continue,
                         },
                     };
-                    let Ok(handle) = stream.try_clone() else { continue };
+                    let Ok(handle) = stream.try_clone() else {
+                        continue;
+                    };
                     let id = next_id;
                     next_id += 1;
                     conns.lock().expect("conns").insert(id, handle);
@@ -740,7 +898,13 @@ impl Server {
                 }
             })
         };
-        Ok(Self { path, stop, conns, workers, accept: Some(accept) })
+        Ok(Self {
+            path,
+            stop,
+            conns,
+            workers,
+            accept: Some(accept),
+        })
     }
 
     /// The socket path.
@@ -756,7 +920,9 @@ impl Server {
     }
 
     fn shutdown(&mut self) {
-        let Some(accept) = self.accept.take() else { return };
+        let Some(accept) = self.accept.take() else {
+            return;
+        };
         self.stop.store(true, Ordering::SeqCst);
         let _ = accept.join();
         for c in self.conns.lock().expect("conns").values() {
@@ -803,7 +969,11 @@ impl RemoteCoord {
 
     /// A client waiting at most `timeout` for each answer.
     pub fn with_timeout(path: impl Into<PathBuf>, timeout: Duration) -> Self {
-        Self { path: path.into(), timeout, idle: Mutex::new(Vec::new()) }
+        Self {
+            path: path.into(),
+            timeout,
+            idle: Mutex::new(Vec::new()),
+        }
     }
 
     /// An idle connection, or a new one.
@@ -819,8 +989,10 @@ impl RemoteCoord {
                 other => break other.map_err(CoordError::Unavailable)?,
             }
         };
-        s.set_read_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
-        s.set_write_timeout(Some(self.timeout)).map_err(CoordError::Unavailable)?;
+        s.set_read_timeout(Some(self.timeout))
+            .map_err(CoordError::Unavailable)?;
+        s.set_write_timeout(Some(self.timeout))
+            .map_err(CoordError::Unavailable)?;
         Ok(s)
     }
 
@@ -838,9 +1010,12 @@ impl RemoteCoord {
             write_frame(&mut stream, &req.encode()).map_err(unavailable)?;
             let body = read_frame(&mut stream)
                 .map_err(unavailable)?
-                .ok_or_else(|| CoordError::Unavailable(io::Error::from(io::ErrorKind::UnexpectedEof)))?;
-            Reply::decode(&body, req.ok_kind())
-                .map_err(|m| CoordError::Unavailable(io::Error::new(io::ErrorKind::InvalidData, m.0)))
+                .ok_or_else(|| {
+                    CoordError::Unavailable(io::Error::from(io::ErrorKind::UnexpectedEof))
+                })?;
+            Reply::decode(&body, req.ok_kind()).map_err(|m| {
+                CoordError::Unavailable(io::Error::new(io::ErrorKind::InvalidData, m.0))
+            })
         })();
         match result {
             Ok(Reply::Bad(why)) => {
@@ -866,16 +1041,26 @@ impl RemoteCoord {
 fn unavailable(e: FrameError) -> CoordError {
     match e {
         FrameError::Io(e) => CoordError::Unavailable(e),
-        other => CoordError::Unavailable(io::Error::new(io::ErrorKind::InvalidData, other.to_string())),
+        other => CoordError::Unavailable(io::Error::new(
+            io::ErrorKind::InvalidData,
+            other.to_string(),
+        )),
     }
 }
 
 fn unexpected(r: Reply) -> CoordError {
-    CoordError::Unavailable(io::Error::new(io::ErrorKind::InvalidData, format!("unexpected reply {r:?}")))
+    CoordError::Unavailable(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("unexpected reply {r:?}"),
+    ))
 }
 
 impl Coord for RemoteCoord {
-    fn register(&self, chronicle: ChronicleId, holder: WardenId) -> Result<ChronicleHead, CoordError> {
+    fn register(
+        &self,
+        chronicle: ChronicleId,
+        holder: WardenId,
+    ) -> Result<ChronicleHead, CoordError> {
         match self.call(Request::Register { chronicle, holder })? {
             Reply::Head(h) => Ok(h),
             Reply::Err(e) => Err(e),
@@ -884,18 +1069,30 @@ impl Coord for RemoteCoord {
     }
 
     fn append(&self, warden: WardenId, envelope: &Envelope) -> Result<ChronicleHead, CoordError> {
-        match self.call(Request::Append { warden, envelope: *envelope })? {
+        match self.call(Request::Append {
+            warden,
+            envelope: *envelope,
+        })? {
             Reply::Head(h) => Ok(h),
             Reply::Err(e) => Err(e),
             r => Err(unexpected(r)),
         }
     }
 
-    fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError> {
+    fn append_batch(
+        &self,
+        warden: WardenId,
+        envelopes: &[Envelope],
+    ) -> Result<ChronicleHead, CoordError> {
         if envelopes.len() > MAX_BATCH as usize {
-            return Err(CoordError::BadBatch { lsn: envelopes[MAX_BATCH as usize].lsn });
+            return Err(CoordError::BadBatch {
+                lsn: envelopes[MAX_BATCH as usize].lsn,
+            });
         }
-        match self.call(Request::AppendBatch { warden, envelopes: envelopes.to_vec() })? {
+        match self.call(Request::AppendBatch {
+            warden,
+            envelopes: envelopes.to_vec(),
+        })? {
             Reply::Head(h) => Ok(h),
             Reply::Err(e) => Err(e),
             r => Err(unexpected(r)),
@@ -908,7 +1105,11 @@ impl Coord for RemoteCoord {
         new_holder: WardenId,
         expected: (WardenId, Epoch),
     ) -> Result<Epoch, CoordError> {
-        match self.call(Request::TransferIf { chronicle, new_holder, expected })? {
+        match self.call(Request::TransferIf {
+            chronicle,
+            new_holder,
+            expected,
+        })? {
             Reply::Epoch(e) => Ok(e),
             Reply::Err(e) => Err(e),
             other => Err(unexpected(other)),
@@ -916,7 +1117,10 @@ impl Coord for RemoteCoord {
     }
 
     fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
-        match self.call(Request::Transfer { chronicle, new_holder })? {
+        match self.call(Request::Transfer {
+            chronicle,
+            new_holder,
+        })? {
             Reply::Epoch(e) => Ok(e),
             Reply::Err(e) => Err(e),
             r => Err(unexpected(r)),
@@ -946,7 +1150,12 @@ impl Coord for RemoteCoord {
         epoch: Epoch,
         to: Position,
     ) -> Result<Position, CoordError> {
-        match self.call(Request::AdvanceShipped { warden, chronicle, epoch, to })? {
+        match self.call(Request::AdvanceShipped {
+            warden,
+            chronicle,
+            epoch,
+            to,
+        })? {
             Reply::Position(p) => Ok(p),
             Reply::Err(e) => Err(e),
             r => Err(unexpected(r)),
@@ -1013,7 +1222,8 @@ mod tests {
     }
 
     fn record(w: &WardenModel, n: u8) -> Envelope {
-        w.build_record(Stream::Fs, Payload::Raw(vec![n; 4])).envelope
+        w.build_record(Stream::Fs, Payload::Raw(vec![n; 4]))
+            .envelope
     }
 
     // ── through the socket ──────────────────────────────────────────
@@ -1023,14 +1233,20 @@ mod tests {
         let e = Env::new();
         let c = e.client();
         let g = c.register(chron(1), A).unwrap();
-        assert_eq!((g.lsn, g.hash, g.epoch), (Lsn::new(0), HashVal::GENESIS, Epoch::FIRST));
+        assert_eq!(
+            (g.lsn, g.hash, g.epoch),
+            (Lsn::new(0), HashVal::GENESIS, Epoch::FIRST)
+        );
         let w = WardenModel::resume(A, chron(1), Epoch::FIRST, g, Lsn::new(1));
         let h = c.append(A, &record(&w, 1)).unwrap();
         assert_eq!(h.lsn, Lsn::new(1));
         assert_eq!(c.head(chron(1)).unwrap(), h);
         assert_eq!(c.transfer(chron(1), B).unwrap(), Epoch::new(2));
         let o = c.ownership(chron(1)).unwrap();
-        assert_eq!((o.epoch, o.holder, o.sealed_prefix.lsn), (Epoch::new(2), B, Lsn::new(1)));
+        assert_eq!(
+            (o.epoch, o.holder, o.sealed_prefix.lsn),
+            (Epoch::new(2), B, Lsn::new(1))
+        );
     }
 
     #[test]
@@ -1039,7 +1255,9 @@ mod tests {
         let c = e.client();
         assert!(matches!(c.head(chron(9)), Err(CoordError::UnknownChronicle(x)) if x == chron(9)));
         c.register(chron(1), A).unwrap();
-        assert!(matches!(c.register(chron(1), B), Err(CoordError::AlreadyRegistered(x)) if x == chron(1)));
+        assert!(
+            matches!(c.register(chron(1), B), Err(CoordError::AlreadyRegistered(x)) if x == chron(1))
+        );
         let w = WardenModel::new(B, chron(1), Epoch::FIRST);
         assert!(matches!(
             c.append(B, &record(&w, 1)),
@@ -1048,7 +1266,10 @@ mod tests {
         // A refusal does not close the connection.
         assert_eq!(c.head(chron(1)).unwrap().lsn, Lsn::new(0));
         // The conditional transfer, both answers, through the socket.
-        assert_eq!(c.transfer_if(chron(1), B, (A, Epoch::FIRST)).unwrap(), Epoch::new(2));
+        assert_eq!(
+            c.transfer_if(chron(1), B, (A, Epoch::FIRST)).unwrap(),
+            Epoch::new(2)
+        );
         assert!(matches!(
             c.transfer_if(chron(1), A, (A, Epoch::FIRST)),
             Err(CoordError::OwnershipChanged { holder, epoch }) if holder == B && epoch == Epoch::new(2)
@@ -1064,31 +1285,59 @@ mod tests {
             CoordError::UnknownChronicle(chron(1)),
             CoordError::AlreadyRegistered(chron(2)),
             CoordError::BadHash { lsn: Lsn::new(7) },
-            CoordError::NotHolder { warden: A, holder: B },
-            CoordError::EpochMismatch { record_epoch: Epoch::new(1), current: Epoch::new(4) },
-            CoordError::HeadMismatch { prev: h, anchored: HashVal::GENESIS },
-            CoordError::LsnNotNext { lsn: Lsn::new(9), expected: Lsn::new(2) },
-            CoordError::ShippedAhead { to: Lsn::new(6), head: Lsn::new(5) },
+            CoordError::NotHolder {
+                warden: A,
+                holder: B,
+            },
+            CoordError::EpochMismatch {
+                record_epoch: Epoch::new(1),
+                current: Epoch::new(4),
+            },
+            CoordError::HeadMismatch {
+                prev: h,
+                anchored: HashVal::GENESIS,
+            },
+            CoordError::LsnNotNext {
+                lsn: Lsn::new(9),
+                expected: Lsn::new(2),
+            },
+            CoordError::ShippedAhead {
+                to: Lsn::new(6),
+                head: Lsn::new(5),
+            },
             CoordError::ShippedConflict { lsn: Lsn::new(5) },
             CoordError::BadBatch { lsn: Lsn::new(3) },
-            CoordError::NotYou { claimed: B, peer: A },
+            CoordError::NotYou {
+                claimed: B,
+                peer: A,
+            },
             CoordError::UnknownPeer { uid: 30033 },
-            CoordError::OwnershipChanged { holder: B, epoch: Epoch::new(2) },
+            CoordError::OwnershipChanged {
+                holder: B,
+                epoch: Epoch::new(2),
+            },
         ];
         for e in refusals {
             let body = Reply::Err(e).encode();
-            let Reply::Err(back) = Reply::decode(&body, OkKind::Head).unwrap() else { panic!() };
+            let Reply::Err(back) = Reply::decode(&body, OkKind::Head).unwrap() else {
+                panic!()
+            };
             assert_eq!(Reply::Err(back).encode(), body);
         }
         let failures = [
-            CoordError::Corrupt { chronicle: chron(1), reason: "x" },
+            CoordError::Corrupt {
+                chronicle: chron(1),
+                reason: "x",
+            },
             CoordError::Storage(redb::Error::Corrupted("x".into())),
             CoordError::Unavailable(io::Error::other("x")),
         ];
         for e in failures {
             let body = Reply::Err(e).encode();
             assert_eq!(body[0], ST_FAILED);
-            let Reply::Err(back) = Reply::decode(&body, OkKind::Head).unwrap() else { panic!() };
+            let Reply::Err(back) = Reply::decode(&body, OkKind::Head).unwrap() else {
+                panic!()
+            };
             assert!(back.outcome_unknown(), "{back:?}");
         }
     }
@@ -1097,26 +1346,57 @@ mod tests {
     fn requests_round_trip_and_junk_is_rejected() {
         let w = WardenModel::new(A, chron(1), Epoch::FIRST);
         let reqs = [
-            Request::Register { chronicle: chron(1), holder: A },
-            Request::Append { warden: A, envelope: record(&w, 1) },
-            Request::Transfer { chronicle: chron(1), new_holder: B },
-            Request::TransferIf { chronicle: chron(1), new_holder: B, expected: (A, Epoch::new(3)) },
-            Request::Ownership { chronicle: chron(1) },
-            Request::Head { chronicle: chron(1) },
+            Request::Register {
+                chronicle: chron(1),
+                holder: A,
+            },
+            Request::Append {
+                warden: A,
+                envelope: record(&w, 1),
+            },
+            Request::Transfer {
+                chronicle: chron(1),
+                new_holder: B,
+            },
+            Request::TransferIf {
+                chronicle: chron(1),
+                new_holder: B,
+                expected: (A, Epoch::new(3)),
+            },
+            Request::Ownership {
+                chronicle: chron(1),
+            },
+            Request::Head {
+                chronicle: chron(1),
+            },
             Request::AdvanceShipped {
                 warden: A,
                 chronicle: chron(1),
                 epoch: Epoch::new(3),
-                to: Position { lsn: Lsn::new(4), hash: HashVal::from_bytes([4; 32]) },
+                to: Position {
+                    lsn: Lsn::new(4),
+                    hash: HashVal::from_bytes([4; 32]),
+                },
             },
-            Request::Shipped { chronicle: chron(1) },
-            Request::AppendBatch { warden: A, envelopes: vec![record(&w, 1), record(&w, 1)] },
-            Request::AppendBatch { warden: A, envelopes: vec![] },
+            Request::Shipped {
+                chronicle: chron(1),
+            },
+            Request::AppendBatch {
+                warden: A,
+                envelopes: vec![record(&w, 1), record(&w, 1)],
+            },
+            Request::AppendBatch {
+                warden: A,
+                envelopes: vec![],
+            },
         ];
         for r in reqs.clone() {
             let b = r.encode();
             assert_eq!(Request::decode(&b), Ok(r.clone()));
-            assert!(Request::decode(&b[..b.len() - 1]).is_err(), "truncated {r:?}");
+            assert!(
+                Request::decode(&b[..b.len() - 1]).is_err(),
+                "truncated {r:?}"
+            );
             let mut extra = b.clone();
             extra.push(0);
             assert!(Request::decode(&extra).is_err(), "trailing {r:?}");
@@ -1126,7 +1406,10 @@ mod tests {
         }
         let mut bad_stream = reqs[1].encode();
         bad_stream[2 + 8 + 32] = 9; // the envelope's stream byte
-        assert_eq!(Request::decode(&bad_stream), Err(Malformed("unknown stream")));
+        assert_eq!(
+            Request::decode(&bad_stream),
+            Err(Malformed("unknown stream"))
+        );
         assert!(Request::decode(&[WIRE_V1, 99]).is_err());
         assert!(Request::decode(&[]).is_err());
         // A batch larger than MAX_BATCH is malformed before it is read.
@@ -1145,12 +1428,28 @@ mod tests {
         c.register(chron(1), A).unwrap();
         let w = WardenModel::new(A, chron(1), Epoch::FIRST);
         let first = record(&w, 1);
-        let w2 = WardenModel::resume(A, chron(1), Epoch::FIRST, ChronicleHead { lsn: first.lsn, hash: first.hash, epoch: Epoch::FIRST }, first.lsn.next());
+        let w2 = WardenModel::resume(
+            A,
+            chron(1),
+            Epoch::FIRST,
+            ChronicleHead {
+                lsn: first.lsn,
+                hash: first.hash,
+                epoch: Epoch::FIRST,
+            },
+            first.lsn.next(),
+        );
         let second = w2.build_record(Stream::Fs, Payload::Raw(vec![2])).envelope;
         let h = c.append_batch(A, &[first, second]).unwrap();
         assert_eq!((h.lsn, h.hash), (Lsn::new(2), second.hash));
-        assert!(matches!(c.append_batch(A, &[first]), Err(CoordError::HeadMismatch { .. })));
-        assert!(matches!(c.append_batch(A, &[]), Err(CoordError::BadBatch { .. })));
+        assert!(matches!(
+            c.append_batch(A, &[first]),
+            Err(CoordError::HeadMismatch { .. })
+        ));
+        assert!(matches!(
+            c.append_batch(A, &[]),
+            Err(CoordError::BadBatch { .. })
+        ));
         assert_eq!(c.head(chron(1)).unwrap(), h);
     }
 
@@ -1164,11 +1463,19 @@ mod tests {
 
         let mut s = UnixStream::connect(e.sock()).unwrap();
         // A transfer request with one byte missing.
-        let req = Request::Transfer { chronicle: chron(1), new_holder: B }.encode();
+        let req = Request::Transfer {
+            chronicle: chron(1),
+            new_holder: B,
+        }
+        .encode();
         write_frame(&mut s, &req[..req.len() - 1]).unwrap();
         let reply = read_frame(&mut s).unwrap().unwrap();
         assert_eq!(reply[0], ST_BAD);
-        assert_eq!(read_frame(&mut s).unwrap(), None, "server closed the connection");
+        assert_eq!(
+            read_frame(&mut s).unwrap(),
+            None,
+            "server closed the connection"
+        );
         // An oversized frame header.
         let mut s = UnixStream::connect(e.sock()).unwrap();
         s.write_all(&u32::MAX.to_be_bytes()).unwrap();
@@ -1187,12 +1494,18 @@ mod tests {
 
     fn my_gid() -> u32 {
         let (a, _b) = UnixStream::pair().unwrap();
-        rustix::net::sockopt::socket_peercred(&a).unwrap().gid.as_raw()
+        rustix::net::sockopt::socket_peercred(&a)
+            .unwrap()
+            .gid
+            .as_raw()
     }
 
     fn spawn_mapped(dir: &Path, peers: &[(u32, WardenId)]) -> Server {
         let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(dir.join("coord.redb")).unwrap());
-        let options = ServerOptions { peers: Some(peers.iter().copied().collect()), group: None };
+        let options = ServerOptions {
+            peers: Some(peers.iter().copied().collect()),
+            group: None,
+        };
         Server::spawn_with(dir.join("coord.sock"), coord, options).unwrap()
     }
 
@@ -1200,17 +1513,74 @@ mod tests {
     #[test]
     fn every_request_declares_whom_it_acts_as() {
         let w = WardenModel::new(A, chron(1), Epoch::FIRST);
-        let pos = Position { lsn: Lsn::new(1), hash: HashVal::GENESIS };
+        let pos = Position {
+            lsn: Lsn::new(1),
+            hash: HashVal::GENESIS,
+        };
         let cases = [
-            (Request::Register { chronicle: chron(1), holder: A }, Some(A)),
-            (Request::Append { warden: A, envelope: record(&w, 1) }, Some(A)),
-            (Request::AppendBatch { warden: B, envelopes: vec![] }, Some(B)),
-            (Request::Transfer { chronicle: chron(1), new_holder: B }, Some(B)),
-            (Request::TransferIf { chronicle: chron(1), new_holder: B, expected: (A, Epoch::FIRST) }, Some(B)),
-            (Request::AdvanceShipped { warden: A, chronicle: chron(1), epoch: Epoch::FIRST, to: pos }, Some(A)),
-            (Request::Ownership { chronicle: chron(1) }, None),
-            (Request::Head { chronicle: chron(1) }, None),
-            (Request::Shipped { chronicle: chron(1) }, None),
+            (
+                Request::Register {
+                    chronicle: chron(1),
+                    holder: A,
+                },
+                Some(A),
+            ),
+            (
+                Request::Append {
+                    warden: A,
+                    envelope: record(&w, 1),
+                },
+                Some(A),
+            ),
+            (
+                Request::AppendBatch {
+                    warden: B,
+                    envelopes: vec![],
+                },
+                Some(B),
+            ),
+            (
+                Request::Transfer {
+                    chronicle: chron(1),
+                    new_holder: B,
+                },
+                Some(B),
+            ),
+            (
+                Request::TransferIf {
+                    chronicle: chron(1),
+                    new_holder: B,
+                    expected: (A, Epoch::FIRST),
+                },
+                Some(B),
+            ),
+            (
+                Request::AdvanceShipped {
+                    warden: A,
+                    chronicle: chron(1),
+                    epoch: Epoch::FIRST,
+                    to: pos,
+                },
+                Some(A),
+            ),
+            (
+                Request::Ownership {
+                    chronicle: chron(1),
+                },
+                None,
+            ),
+            (
+                Request::Head {
+                    chronicle: chron(1),
+                },
+                None,
+            ),
+            (
+                Request::Shipped {
+                    chronicle: chron(1),
+                },
+                None,
+            ),
         ];
         for (req, want) in cases {
             assert_eq!(req.claimed(), want, "{req:?}");
@@ -1231,7 +1601,17 @@ mod tests {
         let w = WardenModel::resume(A, chron(1), Epoch::FIRST, g, Lsn::new(1));
         let env = record(&w, 1);
         let h = c.append(A, &env).unwrap();
-        let shipped = c.advance_shipped(A, chron(1), Epoch::FIRST, Position { lsn: h.lsn, hash: h.hash }).unwrap();
+        let shipped = c
+            .advance_shipped(
+                A,
+                chron(1),
+                Epoch::FIRST,
+                Position {
+                    lsn: h.lsn,
+                    hash: h.hash,
+                },
+            )
+            .unwrap();
         assert_eq!(shipped.lsn, Lsn::new(1));
 
         // As B, on the same connection: refused, field for field.
@@ -1243,14 +1623,24 @@ mod tests {
         not_you(c.transfer(chron(1), B).map(|_| ()));
         not_you(c.append(B, &env).map(|_| ()));
         not_you(c.append_batch(B, &[env]).map(|_| ()));
-        not_you(c.advance_shipped(B, chron(1), Epoch::FIRST, shipped).map(|_| ()));
+        not_you(
+            c.advance_shipped(B, chron(1), Epoch::FIRST, shipped)
+                .map(|_| ()),
+        );
         // A refusal is a refusal: nothing changed, and the connection lives.
         let o = c.ownership(chron(1)).unwrap();
         assert_eq!((o.epoch, o.holder), (Epoch::FIRST, A));
         assert_eq!(c.head(chron(1)).unwrap(), h);
         assert_eq!(c.shipped(chron(1)).unwrap(), shipped);
-        assert!(matches!(c.head(chron(2)), Err(CoordError::UnknownChronicle(_))), "B's register never happened");
-        assert!(!CoordError::NotYou { claimed: B, peer: A }.outcome_unknown());
+        assert!(
+            matches!(c.head(chron(2)), Err(CoordError::UnknownChronicle(_))),
+            "B's register never happened"
+        );
+        assert!(!CoordError::NotYou {
+            claimed: B,
+            peer: A
+        }
+        .outcome_unknown());
     }
 
     /// A uid the map does not know gets nothing, not even a read, and the
@@ -1275,7 +1665,10 @@ mod tests {
         let e = Env { server: None, dir };
         let mut e = e;
         e.start();
-        assert!(matches!(e.client().head(chron(1)), Err(CoordError::UnknownChronicle(_))));
+        assert!(matches!(
+            e.client().head(chron(1)),
+            Err(CoordError::UnknownChronicle(_))
+        ));
     }
 
     /// The socket arrives with its final mode and group, and the staging
@@ -1302,13 +1695,19 @@ mod tests {
         e.stop();
 
         let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(e.db()).unwrap());
-        let options = ServerOptions { peers: None, group: Some(my_gid()) };
+        let options = ServerOptions {
+            peers: None,
+            group: Some(my_gid()),
+        };
         let s = Server::spawn_with(e.sock(), coord, options).unwrap();
         let m = std::fs::metadata(e.sock()).unwrap();
         assert_eq!(m.mode() & 0o777, 0o660);
         assert_eq!(m.gid(), my_gid());
         no_staging(e.dir.path());
-        assert!(RemoteCoord::new(e.sock()).register(chron(1), A).is_ok(), "serves after the rename");
+        assert!(
+            RemoteCoord::new(e.sock()).register(chron(1), A).is_ok(),
+            "serves after the rename"
+        );
         s.stop();
         assert!(!e.sock().exists());
         no_staging(e.dir.path());
@@ -1324,7 +1723,10 @@ mod tests {
         c.register(chron(1), A).unwrap();
         e.stop();
         let err = c.head(chron(1)).unwrap_err();
-        assert!(matches!(err, CoordError::Unavailable(_)) && err.outcome_unknown(), "{err:?}");
+        assert!(
+            matches!(err, CoordError::Unavailable(_)) && err.outcome_unknown(),
+            "{err:?}"
+        );
         e.start();
         assert_eq!(c.ownership(chron(1)).unwrap().holder, A);
     }
@@ -1346,8 +1748,17 @@ mod tests {
         let w = WardenModel::new(A, chron(1), Epoch::FIRST);
         let env = record(&w, 1);
         let err = c.append(A, &env).unwrap_err();
-        assert!(matches!(err, CoordError::Unavailable(_)) && err.outcome_unknown(), "{err:?}");
-        assert_eq!(Request::decode(&t.join().unwrap()), Ok(Request::Append { warden: A, envelope: env }));
+        assert!(
+            matches!(err, CoordError::Unavailable(_)) && err.outcome_unknown(),
+            "{err:?}"
+        );
+        assert_eq!(
+            Request::decode(&t.join().unwrap()),
+            Ok(Request::Append {
+                warden: A,
+                envelope: env
+            })
+        );
     }
 
     /// A server that never answers: the client times out as unavailable.
@@ -1369,7 +1780,12 @@ mod tests {
         fn append_batch(&self, w: WardenId, e: &[Envelope]) -> Result<ChronicleHead, CoordError> {
             self.inner.append_batch(w, e)
         }
-        fn transfer_if(&self, c: ChronicleId, h: WardenId, e: (WardenId, Epoch)) -> Result<Epoch, CoordError> {
+        fn transfer_if(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+            e: (WardenId, Epoch),
+        ) -> Result<Epoch, CoordError> {
             self.inner.transfer_if(c, h, e)
         }
         fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
@@ -1386,7 +1802,13 @@ mod tests {
             self.now.fetch_sub(1, SeqCst);
             self.inner.head(c)
         }
-        fn advance_shipped(&self, w: WardenId, c: ChronicleId, e: Epoch, to: Position) -> Result<Position, CoordError> {
+        fn advance_shipped(
+            &self,
+            w: WardenId,
+            c: ChronicleId,
+            e: Epoch,
+            to: Position,
+        ) -> Result<Position, CoordError> {
             self.inner.advance_shipped(w, c, e, to)
         }
         fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
@@ -1407,7 +1829,10 @@ mod tests {
             most: Default::default(),
         });
         let _server = Server::spawn(dir.path().join("c.sock"), slow.clone()).unwrap();
-        let c = Arc::new(RemoteCoord::with_timeout(dir.path().join("c.sock"), Duration::from_secs(5)));
+        let c = Arc::new(RemoteCoord::with_timeout(
+            dir.path().join("c.sock"),
+            Duration::from_secs(5),
+        ));
         c.register(chron(1), A).unwrap();
         let t0 = std::time::Instant::now();
         let threads: Vec<_> = (0..8)
@@ -1420,8 +1845,15 @@ mod tests {
             t.join().unwrap();
         }
         let took = t0.elapsed();
-        assert_eq!(slow.most.load(std::sync::atomic::Ordering::SeqCst), 8, "all eight at once");
-        assert!(took < Duration::from_millis(800), "not one after another: {took:?}");
+        assert_eq!(
+            slow.most.load(std::sync::atomic::Ordering::SeqCst),
+            8,
+            "all eight at once"
+        );
+        assert!(
+            took < Duration::from_millis(800),
+            "not one after another: {took:?}"
+        );
         let idle = c.idle.lock().unwrap().len();
         assert_eq!(idle, 8, "each connection kept for reuse");
         c.head(chron(1)).unwrap();
@@ -1447,7 +1879,8 @@ mod tests {
     #[test]
     fn a_live_socket_is_not_taken_over() {
         let e = Env::new();
-        let other: Arc<dyn Coord> = Arc::new(Coordinator::open(e.dir.path().join("other.redb")).unwrap());
+        let other: Arc<dyn Coord> =
+            Arc::new(Coordinator::open(e.dir.path().join("other.redb")).unwrap());
         let err = Server::spawn(e.sock(), other).err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         assert!(e.client().register(chron(1), A).is_ok());

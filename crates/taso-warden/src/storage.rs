@@ -120,7 +120,13 @@ impl Pool for Storage {
         }
     }
 
-    fn clone(&self, source: &Dataset, seal: Lsn, seal_hash: HashVal, target: &Dataset) -> Result<DatasetInfo, LayerError> {
+    fn clone(
+        &self,
+        source: &Dataset,
+        seal: Lsn,
+        seal_hash: HashVal,
+        target: &Dataset,
+    ) -> Result<DatasetInfo, LayerError> {
         match self {
             Self::Zfs(z) => Pool::clone(z, source, seal, seal_hash, target),
             Self::Blk(p) => Pool::clone(p, source, seal, seal_hash, target),
@@ -154,7 +160,13 @@ impl Pool for Storage {
         }
     }
 
-    fn receive_clone(&self, dataset: &Dataset, base: &CloneBase, to: (Lsn, HashVal), stream: &mut dyn io::Read) -> Result<u64, LayerError> {
+    fn receive_clone(
+        &self,
+        dataset: &Dataset,
+        base: &CloneBase,
+        to: (Lsn, HashVal),
+        stream: &mut dyn io::Read,
+    ) -> Result<u64, LayerError> {
         match self {
             Self::Zfs(z) => Pool::receive_clone(z, dataset, base, to, stream),
             Self::Blk(p) => p.receive_clone(dataset, base, to, stream),

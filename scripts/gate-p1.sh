@@ -136,7 +136,11 @@ run_bare() {   # $1 = run number
 
 # ── warden ────────────────────────────────────────────────────────────
 run_warden() {   # $1 = run number
-    local r=$1 root="$BASE/w-$r" cfg="$WORK/w-$r.json"
+    # Two `local`s: in one, "$r" would expand before the assignment to r
+    # takes effect (shellcheck SC2318).  It worked anyway because the
+    # caller's loop variable is also r; the fix removes the coincidence.
+    local r=$1
+    local root="$BASE/w-$r" cfg="$WORK/w-$r.json"
     zfs create "$root"
     python3 - "$cfg" "$r" <<PY
 import json, sys
