@@ -32,17 +32,16 @@
 #   R5 disk       on a read-only mount of the child's last Seal: every
 #                 file's uid and gid (but root's) in the parent's range
 #                 265536..+65536, none in the child's 331072..+65536
-#   R6 data       SQLite integrity "ok" on that mount, and the parent's
-#                 rows are all there with the child's added
+#   R6 data       dbcheck.py on that mount at the child's last sealed turn:
+#                 integrity "ok" and exactly turns 1.. that turn, each
+#                 whole: the parent's turns, then the child's after them
 #   R7 restart    phase 3: neither Vessel refused (no "is not run"), both
 #                 opened, both seal new turns, the child idmapped again;
 #                 the Warden exits 0
-#   TURNS         not a pass or fail: what the child's agent was told it
-#                 resumes after, against the parent's last turn.  A fork's
-#                 own Chronicle has only its birth Seal, and Hello reports
-#                 that as no turn: the child is expected to start again at
-#                 turn 1 over the parent's turns.  Whether a fork continues
-#                 its parent's turn count is a decision, not a test.
+#   R8 turns      the child continues the parent's count (decision of
+#                 2026-10-21; its birth Seal carries the parent's turn T):
+#                 its agent was told it resumes after T, ran turns
+#                 T+1..T+$CHILD_TURNS, and its last Seal is at T+$CHILD_TURNS
 #
 # Usage (root on a node with runc, cargo, python3, ublk and the installed
 # taso-blkd; node-setup.sh vessel-blk):
@@ -301,7 +300,7 @@ if [ "$r4" = same ] && [ "$P_EXPORT" = "$P_EXPORT_AFTER" ]; then row R4 PASS; el
 
 # The child's last Seal, forked to a scratch branch and mounted read-only:
 # the bytes as they are on disk, no idmapping.
-read -r C_LSN _ < <(last_seal "$OUT/child.json")
+read -r C_LSN C_TURN < <(last_seal "$OUT/child.json")
 C_LAYER=$(seal_layer "$CDS" "$C_LSN")
 out=$(blk fork "$C_LAYER" "$ROOT/scratch")
 SCRATCH_BRANCH=${out%% *}; dev=${out#* }
@@ -325,29 +324,26 @@ else: print(f"PASS ({seen} owner ids, all in the parent's range)")
 PY
 )
 row R5 "$r5"
-r6=$(python3 - "$WORK/scratch" "$P_TURN" <<'PY'
-import os, shutil, sqlite3, sys, tempfile
-src, pturn = sys.argv[1], int(sys.argv[2])
-if not os.path.exists(os.path.join(src, "state.db")):
-    print("FAIL (no state.db)"); sys.exit()
-with tempfile.TemporaryDirectory() as d:
-    for f in ("state.db", "state.db-wal"):
-        if os.path.exists(os.path.join(src, f)): shutil.copy2(os.path.join(src, f), d)
-    c = sqlite3.connect(os.path.join(d, "state.db"))
-    ok = c.execute("PRAGMA integrity_check").fetchone()[0]
-    rows = c.execute("SELECT count(*) FROM events").fetchone()[0]
-    c.close()
-parent_rows = pturn * 2 * 4
-if ok != "ok": print(f"FAIL (integrity: {ok})")
-elif rows <= parent_rows: print(f"FAIL ({rows} rows: the parent's {parent_rows} and nothing of the child's)")
-else: print(f"PASS ({rows} rows: the parent's {parent_rows} and the child's {rows - parent_rows})")
-PY
-)
+r6=$(python3 scripts/gate-cloud/dbcheck.py "$WORK/scratch" "$C_TURN" 2 4 2>&1 \
+    | python3 -c 'import json,sys
+t = sys.stdin.read()
+try: v = json.loads(t)
+except ValueError: print("FAIL (dbcheck: " + t.strip()[:160] + ")"); sys.exit()
+print(("PASS (turns 1..%s whole)" % sys.argv[1]) if v.get("ok") else "FAIL (" + json.dumps(v)[:200] + ")")' "$C_TURN")
 row R6 "$r6"
 umount "$WORK/scratch"; blk drop "$SCRATCH_BRANCH" >/dev/null 2>&1 || echo "  drop scratch refused" >&2; SCRATCH_BRANCH=
 
-resumed=$(python3 -c "import json,sys; j=json.load(open(sys.argv[1])); print(j['resumed_after'], j['turns'])" "$WORK/mnt/$CDS/sim-stats.json" 2>/dev/null || echo "unknown")
-row TURNS "DECISION: the parent's last turn is $P_TURN; the child was told it resumes after: $resumed"
+r8=$(python3 - "$WORK/mnt/$CDS/sim-stats.json" "$P_TURN" "$CHILD_TURNS" "$C_TURN" <<'PY'
+import json, sys
+p, n, c = map(int, sys.argv[2:])
+try: j = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as e: print(f"FAIL (sim-stats: {e})"); sys.exit()
+got = (j.get("resumed_after"), j.get("turns"), c)
+want = (p, [p + 1, p + n], p + n)
+print(f"PASS (resumed after {p}, turns {p + 1}..{p + n})" if got == want else f"FAIL (resumed after, turns, last Seal's turn: {got}, want {want})")
+PY
+)
+row R8 "$r8"
 
 # ── phase 3: a new Warden with both ───────────────────────────────────
 config "$WORK/p3.json" "$AGAIN_TURNS" "$PARENT" "$CHILD"
@@ -374,10 +370,10 @@ fi
 
 # ── summary ───────────────────────────────────────────────────────────
 fails=0
-for r in R1 R2 R3 R4 R5 R6 R7; do [[ "${ROW[$r]}" == PASS* ]] || fails=$((fails + 1)); done
+for r in R1 R2 R3 R4 R5 R6 R7 R8; do [[ "${ROW[$r]}" == PASS* ]] || fails=$((fails + 1)); done
 {
-    echo "f6-fork-blk $RUN: $((7 - fails))/7 rows passed"
-    for r in R1 R2 R3 R4 R5 R6 R7 TURNS; do printf '%-6s %s\n' "$r" "${ROW[$r]}"; done
+    echo "f6-fork-blk $RUN: $((8 - fails))/8 rows passed"
+    for r in R1 R2 R3 R4 R5 R6 R7 R8; do printf '%-6s %s\n' "$r" "${ROW[$r]}"; done
 } | tee "$OUT/summary.txt"
 echo "== results in $OUT"
 [ "$fails" = 0 ]

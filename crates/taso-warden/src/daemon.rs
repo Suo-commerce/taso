@@ -112,7 +112,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use taso_core::envelope::{ChronicleId, Epoch, Lsn};
-use taso_core::record::{vessel_id, Namespace, Verdict};
+use taso_core::record::{vessel_id, Namespace, TurnId, Verdict};
 use taso_field::adapter::Registry;
 
 use crate::chronicle::Layers;
@@ -131,7 +131,7 @@ use crate::segment::Position;
 use crate::ship::{LocalStore, SharedStore};
 use crate::source::Held;
 use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
-use crate::vessel::{Ensured, Host, Pool, SealAt, Vessel, VesselError};
+use crate::vessel::{Ensured, Host, Pool, SealAt, Vessel, VesselError, BIRTH_TURN};
 use crate::zfs::{Dataset, Snapshot};
 use taso_core::model::WardenId;
 
@@ -1388,8 +1388,18 @@ impl Settled {
 /// last Seal.  `NotPristine` (no Seal, but records after Lineage) is an
 /// error: there is no level to put the state at.
 pub fn settle<L: Layers>(vessel: &mut Vessel<L>) -> Result<Settled, VesselError> {
+    settle_at(vessel, BIRTH_TURN)
+}
+
+/// [`settle`] with the birth Seal (if one is taken) at `birth_turn`: a
+/// fork's or succession's parent's turn ([`Host::birth_turn`]), so its agent
+/// continues the parent's count.
+pub fn settle_at<L: Layers>(
+    vessel: &mut Vessel<L>,
+    birth_turn: TurnId,
+) -> Result<Settled, VesselError> {
     let birth = match vessel.last_seal() {
-        None => Some(vessel.seal_birth()?.seal),
+        None => Some(vessel.seal_birth_at(birth_turn)?.seal),
         Some(_) => None,
     };
     let rolled_back_to = vessel.rollback()?;
@@ -1803,9 +1813,20 @@ impl Node {
         let (mut vessel, start, mut verdict) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
-        let settled = settle(&mut vessel)?;
+        let birth_turn = match vessel.last_seal() {
+            None => self.host().birth_turn(&vessel)?,
+            Some(_) => BIRTH_TURN,
+        };
+        let settled = settle_at(&mut vessel, birth_turn)?;
         if let Some(b) = settled.birth {
-            self.log(vc, format_args!("birth Seal at lsn {}", b.lsn.get()));
+            self.log(
+                vc,
+                format_args!(
+                    "birth Seal at lsn {} (turn {})",
+                    b.lsn.get(),
+                    birth_turn.get()
+                ),
+            );
         }
         match settled.rolled_back_to {
             Some(s) => self.log(
