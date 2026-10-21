@@ -1109,6 +1109,28 @@ fn decode(frame: &Frame) -> Result<Payload, VesselError> {
     })
 }
 
+/// The Lineage record of the Chronicle whose local log is in `dir`, read
+/// without writing anything and without the coordinator
+/// ([`crate::chronicle::read_log`]): for a node's inventory at start, where
+/// a Vessel's parent decides which lineage its files belong to.  `None` if
+/// there is no local log or it holds no record yet (an interrupted birth).
+///
+/// Nothing here is verified against the coordinator: a caller may only use
+/// it to decide *less* (the source guard: a wrong parent can only group a
+/// Vessel into a lineage whose open then refuses it, since opening verifies
+/// the whole chain and the lineage against the dataset).  A second Lineage
+/// record, or records after a Succession, are refused as in an open.
+pub fn lineage_in(dir: &std::path::Path) -> Result<Option<LineageRecord>, VesselError> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let frames = crate::chronicle::read_log(dir)?;
+    if frames.is_empty() {
+        return Ok(None);
+    }
+    read_lineage(&frames).map(|(lineage, _)| Some(lineage))
+}
+
 /// The Lineage record (lsn 1) and the Succession record, if it ends the
 /// Chronicle.  Refuses a second Lineage and anything after a Succession.
 fn read_lineage(
@@ -2273,6 +2295,27 @@ pub(crate) mod tests {
                 )
             );
         }
+    }
+
+    /// What a node's inventory reads (F6 step 3b): a fork's parent from its
+    /// local log, without the coordinator; none for a void birth, nothing
+    /// for a Vessel with no local log.
+    #[test]
+    fn lineage_in_reads_a_forks_parent_from_its_local_log() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s = seal(&mut p);
+        let child = e.host.fork(&p, s, b"child").unwrap();
+        let (pid, cid) = (p.id(), child.id());
+        drop(child);
+        drop(p);
+        let l = lineage_in(&e.host.dir_for(cid)).unwrap().unwrap();
+        assert_eq!(l.origin.parent().map(|x| x.chronicle), Some(pid));
+        let l = lineage_in(&e.host.dir_for(pid)).unwrap().unwrap();
+        assert_eq!(l.origin, Origin::Void);
+        let nobody = vessel_id(ns(1), b"nobody");
+        assert_eq!(lineage_in(&e.host.dir_for(nobody)).unwrap(), None);
     }
 
     // ── fork ────────────────────────────────────────────────────────

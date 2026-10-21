@@ -16,17 +16,29 @@
 //! - **One entry per Vessel id**, and a slot range that fits above the
 //!   node's `host_uid_base`.
 //! - **No two Vessels share a uid slot** — not at once, and not over time:
-//!   a slot once admitted for one Vessel stays bound to it, also after that
-//!   Vessel is removed (its files on the node are owned by that range).
-//!   "Over time" spans Warden restarts: a guard starts [`Guard::seeded`]
-//!   with what the node's pool says ([`Held`]: which range owns each
-//!   Vessel's files), so a newcomer never takes a slot whose range owns
-//!   another Vessel's files, whichever entry a new Warden sees first.  A
-//!   Vessel whose files belong to more than one range is never run, and
-//!   none of those slots is given to anyone else.
+//!   a slot whose range owns files on the node stays reserved for them,
+//!   also after their Vessel is removed.  "Over time" spans Warden
+//!   restarts: a guard starts [`Guard::seeded`] with what the node's pool
+//!   says ([`Held`]: which range owns each Vessel's files, and each
+//!   Vessel's parent from its local Chronicle), so a newcomer never takes a
+//!   slot whose range owns another Vessel's files, whichever entry a new
+//!   Warden sees first.  A Vessel whose files belong to more than one range
+//!   is never run, and none of those slots is given to anyone else.
+//! - **Files belong to a lineage, not to one Vessel** (fencing review F6,
+//!   decisions D2/D3 of 2026-10-21).  A fork or succession in another slot
+//!   runs over its parent's files through an idmapped mount, so its files
+//!   stay owned by its lineage's range.  One range may hold files of
+//!   several Vessels if they are **one lineage** (joined by their
+//!   Chronicles' single Lineage record: trees, never two parents); files of
+//!   two lineages on one range block it and all of them, as before.  A fork
+//!   whose parent is not on this node is a lineage of its own here, so it
+//!   can only be blocked by this, never let into another's range.
 //! - **Immutable once admitted:** a Vessel's uid slot never changes for the
-//!   life of this Warden, also across a removal and a return (its dataset's
-//!   files are owned by its range); an entry that tries is refused.
+//!   life of this Warden, also across a removal and a return.  Across
+//!   restarts, the slot of a Vessel born from the void stays fixed (its
+//!   range owns its files); a fork's slot owns none of its files, so it
+//!   comes from its entry, and a fork may move to another free slot between
+//!   Warden lifetimes — the mount follows it, the files do not move.
 //! - **Deterministic:** when two new entries want the same slot, the one with
 //!   the smaller Vessel id gets it, whatever order the source lists them in.
 //! - **A bad entry hurts only itself:** a new entry that fails is not
@@ -135,6 +147,9 @@ pub struct Held {
     pub key: VesselKey,
     /// The slots owning its files.
     pub slots: std::collections::BTreeSet<u32>,
+    /// Its parent, if it is a fork or succession whose local Chronicle
+    /// names one (`None`: born from the void, or not known here).
+    pub parent: Option<VesselKey>,
 }
 
 /// Checks every set a source reports (see the module docs).
@@ -161,11 +176,16 @@ impl Guard {
 
     /// A guard that starts from what the node holds (see the module docs):
     ///
-    /// - a Vessel whose files belong to one slot is bound to it;
     /// - a Vessel whose files belong to several slots is blocked, and so
     ///   are those slots (whose files they are cannot be told);
-    /// - a slot owning the files of two Vessels is blocked, and so are both
-    ///   Vessels.
+    /// - Vessels joined by [`Held::parent`] are one **lineage**; a slot
+    ///   owning files of two lineages is blocked, and so are all of them;
+    /// - a slot owning files of one lineage is reserved for its topmost
+    ///   owner there (the one whose parent owns no files of that slot, or
+    ///   is not on this node): no newcomer gets it.  If that owner was born
+    ///   from the void it is also bound to the slot (fixed, as before);
+    ///   a fork's own slot comes from its entry (D3: its files' range is its
+    ///   lineage's, so its slot owns none of them).
     pub fn seeded(runtime: RuntimeConf, held: Vec<Held>) -> Self {
         let mut g = Self {
             runtime,
@@ -175,6 +195,27 @@ impl Guard {
             blocked_keys: BTreeMap::new(),
             blocked_slots: BTreeMap::new(),
         };
+        // Lineages: Vessels joined by parent edges among those held here.
+        // A Vessel has one parent (its Chronicle's single Lineage record),
+        // so these are trees; the root's key names each one.
+        let parent_of: BTreeMap<VesselKey, VesselKey> = held
+            .iter()
+            .filter_map(|h| h.parent.map(|p| (h.key, p)))
+            .collect();
+        let here: std::collections::BTreeSet<VesselKey> = held.iter().map(|h| h.key).collect();
+        let lineage_of = |k: VesselKey| {
+            let mut k = k;
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(&p) = parent_of.get(&k) {
+                if !here.contains(&p) || !seen.insert(k) {
+                    break; // the parent is elsewhere, or a cycle (refused below)
+                }
+                k = p;
+            }
+            k
+        };
+        let absent_parent = |k: &VesselKey| parent_of.get(k).is_some_and(|p| !here.contains(p));
+
         let mut owners: BTreeMap<u32, Vec<VesselKey>> = BTreeMap::new();
         for h in &held {
             for s in &h.slots {
@@ -202,30 +243,45 @@ impl Guard {
             }
         }
         for (slot, keys) in &owners {
-            if keys.len() > 1 {
+            let lineages: std::collections::BTreeSet<VesselKey> =
+                keys.iter().map(|k| lineage_of(*k)).collect();
+            // The topmost owners: whose parent owns no files of this slot.
+            let top: Vec<VesselKey> = keys
+                .iter()
+                .copied()
+                .filter(|k| parent_of.get(k).is_none_or(|p| !keys.contains(p)))
+                .collect();
+            if lineages.len() > 1 || top.len() != 1 {
                 g.blocked_slots.insert(
                     *slot,
                     format!(
-                        "uid slot {slot} owns files of {} Vessels on this node",
+                        "uid slot {slot} owns files of {} Vessels on this node, not of one lineage",
                         keys.len()
                     ),
                 );
                 for k in keys {
-                    g.blocked_keys.insert(
-                        *k,
+                    let why = if absent_parent(k) {
                         format!(
-                            "its uid slot {slot} also owns another Vessel's files on this node"
-                        ),
-                    );
+                            "its uid slot {slot} also owns another Vessel's files on this node, \
+                             of another lineage (its parent is not on this node)"
+                        )
+                    } else {
+                        format!(
+                            "its uid slot {slot} also owns another Vessel's files on this node, \
+                             of another lineage"
+                        )
+                    };
+                    g.blocked_keys.insert(*k, why);
                 }
+                continue;
             }
-        }
-        for h in held {
-            if let (1, Some(&s)) = (h.slots.len(), h.slots.first()) {
-                if !g.blocked_keys.contains_key(&h.key) {
-                    g.bound.insert(h.key, s);
-                    g.slots.insert(s, h.key);
-                }
+            let k = top[0];
+            if g.blocked_keys.contains_key(&k) {
+                continue;
+            }
+            g.slots.insert(*slot, k);
+            if !parent_of.contains_key(&k) {
+                g.bound.insert(k, *slot);
             }
         }
         g
@@ -576,6 +632,15 @@ mod tests {
         Held {
             key: *vc(subject, 0).id().as_bytes(),
             slots: slots.iter().copied().collect(),
+            parent: None,
+        }
+    }
+
+    /// A fork of `parent` (by subject) whose dataset holds files of `slots`.
+    fn forked(subject: &str, slots: &[u32], parent: &str) -> Held {
+        Held {
+            parent: Some(*vc(parent, 0).id().as_bytes()),
+            ..held(subject, slots)
         }
     }
 
@@ -630,6 +695,138 @@ mod tests {
         );
         // Also at the slot it does not ask for.
         assert!(g.admit(vec![vc("mixed", 3)]).set.is_empty());
+    }
+
+    // ── lineages (fencing review F6 step 3b, decisions D2/D3) ─────────
+    //
+    // A fork in another slot runs idmapped over its lineage's range, so
+    // its files are owned by that range, not by its own slot.  Predictions
+    // written before the code (2026-10-21): B1-B6.
+
+    /// B1: a parent in slot 1 and its child in slot 2, both datasets owned
+    /// by range 1, after a restart: neither is blocked; slot 1 stays the
+    /// parent's; the child runs in the slot its entry names.
+    #[test]
+    fn a_parent_and_its_cross_slot_child_share_a_range_unblocked() {
+        let seed = || vec![held("parent", &[1]), forked("child", &[1], "parent")];
+        let mut g = Guard::seeded(runtime(), seed());
+        let a = g.admit(vec![vc("parent", 1), vc("child", 2)]);
+        assert_eq!(
+            subjects(&a),
+            vec![("child".to_string(), 2), ("parent".to_string(), 1)],
+            "{:?}",
+            a.refused
+        );
+        // Range 1 is still reserved: no newcomer gets it.
+        let mut g = Guard::seeded(runtime(), seed());
+        let a = g.admit(vec![vc("parent", 1), vc("child", 2), vc("newcomer", 1)]);
+        assert_eq!(reasons(&a), vec![("newcomer".to_string(), false)]);
+        // The root's slot is fixed as before; the fork's is its entry's.
+        let mut g = Guard::seeded(runtime(), seed());
+        let a = g.admit(vec![vc("parent", 3), vc("child", 4)]);
+        assert_eq!(
+            subjects(&a),
+            vec![("child".to_string(), 4)],
+            "{:?}",
+            a.refused
+        );
+        assert!(a.refused[0]
+            .reason
+            .contains("uid_slot is fixed once admitted"));
+    }
+
+    /// B2: the same two datasets with no lineage between them: both blocked,
+    /// and the slot, as before F6.
+    #[test]
+    fn two_unrelated_vessels_on_one_range_are_still_blocked() {
+        let mut g = Guard::seeded(runtime(), vec![held("a", &[1]), held("b", &[1])]);
+        let a = g.admit(vec![vc("a", 1), vc("b", 2)]);
+        assert!(a.set.is_empty(), "{a:?}");
+        // A fork of a third Vessel that is not on this node does not join
+        // them either.
+        let mut g = Guard::seeded(
+            runtime(),
+            vec![held("a", &[1]), forked("b", &[1], "elsewhere")],
+        );
+        assert!(g.admit(vec![vc("a", 1), vc("b", 2)]).set.is_empty());
+    }
+
+    /// B3: a grandchild belongs to the same lineage.
+    #[test]
+    fn a_grandchild_groups_with_its_lineage() {
+        let mut g = Guard::seeded(
+            runtime(),
+            vec![
+                forked("grandchild", &[1], "child"),
+                held("parent", &[1]),
+                forked("child", &[1], "parent"),
+            ],
+        );
+        let a = g.admit(vec![vc("parent", 1), vc("child", 2), vc("grandchild", 3)]);
+        assert_eq!(a.set.len(), 3, "{:?}", a.refused);
+    }
+
+    /// B4: a child reborn alone (its parent is not on this node).  With an
+    /// unrelated Vessel on its range: both blocked, and the child's reason
+    /// says its parent is not here.  Alone: it runs in its entry's slot, and
+    /// its range is reserved for it.
+    #[test]
+    fn a_child_reborn_alone_fails_safe() {
+        let mut g = Guard::seeded(
+            runtime(),
+            vec![forked("child", &[1], "parent"), held("stranger", &[1])],
+        );
+        let a = g.admit(vec![vc("child", 2), vc("stranger", 1)]);
+        assert!(a.set.is_empty(), "{a:?}");
+        let child = a.refused.iter().find(|r| r.subject == "child").unwrap();
+        assert!(
+            child.reason.contains("parent is not on this node"),
+            "{}",
+            child.reason
+        );
+
+        let mut g = Guard::seeded(runtime(), vec![forked("child", &[1], "parent")]);
+        let a = g.admit(vec![vc("child", 2), vc("newcomer", 1)]);
+        assert_eq!(
+            subjects(&a),
+            vec![("child".to_string(), 2)],
+            "{:?}",
+            a.refused
+        );
+        assert_eq!(reasons(&a), vec![("newcomer".to_string(), false)]);
+    }
+
+    /// B6: one lineage owning two ranges: the parent prepared range 1, a
+    /// child forked from its birth Seal prepared range 2 (D2), and that
+    /// child's own child runs idmapped over range 2.  Each range is
+    /// reserved for its preparer; nothing is blocked.
+    #[test]
+    fn a_lineage_may_own_several_ranges() {
+        let seed = || {
+            vec![
+                held("parent", &[1]),
+                forked("own", &[2], "parent"),
+                forked("grandchild", &[2], "own"),
+            ]
+        };
+        let mut g = Guard::seeded(runtime(), seed());
+        let a = g.admit(vec![vc("parent", 1), vc("own", 2), vc("grandchild", 3)]);
+        assert_eq!(a.set.len(), 3, "{:?}", a.refused);
+        // Neither range goes to a newcomer, nor to another member.
+        let mut g = Guard::seeded(runtime(), seed());
+        let a = g.admit(vec![
+            vc("parent", 1),
+            vc("own", 2),
+            vc("grandchild", 1),
+            vc("newcomer", 2),
+        ]);
+        assert_eq!(
+            reasons(&a),
+            vec![
+                ("grandchild".to_string(), false),
+                ("newcomer".to_string(), false)
+            ]
+        );
     }
 
     #[test]
