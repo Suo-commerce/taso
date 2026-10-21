@@ -14,9 +14,11 @@
 #   2. running    the good Vessels (two namespaces) reach Running, their
 #                 agents run and seal turns (snapshots on their datasets)
 #   3. refused    D1 (tenant of another namespace, an unmapped namespace),
-#                 D2 (rootfs through a symlink out of rootfs_dir), D3
-#                 (takeover), limits, Landlock off, a uid slot already bound:
-#                 each Refused with its reason; nothing runs for them
+#                 D2 (rootfs through a symlink out of rootfs_dir), D3 (a
+#                 takeover for a Vessel nobody holds: the source passes it
+#                 on, the daemon refuses it, 2026-10-21), limits, Landlock
+#                 off, a uid slot already bound: each Refused with its
+#                 reason; nothing runs for them
 #   4. elsewhere  a Vessel of another node: no status, nothing runs
 #   5. deleted    a deleted Vessel's agent is stopped and not started again;
 #                 the others run on
@@ -262,12 +264,13 @@ check_refused() {   # ns name reason-part sleep-ms
 }
 check_refused team-a wrong-tenant 'not the tenant of namespace "team-a"' 110
 [ "$refused_ok" = 1 ] && check_refused team-c unmapped 'not mapped to a tenant' 111
-[ "$refused_ok" = 1 ] && check_refused team-a takeover 'F1/F2' 112
+# D3: the reason is the daemon's, so the source passed the takeover on.
+[ "$refused_ok" = 1 ] && check_refused team-a takeover 'nobody holds the Vessel' 112
 [ "$refused_ok" = 1 ] && check_refused team-a escape 'not inside this node' 113
 [ "$refused_ok" = 1 ] && check_refused team-a bigmem 'this node allows 1 to 1073741824' 114
 [ "$refused_ok" = 1 ] && check_refused team-a no-landlock 'does not allow agents without Landlock' 115
 [ "$refused_ok" = 1 ] && check_refused team-b clash 'uid_slot 1 is bound to another Vessel' 116
-[ "$refused_ok" = 1 ] && pass refused "D1 x2, D2 symlink escape, D3 takeover, memory, Landlock off, a bound uid slot: each Refused with its reason, none ran"
+[ "$refused_ok" = 1 ] && pass refused "D1 x2, D2 symlink escape, D3 takeover of an unheld Vessel (by the daemon), memory, Landlock off, a bound uid slot: each Refused with its reason, none ran"
 [ -n "$(ls -A "$WORK/outside")" ] && fail refused "something was written through the escaping symlink"
 
 # ── 4. elsewhere ──────────────────────────────────────────────────────
