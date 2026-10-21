@@ -505,7 +505,7 @@ fn authorization(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn aws_example() -> S3Config {
@@ -676,139 +676,46 @@ mod tests {
     /// `openssl` or `python3` is missing.
     #[test]
     fn https_trusts_exactly_the_given_ca() {
-        use std::process::{Command, Stdio};
-        let have = |c: &str| {
-            Command::new(c)
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok()
-        };
-        if !have("openssl") || !have("python3") {
+        if !have_tools() {
             eprintln!("skipped: needs openssl and python3");
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let p = |n: &str| dir.path().join(n).to_string_lossy().into_owned();
-        let sh = |args: &[&str]| {
-            assert!(
-                Command::new("openssl")
-                    .args(args)
-                    .stderr(Stdio::null())
-                    .status()
-                    .unwrap()
-                    .success(),
-                "{args:?}"
-            )
-        };
-        for ca in ["ca", "other"] {
-            sh(&[
-                "req",
-                "-x509",
-                "-newkey",
-                "ec",
-                "-pkeyopt",
-                "ec_paramgen_curve:P-256",
-                "-nodes",
-                "-days",
-                "2",
-                "-subj",
-                &format!("/CN=taso test {ca}"),
-                "-keyout",
-                &p(&format!("{ca}.key")),
-                "-out",
-                &p(&format!("{ca}.pem")),
-            ]);
-        }
-        sh(&[
-            "req",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-subj",
-            "/CN=localhost",
-            "-keyout",
-            &p("srv.key"),
-            "-out",
-            &p("srv.csr"),
-        ]);
-        std::fs::write(p("ext"), "subjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
-        sh(&[
-            "x509",
-            "-req",
-            "-in",
-            &p("srv.csr"),
-            "-CA",
-            &p("ca.pem"),
-            "-CAkey",
-            &p("ca.key"),
-            "-CAcreateserial",
-            "-days",
-            "2",
-            "-extfile",
-            &p("ext"),
-            "-out",
-            &p("srv.pem"),
-        ]);
-        // A server that answers every HEAD with 404 (the key does not exist).
-        let server = format!(
+        // Every HEAD is answered 404 (the key does not exist).
+        let srv = TestServer::start(
+            true,
             r#"
-import http.server, ssl, sys
 class H(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a): pass
-s = http.server.HTTPServer(("127.0.0.1", 0), H)
-c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain("{}", "{}")
-s.socket = c.wrap_socket(s.socket, server_side=True)
-print(s.server_address[1], flush=True)
-s.serve_forever()
 "#,
-            p("srv.pem"),
-            p("srv.key")
         );
-        let mut child = Command::new("python3")
-            .args(["-c", &server])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut port = String::new();
-        std::io::BufRead::read_line(
-            &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
-            &mut port,
-        )
-        .unwrap();
         let store = |ca: Option<&str>| {
             S3Store::new(
                 S3Config {
-                    endpoint: format!("https://localhost:{}", port.trim()),
+                    endpoint: format!("https://localhost:{}", srv.port),
                     region: "garage".into(),
                     bucket: "taso".into(),
-                    ca_file: ca.map(|c| dir.path().join(c)),
+                    ca_file: ca.map(|c| srv.dir.path().join(c)),
                     ..aws_example()
                 },
                 Duration::from_secs(5),
             )
             .unwrap()
         };
-        let trusted = store(Some("ca.pem")).exists("a/b");
-        let public_roots = store(None).exists("a/b");
-        let other = store(Some("other.pem")).exists("a/b");
-        let _ = child.kill();
-        let _ = child.wait();
         assert!(
-            !trusted.unwrap(),
+            !store(Some("ca.pem")).exists("a/b").unwrap(),
             "with its CA: a 404 answer, so the key does not exist"
         );
         assert!(
-            public_roots.is_err(),
+            store(None).exists("a/b").is_err(),
             "the public roots do not know a private CA"
         );
-        assert!(other.is_err(), "another CA is not trusted");
-        let empty = dir.path().join("empty.pem");
+        assert!(
+            store(Some("other.pem")).exists("a/b").is_err(),
+            "another CA is not trusted"
+        );
+        let empty = srv.dir.path().join("empty.pem");
         std::fs::write(&empty, "").unwrap();
         assert!(
             tls_trusting(&empty).is_err(),
@@ -816,6 +723,110 @@ s.serve_forever()
         );
     }
 
+    /// PUT, GET, HEAD and a paged list against a local S3 stand-in (plain
+    /// HTTP), and the store's error answers: a missing key is `None` /
+    /// `false`, a refusal carries the store's `<Code>`, and the payload
+    /// hash header matches the body.  What the ignored Garage test checks
+    /// against a real store, here on every run.
+    #[test]
+    fn talks_s3_to_a_local_server() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = TestServer::start(
+            false,
+            r#"
+import hashlib, urllib.parse
+objs = {}
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def reply(self, code, body=b"", ctype="application/xml"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD": self.wfile.write(body)
+    def error(self, code, name):
+        self.reply(code, ("<Error><Code>%s</Code><Message>m</Message></Error>" % name).encode())
+    def key(self):
+        u = urllib.parse.urlparse(self.path)
+        parts = urllib.parse.unquote(u.path).split("/", 2)
+        return parts[1], (parts[2] if len(parts) > 2 else ""), urllib.parse.parse_qs(u.query)
+    def signed(self):
+        a = self.headers.get("authorization", "")
+        return a.startswith("AWS4-HMAC-SHA256 Credential=") and self.headers.get("x-amz-date")
+    def do_PUT(self):
+        b, k, _ = self.key()
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        if not self.signed(): return self.error(403, "AccessDenied")
+        if k.startswith("deny/"): return self.error(403, "AccessDenied")
+        if self.headers.get("x-amz-content-sha256") != hashlib.sha256(body).hexdigest():
+            return self.error(400, "XAmzContentSHA256Mismatch")
+        objs[k] = body
+        self.reply(200)
+    def do_HEAD(self):
+        b, k, _ = self.key()
+        self.reply(200 if k in objs else 404)
+    def do_GET(self):
+        b, k, q = self.key()
+        if k == "" and q.get("list-type") == ["2"]:
+            prefix = q.get("prefix", [""])[0]
+            keys = sorted(x for x in objs if x.startswith(prefix))
+            start = int(q.get("continuation-token", ["0"])[0])
+            page = keys[start:start + 2]
+            more = start + 2 < len(keys)
+            xml = "<ListBucketResult>" + "".join("<Contents><Key>%s</Key></Contents>" % x for x in page)
+            xml += "<IsTruncated>%s</IsTruncated>" % ("true" if more else "false")
+            if more: xml += "<NextContinuationToken>%d</NextContinuationToken>" % (start + 2)
+            return self.reply(200, (xml + "</ListBucketResult>").encode())
+        if k not in objs: return self.error(404, "NoSuchKey")
+        self.reply(200, objs[k], "application/octet-stream")
+    def log_message(self, *a): pass
+"#,
+        );
+        let store = S3Store::new(
+            S3Config {
+                endpoint: format!("http://127.0.0.1:{}", srv.port),
+                region: "garage".into(),
+                bucket: "taso".into(),
+                ..aws_example()
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(!store.exists("d/a").unwrap(), "missing: false");
+        assert!(store.get("d/a").unwrap().is_none(), "missing: None");
+        assert_eq!(store.put("d/a", &mut &b"hello"[..]).unwrap(), 5);
+        let big: Vec<u8> = (0..300_000u32).map(|i| i as u8).collect();
+        store.put("d/sub/b", &mut &big[..]).unwrap();
+        store.put("d/c", &mut &b""[..]).unwrap();
+        assert!(store.exists("d/a").unwrap());
+        let mut got = Vec::new();
+        store
+            .get("d/sub/b")
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, big, "a large object, read back whole");
+        assert_eq!(
+            store.list("d").unwrap(),
+            vec!["d/a".to_string(), "d/c".into(), "d/sub/b".into()],
+            "three keys over two pages"
+        );
+        let e = store.put("deny/x", &mut &b"x"[..]).unwrap_err();
+        assert!(
+            e.to_string().contains("HTTP 403 AccessDenied"),
+            "the store's code is reported: {e}"
+        );
+        drop(srv);
+        assert_eq!(
+            store.exists("d/a").unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted,
+            "no server: a transport error"
+        );
+    }
     /// The same contract tests as `LocalStore`, against a real Garage:
     /// set TASO_S3_ENDPOINT, TASO_S3_BUCKET, TASO_S3_KEY_ID, TASO_S3_SECRET
     /// (TASO_S3_REGION defaults to `garage`).
@@ -881,5 +892,134 @@ s.serve_forever()
         let e = wrong.put(&k("c"), &mut &b"x"[..]).unwrap_err();
         println!("a wrong secret: {e}");
         assert!(!store.exists(&k("c")).unwrap());
+    }
+
+    /// Whether the tools the local-server tests need are here.
+    pub(crate) fn have_tools() -> bool {
+        use std::process::{Command, Stdio};
+        ["openssl", "python3"].iter().all(|c| {
+            Command::new(c)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok()
+        })
+    }
+
+    /// A local test server: Python's `http.server` with the handler class
+    /// `H` given as source, on 127.0.0.1 and a free port.  With `tls`, it
+    /// speaks HTTPS with a certificate for `localhost` and 127.0.0.1 signed
+    /// by a private CA (`ca.pem` in `dir`); `other.pem` is a second,
+    /// unrelated CA.  Stopped when dropped.
+    pub(crate) struct TestServer {
+        pub(crate) dir: tempfile::TempDir,
+        pub(crate) port: u16,
+        child: std::process::Child,
+    }
+
+    impl TestServer {
+        pub(crate) fn start(tls: bool, handler: &str) -> Self {
+            use std::process::{Command, Stdio};
+            let dir = tempfile::tempdir().unwrap();
+            let p = |n: &str| dir.path().join(n).to_string_lossy().into_owned();
+            let sh = |args: &[&str]| {
+                assert!(
+                    Command::new("openssl")
+                        .args(args)
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "{args:?}"
+                )
+            };
+            let wrap = if tls {
+                for ca in ["ca", "other"] {
+                    sh(&[
+                        "req",
+                        "-x509",
+                        "-newkey",
+                        "ec",
+                        "-pkeyopt",
+                        "ec_paramgen_curve:P-256",
+                        "-nodes",
+                        "-days",
+                        "2",
+                        "-subj",
+                        &format!("/CN=taso test {ca}"),
+                        "-keyout",
+                        &p(&format!("{ca}.key")),
+                        "-out",
+                        &p(&format!("{ca}.pem")),
+                    ]);
+                }
+                sh(&[
+                    "req",
+                    "-newkey",
+                    "ec",
+                    "-pkeyopt",
+                    "ec_paramgen_curve:P-256",
+                    "-nodes",
+                    "-subj",
+                    "/CN=localhost",
+                    "-keyout",
+                    &p("srv.key"),
+                    "-out",
+                    &p("srv.csr"),
+                ]);
+                std::fs::write(p("ext"), "subjectAltName=DNS:localhost,IP:127.0.0.1\n").unwrap();
+                sh(&[
+                    "x509",
+                    "-req",
+                    "-in",
+                    &p("srv.csr"),
+                    "-CA",
+                    &p("ca.pem"),
+                    "-CAkey",
+                    &p("ca.key"),
+                    "-CAcreateserial",
+                    "-days",
+                    "2",
+                    "-extfile",
+                    &p("ext"),
+                    "-out",
+                    &p("srv.pem"),
+                ]);
+                format!(
+                    "import ssl\nc = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain({:?}, {:?})\ns.socket = c.wrap_socket(s.socket, server_side=True)\n",
+                    p("srv.pem"),
+                    p("srv.key")
+                )
+            } else {
+                String::new()
+            };
+            let script = format!(
+                "import http.server\n{handler}\ns = http.server.HTTPServer((\"127.0.0.1\", 0), H)\n{wrap}print(s.server_address[1], flush=True)\ns.serve_forever()\n"
+            );
+            let mut child = Command::new("python3")
+                .args(["-c", &script])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut port = String::new();
+            std::io::BufRead::read_line(
+                &mut std::io::BufReader::new(child.stdout.as_mut().unwrap()),
+                &mut port,
+            )
+            .unwrap();
+            let port = port.trim().parse().unwrap_or_else(|_| {
+                let _ = child.kill();
+                panic!("the test server did not start: {port:?}")
+            });
+            Self { dir, port, child }
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
