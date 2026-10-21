@@ -1785,5 +1785,170 @@ while read a b c; do echo "uidmap $a $b $c" >> $o; done < /proc/self/uid_map
             }
             drop(disk);
         }
+        /// F6 step 4: the attack on step 2's setup.  A child in slot B,
+        /// running over files its parent in slot A left, tries to act as
+        /// the parent or as anyone else through the idmapped `/work`.  The
+        /// kernel refuses (Taso is not a sandbox: no syscall is intercepted);
+        /// the test records each attempt's error and checks that it is the
+        /// refusal it should be, never a missing tool.  Predictions (written
+        /// before the first run, 2026-10-21):
+        ///
+        /// - X1 `chown` to its own 1000 (on disk the parent's A+1000):
+        ///   refused, no `CAP_CHOWN` ("Operation not permitted").
+        /// - X2 `chown` to an id outside its user namespace (70000):
+        ///   refused ("Invalid argument": not mappable).
+        /// - X3 `setpriv --reuid 1000`: refused, no `CAP_SETUID`.
+        /// - X4 `setpriv --reuid 70000`: refused (not mappable, and no
+        ///   capability).
+        /// - X5 `mknod` a character device: refused (no `CAP_MKNOD`).
+        /// - X6 a setuid program the parent left (owned A+1000 on disk,
+        ///   mode 4755) runs as the child's root, not as its owner
+        ///   (`nosuid`): `id -u` prints 0, `id -un`'s effective is not 1000.
+        /// - X7 afterwards on disk: nothing re-owned (the child's file is
+        ///   A+0, the parent's files as they were), no device node.
+        #[test]
+        #[ignore = "needs runc, root, mkfs.ext4 and a loop device"]
+        fn a_fork_cannot_act_as_its_parent_through_the_mount() {
+            const A: u32 = 200_000 + ID_RANGE; // slot 1: the parent
+            const B: u32 = 200_000 + 2 * ID_RANGE; // slot 2: the child
+
+            let dir = tempfile::tempdir().unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let rootfs = dir.path().join("rootfs");
+            tiny_rootfs(&rootfs);
+            for prog in [
+                "/usr/bin/stat",
+                "/usr/bin/chown",
+                "/usr/bin/setpriv",
+                "/usr/bin/mknod",
+                "/usr/bin/id",
+            ] {
+                add_binary(&rootfs, prog);
+            }
+            let disk = LoopFs::new(&dir.path().join("disk.img"), &dir.path().join("disk"));
+            let work = disk.mnt.clone();
+
+            // The parent's files, as in step 2, and a setuid program of its
+            // user 1000 (a copy of `id`, its libraries are in the rootfs).
+            let own = |p: &Path, id: u32, mode: u32| {
+                std::os::unix::fs::chown(p, Some(id), Some(id)).unwrap();
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+            };
+            own(&work, A, 0o750);
+            std::fs::create_dir(work.join("home")).unwrap();
+            own(&work.join("home"), A + 1000, 0o755);
+            std::fs::write(work.join("home/notes"), b"parent\n").unwrap();
+            own(&work.join("home/notes"), A + 1000, 0o644);
+            std::fs::copy(
+                std::fs::canonicalize("/usr/bin/id").unwrap(),
+                work.join("home/suid-id"),
+            )
+            .unwrap();
+            own(&work.join("home/suid-id"), A + 1000, 0o4755);
+            let before: Vec<(PathBuf, u32, u32, u32)> = ["", "home", "home/notes", "home/suid-id"]
+                .iter()
+                .map(|r| {
+                    let m = std::fs::symlink_metadata(work.join(r)).unwrap();
+                    (work.join(r), m.uid(), m.gid(), m.mode())
+                })
+                .collect();
+
+            let sock = dir.path().join("field.sock");
+            let _listener = UnixListener::bind(&sock).unwrap();
+            let agent = r#"
+o=/work/attack
+: > $o
+for t in stat chown setpriv mknod id; do command -v $t >/dev/null || echo "missing $t" >> $o; done
+attempt() {
+    name=$1; shift
+    if "$@" 2>/work/err; then echo "$name allowed" >> $o
+    else e=; read -r e < /work/err || true; echo "$name refused: $e" >> $o; fi
+}
+echo child > /work/new
+attempt X1 chown 1000:1000 /work/new
+attempt X2 chown 70000:70000 /work/new
+attempt X3 setpriv --reuid=1000 --regid=1000 --clear-groups true
+attempt X4 setpriv --reuid=70000 --regid=70000 --clear-groups true
+attempt X5 mknod /work/dev c 1 3
+echo "X6 $(/work/home/suid-id -u) $(/work/home/suid-id -ru)" >> $o
+echo "new $(stat -c %u:%g /work/new)" >> $o
+"#;
+            let spec = VesselSpec {
+                id: format!("taso-f6x-{}", std::process::id()),
+                rootfs,
+                work: work.clone(),
+                socket: sock,
+                host_uid_base: B,
+                disk_uid_base: Some(A),
+                args: vec!["/bin/sh".into(), "-c".into(), agent.into()],
+                env: vec![],
+                landlock_shim: None,
+                memory_bytes: Some(256 << 20),
+                pids: Some(64),
+            };
+            let bundle = dir.path().join("bundle");
+            write_bundle(&bundle, &spec).unwrap();
+            let runc = Runc::new(RuncCli::new(dir.path().join("runc-state")));
+            let (ok, err) = runc.run(&bundle, &spec.id).unwrap();
+            let _ = runc.delete(&spec.id);
+            assert!(ok, "the agent failed: {err}");
+
+            let out = std::fs::read_to_string(work.join("attack")).unwrap();
+            println!("inside the Vessel:\n{out}");
+            assert!(
+                !out.contains("missing "),
+                "test setup: a tool does not run inside the Vessel:\n{out}"
+            );
+            let line = |k: &str| {
+                out.lines()
+                    .find(|l| l.starts_with(&format!("{k} ")))
+                    .unwrap_or_else(|| panic!("no {k} line in:\n{out}"))
+                    .to_string()
+            };
+            let refused = |k: &str, why: &[&str]| {
+                let l = line(k);
+                assert!(
+                    l.starts_with(&format!("{k} refused: ")),
+                    "{k} was not refused: {l}"
+                );
+                assert!(
+                    why.iter().any(|w| l.contains(w)),
+                    "{k} refused for another reason: {l}"
+                );
+            };
+            const EPERM: &str = "Operation not permitted";
+            const EINVAL: &str = "Invalid argument";
+            refused("X1", &[EPERM]);
+            refused("X2", &[EINVAL, EPERM]);
+            refused("X3", &[EPERM]);
+            refused("X4", &[EINVAL, EPERM]);
+            refused("X5", &[EPERM]);
+            assert_eq!(
+                line("X6"),
+                "X6 0 0",
+                "X6: the parent's setuid bit must not apply"
+            );
+            assert_eq!(line("new"), "new 0:0");
+
+            // X7: on disk, nothing re-owned, no device node.
+            let new = std::fs::metadata(work.join("new")).unwrap();
+            assert_eq!(
+                (new.uid(), new.gid()),
+                (A, A),
+                "X7: the child's file is the parent's range"
+            );
+            assert!(!work.join("dev").exists(), "X7: no device node");
+            for (p, uid, gid, mode) in &before {
+                let m = std::fs::symlink_metadata(p).unwrap();
+                assert_eq!(
+                    (m.uid(), m.gid(), m.mode()),
+                    (*uid, *gid, *mode),
+                    "X7: {} changed",
+                    p.display()
+                );
+            }
+            drop(disk);
+        }
     }
 }
