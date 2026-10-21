@@ -42,6 +42,15 @@
 //!   which is accepted and stays; it is counted
 //!   ([`Session::after_seal_failures`]) and the next Seal's publish ships
 //!   from the last one that was named, so nothing is skipped for good.
+//! - **A failed publish is retried before an effect** (fencing review
+//!   F4b).  The log is never shipped past a Seal whose `fs` section is not
+//!   shipped (F4), so until that Seal is published every effect would be
+//!   refused (`SealNotShipped`) — for the rest of the turn.  So an
+//!   `Effect` request first runs the hook once more for that Seal; if it
+//!   lands, the effect proceeds, and if not, the failure is counted and
+//!   the effect is refused as before.  Once per request: no loop, no wait.
+//!   A later Seal published replaces the retry (a named Seal covers every
+//!   Seal before it).
 //! - A malformed body is answered with `Malformed` and the connection
 //!   continues (the frame boundary is intact); a broken frame or a socket
 //!   error ends the connection.
@@ -99,6 +108,9 @@ pub struct Session<'v, L: Layers> {
     last_after_seal_error: Option<String>,
     /// A Seal taken whose hook has not run yet (it runs after the reply).
     pending_seal: Option<Position>,
+    /// The newest Seal whose hook ran and failed: retried before the next
+    /// effect (F4b).  Cleared when a hook succeeds.
+    unpublished: Option<Position>,
 }
 
 impl<'v, L: Layers> Session<'v, L> {
@@ -128,6 +140,7 @@ impl<'v, L: Layers> Session<'v, L> {
             after_seal_failures: 0,
             last_after_seal_error: None,
             pending_seal: None,
+            unpublished: None,
         })
     }
 
@@ -171,10 +184,22 @@ impl<'v, L: Layers> Session<'v, L> {
         let Some(seal) = self.pending_seal.take() else {
             return;
         };
-        if let Some(hook) = self.after_seal.as_deref_mut() {
-            if let Err(e) = hook.after_seal(self.vessel, seal) {
+        self.run_hook(seal);
+    }
+
+    /// Run the after-Seal hook for `seal`.  A success clears the retry
+    /// (this Seal covers any earlier unpublished one); a failure is
+    /// counted and leaves `seal` to be retried before the next effect.
+    fn run_hook(&mut self, seal: Position) {
+        let Some(hook) = self.after_seal.as_deref_mut() else {
+            return;
+        };
+        match hook.after_seal(self.vessel, seal) {
+            Ok(()) => self.unpublished = None,
+            Err(e) => {
                 self.after_seal_failures += 1;
                 self.last_after_seal_error = Some(e);
+                self.unpublished = Some(seal);
             }
         }
     }
@@ -223,13 +248,22 @@ impl<'v, L: Layers> Session<'v, L> {
                     args,
                 },
             ) => {
-                let Some(fx) = self.effects.as_deref_mut() else {
+                if self.effects.is_none() {
                     return Reply::Effect {
                         call,
                         result: EffectResult::Refused {
                             reason: format!("no adapter for provider {provider:?}"),
                         },
                     };
+                }
+                // F4b: the log cannot ship past an unpublished Seal, so
+                // without this the effect would be refused until the next
+                // Seal.  One more try; a failure is refused below as before.
+                if let Some(seal) = self.unpublished {
+                    self.run_hook(seal);
+                }
+                let Some(fx) = self.effects.as_deref_mut() else {
+                    unreachable!("checked above")
                 };
                 let before = self.vessel.tail();
                 match fx.dispatch(self.vessel, &provider, Call { operation, args }) {
@@ -769,6 +803,165 @@ mod tests {
         assert_eq!(s.after_seal_failures(), (1, Some("store down")));
         drop(s);
         assert_eq!(v.last_seal().unwrap().lsn, Lsn::new(3), "the Seal stands");
+    }
+
+    /// F4b.  A publish that failed is retried before the next effect, and
+    /// the effect goes out if the retry lands.  The publisher refuses
+    /// while the Seal is unpublished, as `ship_log` does (F4).
+    #[test]
+    fn a_failed_publish_is_retried_before_an_effect() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        /// Fails the first `fails` calls; marks the Seal published after.
+        struct Flaky {
+            seen: Vec<Position>,
+            fails: u32,
+            published: Rc<Cell<bool>>,
+        }
+        impl<L: Layers> AfterSeal<L> for Flaky {
+            fn after_seal(&mut self, _: &mut Vessel<L>, seal: Position) -> Result<(), String> {
+                self.seen.push(seal);
+                if self.fails > 0 {
+                    self.fails -= 1;
+                    self.published.set(false);
+                    return Err("store down".into());
+                }
+                self.published.set(true);
+                Ok(())
+            }
+        }
+        /// Refuses to ship the log while the Seal is unpublished.
+        struct Strict(Rc<Cell<bool>>);
+        impl crate::effects::Publish for Strict {
+            fn publish(
+                &mut self,
+                _: taso_core::envelope::ChronicleId,
+                _: taso_core::envelope::Epoch,
+                _: &[&crate::segment::Segment],
+                _: Position,
+            ) -> Result<(), crate::effects::PublishError> {
+                if self.0.get() {
+                    Ok(())
+                } else {
+                    Err(crate::effects::PublishError(
+                        "pack: Seal not shipped".into(),
+                    ))
+                }
+            }
+        }
+        let mail = |call| Request::Effect {
+            call,
+            provider: "mail".into(),
+            operation: "send".into(),
+            args: b"bob".to_vec(),
+        };
+
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let published = Rc::new(Cell::new(true));
+        let mut reg = Registry::new();
+        reg.register(Box::new(FakeProvider::new("mail")));
+        let (mut fx, _) = Effects::open(reg, Box::new(Strict(published.clone())), &mut v).unwrap();
+        // Two failures: the publish after the reply, and the first retry.
+        let mut hook = Flaky {
+            seen: Vec::new(),
+            fails: 2,
+            published: published.clone(),
+        };
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_after_seal(&mut hook);
+        s.handle(hello());
+        let Reply::TurnEnd {
+            sealed: Some(seal), ..
+        } = s.handle(Request::TurnEnd {
+            turn: 1,
+            quiescent: true,
+        })
+        else {
+            panic!("turn 1 not sealed")
+        };
+        s.after_reply();
+        assert_eq!(s.after_seal_failures().0, 1);
+
+        // Retry fails: the effect is refused, as before F4b.
+        assert!(matches!(
+            s.handle(mail(1)),
+            Reply::Effect {
+                result: EffectResult::Refused { .. } | EffectResult::NotApplied { .. },
+                ..
+            }
+        ));
+        assert_eq!(s.after_seal_failures().0, 2);
+        // Retry lands: the effect goes out, in the same turn.
+        assert!(matches!(
+            s.handle(mail(2)),
+            Reply::Effect {
+                result: EffectResult::Applied { .. },
+                ..
+            }
+        ));
+        // Published: no more retries.
+        s.handle(mail(3));
+        assert_eq!(s.after_seal_failures().0, 2);
+        drop(s);
+        assert_eq!(
+            hook.seen.iter().map(|p| p.lsn.get()).collect::<Vec<_>>(),
+            vec![seal; 3],
+            "the same Seal each time, retried once per effect until it landed"
+        );
+    }
+
+    /// A later Seal published replaces the retry: an earlier Seal is never
+    /// published after a newer one.
+    #[test]
+    fn a_later_seal_replaces_the_retry() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut reg = Registry::new();
+        reg.register(Box::new(FakeProvider::new("mail")));
+        let (mut fx, _) =
+            Effects::open(reg, Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
+        let mut hook = Hook {
+            seen: Vec::new(),
+            fail: true,
+        };
+        {
+            let mut s = Session::new(&mut v, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx)
+                .with_after_seal(&mut hook);
+            s.handle(hello());
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true,
+            });
+            s.after_reply();
+            assert!(s.unpublished.is_some(), "turn 1's Seal awaits a retry");
+        }
+        hook.fail = false;
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_after_seal(&mut hook);
+        s.handle(hello());
+        s.handle(Request::TurnEnd {
+            turn: 2,
+            quiescent: true,
+        });
+        s.after_reply();
+        assert_eq!(s.unpublished, None);
+        s.handle(Request::Effect {
+            call: 1,
+            provider: "mail".into(),
+            operation: "send".into(),
+            args: b"bob".to_vec(),
+        });
+        drop(s);
+        let seen: Vec<u64> = hook.seen.iter().map(|p| p.lsn.get()).collect();
+        assert_eq!(seen.len(), 2, "turn 1 once (failed), turn 2 once: {seen:?}");
+        assert!(seen[1] > seen[0], "never back to the older Seal: {seen:?}");
     }
 
     /// Over a connection: the TurnEnd reply is written before the hook
