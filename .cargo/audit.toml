@@ -1,0 +1,16 @@
+# cargo audit: advisories known and left open on purpose.  Every entry
+# says why and what closes it; CI (.github/workflows/ci.yml) fails on any
+# advisory not listed here.  Remove an entry when its fix is merged.
+
+[advisories]
+ignore = [
+    # webpki-roots 0.26.11: bundled roots trust distrusted emSign
+    # intermediates.  Pulled by ureq 2.12.1 (the last 2.x), which pins
+    # webpki-roots 0.26; the fix (>= 1.0.10) needs ureq 3, an API change in
+    # taso-warden's S3 client.  Checked 2026-10-21: 0.26.11 is a 33-line
+    # shim, `pub use parent::TLS_SERVER_ROOTS` with parent = webpki-roots 1,
+    # which the lockfile holds at 1.0.10 — so the roots in use are the
+    # fixed ones and the advisory matches on the version string only.
+    # Open since 2026-10-21; closes with the ureq 3 move.
+    "RUSTSEC-2026-0381",
+]
