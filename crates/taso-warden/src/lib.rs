@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod bench;
 pub mod blk;
 pub mod chronicle;
 pub mod coordinator;
@@ -25,15 +26,14 @@ pub mod rebirth;
 pub mod runtime;
 pub mod s3;
 pub mod segment;
+pub mod ship;
 pub mod snapbatch;
 pub mod source;
 pub mod source_kube;
 pub mod status_kube;
 pub mod storage;
-pub mod supervisor;
 pub mod summary;
-pub mod ship;
+pub mod supervisor;
 pub mod timing;
-mod bench;
 pub mod vessel;
 pub mod zfs;

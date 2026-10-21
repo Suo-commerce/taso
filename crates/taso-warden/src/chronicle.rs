@@ -74,9 +74,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use taso_core::canon::Canonical;
-use taso_core::envelope::{BranchId, ChronicleHead, ChronicleId, Epoch, HashVal, Lsn, Stream, Envelope};
+use taso_core::envelope::{
+    BranchId, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream,
+};
 use taso_core::model::WardenId;
-use taso_core::record::{GapRecord, LayerRef, Payload, Record, SealRecord, StreamCut, TurnId, Verdict};
+use taso_core::record::{
+    GapRecord, LayerRef, Payload, Record, SealRecord, StreamCut, TurnId, Verdict,
+};
 
 use crate::coordinator::{Coord, CoordError};
 use crate::segment::{self, Frame, Position, Segment, SegmentError};
@@ -99,7 +103,12 @@ impl fmt::Display for Claim {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mine => f.write_str("mine"),
-            Self::TakeOver { from, epoch } => write!(f, "takeover from warden {} at epoch {}", from.get(), epoch.get()),
+            Self::TakeOver { from, epoch } => write!(
+                f,
+                "takeover from warden {} at epoch {}",
+                from.get(),
+                epoch.get()
+            ),
         }
     }
 }
@@ -279,10 +288,16 @@ impl fmt::Display for ChronicleError {
             Self::CheckFailed(why) => write!(f, "seal check failed: {why}"),
             Self::BadSegmentName(n) => write!(f, "{n} is not a segment file name"),
             Self::SegmentsDisagree { at, why } => {
-                write!(f, "the segment at lsn {} does not join the one before: {why}", at.get())
+                write!(
+                    f,
+                    "the segment at lsn {} does not join the one before: {why}",
+                    at.get()
+                )
             }
             Self::StateExists(p) => write!(f, "{} already exists", p.display()),
-            Self::Decode { lsn, error } => write!(f, "record at lsn {} does not decode: {error}", lsn.get()),
+            Self::Decode { lsn, error } => {
+                write!(f, "record at lsn {} does not decode: {error}", lsn.get())
+            }
             Self::NoLineage => write!(f, "the log has no Lineage record to checkpoint"),
             Self::GapPending { kept, head } => write!(
                 f,
@@ -466,7 +481,12 @@ impl<L: Layers> Chronicle<L> {
 
     /// The ownership `claim` stands for, for [`Coord::transfer_if`]: a
     /// takeover names it; `Mine` is this Warden at the epoch read now.
-    pub fn expected(coord: &dyn Coord, id: ChronicleId, warden: WardenId, claim: Claim) -> Result<(WardenId, Epoch), CoordError> {
+    pub fn expected(
+        coord: &dyn Coord,
+        id: ChronicleId,
+        warden: WardenId,
+        claim: Claim,
+    ) -> Result<(WardenId, Epoch), CoordError> {
         Ok(match claim {
             Claim::Mine => (warden, coord.ownership(id)?.epoch),
             Claim::TakeOver { from, epoch } => (from, epoch),
@@ -484,8 +504,11 @@ impl<L: Layers> Chronicle<L> {
     ) -> Result<(Self, Recovery), ChronicleError> {
         let lock = lock_dir(dir)?;
 
-        let expected = Self::expected(coord.as_ref(), id, warden, claim).map_err(ChronicleError::Coord)?;
-        let epoch = coord.transfer_if(id, warden, expected).map_err(ChronicleError::Coord)?;
+        let expected =
+            Self::expected(coord.as_ref(), id, warden, claim).map_err(ChronicleError::Coord)?;
+        let epoch = coord
+            .transfer_if(id, warden, expected)
+            .map_err(ChronicleError::Coord)?;
         let head = coord.head(id).map_err(ChronicleError::Coord)?;
 
         let files = list_segments(dir)?;
@@ -496,15 +519,26 @@ impl<L: Layers> Chronicle<L> {
             }
             None => return Err(ChronicleError::MissingSegment { anchored: head.lsn }),
             Some((last, older)) => {
-                let mut closed = older.iter().map(Segment::open_closed).collect::<Result<Vec<_>, _>>()?;
+                let mut closed = older
+                    .iter()
+                    .map(Segment::open_closed)
+                    .collect::<Result<Vec<_>, _>>()?;
                 let local = Segment::peek_tail(last)?;
                 if continue_gap && local.lsn < head.lsn {
                     // The head's records are not here.  Cut any torn tail,
                     // close this file, and start the continuation at the head.
-                    let at = ChronicleHead { lsn: local.lsn, hash: local.hash, epoch };
+                    let at = ChronicleHead {
+                        lsn: local.lsn,
+                        hash: local.hash,
+                        epoch,
+                    };
                     let (_, rec) = Segment::open(last, at)?;
                     closed.push(Segment::open_closed(last)?);
-                    let seg = Segment::create(dir.join(segment_name(head.lsn)), id, Position::from(head))?;
+                    let seg = Segment::create(
+                        dir.join(segment_name(head.lsn)),
+                        id,
+                        Position::from(head),
+                    )?;
                     (closed, seg, rec)
                 } else {
                     let (seg, rec) = Segment::open(last, head)?;
@@ -514,7 +548,10 @@ impl<L: Layers> Chronicle<L> {
         };
         for seg in closed.iter().chain(std::iter::once(&segment)) {
             if seg.chronicle() != id {
-                return Err(ChronicleError::SegmentsDisagree { at: seg.base().lsn, why: "another Chronicle's segment" });
+                return Err(ChronicleError::SegmentsDisagree {
+                    at: seg.base().lsn,
+                    why: "another Chronicle's segment",
+                });
             }
         }
         // Older segments may have been pruned: then the first one starts
@@ -531,9 +568,13 @@ impl<L: Layers> Chronicle<L> {
                     why: "the first segment starts after genesis, past what was shipped",
                 });
             }
-            let has_checkpoint = closed.iter().chain(std::iter::once(&segment)).try_fold(false, |found, seg| {
-                Ok::<bool, ChronicleError>(found || seg.frames()?.iter().any(is_checkpoint))
-            })?;
+            let has_checkpoint =
+                closed
+                    .iter()
+                    .chain(std::iter::once(&segment))
+                    .try_fold(false, |found, seg| {
+                        Ok::<bool, ChronicleError>(found || seg.frames()?.iter().any(is_checkpoint))
+                    })?;
             if !has_checkpoint {
                 return Err(ChronicleError::SegmentsDisagree {
                     at: first_base.lsn,
@@ -561,7 +602,10 @@ impl<L: Layers> Chronicle<L> {
         if let Some(kept) = pending {
             let resumes = chronicle.segment.base();
             if !continue_gap {
-                return Err(ChronicleError::GapPending { kept: kept.lsn, head: resumes.lsn });
+                return Err(ChronicleError::GapPending {
+                    kept: kept.lsn,
+                    head: resumes.lsn,
+                });
             }
             // Only what was shipped may be kept: rebirth rebuilds the log
             // from the packs up to the shipped anchor, which the fenced
@@ -574,7 +618,12 @@ impl<L: Layers> Chronicle<L> {
             }
             chronicle.append(
                 Stream::Ctl,
-                Payload::Gap(GapRecord { kept: kept.lsn, kept_hash: kept.hash, resumes: resumes.lsn, resumes_hash: resumes.hash }),
+                Payload::Gap(GapRecord {
+                    kept: kept.lsn,
+                    kept_hash: kept.hash,
+                    resumes: resumes.lsn,
+                    resumes_hash: resumes.hash,
+                }),
             )?;
             gap = Some((kept, resumes));
         }
@@ -586,14 +635,26 @@ impl<L: Layers> Chronicle<L> {
         let local_from = frames.first().map_or(Lsn::new(1), |f| f.envelope.lsn);
         let mut seals: Vec<Position> = frames
             .iter()
-            .filter(|f| f.envelope.stream == Stream::Ctl && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_))))
-            .map(|f| Position { lsn: f.envelope.lsn, hash: f.envelope.hash })
+            .filter(|f| {
+                f.envelope.stream == Stream::Ctl
+                    && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_)))
+            })
+            .map(|f| Position {
+                lsn: f.envelope.lsn,
+                hash: f.envelope.hash,
+            })
             .collect();
-        let summary =
-            crate::summary::Summary::of(&frames).map_err(|(lsn, error)| ChronicleError::Decode { lsn, error })?;
+        let summary = crate::summary::Summary::of(&frames)
+            .map_err(|(lsn, error)| ChronicleError::Decode { lsn, error })?;
         if let Some(cs) = summary.seal {
             if !seals.iter().any(|p| p.lsn == cs.lsn) {
-                seals.insert(0, Position { lsn: cs.lsn, hash: cs.hash });
+                seals.insert(
+                    0,
+                    Position {
+                        lsn: cs.lsn,
+                        hash: cs.hash,
+                    },
+                );
             }
         }
         let by_lsn: HashMap<Lsn, HashVal> = seals.iter().map(|p| (p.lsn, p.hash)).collect();
@@ -610,23 +671,41 @@ impl<L: Layers> Chronicle<L> {
                 // Its record was pruned with its segment; it was judged
                 // when it was taken.  Kept, not judged again.
             } else {
-                chronicle.layers.destroy(lsn).map_err(ChronicleError::Layer)?;
+                chronicle
+                    .layers
+                    .destroy(lsn)
+                    .map_err(ChronicleError::Layer)?;
                 orphan_layers.push(lsn);
             }
         }
         // The other way round: a Seal record whose layer is not there.
-        let missing_layers: Vec<Position> = seals.iter().filter(|p| !present.contains(&p.lsn)).copied().collect();
+        let missing_layers: Vec<Position> = seals
+            .iter()
+            .filter(|p| !present.contains(&p.lsn))
+            .copied()
+            .collect();
         let last_seal = seals.last().copied();
         chronicle.last_seal = last_seal;
         chronicle.missing_layers = missing_layers.iter().map(|p| p.lsn).collect();
         let head = chronicle.coord.head(id).map_err(ChronicleError::Coord)?;
-        let recovery =
-            Recovery { epoch, head, segment: seg_recovery, orphan_layers, last_seal, missing_layers, gap };
+        let recovery = Recovery {
+            epoch,
+            head,
+            segment: seg_recovery,
+            orphan_layers,
+            last_seal,
+            missing_layers,
+            gap,
+        };
         Ok((chronicle, recovery))
     }
 
     /// Append one record: segment (fsync), then CAS.
-    pub fn append(&mut self, stream: Stream, payload: Payload) -> Result<ChronicleHead, ChronicleError> {
+    pub fn append(
+        &mut self,
+        stream: Stream,
+        payload: Payload,
+    ) -> Result<ChronicleHead, ChronicleError> {
         self.ready()?;
         let rec = self.next_record(stream, payload);
         self.commit(&rec)
@@ -635,14 +714,28 @@ impl<L: Layers> Chronicle<L> {
     /// Append consecutive records together: one segment write and fsync,
     /// one CAS ([`Coord::append_batch`]).  All are accepted or none: a
     /// refusal cuts them all and fences, an unknown outcome poisons.
-    pub fn append_batch(&mut self, records: Vec<(Stream, Payload)>) -> Result<ChronicleHead, ChronicleError> {
+    pub fn append_batch(
+        &mut self,
+        records: Vec<(Stream, Payload)>,
+    ) -> Result<ChronicleHead, ChronicleError> {
         self.ready()?;
         let mut tail = self.segment.tail();
         let recs: Vec<Record> = records
             .into_iter()
             .map(|(stream, payload)| {
-                let r = Record::new(self.id, BranchId::TRUNK, self.epoch, stream, tail.lsn.next(), tail.hash, payload);
-                tail = Position { lsn: r.envelope.lsn, hash: r.envelope.hash };
+                let r = Record::new(
+                    self.id,
+                    BranchId::TRUNK,
+                    self.epoch,
+                    stream,
+                    tail.lsn.next(),
+                    tail.hash,
+                    payload,
+                );
+                tail = Position {
+                    lsn: r.envelope.lsn,
+                    hash: r.envelope.hash,
+                };
                 r
             })
             .collect();
@@ -695,7 +788,9 @@ impl<L: Layers> Chronicle<L> {
         );
         let hash = rec.envelope.hash;
         let snap = crate::timing::span("seal.snapshot");
-        self.layers.snapshot(lsn, hash).map_err(ChronicleError::Layer)?;
+        self.layers
+            .snapshot(lsn, hash)
+            .map_err(ChronicleError::Layer)?;
         drop(snap);
         if let Err(why) = check() {
             // Best effort: if this fails, the next recovery destroys the
@@ -768,7 +863,12 @@ impl<L: Layers> Chronicle<L> {
         };
         if lsn > last.lsn {
             return Err(ChronicleError::Layer(
-                format!("layer {} is past the last Seal {}: not rolling back", lsn.get(), last.lsn.get()).into(),
+                format!(
+                    "layer {} is past the last Seal {}: not rolling back",
+                    lsn.get(),
+                    last.lsn.get()
+                )
+                .into(),
             ));
         }
         if lsn == last.lsn && hash != last.hash {
@@ -776,7 +876,9 @@ impl<L: Layers> Chronicle<L> {
                 format!("layer {} is not bound to the last Seal's record", lsn.get()).into(),
             ));
         }
-        self.layers.rollback(lsn, hash).map_err(ChronicleError::Layer)?;
+        self.layers
+            .rollback(lsn, hash)
+            .map_err(ChronicleError::Layer)?;
         Ok(Some(Position { lsn, hash }))
     }
 
@@ -797,7 +899,12 @@ impl<L: Layers> Chronicle<L> {
 
     /// The local frame at `lsn`, if a local segment holds it (one read).
     pub fn frame(&self, lsn: Lsn) -> Result<Option<Frame>, SegmentError> {
-        match self.segments().into_iter().rev().find(|s| s.base().lsn < lsn && lsn <= s.tail().lsn) {
+        match self
+            .segments()
+            .into_iter()
+            .rev()
+            .find(|s| s.base().lsn < lsn && lsn <= s.tail().lsn)
+        {
             Some(s) => s.frame(lsn),
             None => Ok(None),
         }
@@ -805,7 +912,10 @@ impl<L: Layers> Chronicle<L> {
 
     /// Every local segment, oldest first; the last is the one written.
     pub fn segments(&self) -> Vec<&Segment> {
-        self.closed.iter().chain(std::iter::once(&self.segment)).collect()
+        self.closed
+            .iter()
+            .chain(std::iter::once(&self.segment))
+            .collect()
     }
 
     /// Every local record, oldest first, across all segment files.  After
@@ -843,7 +953,10 @@ impl<L: Layers> Chronicle<L> {
         }
         let shipped = self.coord.shipped(self.id).map_err(ChronicleError::Coord)?;
         let removable = |closed: &[Segment]| {
-            closed[..closed.len().saturating_sub(keep_closed)].iter().take_while(|seg| seg.tail().lsn <= shipped.lsn).count()
+            closed[..closed.len().saturating_sub(keep_closed)]
+                .iter()
+                .take_while(|seg| seg.tail().lsn <= shipped.lsn)
+                .count()
         };
         if removable(&self.closed) == 0 {
             return Ok(Pruned::default());
@@ -857,14 +970,23 @@ impl<L: Layers> Chronicle<L> {
         let mut removed = Vec::with_capacity(n);
         for _ in 0..n {
             let path = self.closed[0].path().to_path_buf();
-            std::fs::remove_file(&path).map_err(|e| ChronicleError::Segment(SegmentError::Io(e)))?;
+            std::fs::remove_file(&path)
+                .map_err(|e| ChronicleError::Segment(SegmentError::Io(e)))?;
             self.closed.remove(0);
             removed.push(path);
         }
         if let Some(dir) = removed.last().and_then(|p| p.parent()) {
-            File::open(dir).and_then(|d| d.sync_all()).map_err(|e| ChronicleError::Segment(SegmentError::Io(e)))?;
+            File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| ChronicleError::Segment(SegmentError::Io(e)))?;
         }
-        Ok(Pruned { checkpoint: Some(Position { lsn: head.lsn, hash: head.hash }), removed })
+        Ok(Pruned {
+            checkpoint: Some(Position {
+                lsn: head.lsn,
+                hash: head.hash,
+            }),
+            removed,
+        })
     }
 
     /// Roll to a new segment file once the current one reaches `bytes`
@@ -890,7 +1012,12 @@ impl<L: Layers> Chronicle<L> {
             return Ok(());
         }
         let tail = self.segment.tail();
-        let dir = self.segment.path().parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = self
+            .segment
+            .path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         let next = Segment::create(dir.join(segment_name(tail.lsn)), self.id, tail)?;
         let old = std::mem::replace(&mut self.segment, next);
         self.closed.push(old);
@@ -907,7 +1034,15 @@ impl<L: Layers> Chronicle<L> {
 
     fn next_record(&self, stream: Stream, payload: Payload) -> Record {
         let tail = self.segment.tail();
-        Record::new(self.id, BranchId::TRUNK, self.epoch, stream, tail.lsn.next(), tail.hash, payload)
+        Record::new(
+            self.id,
+            BranchId::TRUNK,
+            self.epoch,
+            stream,
+            tail.lsn.next(),
+            tail.hash,
+            payload,
+        )
     }
 
     /// Segment append (fsync), then CAS; on refusal cut the frame off and
@@ -923,8 +1058,11 @@ impl<L: Layers> Chronicle<L> {
         self.roll_if_full()?;
         let before = self.segment.tail();
         let payloads: Vec<Vec<u8>> = recs.iter().map(|r| r.payload.canon_bytes()).collect();
-        let frames: Vec<(&Envelope, &[u8])> =
-            recs.iter().zip(&payloads).map(|(r, p)| (&r.envelope, p.as_slice())).collect();
+        let frames: Vec<(&Envelope, &[u8])> = recs
+            .iter()
+            .zip(&payloads)
+            .map(|(r, p)| (&r.envelope, p.as_slice()))
+            .collect();
         self.segment.append_batch(&frames)?;
         let envelopes: Vec<Envelope> = recs.iter().map(|r| r.envelope).collect();
         let cas = crate::timing::span("append.cas");
@@ -1035,7 +1173,10 @@ pub fn restore_log(dir: &Path, id: ChronicleId, frames: &[Frame]) -> Result<(), 
     let mut run: Vec<&Frame> = Vec::new();
     let flush = |seg: &mut Segment, run: &mut Vec<&Frame>| -> Result<(), ChronicleError> {
         for chunk in run.chunks(1024) {
-            let batch: Vec<(&Envelope, &[u8])> = chunk.iter().map(|f| (&f.envelope, f.payload.as_slice())).collect();
+            let batch: Vec<(&Envelope, &[u8])> = chunk
+                .iter()
+                .map(|f| (&f.envelope, f.payload.as_slice()))
+                .collect();
             seg.append_batch(&batch)?;
         }
         run.clear();
@@ -1046,18 +1187,28 @@ pub fn restore_log(dir: &Path, id: ChronicleId, frames: &[Frame]) -> Result<(), 
         if f.envelope.lsn != tail.lsn.next() {
             // A Gap record: the next file starts where it resumes.
             flush(&mut seg, &mut run)?;
-            let base = Position { lsn: Lsn::new(f.envelope.lsn.get().saturating_sub(1)), hash: f.envelope.prev };
+            let base = Position {
+                lsn: Lsn::new(f.envelope.lsn.get().saturating_sub(1)),
+                hash: f.envelope.prev,
+            };
             seg = Segment::create(tmp.join(segment_name(base.lsn)), id, base)?;
         }
         run.push(f);
-        tail = Position { lsn: f.envelope.lsn, hash: f.envelope.hash };
+        tail = Position {
+            lsn: f.envelope.lsn,
+            hash: f.envelope.hash,
+        };
     }
     flush(&mut seg, &mut run)?;
     drop(seg);
-    std::fs::File::open(&tmp).and_then(|d| d.sync_all()).map_err(io)?;
+    std::fs::File::open(&tmp)
+        .and_then(|d| d.sync_all())
+        .map_err(io)?;
     std::fs::rename(&tmp, dir).map_err(io)?;
     if let Some(parent) = dir.parent() {
-        std::fs::File::open(parent).and_then(|d| d.sync_all()).map_err(io)?;
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(io)?;
     }
     Ok(())
 }
@@ -1069,8 +1220,12 @@ fn list_segments(dir: &Path) -> Result<Vec<PathBuf>, ChronicleError> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(io)? {
         let name = entry.map_err(io)?.file_name();
-        let Some(name) = name.to_str().map(str::to_owned) else { continue };
-        let Some(digits) = name.strip_prefix(SEGMENT_PREFIX) else { continue };
+        let Some(name) = name.to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(digits) = name.strip_prefix(SEGMENT_PREFIX) else {
+            continue;
+        };
         let base = (digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
             .then(|| digits.parse::<u64>().ok())
             .flatten()
@@ -1083,7 +1238,8 @@ fn list_segments(dir: &Path) -> Result<Vec<PathBuf>, ChronicleError> {
 
 /// Whether a frame is a Checkpoint record.
 fn is_checkpoint(f: &Frame) -> bool {
-    f.envelope.stream == Stream::Ctl && matches!(Payload::decode(&f.payload), Ok(Payload::Checkpoint(_)))
+    f.envelope.stream == Stream::Ctl
+        && matches!(Payload::decode(&f.payload), Ok(Payload::Checkpoint(_)))
 }
 
 /// Check that the segments form one chain.  The first starts at genesis
@@ -1095,11 +1251,18 @@ fn is_checkpoint(f: &Frame) -> bool {
 ///
 /// Returns the kept position if the newest segment is such a continuation
 /// whose Gap record is not written yet.
-fn check_joints(closed: &[Segment], newest: &Segment, pruned: bool) -> Result<Option<Position>, ChronicleError> {
+fn check_joints(
+    closed: &[Segment],
+    newest: &Segment,
+    pruned: bool,
+) -> Result<Option<Position>, ChronicleError> {
     let disagree = |at: Lsn, why| ChronicleError::SegmentsDisagree { at, why };
     let first = closed.first().unwrap_or(newest);
     if first.base() != Position::GENESIS && !pruned {
-        return Err(disagree(first.base().lsn, "the first segment does not start at genesis"));
+        return Err(disagree(
+            first.base().lsn,
+            "the first segment does not start at genesis",
+        ));
     }
     let mut pending = None;
     let all: Vec<&Segment> = closed.iter().chain(std::iter::once(newest)).collect();
@@ -1124,9 +1287,17 @@ fn check_joints(closed: &[Segment], newest: &Segment, pruned: bool) -> Result<Op
         let gap = (first.envelope.stream == Stream::Ctl)
             .then(|| Payload::decode(&first.payload).ok())
             .flatten();
-        let want = GapRecord { kept: kept.lsn, kept_hash: kept.hash, resumes: resumes.lsn, resumes_hash: resumes.hash };
+        let want = GapRecord {
+            kept: kept.lsn,
+            kept_hash: kept.hash,
+            resumes: resumes.lsn,
+            resumes_hash: resumes.hash,
+        };
         if gap != Some(Payload::Gap(want)) {
-            return Err(disagree(resumes.lsn, "it skips records without a Gap record"));
+            return Err(disagree(
+                resumes.lsn,
+                "it skips records without a Gap record",
+            ));
         }
     }
     Ok(pending)
@@ -1184,7 +1355,9 @@ mod tests {
             let s = self.snaps.borrow();
             match s.get(&lsn) {
                 None => return Err(format!("no layer {}", lsn.get()).into()),
-                Some(h) if *h != hash => return Err(format!("layer {} has another hash", lsn.get()).into()),
+                Some(h) if *h != hash => {
+                    return Err(format!("layer {} has another hash", lsn.get()).into())
+                }
                 Some(_) => {}
             }
             if s.range(lsn.next()..).next().is_some() {
@@ -1207,7 +1380,11 @@ mod tests {
     }
 
     fn cut() -> StreamCut {
-        StreamCut { fs: Lsn::new(0), db: Lsn::new(0), transcript: Lsn::new(0) }
+        StreamCut {
+            fs: Lsn::new(0),
+            db: Lsn::new(0),
+            transcript: Lsn::new(0),
+        }
     }
 
     struct Env {
@@ -1222,15 +1399,30 @@ mod tests {
         let coord = Arc::new(Coordinator::open(root.path().join("coord.redb")).unwrap());
         let dir = root.path().join("vessel");
         std::fs::create_dir(&dir).unwrap();
-        Env { _root: root, coord, dir, layers: FakeLayers::default() }
+        Env {
+            _root: root,
+            coord,
+            dir,
+            layers: FakeLayers::default(),
+        }
     }
 
     impl Env {
         fn create(&self) -> Chronicle<FakeLayers> {
-            Chronicle::create(&self.dir, self.coord.clone(), cid(), A, self.layers.clone()).unwrap().0
+            Chronicle::create(&self.dir, self.coord.clone(), cid(), A, self.layers.clone())
+                .unwrap()
+                .0
         }
         fn open(&self, w: WardenId) -> (Chronicle<FakeLayers>, Recovery) {
-            Chronicle::open_as(&self.dir, self.coord.clone(), cid(), w, self.layers.clone(), claim(&*self.coord, w)).unwrap()
+            Chronicle::open_as(
+                &self.dir,
+                self.coord.clone(),
+                cid(),
+                w,
+                self.layers.clone(),
+                claim(&*self.coord, w),
+            )
+            .unwrap()
         }
     }
 
@@ -1241,7 +1433,10 @@ mod tests {
         if o.holder == w {
             Claim::Mine
         } else {
-            Claim::TakeOver { from: o.holder, epoch: o.epoch }
+            Claim::TakeOver {
+                from: o.holder,
+                epoch: o.epoch,
+            }
         }
     }
 
@@ -1278,7 +1473,11 @@ mod tests {
         assert_eq!(r.last_seal, Some(sealed.seal));
         assert_eq!((r.segment.unaccepted_frames, r.gap), (0, None));
         assert_eq!(lsns(&c), (1..=11).collect::<Vec<_>>());
-        assert_eq!(c.frame(Lsn::new(3)).unwrap().unwrap().envelope.lsn, Lsn::new(3), "read from a closed file");
+        assert_eq!(
+            c.frame(Lsn::new(3)).unwrap().unwrap().envelope.lsn,
+            Lsn::new(3),
+            "read from a closed file"
+        );
         c.append(Stream::Fs, raw(100)).unwrap();
         assert_eq!(c.tail().lsn, Lsn::new(12));
         // The default never rolls a small log.
@@ -1301,10 +1500,17 @@ mod tests {
         a.set_roll_at(1);
         // Another incarnation takes over: A's next append rolls, then is refused.
         e.coord.transfer(cid(), B).unwrap();
-        assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
+        assert!(matches!(
+            a.append(Stream::Fs, raw(2)),
+            Err(ChronicleError::Refused(_))
+        ));
         let files = list_segments(&e.dir).unwrap();
         assert_eq!(files.len(), 2);
-        assert_eq!(files[1].file_name().unwrap().to_str().unwrap(), segment_name(Lsn::new(1)), "named after its base: the tail it starts at");
+        assert_eq!(
+            files[1].file_name().unwrap().to_str().unwrap(),
+            segment_name(Lsn::new(1)),
+            "named after its base: the tail it starts at"
+        );
         assert!(a.segment().is_empty());
         drop(a);
         let (mut b, r) = e.open(B);
@@ -1312,8 +1518,16 @@ mod tests {
         // Rolling at every append, but an empty file is written, not rolled.
         b.set_roll_at(1);
         b.append(Stream::Fs, raw(3)).unwrap();
-        assert_eq!(lsns(&b), vec![1, 2], "A's refused record was cut; B's is lsn 2");
-        assert_eq!(b.segments().len(), 2, "written into the empty file, not past it");
+        assert_eq!(
+            lsns(&b),
+            vec![1, 2],
+            "A's refused record was cut; B's is lsn 2"
+        );
+        assert_eq!(
+            b.segments().len(),
+            2,
+            "written into the empty file, not past it"
+        );
         b.append(Stream::Fs, raw(4)).unwrap();
         b.append(Stream::Fs, raw(5)).unwrap();
         assert_eq!(lsns(&b), vec![1, 2, 3, 4]);
@@ -1345,7 +1559,9 @@ mod tests {
     }
 
     fn ship_to_tail(e: &Env, c: &Chronicle<FakeLayers>) {
-        e.coord.advance_shipped(A, cid(), c.epoch(), c.tail()).unwrap();
+        e.coord
+            .advance_shipped(A, cid(), c.epoch(), c.tail())
+            .unwrap();
     }
 
     /// Nothing shipped: nothing pruned and nothing written.  Shipped:
@@ -1367,11 +1583,18 @@ mod tests {
         e.coord.advance_shipped(A, cid(), c.epoch(), half).unwrap();
         let p = c.prune(2).unwrap();
         assert!(!p.removed.is_empty());
-        assert_eq!(list_segments(&e.dir).unwrap().len(), c.segments().len(), "the files are the segments");
+        assert_eq!(
+            list_segments(&e.dir).unwrap().len(),
+            c.segments().len(),
+            "the files are the segments"
+        );
         for gone in &p.removed {
             assert!(!gone.exists());
         }
-        assert!(c.segments()[0].base().lsn <= half.lsn, "nothing past the anchor went");
+        assert!(
+            c.segments()[0].base().lsn <= half.lsn,
+            "nothing past the anchor went"
+        );
         let cp = p.checkpoint.unwrap();
         assert_eq!(cp.lsn, tail.lsn.next(), "the Checkpoint is the next record");
 
@@ -1387,8 +1610,14 @@ mod tests {
         let (mut c, r) = e.open(A);
         assert_eq!(lsns(&c), lsns_before);
         assert_eq!(r.last_seal, Some(sealed.seal), "known from the Checkpoint");
-        assert!(r.missing_layers.is_empty() && r.orphan_layers.is_empty(), "{r:?}");
-        assert!(e.layers.snaps().iter().any(|(l, _)| *l == sealed.seal.lsn), "its layer is kept");
+        assert!(
+            r.missing_layers.is_empty() && r.orphan_layers.is_empty(),
+            "{r:?}"
+        );
+        assert!(
+            e.layers.snaps().iter().any(|(l, _)| *l == sealed.seal.lsn),
+            "its layer is kept"
+        );
         c.append(Stream::Fs, raw(200)).unwrap();
         let s2 = seal(&mut c, 2).unwrap();
         drop(c);
@@ -1413,14 +1642,20 @@ mod tests {
         }
         ship_to_tail(&e, &c);
         c.prune(1).unwrap();
-        assert!(c.segments()[0].base().lsn > second.seal.lsn, "both Seal records are gone");
+        assert!(
+            c.segments()[0].base().lsn > second.seal.lsn,
+            "both Seal records are gone"
+        );
         drop(c);
 
         let (_, r) = e.open(A);
         assert_eq!(r.last_seal, Some(second.seal));
         assert!(r.orphan_layers.is_empty(), "{r:?}");
         let snaps: Vec<Lsn> = e.layers.snaps().iter().map(|(l, _)| *l).collect();
-        assert!(snaps.contains(&first.seal.lsn) && snaps.contains(&second.seal.lsn), "{snaps:?}");
+        assert!(
+            snaps.contains(&first.seal.lsn) && snaps.contains(&second.seal.lsn),
+            "{snaps:?}"
+        );
     }
 
     #[test]
@@ -1441,7 +1676,10 @@ mod tests {
         };
         c2.set_roll_at(1);
         e.coord.transfer(cid(), B).unwrap();
-        assert!(c2.prune(0).is_err(), "fenced: it may not write the Checkpoint");
+        assert!(
+            c2.prune(0).is_err(),
+            "fenced: it may not write the Checkpoint"
+        );
     }
 
     /// A log cut without a Checkpoint, or cut past what was shipped, is
@@ -1454,7 +1692,14 @@ mod tests {
         drop(c);
         let files = list_segments(&e.dir).unwrap();
         std::fs::remove_file(&files[0]).unwrap();
-        let r = Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A));
+        let r = Chronicle::open_as(
+            &e.dir,
+            e.coord.clone(),
+            cid(),
+            A,
+            e.layers.clone(),
+            claim(&*e.coord, A),
+        );
         assert!(
             matches!(r, Err(ChronicleError::SegmentsDisagree { why, .. }) if why.contains("no Checkpoint")),
             "{:?}",
@@ -1466,7 +1711,14 @@ mod tests {
         drop(c);
         let files = list_segments(&e.dir).unwrap();
         std::fs::remove_file(&files[0]).unwrap();
-        let r = Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A));
+        let r = Chronicle::open_as(
+            &e.dir,
+            e.coord.clone(),
+            cid(),
+            A,
+            e.layers.clone(),
+            claim(&*e.coord, A),
+        );
         assert!(
             matches!(r, Err(ChronicleError::SegmentsDisagree { why, .. }) if why.contains("past what was shipped")),
             "{:?}",
@@ -1481,7 +1733,13 @@ mod tests {
         let e = env();
         let mut c = e.create();
         c.append(Stream::Fs, raw(1)).unwrap();
-        let h = c.append_batch(vec![(Stream::Effect, raw(2)), (Stream::Effect, raw(3)), (Stream::Fs, raw(4))]).unwrap();
+        let h = c
+            .append_batch(vec![
+                (Stream::Effect, raw(2)),
+                (Stream::Effect, raw(3)),
+                (Stream::Fs, raw(4)),
+            ])
+            .unwrap();
         assert_eq!(h.lsn, Lsn::new(4));
         assert_eq!(e.coord.head(cid()).unwrap(), h);
         assert_eq!(Position::from(h), c.tail());
@@ -1573,14 +1831,23 @@ mod tests {
         let mut c = e.create();
         let s1 = seal(&mut c, 1).unwrap().seal;
         // Made behind the Chronicle's back after open.
-        e.layers.clone().snapshot(Lsn::new(9), HashVal::from_bytes([9; 32])).unwrap();
+        e.layers
+            .clone()
+            .snapshot(Lsn::new(9), HashVal::from_bytes([9; 32]))
+            .unwrap();
         let err = c.rollback_to_last_seal().unwrap_err();
         assert!(err.to_string().contains("past the last Seal"), "{err}");
         e.layers.clone().destroy(Lsn::new(9)).unwrap();
         e.layers.clone().destroy(s1.lsn).unwrap();
-        e.layers.clone().snapshot(s1.lsn, HashVal::from_bytes([7; 32])).unwrap();
+        e.layers
+            .clone()
+            .snapshot(s1.lsn, HashVal::from_bytes([7; 32]))
+            .unwrap();
         let err = c.rollback_to_last_seal().unwrap_err();
-        assert!(err.to_string().contains("not bound to the last Seal"), "{err}");
+        assert!(
+            err.to_string().contains("not bound to the last Seal"),
+            "{err}"
+        );
         assert!(e.layers.rolled_back.borrow().is_empty());
     }
 
@@ -1591,8 +1858,14 @@ mod tests {
         let mut a = e.create();
         seal(&mut a, 1).unwrap();
         e.coord.transfer(cid(), B).unwrap();
-        assert!(matches!(a.append(Stream::Fs, raw(1)), Err(ChronicleError::Refused(_))));
-        assert!(matches!(a.rollback_to_last_seal(), Err(ChronicleError::Fenced)));
+        assert!(matches!(
+            a.append(Stream::Fs, raw(1)),
+            Err(ChronicleError::Refused(_))
+        ));
+        assert!(matches!(
+            a.rollback_to_last_seal(),
+            Err(ChronicleError::Fenced)
+        ));
         assert!(e.layers.rolled_back.borrow().is_empty());
     }
 
@@ -1600,22 +1873,37 @@ mod tests {
     /// after checking its binding.
     #[test]
     fn zfs_layers_roll_back_with_zfs() {
-        struct Rec(Rc<RefCell<Vec<Vec<String>>>>, RefCell<Vec<crate::zfs::Output>>);
+        struct Rec(
+            Rc<RefCell<Vec<Vec<String>>>>,
+            RefCell<Vec<crate::zfs::Output>>,
+        );
         impl Runner for Rec {
             fn run(&self, args: &[String]) -> Result<crate::zfs::Output, crate::zfs::ZfsError> {
                 self.0.borrow_mut().push(args.to_vec());
                 Ok(self.1.borrow_mut().remove(0))
             }
-            fn run_input(&self, _: &[String], _: &mut dyn std::io::Read) -> Result<crate::zfs::Output, crate::zfs::ZfsError> {
+            fn run_input(
+                &self,
+                _: &[String],
+                _: &mut dyn std::io::Read,
+            ) -> Result<crate::zfs::Output, crate::zfs::ZfsError> {
                 unreachable!()
             }
         }
-        let ok = |stdout: &str| crate::zfs::Output { success: true, code: Some(0), stdout: stdout.into(), stderr: String::new() };
+        let ok = |stdout: &str| crate::zfs::Output {
+            success: true,
+            code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        };
         let ds = Dataset::new("tasotest/vessel/v").unwrap();
         let name = ds.seal_snapshot(Lsn::new(4));
         let h = HashVal::from_bytes([4; 32]);
         let calls = Rc::new(RefCell::new(vec![]));
-        let rec = Rec(calls.clone(), RefCell::new(vec![ok(&format!("{name}\t845\t17\t{h}\n")), ok("")]));
+        let rec = Rec(
+            calls.clone(),
+            RefCell::new(vec![ok(&format!("{name}\t845\t17\t{h}\n")), ok("")]),
+        );
         let mut layers = ZfsLayers::new(Zfs::with_runner(rec), ds);
         layers.rollback(Lsn::new(4), h).unwrap();
         let calls = calls.borrow().clone();
@@ -1638,7 +1926,9 @@ mod tests {
                 Ok(())
             }
         }
-        let e = NoRollback.rollback(Lsn::new(3), HashVal::from_bytes([3; 32])).unwrap_err();
+        let e = NoRollback
+            .rollback(Lsn::new(3), HashVal::from_bytes([3; 32]))
+            .unwrap_err();
         assert!(e.to_string().contains("cannot roll back"), "{e}");
     }
 
@@ -1658,7 +1948,11 @@ mod tests {
         e.layers.clone().destroy(s2.lsn).unwrap(); // lost by hand
         let (c, r) = e.open(A);
         assert_eq!(r.missing_layers, vec![s2]);
-        assert_eq!(r.last_seal, Some(s2), "the last Seal comes from the records");
+        assert_eq!(
+            r.last_seal,
+            Some(s2),
+            "the last Seal comes from the records"
+        );
         assert!(r.orphan_layers.is_empty());
         assert!(c.layer_missing(s2.lsn));
         assert!(!c.layer_missing(s1.lsn));
@@ -1709,7 +2003,10 @@ mod tests {
         let s1 = seal(&mut c, 1).unwrap();
         c.append(Stream::Fs, raw(2)).unwrap();
         let s2 = seal(&mut c, 2).unwrap();
-        assert_eq!(e.layers.snaps(), vec![(s1.seal.lsn, s1.seal.hash), (s2.seal.lsn, s2.seal.hash)]);
+        assert_eq!(
+            e.layers.snaps(),
+            vec![(s1.seal.lsn, s1.seal.hash), (s2.seal.lsn, s2.seal.hash)]
+        );
         assert_eq!(c.last_seal(), Some(s2.seal));
 
         let frames = c.segment().frames().unwrap();
@@ -1762,7 +2059,14 @@ mod tests {
         let e = env();
         let _c = e.create();
         assert!(matches!(
-            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A)),
+            Chronicle::open_as(
+                &e.dir,
+                e.coord.clone(),
+                cid(),
+                A,
+                e.layers.clone(),
+                claim(&*e.coord, A)
+            ),
             Err(ChronicleError::Locked(_))
         ));
     }
@@ -1801,7 +2105,10 @@ mod tests {
         spawner.join().unwrap();
         let n = spawned.load(Ordering::Relaxed);
         assert!(n >= 300, "the spawner only started {n} processes");
-        assert_eq!(refused, 0, "{refused} of {relocks} relocks refused while {n} processes were spawned");
+        assert_eq!(
+            refused, 0,
+            "{refused} of {relocks} relocks refused while {n} processes were spawned"
+        );
     }
 
     /// A second incarnation elsewhere (a copy of the segment, as rebirth
@@ -1818,12 +2125,25 @@ mod tests {
         std::fs::create_dir(&dir_b).unwrap();
         std::fs::copy(a.segment().path(), dir_b.join(SEGMENT_FILE)).unwrap();
         let layers_b = FakeLayers::default();
-        let (mut b, _) =
-            Chronicle::open_as(&dir_b, e.coord.clone(), cid(), B, layers_b.clone(), claim(&*e.coord, B)).unwrap();
+        let (mut b, _) = Chronicle::open_as(
+            &dir_b,
+            e.coord.clone(),
+            cid(),
+            B,
+            layers_b.clone(),
+            claim(&*e.coord, B),
+        )
+        .unwrap();
 
-        assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
+        assert!(matches!(
+            a.append(Stream::Fs, raw(2)),
+            Err(ChronicleError::Refused(_))
+        ));
         assert!(a.is_fenced());
-        assert_eq!(std::fs::metadata(a.segment().path()).unwrap().len(), a_seg_len);
+        assert_eq!(
+            std::fs::metadata(a.segment().path()).unwrap().len(),
+            a_seg_len
+        );
         assert!(matches!(seal(&mut a, 9), Err(ChronicleError::Fenced)));
         assert!(e.layers.snaps().is_empty());
 
@@ -1844,7 +2164,17 @@ mod tests {
         a.append(Stream::Fs, raw(1)).unwrap();
         // Shipped, as a Warden does before anything that may need it.
         let h = e.coord.head(cid()).unwrap();
-        e.coord.advance_shipped(A, cid(), h.epoch, Position { lsn: h.lsn, hash: h.hash }).unwrap();
+        e.coord
+            .advance_shipped(
+                A,
+                cid(),
+                h.epoch,
+                Position {
+                    lsn: h.lsn,
+                    hash: h.hash,
+                },
+            )
+            .unwrap();
         drop(a);
 
         // 1. A reads: it is the holder (its own restart).
@@ -1857,9 +2187,17 @@ mod tests {
         std::fs::create_dir(&dir_b).unwrap();
         std::fs::copy(e.dir.join(SEGMENT_FILE), dir_b.join(SEGMENT_FILE)).unwrap();
         let (mut b, _) = Chronicle::open_as(
-            &dir_b, e.coord.clone(), cid(), B, FakeLayers::default(),
-            Claim::TakeOver { from: a_read.holder, epoch: a_read.epoch },
-        ).unwrap();
+            &dir_b,
+            e.coord.clone(),
+            cid(),
+            B,
+            FakeLayers::default(),
+            Claim::TakeOver {
+                from: a_read.holder,
+                epoch: a_read.epoch,
+            },
+        )
+        .unwrap();
         assert_eq!(b.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
 
         // 3. A acts on its read: refused, and nothing moved.
@@ -1873,14 +2211,29 @@ mod tests {
         assert_eq!(b.append(Stream::Fs, raw(3)).unwrap().lsn, Lsn::new(3));
 
         // A takeover on the stale read is refused too; on the current one it wins.
-        let stale = Claim::TakeOver { from: a_read.holder, epoch: a_read.epoch };
-        let r = Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), stale).err();
-        assert!(matches!(r, Some(ChronicleError::Coord(CoordError::OwnershipChanged { .. }))), "{r:?}");
+        let stale = Claim::TakeOver {
+            from: a_read.holder,
+            epoch: a_read.epoch,
+        };
+        let r =
+            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), stale).err();
+        assert!(
+            matches!(
+                r,
+                Some(ChronicleError::Coord(CoordError::OwnershipChanged { .. }))
+            ),
+            "{r:?}"
+        );
         drop(b);
-        let now = Claim::TakeOver { from: B, epoch: e_b };
+        let now = Claim::TakeOver {
+            from: B,
+            epoch: e_b,
+        };
         // A's copy ends at lsn 1 while the head is 3: a takeover continues
         // from the head after a gap (open_after_gap), as rebirth does.
-        let (mut a, r) = Chronicle::open_after_gap_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), now).unwrap();
+        let (mut a, r) =
+            Chronicle::open_after_gap_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), now)
+                .unwrap();
         assert_eq!(e.coord.ownership(cid()).unwrap().epoch, e_b.next());
         assert!(r.gap.is_some());
         assert!(a.append(Stream::Fs, raw(4)).unwrap().lsn > Lsn::new(3));
@@ -1951,9 +2304,12 @@ mod tests {
             }),
         );
         let mut layers = e.layers.clone();
-        layers.snapshot(rec.envelope.lsn, rec.envelope.hash).unwrap();
+        layers
+            .snapshot(rec.envelope.lsn, rec.envelope.hash)
+            .unwrap();
         let (mut seg, _) = Segment::open(&seg_path, e.coord.head(cid()).unwrap()).unwrap();
-        seg.append(&rec.envelope, &rec.payload.canon_bytes()).unwrap();
+        seg.append(&rec.envelope, &rec.payload.canon_bytes())
+            .unwrap();
         drop(seg);
 
         let (c, r) = e.open(A);
@@ -2005,7 +2361,9 @@ mod tests {
         let e = env();
         let mut c = e.create();
         let mut layers = e.layers.clone();
-        layers.snapshot(Lsn::new(1), HashVal::from_bytes([0xEE; 32])).unwrap();
+        layers
+            .snapshot(Lsn::new(1), HashVal::from_bytes([0xEE; 32]))
+            .unwrap();
         c.append(Stream::Fs, raw(1)).unwrap();
         drop(c);
         let (_c, r) = e.open(A);
@@ -2022,7 +2380,14 @@ mod tests {
         drop(c);
         std::fs::remove_file(seg).unwrap();
         assert!(matches!(
-            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A)),
+            Chronicle::open_as(
+                &e.dir,
+                e.coord.clone(),
+                cid(),
+                A,
+                e.layers.clone(),
+                claim(&*e.coord, A)
+            ),
             Err(ChronicleError::MissingSegment { .. })
         ));
     }
@@ -2038,7 +2403,10 @@ mod tests {
             a.append(Stream::Fs, raw(k)).unwrap();
         }
         let frames = a.frames().unwrap();
-        let to = Position { lsn: Lsn::new(shipped), hash: frames[shipped as usize - 1].envelope.hash };
+        let to = Position {
+            lsn: Lsn::new(shipped),
+            hash: frames[shipped as usize - 1].envelope.hash,
+        };
         e.coord.advance_shipped(A, cid(), a.epoch(), to).unwrap();
         let b_dir = e.dir.parent().unwrap().join("node-b");
         std::fs::create_dir(&b_dir).unwrap();
@@ -2049,12 +2417,20 @@ mod tests {
         (a, b_dir)
     }
 
-    fn open_b(e: &Env, dir: &Path, layers: FakeLayers) -> Result<(Chronicle<FakeLayers>, Recovery), ChronicleError> {
+    fn open_b(
+        e: &Env,
+        dir: &Path,
+        layers: FakeLayers,
+    ) -> Result<(Chronicle<FakeLayers>, Recovery), ChronicleError> {
         Chronicle::open_after_gap_as(dir, e.coord.clone(), cid(), B, layers, claim(&*e.coord, B))
     }
 
     fn lsns(c: &Chronicle<FakeLayers>) -> Vec<u64> {
-        c.frames().unwrap().iter().map(|f| f.envelope.lsn.get()).collect()
+        c.frames()
+            .unwrap()
+            .iter()
+            .map(|f| f.envelope.lsn.get())
+            .collect()
     }
 
     #[test]
@@ -2065,7 +2441,12 @@ mod tests {
         let kept = e.coord.shipped(cid()).unwrap();
         // A crash on B tore the log's tail; that is cut, not refused.
         let seg0 = b_dir.join(SEGMENT_FILE);
-        std::fs::OpenOptions::new().append(true).open(&seg0).unwrap().write_all(&[7; 20]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg0)
+            .unwrap()
+            .write_all(&[7; 20])
+            .unwrap();
 
         let (mut b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
         assert_eq!(r.gap, Some((kept, Position::from(head))));
@@ -2078,15 +2459,31 @@ mod tests {
         assert_eq!(gap.envelope.prev, head.hash);
         assert_eq!(
             Payload::decode(&gap.payload).unwrap(),
-            Payload::Gap(GapRecord { kept: kept.lsn, kept_hash: kept.hash, resumes: head.lsn, resumes_hash: head.hash })
+            Payload::Gap(GapRecord {
+                kept: kept.lsn,
+                kept_hash: kept.hash,
+                resumes: head.lsn,
+                resumes_hash: head.hash
+            })
         );
         assert_eq!(Position::from(e.coord.head(cid()).unwrap()), b.tail());
         // The old holder is fenced.
-        assert!(matches!(a.append(Stream::Fs, raw(1)), Err(ChronicleError::Refused(_))));
+        assert!(matches!(
+            a.append(Stream::Fs, raw(1)),
+            Err(ChronicleError::Refused(_))
+        ));
 
         // Both opens read the joined files back the same way.
         drop(b);
-        let (b, r) = Chronicle::open_as(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default(), claim(&*e.coord, B)).unwrap();
+        let (b, r) = Chronicle::open_as(
+            &b_dir,
+            e.coord.clone(),
+            cid(),
+            B,
+            FakeLayers::default(),
+            claim(&*e.coord, B),
+        )
+        .unwrap();
         assert_eq!((lsns(&b), r.gap), (vec![1, 2, 3, 6, 7], None));
         drop(b);
         let (b, r) = open_b(&e, &b_dir, FakeLayers::default()).unwrap();
@@ -2106,12 +2503,25 @@ mod tests {
         drop(b);
         let c_dir = e.dir.with_file_name("vessel-c");
         restore_log(&c_dir, cid(), &frames).unwrap();
-        assert!(c_dir.join(SEGMENT_FILE).exists() && c_dir.join(segment_name(Lsn::new(5))).exists());
+        assert!(
+            c_dir.join(SEGMENT_FILE).exists() && c_dir.join(segment_name(Lsn::new(5))).exists()
+        );
         assert!(!c_dir.with_file_name("vessel-c.restore").exists());
-        let (c, r) = Chronicle::open_after_gap_as(&c_dir, e.coord.clone(), cid(), WardenId::new(3), FakeLayers::default(), claim(&*e.coord, WardenId::new(3))).unwrap();
+        let (c, r) = Chronicle::open_after_gap_as(
+            &c_dir,
+            e.coord.clone(),
+            cid(),
+            WardenId::new(3),
+            FakeLayers::default(),
+            claim(&*e.coord, WardenId::new(3)),
+        )
+        .unwrap();
         assert_eq!((c.frames().unwrap(), r.gap), (frames.clone(), None));
         drop(c);
-        assert!(matches!(restore_log(&c_dir, cid(), &frames), Err(ChronicleError::StateExists(_))));
+        assert!(matches!(
+            restore_log(&c_dir, cid(), &frames),
+            Err(ChronicleError::StateExists(_))
+        ));
         // A leftover from a crashed restore is replaced.
         let d_dir = e.dir.with_file_name("vessel-d");
         std::fs::create_dir_all(d_dir.with_file_name("vessel-d.restore")).unwrap();
@@ -2130,7 +2540,12 @@ mod tests {
         let (_a, b_dir) = shipped_elsewhere(&e, 5, 3);
         let head = e.coord.head(cid()).unwrap();
         // Crash after the continuation file was created, before its Gap record.
-        Segment::create(b_dir.join(segment_name(head.lsn)), cid(), Position::from(head)).unwrap();
+        Segment::create(
+            b_dir.join(segment_name(head.lsn)),
+            cid(),
+            Position::from(head),
+        )
+        .unwrap();
         assert!(matches!(
             Chronicle::open_as(&b_dir, e.coord.clone(), cid(), B, FakeLayers::default(), claim(&*e.coord, B)),
             Err(ChronicleError::GapPending { kept, head: h }) if kept == Lsn::new(3) && h == head.lsn
@@ -2146,7 +2561,11 @@ mod tests {
         let (a, b_dir) = shipped_elsewhere(&e, 5, 3);
         // B holds one record less than was shipped.
         let two = a.frames().unwrap()[1].envelope.hash;
-        let at_two = ChronicleHead { lsn: Lsn::new(2), hash: two, epoch: a.epoch() };
+        let at_two = ChronicleHead {
+            lsn: Lsn::new(2),
+            hash: two,
+            epoch: a.epoch(),
+        };
         Segment::open(b_dir.join(SEGMENT_FILE), at_two).unwrap();
         let head = e.coord.head(cid()).unwrap();
         assert!(matches!(
@@ -2176,7 +2595,9 @@ mod tests {
         let s = seal(&mut a, 1).unwrap();
         a.append(Stream::Fs, raw(2)).unwrap();
         a.append(Stream::Fs, raw(3)).unwrap();
-        e.coord.advance_shipped(A, cid(), a.epoch(), s.seal).unwrap();
+        e.coord
+            .advance_shipped(A, cid(), a.epoch(), s.seal)
+            .unwrap();
         let b_dir = e.dir.parent().unwrap().join("node-b");
         std::fs::create_dir(&b_dir).unwrap();
         let mut seg = Segment::create(b_dir.join(SEGMENT_FILE), cid(), Position::GENESIS).unwrap();
@@ -2187,7 +2608,10 @@ mod tests {
         // B's layers hold the Seal (rebirth received it) and an orphan.
         let layers = FakeLayers::default();
         layers.snaps.borrow_mut().insert(s.seal.lsn, s.seal.hash);
-        layers.snaps.borrow_mut().insert(Lsn::new(3), HashVal::from_bytes([9; 32]));
+        layers
+            .snaps
+            .borrow_mut()
+            .insert(Lsn::new(3), HashVal::from_bytes([9; 32]));
         let (b, r) = open_b(&e, &b_dir, layers.clone()).unwrap();
         assert_eq!(b.last_seal(), Some(s.seal));
         assert_eq!(r.orphan_layers, vec![Lsn::new(3)]);
@@ -2200,10 +2624,17 @@ mod tests {
         let (_a, b_dir) = shipped_elsewhere(&e, 5, 3);
         drop(open_b(&e, &b_dir, FakeLayers::default()).unwrap());
         let seg0 = b_dir.join(SEGMENT_FILE);
-        std::fs::OpenOptions::new().append(true).open(&seg0).unwrap().write_all(&[7; 20]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&seg0)
+            .unwrap()
+            .write_all(&[7; 20])
+            .unwrap();
         assert!(matches!(
             open_b(&e, &b_dir, FakeLayers::default()),
-            Err(ChronicleError::Segment(SegmentError::ClosedTorn { invalid_bytes: 20 }))
+            Err(ChronicleError::Segment(SegmentError::ClosedTorn {
+                invalid_bytes: 20
+            }))
         ));
     }
 
@@ -2217,11 +2648,24 @@ mod tests {
         let want = c.frames().unwrap();
         drop(c);
         let newest = list_segments(&e.dir).unwrap().pop().unwrap();
-        std::fs::OpenOptions::new().append(true).open(&newest).unwrap().write_all(&[7; 20]).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&newest)
+            .unwrap()
+            .write_all(&[7; 20])
+            .unwrap();
         let bytes = |p: &Path| std::fs::read(p).unwrap();
-        let before: Vec<Vec<u8>> = list_segments(&e.dir).unwrap().iter().map(|p| bytes(p)).collect();
+        let before: Vec<Vec<u8>> = list_segments(&e.dir)
+            .unwrap()
+            .iter()
+            .map(|p| bytes(p))
+            .collect();
         assert_eq!(read_log(&e.dir).unwrap(), want);
-        let after: Vec<Vec<u8>> = list_segments(&e.dir).unwrap().iter().map(|p| bytes(p)).collect();
+        let after: Vec<Vec<u8>> = list_segments(&e.dir)
+            .unwrap()
+            .iter()
+            .map(|p| bytes(p))
+            .collect();
         assert_eq!(before, after, "nothing was cut or written");
         assert!(read_log(&e.dir.join("missing")).is_err());
     }
@@ -2234,8 +2678,18 @@ mod tests {
         std::fs::remove_file(&seg0).unwrap();
         Segment::create(&seg0, ChronicleId::from_bytes([6; 16]), Position::GENESIS).unwrap();
         assert!(matches!(
-            Chronicle::open_as(&e.dir, e.coord.clone(), cid(), A, e.layers.clone(), claim(&*e.coord, A)),
-            Err(ChronicleError::SegmentsDisagree { why: "another Chronicle's segment", .. })
+            Chronicle::open_as(
+                &e.dir,
+                e.coord.clone(),
+                cid(),
+                A,
+                e.layers.clone(),
+                claim(&*e.coord, A)
+            ),
+            Err(ChronicleError::SegmentsDisagree {
+                why: "another Chronicle's segment",
+                ..
+            })
         ));
     }
 
@@ -2255,7 +2709,15 @@ mod tests {
     fn segments_join_only_end_to_start_or_through_a_gap_record() {
         let root = tempfile::tempdir().unwrap();
         let rec = |prev: Position, stream, payload| {
-            Record::new(cid(), BranchId::TRUNK, Epoch::new(1), stream, prev.lsn.next(), prev.hash, payload)
+            Record::new(
+                cid(),
+                BranchId::TRUNK,
+                Epoch::new(1),
+                stream,
+                prev.lsn.next(),
+                prev.hash,
+                payload,
+            )
         };
         let mut n = 0;
         // A segment from `base` holding `payloads`.
@@ -2268,11 +2730,25 @@ mod tests {
             }
             s
         };
-        let first = seg(Position::GENESIS, vec![(Stream::Fs, raw(1)), (Stream::Fs, raw(2))]);
+        let first = seg(
+            Position::GENESIS,
+            vec![(Stream::Fs, raw(1)), (Stream::Fs, raw(2))],
+        );
         let kept = first.tail();
-        let far = Position { lsn: Lsn::new(9), hash: HashVal::from_bytes([3; 32]) };
+        let far = Position {
+            lsn: Lsn::new(9),
+            hash: HashVal::from_bytes([3; 32]),
+        };
         let gap = |k: Position, r: Position| {
-            (Stream::Ctl, Payload::Gap(GapRecord { kept: k.lsn, kept_hash: k.hash, resumes: r.lsn, resumes_hash: r.hash }))
+            (
+                Stream::Ctl,
+                Payload::Gap(GapRecord {
+                    kept: k.lsn,
+                    kept_hash: k.hash,
+                    resumes: r.lsn,
+                    resumes_hash: r.hash,
+                }),
+            )
         };
         let why = |r: Result<Option<Position>, ChronicleError>| match r {
             Err(ChronicleError::SegmentsDisagree { why, .. }) => why,
@@ -2281,31 +2757,109 @@ mod tests {
 
         // End to start; a gap with its record; a continuation not begun.
         let next = seg(kept, vec![(Stream::Fs, raw(3))]);
-        assert_eq!(check_joints(std::slice::from_ref(&first), &next, false).unwrap(), None);
+        assert_eq!(
+            check_joints(std::slice::from_ref(&first), &next, false).unwrap(),
+            None
+        );
         let cont = seg(far, vec![gap(kept, far), (Stream::Fs, raw(4))]);
-        assert_eq!(check_joints(std::slice::from_ref(&first), &cont, false).unwrap(), None);
+        assert_eq!(
+            check_joints(std::slice::from_ref(&first), &cont, false).unwrap(),
+            None
+        );
         let empty = seg(far, vec![]);
-        assert_eq!(check_joints(std::slice::from_ref(&first), &empty, false).unwrap(), Some(kept));
+        assert_eq!(
+            check_joints(std::slice::from_ref(&first), &empty, false).unwrap(),
+            Some(kept)
+        );
 
         // Refusals.
         let not_genesis = seg(kept, vec![]);
-        assert_eq!(why(check_joints(&[], &not_genesis, false)), "the first segment does not start at genesis");
-        let inside = seg(Position { lsn: Lsn::new(1), hash: HashVal::from_bytes([1; 32]) }, vec![]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &inside, false)), "it starts inside the one before");
-        let same_lsn = seg(Position { lsn: kept.lsn, hash: HashVal::from_bytes([1; 32]) }, vec![]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &same_lsn, false)), "it starts inside the one before");
+        assert_eq!(
+            why(check_joints(&[], &not_genesis, false)),
+            "the first segment does not start at genesis"
+        );
+        let inside = seg(
+            Position {
+                lsn: Lsn::new(1),
+                hash: HashVal::from_bytes([1; 32]),
+            },
+            vec![],
+        );
+        assert_eq!(
+            why(check_joints(std::slice::from_ref(&first), &inside, false)),
+            "it starts inside the one before"
+        );
+        let same_lsn = seg(
+            Position {
+                lsn: kept.lsn,
+                hash: HashVal::from_bytes([1; 32]),
+            },
+            vec![],
+        );
+        assert_eq!(
+            why(check_joints(std::slice::from_ref(&first), &same_lsn, false)),
+            "it starts inside the one before"
+        );
         let no_record = seg(far, vec![(Stream::Fs, raw(4))]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &no_record, false)), "it skips records without a Gap record");
-        let wrong_kept = seg(far, vec![gap(Position { lsn: Lsn::new(1), hash: kept.hash }, far)]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_kept, false)), "it skips records without a Gap record");
-        let wrong_resumes =
-            seg(far, vec![gap(kept, Position { lsn: far.lsn, hash: HashVal::from_bytes([4; 32]) })]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &wrong_resumes, false)), "it skips records without a Gap record");
+        assert_eq!(
+            why(check_joints(
+                std::slice::from_ref(&first),
+                &no_record,
+                false
+            )),
+            "it skips records without a Gap record"
+        );
+        let wrong_kept = seg(
+            far,
+            vec![gap(
+                Position {
+                    lsn: Lsn::new(1),
+                    hash: kept.hash,
+                },
+                far,
+            )],
+        );
+        assert_eq!(
+            why(check_joints(
+                std::slice::from_ref(&first),
+                &wrong_kept,
+                false
+            )),
+            "it skips records without a Gap record"
+        );
+        let wrong_resumes = seg(
+            far,
+            vec![gap(
+                kept,
+                Position {
+                    lsn: far.lsn,
+                    hash: HashVal::from_bytes([4; 32]),
+                },
+            )],
+        );
+        assert_eq!(
+            why(check_joints(
+                std::slice::from_ref(&first),
+                &wrong_resumes,
+                false
+            )),
+            "it skips records without a Gap record"
+        );
         let gap_on_fs = seg(far, vec![(Stream::Fs, gap(kept, far).1)]);
-        assert_eq!(why(check_joints(std::slice::from_ref(&first), &gap_on_fs, false)), "it skips records without a Gap record");
+        assert_eq!(
+            why(check_joints(
+                std::slice::from_ref(&first),
+                &gap_on_fs,
+                false
+            )),
+            "it skips records without a Gap record"
+        );
         let empty_middle = seg(far, vec![]);
         let after = seg(far, vec![(Stream::Fs, raw(5))]);
-        assert_eq!(why(check_joints(&[first, empty_middle], &after, false)), "an empty segment after a gap");
+        assert_eq!(
+            why(check_joints(&[first, empty_middle], &after, false)),
+            "an empty segment after a gap"
+        );
     }
 
     // ── unknown outcomes (remote coordinator) ───────────────────────
@@ -2321,21 +2875,44 @@ mod tests {
         fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
             self.inner.register(c, h)
         }
-        fn append(&self, w: WardenId, e: &taso_core::envelope::Envelope) -> Result<ChronicleHead, CoordError> {
+        fn append(
+            &self,
+            w: WardenId,
+            e: &taso_core::envelope::Envelope,
+        ) -> Result<ChronicleHead, CoordError> {
             let r = self.inner.append(w, e);
-            if self.lose_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                return Err(CoordError::Unavailable(std::io::ErrorKind::ConnectionReset.into()));
+            if self
+                .lose_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CoordError::Unavailable(
+                    std::io::ErrorKind::ConnectionReset.into(),
+                ));
             }
             r
         }
-        fn append_batch(&self, w: WardenId, es: &[taso_core::envelope::Envelope]) -> Result<ChronicleHead, CoordError> {
+        fn append_batch(
+            &self,
+            w: WardenId,
+            es: &[taso_core::envelope::Envelope],
+        ) -> Result<ChronicleHead, CoordError> {
             let r = self.inner.append_batch(w, es);
-            if self.lose_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                return Err(CoordError::Unavailable(std::io::ErrorKind::ConnectionReset.into()));
+            if self
+                .lose_next
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CoordError::Unavailable(
+                    std::io::ErrorKind::ConnectionReset.into(),
+                ));
             }
             r
         }
-        fn transfer_if(&self, c: ChronicleId, h: WardenId, e: (WardenId, Epoch)) -> Result<Epoch, CoordError> {
+        fn transfer_if(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+            e: (WardenId, Epoch),
+        ) -> Result<Epoch, CoordError> {
             self.inner.transfer_if(c, h, e)
         }
         fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
@@ -2347,7 +2924,13 @@ mod tests {
         fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
             self.inner.head(c)
         }
-        fn advance_shipped(&self, w: WardenId, c: ChronicleId, e: Epoch, to: Position) -> Result<Position, CoordError> {
+        fn advance_shipped(
+            &self,
+            w: WardenId,
+            c: ChronicleId,
+            e: Epoch,
+            to: Position,
+        ) -> Result<Position, CoordError> {
             self.inner.advance_shipped(w, c, e, to)
         }
         fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
@@ -2371,18 +2954,34 @@ mod tests {
         let (mut c, _) = Chronicle::create(&dir, coord.clone(), cid(), A, layers.clone()).unwrap();
         c.append(Stream::Fs, raw(1)).unwrap();
 
-        coord.lose_next.store(true, std::sync::atomic::Ordering::SeqCst);
+        coord
+            .lose_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let err = c.append(Stream::Fs, raw(2)).unwrap_err();
-        assert!(matches!(err, ChronicleError::Coord(CoordError::Unavailable(_))), "{err}");
+        assert!(
+            matches!(err, ChronicleError::Coord(CoordError::Unavailable(_))),
+            "{err}"
+        );
         assert!(!c.is_fenced(), "an unknown outcome is not a refusal");
         assert_eq!(c.tail().lsn, Lsn::new(2), "the frame is kept");
-        assert_eq!(coord.head(cid()).unwrap().lsn, Lsn::new(2), "the CAS did land");
-        assert!(matches!(c.append(Stream::Fs, raw(3)), Err(ChronicleError::Poisoned)));
+        assert_eq!(
+            coord.head(cid()).unwrap().lsn,
+            Lsn::new(2),
+            "the CAS did land"
+        );
+        assert!(matches!(
+            c.append(Stream::Fs, raw(3)),
+            Err(ChronicleError::Poisoned)
+        ));
         assert!(matches!(seal(&mut c, 1), Err(ChronicleError::Poisoned)));
         assert!(layers.snaps().is_empty());
         drop(c);
 
-        let (mut c, r) = { let cl = claim(&*coord, A); Chronicle::open_as(&dir, coord.clone(), cid(), A, layers, cl) }.unwrap();
+        let (mut c, r) = {
+            let cl = claim(&*coord, A);
+            Chronicle::open_as(&dir, coord.clone(), cid(), A, layers, cl)
+        }
+        .unwrap();
         assert_eq!(r.segment.unaccepted_frames, 0);
         assert_eq!(c.tail().lsn, Lsn::new(2));
         assert_eq!(c.append(Stream::Fs, raw(3)).unwrap().lsn, Lsn::new(3));
@@ -2401,7 +3000,10 @@ mod tests {
     }
 
     fn remote(sock: &Path) -> Arc<dyn Coord> {
-        Arc::new(crate::coordsrv::RemoteCoord::with_timeout(sock, std::time::Duration::from_secs(5)))
+        Arc::new(crate::coordsrv::RemoteCoord::with_timeout(
+            sock,
+            std::time::Duration::from_secs(5),
+        ))
     }
 
     /// The coordinator process goes away during an append: the Chronicle
@@ -2419,15 +3021,26 @@ mod tests {
 
         server.stop();
         let err = c.append(Stream::Fs, raw(2)).unwrap_err();
-        assert!(matches!(err, ChronicleError::Coord(CoordError::Unavailable(_))), "{err}");
+        assert!(
+            matches!(err, ChronicleError::Coord(CoordError::Unavailable(_))),
+            "{err}"
+        );
         assert!(!c.is_fenced());
-        assert_eq!(c.tail().lsn, Lsn::new(2), "the frame is kept until recovery decides");
+        assert_eq!(
+            c.tail().lsn,
+            Lsn::new(2),
+            "the frame is kept until recovery decides"
+        );
         assert!(matches!(seal(&mut c, 1), Err(ChronicleError::Poisoned)));
         assert!(layers.snaps().is_empty());
         drop(c);
 
         let _server = spawn_server(&sock, &db);
-        let (mut c, r) = { let cl = claim(&*coord, A); Chronicle::open_as(&dir, coord, cid(), A, layers, cl) }.unwrap();
+        let (mut c, r) = {
+            let cl = claim(&*coord, A);
+            Chronicle::open_as(&dir, coord, cid(), A, layers, cl)
+        }
+        .unwrap();
         assert_eq!(r.segment.unaccepted_frames, 1);
         assert_eq!(c.tail().lsn, Lsn::new(1));
         assert_eq!(c.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
@@ -2444,15 +3057,24 @@ mod tests {
         std::fs::create_dir(&dir_a).unwrap();
         std::fs::create_dir(&dir_b).unwrap();
         let layers_a = FakeLayers::default();
-        let (mut a, _) = Chronicle::create(&dir_a, remote(&sock), cid(), A, layers_a.clone()).unwrap();
+        let (mut a, _) =
+            Chronicle::create(&dir_a, remote(&sock), cid(), A, layers_a.clone()).unwrap();
         a.append(Stream::Fs, raw(1)).unwrap();
         let a_len = std::fs::metadata(a.segment().path()).unwrap().len();
 
         std::fs::copy(a.segment().path(), dir_b.join(SEGMENT_FILE)).unwrap();
-        let (mut b, rb) = { let c = remote(&sock); let cl = claim(&*c, B); Chronicle::open_as(&dir_b, c, cid(), B, FakeLayers::default(), cl) }.unwrap();
+        let (mut b, rb) = {
+            let c = remote(&sock);
+            let cl = claim(&*c, B);
+            Chronicle::open_as(&dir_b, c, cid(), B, FakeLayers::default(), cl)
+        }
+        .unwrap();
         assert_eq!(rb.head.lsn, Lsn::new(1));
 
-        assert!(matches!(a.append(Stream::Fs, raw(2)), Err(ChronicleError::Refused(_))));
+        assert!(matches!(
+            a.append(Stream::Fs, raw(2)),
+            Err(ChronicleError::Refused(_))
+        ));
         assert!(a.is_fenced());
         assert_eq!(std::fs::metadata(a.segment().path()).unwrap().len(), a_len);
         assert!(matches!(seal(&mut a, 1), Err(ChronicleError::Fenced)));
@@ -2491,13 +3113,18 @@ mod tests {
                 let mountpoint = PathBuf::from(
                     zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", &name]).trim(),
                 );
-                Self { ds: Dataset::new(&name).unwrap(), mountpoint }
+                Self {
+                    ds: Dataset::new(&name).unwrap(),
+                    mountpoint,
+                }
             }
         }
 
         impl Drop for Scratch {
             fn drop(&mut self) {
-                let _ = Command::new("zfs").args(["destroy", "-r", self.ds.as_str()]).status();
+                let _ = Command::new("zfs")
+                    .args(["destroy", "-r", self.ds.as_str()])
+                    .status();
             }
         }
 
@@ -2522,7 +3149,10 @@ mod tests {
                 vec![(s1.seal.lsn, s1.seal.hash), (s2.seal.lsn, s2.seal.hash)]
             );
             // The first Seal froze the first contents.
-            let snap = s.mountpoint.join(format!(".zfs/snapshot/taso-seal-{:020}/a.txt", s1.seal.lsn.get()));
+            let snap = s.mountpoint.join(format!(
+                ".zfs/snapshot/taso-seal-{:020}/a.txt",
+                s1.seal.lsn.get()
+            ));
             assert_eq!(std::fs::read(snap).unwrap(), b"one");
             let tail = c.tail();
             drop(c);
@@ -2533,7 +3163,11 @@ mod tests {
                 .unwrap();
 
             let layers = ZfsLayers::new(Zfs::cli(), s.ds.clone());
-            let (c, r) = { let cl = claim(&*coord, A); Chronicle::open_as(root.path(), coord, cid(), A, layers, cl) }.unwrap();
+            let (c, r) = {
+                let cl = claim(&*coord, A);
+                Chronicle::open_as(root.path(), coord, cid(), A, layers, cl)
+            }
+            .unwrap();
             assert_eq!(r.orphan_layers, vec![tail.lsn.next()]);
             assert_eq!(r.last_seal, Some(s2.seal));
             assert_eq!(c.layers().list().unwrap().len(), 2);

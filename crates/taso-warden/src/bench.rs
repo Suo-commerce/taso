@@ -38,7 +38,10 @@ mod tests {
     use crate::zfs::{Dataset, Snapshot};
 
     fn n(default: usize) -> usize {
-        std::env::var("TASO_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        std::env::var("TASO_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
     }
 
     /// p50 and p95 (ms) of `durations` (µs) in consecutive blocks of `block`:
@@ -59,9 +62,18 @@ mod tests {
         out
     }
 
-    fn print(title: &str, spans: &BTreeMap<&'static str, Vec<u64>>, growth_of: &str, block: usize, wall: f64) {
+    fn print(
+        title: &str,
+        spans: &BTreeMap<&'static str, Vec<u64>>,
+        growth_of: &str,
+        block: usize,
+        wall: f64,
+    ) {
         println!("\n=== {title} ===");
-        println!("TMPDIR={}", std::env::var("TMPDIR").unwrap_or_else(|_| "(default)".into()));
+        println!(
+            "TMPDIR={}",
+            std::env::var("TMPDIR").unwrap_or_else(|_| "(default)".into())
+        );
         print!("{}", timing::report(spans));
         if let Some(v) = spans.get(growth_of) {
             print!("{}", growth(growth_of, v, block));
@@ -86,7 +98,13 @@ mod tests {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"bench").unwrap();
         let store_dir = tempfile::tempdir().unwrap();
-        let packs = Packs::new(LocalStore::new(store_dir.path()), FixedSend(0), "vessels", v.id()).unwrap();
+        let packs = Packs::new(
+            LocalStore::new(store_dir.path()),
+            FixedSend(0),
+            "vessels",
+            v.id(),
+        )
+        .unwrap();
         let publisher = PackPublisher::new(packs, e.host.coord.clone(), e.host.warden);
         let mut registry = Registry::new();
         registry.register(Box::new(FakeProvider::new("mail")));
@@ -96,18 +114,33 @@ mod tests {
         timing::enable(true);
         let start = Instant::now();
         for i in 0..count {
-            let call = Call { operation: "send".into(), args: format!("user-{i}").into_bytes() };
+            let call = Call {
+                operation: "send".into(),
+                args: format!("user-{i}").into_bytes(),
+            };
             fx.dispatch(&mut v, "mail", call).unwrap();
         }
         let wall = start.elapsed().as_secs_f64();
         timing::enable(false);
         let spans = timing::take();
-        print(&format!("dispatch: {count} effects, one Vessel"), &spans, "effect.total", count / 4, wall);
+        print(
+            &format!("dispatch: {count} effects, one Vessel"),
+            &spans,
+            "effect.total",
+            count / 4,
+            wall,
+        );
         assert_eq!(spans["effect.total"].len(), count);
     }
 
     fn snapshot_of<L: Layers>(v: &Vessel<L>, seal: Position) -> Snapshot {
-        Snapshot { dataset: v.dataset().clone(), seal: seal.lsn, createtxg: 1, guid: 1000 + seal.lsn.get(), seal_hash: Some(seal.hash) }
+        Snapshot {
+            dataset: v.dataset().clone(),
+            seal: seal.lsn,
+            createtxg: 1,
+            guid: 1000 + seal.lsn.get(),
+            seal_hash: Some(seal.hash),
+        }
     }
 
     /// A turn of `records` appends, then a Seal and its publication (Seal
@@ -120,17 +153,33 @@ mod tests {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"bench").unwrap();
         let store_dir = tempfile::tempdir().unwrap();
-        let packs = Packs::new(LocalStore::new(store_dir.path()), FixedSend(64 << 10), "vessels", v.id()).unwrap();
+        let packs = Packs::new(
+            LocalStore::new(store_dir.path()),
+            FixedSend(64 << 10),
+            "vessels",
+            v.id(),
+        )
+        .unwrap();
 
         timing::take();
         timing::enable(true);
         let start = Instant::now();
         for turn in 0..count {
             for r in 0..records {
-                v.append(Stream::Fs, Payload::Raw(vec![r as u8; 200])).unwrap();
+                v.append(Stream::Fs, Payload::Raw(vec![r as u8; 200]))
+                    .unwrap();
             }
-            let seal = v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn as u64 + 1)).unwrap().seal;
-            v.publish_seal(&packs, &snapshot_of(&v, seal), None).unwrap();
+            let seal = v
+                .seal(
+                    StreamCut::EMPTY,
+                    Verdict::Clean,
+                    Lsn::new(0),
+                    TurnId::new(turn as u64 + 1),
+                )
+                .unwrap()
+                .seal;
+            v.publish_seal(&packs, &snapshot_of(&v, seal), None)
+                .unwrap();
         }
         let wall = start.elapsed().as_secs_f64();
         timing::enable(false);
@@ -176,19 +225,33 @@ mod tests {
 
         fn p64(batched: bool) {
             let turns = n(20);
-            let vessels: usize =
-                std::env::var("TASO_BENCH_VESSELS").ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+            let vessels: usize = std::env::var("TASO_BENCH_VESSELS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64);
             let Ok(base) = std::env::var("TASO_ZFS_DATASET") else {
-                println!("\n=== seals at p{vessels} on ZFS: skipped, TASO_ZFS_DATASET is not set ===");
+                println!(
+                    "\n=== seals at p{vessels} on ZFS: skipped, TASO_ZFS_DATASET is not set ==="
+                );
                 return;
             };
-            let root = format!("{base}/p64{}-{}", if batched { "b" } else { "" }, std::process::id());
-            let zfs = if batched { Zfs::<Cli>::cli().batched() } else { Zfs::<Cli>::cli() };
+            let root = format!(
+                "{base}/p64{}-{}",
+                if batched { "b" } else { "" },
+                std::process::id()
+            );
+            let zfs = if batched {
+                Zfs::<Cli>::cli().batched()
+            } else {
+                Zfs::<Cli>::cli()
+            };
             Zfs::create(&zfs, &Dataset::new(&root).unwrap()).unwrap();
             struct Cleanup(String);
             impl Drop for Cleanup {
                 fn drop(&mut self) {
-                    let _ = Command::new("zfs").args(["destroy", "-R", &self.0]).status();
+                    let _ = Command::new("zfs")
+                        .args(["destroy", "-R", &self.0])
+                        .status();
                 }
             }
             let _c = Cleanup(root.clone());
@@ -203,7 +266,12 @@ mod tests {
             let mut all = Vec::new();
             for i in 0..vessels {
                 let (v, _) = host.ensure(ns(1), format!("bench-{i}").as_bytes()).unwrap();
-                let mount = zfs.dataset_info(v.dataset()).unwrap().unwrap().mountpoint.unwrap();
+                let mount = zfs
+                    .dataset_info(v.dataset())
+                    .unwrap()
+                    .unwrap()
+                    .mountpoint
+                    .unwrap();
                 all.push((v, mount));
             }
 
@@ -217,9 +285,19 @@ mod tests {
                     scope.spawn(move || {
                         go.wait();
                         for turn in 0..turns {
-                            std::fs::write(mount.join(format!("f{}", turn % 4)), vec![turn as u8; 16 << 10]).unwrap();
+                            std::fs::write(
+                                mount.join(format!("f{}", turn % 4)),
+                                vec![turn as u8; 16 << 10],
+                            )
+                            .unwrap();
                             v.append(Stream::Fs, Payload::Raw(vec![1; 200])).unwrap();
-                            v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn as u64 + 1)).unwrap();
+                            v.seal(
+                                StreamCut::EMPTY,
+                                Verdict::Clean,
+                                Lsn::new(0),
+                                TurnId::new(turn as u64 + 1),
+                            )
+                            .unwrap();
                         }
                     });
                 }
@@ -227,13 +305,27 @@ mod tests {
             let wall = start.elapsed().as_secs_f64();
             timing::enable(false);
             let spans = timing::take();
-            let how = if batched { "batched snapshots" } else { "one zfs snapshot per Seal" };
-            let title = format!("seals at p{vessels} on ZFS, {how}: {turns} turns each, dataset {root}");
-            print(&title, &spans, "seal.total", (vessels * turns / 4).max(1), wall);
+            let how = if batched {
+                "batched snapshots"
+            } else {
+                "one zfs snapshot per Seal"
+            };
+            let title =
+                format!("seals at p{vessels} on ZFS, {how}: {turns} turns each, dataset {root}");
+            print(
+                &title,
+                &spans,
+                "seal.total",
+                (vessels * turns / 4).max(1),
+                wall,
+            );
             let mut seal = spans["seal.total"].clone();
             seal.sort_unstable();
             let p95 = timing::quantile(&seal, 0.95) as f64 / 1000.0;
-            println!("gate (Seal p95 < 50 ms): {p95:.1} ms -> {}", if p95 < 50.0 { "within" } else { "OVER" });
+            println!(
+                "gate (Seal p95 < 50 ms): {p95:.1} ms -> {}",
+                if p95 < 50.0 { "within" } else { "OVER" }
+            );
             assert_eq!(seal.len(), vessels * turns);
         }
 
@@ -253,7 +345,9 @@ mod tests {
             struct Cleanup(String);
             impl Drop for Cleanup {
                 fn drop(&mut self) {
-                    let _ = Command::new("zfs").args(["destroy", "-R", &self.0]).status();
+                    let _ = Command::new("zfs")
+                        .args(["destroy", "-R", &self.0])
+                        .status();
                 }
             }
             let _c = Cleanup(root.clone());
@@ -266,28 +360,59 @@ mod tests {
                 warden: WardenId::new(1),
             };
             let (mut v, _) = host.ensure(ns(1), b"bench").unwrap();
-            let mount = zfs.dataset_info(v.dataset()).unwrap().unwrap().mountpoint.unwrap();
-            let packs = Packs::new(LocalStore::new(tmp.path().join("store")), ZfsSend::default(), "vessels", v.id()).unwrap();
+            let mount = zfs
+                .dataset_info(v.dataset())
+                .unwrap()
+                .unwrap()
+                .mountpoint
+                .unwrap();
+            let packs = Packs::new(
+                LocalStore::new(tmp.path().join("store")),
+                ZfsSend::default(),
+                "vessels",
+                v.id(),
+            )
+            .unwrap();
 
             timing::take();
             timing::enable(true);
             let start = Instant::now();
             for turn in 0..count {
-                std::fs::write(mount.join(format!("f{}", turn % 8)), vec![turn as u8; 64 << 10]).unwrap();
+                std::fs::write(
+                    mount.join(format!("f{}", turn % 8)),
+                    vec![turn as u8; 64 << 10],
+                )
+                .unwrap();
                 v.append(Stream::Fs, Payload::Raw(vec![1; 200])).unwrap();
-                let seal = v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(turn as u64 + 1)).unwrap().seal;
+                let seal = v
+                    .seal(
+                        StreamCut::EMPTY,
+                        Verdict::Clean,
+                        Lsn::new(0),
+                        TurnId::new(turn as u64 + 1),
+                    )
+                    .unwrap()
+                    .seal;
                 let snap = {
                     // One snapshot, not the whole list (which grows with
                     // every Seal: the 2026-10-16 finding).
                     let _t = timing::span("bench.zfs_get");
-                    zfs.get(v.dataset(), seal.lsn).unwrap().expect("the Seal's snapshot")
+                    zfs.get(v.dataset(), seal.lsn)
+                        .unwrap()
+                        .expect("the Seal's snapshot")
                 };
                 v.publish_seal(&packs, &snap, None).unwrap();
             }
             let wall = start.elapsed().as_secs_f64();
             timing::enable(false);
             let spans = timing::take();
-            print(&format!("seal + publish on ZFS: {count} turns, dataset {root}"), &spans, "publish.total", count / 4, wall);
+            print(
+                &format!("seal + publish on ZFS: {count} turns, dataset {root}"),
+                &spans,
+                "publish.total",
+                count / 4,
+                wall,
+            );
             assert_eq!(spans["publish.total"].len(), count);
         }
     }

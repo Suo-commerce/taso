@@ -59,12 +59,22 @@ fn writes_only_beneath_the_write_paths() {
     std::fs::write(dir.path().join("c/o/existing"), b"keep\n").unwrap();
     std::fs::write(dir.path().join("c/w/mine"), b"m").unwrap();
     let control = Command::new("/bin/sh")
-        .args(["-c", &script.replace(&dir.path().display().to_string(), &format!("{}/c", dir.path().display()))])
+        .args([
+            "-c",
+            &script.replace(
+                &dir.path().display().to_string(),
+                &format!("{}/c", dir.path().display()),
+            ),
+        ])
         .env("TEST_PID", std::process::id().to_string())
         .output()
         .unwrap();
     let c = String::from_utf8_lossy(&control.stdout).into_owned();
-    assert!(c.lines().all(|l| l.trim().is_empty() || l.trim().ends_with(" yes")), "control:\n{c}");
+    assert!(
+        c.lines()
+            .all(|l| l.trim().is_empty() || l.trim().ends_with(" yes")),
+        "control:\n{c}"
+    );
 
     let out = shim(&["--write", w.to_str().unwrap()], &script);
     let text = String::from_utf8_lossy(&out.stdout);
@@ -79,7 +89,10 @@ fn writes_only_beneath_the_write_paths() {
         "dev_null yes",
         "signal_out no",
     ] {
-        assert!(text.lines().any(|l| l.trim() == want), "expected {want:?} in:\n{text}");
+        assert!(
+            text.lines().any(|l| l.trim() == want),
+            "expected {want:?} in:\n{text}"
+        );
     }
     assert_eq!(std::fs::read(o.join("existing")).unwrap(), b"keep\n");
     assert!(!o.join("x").exists() && !o.join("mine").exists());
@@ -92,7 +105,10 @@ fn a_missing_write_path_runs_nothing() {
     }
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("ran");
-    let out = shim(&["--write", "/does/not/exist"], &format!("touch {}", marker.display()));
+    let out = shim(
+        &["--write", "/does/not/exist"],
+        &format!("touch {}", marker.display()),
+    );
     assert_eq!(out.status.code(), Some(71), "{out:?}");
     assert!(!Path::new(&marker).exists());
 }
@@ -101,7 +117,10 @@ fn a_missing_write_path_runs_nothing() {
 fn usage_errors_run_nothing() {
     let out = Command::new(SHIM).args(["--write"]).output().unwrap();
     assert_eq!(out.status.code(), Some(64));
-    let out = Command::new(SHIM).args(["--write", "/tmp", "--", "/does/not/exist"]).output().unwrap();
+    let out = Command::new(SHIM)
+        .args(["--write", "/tmp", "--", "/does/not/exist"])
+        .output()
+        .unwrap();
     // With Landlock: restricted, then exec fails (126).  Without: 70.
     assert!(matches!(out.status.code(), Some(126) | Some(70)), "{out:?}");
 }

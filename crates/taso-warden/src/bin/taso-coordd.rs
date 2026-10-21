@@ -23,7 +23,8 @@ use taso_core::model::WardenId;
 use taso_warden::coordinator::{Coord, Coordinator};
 use taso_warden::coordsrv::{Server, ServerOptions};
 
-const USAGE: &str = "usage: taso-coordd <coord.redb> <socket> [--peer UID=WARDEN]... [--socket-group GID]";
+const USAGE: &str =
+    "usage: taso-coordd <coord.redb> <socket> [--peer UID=WARDEN]... [--socket-group GID]";
 
 /// What the command line asked for.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,7 +44,11 @@ struct ServerOptionsSpec {
 impl ServerOptionsSpec {
     fn build(self) -> ServerOptions {
         ServerOptions {
-            peers: self.peers.map(|p| p.into_iter().map(|(uid, w)| (uid, WardenId::new(w))).collect::<HashMap<_, _>>()),
+            peers: self.peers.map(|p| {
+                p.into_iter()
+                    .map(|(uid, w)| (uid, WardenId::new(w)))
+                    .collect::<HashMap<_, _>>()
+            }),
             group: self.group,
         }
     }
@@ -60,9 +65,15 @@ fn parse(args: &[String]) -> Result<Args, String> {
         match a.as_str() {
             "--peer" => {
                 let v = it.next().ok_or("--peer needs UID=WARDEN")?;
-                let (uid, warden) = v.split_once('=').ok_or_else(|| format!("--peer {v}: expected UID=WARDEN"))?;
-                let uid: u32 = uid.parse().map_err(|_| format!("--peer {v}: uid is not a number"))?;
-                let warden: u64 = warden.parse().map_err(|_| format!("--peer {v}: warden is not a number"))?;
+                let (uid, warden) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("--peer {v}: expected UID=WARDEN"))?;
+                let uid: u32 = uid
+                    .parse()
+                    .map_err(|_| format!("--peer {v}: uid is not a number"))?;
+                let warden: u64 = warden
+                    .parse()
+                    .map_err(|_| format!("--peer {v}: warden is not a number"))?;
                 if peers.iter().any(|(u, _)| *u == uid) {
                     return Err(format!("--peer {v}: uid {uid} given twice"));
                 }
@@ -76,7 +87,10 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 if group.is_some() {
                     return Err("--socket-group given twice".into());
                 }
-                group = Some(v.parse().map_err(|_| format!("--socket-group {v}: not a numeric gid"))?);
+                group = Some(
+                    v.parse()
+                        .map_err(|_| format!("--socket-group {v}: not a numeric gid"))?,
+                );
             }
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             _ => positional.push(a.clone()),
@@ -88,7 +102,10 @@ fn parse(args: &[String]) -> Result<Args, String> {
     Ok(Args {
         db: db.clone(),
         sock: sock.clone(),
-        options: ServerOptionsSpec { peers: (!peers.is_empty()).then_some(peers), group },
+        options: ServerOptionsSpec {
+            peers: (!peers.is_empty()).then_some(peers),
+            group,
+        },
     })
 }
 
@@ -144,8 +161,24 @@ mod tests {
 
     #[test]
     fn peers_and_group_parse_in_any_order() {
-        let a = p(&["--peer", "1001=1", "c.redb", "--socket-group", "990", "c.sock", "--peer", "1002=2"]).unwrap();
-        assert_eq!(a.options, ServerOptionsSpec { peers: Some(vec![(1001, 1), (1002, 2)]), group: Some(990) });
+        let a = p(&[
+            "--peer",
+            "1001=1",
+            "c.redb",
+            "--socket-group",
+            "990",
+            "c.sock",
+            "--peer",
+            "1002=2",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.options,
+            ServerOptionsSpec {
+                peers: Some(vec![(1001, 1), (1002, 2)]),
+                group: Some(990)
+            }
+        );
         let o = a.options.build();
         let peers = o.peers.unwrap();
         assert_eq!(peers.get(&1001), Some(&WardenId::new(1)));
@@ -159,14 +192,35 @@ mod tests {
             (&["c.redb"][..], "expected 2 arguments, got 1"),
             (&["a", "b", "c"], "expected 2 arguments, got 3"),
             (&["a", "b", "--peer"], "--peer needs UID=WARDEN"),
-            (&["a", "b", "--peer", "1001"], "--peer 1001: expected UID=WARDEN"),
-            (&["a", "b", "--peer", "x=1"], "--peer x=1: uid is not a number"),
-            (&["a", "b", "--peer", "1=y"], "--peer 1=y: warden is not a number"),
-            (&["a", "b", "--peer", "1=1", "--peer", "1=2"], "--peer 1=2: uid 1 given twice"),
-            (&["a", "b", "--peer", "1=7", "--peer", "2=7"], "--peer 2=7: warden 7 given twice"),
+            (
+                &["a", "b", "--peer", "1001"],
+                "--peer 1001: expected UID=WARDEN",
+            ),
+            (
+                &["a", "b", "--peer", "x=1"],
+                "--peer x=1: uid is not a number",
+            ),
+            (
+                &["a", "b", "--peer", "1=y"],
+                "--peer 1=y: warden is not a number",
+            ),
+            (
+                &["a", "b", "--peer", "1=1", "--peer", "1=2"],
+                "--peer 1=2: uid 1 given twice",
+            ),
+            (
+                &["a", "b", "--peer", "1=7", "--peer", "2=7"],
+                "--peer 2=7: warden 7 given twice",
+            ),
             (&["a", "b", "--socket-group"], "--socket-group needs a GID"),
-            (&["a", "b", "--socket-group", "wardens"], "--socket-group wardens: not a numeric gid"),
-            (&["a", "b", "--socket-group", "1", "--socket-group", "2"], "--socket-group given twice"),
+            (
+                &["a", "b", "--socket-group", "wardens"],
+                "--socket-group wardens: not a numeric gid",
+            ),
+            (
+                &["a", "b", "--socket-group", "1", "--socket-group", "2"],
+                "--socket-group given twice",
+            ),
             (&["a", "b", "--tls"], "unknown option --tls"),
         ];
         for (args, want) in bad {

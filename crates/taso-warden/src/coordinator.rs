@@ -58,7 +58,8 @@ use crate::segment::Position;
 
 /// One row per Chronicle: key = `ChronicleId` bytes, value = [`State`]
 /// in the fixed layout of [`State::encode`].
-const CHRONICLES: TableDefinition<[u8; 16], &[u8]> = TableDefinition::new("taso.coordinator.chronicles");
+const CHRONICLES: TableDefinition<[u8; 16], &[u8]> =
+    TableDefinition::new("taso.coordinator.chronicles");
 
 /// Layout version byte at the start of every row.
 const LAYOUT_V1: u8 = 1;
@@ -222,14 +223,21 @@ impl fmt::Display for CoordError {
                 warden.get(),
                 holder.get()
             ),
-            Self::EpochMismatch { record_epoch, current } => write!(
+            Self::EpochMismatch {
+                record_epoch,
+                current,
+            } => write!(
                 f,
                 "epoch {} is not the current epoch {}",
                 record_epoch.get(),
                 current.get()
             ),
             Self::HeadMismatch { .. } => write!(f, "prev does not match the anchored head"),
-            Self::BadBatch { lsn } => write!(f, "bad batch at lsn {}: empty, or another chronicle", lsn.get()),
+            Self::BadBatch { lsn } => write!(
+                f,
+                "bad batch at lsn {}: empty, or another chronicle",
+                lsn.get()
+            ),
             Self::LsnNotNext { lsn, expected } => write!(
                 f,
                 "lsn {} is not the next lsn {}",
@@ -241,9 +249,18 @@ impl fmt::Display for CoordError {
             }
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::ShippedAhead { to, head } => {
-                write!(f, "shipped lsn {} is past the anchored head {}", to.get(), head.get())
+                write!(
+                    f,
+                    "shipped lsn {} is past the anchored head {}",
+                    to.get(),
+                    head.get()
+                )
             }
-            Self::ShippedConflict { lsn } => write!(f, "shipped position at lsn {} names another record", lsn.get()),
+            Self::ShippedConflict { lsn } => write!(
+                f,
+                "shipped position at lsn {} names another record",
+                lsn.get()
+            ),
             Self::OwnershipChanged { holder, epoch } => write!(
                 f,
                 "ownership is not what was read: warden {} holds it at epoch {}",
@@ -283,7 +300,11 @@ impl std::error::Error for CoordError {
 pub trait Coord: Send + Sync {
     /// Register a fresh Chronicle with its first holder; returns the
     /// genesis head (lsn 0, [`HashVal::GENESIS`], [`Epoch::FIRST`]).
-    fn register(&self, chronicle: ChronicleId, holder: WardenId) -> Result<ChronicleHead, CoordError>;
+    fn register(
+        &self,
+        chronicle: ChronicleId,
+        holder: WardenId,
+    ) -> Result<ChronicleHead, CoordError>;
 
     /// CAS append: accept `envelope` as the next record of its Chronicle,
     /// or refuse it.  On success returns the new anchored head.
@@ -293,7 +314,11 @@ pub trait Coord: Send + Sync {
     /// one durable transaction: each must pass [`Coord::append`]'s checks
     /// against the head the one before it leaves.  On success returns the
     /// new anchored head.
-    fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError>;
+    fn append_batch(
+        &self,
+        warden: WardenId,
+        envelopes: &[Envelope],
+    ) -> Result<ChronicleHead, CoordError>;
 
     /// Atomic ownership transfer, conditional on the ownership being
     /// exactly `expected` (holder, epoch) — what the caller read before
@@ -382,7 +407,10 @@ impl State {
             (Some(&LAYOUT_V2), ROW_LEN) => {
                 let mut h = [0u8; 32];
                 h.copy_from_slice(&b[ROW_LEN_V1 + 8..]);
-                Position { lsn: Lsn::new(be_u64(&b[ROW_LEN_V1..ROW_LEN_V1 + 8])), hash: HashVal::from_bytes(h) }
+                Position {
+                    lsn: Lsn::new(be_u64(&b[ROW_LEN_V1..ROW_LEN_V1 + 8])),
+                    hash: HashVal::from_bytes(h),
+                }
             }
             (Some(&LAYOUT_V1 | &LAYOUT_V2), _) => return Err(corrupt("wrong row length")),
             _ => return Err(corrupt("unknown layout version")),
@@ -469,7 +497,8 @@ type Done = Box<dyn FnOnce(Option<&CoordError>) + Send>;
 
 /// A queued write request: run against the group's table (or told why
 /// there is none); returns whether it wrote, and how to answer.
-type Job = Box<dyn for<'a, 't> FnOnce(Result<&'a mut Rows<'t>, &'a CoordError>) -> (bool, Done) + Send>;
+type Job =
+    Box<dyn for<'a, 't> FnOnce(Result<&'a mut Rows<'t>, &'a CoordError>) -> (bool, Done) + Send>;
 
 #[derive(Default)]
 struct Queue {
@@ -528,7 +557,11 @@ impl Coordinator {
         if lead {
             self.lead();
         }
-        rx.recv().unwrap_or_else(|_| Err(CoordError::Unavailable(std::io::Error::other("the group commit leader is gone"))))
+        rx.recv().unwrap_or_else(|_| {
+            Err(CoordError::Unavailable(std::io::Error::other(
+                "the group commit leader is gone",
+            )))
+        })
     }
 
     /// Commit queued requests, group after group, until the queue is empty.
@@ -565,7 +598,8 @@ impl Coordinator {
     fn commit_group(&self, jobs: Vec<Job>) {
         let _t = crate::timing::span("coord.group");
         #[cfg(test)]
-        self.groups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.groups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let begun = self.db.begin_write().map_err(storage).and_then(|mut txn| {
             // Immediate is redb's default; stated so it cannot drift.
             txn.set_durability(Durability::Immediate).map_err(storage)?;
@@ -600,7 +634,11 @@ impl Coordinator {
                 dones.push(done);
             }
         }
-        let ended = if any { txn.commit().map_err(storage) } else { txn.abort().map_err(storage) };
+        let ended = if any {
+            txn.commit().map_err(storage)
+        } else {
+            txn.abort().map_err(storage)
+        };
         let failed = ended.err();
         for done in dones {
             done(failed.as_ref());
@@ -668,16 +706,19 @@ impl Coord for Coordinator {
     ///
     /// The coordinator re-validates ownership on every append; there is no
     /// separate heartbeat (v0.4 §8.7).
-    fn append(
-        &self,
-        warden: WardenId,
-        envelope: &Envelope,
-    ) -> Result<ChronicleHead, CoordError> {
+    fn append(&self, warden: WardenId, envelope: &Envelope) -> Result<ChronicleHead, CoordError> {
         self.append_batch(warden, std::slice::from_ref(envelope))
     }
 
-    fn append_batch(&self, warden: WardenId, envelopes: &[Envelope]) -> Result<ChronicleHead, CoordError> {
-        let chronicle = envelopes.first().ok_or(CoordError::BadBatch { lsn: Lsn::new(0) })?.chronicle;
+    fn append_batch(
+        &self,
+        warden: WardenId,
+        envelopes: &[Envelope],
+    ) -> Result<ChronicleHead, CoordError> {
+        let chronicle = envelopes
+            .first()
+            .ok_or(CoordError::BadBatch { lsn: Lsn::new(0) })?
+            .chronicle;
         // Owned: the request may run on the thread leading the group.
         let envelopes = envelopes.to_vec();
         self.write(move |rows| {
@@ -693,7 +734,10 @@ impl Coord for Coordinator {
                     return Err(CoordError::BadHash { lsn: envelope.lsn });
                 }
                 if warden != state.holder {
-                    return Err(CoordError::NotHolder { warden, holder: state.holder });
+                    return Err(CoordError::NotHolder {
+                        warden,
+                        holder: state.holder,
+                    });
                 }
                 if envelope.epoch != state.epoch {
                     return Err(CoordError::EpochMismatch {
@@ -709,7 +753,10 @@ impl Coord for Coordinator {
                 }
                 let expected = state.head.lsn.next();
                 if envelope.lsn != expected {
-                    return Err(CoordError::LsnNotNext { lsn: envelope.lsn, expected });
+                    return Err(CoordError::LsnNotNext {
+                        lsn: envelope.lsn,
+                        expected,
+                    });
                 }
                 state.head = ChronicleHead {
                     lsn: envelope.lsn,
@@ -741,7 +788,10 @@ impl Coord for Coordinator {
             let mut state =
                 load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             if (state.holder, state.epoch) != expected {
-                return Err(CoordError::OwnershipChanged { holder: state.holder, epoch: state.epoch });
+                return Err(CoordError::OwnershipChanged {
+                    holder: state.holder,
+                    epoch: state.epoch,
+                });
             }
             state.sealed_prefix = state.head;
             state.epoch = state.epoch.next();
@@ -752,11 +802,7 @@ impl Coord for Coordinator {
         })
     }
 
-    fn transfer(
-        &self,
-        chronicle: ChronicleId,
-        new_holder: WardenId,
-    ) -> Result<Epoch, CoordError> {
+    fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
         self.write(move |rows| {
             let mut state =
                 load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
@@ -789,15 +835,25 @@ impl Coord for Coordinator {
         to: Position,
     ) -> Result<Position, CoordError> {
         self.write(move |rows| {
-            let mut state = load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+            let mut state =
+                load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             if warden != state.holder {
-                return Err(CoordError::NotHolder { warden, holder: state.holder });
+                return Err(CoordError::NotHolder {
+                    warden,
+                    holder: state.holder,
+                });
             }
             if epoch != state.epoch {
-                return Err(CoordError::EpochMismatch { record_epoch: epoch, current: state.epoch });
+                return Err(CoordError::EpochMismatch {
+                    record_epoch: epoch,
+                    current: state.epoch,
+                });
             }
             if to.lsn > state.head.lsn {
-                return Err(CoordError::ShippedAhead { to: to.lsn, head: state.head.lsn });
+                return Err(CoordError::ShippedAhead {
+                    to: to.lsn,
+                    head: state.head.lsn,
+                });
             }
             if (to.lsn == state.head.lsn && to.hash != state.head.hash)
                 || (to.lsn == state.shipped.lsn && to.hash != state.shipped.hash)
@@ -912,8 +968,14 @@ mod tests {
     #[test]
     fn unknown_chronicle() {
         let (_d, _p, coord) = fresh();
-        assert!(matches!(coord.head(chron(9)), Err(CoordError::UnknownChronicle(_))));
-        assert!(matches!(coord.transfer(chron(9), A), Err(CoordError::UnknownChronicle(_))));
+        assert!(matches!(
+            coord.head(chron(9)),
+            Err(CoordError::UnknownChronicle(_))
+        ));
+        assert!(matches!(
+            coord.transfer(chron(9), A),
+            Err(CoordError::UnknownChronicle(_))
+        ));
         let mut w = WardenModel::new(A, chron(9), Epoch::FIRST);
         assert!(matches!(
             submit(&coord, &mut w, chron(9), 0),
@@ -940,7 +1002,10 @@ mod tests {
         let w = resumed(A, chron(1), &coord);
         let mut env = w.build_record(Stream::Fs, raw(1)).envelope;
         env.hash = HashVal::from_bytes([7; 32]);
-        assert!(matches!(coord.append(A, &env), Err(CoordError::BadHash { .. })));
+        assert!(matches!(
+            coord.append(A, &env),
+            Err(CoordError::BadHash { .. })
+        ));
         assert_eq!(coord.head(chron(1)).unwrap().lsn, Lsn::new(0));
     }
 
@@ -969,7 +1034,15 @@ mod tests {
         let mut prev = (from.lsn, from.hash);
         (0..n)
             .map(|i| {
-                let rec = Record::new(c, BranchId::TRUNK, from.epoch, Stream::Fs, prev.0.next(), prev.1, raw(100 + i));
+                let rec = Record::new(
+                    c,
+                    BranchId::TRUNK,
+                    from.epoch,
+                    Stream::Fs,
+                    prev.0.next(),
+                    prev.1,
+                    raw(100 + i),
+                );
                 prev = (rec.envelope.lsn, rec.envelope.hash);
                 rec.envelope
             })
@@ -987,17 +1060,36 @@ mod tests {
         // One bad envelope anywhere: nothing of the batch is accepted.
         let mut more = chain_after(chron(1), h, 3);
         more[2].hash = HashVal::from_bytes([9; 32]);
-        assert!(matches!(coord.append_batch(A, &more), Err(CoordError::BadHash { lsn }) if lsn == Lsn::new(6)));
+        assert!(
+            matches!(coord.append_batch(A, &more), Err(CoordError::BadHash { lsn }) if lsn == Lsn::new(6))
+        );
         assert_eq!(coord.head(chron(1)).unwrap(), h);
         let next = chain_after(chron(1), h, 1)[0];
-        assert!(matches!(coord.append_batch(A, &[next, next]), Err(CoordError::HeadMismatch { .. })), "not chained");
-        assert!(matches!(coord.append_batch(B, &chain_after(chron(1), h, 2)), Err(CoordError::NotHolder { .. })));
+        assert!(
+            matches!(
+                coord.append_batch(A, &[next, next]),
+                Err(CoordError::HeadMismatch { .. })
+            ),
+            "not chained"
+        );
+        assert!(matches!(
+            coord.append_batch(B, &chain_after(chron(1), h, 2)),
+            Err(CoordError::NotHolder { .. })
+        ));
         assert_eq!(coord.head(chron(1)).unwrap(), h);
         // Empty, or another Chronicle in it.
-        assert!(matches!(coord.append_batch(A, &[]), Err(CoordError::BadBatch { lsn }) if lsn == Lsn::new(0)));
+        assert!(
+            matches!(coord.append_batch(A, &[]), Err(CoordError::BadBatch { lsn }) if lsn == Lsn::new(0))
+        );
         let g2 = coord.register(chron(2), A).unwrap();
-        let mixed = [chain_after(chron(1), h, 1)[0], chain_after(chron(2), g2, 1)[0]];
-        assert!(matches!(coord.append_batch(A, &mixed), Err(CoordError::BadBatch { .. })));
+        let mixed = [
+            chain_after(chron(1), h, 1)[0],
+            chain_after(chron(2), g2, 1)[0],
+        ];
+        assert!(matches!(
+            coord.append_batch(A, &mixed),
+            Err(CoordError::BadBatch { .. })
+        ));
         assert_eq!(coord.head(chron(1)).unwrap(), h);
         assert_eq!(coord.head(chron(2)).unwrap(), g2);
         assert!(!CoordError::BadBatch { lsn: Lsn::new(0) }.outcome_unknown());
@@ -1027,7 +1119,9 @@ mod tests {
         const EACH: u64 = 40;
         let (_d, path, coord) = fresh();
         for t in 0..THREADS {
-            coord.register(chron(t), WardenId::new(u64::from(t) + 1)).unwrap();
+            coord
+                .register(chron(t), WardenId::new(u64::from(t) + 1))
+                .unwrap();
         }
         let start = std::sync::Barrier::new(usize::from(THREADS));
         let heads: Vec<ChronicleHead> = std::thread::scope(|s| {
@@ -1052,7 +1146,10 @@ mod tests {
         });
         let writes = usize::from(THREADS) * EACH as usize + usize::from(THREADS);
         let groups = coord.groups.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(groups < writes, "{groups} transactions for {writes} writes: nothing was grouped");
+        assert!(
+            groups < writes,
+            "{groups} transactions for {writes} writes: nothing was grouped"
+        );
         drop(coord);
         let coord = Coordinator::open(&path).unwrap();
         for (t, h) in heads.iter().enumerate() {
@@ -1086,8 +1183,13 @@ mod tests {
                             // Build on whatever is anchored now; others race.
                             let head = coord.head(chron(1)).unwrap();
                             let env = Record::new(
-                                chron(1), BranchId::TRUNK, head.epoch, Stream::Fs,
-                                head.lsn.next(), head.hash, raw(r * 1000 + n),
+                                chron(1),
+                                BranchId::TRUNK,
+                                head.epoch,
+                                Stream::Fs,
+                                head.lsn.next(),
+                                head.hash,
+                                raw(r * 1000 + n),
                             )
                             .envelope;
                             match coord.append(A, &env) {
@@ -1096,7 +1198,11 @@ mod tests {
                                     wins += 1;
                                 }
                                 Err(e) => assert!(
-                                    matches!(e, CoordError::HeadMismatch { .. } | CoordError::LsnNotNext { .. }),
+                                    matches!(
+                                        e,
+                                        CoordError::HeadMismatch { .. }
+                                            | CoordError::LsnNotNext { .. }
+                                    ),
                                     "{e}"
                                 ),
                             }
@@ -1118,7 +1224,11 @@ mod tests {
             }
             racers.into_iter().map(|h| h.join().unwrap()).sum()
         });
-        assert_eq!(coord.head(chron(1)).unwrap().lsn, Lsn::new(wins), "every accepted append advanced the head once");
+        assert_eq!(
+            coord.head(chron(1)).unwrap().lsn,
+            Lsn::new(wins),
+            "every accepted append advanced the head once"
+        );
         assert!(wins >= ROUNDS, "each round has a winner");
         for t in 0..4u8 {
             assert_eq!(coord.head(chron(10 + t)).unwrap().lsn, Lsn::new(ROUNDS));
@@ -1136,7 +1246,10 @@ mod tests {
         }));
         assert!(hit.is_err());
         let mut w = resumed(A, chron(1), &coord);
-        assert_eq!(submit(&coord, &mut w, chron(1), 1).unwrap().lsn, Lsn::new(1));
+        assert_eq!(
+            submit(&coord, &mut w, chron(1), 1).unwrap().lsn,
+            Lsn::new(1)
+        );
     }
 
     /// A caller queued behind a leader that panics is answered (outcome
@@ -1187,7 +1300,10 @@ mod tests {
     fn a_failed_group_is_outcome_unknown() {
         let e = group_failed(&CoordError::Unavailable(std::io::Error::other("disk gone")));
         assert!(e.outcome_unknown());
-        assert!(e.to_string().contains("group commit failed") && e.to_string().contains("disk gone"), "{e}");
+        assert!(
+            e.to_string().contains("group commit failed") && e.to_string().contains("disk gone"),
+            "{e}"
+        );
     }
 
     // ── durability ──────────────────────────────────────────────────
@@ -1201,11 +1317,17 @@ mod tests {
             submit(&coord, &mut w, chron(1), n).unwrap();
         }
         coord.transfer(chron(1), B).unwrap();
-        let (o1, h1) = (coord.ownership(chron(1)).unwrap(), coord.head(chron(1)).unwrap());
+        let (o1, h1) = (
+            coord.ownership(chron(1)).unwrap(),
+            coord.head(chron(1)).unwrap(),
+        );
         drop(coord);
 
         let coord = Coordinator::open(&path).unwrap();
-        let (o2, h2) = (coord.ownership(chron(1)).unwrap(), coord.head(chron(1)).unwrap());
+        let (o2, h2) = (
+            coord.ownership(chron(1)).unwrap(),
+            coord.head(chron(1)).unwrap(),
+        );
         assert_eq!(h1, h2);
         assert_eq!(
             (o1.epoch, o1.holder, o1.sealed_prefix),
@@ -1213,13 +1335,19 @@ mod tests {
         );
         // And the new holder carries on from it.
         let mut b = resumed(B, chron(1), &coord);
-        assert_eq!(submit(&coord, &mut b, chron(1), 4).unwrap().lsn, Lsn::new(4));
+        assert_eq!(
+            submit(&coord, &mut b, chron(1), 4).unwrap().lsn,
+            Lsn::new(4)
+        );
     }
 
     #[test]
     fn second_open_while_open_is_refused() {
         let (_d, path, _coord) = fresh();
-        assert!(matches!(Coordinator::open(&path), Err(CoordError::Storage(_))));
+        assert!(matches!(
+            Coordinator::open(&path),
+            Err(CoordError::Storage(_))
+        ));
     }
 
     #[test]
@@ -1228,12 +1356,19 @@ mod tests {
         coord.register(chron(1), A).unwrap();
         coord
             .write(|rows| {
-                rows.insert(*chron(1).as_bytes(), [0u8; 3].as_slice()).map_err(storage)?;
+                rows.insert(*chron(1).as_bytes(), [0u8; 3].as_slice())
+                    .map_err(storage)?;
                 Ok(())
             })
             .unwrap();
-        assert!(matches!(coord.head(chron(1)), Err(CoordError::Corrupt { .. })));
-        assert!(matches!(coord.transfer(chron(1), B), Err(CoordError::Corrupt { .. })));
+        assert!(matches!(
+            coord.head(chron(1)),
+            Err(CoordError::Corrupt { .. })
+        ));
+        assert!(matches!(
+            coord.transfer(chron(1), B),
+            Err(CoordError::Corrupt { .. })
+        ));
     }
 
     #[test]
@@ -1251,19 +1386,34 @@ mod tests {
                 hash: HashVal::from_bytes([2; 32]),
                 epoch: Epoch::new(7),
             },
-            shipped: Position { lsn: Lsn::new(8), hash: HashVal::from_bytes([3; 32]) },
+            shipped: Position {
+                lsn: Lsn::new(8),
+                hash: HashVal::from_bytes([3; 32]),
+            },
         };
         assert_eq!(State::decode(chron(1), &s.encode()).unwrap(), s);
         // A v1 row (written before the shipped anchor) reads as shipped = genesis.
         let mut v1 = s.encode()[..ROW_LEN_V1].to_vec();
         v1[0] = LAYOUT_V1;
-        assert_eq!(State::decode(chron(1), &v1).unwrap(), State { shipped: Position::GENESIS, ..s });
+        assert_eq!(
+            State::decode(chron(1), &v1).unwrap(),
+            State {
+                shipped: Position::GENESIS,
+                ..s
+            }
+        );
         // Wrong lengths for either version, and a shipped anchor past the head.
         assert!(State::decode(chron(1), &s.encode()[..ROW_LEN_V1]).is_err());
         let mut long_v1 = s.encode().to_vec();
         long_v1[0] = LAYOUT_V1;
         assert!(State::decode(chron(1), &long_v1).is_err());
-        let ahead = State { shipped: Position { lsn: Lsn::new(10), hash: HashVal::GENESIS }, ..s };
+        let ahead = State {
+            shipped: Position {
+                lsn: Lsn::new(10),
+                hash: HashVal::GENESIS,
+            },
+            ..s
+        };
         assert!(State::decode(chron(1), &ahead.encode()).is_err());
     }
 
@@ -1278,27 +1428,71 @@ mod tests {
         }
         let e = Epoch::FIRST;
         assert_eq!(coord.shipped(chron(1)).unwrap(), Position::GENESIS);
-        assert_eq!(coord.advance_shipped(A, chron(1), e, heads[3]).unwrap(), heads[3]);
+        assert_eq!(
+            coord.advance_shipped(A, chron(1), e, heads[3]).unwrap(),
+            heads[3]
+        );
         // Lower or equal: no change.
-        assert_eq!(coord.advance_shipped(A, chron(1), e, heads[2]).unwrap(), heads[3]);
-        assert_eq!(coord.advance_shipped(A, chron(1), e, heads[3]).unwrap(), heads[3]);
+        assert_eq!(
+            coord.advance_shipped(A, chron(1), e, heads[2]).unwrap(),
+            heads[3]
+        );
+        assert_eq!(
+            coord.advance_shipped(A, chron(1), e, heads[3]).unwrap(),
+            heads[3]
+        );
         // Refusals: not the holder, a stale epoch, past the head, another
         // record at the head or at the anchor; nothing changes.
-        assert!(matches!(coord.advance_shipped(B, chron(1), e, heads[4]), Err(CoordError::NotHolder { .. })));
-        assert!(matches!(coord.advance_shipped(A, chron(1), Epoch::new(9), heads[4]), Err(CoordError::EpochMismatch { .. })));
-        let ahead = Position { lsn: Lsn::new(6), hash: heads[5].hash };
-        assert!(matches!(coord.advance_shipped(A, chron(1), e, ahead), Err(CoordError::ShippedAhead { .. })));
-        let bad_head = Position { lsn: Lsn::new(5), hash: heads[4].hash };
-        assert!(matches!(coord.advance_shipped(A, chron(1), e, bad_head), Err(CoordError::ShippedConflict { .. })));
-        let bad_anchor = Position { lsn: Lsn::new(3), hash: heads[4].hash };
-        assert!(matches!(coord.advance_shipped(A, chron(1), e, bad_anchor), Err(CoordError::ShippedConflict { .. })));
-        assert!(matches!(coord.advance_shipped(A, chron(9), e, heads[4]), Err(CoordError::UnknownChronicle(_))));
+        assert!(matches!(
+            coord.advance_shipped(B, chron(1), e, heads[4]),
+            Err(CoordError::NotHolder { .. })
+        ));
+        assert!(matches!(
+            coord.advance_shipped(A, chron(1), Epoch::new(9), heads[4]),
+            Err(CoordError::EpochMismatch { .. })
+        ));
+        let ahead = Position {
+            lsn: Lsn::new(6),
+            hash: heads[5].hash,
+        };
+        assert!(matches!(
+            coord.advance_shipped(A, chron(1), e, ahead),
+            Err(CoordError::ShippedAhead { .. })
+        ));
+        let bad_head = Position {
+            lsn: Lsn::new(5),
+            hash: heads[4].hash,
+        };
+        assert!(matches!(
+            coord.advance_shipped(A, chron(1), e, bad_head),
+            Err(CoordError::ShippedConflict { .. })
+        ));
+        let bad_anchor = Position {
+            lsn: Lsn::new(3),
+            hash: heads[4].hash,
+        };
+        assert!(matches!(
+            coord.advance_shipped(A, chron(1), e, bad_anchor),
+            Err(CoordError::ShippedConflict { .. })
+        ));
+        assert!(matches!(
+            coord.advance_shipped(A, chron(9), e, heads[4]),
+            Err(CoordError::UnknownChronicle(_))
+        ));
         assert_eq!(coord.shipped(chron(1)).unwrap(), heads[3]);
         // Transfer keeps it; the old holder can no longer move it; it survives a reopen.
         coord.transfer(chron(1), B).unwrap();
         assert_eq!(coord.shipped(chron(1)).unwrap(), heads[3]);
-        assert!(matches!(coord.advance_shipped(A, chron(1), e, heads[5]), Err(CoordError::NotHolder { .. })));
-        assert_eq!(coord.advance_shipped(B, chron(1), Epoch::new(2), heads[5]).unwrap(), heads[5]);
+        assert!(matches!(
+            coord.advance_shipped(A, chron(1), e, heads[5]),
+            Err(CoordError::NotHolder { .. })
+        ));
+        assert_eq!(
+            coord
+                .advance_shipped(B, chron(1), Epoch::new(2), heads[5])
+                .unwrap(),
+            heads[5]
+        );
         drop(coord);
         let coord = Coordinator::open(&path).unwrap();
         assert_eq!(coord.shipped(chron(1)).unwrap(), heads[5]);
@@ -1323,7 +1517,10 @@ mod tests {
             Err(CoordError::NotHolder { .. })
         ));
         assert_eq!(coord.head(chron(1)).unwrap(), before);
-        assert_eq!(coord.ownership(chron(1)).unwrap().sealed_prefix.lsn, Lsn::new(1));
+        assert_eq!(
+            coord.ownership(chron(1)).unwrap().sealed_prefix.lsn,
+            Lsn::new(1)
+        );
     }
 
     /// Same, but the transfer is to A itself (a restarted A): the old
@@ -1366,7 +1563,10 @@ mod tests {
             Err(CoordError::EpochMismatch { .. })
         ));
         let mut b = resumed(B, chron(1), &coord);
-        assert_eq!(submit(&coord, &mut b, chron(1), 2).unwrap().lsn, Lsn::new(2));
+        assert_eq!(
+            submit(&coord, &mut b, chron(1), 2).unwrap().lsn,
+            Lsn::new(2)
+        );
     }
 
     // ── classification of failures ──────────────────────────────────
@@ -1403,9 +1603,18 @@ mod tests {
 
         let now = (B, Epoch::new(2));
         assert_eq!(coord.transfer_if(chron(1), B, now).unwrap(), Epoch::new(3));
-        assert!(matches!(coord.transfer_if(chron(1), B, now), Err(CoordError::OwnershipChanged { epoch, .. }) if epoch == Epoch::new(3)));
-        assert!(matches!(coord.transfer_if(chron(9), B, now), Err(CoordError::UnknownChronicle(_))));
-        assert!(!CoordError::OwnershipChanged { holder: B, epoch: Epoch::new(3) }.outcome_unknown());
+        assert!(
+            matches!(coord.transfer_if(chron(1), B, now), Err(CoordError::OwnershipChanged { epoch, .. }) if epoch == Epoch::new(3))
+        );
+        assert!(matches!(
+            coord.transfer_if(chron(9), B, now),
+            Err(CoordError::UnknownChronicle(_))
+        ));
+        assert!(!CoordError::OwnershipChanged {
+            holder: B,
+            epoch: Epoch::new(3)
+        }
+        .outcome_unknown());
     }
 
     #[test]
@@ -1415,21 +1624,45 @@ mod tests {
             CoordError::UnknownChronicle(chron(1)),
             CoordError::AlreadyRegistered(chron(1)),
             CoordError::BadHash { lsn: Lsn::new(1) },
-            CoordError::NotHolder { warden: A, holder: B },
-            CoordError::EpochMismatch { record_epoch: Epoch::FIRST, current: Epoch::new(2) },
-            CoordError::HeadMismatch { prev: h, anchored: HashVal::GENESIS },
-            CoordError::LsnNotNext { lsn: Lsn::new(5), expected: Lsn::new(1) },
-            CoordError::ShippedAhead { to: Lsn::new(5), head: Lsn::new(4) },
+            CoordError::NotHolder {
+                warden: A,
+                holder: B,
+            },
+            CoordError::EpochMismatch {
+                record_epoch: Epoch::FIRST,
+                current: Epoch::new(2),
+            },
+            CoordError::HeadMismatch {
+                prev: h,
+                anchored: HashVal::GENESIS,
+            },
+            CoordError::LsnNotNext {
+                lsn: Lsn::new(5),
+                expected: Lsn::new(1),
+            },
+            CoordError::ShippedAhead {
+                to: Lsn::new(5),
+                head: Lsn::new(4),
+            },
             CoordError::ShippedConflict { lsn: Lsn::new(4) },
-            CoordError::NotYou { claimed: A, peer: B },
+            CoordError::NotYou {
+                claimed: A,
+                peer: B,
+            },
             CoordError::UnknownPeer { uid: 1000 },
-            CoordError::OwnershipChanged { holder: B, epoch: Epoch::new(2) },
+            CoordError::OwnershipChanged {
+                holder: B,
+                epoch: Epoch::new(2),
+            },
         ];
         for e in &refusals {
             assert!(!e.outcome_unknown(), "{e:?} is a refusal");
         }
         let failures = [
-            CoordError::Corrupt { chronicle: chron(1), reason: "x" },
+            CoordError::Corrupt {
+                chronicle: chron(1),
+                reason: "x",
+            },
             CoordError::Storage(redb::Error::Corrupted("x".into())),
             CoordError::Unavailable(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
         ];
@@ -1465,7 +1698,9 @@ pub(crate) mod conformance {
     use super::*;
     use proptest::prelude::*;
     use taso_core::envelope::Stream;
-    use taso_core::model::{AppendError as ModelError, Anchor, Coordinator as Model, ShipError, WardenModel};
+    use taso_core::model::{
+        Anchor, AppendError as ModelError, Coordinator as Model, ShipError, WardenModel,
+    };
     use taso_core::record::Payload;
 
     const IDS: [WardenId; 2] = [WardenId::new(1), WardenId::new(2)];
@@ -1513,16 +1748,34 @@ pub(crate) mod conformance {
     fn same_refusal(m: &ModelError, r: &CoordError) -> bool {
         match (m, r) {
             (
-                ModelError::NotHolder { warden: w1, holder: h1 },
-                CoordError::NotHolder { warden: w2, holder: h2 },
+                ModelError::NotHolder {
+                    warden: w1,
+                    holder: h1,
+                },
+                CoordError::NotHolder {
+                    warden: w2,
+                    holder: h2,
+                },
             ) => w1 == w2 && h1 == h2,
             (
-                ModelError::EpochMismatch { record_epoch: e1, current: c1 },
-                CoordError::EpochMismatch { record_epoch: e2, current: c2 },
+                ModelError::EpochMismatch {
+                    record_epoch: e1,
+                    current: c1,
+                },
+                CoordError::EpochMismatch {
+                    record_epoch: e2,
+                    current: c2,
+                },
             ) => e1 == e2 && c1 == c2,
             (
-                ModelError::HeadMismatch { prev: p1, anchored: a1 },
-                CoordError::HeadMismatch { prev: p2, anchored: a2 },
+                ModelError::HeadMismatch {
+                    prev: p1,
+                    anchored: a1,
+                },
+                CoordError::HeadMismatch {
+                    prev: p2,
+                    anchored: a2,
+                },
             ) => p1 == p2 && a1 == a2,
             _ => false,
         }
@@ -1530,21 +1783,40 @@ pub(crate) mod conformance {
 
     fn same_ship_refusal(m: &ShipError, r: &CoordError) -> bool {
         match (m, r) {
-            (ShipError::NotHolder { warden: w1, holder: h1 }, CoordError::NotHolder { warden: w2, holder: h2 }) => {
-                w1 == w2 && h1 == h2
-            }
             (
-                ShipError::EpochMismatch { epoch: e1, current: c1 },
-                CoordError::EpochMismatch { record_epoch: e2, current: c2 },
+                ShipError::NotHolder {
+                    warden: w1,
+                    holder: h1,
+                },
+                CoordError::NotHolder {
+                    warden: w2,
+                    holder: h2,
+                },
+            ) => w1 == w2 && h1 == h2,
+            (
+                ShipError::EpochMismatch {
+                    epoch: e1,
+                    current: c1,
+                },
+                CoordError::EpochMismatch {
+                    record_epoch: e2,
+                    current: c2,
+                },
             ) => e1 == e2 && c1 == c2,
-            (ShipError::Ahead { to: t1, head: h1 }, CoordError::ShippedAhead { to: t2, head: h2 }) => t1 == t2 && h1 == h2,
+            (
+                ShipError::Ahead { to: t1, head: h1 },
+                CoordError::ShippedAhead { to: t2, head: h2 },
+            ) => t1 == t2 && h1 == h2,
             (ShipError::Conflict { lsn: l1 }, CoordError::ShippedConflict { lsn: l2 }) => l1 == l2,
             _ => false,
         }
     }
 
     fn pos(a: Anchor) -> Position {
-        Position { lsn: a.lsn, hash: a.hash }
+        Position {
+            lsn: a.lsn,
+            hash: a.hash,
+        }
     }
 
     fn other(h: HashVal) -> HashVal {
@@ -1561,12 +1833,24 @@ pub(crate) mod conformance {
                 let log = model.log();
                 match (pick as usize) % (log.len() + 1) {
                     0 => Anchor::GENESIS,
-                    k => Anchor { lsn: log[k - 1].envelope.lsn, hash: log[k - 1].envelope.hash },
+                    k => Anchor {
+                        lsn: log[k - 1].envelope.lsn,
+                        hash: log[k - 1].envelope.hash,
+                    },
                 }
             }
-            8 | 9 => Anchor { lsn: head.lsn, hash: other(head.hash) },
-            10 => Anchor { lsn: head.lsn.next(), hash: head.hash },
-            _ => Anchor { lsn: model.shipped().lsn, hash: other(model.shipped().hash) },
+            8 | 9 => Anchor {
+                lsn: head.lsn,
+                hash: other(head.hash),
+            },
+            10 => Anchor {
+                lsn: head.lsn.next(),
+                hash: head.hash,
+            },
+            _ => Anchor {
+                lsn: model.shipped().lsn,
+                hash: other(model.shipped().hash),
+            },
         }
     }
 
@@ -1579,30 +1863,52 @@ pub(crate) mod conformance {
     /// Run `ops`.  `open` returns the coordinator under test: the first
     /// call a fresh, empty one; every later call the same coordinator
     /// opened again (the previous handle is dropped before the call).
-    pub(crate) fn run(ops: Vec<Op>, open: &mut dyn FnMut() -> Box<dyn Coord>) -> Result<(), TestCaseError> {
+    pub(crate) fn run(
+        ops: Vec<Op>,
+        open: &mut dyn FnMut() -> Box<dyn Coord>,
+    ) -> Result<(), TestCaseError> {
         let c = ChronicleId::from_bytes([1; 16]);
         let mut coord = Some(open());
         coord.as_ref().unwrap().register(c, IDS[0]).unwrap();
         let mut model = Model::new(c, IDS[0]);
         // Both start at genesis believing they hold epoch 1.
-        let mut wardens = [WardenModel::new(IDS[0], c, Epoch::FIRST), WardenModel::new(IDS[1], c, Epoch::FIRST)];
+        let mut wardens = [
+            WardenModel::new(IDS[0], c, Epoch::FIRST),
+            WardenModel::new(IDS[1], c, Epoch::FIRST),
+        ];
         // What each Warden last read of the ownership (holder, epoch).
         let mut read = [(IDS[0], Epoch::FIRST); 2];
 
         for (n, op) in ops.into_iter().enumerate() {
             match op {
                 Op::Append(i) => {
-                    let rec = wardens[i].build_record(Stream::Fs, Payload::Raw((n as u64).to_be_bytes().to_vec()));
+                    let rec = wardens[i]
+                        .build_record(Stream::Fs, Payload::Raw((n as u64).to_be_bytes().to_vec()));
                     let m = model.append(IDS[i], rec.clone());
                     let r = coord.as_ref().unwrap().append(IDS[i], &rec.envelope);
                     match (m, r) {
                         (Ok(hm), Ok(hr)) => {
                             prop_assert_eq!(hm, hr);
-                            wardens[i] = WardenModel::resume(IDS[i], c, wardens[i].epoch(), hr, hr.lsn.next());
+                            wardens[i] = WardenModel::resume(
+                                IDS[i],
+                                c,
+                                wardens[i].epoch(),
+                                hr,
+                                hr.lsn.next(),
+                            );
                         }
                         (Err(em), Err(er)) => {
-                            prop_assert!(!er.outcome_unknown(), "a failure, not a decision: {:?}", er);
-                            prop_assert!(same_refusal(&em, &er), "model {:?} vs coordinator {:?}", em, er);
+                            prop_assert!(
+                                !er.outcome_unknown(),
+                                "a failure, not a decision: {:?}",
+                                er
+                            );
+                            prop_assert!(
+                                same_refusal(&em, &er),
+                                "model {:?} vs coordinator {:?}",
+                                em,
+                                er
+                            );
                         }
                         (m, r) => prop_assert!(false, "model {:?} vs coordinator {:?}", m, r),
                     }
@@ -1640,12 +1946,24 @@ pub(crate) mod conformance {
                     let to = report(&model, pick);
                     let epoch = wardens[i].epoch();
                     let m = model.advance_shipped(IDS[i], epoch, to);
-                    let r = coord.as_ref().unwrap().advance_shipped(IDS[i], c, epoch, pos(to));
+                    let r = coord
+                        .as_ref()
+                        .unwrap()
+                        .advance_shipped(IDS[i], c, epoch, pos(to));
                     match (m, r) {
                         (Ok(am), Ok(ar)) => prop_assert_eq!(pos(am), ar),
                         (Err(em), Err(er)) => {
-                            prop_assert!(!er.outcome_unknown(), "a failure, not a decision: {:?}", er);
-                            prop_assert!(same_ship_refusal(&em, &er), "model {:?} vs coordinator {:?}", em, er);
+                            prop_assert!(
+                                !er.outcome_unknown(),
+                                "a failure, not a decision: {:?}",
+                                er
+                            );
+                            prop_assert!(
+                                same_ship_refusal(&em, &er),
+                                "model {:?} vs coordinator {:?}",
+                                em,
+                                er
+                            );
                         }
                         (m, r) => prop_assert!(false, "model {:?} vs coordinator {:?}", m, r),
                     }

@@ -80,7 +80,9 @@ impl Effects {
         publisher: Box<dyn Publish>,
         vessel: &mut Vessel<L>,
     ) -> Result<(Self, Reconciled), VesselError> {
-        let (ledger, r) = Ledger::open(publisher, vessel, |l, v, i, s| settle(&mut registry, l, v, i, s))?;
+        let (ledger, r) = Ledger::open(publisher, vessel, |l, v, i, s| {
+            settle(&mut registry, l, v, i, s)
+        })?;
         Ok((Self { registry, ledger }, r))
     }
 
@@ -101,7 +103,9 @@ impl Effects {
         provider: &str,
         call: Call,
     ) -> Result<EffectResult, VesselError> {
-        Ok(self.dispatch_until(vessel, provider, call, None)?.expect("not stopped"))
+        Ok(self
+            .dispatch_until(vessel, provider, call, None)?
+            .expect("not stopped"))
     }
 
     pub(crate) fn dispatch_until<L: Layers>(
@@ -118,7 +122,9 @@ impl Effects {
             ))));
         }
         let Some(adapter) = self.registry.get_mut(provider) else {
-            return Ok(Some(refused(format!("no adapter for provider {provider:?}"))));
+            return Ok(Some(refused(format!(
+                "no adapter for provider {provider:?}"
+            ))));
         };
         let op = self.ledger.next_op();
         let plan = match adapter.plan(op, &call) {
@@ -126,7 +132,9 @@ impl Effects {
             Err(r) => return Ok(Some(refused(r.to_string()))),
         };
         if plan.dispatch == Dispatch::Deferrable {
-            return Ok(Some(refused("deferrable dispatch is not supported yet".into())));
+            return Ok(Some(refused(
+                "deferrable dispatch is not supported yet".into(),
+            )));
         }
         let proposed = proposed(provider, &plan);
 
@@ -139,7 +147,10 @@ impl Effects {
         }
         // 3. Intent and dispatch authorized, durable together.
         let a = self.ledger.authorize(vessel, &proposed)?;
-        debug_assert_eq!(a.op, op, "the plan was made for the op id the ledger assigned");
+        debug_assert_eq!(
+            a.op, op,
+            "the plan was made for the op id the ledger assigned"
+        );
         if stop == Some(CrashAfter::Authorized) {
             return Ok(None);
         }
@@ -265,13 +276,13 @@ mod tests {
     use super::*;
     use crate::segment::{Position, Segment};
     use crate::vessel::tests::{env, ns, Env, FakeLayers};
+    use proptest::prelude::*;
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
     use taso_core::canon::Canonical;
     use taso_core::envelope::{ChronicleId, Epoch, Stream};
     use taso_core::record::{BarrierId, Consequence, Payload};
-    use proptest::prelude::*;
-    use std::sync::{Arc, Mutex};
-    use taso_field::adapter::{Adapter, Fault, FakeProvider, Refusal};
+    use taso_field::adapter::{Adapter, FakeProvider, Fault, Refusal};
 
     /// What happened, in order, across the provider and the publisher.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,7 +309,13 @@ mod tests {
     struct TestPublish(Arc<Mutex<World>>);
 
     impl Publish for TestPublish {
-        fn publish(&mut self, _: ChronicleId, _: Epoch, _: &[&Segment], upto: Position) -> Result<(), PublishError> {
+        fn publish(
+            &mut self,
+            _: ChronicleId,
+            _: Epoch,
+            _: &[&Segment],
+            upto: Position,
+        ) -> Result<(), PublishError> {
             let mut w = self.0.lock().unwrap();
             if w.publish_fails > 0 {
                 w.publish_fails -= 1;
@@ -311,7 +328,10 @@ mod tests {
 
     impl Shared {
         fn new(name: &str) -> Self {
-            Self(Arc::new(Mutex::new(FakeProvider::new(name))), Arc::default())
+            Self(
+                Arc::new(Mutex::new(FakeProvider::new(name))),
+                Arc::default(),
+            )
         }
         fn publisher(&self) -> Box<dyn Publish> {
             Box::new(TestPublish(self.1.clone()))
@@ -341,7 +361,11 @@ mod tests {
             self.0.lock().unwrap().plan(op, call)
         }
         fn send(&mut self, op: OpId, plan: &Plan) -> Sent {
-            self.1.lock().unwrap().timeline.push(Ev::Sent(plan.request.clone()));
+            self.1
+                .lock()
+                .unwrap()
+                .timeline
+                .push(Ev::Sent(plan.request.clone()));
             self.0.lock().unwrap().send(op, plan)
         }
         fn probe(&mut self, op: OpId, plan: &Plan) -> Probed {
@@ -356,7 +380,10 @@ mod tests {
     }
 
     fn call(op: &str, target: &str) -> Call {
-        Call { operation: op.into(), args: target.as_bytes().to_vec() }
+        Call {
+            operation: op.into(),
+            args: target.as_bytes().to_vec(),
+        }
     }
 
     fn vessel(e: &Env) -> Vessel<FakeLayers> {
@@ -385,7 +412,10 @@ mod tests {
     }
 
     fn auth() -> Authority {
-        Authority { actor: "jarmo".into(), reason: "checked the provider by hand".into() }
+        Authority {
+            actor: "jarmo".into(),
+            reason: "checked the provider by hand".into(),
+        }
     }
 
     /// Every send came after a successful publish that covered the
@@ -413,9 +443,14 @@ mod tests {
                 Ev::Published(l) => published = published.max(l.get()),
                 Ev::Sent(req) => {
                     let op = op_of.get(&req).ok_or("a send without an intent")?;
-                    let at = authorized_at.get(op).ok_or("a send without an authorization")?;
+                    let at = authorized_at
+                        .get(op)
+                        .ok_or("a send without an authorization")?;
                     if published < *at {
-                        return Err(format!("{:?} sent with the ledger shipped to {published}, authorized at {at}", String::from_utf8_lossy(&req)));
+                        return Err(format!(
+                            "{:?} sent with the ledger shipped to {published}, authorized at {at}",
+                            String::from_utf8_lossy(&req)
+                        ));
                     }
                 }
             }
@@ -439,12 +474,24 @@ mod tests {
         assert_eq!(p.applied(b"send bob"), 1);
 
         let l = ledger(&v);
-        let Payload::Intent(i) = &l[0] else { panic!("intent first") };
+        let Payload::Intent(i) = &l[0] else {
+            panic!("intent first")
+        };
         assert_eq!(i.provider, "mail");
         assert_eq!(i.request, b"send bob");
         assert_eq!(i.consequence, Consequence::Irreversible);
-        assert_eq!(i.barrier, Some(BarrierId::new(intent_lsn.get())), "barrier = intent's own lsn");
-        assert_eq!(states(&v), vec![OutcomeState::DispatchAuthorized, OutcomeState::ConfirmedApplied]);
+        assert_eq!(
+            i.barrier,
+            Some(BarrierId::new(intent_lsn.get())),
+            "barrier = intent's own lsn"
+        );
+        assert_eq!(
+            states(&v),
+            vec![
+                OutcomeState::DispatchAuthorized,
+                OutcomeState::ConfirmedApplied
+            ]
+        );
     }
 
     #[test]
@@ -454,8 +501,15 @@ mod tests {
         let mut v = vessel(&e);
         let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         let tail = v.tail();
-        for (prov, c) in [("http", call("send", "bob")), ("mail", call("format-disk", "x")), ("mail", call("send", ""))] {
-            assert!(matches!(fx.dispatch(&mut v, prov, c).unwrap(), EffectResult::Refused { .. }));
+        for (prov, c) in [
+            ("http", call("send", "bob")),
+            ("mail", call("format-disk", "x")),
+            ("mail", call("send", "")),
+        ] {
+            assert!(matches!(
+                fx.dispatch(&mut v, prov, c).unwrap(),
+                EffectResult::Refused { .. }
+            ));
         }
         assert_eq!(v.tail(), tail);
     }
@@ -467,7 +521,9 @@ mod tests {
         let mut v = vessel(&e);
         let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         fx.dispatch(&mut v, "mail", call("read", "inbox")).unwrap();
-        let Payload::Intent(i) = &ledger(&v)[0] else { panic!() };
+        let Payload::Intent(i) = &ledger(&v)[0] else {
+            panic!()
+        };
         assert_eq!(i.barrier, None);
     }
 
@@ -478,21 +534,45 @@ mod tests {
         let mut v = vessel(&e);
         let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         p.fail_next(Fault::ReplyLost);
-        assert_eq!(fx.dispatch(&mut v, "mail", call("fire", "moon")).unwrap(), EffectResult::Unknown);
+        assert_eq!(
+            fx.dispatch(&mut v, "mail", call("fire", "moon")).unwrap(),
+            EffectResult::Unknown
+        );
         assert!(!fx.authorized());
-        assert!(matches!(fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap(), EffectResult::Refused { .. }));
+        assert!(matches!(
+            fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap(),
+            EffectResult::Refused { .. }
+        ));
         assert_eq!(p.applied(b"send bob"), 0);
 
         let op = fx.open_obligations()[0];
-        let empty = Authority { actor: "jarmo".into(), reason: " ".into() };
-        assert!(matches!(fx.resolve(&mut v, op, true, empty), Err(ResolveError::EmptyAuthority)));
-        assert!(matches!(fx.resolve(&mut v, OpId::new(99), true, auth()), Err(ResolveError::NotOpen(_))));
+        let empty = Authority {
+            actor: "jarmo".into(),
+            reason: " ".into(),
+        };
+        assert!(matches!(
+            fx.resolve(&mut v, op, true, empty),
+            Err(ResolveError::EmptyAuthority)
+        ));
+        assert!(matches!(
+            fx.resolve(&mut v, OpId::new(99), true, auth()),
+            Err(ResolveError::NotOpen(_))
+        ));
         fx.resolve(&mut v, op, true, auth()).unwrap();
         assert!(fx.authorized());
-        let Some(Payload::Outcome(last)) = ledger(&v).pop() else { panic!() };
+        let Some(Payload::Outcome(last)) = ledger(&v).pop() else {
+            panic!()
+        };
         assert_eq!(last.state, OutcomeState::ConfirmedApplied);
-        assert_eq!(last.evidence, Some(auth().canon_bytes()), "the operator's authority is the evidence");
-        assert!(matches!(fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap(), EffectResult::Applied { .. }));
+        assert_eq!(
+            last.evidence,
+            Some(auth().canon_bytes()),
+            "the operator's authority is the evidence"
+        );
+        assert!(matches!(
+            fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap(),
+            EffectResult::Applied { .. }
+        ));
     }
 
     // ── crash points, then reopen and reconcile ─────────────────────
@@ -507,7 +587,10 @@ mod tests {
     ) -> (Vessel<FakeLayers>, Effects, Reconciled) {
         let mut v = vessel(e);
         let (mut fx, _) = Effects::open(registry(p), p.publisher(), &mut v).unwrap();
-        assert!(fx.dispatch_until(&mut v, "mail", call(op, "x"), Some(stop)).unwrap().is_none());
+        assert!(fx
+            .dispatch_until(&mut v, "mail", call(op, "x"), Some(stop))
+            .unwrap()
+            .is_none());
         drop((fx, v));
         let mut v = vessel(e);
         let (fx, r) = Effects::open(registry(p), p.publisher(), &mut v).unwrap();
@@ -567,7 +650,13 @@ mod tests {
         let p = Shared::new("mail");
         let mut v = vessel(&e);
         let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch_until(&mut v, "mail", call("send", "x"), Some(CrashAfter::Authorized)).unwrap();
+        fx.dispatch_until(
+            &mut v,
+            "mail",
+            call("send", "x"),
+            Some(CrashAfter::Authorized),
+        )
+        .unwrap();
         drop((fx, v));
         let mut v = vessel(&e);
         let (fx, r) = Effects::open(Registry::new(), p.publisher(), &mut v).unwrap();
@@ -609,7 +698,10 @@ mod tests {
         fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap();
         fx.dispatch(&mut v, "mail", call("put", "x")).unwrap();
         let t = p.timeline();
-        assert!(matches!(t[0], Ev::Published(_)) && t[1] == Ev::Sent(b"send bob".to_vec()), "{t:?}");
+        assert!(
+            matches!(t[0], Ev::Published(_)) && t[1] == Ev::Sent(b"send bob".to_vec()),
+            "{t:?}"
+        );
         sent_only_after_publish(&v, &p).unwrap();
     }
 
@@ -623,13 +715,25 @@ mod tests {
         let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
         p.fail_publish(1);
         let r = fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap();
-        assert!(matches!(&r, EffectResult::NotApplied { reason } if reason.contains("ledger not shipped")), "{r:?}");
+        assert!(
+            matches!(&r, EffectResult::NotApplied { reason } if reason.contains("ledger not shipped")),
+            "{r:?}"
+        );
         assert_eq!(p.applied(b"send bob"), 0);
         assert!(p.timeline().is_empty());
-        assert_eq!(states(&v), vec![OutcomeState::DispatchAuthorized, OutcomeState::ConfirmedNotApplied]);
+        assert_eq!(
+            states(&v),
+            vec![
+                OutcomeState::DispatchAuthorized,
+                OutcomeState::ConfirmedNotApplied
+            ]
+        );
         assert!(fx.authorized());
         // The next one goes through.
-        assert!(matches!(fx.dispatch(&mut v, "mail", call("send", "carol")).unwrap(), EffectResult::Applied { .. }));
+        assert!(matches!(
+            fx.dispatch(&mut v, "mail", call("send", "carol")).unwrap(),
+            EffectResult::Applied { .. }
+        ));
         sent_only_after_publish(&v, &p).unwrap();
     }
 
@@ -641,7 +745,13 @@ mod tests {
         let p = Shared::new("mail");
         let mut v = vessel(&e);
         let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch_until(&mut v, "mail", call("send", "x"), Some(CrashAfter::Authorized)).unwrap();
+        fx.dispatch_until(
+            &mut v,
+            "mail",
+            call("send", "x"),
+            Some(CrashAfter::Authorized),
+        )
+        .unwrap();
         drop((fx, v));
         // Reopen while the store is down: open, unsent.
         p.fail_publish(1);
@@ -687,7 +797,12 @@ mod tests {
 
     fn step() -> impl Strategy<Value = Step> {
         let op = prop_oneof![Just("send"), Just("put"), Just("fire"), Just("read")];
-        let fault = prop_oneof![Just(Fault::None), Just(Fault::Lost), Just(Fault::ReplyLost), Just(Fault::Decline)];
+        let fault = prop_oneof![
+            Just(Fault::None),
+            Just(Fault::Lost),
+            Just(Fault::ReplyLost),
+            Just(Fault::Decline)
+        ];
         let crash = prop_oneof![
             3 => Just(None),
             1 => Just(Some(CrashAfter::Intent)),
@@ -696,7 +811,12 @@ mod tests {
             1 => Just(Some(CrashAfter::Send)),
         ];
         let publish_fails = prop_oneof![4 => Just(false), 1 => Just(true)];
-        (op, fault, crash, publish_fails).prop_map(|(op, fault, crash, publish_fails)| Step { op, fault, crash, publish_fails })
+        (op, fault, crash, publish_fails).prop_map(|(op, fault, crash, publish_fails)| Step {
+            op,
+            fault,
+            crash,
+            publish_fails,
+        })
     }
 
     proptest! {

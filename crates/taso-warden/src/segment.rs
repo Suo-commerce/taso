@@ -68,12 +68,18 @@ pub struct Position {
 
 impl Position {
     /// The position before the first record of a Chronicle.
-    pub const GENESIS: Self = Self { lsn: Lsn::new(0), hash: HashVal::GENESIS };
+    pub const GENESIS: Self = Self {
+        lsn: Lsn::new(0),
+        hash: HashVal::GENESIS,
+    };
 }
 
 impl From<ChronicleHead> for Position {
     fn from(h: ChronicleHead) -> Self {
-        Self { lsn: h.lsn, hash: h.hash }
+        Self {
+            lsn: h.lsn,
+            hash: h.hash,
+        }
     }
 }
 
@@ -182,7 +188,12 @@ impl fmt::Display for SegmentError {
                 write!(f, "chronicle {got:?} is not this segment's {expected:?}")
             }
             Self::NotNext { lsn, expected } => {
-                write!(f, "lsn {} is not the next lsn {}", lsn.get(), expected.get())
+                write!(
+                    f,
+                    "lsn {} is not the next lsn {}",
+                    lsn.get(),
+                    expected.get()
+                )
             }
             Self::PrevMismatch { lsn } => write!(f, "lsn {}: prev is not the tail", lsn.get()),
             Self::BadHash { lsn } => write!(f, "lsn {}: envelope does not verify", lsn.get()),
@@ -191,9 +202,16 @@ impl fmt::Display for SegmentError {
             }
             Self::PayloadTooLarge { len } => write!(f, "payload of {len} bytes is too large"),
             Self::Diverged { lsn } => {
-                write!(f, "local record at lsn {} is not the anchored record", lsn.get())
+                write!(
+                    f,
+                    "local record at lsn {} is not the anchored record",
+                    lsn.get()
+                )
             }
-            Self::MissingAccepted { anchored, local_tail } => write!(
+            Self::MissingAccepted {
+                anchored,
+                local_tail,
+            } => write!(
                 f,
                 "coordinator accepted up to lsn {} but the segment ends at {}",
                 anchored.get(),
@@ -206,7 +224,10 @@ impl fmt::Display for SegmentError {
                 base.get()
             ),
             Self::ClosedTorn { invalid_bytes } => {
-                write!(f, "a closed segment has {invalid_bytes} bytes after its valid frames")
+                write!(
+                    f,
+                    "a closed segment has {invalid_bytes} bytes after its valid frames"
+                )
             }
             Self::OutOfRange { lsn } => write!(f, "lsn {} is outside the segment", lsn.get()),
             Self::Poisoned => write!(f, "segment is poisoned by an earlier failed write"),
@@ -314,7 +335,10 @@ impl Segment {
 
         let anchor = Position::from(anchored);
         if anchor.lsn < base.lsn {
-            return Err(SegmentError::AnchorBeforeBase { anchored: anchor.lsn, base: base.lsn });
+            return Err(SegmentError::AnchorBeforeBase {
+                anchored: anchor.lsn,
+                base: base.lsn,
+            });
         }
         let local_tail = seg.tail();
         if anchor.lsn > local_tail.lsn {
@@ -348,7 +372,9 @@ impl Segment {
         let (seg, file_len) = Self::read_only(path.as_ref())?;
         let valid_end = seg.end_of_index(seg.hashes.len());
         if valid_end != file_len {
-            return Err(SegmentError::ClosedTorn { invalid_bytes: file_len - valid_end });
+            return Err(SegmentError::ClosedTorn {
+                invalid_bytes: file_len - valid_end,
+            });
         }
         Ok(seg)
     }
@@ -394,7 +420,11 @@ impl Segment {
     ///
     /// If the write or fsync fails, the frame is cut off again; if even
     /// that fails, the segment is poisoned and refuses further writes.
-    pub fn append(&mut self, envelope: &Envelope, payload: &[u8]) -> Result<Position, SegmentError> {
+    pub fn append(
+        &mut self,
+        envelope: &Envelope,
+        payload: &[u8],
+    ) -> Result<Position, SegmentError> {
         self.append_batch(&[(envelope, payload)])
     }
 
@@ -403,7 +433,10 @@ impl Segment {
     /// is written unless all of them pass.  A crash during the write
     /// leaves a prefix of them, the last possibly torn; recovery treats
     /// them like any unaccepted tail.
-    pub fn append_batch(&mut self, frames: &[(&Envelope, &[u8])]) -> Result<Position, SegmentError> {
+    pub fn append_batch(
+        &mut self,
+        frames: &[(&Envelope, &[u8])],
+    ) -> Result<Position, SegmentError> {
         if self.poisoned {
             return Err(SegmentError::Poisoned);
         }
@@ -417,7 +450,10 @@ impl Segment {
             encode_envelope(envelope, &mut buf);
             buf.extend_from_slice(payload);
             ends.push(start + buf.len() as u64);
-            tail = Position { lsn: envelope.lsn, hash: envelope.hash };
+            tail = Position {
+                lsn: envelope.lsn,
+                hash: envelope.hash,
+            };
         }
         if frames.is_empty() {
             return Ok(tail);
@@ -429,7 +465,12 @@ impl Segment {
             .write_all_at(&buf, start)
             .and_then(|()| self.file.sync_data());
         if let Err(e) = written {
-            if self.file.set_len(start).and_then(|()| self.file.sync_all()).is_err() {
+            if self
+                .file
+                .set_len(start)
+                .and_then(|()| self.file.sync_all())
+                .is_err()
+            {
                 self.poisoned = true;
             }
             return Err(SegmentError::Io(e));
@@ -508,7 +549,9 @@ impl Segment {
     /// The frame at `lsn`, read from its offset; `None` if this segment
     /// does not hold it.
     pub fn frame(&self, lsn: Lsn) -> Result<Option<Frame>, SegmentError> {
-        let Some(i) = self.index_of(lsn) else { return Ok(None) };
+        let Some(i) = self.index_of(lsn) else {
+            return Ok(None);
+        };
         Ok(self.read_range(i, i + 1)?.pop())
     }
 
@@ -525,7 +568,11 @@ impl Segment {
 
     /// Byte offset where frame `i` starts (= where frame `i - 1` ends).
     fn end_of_index(&self, i: usize) -> u64 {
-        if i == 0 { HEADER_LEN } else { self.ends[i - 1] }
+        if i == 0 {
+            HEADER_LEN
+        } else {
+            self.ends[i - 1]
+        }
     }
 
     /// The index of the frame at `lsn`, if this segment holds it.
@@ -552,7 +599,10 @@ impl Segment {
         for i in first..last {
             let frame = &buf[(at - start) as usize..(self.ends[i] - start) as usize];
             let envelope = decode_envelope(&frame[4..FRAME_PREFIX]);
-            out.push(Frame { envelope, payload: frame[FRAME_PREFIX..].to_vec() });
+            out.push(Frame {
+                envelope,
+                payload: frame[FRAME_PREFIX..].to_vec(),
+            });
             at = self.ends[i];
         }
         Ok(out)
@@ -588,7 +638,9 @@ impl Segment {
             if len > MAX_PAYLOAD || file_len - pos - (FRAME_PREFIX as u64) < len as u64 {
                 break;
             }
-            let Some(envelope) = try_decode_envelope(&prefix[4..]) else { break };
+            let Some(envelope) = try_decode_envelope(&prefix[4..]) else {
+                break;
+            };
             let mut payload = vec![0u8; len as usize];
             reader.read_exact(&mut payload)?;
             if check_frame(self.chronicle, self.tail(), &envelope, &payload).is_err() {
@@ -614,11 +666,17 @@ pub(crate) fn check_frame(
         return Err(SegmentError::PayloadTooLarge { len: payload.len() });
     }
     if env.chronicle != chronicle {
-        return Err(SegmentError::ChronicleMismatch { expected: chronicle, got: env.chronicle });
+        return Err(SegmentError::ChronicleMismatch {
+            expected: chronicle,
+            got: env.chronicle,
+        });
     }
     let expected = tail.lsn.next();
     if env.lsn != expected {
-        return Err(SegmentError::NotNext { lsn: env.lsn, expected });
+        return Err(SegmentError::NotNext {
+            lsn: env.lsn,
+            expected,
+        });
     }
     if env.prev != tail.hash {
         return Err(SegmentError::PrevMismatch { lsn: env.lsn });
@@ -739,14 +797,21 @@ mod tests {
                     prev.hash,
                     payload,
                 );
-                prev = Position { lsn: rec.envelope.lsn, hash: rec.envelope.hash };
+                prev = Position {
+                    lsn: rec.envelope.lsn,
+                    hash: rec.envelope.hash,
+                };
                 (rec.envelope, rec.payload.canon_bytes())
             })
             .collect()
     }
 
     fn head(p: Position) -> ChronicleHead {
-        ChronicleHead { lsn: p.lsn, hash: p.hash, epoch: Epoch::FIRST }
+        ChronicleHead {
+            lsn: p.lsn,
+            hash: p.hash,
+            epoch: Epoch::FIRST,
+        }
     }
 
     fn fresh(base: Position) -> (tempfile::TempDir, PathBuf, Segment) {
@@ -779,16 +844,35 @@ mod tests {
         seg.append_batch(&all[3..]).unwrap();
         assert_eq!(seg.tail().lsn, Lsn::new(4));
         drop(seg);
-        let (seg, _) = Segment::open(&path, head(Position { lsn: Lsn::new(4), hash: recs[3].0.hash })).unwrap();
+        let (seg, _) = Segment::open(
+            &path,
+            head(Position {
+                lsn: Lsn::new(4),
+                hash: recs[3].0.hash,
+            }),
+        )
+        .unwrap();
         let frames = seg.frames().unwrap();
-        assert_eq!(frames.iter().map(|f| (&f.envelope, f.payload.as_slice())).collect::<Vec<_>>(), all);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|f| (&f.envelope, f.payload.as_slice()))
+                .collect::<Vec<_>>(),
+            all
+        );
     }
 
     /// Reads by lsn match the full read, from a segment based past
     /// genesis too, and touch nothing they do not hold.
     #[test]
     fn reads_by_lsn() {
-        for base in [Position::GENESIS, Position { lsn: Lsn::new(7), hash: HashVal::from_bytes([7; 32]) }] {
+        for base in [
+            Position::GENESIS,
+            Position {
+                lsn: Lsn::new(7),
+                hash: HashVal::from_bytes([7; 32]),
+            },
+        ] {
             let (_d, _p, mut seg) = fresh(base);
             for (e, p) in &chain(chron(1), base, &[0, 1, 100, 4096, 3]) {
                 seg.append(e, p).unwrap();
@@ -796,10 +880,18 @@ mod tests {
             let all = seg.frames().unwrap();
             let b = base.lsn.get();
             for k in 0..=5u64 {
-                assert_eq!(seg.frames_after(Lsn::new(b + k)).unwrap(), all[k as usize..], "after {k}");
+                assert_eq!(
+                    seg.frames_after(Lsn::new(b + k)).unwrap(),
+                    all[k as usize..],
+                    "after {k}"
+                );
             }
             assert_eq!(seg.frames_after(Lsn::new(b + 9)).unwrap(), vec![]);
-            assert_eq!(seg.frames_after(Lsn::new(0)).unwrap(), all, "before the base: everything");
+            assert_eq!(
+                seg.frames_after(Lsn::new(0)).unwrap(),
+                all,
+                "before the base: everything"
+            );
             for (i, f) in all.iter().enumerate() {
                 let lsn = Lsn::new(b + 1 + i as u64);
                 assert_eq!(seg.frame(lsn).unwrap().as_ref(), Some(f));
@@ -836,7 +928,10 @@ mod tests {
 
     #[test]
     fn non_genesis_base() {
-        let base = Position { lsn: Lsn::new(41), hash: HashVal::from_bytes([9; 32]) };
+        let base = Position {
+            lsn: Lsn::new(41),
+            hash: HashVal::from_bytes([9; 32]),
+        };
         let (_d, path, mut seg) = fresh(base);
         assert_eq!(seg.tail(), base);
         let recs = chain(chron(1), base, &[8, 8]);
@@ -867,13 +962,19 @@ mod tests {
         let mut closed = Segment::open_closed(&path).unwrap();
         assert_eq!((closed.tail(), closed.frames().unwrap().len()), (tail, 3));
         let more = chain(chron(1), tail, &[1]);
-        assert!(matches!(closed.append(&more[0].0, &more[0].1), Err(SegmentError::Poisoned)));
+        assert!(matches!(
+            closed.append(&more[0].0, &more[0].1),
+            Err(SegmentError::Poisoned)
+        ));
         assert_eq!(file_len(&path), len, "nothing written");
         // A torn tail: refused, and left exactly as it is.
         let f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all_at(&[1, 2, 3], len).unwrap();
         drop(f);
-        assert!(matches!(Segment::open_closed(&path), Err(SegmentError::ClosedTorn { invalid_bytes: 3 })));
+        assert!(matches!(
+            Segment::open_closed(&path),
+            Err(SegmentError::ClosedTorn { invalid_bytes: 3 })
+        ));
         assert_eq!(file_len(&path), len + 3);
     }
 
@@ -896,18 +997,30 @@ mod tests {
         let len = file_len(&path);
 
         // Skips lsn 2.
-        assert!(matches!(seg.append(&recs[2].0, &recs[2].1), Err(SegmentError::NotNext { .. })));
+        assert!(matches!(
+            seg.append(&recs[2].0, &recs[2].1),
+            Err(SegmentError::NotNext { .. })
+        ));
         // Repeats lsn 1.
-        assert!(matches!(seg.append(&recs[0].0, &recs[0].1), Err(SegmentError::NotNext { .. })));
+        assert!(matches!(
+            seg.append(&recs[0].0, &recs[0].1),
+            Err(SegmentError::NotNext { .. })
+        ));
         // Right lsn, wrong prev (a fork from genesis).
         let fork = chain(chron(1), Position::GENESIS, &[5, 5]);
         let mut bad = fork[1].0;
         bad.prev = HashVal::from_bytes([3; 32]);
-        assert!(matches!(seg.append(&bad, &fork[1].1), Err(SegmentError::PrevMismatch { .. })));
+        assert!(matches!(
+            seg.append(&bad, &fork[1].1),
+            Err(SegmentError::PrevMismatch { .. })
+        ));
         // Tampered hash.
         let mut bad = recs[1].0;
         bad.hash = HashVal::from_bytes([1; 32]);
-        assert!(matches!(seg.append(&bad, &recs[1].1), Err(SegmentError::BadHash { .. })));
+        assert!(matches!(
+            seg.append(&bad, &recs[1].1),
+            Err(SegmentError::BadHash { .. })
+        ));
         // Wrong payload.
         assert!(matches!(
             seg.append(&recs[1].0, b"not it"),
@@ -941,7 +1054,10 @@ mod tests {
         seg.truncate_to(accepted.lsn).unwrap();
         assert_eq!(seg.tail(), accepted);
         assert_eq!(file_len(&path), len);
-        assert!(matches!(seg.truncate_to(Lsn::new(5)), Err(SegmentError::OutOfRange { .. })));
+        assert!(matches!(
+            seg.truncate_to(Lsn::new(5)),
+            Err(SegmentError::OutOfRange { .. })
+        ));
         // The same lsn can be appended again.
         seg.append(&recs[1].0, &recs[1].1).unwrap();
         assert_eq!(seg.tail().lsn, Lsn::new(2));
@@ -965,7 +1081,13 @@ mod tests {
         drop(f);
 
         let (seg, rec) = Segment::open(&path, head(tails[1].0)).unwrap();
-        assert_eq!(rec, Recovery { unaccepted_frames: 2, invalid_bytes: 70 });
+        assert_eq!(
+            rec,
+            Recovery {
+                unaccepted_frames: 2,
+                invalid_bytes: 70
+            }
+        );
         assert_eq!(seg.tail(), tails[1].0);
         assert_eq!(file_len(&path), tails[1].1);
     }
@@ -979,8 +1101,14 @@ mod tests {
         drop(seg);
         let len = file_len(&path);
         let other = chain(chron(1), Position::GENESIS, &[9]);
-        let wrong = Position { lsn: Lsn::new(1), hash: other[0].0.hash };
-        assert!(matches!(Segment::open(&path, head(wrong)), Err(SegmentError::Diverged { .. })));
+        let wrong = Position {
+            lsn: Lsn::new(1),
+            hash: other[0].0.hash,
+        };
+        assert!(matches!(
+            Segment::open(&path, head(wrong)),
+            Err(SegmentError::Diverged { .. })
+        ));
         assert_eq!(file_len(&path), len);
     }
 
@@ -991,7 +1119,10 @@ mod tests {
         seg.append(&recs[0].0, &recs[0].1).unwrap();
         drop(seg);
         let len = file_len(&path);
-        let ahead = Position { lsn: Lsn::new(3), hash: recs[2].0.hash };
+        let ahead = Position {
+            lsn: Lsn::new(3),
+            hash: recs[2].0.hash,
+        };
         assert!(matches!(
             Segment::open(&path, head(ahead)),
             Err(SegmentError::MissingAccepted { .. })
@@ -1001,7 +1132,10 @@ mod tests {
 
     #[test]
     fn anchor_before_base() {
-        let base = Position { lsn: Lsn::new(10), hash: HashVal::from_bytes([2; 32]) };
+        let base = Position {
+            lsn: Lsn::new(10),
+            hash: HashVal::from_bytes([2; 32]),
+        };
         let (_d, path, seg) = fresh(base);
         drop(seg);
         assert!(matches!(

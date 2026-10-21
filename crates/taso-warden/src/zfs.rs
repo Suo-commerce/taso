@@ -157,7 +157,9 @@ impl fmt::Display for ZfsError {
             }
             Self::NotLatest(name) => write!(f, "{name} is not the dataset's last Seal snapshot"),
             Self::Input(e) => write!(f, "the stream being received could not be read: {e}"),
-            Self::Channel { name, errno } => write!(f, "zfs program could not snapshot {name}: errno {errno}"),
+            Self::Channel { name, errno } => {
+                write!(f, "zfs program could not snapshot {name}: errno {errno}")
+            }
             Self::Parse { line, why } => write!(f, "cannot parse zfs output {line:?}: {why}"),
         }
     }
@@ -179,7 +181,12 @@ pub struct Dataset(String);
 impl Dataset {
     /// Validate a dataset name.
     pub fn new(name: &str) -> Result<Self, ZfsError> {
-        let bad = |why| Err(ZfsError::InvalidName { name: name.to_string(), why });
+        let bad = |why| {
+            Err(ZfsError::InvalidName {
+                name: name.to_string(),
+                why,
+            })
+        };
         if name.is_empty() {
             return bad("empty");
         }
@@ -302,7 +309,10 @@ impl DatasetInfo {
 
 /// Parse the single `zfs list` line of [`Zfs::dataset_info`].
 fn parse_info_line(dataset: &Dataset, line: &str) -> Result<DatasetInfo, ZfsError> {
-    let bad = |why| ZfsError::Parse { line: line.to_string(), why };
+    let bad = |why| ZfsError::Parse {
+        line: line.to_string(),
+        why,
+    };
     let fields: Vec<&str> = line.split('\t').collect();
     let [name, mountpoint, origin, prop] = fields[..] else {
         return Err(bad("expected 4 tab-separated fields"));
@@ -310,7 +320,9 @@ fn parse_info_line(dataset: &Dataset, line: &str) -> Result<DatasetInfo, ZfsErro
     if name != dataset.as_str() {
         return Err(bad("not the requested dataset"));
     }
-    let mountpoint = mountpoint.starts_with('/').then(|| PathBuf::from(mountpoint));
+    let mountpoint = mountpoint
+        .starts_with('/')
+        .then(|| PathBuf::from(mountpoint));
     let origin = match origin {
         "-" | "" => None,
         o if o.contains('@') => Some(o.to_string()),
@@ -320,7 +332,12 @@ fn parse_info_line(dataset: &Dataset, line: &str) -> Result<DatasetInfo, ZfsErro
         "-" => None,
         hex => Some(parse_hash(hex).ok_or_else(|| bad("taso:parent is not a 64-digit hex hash"))?),
     };
-    Ok(DatasetInfo { dataset: dataset.clone(), mountpoint, origin, parent })
+    Ok(DatasetInfo {
+        dataset: dataset.clone(),
+        mountpoint,
+        origin,
+        parent,
+    })
 }
 
 /// [`parse_line`] for the batch.
@@ -331,7 +348,10 @@ pub(crate) fn parse_line_for(dataset: &Dataset, line: &str) -> Result<Option<Sna
 /// Parse one tab-separated `zfs list` line.  `Ok(None)` for snapshots
 /// Taso did not make, or of another dataset.
 fn parse_line(dataset: &Dataset, line: &str) -> Result<Option<Snapshot>, ZfsError> {
-    let bad = |why| ZfsError::Parse { line: line.to_string(), why };
+    let bad = |why| ZfsError::Parse {
+        line: line.to_string(),
+        why,
+    };
     let fields: Vec<&str> = line.split('\t').collect();
     let [name, txg, guid, prop] = fields[..] else {
         return Err(bad("expected 4 tab-separated fields"));
@@ -351,7 +371,13 @@ fn parse_line(dataset: &Dataset, line: &str) -> Result<Option<Snapshot>, ZfsErro
         "-" => None,
         hex => Some(parse_hash(hex).ok_or_else(|| bad("taso:seal is not a 64-digit hex hash"))?),
     };
-    Ok(Some(Snapshot { dataset: dataset.clone(), seal, createtxg, guid, seal_hash }))
+    Ok(Some(Snapshot {
+        dataset: dataset.clone(),
+        seal,
+        createtxg,
+        guid,
+        seal_hash,
+    }))
 }
 
 // ── Runner ─────────────────────────────────────────────────────────
@@ -388,14 +414,18 @@ pub struct Cli {
 
 impl Default for Cli {
     fn default() -> Self {
-        Self { program: PathBuf::from("zfs") }
+        Self {
+            program: PathBuf::from("zfs"),
+        }
     }
 }
 
 impl Cli {
     /// Use a `zfs` binary at a specific path.
     pub fn at(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into() }
+        Self {
+            program: program.into(),
+        }
     }
 }
 
@@ -433,8 +463,18 @@ impl Runner for Cli {
                 v
             })
         };
-        let out_t = drain(child.stdout.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
-        let err_t = drain(child.stderr.take().map(|r| Box::new(r) as Box<dyn Read + Send>));
+        let out_t = drain(
+            child
+                .stdout
+                .take()
+                .map(|r| Box::new(r) as Box<dyn Read + Send>),
+        );
+        let err_t = drain(
+            child
+                .stderr
+                .take()
+                .map(|r| Box::new(r) as Box<dyn Read + Send>),
+        );
 
         let mut stdin = child.stdin.take();
         let mut read_error = None;
@@ -556,7 +596,10 @@ pub struct Zfs<R: Runner = Cli> {
 impl Zfs<Cli> {
     /// The driver over the `zfs` on `PATH`.
     pub fn cli() -> Self {
-        Self { runner: Cli::default(), batch: None }
+        Self {
+            runner: Cli::default(),
+            batch: None,
+        }
     }
 }
 
@@ -567,7 +610,10 @@ fn strs_of(v: &[&str]) -> Vec<String> {
 impl<R: Runner> Zfs<R> {
     /// The driver over any runner.
     pub fn with_runner(runner: R) -> Self {
-        Self { runner, batch: None }
+        Self {
+            runner,
+            batch: None,
+        }
     }
 
     /// This driver, with Seal snapshots batched: concurrent
@@ -591,7 +637,11 @@ impl<R: Runner> Zfs<R> {
         if out.success {
             Ok(out.stdout)
         } else {
-            Err(ZfsError::Exit { args, code: out.code, stderr: out.stderr })
+            Err(ZfsError::Exit {
+                args,
+                code: out.code,
+                stderr: out.stderr,
+            })
         }
     }
 
@@ -687,7 +737,9 @@ impl<R: Runner> Zfs<R> {
         target: &Dataset,
     ) -> Result<DatasetInfo, ZfsError> {
         let origin = source.seal_snapshot(seal);
-        let snap = self.get(source, seal)?.ok_or_else(|| ZfsError::NotFound(origin.clone()))?;
+        let snap = self
+            .get(source, seal)?
+            .ok_or_else(|| ZfsError::NotFound(origin.clone()))?;
         if snap.seal_hash != Some(seal_hash) {
             return Err(ZfsError::SealMismatch(origin));
         }
@@ -732,16 +784,37 @@ impl<R: Runner> Zfs<R> {
     /// The filesystems directly under `root` (not `root` itself, nor
     /// deeper ones).
     pub fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, ZfsError> {
-        let stdout = self.run(strs_of(&["list", "-H", "-o", "name", "-t", "filesystem", "-d", "1", root.as_str()]))?;
+        let stdout = self.run(strs_of(&[
+            "list",
+            "-H",
+            "-o",
+            "name",
+            "-t",
+            "filesystem",
+            "-d",
+            "1",
+            root.as_str(),
+        ]))?;
         let mut out = Vec::new();
         for line in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
             if line == root.as_str() {
                 continue;
             }
-            let child = Dataset::new(line).map_err(|_| ZfsError::Parse { line: line.to_string(), why: "not a dataset name" })?;
-            match line.strip_prefix(root.as_str()).and_then(|r| r.strip_prefix('/')) {
+            let child = Dataset::new(line).map_err(|_| ZfsError::Parse {
+                line: line.to_string(),
+                why: "not a dataset name",
+            })?;
+            match line
+                .strip_prefix(root.as_str())
+                .and_then(|r| r.strip_prefix('/'))
+            {
                 Some(rest) if !rest.contains('/') => out.push(child),
-                _ => return Err(ZfsError::Parse { line: line.to_string(), why: "not a direct child of the root" }),
+                _ => {
+                    return Err(ZfsError::Parse {
+                        line: line.to_string(),
+                        why: "not a direct child of the root",
+                    })
+                }
             }
         }
         Ok(out)
@@ -750,13 +823,31 @@ impl<R: Runner> Zfs<R> {
     /// The uids owning space in `dataset`, as ZFS accounts it (`zfs
     /// userspace`: POSIX users, numeric).  Works on an unmounted dataset
     /// too (measured on taso-test 2026-10-17), so a received one counts.
-    pub fn owner_uids(&self, dataset: &Dataset) -> Result<std::collections::BTreeSet<u32>, ZfsError> {
-        let stdout = self.run(strs_of(&["userspace", "-H", "-n", "-p", "-t", "posixuser", "-o", "name", dataset.as_str()]))?;
+    pub fn owner_uids(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<std::collections::BTreeSet<u32>, ZfsError> {
+        let stdout = self.run(strs_of(&[
+            "userspace",
+            "-H",
+            "-n",
+            "-p",
+            "-t",
+            "posixuser",
+            "-o",
+            "name",
+            dataset.as_str(),
+        ]))?;
         stdout
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .map(|l| l.parse::<u32>().map_err(|_| ZfsError::Parse { line: l.to_string(), why: "not a numeric uid" }))
+            .map(|l| {
+                l.parse::<u32>().map_err(|_| ZfsError::Parse {
+                    line: l.to_string(),
+                    why: "not a numeric uid",
+                })
+            })
             .collect()
     }
 
@@ -818,7 +909,11 @@ impl<R: Runner> Zfs<R> {
         let args = vec!["receive".to_string(), "-u".to_string(), dataset.to_string()];
         let out = self.runner.run_input(&args, &mut HoldBack::new(stream))?;
         if !out.success {
-            return Err(ZfsError::Exit { args, code: out.code, stderr: out.stderr });
+            return Err(ZfsError::Exit {
+                args,
+                code: out.code,
+                stderr: out.stderr,
+            });
         }
         let snap = self.get(dataset, to.0)?.ok_or(ZfsError::Parse {
             line: dataset.seal_snapshot(to.0),
@@ -850,7 +945,9 @@ impl<R: Runner> Zfs<R> {
             self.check_clone_of(dataset, &base_name, base.hash)?;
             return self.bind(existing, to.1);
         }
-        let snap = self.get(&base.dataset, base.seal)?.ok_or_else(|| ZfsError::NotFound(base_name.clone()))?;
+        let snap = self
+            .get(&base.dataset, base.seal)?
+            .ok_or_else(|| ZfsError::NotFound(base_name.clone()))?;
         if snap.seal_hash != Some(base.hash) || snap.guid != base.guid {
             return Err(ZfsError::SealMismatch(base_name));
         }
@@ -868,7 +965,11 @@ impl<R: Runner> Zfs<R> {
         ];
         let out = self.runner.run_input(&args, &mut HoldBack::new(stream))?;
         if !out.success {
-            return Err(ZfsError::Exit { args, code: out.code, stderr: out.stderr });
+            return Err(ZfsError::Exit {
+                args,
+                code: out.code,
+                stderr: out.stderr,
+            });
         }
         self.check_clone_of(dataset, &base_name, base.hash)?;
         let snap = self.get(dataset, to.0)?.ok_or(ZfsError::Parse {
@@ -879,8 +980,15 @@ impl<R: Runner> Zfs<R> {
     }
 
     /// `dataset` is a clone of `origin` and carries `taso:parent=<hash>`.
-    fn check_clone_of(&self, dataset: &Dataset, origin: &str, hash: HashVal) -> Result<(), ZfsError> {
-        let info = self.dataset_info(dataset)?.ok_or_else(|| ZfsError::NotFound(dataset.to_string()))?;
+    fn check_clone_of(
+        &self,
+        dataset: &Dataset,
+        origin: &str,
+        hash: HashVal,
+    ) -> Result<(), ZfsError> {
+        let info = self
+            .dataset_info(dataset)?
+            .ok_or_else(|| ZfsError::NotFound(dataset.to_string()))?;
         if info.origin.as_deref() != Some(origin) || info.parent != Some(hash) {
             return Err(ZfsError::SealMismatch(dataset.to_string()));
         }
@@ -895,11 +1003,18 @@ impl<R: Runner> Zfs<R> {
             Some(_) => return Err(ZfsError::SealMismatch(snap.name())),
             None => {}
         }
-        self.run(vec!["set".to_string(), format!("{SEAL_PROPERTY}={hash}"), snap.name()])?;
+        self.run(vec![
+            "set".to_string(),
+            format!("{SEAL_PROPERTY}={hash}"),
+            snap.name(),
+        ])?;
         let bound = self.get(&snap.dataset, snap.seal)?;
         match bound {
             Some(b) if b.seal_hash == Some(hash) => Ok(b),
-            _ => Err(ZfsError::Parse { line: snap.name(), why: "taso:seal was set but zfs list does not show it" }),
+            _ => Err(ZfsError::Parse {
+                line: snap.name(),
+                why: "taso:seal was set but zfs list does not show it",
+            }),
         }
     }
 
@@ -913,8 +1028,15 @@ impl<R: Runner> Zfs<R> {
     /// [`ZfsError::NotFound`]; one bound to another hash, or unbound, is
     /// [`ZfsError::SealMismatch`] (nothing is rolled back to a snapshot
     /// that is not this Seal's layer).
-    pub fn rollback(&self, dataset: &Dataset, seal: Lsn, seal_hash: HashVal) -> Result<Snapshot, ZfsError> {
-        let snap = self.get(dataset, seal)?.ok_or_else(|| ZfsError::NotFound(dataset.seal_snapshot(seal)))?;
+    pub fn rollback(
+        &self,
+        dataset: &Dataset,
+        seal: Lsn,
+        seal_hash: HashVal,
+    ) -> Result<Snapshot, ZfsError> {
+        let snap = self
+            .get(dataset, seal)?
+            .ok_or_else(|| ZfsError::NotFound(dataset.seal_snapshot(seal)))?;
         if snap.seal_hash != Some(seal_hash) {
             return Err(ZfsError::SealMismatch(snap.name()));
         }
@@ -925,7 +1047,8 @@ impl<R: Runner> Zfs<R> {
     /// Destroy one Seal snapshot.  For test cleanup only: purge rules
     /// (what may be destroyed, and when) come with the sanction loop.
     pub fn destroy(&self, snapshot: &Snapshot) -> Result<(), ZfsError> {
-        self.run(vec!["destroy".to_string(), snapshot.name()]).map(|_| ())
+        self.run(vec!["destroy".to_string(), snapshot.name()])
+            .map(|_| ())
     }
 }
 
@@ -985,7 +1108,10 @@ mod tests {
     impl Runner for Fake {
         fn run(&self, args: &[String]) -> Result<Output, ZfsError> {
             self.calls.borrow_mut().push(args.to_vec());
-            self.replies.borrow_mut().pop_front().ok_or(ZfsError::Spawn("no reply queued".into()))
+            self.replies
+                .borrow_mut()
+                .pop_front()
+                .ok_or(ZfsError::Spawn("no reply queued".into()))
         }
         fn run_input(&self, args: &[String], input: &mut dyn Read) -> Result<Output, ZfsError> {
             self.calls.borrow_mut().push(args.to_vec());
@@ -993,7 +1119,10 @@ mod tests {
             let r = input.read_to_end(&mut got);
             self.inputs.borrow_mut().push(got);
             r.map_err(|e| ZfsError::Input(e.to_string()))?;
-            self.replies.borrow_mut().pop_front().ok_or(ZfsError::Spawn("no reply queued".into()))
+            self.replies
+                .borrow_mut()
+                .pop_front()
+                .ok_or(ZfsError::Spawn("no reply queued".into()))
         }
     }
 
@@ -1013,26 +1142,77 @@ mod tests {
 
     #[test]
     fn children_are_the_direct_filesystems_under_the_root() {
-        let z = Zfs::with_runner(Fake::default().reply(true, "tasotest/vessel\ntasotest/vessel/v-01\ntasotest/vessel/v-02\n\n", ""));
+        let z = Zfs::with_runner(Fake::default().reply(
+            true,
+            "tasotest/vessel\ntasotest/vessel/v-01\ntasotest/vessel/v-02\n\n",
+            "",
+        ));
         let got = z.children(&ds()).unwrap();
-        assert_eq!(got.iter().map(Dataset::as_str).collect::<Vec<_>>(), vec!["tasotest/vessel/v-01", "tasotest/vessel/v-02"]);
-        assert_eq!(z.runner.calls.borrow()[0], strs(&["list", "-H", "-o", "name", "-t", "filesystem", "-d", "1", "tasotest/vessel"]));
-        for bad in ["tasotest/vessel/a/b\n", "tasotest/other\n", "tasotest/vesselx\n", "tasotest/vessel/a b\n"] {
+        assert_eq!(
+            got.iter().map(Dataset::as_str).collect::<Vec<_>>(),
+            vec!["tasotest/vessel/v-01", "tasotest/vessel/v-02"]
+        );
+        assert_eq!(
+            z.runner.calls.borrow()[0],
+            strs(&[
+                "list",
+                "-H",
+                "-o",
+                "name",
+                "-t",
+                "filesystem",
+                "-d",
+                "1",
+                "tasotest/vessel"
+            ])
+        );
+        for bad in [
+            "tasotest/vessel/a/b\n",
+            "tasotest/other\n",
+            "tasotest/vesselx\n",
+            "tasotest/vessel/a b\n",
+        ] {
             let z = Zfs::with_runner(Fake::default().reply(true, bad, ""));
-            assert!(matches!(z.children(&ds()), Err(ZfsError::Parse { .. })), "{bad:?}");
+            assert!(
+                matches!(z.children(&ds()), Err(ZfsError::Parse { .. })),
+                "{bad:?}"
+            );
         }
-        let z = Zfs::with_runner(Fake::default().reply(false, "", "cannot open 'tasotest/vessel': dataset does not exist"));
-        assert!(matches!(z.children(&ds()), Err(ZfsError::Exit { .. })), "a missing root is an error, not no children");
+        let z = Zfs::with_runner(Fake::default().reply(
+            false,
+            "",
+            "cannot open 'tasotest/vessel': dataset does not exist",
+        ));
+        assert!(
+            matches!(z.children(&ds()), Err(ZfsError::Exit { .. })),
+            "a missing root is an error, not no children"
+        );
     }
 
     #[test]
     fn owner_uids_are_parsed_numerically() {
         let z = Zfs::with_runner(Fake::default().reply(true, "0\n265536\n265537\n\n", ""));
         assert_eq!(z.owner_uids(&ds()).unwrap(), [0, 265_536, 265_537].into());
-        assert_eq!(z.runner.calls.borrow()[0], strs(&["userspace", "-H", "-n", "-p", "-t", "posixuser", "-o", "name", "tasotest/vessel"]));
+        assert_eq!(
+            z.runner.calls.borrow()[0],
+            strs(&[
+                "userspace",
+                "-H",
+                "-n",
+                "-p",
+                "-t",
+                "posixuser",
+                "-o",
+                "name",
+                "tasotest/vessel"
+            ])
+        );
         for bad in ["root\n", "-1\n", "4294967296\n"] {
             let z = Zfs::with_runner(Fake::default().reply(true, bad, ""));
-            assert!(matches!(z.owner_uids(&ds()), Err(ZfsError::Parse { .. })), "{bad:?}");
+            assert!(
+                matches!(z.owner_uids(&ds()), Err(ZfsError::Parse { .. })),
+                "{bad:?}"
+            );
         }
         let z = Zfs::with_runner(Fake::default().reply(true, "", ""));
         assert!(z.owner_uids(&ds()).unwrap().is_empty());
@@ -1050,8 +1230,17 @@ mod tests {
     #[test]
     fn invalid_dataset_names() {
         for name in [
-            "", "/pool", "pool/", "pool//a", "pool@snap", "pool/a b", "1pool", "pool/./a",
-            "pool/../a", "pool/ä", "pool#bm",
+            "",
+            "/pool",
+            "pool/",
+            "pool//a",
+            "pool@snap",
+            "pool/a b",
+            "1pool",
+            "pool/./a",
+            "pool/../a",
+            "pool/ä",
+            "pool#bm",
         ] {
             assert!(
                 matches!(Dataset::new(name), Err(ZfsError::InvalidName { .. })),
@@ -1072,7 +1261,10 @@ mod tests {
     #[test]
     fn snapshot_names_sort_in_seal_order() {
         assert_eq!(snap_name(Lsn::new(1)), "taso-seal-00000000000000000001");
-        assert_eq!(snap_name(Lsn::new(u64::MAX)), "taso-seal-18446744073709551615");
+        assert_eq!(
+            snap_name(Lsn::new(u64::MAX)),
+            "taso-seal-18446744073709551615"
+        );
         let lsns = [1u64, 2, 9, 10, 99, 100, 12345, u64::MAX];
         let names: Vec<String> = lsns.iter().map(|&l| snap_name(Lsn::new(l))).collect();
         let mut sorted = names.clone();
@@ -1085,7 +1277,12 @@ mod tests {
 
     #[test]
     fn foreign_snapshot_names_are_not_seals() {
-        for snap in ["manual", "taso-seal-1", "taso-seal-0000000000000000000x", "zfs-auto-snap_hourly"] {
+        for snap in [
+            "manual",
+            "taso-seal-1",
+            "taso-seal-0000000000000000000x",
+            "zfs-auto-snap_hourly",
+        ] {
             assert_eq!(parse_snap_name(snap), None, "{snap}");
         }
     }
@@ -1115,11 +1312,23 @@ mod tests {
         );
         assert_eq!(
             calls[1],
-            strs(&["list", "-H", "-p", "-t", "snapshot", "-o", "name,createtxg,guid,taso:seal", name]),
+            strs(&[
+                "list",
+                "-H",
+                "-p",
+                "-t",
+                "snapshot",
+                "-o",
+                "name,createtxg,guid,taso:seal",
+                name
+            ]),
         );
         assert_eq!(snap.seal, Lsn::new(7));
         assert_eq!(snap.createtxg, 845);
-        assert_eq!(snap.guid, 17214216927645466380, "guid exceeds i64; must be u64");
+        assert_eq!(
+            snap.guid, 17214216927645466380,
+            "guid exceeds i64; must be u64"
+        );
         assert_eq!(snap.seal_hash, Some(hash(1)));
         assert_eq!(snap.name(), name);
     }
@@ -1132,9 +1341,15 @@ mod tests {
         let zfs = Zfs::with_runner(Fake::default().reply(false, "", stderr));
         assert_eq!(
             zfs.snapshot(&ds(), Lsn::new(1), hash(1)),
-            Err(ZfsError::AlreadyExists("tasotest/vessel@taso-seal-00000000000000000001".into())),
+            Err(ZfsError::AlreadyExists(
+                "tasotest/vessel@taso-seal-00000000000000000001".into()
+            )),
         );
-        assert_eq!(zfs.runner.calls.borrow().len(), 1, "no list after a refused snapshot");
+        assert_eq!(
+            zfs.runner.calls.borrow().len(),
+            1,
+            "no list after a refused snapshot"
+        );
     }
 
     #[test]
@@ -1164,8 +1379,16 @@ mod tests {
         assert_eq!(
             zfs.runner.calls.borrow()[0],
             strs(&[
-                "list", "-H", "-p", "-t", "snapshot", "-o", "name,createtxg,guid,taso:seal",
-                "-d", "1", "tasotest/vessel",
+                "list",
+                "-H",
+                "-p",
+                "-t",
+                "snapshot",
+                "-o",
+                "name,createtxg,guid,taso:seal",
+                "-d",
+                "1",
+                "tasotest/vessel",
             ]),
         );
         let seals: Vec<u64> = snaps.iter().map(|s| s.seal.get()).collect();
@@ -1208,7 +1431,13 @@ mod tests {
     #[test]
     fn destroy_names_exactly_one_snapshot() {
         let zfs = Zfs::with_runner(Fake::default().reply(true, "", ""));
-        let snap = Snapshot { dataset: ds(), seal: Lsn::new(4), createtxg: 1, guid: 1, seal_hash: None };
+        let snap = Snapshot {
+            dataset: ds(),
+            seal: Lsn::new(4),
+            createtxg: 1,
+            guid: 1,
+            seal_hash: None,
+        };
         zfs.destroy(&snap).unwrap();
         assert_eq!(
             zfs.runner.calls.borrow()[0],
@@ -1229,8 +1458,14 @@ mod tests {
         let line = format!("{SNAP4}\t845\t17\t{}\n", hash(4));
         let zfs = Zfs::with_runner(Fake::default().reply(true, &line, "").reply(true, "", ""));
         let snap = zfs.rollback(&ds(), Lsn::new(4), hash(4)).unwrap();
-        assert_eq!((snap.seal, snap.guid, snap.seal_hash), (Lsn::new(4), 17, Some(hash(4))));
-        assert_eq!(*zfs.runner.calls.borrow(), vec![get_args(SNAP4), strs(&["rollback", SNAP4])]);
+        assert_eq!(
+            (snap.seal, snap.guid, snap.seal_hash),
+            (Lsn::new(4), 17, Some(hash(4)))
+        );
+        assert_eq!(
+            *zfs.runner.calls.borrow(),
+            vec![get_args(SNAP4), strs(&["rollback", SNAP4])]
+        );
     }
 
     #[test]
@@ -1238,24 +1473,38 @@ mod tests {
         for bound in [format!("{}", hash(9)), "-".to_string()] {
             let line = format!("{SNAP4}\t845\t17\t{bound}\n");
             let zfs = Zfs::with_runner(Fake::default().reply(true, &line, ""));
-            assert!(matches!(zfs.rollback(&ds(), Lsn::new(4), hash(4)), Err(ZfsError::SealMismatch(n)) if n == SNAP4));
-            assert_eq!(zfs.runner.calls.borrow().len(), 1, "no rollback after a mismatch ({bound})");
+            assert!(
+                matches!(zfs.rollback(&ds(), Lsn::new(4), hash(4)), Err(ZfsError::SealMismatch(n)) if n == SNAP4)
+            );
+            assert_eq!(
+                zfs.runner.calls.borrow().len(),
+                1,
+                "no rollback after a mismatch ({bound})"
+            );
         }
     }
 
     #[test]
     fn rollback_to_a_missing_snapshot_is_not_found() {
-        let zfs = Zfs::with_runner(Fake::default().reply(false, "", "cannot open 'x': dataset does not exist"));
-        assert!(matches!(zfs.rollback(&ds(), Lsn::new(4), hash(4)), Err(ZfsError::NotFound(n)) if n == SNAP4));
+        let zfs = Zfs::with_runner(Fake::default().reply(
+            false,
+            "",
+            "cannot open 'x': dataset does not exist",
+        ));
+        assert!(
+            matches!(zfs.rollback(&ds(), Lsn::new(4), hash(4)), Err(ZfsError::NotFound(n)) if n == SNAP4)
+        );
         assert_eq!(zfs.runner.calls.borrow().len(), 1);
     }
 
     #[test]
     fn a_refused_rollback_is_reported_as_is() {
         let line = format!("{SNAP4}\t845\t17\t{}\n", hash(4));
-        let zfs = Zfs::with_runner(
-            Fake::default().reply(true, &line, "").reply(false, "", "cannot rollback: more recent snapshots or bookmarks exist"),
-        );
+        let zfs = Zfs::with_runner(Fake::default().reply(true, &line, "").reply(
+            false,
+            "",
+            "cannot rollback: more recent snapshots or bookmarks exist",
+        ));
         match zfs.rollback(&ds(), Lsn::new(4), hash(4)) {
             Err(ZfsError::Exit { args, stderr, .. }) => {
                 assert_eq!(args, strs(&["rollback", SNAP4]));
@@ -1277,7 +1526,15 @@ mod tests {
         format!("{name}\t{mount}\t{origin}\t{parent}\n")
     }
 
-    const LIST_FS: [&str; 7] = ["list", "-H", "-p", "-t", "filesystem", "-o", "name,mountpoint,origin,taso:parent"];
+    const LIST_FS: [&str; 7] = [
+        "list",
+        "-H",
+        "-p",
+        "-t",
+        "filesystem",
+        "-o",
+        "name,mountpoint,origin,taso:parent",
+    ];
 
     #[test]
     fn create_builds_exact_arguments() {
@@ -1298,20 +1555,33 @@ mod tests {
         let zfs = Zfs::with_runner(
             Fake::default()
                 .reply(true, "", "")
-                .reply(false, "", "cannot mount 'tasotest/vessel': filesystem already mounted\n")
+                .reply(
+                    false,
+                    "",
+                    "cannot mount 'tasotest/vessel': filesystem already mounted\n",
+                )
                 .reply(false, "", "cannot mount 'tasotest/vessel': no such pool\n"),
         );
         zfs.ensure_mounted(&ds()).unwrap();
         zfs.ensure_mounted(&ds()).unwrap();
-        assert!(matches!(zfs.ensure_mounted(&ds()), Err(ZfsError::Exit { .. })));
-        assert_eq!(zfs.runner.calls.borrow()[0], strs(&["mount", "tasotest/vessel"]));
+        assert!(matches!(
+            zfs.ensure_mounted(&ds()),
+            Err(ZfsError::Exit { .. })
+        ));
+        assert_eq!(
+            zfs.runner.calls.borrow()[0],
+            strs(&["mount", "tasotest/vessel"])
+        );
     }
 
     #[test]
     fn create_existing_is_already_exists() {
         let stderr = "cannot create 'tasotest/vessel': dataset already exists\n";
         let zfs = Zfs::with_runner(Fake::default().reply(false, "", stderr));
-        assert_eq!(zfs.create(&ds()), Err(ZfsError::AlreadyExists("tasotest/vessel".into())));
+        assert_eq!(
+            zfs.create(&ds()),
+            Err(ZfsError::AlreadyExists("tasotest/vessel".into()))
+        );
     }
 
     fn fork_target() -> Dataset {
@@ -1325,20 +1595,33 @@ mod tests {
     #[test]
     fn clone_builds_exact_arguments() {
         let origin = ds().seal_snapshot(Lsn::new(7));
-        let info = info_line("tasotest/fork", "/tasotest/fork", &origin, &hash(3).to_string());
+        let info = info_line(
+            "tasotest/fork",
+            "/tasotest/fork",
+            &origin,
+            &hash(3).to_string(),
+        );
         let zfs = Zfs::with_runner(
             Fake::default()
                 .reply(true, &seal_line(Lsn::new(7), &hash(3).to_string()), "")
                 .reply(true, "", "")
                 .reply(true, &info, ""),
         );
-        let got = zfs.clone(&ds(), Lsn::new(7), hash(3), &fork_target()).unwrap();
+        let got = zfs
+            .clone(&ds(), Lsn::new(7), hash(3), &fork_target())
+            .unwrap();
         let calls = zfs.runner.calls.borrow();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[0][0], "list", "the binding is checked first");
         assert_eq!(
             calls[1],
-            strs(&["clone", "-o", &format!("taso:parent={}", hash(3)), &origin, "tasotest/fork"]),
+            strs(&[
+                "clone",
+                "-o",
+                &format!("taso:parent={}", hash(3)),
+                &origin,
+                "tasotest/fork"
+            ]),
         );
         assert_eq!(got.parent, Some(hash(3)));
         assert_eq!(got.origin.as_deref(), Some(origin.as_str()));
@@ -1348,7 +1631,8 @@ mod tests {
     #[test]
     fn clone_refuses_wrong_or_unbound_seal_before_cloning() {
         for prop in [hash(4).to_string(), "-".to_string()] {
-            let zfs = Zfs::with_runner(Fake::default().reply(true, &seal_line(Lsn::new(7), &prop), ""));
+            let zfs =
+                Zfs::with_runner(Fake::default().reply(true, &seal_line(Lsn::new(7), &prop), ""));
             assert_eq!(
                 zfs.clone(&ds(), Lsn::new(7), hash(3), &fork_target()),
                 Err(ZfsError::SealMismatch(ds().seal_snapshot(Lsn::new(7)))),
@@ -1385,11 +1669,22 @@ mod tests {
 
     #[test]
     fn dataset_info_parses_and_reports_missing() {
-        for (mount, want) in [("/m/x", Some(PathBuf::from("/m/x"))), ("none", None), ("legacy", None), ("-", None)] {
-            let zfs = Zfs::with_runner(
-                Fake::default().reply(true, &info_line("tasotest/vessel", mount, "-", "-"), ""),
+        for (mount, want) in [
+            ("/m/x", Some(PathBuf::from("/m/x"))),
+            ("none", None),
+            ("legacy", None),
+            ("-", None),
+        ] {
+            let zfs = Zfs::with_runner(Fake::default().reply(
+                true,
+                &info_line("tasotest/vessel", mount, "-", "-"),
+                "",
+            ));
+            assert_eq!(
+                zfs.dataset_info(&ds()).unwrap().unwrap().mountpoint,
+                want,
+                "{mount}"
             );
-            assert_eq!(zfs.dataset_info(&ds()).unwrap().unwrap().mountpoint, want, "{mount}");
         }
         let stderr = "cannot open 'tasotest/vessel': dataset does not exist\n";
         let zfs = Zfs::with_runner(Fake::default().reply(false, "", stderr));
@@ -1438,14 +1733,21 @@ mod tests {
             let n = buf.len().min(self.chunk);
             let got = self.data.read(&mut buf[..n])?;
             if got == 0 && self.fail_at_end {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "stream does not match its metadata"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream does not match its metadata",
+                ));
             }
             Ok(got)
         }
     }
 
     fn source(data: &[u8], chunk: usize, fail_at_end: bool) -> Source {
-        Source { data: io::Cursor::new(data.to_vec()), chunk, fail_at_end }
+        Source {
+            data: io::Cursor::new(data.to_vec()),
+            chunk,
+            fail_at_end,
+        }
     }
 
     /// Read everything `r` gives, in reads of `buf` bytes; the bytes read
@@ -1515,7 +1817,9 @@ mod tests {
                 .reply(true, "", "") // set
                 .reply(true, &seal_line(Lsn::new(1), &hash(1).to_string()), ""),
         );
-        let snap = zfs.receive(&ds(), None, (Lsn::new(1), hash(1)), &mut &b"STREAM"[..]).unwrap();
+        let snap = zfs
+            .receive(&ds(), None, (Lsn::new(1), hash(1)), &mut &b"STREAM"[..])
+            .unwrap();
         assert_eq!((snap.seal, snap.seal_hash), (Lsn::new(1), Some(hash(1))));
         let calls = zfs.runner.calls.borrow();
         assert_eq!(calls.len(), 6);
@@ -1538,7 +1842,12 @@ mod tests {
                 .reply(true, &seal_line(Lsn::new(7), &hash(7).to_string()), ""),
         );
         let snap = zfs
-            .receive(&ds(), Some((Lsn::new(3), hash(3))), (Lsn::new(7), hash(7)), &mut &b"INC"[..])
+            .receive(
+                &ds(),
+                Some((Lsn::new(3), hash(3))),
+                (Lsn::new(7), hash(7)),
+                &mut &b"INC"[..],
+            )
             .unwrap();
         assert_eq!(snap.seal_hash, Some(hash(7)));
         let calls = zfs.runner.calls.borrow();
@@ -1556,19 +1865,26 @@ mod tests {
         let cases: Vec<Case> = vec![
             // A full stream into an existing dataset.
             (
-                Fake::default().reply(false, "", MISSING).reply(true, &ds_info(), ""),
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(true, &ds_info(), ""),
                 None,
                 ZfsError::AlreadyExists("tasotest/vessel".into()),
             ),
             // An incremental into a missing dataset.
             (
-                Fake::default().reply(false, "", MISSING).reply(false, "", MISSING),
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(false, "", MISSING),
                 Some((Lsn::new(3), hash(3))),
                 ZfsError::NotFound("tasotest/vessel".into()),
             ),
             // The base is missing.
             (
-                Fake::default().reply(false, "", MISSING).reply(true, &ds_info(), "").reply(true, "", ""),
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(true, &ds_info(), "")
+                    .reply(true, "", ""),
                 Some((Lsn::new(3), hash(3))),
                 ZfsError::NotFound(base_name.clone()),
             ),
@@ -1582,7 +1898,10 @@ mod tests {
                 ZfsError::SealMismatch(base_name.clone()),
             ),
             (
-                Fake::default().reply(false, "", MISSING).reply(true, &ds_info(), "").reply(true, &base("-"), ""),
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(true, &ds_info(), "")
+                    .reply(true, &base("-"), ""),
                 Some((Lsn::new(3), hash(3))),
                 ZfsError::SealMismatch(base_name.clone()),
             ),
@@ -1591,14 +1910,25 @@ mod tests {
                 Fake::default()
                     .reply(false, "", MISSING)
                     .reply(true, &ds_info(), "")
-                    .reply(true, &format!("{}{}", base(&hash(3).to_string()), seal_line(Lsn::new(5), &hash(5).to_string())), ""),
+                    .reply(
+                        true,
+                        &format!(
+                            "{}{}",
+                            base(&hash(3).to_string()),
+                            seal_line(Lsn::new(5), &hash(5).to_string())
+                        ),
+                        "",
+                    ),
                 Some((Lsn::new(3), hash(3))),
                 ZfsError::NotLatest(base_name.clone()),
             ),
         ];
         for (fake, from, want) in cases {
             let zfs = Zfs::with_runner(fake);
-            assert_eq!(zfs.receive(&ds(), from, (Lsn::new(7), hash(7)), &mut &b"X"[..]), Err(want.clone()));
+            assert_eq!(
+                zfs.receive(&ds(), from, (Lsn::new(7), hash(7)), &mut &b"X"[..]),
+                Err(want.clone())
+            );
             assert!(
                 zfs.runner.calls.borrow().iter().all(|c| c[0] != "receive"),
                 "no receive for {want:?}"
@@ -1611,8 +1941,14 @@ mod tests {
     #[test]
     fn receive_is_idempotent() {
         // Already bound to this Seal.
-        let zfs = Zfs::with_runner(Fake::default().reply(true, &seal_line(Lsn::new(7), &hash(7).to_string()), ""));
-        let s = zfs.receive(&ds(), None, (Lsn::new(7), hash(7)), &mut io::empty()).unwrap();
+        let zfs = Zfs::with_runner(Fake::default().reply(
+            true,
+            &seal_line(Lsn::new(7), &hash(7).to_string()),
+            "",
+        ));
+        let s = zfs
+            .receive(&ds(), None, (Lsn::new(7), hash(7)), &mut io::empty())
+            .unwrap();
         assert_eq!(s.seal_hash, Some(hash(7)));
         assert_eq!(zfs.runner.calls.borrow().len(), 1);
         // Received but unbound (a crash before the bind): bound now.
@@ -1622,11 +1958,22 @@ mod tests {
                 .reply(true, "", "")
                 .reply(true, &seal_line(Lsn::new(7), &hash(7).to_string()), ""),
         );
-        let s = zfs.receive(&ds(), Some((Lsn::new(3), hash(3))), (Lsn::new(7), hash(7)), &mut io::empty()).unwrap();
+        let s = zfs
+            .receive(
+                &ds(),
+                Some((Lsn::new(3), hash(3))),
+                (Lsn::new(7), hash(7)),
+                &mut io::empty(),
+            )
+            .unwrap();
         assert_eq!(s.seal_hash, Some(hash(7)));
         assert_eq!(zfs.runner.calls.borrow()[1], set_args(Lsn::new(7), hash(7)));
         // Bound to another Seal.
-        let zfs = Zfs::with_runner(Fake::default().reply(true, &seal_line(Lsn::new(7), &hash(8).to_string()), ""));
+        let zfs = Zfs::with_runner(Fake::default().reply(
+            true,
+            &seal_line(Lsn::new(7), &hash(8).to_string()),
+            "",
+        ));
         assert_eq!(
             zfs.receive(&ds(), None, (Lsn::new(7), hash(7)), &mut io::empty()),
             Err(ZfsError::SealMismatch(ds().seal_snapshot(Lsn::new(7)))),
@@ -1638,17 +1985,31 @@ mod tests {
     /// the result is `Input`, and nothing is bound.
     #[test]
     fn receive_of_a_failing_stream_is_input_error() {
-        let zfs = Zfs::with_runner(Fake::default().reply(false, "", MISSING).reply(false, "", MISSING));
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(false, "", MISSING)
+                .reply(false, "", MISSING),
+        );
         let mut bad = source(b"0123456789", 3, true);
-        assert!(matches!(zfs.receive(&ds(), None, (Lsn::new(1), hash(1)), &mut bad), Err(ZfsError::Input(_))));
+        assert!(matches!(
+            zfs.receive(&ds(), None, (Lsn::new(1), hash(1)), &mut bad),
+            Err(ZfsError::Input(_))
+        ));
         assert_eq!(zfs.runner.inputs.borrow()[0], b"012345678");
-        assert_eq!(zfs.runner.calls.borrow().len(), 3, "no get or set after the failed receive");
+        assert_eq!(
+            zfs.runner.calls.borrow().len(),
+            3,
+            "no get or set after the failed receive"
+        );
     }
 
     #[test]
     fn receive_failure_and_missing_snapshot_are_reported() {
         let zfs = Zfs::with_runner(
-            Fake::default().reply(false, "", MISSING).reply(false, "", MISSING).reply(false, "", "cannot receive: invalid stream\n"),
+            Fake::default()
+                .reply(false, "", MISSING)
+                .reply(false, "", MISSING)
+                .reply(false, "", "cannot receive: invalid stream\n"),
         );
         assert!(matches!(
             zfs.receive(&ds(), None, (Lsn::new(1), hash(1)), &mut &b"X"[..]),
@@ -1656,7 +2017,11 @@ mod tests {
         ));
         // A stream for another Seal: receive succeeds, the snapshot is not there.
         let zfs = Zfs::with_runner(
-            Fake::default().reply(false, "", MISSING).reply(false, "", MISSING).reply(true, "", "").reply(false, "", MISSING),
+            Fake::default()
+                .reply(false, "", MISSING)
+                .reply(false, "", MISSING)
+                .reply(true, "", "")
+                .reply(false, "", MISSING),
         );
         assert!(matches!(
             zfs.receive(&ds(), None, (Lsn::new(1), hash(1)), &mut &b"X"[..]),
@@ -1672,7 +2037,10 @@ mod tests {
         assert!(out.success);
         assert_eq!(out.stdout, "hello");
         let mut bad = source(b"abc", 1, true);
-        assert!(matches!(cat.run_input(&[], &mut bad), Err(ZfsError::Input(_))));
+        assert!(matches!(
+            cat.run_input(&[], &mut bad),
+            Err(ZfsError::Input(_))
+        ));
         // A command that exits without reading: its own status is reported.
         let f = Cli::at("false");
         let big = vec![0u8; 4 << 20];
@@ -1687,7 +2055,12 @@ mod tests {
     }
 
     fn base() -> CloneBase {
-        CloneBase { dataset: tpl(), seal: Lsn::new(5), hash: hash(5), guid: 42 }
+        CloneBase {
+            dataset: tpl(),
+            seal: Lsn::new(5),
+            hash: hash(5),
+            guid: 42,
+        }
     }
 
     fn tpl_line(prop: &str, guid: u64) -> String {
@@ -1712,7 +2085,9 @@ mod tests {
                 .reply(true, "", "") // set
                 .reply(true, &seal_line(Lsn::new(2), &hash(2).to_string()), ""),
         );
-        let s = zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut &b"INC"[..]).unwrap();
+        let s = zfs
+            .receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut &b"INC"[..])
+            .unwrap();
         assert_eq!(s.seal_hash, Some(hash(2)));
         let calls = zfs.runner.calls.borrow();
         assert_eq!(
@@ -1736,20 +2111,32 @@ mod tests {
         let cases: Vec<(Fake, ZfsError)> = vec![
             // No base on this node.
             (
-                Fake::default().reply(false, "", MISSING).reply(false, "", MISSING),
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(false, "", MISSING),
                 ZfsError::NotFound(tpl().seal_snapshot(Lsn::new(5))),
             ),
             // The base is bound to another Seal, unbound, or another snapshot (guid).
             (
-                Fake::default().reply(false, "", MISSING).reply(true, &tpl_line(&hash(6).to_string(), 42), ""),
+                Fake::default().reply(false, "", MISSING).reply(
+                    true,
+                    &tpl_line(&hash(6).to_string(), 42),
+                    "",
+                ),
                 ZfsError::SealMismatch(tpl().seal_snapshot(Lsn::new(5))),
             ),
             (
-                Fake::default().reply(false, "", MISSING).reply(true, &tpl_line("-", 42), ""),
+                Fake::default()
+                    .reply(false, "", MISSING)
+                    .reply(true, &tpl_line("-", 42), ""),
                 ZfsError::SealMismatch(tpl().seal_snapshot(Lsn::new(5))),
             ),
             (
-                Fake::default().reply(false, "", MISSING).reply(true, &tpl_line(&hash(5).to_string(), 43), ""),
+                Fake::default().reply(false, "", MISSING).reply(
+                    true,
+                    &tpl_line(&hash(5).to_string(), 43),
+                    "",
+                ),
                 ZfsError::SealMismatch(tpl().seal_snapshot(Lsn::new(5))),
             ),
             // The target exists already.
@@ -1763,8 +2150,14 @@ mod tests {
         ];
         for (fake, want) in cases {
             let zfs = Zfs::with_runner(fake);
-            assert_eq!(zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut &b"X"[..]), Err(want.clone()));
-            assert!(zfs.runner.calls.borrow().iter().all(|c| c[0] != "receive"), "no receive for {want:?}");
+            assert_eq!(
+                zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut &b"X"[..]),
+                Err(want.clone())
+            );
+            assert!(
+                zfs.runner.calls.borrow().iter().all(|c| c[0] != "receive"),
+                "no receive for {want:?}"
+            );
             assert!(zfs.runner.inputs.borrow().is_empty());
         }
     }
@@ -1774,7 +2167,14 @@ mod tests {
     #[test]
     fn receive_clone_checks_what_was_made() {
         let origin = tpl().seal_snapshot(Lsn::new(5));
-        for info in [clone_info("-", "-"), clone_info("tasotest/other@taso-seal-00000000000000000005", &hash(5).to_string()), clone_info(&origin, "-")] {
+        for info in [
+            clone_info("-", "-"),
+            clone_info(
+                "tasotest/other@taso-seal-00000000000000000005",
+                &hash(5).to_string(),
+            ),
+            clone_info(&origin, "-"),
+        ] {
             let zfs = Zfs::with_runner(
                 Fake::default()
                     .reply(false, "", MISSING)
@@ -1799,7 +2199,9 @@ mod tests {
                 .reply(true, &seal_line(Lsn::new(2), &hash(2).to_string()), "")
                 .reply(true, &clone_info(&origin, &hash(5).to_string()), ""),
         );
-        let s = zfs.receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut io::empty()).unwrap();
+        let s = zfs
+            .receive_clone(&ds(), &base(), (Lsn::new(2), hash(2)), &mut io::empty())
+            .unwrap();
         assert_eq!(s.seal_hash, Some(hash(2)));
         assert_eq!(zfs.runner.calls.borrow().len(), 2);
         // Already there, but on a dataset that is not a clone of this base.
@@ -1865,8 +2267,9 @@ mod tests {
                 let name = format!("{base}/t-{test}-{}", std::process::id());
                 let ds = Dataset::new(&name).unwrap();
                 zfs_cmd(&["create", &name]);
-                let mountpoint =
-                    PathBuf::from(zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", &name]).trim());
+                let mountpoint = PathBuf::from(
+                    zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", &name]).trim(),
+                );
                 Self { ds, mountpoint }
             }
         }
@@ -1874,7 +2277,9 @@ mod tests {
         impl Drop for Scratch {
             fn drop(&mut self) {
                 // -R: also the clones made from its snapshots.
-                let _ = Command::new("zfs").args(["destroy", "-R", self.ds.as_str()]).status();
+                let _ = Command::new("zfs")
+                    .args(["destroy", "-R", self.ds.as_str()])
+                    .status();
             }
         }
 
@@ -1898,11 +2303,17 @@ mod tests {
             assert_eq!(snap.seal, Lsn::new(3));
             assert_eq!(std::fs::read(&a).unwrap(), b"sealed");
             assert!(!b.exists(), "a file made after the Seal is gone");
-            assert_eq!(zfs_cmd(&["get", "-H", "-o", "value", "mounted", s.ds.as_str()]).trim(), "yes");
+            assert_eq!(
+                zfs_cmd(&["get", "-H", "-o", "value", "mounted", s.ds.as_str()]).trim(),
+                "yes"
+            );
 
             // The wrong hash: nothing happens.
             std::fs::write(&b, b"kept").unwrap();
-            assert!(matches!(zfs.rollback(&s.ds, Lsn::new(3), hash(9)), Err(ZfsError::SealMismatch(_))));
+            assert!(matches!(
+                zfs.rollback(&s.ds, Lsn::new(3), hash(9)),
+                Err(ZfsError::SealMismatch(_))
+            ));
             assert!(b.exists());
 
             // A later snapshot: refused, both snapshots and the file stay.
@@ -1910,7 +2321,14 @@ mod tests {
             let e = zfs.rollback(&s.ds, Lsn::new(3), hash(3)).unwrap_err();
             println!("rollback past a later snapshot: {e:?}");
             assert!(matches!(e, ZfsError::Exit { .. }), "{e:?}");
-            assert_eq!(zfs.list(&s.ds).unwrap().iter().map(|x| x.seal.get()).collect::<Vec<_>>(), vec![3, 5]);
+            assert_eq!(
+                zfs.list(&s.ds)
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.seal.get())
+                    .collect::<Vec<_>>(),
+                vec![3, 5]
+            );
             assert!(b.exists());
 
             // A file held open while rolling back to the latest Seal.
@@ -1967,7 +2385,10 @@ mod tests {
                         scope.spawn(move || {
                             start.wait();
                             (1..=5u64)
-                                .map(|l| zfs.snapshot(d, Lsn::new(l), hash((i as u8) * 10 + l as u8)).unwrap())
+                                .map(|l| {
+                                    zfs.snapshot(d, Lsn::new(l), hash((i as u8) * 10 + l as u8))
+                                        .unwrap()
+                                })
                                 .collect()
                         })
                     })
@@ -1975,7 +2396,11 @@ mod tests {
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
             for (i, (d, snaps)) in vessels.iter().zip(&got).enumerate() {
-                assert_eq!(&plain.list(d).unwrap(), snaps, "the plain driver sees what the batch reported");
+                assert_eq!(
+                    &plain.list(d).unwrap(),
+                    snaps,
+                    "the plain driver sees what the batch reported"
+                );
                 for (l, snap) in (1..=5u64).zip(snaps) {
                     assert_eq!(snap.seal_hash, Some(hash((i as u8) * 10 + l as u8)));
                     let prop = zfs_cmd(&["get", "-H", "-o", "value", SEAL_PROPERTY, &snap.name()]);
@@ -1983,7 +2408,8 @@ mod tests {
                 }
             }
             // Snapshots of different Vessels shared transaction groups.
-            let txgs: std::collections::BTreeSet<u64> = got.iter().flatten().map(|s| s.createtxg).collect();
+            let txgs: std::collections::BTreeSet<u64> =
+                got.iter().flatten().map(|s| s.createtxg).collect();
             println!("{} batched snapshots in {} txgs", got.len() * 5, txgs.len());
             assert!(txgs.len() < got.len() * 5, "no two snapshots shared a txg");
 
@@ -1992,9 +2418,14 @@ mod tests {
                 batched.snapshot(&vessels[0], Lsn::new(1), hash(99)),
                 Err(ZfsError::AlreadyExists(first.name())),
             );
-            assert_eq!(plain.get(&vessels[0], Lsn::new(1)).unwrap(), Some(first.clone()));
+            assert_eq!(
+                plain.get(&vessels[0], Lsn::new(1)).unwrap(),
+                Some(first.clone())
+            );
             let fork = Dataset::new(&format!("{}/fork", s.ds)).unwrap();
-            plain.clone(&vessels[0], Lsn::new(1), first.seal_hash.unwrap(), &fork).unwrap();
+            plain
+                .clone(&vessels[0], Lsn::new(1), first.seal_hash.unwrap(), &fork)
+                .unwrap();
         }
 
         #[test]
@@ -2021,7 +2452,11 @@ mod tests {
             let snap = zfs.snapshot(&s.ds, Lsn::new(1), hash(1)).unwrap();
             std::fs::write(&file, b"version two").unwrap();
 
-            let frozen = s.mountpoint.join(".zfs/snapshot").join(snap_name(snap.seal)).join("note.txt");
+            let frozen = s
+                .mountpoint
+                .join(".zfs/snapshot")
+                .join(snap_name(snap.seal))
+                .join("note.txt");
             assert_eq!(std::fs::read(&file).unwrap(), b"version two");
             assert_eq!(std::fs::read(&frozen).unwrap(), b"version one");
         }
@@ -2060,23 +2495,38 @@ mod tests {
             let fork = Dataset::new(&format!("{}/fork", s.ds)).unwrap();
 
             let info = zfs.create(&src).unwrap();
-            assert_eq!(zfs.create(&src), Err(ZfsError::AlreadyExists(src.to_string())));
+            assert_eq!(
+                zfs.create(&src),
+                Err(ZfsError::AlreadyExists(src.to_string()))
+            );
             let mount = info.mountpoint.expect("created dataset is mounted");
             std::fs::write(mount.join("state.txt"), b"at the seal").unwrap();
             zfs.snapshot(&src, Lsn::new(4), hash(4)).unwrap();
             std::fs::write(mount.join("state.txt"), b"after the seal").unwrap();
 
             // Wrong hash and missing Seal are refused, and nothing is made.
-            assert!(matches!(zfs.clone(&src, Lsn::new(4), hash(5), &fork), Err(ZfsError::SealMismatch(_))));
-            assert!(matches!(zfs.clone(&src, Lsn::new(9), hash(4), &fork), Err(ZfsError::NotFound(_))));
+            assert!(matches!(
+                zfs.clone(&src, Lsn::new(4), hash(5), &fork),
+                Err(ZfsError::SealMismatch(_))
+            ));
+            assert!(matches!(
+                zfs.clone(&src, Lsn::new(9), hash(4), &fork),
+                Err(ZfsError::NotFound(_))
+            ));
             assert_eq!(zfs.dataset_info(&fork).unwrap(), None);
 
             let forked = zfs.clone(&src, Lsn::new(4), hash(4), &fork).unwrap();
             assert_eq!(forked.parent, Some(hash(4)));
             assert_eq!(forked.origin_seal(), Some((src.clone(), Lsn::new(4))));
             let fmount = forked.mountpoint.clone().expect("clone is mounted");
-            assert_eq!(std::fs::read(fmount.join("state.txt")).unwrap(), b"at the seal");
-            assert_eq!(std::fs::read(mount.join("state.txt")).unwrap(), b"after the seal");
+            assert_eq!(
+                std::fs::read(fmount.join("state.txt")).unwrap(),
+                b"at the seal"
+            );
+            assert_eq!(
+                std::fs::read(mount.join("state.txt")).unwrap(),
+                b"after the seal"
+            );
             assert!(matches!(
                 zfs.clone(&src, Lsn::new(4), hash(4), &fork),
                 Err(ZfsError::AlreadyExists(_))
@@ -2091,8 +2541,15 @@ mod tests {
             if let Some(f) = from {
                 cmd.arg("-i").arg(format!("@{}", snap_name(f)));
             }
-            let out = cmd.arg(ds.seal_snapshot(to)).output().expect("run zfs send");
-            assert!(out.status.success(), "zfs send: {}", String::from_utf8_lossy(&out.stderr));
+            let out = cmd
+                .arg(ds.seal_snapshot(to))
+                .output()
+                .expect("run zfs send");
+            assert!(
+                out.status.success(),
+                "zfs send: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             out.stdout
         }
 
@@ -2120,16 +2577,30 @@ mod tests {
 
             // A full stream that fails after its last byte: nothing received.
             let mut bad = source(&full, 4096, true);
-            assert!(matches!(zfs.receive(&dst, None, (Lsn::new(1), hash(1)), &mut bad), Err(ZfsError::Input(_))));
-            assert_eq!(zfs.dataset_info(&dst).unwrap(), None, "a failed full receive leaves no dataset");
+            assert!(matches!(
+                zfs.receive(&dst, None, (Lsn::new(1), hash(1)), &mut bad),
+                Err(ZfsError::Input(_))
+            ));
+            assert_eq!(
+                zfs.dataset_info(&dst).unwrap(),
+                None,
+                "a failed full receive leaves no dataset"
+            );
 
             // The same stream, clean.
-            let s1 = zfs.receive(&dst, None, (Lsn::new(1), hash(1)), &mut &full[..]).unwrap();
+            let s1 = zfs
+                .receive(&dst, None, (Lsn::new(1), hash(1)), &mut &full[..])
+                .unwrap();
             assert_eq!(s1.seal_hash, Some(hash(1)));
 
             // Refused before receiving: wrong base, full onto an existing dataset.
             assert!(matches!(
-                zfs.receive(&dst, Some((Lsn::new(1), hash(9))), (Lsn::new(2), hash(2)), &mut &inc[..]),
+                zfs.receive(
+                    &dst,
+                    Some((Lsn::new(1), hash(9))),
+                    (Lsn::new(2), hash(2)),
+                    &mut &inc[..]
+                ),
                 Err(ZfsError::SealMismatch(_))
             ));
             zfs.create(&other).unwrap();
@@ -2141,30 +2612,62 @@ mod tests {
             // An incremental that fails at its end: the target is unchanged.
             let mut bad = source(&inc, 1024, true);
             assert!(matches!(
-                zfs.receive(&dst, Some((Lsn::new(1), hash(1))), (Lsn::new(2), hash(2)), &mut bad),
+                zfs.receive(
+                    &dst,
+                    Some((Lsn::new(1), hash(1))),
+                    (Lsn::new(2), hash(2)),
+                    &mut bad
+                ),
                 Err(ZfsError::Input(_))
             ));
             assert_eq!(zfs.list(&dst).unwrap(), vec![s1.clone()]);
 
             // Clean incremental.
-            let s2 = zfs.receive(&dst, Some((Lsn::new(1), hash(1))), (Lsn::new(2), hash(2)), &mut &inc[..]).unwrap();
+            let s2 = zfs
+                .receive(
+                    &dst,
+                    Some((Lsn::new(1), hash(1))),
+                    (Lsn::new(2), hash(2)),
+                    &mut &inc[..],
+                )
+                .unwrap();
             assert_eq!(s2.seal_hash, Some(hash(2)));
             assert_eq!(zfs.list(&dst).unwrap(), vec![s1.clone(), s2.clone()]);
 
             // An incremental onto a base that is no longer the last Seal.
             assert!(matches!(
-                zfs.receive(&dst, Some((Lsn::new(1), hash(1))), (Lsn::new(3), hash(3)), &mut io::empty()),
+                zfs.receive(
+                    &dst,
+                    Some((Lsn::new(1), hash(1))),
+                    (Lsn::new(3), hash(3)),
+                    &mut io::empty()
+                ),
                 Err(ZfsError::NotLatest(_))
             ));
 
             // Again: nothing received, the stream is not even read.
-            assert_eq!(zfs.receive(&dst, Some((Lsn::new(1), hash(1))), (Lsn::new(2), hash(2)), &mut io::empty()), Ok(s2.clone()));
+            assert_eq!(
+                zfs.receive(
+                    &dst,
+                    Some((Lsn::new(1), hash(1))),
+                    (Lsn::new(2), hash(2)),
+                    &mut io::empty()
+                ),
+                Ok(s2.clone())
+            );
 
             // A crash between receive and bind: the binding is missing,
             // and the next receive restores it without receiving.
             zfs_cmd(&["inherit", SEAL_PROPERTY, &dst.seal_snapshot(Lsn::new(2))]);
             assert_eq!(zfs.get(&dst, Lsn::new(2)).unwrap().unwrap().seal_hash, None);
-            let again = zfs.receive(&dst, Some((Lsn::new(1), hash(1))), (Lsn::new(2), hash(2)), &mut io::empty()).unwrap();
+            let again = zfs
+                .receive(
+                    &dst,
+                    Some((Lsn::new(1), hash(1))),
+                    (Lsn::new(2), hash(2)),
+                    &mut io::empty(),
+                )
+                .unwrap();
             assert_eq!(again.seal_hash, Some(hash(2)));
             assert_eq!(again.guid, s2.guid);
 
@@ -2172,9 +2675,14 @@ mod tests {
             let mounted = zfs_cmd(&["get", "-H", "-o", "value", "mounted", dst.as_str()]);
             assert_eq!(mounted.trim(), "no");
             zfs_cmd(&["mount", dst.as_str()]);
-            let dmount = PathBuf::from(zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", dst.as_str()]).trim());
+            let dmount = PathBuf::from(
+                zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", dst.as_str()]).trim(),
+            );
             assert_eq!(std::fs::read(dmount.join("f")).unwrap(), b"two");
-            let first = dmount.join(".zfs/snapshot").join(snap_name(Lsn::new(1))).join("f");
+            let first = dmount
+                .join(".zfs/snapshot")
+                .join(snap_name(Lsn::new(1)))
+                .join("f");
             assert_eq!(std::fs::read(first).unwrap(), b"one");
         }
 
@@ -2198,56 +2706,125 @@ mod tests {
             std::fs::write(tmount.join("base.bin"), vec![7u8; 1 << 20]).unwrap();
             std::fs::write(tmount.join("note"), b"template").unwrap();
             let t5 = zfs.snapshot(&tpl, Lsn::new(5), hash(5)).unwrap();
-            let vmount = zfs.clone(&tpl, Lsn::new(5), hash(5), &vessel).unwrap().mountpoint.unwrap();
+            let vmount = zfs
+                .clone(&tpl, Lsn::new(5), hash(5), &vessel)
+                .unwrap()
+                .mountpoint
+                .unwrap();
             std::fs::write(vmount.join("note"), b"vessel change").unwrap();
             zfs.snapshot(&vessel, Lsn::new(2), hash(2)).unwrap();
             let full_tpl = send(&tpl, None, Lsn::new(5));
             // The Vessel's first stream, incremental from the Template Seal.
             let out = Command::new("zfs")
-                .args(["send", "-i", &tpl.seal_snapshot(Lsn::new(5)), &vessel.seal_snapshot(Lsn::new(2))])
+                .args([
+                    "send",
+                    "-i",
+                    &tpl.seal_snapshot(Lsn::new(5)),
+                    &vessel.seal_snapshot(Lsn::new(2)),
+                ])
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             let inc = out.stdout;
-            println!("template full {} bytes, vessel incremental from template {} bytes", full_tpl.len(), inc.len());
-            assert!(inc.len() < full_tpl.len() / 10, "the Template's bytes do not travel with the Vessel");
+            println!(
+                "template full {} bytes, vessel incremental from template {} bytes",
+                full_tpl.len(),
+                inc.len()
+            );
+            assert!(
+                inc.len() < full_tpl.len() / 10,
+                "the Template's bytes do not travel with the Vessel"
+            );
 
             // Node B: the Template arrives first, with its guid.
-            let tb = zfs.receive(&tpl_b, None, (Lsn::new(5), hash(5)), &mut &full_tpl[..]).unwrap();
+            let tb = zfs
+                .receive(&tpl_b, None, (Lsn::new(5), hash(5)), &mut &full_tpl[..])
+                .unwrap();
             assert_eq!(tb.guid, t5.guid, "guids survive send and receive");
-            let base = CloneBase { dataset: tpl_b.clone(), seal: Lsn::new(5), hash: hash(5), guid: tb.guid };
+            let base = CloneBase {
+                dataset: tpl_b.clone(),
+                seal: Lsn::new(5),
+                hash: hash(5),
+                guid: tb.guid,
+            };
 
             // Refused before receiving: wrong Seal hash, wrong guid, no such base.
             assert!(matches!(
-                zfs.receive_clone(&vessel_b, &CloneBase { hash: hash(9), ..base.clone() }, (Lsn::new(2), hash(2)), &mut &inc[..]),
+                zfs.receive_clone(
+                    &vessel_b,
+                    &CloneBase {
+                        hash: hash(9),
+                        ..base.clone()
+                    },
+                    (Lsn::new(2), hash(2)),
+                    &mut &inc[..]
+                ),
                 Err(ZfsError::SealMismatch(_))
             ));
             assert!(matches!(
-                zfs.receive_clone(&vessel_b, &CloneBase { guid: tb.guid ^ 1, ..base.clone() }, (Lsn::new(2), hash(2)), &mut &inc[..]),
+                zfs.receive_clone(
+                    &vessel_b,
+                    &CloneBase {
+                        guid: tb.guid ^ 1,
+                        ..base.clone()
+                    },
+                    (Lsn::new(2), hash(2)),
+                    &mut &inc[..]
+                ),
                 Err(ZfsError::SealMismatch(_))
             ));
             assert!(matches!(
-                zfs.receive_clone(&vessel_b, &CloneBase { seal: Lsn::new(6), ..base.clone() }, (Lsn::new(2), hash(2)), &mut &inc[..]),
+                zfs.receive_clone(
+                    &vessel_b,
+                    &CloneBase {
+                        seal: Lsn::new(6),
+                        ..base.clone()
+                    },
+                    (Lsn::new(2), hash(2)),
+                    &mut &inc[..]
+                ),
                 Err(ZfsError::NotFound(_))
             ));
             // A stream that fails at its very end: nothing is made.
             let mut bad = source(&inc, 4096, true);
-            assert!(matches!(zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut bad), Err(ZfsError::Input(_))));
+            assert!(matches!(
+                zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut bad),
+                Err(ZfsError::Input(_))
+            ));
             assert_eq!(zfs.dataset_info(&vessel_b).unwrap(), None);
 
             // The real thing.
-            let got = zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut &inc[..]).unwrap();
+            let got = zfs
+                .receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut &inc[..])
+                .unwrap();
             assert_eq!(got.seal_hash, Some(hash(2)));
             let info = zfs.dataset_info(&vessel_b).unwrap().unwrap();
             assert_eq!(info.origin_seal(), Some((tpl_b.clone(), Lsn::new(5))));
             assert_eq!(info.parent, Some(hash(5)));
             // Again: nothing received.
-            assert_eq!(zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut io::empty()).unwrap().guid, got.guid);
+            assert_eq!(
+                zfs.receive_clone(&vessel_b, &base, (Lsn::new(2), hash(2)), &mut io::empty())
+                    .unwrap()
+                    .guid,
+                got.guid
+            );
 
             zfs_cmd(&["mount", vessel_b.as_str()]);
-            let bmount = PathBuf::from(zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", vessel_b.as_str()]).trim());
-            assert_eq!(std::fs::read(bmount.join("note")).unwrap(), b"vessel change");
-            assert_eq!(std::fs::read(bmount.join("base.bin")).unwrap(), vec![7u8; 1 << 20]);
+            let bmount = PathBuf::from(
+                zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", vessel_b.as_str()]).trim(),
+            );
+            assert_eq!(
+                std::fs::read(bmount.join("note")).unwrap(),
+                b"vessel change"
+            );
+            assert_eq!(
+                std::fs::read(bmount.join("base.bin")).unwrap(),
+                vec![7u8; 1 << 20]
+            );
         }
     }
 }

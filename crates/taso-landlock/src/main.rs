@@ -39,8 +39,8 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use landlock::{
-    path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, Scope, ABI,
+    path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 
 /// The ABI this policy is written and tested against.
@@ -50,7 +50,14 @@ const ABI_TARGET: ABI = ABI::V6;
 const DEFAULT_WRITE: [&str; 2] = ["/work", "/tmp"];
 
 /// Device files the agent may use.
-const DEVICES: [&str; 6] = ["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"];
+const DEVICES: [&str; 6] = [
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/tty",
+];
 
 /// Bad command line.
 const EXIT_USAGE: u8 = 64;
@@ -123,7 +130,8 @@ fn restrict(write: &[PathBuf]) -> Result<RulesetStatus, Refused> {
 
     let mut writable = Vec::with_capacity(write.len());
     for p in write {
-        let fd = PathFd::new(p).map_err(|e| Refused::Policy(format!("write path {}: {e}", p.display())))?;
+        let fd = PathFd::new(p)
+            .map_err(|e| Refused::Policy(format!("write path {}: {e}", p.display())))?;
         writable.push(Ok(PathBeneath::new(fd, AccessFs::from_all(ABI_TARGET))));
     }
     let status = ruleset
@@ -136,7 +144,9 @@ fn restrict(write: &[PathBuf]) -> Result<RulesetStatus, Refused> {
         .restrict_self()
         .map_err(policy)?;
     match status.ruleset {
-        RulesetStatus::NotEnforced => Err(Refused::Unsupported("the ruleset is not enforced".into())),
+        RulesetStatus::NotEnforced => {
+            Err(Refused::Unsupported("the ruleset is not enforced".into()))
+        }
         s => Ok(s),
     }
 }
@@ -150,13 +160,17 @@ fn main() -> ExitCode {
     let args = match parse(std::env::args_os().skip(1)) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("taso-landlock: {e}\nusage: taso-landlock [--write PATH]... -- COMMAND [ARGS...]");
+            eprintln!(
+                "taso-landlock: {e}\nusage: taso-landlock [--write PATH]... -- COMMAND [ARGS...]"
+            );
             return ExitCode::from(EXIT_USAGE);
         }
     };
     match restrict(&args.write) {
         Ok(RulesetStatus::FullyEnforced) => {}
-        Ok(_) => eprintln!("taso-landlock: partially enforced (this kernel lacks some Landlock rights)"),
+        Ok(_) => {
+            eprintln!("taso-landlock: partially enforced (this kernel lacks some Landlock rights)")
+        }
         Err(Refused::Unsupported(e)) => {
             eprintln!("taso-landlock: Landlock is not available, refusing to run the agent: {e}");
             return ExitCode::from(EXIT_UNSUPPORTED);
@@ -166,7 +180,9 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_POLICY);
         }
     }
-    let err = Command::new(&args.command[0]).args(&args.command[1..]).exec();
+    let err = Command::new(&args.command[0])
+        .args(&args.command[1..])
+        .exec();
     eprintln!("taso-landlock: cannot run {:?}: {err}", args.command[0]);
     ExitCode::from(EXIT_EXEC)
 }
@@ -194,11 +210,21 @@ mod tests {
 
     #[test]
     fn bad_command_lines() {
-        for bad in [&[][..], &["/bin/agent"], &["--"], &["--write"], &["--write", "rel", "--", "c"], &["-x", "--", "c"]] {
+        for bad in [
+            &[][..],
+            &["/bin/agent"],
+            &["--"],
+            &["--write"],
+            &["--write", "rel", "--", "c"],
+            &["-x", "--", "c"],
+        ] {
             assert!(parse(os(bad)).is_err(), "{bad:?}");
         }
         // After `--` everything is the command, flags included.
-        assert_eq!(parse(os(&["--", "c", "--write", "/x"])).unwrap().command, os(&["c", "--write", "/x"]));
+        assert_eq!(
+            parse(os(&["--", "c", "--write", "/x"])).unwrap().command,
+            os(&["c", "--write", "/x"])
+        );
     }
 
     #[test]

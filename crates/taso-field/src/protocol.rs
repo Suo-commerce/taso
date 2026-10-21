@@ -287,7 +287,12 @@ impl Request {
             Self::Hello { version } => {
                 o.u8(0).u16(*version);
             }
-            Self::Effect { call, provider, operation, args } => {
+            Self::Effect {
+                call,
+                provider,
+                operation,
+                args,
+            } => {
                 o.u8(1).u64(*call).str(provider).str(operation).bytes(args);
             }
             Self::Transcript { entry } => {
@@ -312,7 +317,10 @@ impl Request {
                 args: r.bytes()?,
             },
             2 => Self::Transcript { entry: r.bytes()? },
-            3 => Self::TurnEnd { turn: r.u64()?, quiescent: r.bool()? },
+            3 => Self::TurnEnd {
+                turn: r.u64()?,
+                quiescent: r.bool()?,
+            },
             _ => return Err(r.bad_tag("unknown request tag")),
         };
         r.finish()?;
@@ -325,7 +333,10 @@ impl Reply {
     pub fn encode(&self) -> Vec<u8> {
         let mut o = Out::default();
         match self {
-            Self::Hello { version, last_sealed_turn } => {
+            Self::Hello {
+                version,
+                last_sealed_turn,
+            } => {
                 o.u8(0).u16(*version).opt_u64(*last_sealed_turn);
             }
             Self::Effect { call, result } => {
@@ -354,20 +365,32 @@ impl Reply {
     pub fn decode(body: &[u8]) -> Result<Self, ProtocolError> {
         let mut r = In::new(body);
         let reply = match r.tag()? {
-            0 => Self::Hello { version: r.u16()?, last_sealed_turn: r.opt_u64()? },
+            0 => Self::Hello {
+                version: r.u16()?,
+                last_sealed_turn: r.opt_u64()?,
+            },
             1 => {
                 let call = r.u64()?;
                 let result = match r.tag()? {
-                    0 => EffectResult::Applied { receipt: r.bytes()? },
-                    1 => EffectResult::NotApplied { reason: r.string()? },
+                    0 => EffectResult::Applied {
+                        receipt: r.bytes()?,
+                    },
+                    1 => EffectResult::NotApplied {
+                        reason: r.string()?,
+                    },
                     2 => EffectResult::Unknown,
-                    3 => EffectResult::Refused { reason: r.string()? },
+                    3 => EffectResult::Refused {
+                        reason: r.string()?,
+                    },
                     _ => return Err(r.bad_tag("unknown effect result tag")),
                 };
                 Self::Effect { call, result }
             }
             2 => Self::Recorded { lsn: r.u64()? },
-            3 => Self::TurnEnd { turn: r.u64()?, sealed: r.opt_u64()? },
+            3 => Self::TurnEnd {
+                turn: r.u64()?,
+                sealed: r.opt_u64()?,
+            },
             4 => {
                 let code = match r.tag()? {
                     0 => ErrorCode::BadHello,
@@ -377,7 +400,10 @@ impl Reply {
                     4 => ErrorCode::Internal,
                     _ => return Err(r.bad_tag("unknown error code")),
                 };
-                Self::Error { code, message: r.string()? }
+                Self::Error {
+                    code,
+                    message: r.string()?,
+                }
             }
             _ => return Err(r.bad_tag("unknown reply tag")),
         };
@@ -397,7 +423,11 @@ struct In<'a> {
 
 impl<'a> In<'a> {
     fn new(b: &'a [u8]) -> Self {
-        Self { b, pos: 0, last_tag: 0 }
+        Self {
+            b,
+            pos: 0,
+            last_tag: 0,
+        }
     }
 
     fn err(&self, at: usize, why: &'static str) -> ProtocolError {
@@ -513,7 +543,11 @@ mod tests {
         let mut framed = Vec::new();
         write_frame(&mut framed, b"hello").unwrap();
         write_frame(&mut framed, b"").unwrap();
-        let mut r = Interrupting { data: framed, at: 0, interrupt: false };
+        let mut r = Interrupting {
+            data: framed,
+            at: 0,
+            interrupt: false,
+        };
         assert_eq!(read_frame(&mut r).unwrap(), Some(b"hello".to_vec()));
         assert_eq!(read_frame(&mut r).unwrap(), Some(Vec::new()));
         assert_eq!(read_frame(&mut r).unwrap(), None);
@@ -531,10 +565,16 @@ mod tests {
         prop_oneof![
             any::<u16>().prop_map(|version| Request::Hello { version }),
             (any::<u64>(), text(), text(), blob()).prop_map(|(call, provider, operation, args)| {
-                Request::Effect { call, provider, operation, args }
+                Request::Effect {
+                    call,
+                    provider,
+                    operation,
+                    args,
+                }
             }),
             blob().prop_map(|entry| Request::Transcript { entry }),
-            (any::<u64>(), any::<bool>()).prop_map(|(turn, quiescent)| Request::TurnEnd { turn, quiescent }),
+            (any::<u64>(), any::<bool>())
+                .prop_map(|(turn, quiescent)| Request::TurnEnd { turn, quiescent }),
         ]
     }
 
@@ -553,8 +593,12 @@ mod tests {
             Just(ErrorCode::Internal),
         ];
         prop_oneof![
-            (any::<u16>(), proptest::option::of(any::<u64>()))
-                .prop_map(|(version, last_sealed_turn)| Reply::Hello { version, last_sealed_turn }),
+            (any::<u16>(), proptest::option::of(any::<u64>())).prop_map(
+                |(version, last_sealed_turn)| Reply::Hello {
+                    version,
+                    last_sealed_turn
+                }
+            ),
             (any::<u64>(), result).prop_map(|(call, result)| Reply::Effect { call, result }),
             any::<u64>().prop_map(|lsn| Reply::Recorded { lsn }),
             (any::<u64>(), proptest::option::of(any::<u64>()))
@@ -641,18 +685,27 @@ mod tests {
         ));
         let mut sink = Vec::new();
         let big = vec![0u8; MAX_FRAME as usize + 1];
-        assert!(matches!(write_frame(&mut sink, &big), Err(ProtocolError::TooLarge(_))));
+        assert!(matches!(
+            write_frame(&mut sink, &big),
+            Err(ProtocolError::TooLarge(_))
+        ));
         assert!(sink.is_empty(), "nothing written for a refused frame");
     }
 
     #[test]
     fn end_of_stream_inside_a_frame_is_an_error() {
         // Inside the length prefix.
-        assert!(matches!(read_frame(&mut Cursor::new(vec![0, 0])), Err(ProtocolError::Io(_))));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(vec![0, 0])),
+            Err(ProtocolError::Io(_))
+        ));
         // Inside the body.
         let mut wire = 10u32.to_be_bytes().to_vec();
         wire.extend_from_slice(&[1, 2, 3]);
-        assert!(matches!(read_frame(&mut Cursor::new(wire)), Err(ProtocolError::Io(_))));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(wire)),
+            Err(ProtocolError::Io(_))
+        ));
         // Clean end between frames.
         assert!(read_frame(&mut Cursor::new(Vec::new())).unwrap().is_none());
     }
@@ -661,33 +714,64 @@ mod tests {
     fn strict_refusals_name_the_offset() {
         assert!(matches!(
             Request::decode(&[9]),
-            Err(ProtocolError::Malformed { at: 0, why: "unknown request tag" })
+            Err(ProtocolError::Malformed {
+                at: 0,
+                why: "unknown request tag"
+            })
         ));
         // TurnEnd with quiescent = 2.
-        let mut b = Request::TurnEnd { turn: 1, quiescent: true }.encode();
+        let mut b = Request::TurnEnd {
+            turn: 1,
+            quiescent: true,
+        }
+        .encode();
         *b.last_mut().unwrap() = 2;
         assert!(matches!(
             Request::decode(&b),
-            Err(ProtocolError::Malformed { at: 9, why: "bool is not 0 or 1" })
+            Err(ProtocolError::Malformed {
+                at: 9,
+                why: "bool is not 0 or 1"
+            })
         ));
         // Effect with a non-UTF-8 provider.
-        let mut b = Request::Effect { call: 0, provider: "ab".into(), operation: String::new(), args: vec![] }
-            .encode();
+        let mut b = Request::Effect {
+            call: 0,
+            provider: "ab".into(),
+            operation: String::new(),
+            args: vec![],
+        }
+        .encode();
         b[17] = 0xFF;
         assert!(matches!(
             Request::decode(&b),
-            Err(ProtocolError::Malformed { at: 17, why: "invalid UTF-8" })
+            Err(ProtocolError::Malformed {
+                at: 17,
+                why: "invalid UTF-8"
+            })
         ));
         // Reply with an unknown error code.
-        let mut b = Reply::Error { code: ErrorCode::Internal, message: String::new() }.encode();
+        let mut b = Reply::Error {
+            code: ErrorCode::Internal,
+            message: String::new(),
+        }
+        .encode();
         b[1] = 9;
         assert!(matches!(
             Reply::decode(&b),
-            Err(ProtocolError::Malformed { at: 1, why: "unknown error code" })
+            Err(ProtocolError::Malformed {
+                at: 1,
+                why: "unknown error code"
+            })
         ));
         // A huge declared length is refused without allocating.
         let mut b = vec![2];
         b.extend_from_slice(&u64::MAX.to_le_bytes());
-        assert!(matches!(Request::decode(&b), Err(ProtocolError::Malformed { why: "truncated", .. })));
+        assert!(matches!(
+            Request::decode(&b),
+            Err(ProtocolError::Malformed {
+                why: "truncated",
+                ..
+            })
+        ));
     }
 }

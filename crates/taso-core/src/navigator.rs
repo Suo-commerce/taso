@@ -57,8 +57,8 @@ use std::collections::BTreeMap;
 use crate::envelope::{ChronicleHead, ChronicleId, HashVal, Lsn, Stream};
 use crate::model::{Coordinator, Ownership};
 use crate::record::{
-    BarrierId, Consequence, GroupId, IntentRecord, Member, OpId,
-    OutcomeState, Payload, Record, SealRecord, StreamCut, TaintKind, Verdict,
+    BarrierId, Consequence, GroupId, IntentRecord, Member, OpId, OutcomeState, Payload, Record,
+    SealRecord, StreamCut, TaintKind, Verdict,
 };
 
 // ── Anchor ─────────────────────────────────────────────────────────
@@ -221,12 +221,7 @@ impl Navigation {
 
 /// Decide whether resuming from the Seal at `seal` is consistent with
 /// the records through `head` (v0.4 §6).
-pub fn navigate(
-    records: &[Record],
-    anchor: &Anchor,
-    seal: Lsn,
-    head: ChronicleHead,
-) -> Navigation {
+pub fn navigate(records: &[Record], anchor: &Anchor, seal: Lsn, head: ChronicleHead) -> Navigation {
     // Phase 1: authority and chain.  If either fails, nothing in the
     // records can be trusted, so stop here.
     if head != anchor.head {
@@ -241,18 +236,14 @@ pub fn navigate(
 
     // Phase 2: the Seal.
     let Some((seal_env_epoch, s)) = find_seal(prefix, seal) else {
-        return Navigation::Inconsistent(vec![Mode::IncompleteState(
-            StateFault::SealMissing,
-        )]);
+        return Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::SealMissing)]);
     };
 
     let mut modes = Vec::new();
     let mut reasons = Vec::new();
     let mut obligations = Vec::new();
 
-    if seal_env_epoch < anchor.ownership.epoch
-        && seal > anchor.ownership.sealed_prefix.lsn
-    {
+    if seal_env_epoch < anchor.ownership.epoch && seal > anchor.ownership.sealed_prefix.lsn {
         modes.push(Mode::InvalidAuthority(AuthorityFault::FencedEpoch));
     }
 
@@ -278,7 +269,13 @@ pub fn navigate(
     }
 
     // Phase 3: the ledger.
-    check_ledger(prefix, s.ledger_pos, &mut modes, &mut reasons, &mut obligations);
+    check_ledger(
+        prefix,
+        s.ledger_pos,
+        &mut modes,
+        &mut reasons,
+        &mut obligations,
+    );
 
     if !modes.is_empty() {
         Navigation::Inconsistent(modes)
@@ -337,7 +334,10 @@ fn check_chain(
 
 /// The record at `lsn`, if present (`prefix` is in lsn order).
 fn at(prefix: &[Record], lsn: Lsn) -> Option<&Record> {
-    prefix.binary_search_by_key(&lsn, |r| r.envelope.lsn).ok().map(|i| &prefix[i])
+    prefix
+        .binary_search_by_key(&lsn, |r| r.envelope.lsn)
+        .ok()
+        .map(|i| &prefix[i])
 }
 
 /// The Seal at `seal`, with the epoch it was written under.
@@ -432,7 +432,10 @@ struct OpTrack<'a> {
 }
 
 const fn is_terminal(s: OutcomeState) -> bool {
-    matches!(s, OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied)
+    matches!(
+        s,
+        OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied
+    )
 }
 
 /// Classify every op in the ledger against S.
@@ -503,8 +506,7 @@ fn check_ledger(
             continue;
         };
 
-        let settled = intent_lsn <= ledger_pos
-            && terminal.is_some_and(|(l, _)| l <= ledger_pos);
+        let settled = intent_lsn <= ledger_pos && terminal.is_some_and(|(l, _)| l <= ledger_pos);
         if settled {
             continue;
         }
@@ -567,7 +569,10 @@ mod tests {
         }
 
         fn append(&mut self, stream: Stream, payload: Payload) -> Lsn {
-            self.warden.append(&mut self.coord, stream, payload).unwrap().lsn
+            self.warden
+                .append(&mut self.coord, stream, payload)
+                .unwrap()
+                .lsn
         }
 
         /// A fresh retry policy: 0 dedup, 1 queryable, 2 unsafe.
@@ -636,8 +641,11 @@ mod tests {
         fn gap(&mut self, keep: Lsn) -> Lsn {
             let head = self.coord.head();
             assert!(keep < head.lsn && !self.is_lost(keep));
-            let kept_hash =
-                if keep.get() == 0 { HashVal::GENESIS } else { self.coord.log()[keep.get() as usize - 1].envelope.hash };
+            let kept_hash = if keep.get() == 0 {
+                HashVal::GENESIS
+            } else {
+                self.coord.log()[keep.get() as usize - 1].envelope.hash
+            };
             let next = WardenId::new(if self.warden_id.get() == 1 { 2 } else { 1 });
             let epoch = self.coord.transfer(next);
             self.warden = WardenModel::resume(next, cid(), epoch, head, head.lsn.next());
@@ -645,7 +653,12 @@ mod tests {
             self.lost.push((keep.next(), head.lsn));
             self.append(
                 Stream::Ctl,
-                Payload::Gap(GapRecord { kept: keep, kept_hash, resumes: head.lsn, resumes_hash: head.hash }),
+                Payload::Gap(GapRecord {
+                    kept: keep,
+                    kept_hash,
+                    resumes: head.lsn,
+                    resumes_hash: head.hash,
+                }),
             )
         }
 
@@ -655,7 +668,12 @@ mod tests {
 
         /// The log as the new holder has it: without the lost records.
         fn records(&self) -> Vec<Record> {
-            self.coord.log().iter().filter(|r| !self.is_lost(r.envelope.lsn)).cloned().collect()
+            self.coord
+                .log()
+                .iter()
+                .filter(|r| !self.is_lost(r.envelope.lsn))
+                .cloned()
+                .collect()
         }
 
         /// One fs write and its group record.
@@ -665,7 +683,10 @@ mod tests {
                 Stream::Fs,
                 Payload::Group(GroupRecord {
                     gid: GroupId::new(gid),
-                    members: vec![Member { stream: Stream::Fs, lsn }],
+                    members: vec![Member {
+                        stream: Stream::Fs,
+                        lsn,
+                    }],
                     depends_on,
                     commit,
                 }),
@@ -718,7 +739,11 @@ mod tests {
     }
 
     fn suppress(op: OpId, barrier: u64) -> Obligation {
-        Obligation { op, barrier: BarrierId::new(barrier), kind: ObligationKind::Suppress }
+        Obligation {
+            op,
+            barrier: BarrierId::new(barrier),
+            kind: ObligationKind::Suppress,
+        }
     }
 
     fn intent(op: u64, consequence: Consequence, barrier: Option<u64>) -> Payload {
@@ -736,7 +761,11 @@ mod tests {
     }
 
     fn outcome(op: u64, state: OutcomeState) -> Payload {
-        Payload::Outcome(OutcomeRecord { op: OpId::new(op), state, evidence: None })
+        Payload::Outcome(OutcomeRecord {
+            op: OpId::new(op),
+            state,
+            evidence: None,
+        })
     }
 
     /// A copy of the log with the first raw record's payload replaced.
@@ -782,7 +811,10 @@ mod tests {
         let s = sim.seal();
         let op = sim.mail(Some(CrashPoint::DuringDispatchReceived));
         assert_eq!(sim.provider.effect_count(op), 1);
-        assert_eq!(sim.nav(s), Navigation::Insufficient(vec![Reason::MissingOutcome(op)]));
+        assert_eq!(
+            sim.nav(s),
+            Navigation::Insufficient(vec![Reason::MissingOutcome(op)])
+        );
     }
 
     #[test]
@@ -791,7 +823,11 @@ mod tests {
         let s = sim.seal();
         let op = sim.mail(Some(CrashPoint::DuringDispatchReceived));
         sim.reconcile();
-        assert_eq!(sim.provider.effect_count(op), 1, "reconcile must not duplicate");
+        assert_eq!(
+            sim.provider.effect_count(op),
+            1,
+            "reconcile must not duplicate"
+        );
         assert_eq!(sim.nav(s), Navigation::Consistent(vec![suppress(op, 1)]));
     }
 
@@ -805,10 +841,16 @@ mod tests {
             Some(CrashPoint::DuringDispatchReceived),
         );
         sim.reconcile();
-        assert_eq!(sim.nav(s), Navigation::Insufficient(vec![Reason::MissingOutcome(op)]));
+        assert_eq!(
+            sim.nav(s),
+            Navigation::Insufficient(vec![Reason::MissingOutcome(op)])
+        );
         // Rebirth reconciles again; still no trusted outcome, no re-dispatch.
         sim.rebirth();
-        assert_eq!(sim.nav(s), Navigation::Insufficient(vec![Reason::MissingOutcome(op)]));
+        assert_eq!(
+            sim.nav(s),
+            Navigation::Insufficient(vec![Reason::MissingOutcome(op)])
+        );
         assert_eq!(sim.provider.effect_count(op), 1);
     }
 
@@ -817,7 +859,10 @@ mod tests {
         let mut sim = Sim::new();
         let s = sim.seal();
         let op = sim.mail(Some(CrashPoint::AfterIntent));
-        assert_eq!(sim.nav(s), Navigation::Insufficient(vec![Reason::MissingOutcome(op)]));
+        assert_eq!(
+            sim.nav(s),
+            Navigation::Insufficient(vec![Reason::MissingOutcome(op)])
+        );
         sim.reconcile();
         assert_eq!(sim.provider.effect_count(op), 0);
         assert_eq!(sim.nav(s), Navigation::Consistent(vec![]));
@@ -834,7 +879,14 @@ mod tests {
         let Payload::Seal(seal) = &sim.coord.log()[s.get() as usize - 1].payload else {
             unreachable!()
         };
-        let intent_lsn = sim.coord.log().iter().find(|r| matches!(r.payload, Payload::Intent(_))).unwrap().envelope.lsn;
+        let intent_lsn = sim
+            .coord
+            .log()
+            .iter()
+            .find(|r| matches!(r.payload, Payload::Intent(_)))
+            .unwrap()
+            .envelope
+            .lsn;
         assert!(intent_lsn <= seal.ledger_pos);
         assert_eq!(sim.provider.effect_count(op), 1);
         assert_eq!(sim.nav(s), Navigation::Consistent(vec![suppress(op, 1)]));
@@ -885,10 +937,12 @@ mod tests {
         let s = sim.seal();
         assert_eq!(
             sim.nav(s),
-            Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::GroupDependencyOpen {
-                gid: GroupId::new(2),
-                dep: GroupId::new(3),
-            })]),
+            Navigation::Inconsistent(vec![Mode::IncompleteState(
+                StateFault::GroupDependencyOpen {
+                    gid: GroupId::new(2),
+                    dep: GroupId::new(3),
+                }
+            )]),
         );
     }
 
@@ -948,9 +1002,15 @@ mod tests {
     fn contradictory_terminal_outcomes() {
         let mut sim = Sim::new();
         let s = sim.seal();
-        sim.append(Stream::Effect, intent(9, Consequence::Irreversible, Some(1)));
+        sim.append(
+            Stream::Effect,
+            intent(9, Consequence::Irreversible, Some(1)),
+        );
         sim.append(Stream::Effect, outcome(9, OutcomeState::ConfirmedApplied));
-        sim.append(Stream::Effect, outcome(9, OutcomeState::ConfirmedNotApplied));
+        sim.append(
+            Stream::Effect,
+            outcome(9, OutcomeState::ConfirmedNotApplied),
+        );
         assert_eq!(
             sim.nav(s),
             Navigation::Inconsistent(vec![Mode::AmbiguousOutcome(OpId::new(9))]),
@@ -982,7 +1042,10 @@ mod tests {
     fn tainted_seal_is_inconsistent() {
         let mut sim = Sim::new();
         let s = sim.seal_with(Verdict::Tainted(TaintKind::BarrierViolation));
-        assert_eq!(sim.nav(s), Navigation::Inconsistent(vec![Mode::UnaccountedBarrier(None)]));
+        assert_eq!(
+            sim.nav(s),
+            Navigation::Inconsistent(vec![Mode::UnaccountedBarrier(None)])
+        );
         let s = sim.seal_with(Verdict::Tainted(TaintKind::GroupIncomplete));
         assert_eq!(
             sim.nav(s),
@@ -1019,7 +1082,9 @@ mod tests {
     }
 
     fn chain_broken(lsn: u64) -> Navigation {
-        Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::ChainBroken { lsn: Lsn::new(lsn) })])
+        Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::ChainBroken {
+            lsn: Lsn::new(lsn),
+        })])
     }
 
     /// The Seal before the gap is judged as if there were none; the log
@@ -1033,7 +1098,11 @@ mod tests {
         transcript(&mut sim);
         let g = sim.gap(s);
         assert_eq!(sim.nav(s), Navigation::Consistent(vec![]));
-        assert_eq!(sim.nav_records(sim.coord.log(), s), chain_broken(g.get()), "the Gap names a record that is not before it");
+        assert_eq!(
+            sim.nav_records(sim.coord.log(), s),
+            chain_broken(g.get()),
+            "the Gap names a record that is not before it"
+        );
     }
 
     /// An effect authorized before the gap whose outcome was lost in it
@@ -1053,10 +1122,19 @@ mod tests {
             .unwrap()
             .envelope
             .lsn;
-        assert!(auth < sim.coord.head().lsn, "the applied outcome comes after the authorization");
+        assert!(
+            auth < sim.coord.head().lsn,
+            "the applied outcome comes after the authorization"
+        );
         sim.gap(auth);
-        assert_eq!(sim.nav(s), Navigation::Insufficient(vec![Reason::MissingOutcome(op)]));
-        sim.append(Stream::Effect, outcome(op.get(), OutcomeState::ConfirmedApplied));
+        assert_eq!(
+            sim.nav(s),
+            Navigation::Insufficient(vec![Reason::MissingOutcome(op)])
+        );
+        sim.append(
+            Stream::Effect,
+            outcome(op.get(), OutcomeState::ConfirmedApplied),
+        );
         assert_eq!(sim.nav(s), Navigation::Consistent(vec![suppress(op, 1)]));
     }
 
@@ -1078,14 +1156,20 @@ mod tests {
         // A Seal whose transcript cut names the lost record.
         let rec = SealRecord {
             parent: None,
-            cut: StreamCut { transcript: lost, ..StreamCut::EMPTY },
+            cut: StreamCut {
+                transcript: lost,
+                ..StreamCut::EMPTY
+            },
             layer: LayerRef::new(99),
             verdict: Verdict::Clean,
             ledger_pos: Lsn::new(0),
             turn: TurnId::new(99),
         };
         let bad = sim.append(Stream::Ctl, Payload::Seal(rec));
-        assert_eq!(sim.nav(bad), Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::CutInvalid)]));
+        assert_eq!(
+            sim.nav(bad),
+            Navigation::Inconsistent(vec![Mode::IncompleteState(StateFault::CutInvalid)])
+        );
     }
 
     /// Everything lost: the Gap keeps genesis.
@@ -1119,7 +1203,10 @@ mod tests {
         // No Gap record: the records after it no longer chain.
         let mut skipped = good.clone();
         skipped.remove(gi);
-        assert_eq!(navigate(&skipped, &anchor, s, head), chain_broken(keep.get() + 1));
+        assert_eq!(
+            navigate(&skipped, &anchor, s, head),
+            chain_broken(keep.get() + 1)
+        );
 
         // A Gap record that names the wrong ends, re-hashed so only the
         // naming is wrong (the records after it no longer link to it, but
@@ -1127,24 +1214,57 @@ mod tests {
         let wrong = |f: &dyn Fn(&mut GapRecord), stream: Stream| {
             let mut copy = good.clone();
             let r = &mut copy[gi];
-            let Payload::Gap(mut gr) = r.payload.clone() else { unreachable!() };
+            let Payload::Gap(mut gr) = r.payload.clone() else {
+                unreachable!()
+            };
             f(&mut gr);
             let e = &r.envelope;
-            let fixed = Record::new(e.chronicle, e.branch, e.epoch, stream, e.lsn, e.prev, Payload::Gap(gr));
+            let fixed = Record::new(
+                e.chronicle,
+                e.branch,
+                e.epoch,
+                stream,
+                e.lsn,
+                e.prev,
+                Payload::Gap(gr),
+            );
             *r = fixed;
             navigate(&copy, &anchor, s, head)
         };
-        assert_eq!(wrong(&|g| g.kept = Lsn::new(0), Stream::Ctl), chain_broken(keep.get() + 1));
-        assert_eq!(wrong(&|g| g.kept_hash = HashVal::GENESIS, Stream::Ctl), chain_broken(keep.get() + 1));
-        assert_eq!(wrong(&|g| g.resumes = g.resumes.next(), Stream::Ctl), chain_broken(keep.get() + 1));
-        assert_eq!(wrong(&|g| g.resumes_hash = HashVal::GENESIS, Stream::Ctl), chain_broken(keep.get() + 1));
-        assert_eq!(wrong(&|_| {}, Stream::Transcript), chain_broken(keep.get() + 1));
+        assert_eq!(
+            wrong(&|g| g.kept = Lsn::new(0), Stream::Ctl),
+            chain_broken(keep.get() + 1)
+        );
+        assert_eq!(
+            wrong(&|g| g.kept_hash = HashVal::GENESIS, Stream::Ctl),
+            chain_broken(keep.get() + 1)
+        );
+        assert_eq!(
+            wrong(&|g| g.resumes = g.resumes.next(), Stream::Ctl),
+            chain_broken(keep.get() + 1)
+        );
+        assert_eq!(
+            wrong(&|g| g.resumes_hash = HashVal::GENESIS, Stream::Ctl),
+            chain_broken(keep.get() + 1)
+        );
+        assert_eq!(
+            wrong(&|_| {}, Stream::Transcript),
+            chain_broken(keep.get() + 1)
+        );
 
         // A Gap record that does not jump is refused too.
         let mut sim = Sim::new();
         let t = transcript(&mut sim);
         let h = sim.coord.head();
-        sim.append(Stream::Ctl, Payload::Gap(GapRecord { kept: t, kept_hash: h.hash, resumes: t, resumes_hash: h.hash }));
+        sim.append(
+            Stream::Ctl,
+            Payload::Gap(GapRecord {
+                kept: t,
+                kept_hash: h.hash,
+                resumes: t,
+                resumes_hash: h.hash,
+            }),
+        );
         let s = sim.seal();
         assert_eq!(sim.nav(s), chain_broken(t.get() + 1));
 
@@ -1152,7 +1272,15 @@ mod tests {
         let mut sim = Sim::new();
         let t = transcript(&mut sim);
         let h = sim.coord.head();
-        sim.append(Stream::Transcript, Payload::Gap(GapRecord { kept: t, kept_hash: h.hash, resumes: t, resumes_hash: h.hash }));
+        sim.append(
+            Stream::Transcript,
+            Payload::Gap(GapRecord {
+                kept: t,
+                kept_hash: h.hash,
+                resumes: t,
+                resumes_hash: h.hash,
+            }),
+        );
         let s = sim.seal();
         assert_eq!(sim.nav(s), chain_broken(t.get() + 1));
     }
@@ -1167,7 +1295,10 @@ mod tests {
         let _ = sim.mail(None);
         anchor.ownership = sim.coord.ownership().clone();
         assert!(sim.coord.head().lsn > head.lsn);
-        assert_eq!(navigate(sim.coord.log(), &anchor, s, head), Navigation::Consistent(vec![]));
+        assert_eq!(
+            navigate(sim.coord.log(), &anchor, s, head),
+            Navigation::Consistent(vec![])
+        );
     }
 
     // ── Soundness ──────────────────────────────────────────────────
@@ -1179,7 +1310,11 @@ mod tests {
 
         #[derive(Clone, Debug)]
         enum Step {
-            Effect { retry: u8, compensatable: bool, crash: Option<CrashPoint> },
+            Effect {
+                retry: u8,
+                compensatable: bool,
+                crash: Option<CrashPoint>,
+            },
             Seal,
             Reconcile,
             Rebirth,

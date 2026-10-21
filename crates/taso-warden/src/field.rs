@@ -52,8 +52,8 @@
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::time::Duration;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{Payload, StreamCut, TurnId, Verdict};
@@ -111,7 +111,8 @@ impl<'v, L: Layers> Session<'v, L> {
             .frames()
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?;
         // From the newest Checkpoint on: older segments may be gone.
-        let summary = crate::summary::Summary::of(&frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+        let summary = crate::summary::Summary::of(&frames)
+            .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
         let (transcript, ledger) = (summary.transcript, summary.effect);
         let last_sealed_turn = summary.seal.map(|s| s.turn.get());
         Ok(Self {
@@ -150,7 +151,10 @@ impl<'v, L: Layers> Session<'v, L> {
 
     /// How many times the after-Seal hook failed, and the last reason.
     pub fn after_seal_failures(&self) -> (u64, Option<&str>) {
-        (self.after_seal_failures, self.last_after_seal_error.as_deref())
+        (
+            self.after_seal_failures,
+            self.last_after_seal_error.as_deref(),
+        )
     }
 
     /// The last turn sealed, if any, counting the birth Seal (turn 0,
@@ -164,7 +168,9 @@ impl<'v, L: Layers> Session<'v, L> {
     /// calls it first, so a pending publish always runs before the next
     /// request is handled.
     pub fn after_reply(&mut self) {
-        let Some(seal) = self.pending_seal.take() else { return };
+        let Some(seal) = self.pending_seal.take() else {
+            return;
+        };
         if let Some(hook) = self.after_seal.as_deref_mut() {
             if let Err(e) = hook.after_seal(self.vessel, seal) {
                 self.after_seal_failures += 1;
@@ -181,24 +187,42 @@ impl<'v, L: Layers> Session<'v, L> {
                 self.greeted = true;
                 // The birth Seal is the Warden's, not a harness turn.
                 let last = self.last_sealed_turn.filter(|&t| t != BIRTH_TURN.get());
-                Reply::Hello { version: VERSION, last_sealed_turn: last }
+                Reply::Hello {
+                    version: VERSION,
+                    last_sealed_turn: last,
+                }
             }
             (false, Request::Hello { version }) => error(
                 ErrorCode::BadHello,
-                format!("protocol version {version} is not supported; this Warden speaks {VERSION}"),
+                format!(
+                    "protocol version {version} is not supported; this Warden speaks {VERSION}"
+                ),
             ),
-            (false, _) => error(ErrorCode::BadHello, "the first request must be Hello".into()),
+            (false, _) => error(
+                ErrorCode::BadHello,
+                "the first request must be Hello".into(),
+            ),
             (true, Request::Hello { .. }) => error(ErrorCode::BadHello, "already greeted".into()),
             (true, Request::Transcript { entry }) => {
                 match self.vessel.append(Stream::Transcript, Payload::Raw(entry)) {
                     Ok(head) => {
                         self.transcript = head.lsn;
-                        Reply::Recorded { lsn: head.lsn.get() }
+                        Reply::Recorded {
+                            lsn: head.lsn.get(),
+                        }
                     }
                     Err(e) => vessel_error(e),
                 }
             }
-            (true, Request::Effect { call, provider, operation, args }) => {
+            (
+                true,
+                Request::Effect {
+                    call,
+                    provider,
+                    operation,
+                    args,
+                },
+            ) => {
                 let Some(fx) = self.effects.as_deref_mut() else {
                     return Reply::Effect {
                         call,
@@ -224,7 +248,10 @@ impl<'v, L: Layers> Session<'v, L> {
 
     fn turn_end(&mut self, turn: u64, quiescent: bool) -> Reply {
         if turn == BIRTH_TURN.get() {
-            return error(ErrorCode::Malformed, format!("turn {turn} is the Warden's birth Seal; turns start at 1"));
+            return error(
+                ErrorCode::Malformed,
+                format!("turn {turn} is the Warden's birth Seal; turns start at 1"),
+            );
         }
         if self.last_sealed_turn.is_some_and(|last| turn <= last) {
             return error(
@@ -249,14 +276,24 @@ impl<'v, L: Layers> Session<'v, L> {
                 _ => Ok(()),
             }
         };
-        let cut = StreamCut { fs: Lsn::new(0), db: Lsn::new(0), transcript: self.transcript };
+        let cut = StreamCut {
+            fs: Lsn::new(0),
+            db: Lsn::new(0),
+            transcript: self.transcript,
+        };
         let verdict = std::mem::replace(&mut self.next_verdict, Verdict::Clean);
-        match self.vessel.seal_checked(cut, verdict.clone(), self.ledger, TurnId::new(turn), check) {
+        match self
+            .vessel
+            .seal_checked(cut, verdict.clone(), self.ledger, TurnId::new(turn), check)
+        {
             Ok(sealed) => {
                 self.last_sealed_turn = Some(turn);
                 // Published after the reply: Session::after_reply.
                 self.pending_seal = Some(sealed.seal);
-                Reply::TurnEnd { turn, sealed: Some(sealed.seal.lsn.get()) }
+                Reply::TurnEnd {
+                    turn,
+                    sealed: Some(sealed.seal.lsn.get()),
+                }
             }
             Err(VesselError::Chronicle(ChronicleError::CheckFailed(_))) => {
                 // Not actually quiescent: no Seal, try again next turn.
@@ -278,7 +315,9 @@ fn error(code: ErrorCode, message: String) -> Reply {
 fn vessel_error(e: VesselError) -> Reply {
     let code = match &e {
         VesselError::Closed { .. } => ErrorCode::Closed,
-        VesselError::Chronicle(ChronicleError::Fenced | ChronicleError::Refused(_)) => ErrorCode::Fenced,
+        VesselError::Chronicle(ChronicleError::Fenced | ChronicleError::Refused(_)) => {
+            ErrorCode::Fenced
+        }
         _ => ErrorCode::Internal,
     };
     error(code, e.to_string())
@@ -355,8 +394,8 @@ impl FieldSocket {
         vessel: &mut Vessel<L>,
         first_verdict: Verdict,
     ) -> io::Result<(Ended, Option<u64>)> {
-        let mut session = Session::new(vessel, first_verdict)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut session =
+            Session::new(vessel, first_verdict).map_err(|e| io::Error::other(e.to_string()))?;
         let ended = self.serve_session(&mut session)?;
         Ok((ended, session.last_sealed_turn()))
     }
@@ -370,7 +409,11 @@ impl FieldSocket {
 
     /// Wait for a connection, checking `stop` every `poll`.  `None` once
     /// `stop` says so with nobody connecting.  The connection is blocking.
-    pub fn accept_until(&self, stop: &dyn Fn() -> bool, poll: Duration) -> io::Result<Option<UnixStream>> {
+    pub fn accept_until(
+        &self,
+        stop: &dyn Fn() -> bool,
+        poll: Duration,
+    ) -> io::Result<Option<UnixStream>> {
         self.listener.set_nonblocking(true)?;
         let got = loop {
             match self.listener.accept() {
@@ -423,9 +466,23 @@ mod tests {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
-        assert!(is_error(&s.handle(Request::Transcript { entry: vec![1] }), ErrorCode::BadHello));
-        assert!(is_error(&s.handle(Request::Hello { version: VERSION + 1 }), ErrorCode::BadHello));
-        assert_eq!(s.handle(hello()), Reply::Hello { version: VERSION, last_sealed_turn: None });
+        assert!(is_error(
+            &s.handle(Request::Transcript { entry: vec![1] }),
+            ErrorCode::BadHello
+        ));
+        assert!(is_error(
+            &s.handle(Request::Hello {
+                version: VERSION + 1
+            }),
+            ErrorCode::BadHello
+        ));
+        assert_eq!(
+            s.handle(hello()),
+            Reply::Hello {
+                version: VERSION,
+                last_sealed_turn: None
+            }
+        );
         assert!(is_error(&s.handle(hello()), ErrorCode::BadHello));
     }
 
@@ -435,23 +492,43 @@ mod tests {
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
         s.handle(hello());
-        let Reply::Recorded { lsn } = s.handle(Request::Transcript { entry: b"user: hi".to_vec() }) else {
+        let Reply::Recorded { lsn } = s.handle(Request::Transcript {
+            entry: b"user: hi".to_vec(),
+        }) else {
             panic!("not recorded")
         };
         assert_eq!(lsn, 2, "lsn 1 is the Lineage record");
 
         // Not quiescent: no Seal.
         assert_eq!(
-            s.handle(Request::TurnEnd { turn: 1, quiescent: false }),
-            Reply::TurnEnd { turn: 1, sealed: None }
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: false
+            }),
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: None
+            }
         );
         // Quiescent: sealed right after the transcript entry.
         assert_eq!(
-            s.handle(Request::TurnEnd { turn: 1, quiescent: true }),
-            Reply::TurnEnd { turn: 1, sealed: Some(3) }
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: Some(3)
+            }
         );
         // Turns must increase.
-        assert!(is_error(&s.handle(Request::TurnEnd { turn: 1, quiescent: true }), ErrorCode::Malformed));
+        assert!(is_error(
+            &s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            ErrorCode::Malformed
+        ));
         assert_eq!(s.last_sealed_turn(), Some(1));
         drop(s);
 
@@ -459,7 +536,9 @@ mod tests {
         let seal = v.last_seal().unwrap();
         let frames = v.chronicle().frames().unwrap();
         let f = frames.iter().find(|f| f.envelope.lsn == seal.lsn).unwrap();
-        let Payload::Seal(rec) = Payload::decode(&f.payload).unwrap() else { panic!() };
+        let Payload::Seal(rec) = Payload::decode(&f.payload).unwrap() else {
+            panic!()
+        };
         assert_eq!(rec.cut.transcript, Lsn::new(2));
         assert_eq!(rec.turn, TurnId::new(1));
         assert_eq!(rec.verdict, Verdict::Clean);
@@ -473,16 +552,44 @@ mod tests {
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let birth = v.seal_birth().unwrap().seal;
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
-        assert_eq!(s.last_sealed_turn(), Some(0), "the session knows the birth Seal");
-        assert_eq!(s.handle(hello()), Reply::Hello { version: VERSION, last_sealed_turn: None });
-        assert!(is_error(&s.handle(Request::TurnEnd { turn: 0, quiescent: true }), ErrorCode::Malformed));
         assert_eq!(
-            s.handle(Request::TurnEnd { turn: 1, quiescent: true }),
-            Reply::TurnEnd { turn: 1, sealed: Some(birth.lsn.get() + 1) }
+            s.last_sealed_turn(),
+            Some(0),
+            "the session knows the birth Seal"
+        );
+        assert_eq!(
+            s.handle(hello()),
+            Reply::Hello {
+                version: VERSION,
+                last_sealed_turn: None
+            }
+        );
+        assert!(is_error(
+            &s.handle(Request::TurnEnd {
+                turn: 0,
+                quiescent: true
+            }),
+            ErrorCode::Malformed
+        ));
+        assert_eq!(
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: Some(birth.lsn.get() + 1)
+            }
         );
         drop(s);
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
-        assert_eq!(s.handle(hello()), Reply::Hello { version: VERSION, last_sealed_turn: Some(1) });
+        assert_eq!(
+            s.handle(hello()),
+            Reply::Hello {
+                version: VERSION,
+                last_sealed_turn: Some(1)
+            }
+        );
     }
 
     /// Turn 0 is refused even before any Seal: a harness Seal at turn 0
@@ -493,7 +600,10 @@ mod tests {
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
         s.handle(hello());
-        let r = s.handle(Request::TurnEnd { turn: 0, quiescent: true });
+        let r = s.handle(Request::TurnEnd {
+            turn: 0,
+            quiescent: true,
+        });
         assert!(is_error(&r, ErrorCode::Malformed), "{r:?}");
         assert_eq!(s.last_sealed_turn(), None);
         drop(s);
@@ -506,23 +616,48 @@ mod tests {
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
         s.handle(hello());
-        s.handle(Request::TurnEnd { turn: 7, quiescent: true });
+        s.handle(Request::TurnEnd {
+            turn: 7,
+            quiescent: true,
+        });
         drop(s);
         drop(v);
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
-        assert_eq!(s.handle(hello()), Reply::Hello { version: VERSION, last_sealed_turn: Some(7) });
-        assert!(is_error(&s.handle(Request::TurnEnd { turn: 7, quiescent: true }), ErrorCode::Malformed));
+        assert_eq!(
+            s.handle(hello()),
+            Reply::Hello {
+                version: VERSION,
+                last_sealed_turn: Some(7)
+            }
+        );
+        assert!(is_error(
+            &s.handle(Request::TurnEnd {
+                turn: 7,
+                quiescent: true
+            }),
+            ErrorCode::Malformed
+        ));
     }
 
     #[test]
     fn first_seal_takes_the_given_verdict_then_clean() {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
-        let mut s = Session::new(&mut v, Verdict::Unverified("recovered: 1 group dropped".into())).unwrap();
+        let mut s = Session::new(
+            &mut v,
+            Verdict::Unverified("recovered: 1 group dropped".into()),
+        )
+        .unwrap();
         s.handle(hello());
-        s.handle(Request::TurnEnd { turn: 1, quiescent: true });
-        s.handle(Request::TurnEnd { turn: 2, quiescent: true });
+        s.handle(Request::TurnEnd {
+            turn: 1,
+            quiescent: true,
+        });
+        s.handle(Request::TurnEnd {
+            turn: 2,
+            quiescent: true,
+        });
         drop(s);
         let verdicts: Vec<Verdict> = v
             .chronicle()
@@ -534,7 +669,13 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(verdicts, vec![Verdict::Unverified("recovered: 1 group dropped".into()), Verdict::Clean]);
+        assert_eq!(
+            verdicts,
+            vec![
+                Verdict::Unverified("recovered: 1 group dropped".into()),
+                Verdict::Clean
+            ]
+        );
     }
 
     /// Records the Seals it was called for; fails when told to.
@@ -545,7 +686,11 @@ mod tests {
 
     impl<L: Layers> AfterSeal<L> for Hook {
         fn after_seal(&mut self, vessel: &mut Vessel<L>, seal: Position) -> Result<(), String> {
-            assert_eq!(vessel.last_seal(), Some(seal), "called with the Seal just taken");
+            assert_eq!(
+                vessel.last_seal(),
+                Some(seal),
+                "called with the Seal just taken"
+            );
             self.seen.push(seal);
             if self.fail {
                 Err("store down".into())
@@ -559,24 +704,68 @@ mod tests {
     fn the_hook_runs_after_each_seal_and_its_failure_does_not_undo_it() {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
-        let mut hook = Hook { seen: Vec::new(), fail: false };
-        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_after_seal(&mut hook);
+        let mut hook = Hook {
+            seen: Vec::new(),
+            fail: false,
+        };
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_after_seal(&mut hook);
         s.handle(hello());
-        assert_eq!(s.handle(Request::TurnEnd { turn: 1, quiescent: false }), Reply::TurnEnd { turn: 1, sealed: None });
-        assert_eq!(s.handle(Request::TurnEnd { turn: 1, quiescent: true }), Reply::TurnEnd { turn: 1, sealed: Some(2) });
-        assert_eq!(s.pending_seal.map(|p| p.lsn.get()), Some(2), "not yet: after the reply");
+        assert_eq!(
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: false
+            }),
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: None
+            }
+        );
+        assert_eq!(
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: Some(2)
+            }
+        );
+        assert_eq!(
+            s.pending_seal.map(|p| p.lsn.get()),
+            Some(2),
+            "not yet: after the reply"
+        );
         s.after_reply();
         s.after_reply();
         assert_eq!(s.after_seal_failures(), (0, None));
         drop(s);
-        assert_eq!(hook.seen.iter().map(|p| p.lsn.get()).collect::<Vec<_>>(), vec![2], "not for the unsealed turn");
+        assert_eq!(
+            hook.seen.iter().map(|p| p.lsn.get()).collect::<Vec<_>>(),
+            vec![2],
+            "not for the unsealed turn"
+        );
 
         hook.fail = true;
-        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_after_seal(&mut hook);
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_after_seal(&mut hook);
         s.handle(hello());
-        assert_eq!(s.handle(Request::TurnEnd { turn: 2, quiescent: true }), Reply::TurnEnd { turn: 2, sealed: Some(3) });
+        assert_eq!(
+            s.handle(Request::TurnEnd {
+                turn: 2,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                turn: 2,
+                sealed: Some(3)
+            }
+        );
         // The next request runs the pending hook first.
-        s.handle(Request::Transcript { entry: b"next".to_vec() });
+        s.handle(Request::Transcript {
+            entry: b"next".to_vec(),
+        });
         assert_eq!(s.after_seal_failures(), (1, Some("store down")));
         drop(s);
         assert_eq!(v.last_seal().unwrap().lsn, Lsn::new(3), "the Seal stands");
@@ -593,7 +782,13 @@ mod tests {
             let mut r = out;
             let mut n = 0;
             while let Some(reply) = recv_reply(&mut r).unwrap() {
-                n += usize::from(matches!(reply, Reply::TurnEnd { sealed: Some(_), .. }));
+                n += usize::from(matches!(
+                    reply,
+                    Reply::TurnEnd {
+                        sealed: Some(_),
+                        ..
+                    }
+                ));
             }
             n
         }
@@ -639,19 +834,39 @@ mod tests {
             }
         }
         let mut input = Vec::new();
-        for req in [hello(), Request::TurnEnd { turn: 1, quiescent: true }, Request::TurnEnd { turn: 2, quiescent: true }] {
+        for req in [
+            hello(),
+            Request::TurnEnd {
+                turn: 1,
+                quiescent: true,
+            },
+            Request::TurnEnd {
+                turn: 2,
+                quiescent: true,
+            },
+        ] {
             taso_field::protocol::send_request(&mut input, &req).unwrap();
         }
         let output = Rc::new(RefCell::new(Vec::new()));
         let published = Rc::new(RefCell::new(0));
-        let mut stream = Duplex { input: std::io::Cursor::new(input), output: output.clone(), published: published.clone() };
+        let mut stream = Duplex {
+            input: std::io::Cursor::new(input),
+            output: output.clone(),
+            published: published.clone(),
+        };
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut hook = Watching(output.clone(), Vec::new(), published.clone());
-        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_after_seal(&mut hook);
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_after_seal(&mut hook);
         assert!(matches!(serve(&mut stream, &mut s), Ended::Closed));
         drop(s);
-        assert_eq!(hook.1, vec![2, 3], "each publish ran after its TurnEnd reply was written");
+        assert_eq!(
+            hook.1,
+            vec![2, 3],
+            "each publish ran after its TurnEnd reply was written"
+        );
     }
 
     #[test]
@@ -660,12 +875,21 @@ mod tests {
         let sock = FieldSocket::bind(dir.path().join("f.sock")).unwrap();
         let polls = std::cell::Cell::new(0);
         let none = sock
-            .accept_until(&|| { polls.set(polls.get() + 1); polls.get() > 2 }, Duration::from_millis(1))
+            .accept_until(
+                &|| {
+                    polls.set(polls.get() + 1);
+                    polls.get() > 2
+                },
+                Duration::from_millis(1),
+            )
             .unwrap();
         assert!(none.is_none());
         assert_eq!(polls.get(), 3);
         let _client = UnixStream::connect(sock.path()).unwrap();
-        let mut got = sock.accept_until(&|| false, Duration::from_millis(1)).unwrap().unwrap();
+        let mut got = sock
+            .accept_until(&|| false, Duration::from_millis(1))
+            .unwrap()
+            .unwrap();
         // The connection serves a session as from serve_session.
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
@@ -676,7 +900,10 @@ mod tests {
         assert!(matches!(serve(&mut got, &mut s), Ended::Closed));
         assert_eq!(
             recv_reply(&mut client).unwrap(),
-            Some(Reply::Hello { version: VERSION, last_sealed_turn: None })
+            Some(Reply::Hello {
+                version: VERSION,
+                last_sealed_turn: None
+            })
         );
     }
 
@@ -693,7 +920,13 @@ mod tests {
             operation: "send".into(),
             args: b"{\"consequence\":\"none\"}".to_vec(),
         });
-        assert!(matches!(r, Reply::Effect { call: 3, result: EffectResult::Refused { .. } }));
+        assert!(matches!(
+            r,
+            Reply::Effect {
+                call: 3,
+                result: EffectResult::Refused { .. }
+            }
+        ));
         drop(s);
         assert_eq!(v.tail(), tail);
     }
@@ -704,8 +937,11 @@ mod tests {
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let mut reg = Registry::new();
         reg.register(Box::new(FakeProvider::new("mail")));
-        let (mut fx, _) = Effects::open(reg, Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
-        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_effects(&mut fx);
+        let (mut fx, _) =
+            Effects::open(reg, Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
         s.handle(hello());
         let r = s.handle(Request::Effect {
             call: 1,
@@ -713,21 +949,41 @@ mod tests {
             operation: "send".into(),
             args: b"bob".to_vec(),
         });
-        assert!(matches!(r, Reply::Effect { call: 1, result: EffectResult::Applied { .. } }));
+        assert!(matches!(
+            r,
+            Reply::Effect {
+                call: 1,
+                result: EffectResult::Applied { .. }
+            }
+        ));
         let r = s.handle(Request::Effect {
             call: 2,
             provider: "http".into(),
             operation: "get".into(),
             args: b"x".to_vec(),
         });
-        assert!(matches!(r, Reply::Effect { call: 2, result: EffectResult::Refused { .. } }));
+        assert!(matches!(
+            r,
+            Reply::Effect {
+                call: 2,
+                result: EffectResult::Refused { .. }
+            }
+        ));
         // The Seal's ledger_pos covers the effect records.
-        s.handle(Request::TurnEnd { turn: 1, quiescent: true });
+        s.handle(Request::TurnEnd {
+            turn: 1,
+            quiescent: true,
+        });
         drop(s);
         let frames = v.chronicle().frames().unwrap();
-        let last_effect = frames.iter().rfind(|f| f.envelope.stream == Stream::Effect).unwrap();
+        let last_effect = frames
+            .iter()
+            .rfind(|f| f.envelope.stream == Stream::Effect)
+            .unwrap();
         let seal = frames.last().unwrap();
-        let Payload::Seal(rec) = Payload::decode(&seal.payload).unwrap() else { panic!() };
+        let Payload::Seal(rec) = Payload::decode(&seal.payload).unwrap() else {
+            panic!()
+        };
         assert_eq!(rec.ledger_pos, last_effect.envelope.lsn);
     }
 
@@ -739,19 +995,33 @@ mod tests {
         std::fs::write(mount.path().join("state.db-journal"), [0u8; 512]).unwrap();
         let watch = Watch::new(mount.path(), &["state.db"]).unwrap();
         let tail = v.tail();
-        let mut s = Session::new(&mut v, Verdict::Clean).unwrap().with_watch(watch);
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_watch(watch);
         s.handle(hello());
         // The harness says quiescent; the journal says otherwise.
         assert_eq!(
-            s.handle(Request::TurnEnd { turn: 1, quiescent: true }),
-            Reply::TurnEnd { turn: 1, sealed: None }
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: None
+            }
         );
         assert_eq!(s.last_sealed_turn(), None);
         // Once the transaction is done, the same turn seals.
         std::fs::remove_file(mount.path().join("state.db-journal")).unwrap();
         assert!(matches!(
-            s.handle(Request::TurnEnd { turn: 1, quiescent: true }),
-            Reply::TurnEnd { turn: 1, sealed: Some(_) }
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: Some(_)
+            }
         ));
         drop(s);
         assert_eq!(v.tail().lsn, tail.lsn.next(), "exactly one Seal record");
@@ -762,13 +1032,35 @@ mod tests {
     fn a_closed_vessel_answers_closed() {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
-        v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(1)).unwrap();
-        let auth = taso_core::record::Authority { actor: "op".into(), reason: "merge".into() };
-        let mut old = e.host.succeed(v, ns(1), b"n", auth, false).unwrap().predecessor;
+        v.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let auth = taso_core::record::Authority {
+            actor: "op".into(),
+            reason: "merge".into(),
+        };
+        let mut old = e
+            .host
+            .succeed(v, ns(1), b"n", auth, false)
+            .unwrap()
+            .predecessor;
         let mut s = Session::new(&mut old, Verdict::Clean).unwrap();
         s.handle(hello());
-        assert!(is_error(&s.handle(Request::Transcript { entry: vec![1] }), ErrorCode::Closed));
-        assert!(is_error(&s.handle(Request::TurnEnd { turn: 2, quiescent: true }), ErrorCode::Closed));
+        assert!(is_error(
+            &s.handle(Request::Transcript { entry: vec![1] }),
+            ErrorCode::Closed
+        ));
+        assert!(is_error(
+            &s.handle(Request::TurnEnd {
+                turn: 2,
+                quiescent: true
+            }),
+            ErrorCode::Closed
+        ));
     }
 
     // ── over a real socket ──────────────────────────────────────────
@@ -783,7 +1075,13 @@ mod tests {
             let r1 = recv_reply(&mut client).unwrap().unwrap();
             write_frame(&mut client, &[42]).unwrap(); // not a request
             let r2 = recv_reply(&mut client).unwrap().unwrap();
-            send_request(&mut client, &Request::Transcript { entry: b"x".to_vec() }).unwrap();
+            send_request(
+                &mut client,
+                &Request::Transcript {
+                    entry: b"x".to_vec(),
+                },
+            )
+            .unwrap();
             let r3 = recv_reply(&mut client).unwrap().unwrap();
             (r1, r2, r3)
         });
@@ -825,14 +1123,27 @@ mod tests {
             let mut c = UnixStream::connect(&path).unwrap();
             send_request(&mut c, &hello()).unwrap();
             recv_reply(&mut c).unwrap();
-            send_request(&mut c, &Request::TurnEnd { turn: 1, quiescent: true }).unwrap();
+            send_request(
+                &mut c,
+                &Request::TurnEnd {
+                    turn: 1,
+                    quiescent: true,
+                },
+            )
+            .unwrap();
             recv_reply(&mut c).unwrap().unwrap()
         });
         let (ended, last) = sock.serve_one(&mut v, Verdict::Clean).unwrap();
         let reply = t.join().unwrap();
         assert!(matches!(ended, Ended::Closed));
         assert_eq!(last, Some(1));
-        assert!(matches!(reply, Reply::TurnEnd { turn: 1, sealed: Some(_) }));
+        assert!(matches!(
+            reply,
+            Reply::TurnEnd {
+                turn: 1,
+                sealed: Some(_)
+            }
+        ));
         assert!(v.last_seal().is_some());
     }
 }

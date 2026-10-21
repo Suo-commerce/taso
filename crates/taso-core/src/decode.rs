@@ -18,10 +18,10 @@ use std::fmt;
 
 use crate::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use crate::record::{
-    Authority, BarrierId, Consequence, Dispatch, GroupId, GroupRecord, IntentRecord, LayerRef,
-    LineageRecord, Member, Namespace, OpId, Origin, OutcomeRecord, OutcomeState, ParentSeal,
-    Payload, RetryPolicy, SealRecord, StreamCut, SuccessionRecord, TaintKind, TurnId, Verdict,
-    FsShippedRecord, GapRecord, StreamBase, CheckpointRecord, CheckpointSeal, OpenEffect,
+    Authority, BarrierId, CheckpointRecord, CheckpointSeal, Consequence, Dispatch, FsShippedRecord,
+    GapRecord, GroupId, GroupRecord, IntentRecord, LayerRef, LineageRecord, Member, Namespace,
+    OpId, OpenEffect, Origin, OutcomeRecord, OutcomeState, ParentSeal, Payload, RetryPolicy,
+    SealRecord, StreamBase, StreamCut, SuccessionRecord, TaintKind, TurnId, Verdict,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -94,7 +94,10 @@ impl<'a> Reader<'a> {
     /// Take `n` bytes, or fail without consuming.
     fn take(&mut self, n: u64) -> R<&'a [u8]> {
         if n > self.remaining() as u64 {
-            return Err(DecodeError::Truncated { at: self.pos, need: n });
+            return Err(DecodeError::Truncated {
+                at: self.pos,
+                need: n,
+            });
         }
         let start = self.pos;
         self.pos += n as usize;
@@ -127,7 +130,11 @@ impl<'a> Reader<'a> {
         match self.tag()? {
             (_, 0) => Ok(false),
             (_, 1) => Ok(true),
-            (at, tag) => Err(DecodeError::BadTag { at, what: "bool", tag }),
+            (at, tag) => Err(DecodeError::BadTag {
+                at,
+                what: "bool",
+                tag,
+            }),
         }
     }
 
@@ -149,7 +156,11 @@ impl<'a> Reader<'a> {
         match self.tag()? {
             (_, 0) => Ok(None),
             (_, 1) => f(self).map(Some),
-            (at, tag) => Err(DecodeError::BadTag { at, what: "option", tag }),
+            (at, tag) => Err(DecodeError::BadTag {
+                at,
+                what: "option",
+                tag,
+            }),
         }
     }
 
@@ -172,7 +183,10 @@ impl<'a> Reader<'a> {
     fn finish(&self) -> R<()> {
         match self.remaining() {
             0 => Ok(()),
-            extra => Err(DecodeError::Trailing { at: self.pos, extra }),
+            extra => Err(DecodeError::Trailing {
+                at: self.pos,
+                extra,
+            }),
         }
     }
 
@@ -197,7 +211,13 @@ impl<'a> Reader<'a> {
             (_, 2) => Stream::Transcript,
             (_, 3) => Stream::Effect,
             (_, 4) => Stream::Ctl,
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "stream", tag }),
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "stream",
+                    tag,
+                })
+            }
         })
     }
 
@@ -209,16 +229,32 @@ impl<'a> Reader<'a> {
                 (_, 0) => TaintKind::ChainBroken,
                 (_, 1) => TaintKind::GroupIncomplete,
                 (_, 2) => TaintKind::BarrierViolation,
-                (at, tag) => return Err(DecodeError::BadTag { at, what: "taint kind", tag }),
+                (at, tag) => {
+                    return Err(DecodeError::BadTag {
+                        at,
+                        what: "taint kind",
+                        tag,
+                    })
+                }
             }),
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "verdict", tag }),
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "verdict",
+                    tag,
+                })
+            }
         })
     }
 
     fn seal(&mut self) -> R<SealRecord> {
         Ok(SealRecord {
             parent: self.option(Self::hash)?,
-            cut: StreamCut { fs: self.lsn()?, db: self.lsn()?, transcript: self.lsn()? },
+            cut: StreamCut {
+                fs: self.lsn()?,
+                db: self.lsn()?,
+                transcript: self.lsn()?,
+            },
             layer: LayerRef::new(self.u64()?),
             verdict: self.verdict()?,
             ledger_pos: self.lsn()?,
@@ -229,7 +265,12 @@ impl<'a> Reader<'a> {
     fn group(&mut self) -> R<GroupRecord> {
         Ok(GroupRecord {
             gid: GroupId::new(self.u64()?),
-            members: self.seq(|r| Ok(Member { stream: r.stream()?, lsn: r.lsn()? }))?,
+            members: self.seq(|r| {
+                Ok(Member {
+                    stream: r.stream()?,
+                    lsn: r.lsn()?,
+                })
+            })?,
             depends_on: self.seq(|r| r.u64().map(GroupId::new))?,
             commit: self.bool()?,
         })
@@ -243,19 +284,41 @@ impl<'a> Reader<'a> {
         let dispatch = match self.tag()? {
             (_, 0) => Dispatch::Immediate,
             (_, 1) => Dispatch::Deferrable,
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "dispatch", tag }),
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "dispatch",
+                    tag,
+                })
+            }
         };
         let retry = match self.tag()? {
             (_, 0) => RetryPolicy::ProviderDeduplicated { key: self.bytes()? },
-            (_, 1) => RetryPolicy::Queryable { probe: self.bytes()? },
+            (_, 1) => RetryPolicy::Queryable {
+                probe: self.bytes()?,
+            },
             (_, 2) => RetryPolicy::UnsafeToRetry,
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "retry policy", tag }),
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "retry policy",
+                    tag,
+                })
+            }
         };
         let consequence = match self.tag()? {
             (_, 0) => Consequence::Irreversible,
-            (_, 1) => Consequence::Compensatable { by: OpId::new(self.u64()?) },
+            (_, 1) => Consequence::Compensatable {
+                by: OpId::new(self.u64()?),
+            },
             (_, 2) => Consequence::NoExternalMutation,
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "consequence", tag }),
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "consequence",
+                    tag,
+                })
+            }
         };
         Ok(IntentRecord {
             op,
@@ -277,7 +340,13 @@ impl<'a> Reader<'a> {
             (_, 2) => OutcomeState::OutcomeUnknown,
             (_, 3) => OutcomeState::ConfirmedApplied,
             (_, 4) => OutcomeState::ConfirmedNotApplied,
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "outcome state", tag }),
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "outcome state",
+                    tag,
+                })
+            }
         })
     }
 
@@ -295,11 +364,20 @@ impl<'a> Reader<'a> {
             transcript: self.lsn()?,
             effect: self.lsn()?,
             seal: self.option(|r| {
-                Ok(CheckpointSeal { lsn: r.lsn()?, hash: r.hash()?, turn: TurnId::new(r.u64()?), ledger_pos: r.lsn()? })
+                Ok(CheckpointSeal {
+                    lsn: r.lsn()?,
+                    hash: r.hash()?,
+                    turn: TurnId::new(r.u64()?),
+                    ledger_pos: r.lsn()?,
+                })
             })?,
             fs_shipped: self.option(Self::fs_shipped)?,
             open: self.seq(|r| {
-                Ok(OpenEffect { lsn: r.lsn()?, intent: r.intent()?, state: r.option(Self::outcome_state)? })
+                Ok(OpenEffect {
+                    lsn: r.lsn()?,
+                    intent: r.intent()?,
+                    state: r.option(Self::outcome_state)?,
+                })
             })?,
             next_op: self.u64()?,
         })
@@ -310,21 +388,43 @@ impl<'a> Reader<'a> {
     }
 
     fn parent_seal(&mut self) -> R<ParentSeal> {
-        Ok(ParentSeal { chronicle: self.chronicle()?, seal: self.lsn()?, seal_hash: self.hash()? })
+        Ok(ParentSeal {
+            chronicle: self.chronicle()?,
+            seal: self.lsn()?,
+            seal_hash: self.hash()?,
+        })
     }
 
     fn authority(&mut self) -> R<Authority> {
-        Ok(Authority { actor: self.string()?, reason: self.string()? })
+        Ok(Authority {
+            actor: self.string()?,
+            reason: self.string()?,
+        })
     }
 
     fn lineage(&mut self) -> R<LineageRecord> {
         let origin = match self.tag()? {
             (_, 0) => Origin::Void,
-            (_, 1) => Origin::Fork { parent: self.parent_seal()? },
-            (_, 2) => Origin::Succession { parent: self.parent_seal()?, authority: self.authority()? },
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "origin", tag }),
+            (_, 1) => Origin::Fork {
+                parent: self.parent_seal()?,
+            },
+            (_, 2) => Origin::Succession {
+                parent: self.parent_seal()?,
+                authority: self.authority()?,
+            },
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "origin",
+                    tag,
+                })
+            }
         };
-        Ok(LineageRecord { origin, namespace: self.namespace()?, ledger_pos: self.lsn()? })
+        Ok(LineageRecord {
+            origin,
+            namespace: self.namespace()?,
+            ledger_pos: self.lsn()?,
+        })
     }
 
     fn succession(&mut self) -> R<SuccessionRecord> {
@@ -338,15 +438,32 @@ impl<'a> Reader<'a> {
     }
 
     fn gap(&mut self) -> R<GapRecord> {
-        Ok(GapRecord { kept: self.lsn()?, kept_hash: self.hash()?, resumes: self.lsn()?, resumes_hash: self.hash()? })
+        Ok(GapRecord {
+            kept: self.lsn()?,
+            kept_hash: self.hash()?,
+            resumes: self.lsn()?,
+            resumes_hash: self.hash()?,
+        })
     }
 
     fn stream_base(&mut self) -> R<StreamBase> {
         Ok(match self.tag()? {
             (_, 0) => StreamBase::Full,
-            (_, 1) => StreamBase::Seal { lsn: self.lsn()?, hash: self.hash()? },
-            (_, 2) => StreamBase::Origin { parent: self.parent_seal()?, guid: self.u64()? },
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "stream base", tag }),
+            (_, 1) => StreamBase::Seal {
+                lsn: self.lsn()?,
+                hash: self.hash()?,
+            },
+            (_, 2) => StreamBase::Origin {
+                parent: self.parent_seal()?,
+                guid: self.u64()?,
+            },
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "stream base",
+                    tag,
+                })
+            }
         })
     }
 
@@ -373,7 +490,13 @@ impl<'a> Reader<'a> {
             (_, 7) => Payload::Gap(self.gap()?),
             (_, 8) => Payload::FsShipped(self.fs_shipped()?),
             (_, 9) => Payload::Checkpoint(Box::new(self.checkpoint()?)),
-            (at, tag) => return Err(DecodeError::BadTag { at, what: "payload", tag }),
+            (at, tag) => {
+                return Err(DecodeError::BadTag {
+                    at,
+                    what: "payload",
+                    tag,
+                })
+            }
         })
     }
 }
@@ -435,17 +558,28 @@ mod tests {
         ]
     }
     fn seal() -> impl Strategy<Value = Payload> {
-        (proptest::option::of(hash()), lsn(), lsn(), lsn(), any::<u64>(), verdict(), lsn(), any::<u64>())
-            .prop_map(|(parent, fs, db, transcript, layer, verdict, ledger_pos, turn)| {
-                Payload::Seal(SealRecord {
-                    parent,
-                    cut: StreamCut { fs, db, transcript },
-                    layer: LayerRef::new(layer),
-                    verdict,
-                    ledger_pos,
-                    turn: TurnId::new(turn),
-                })
-            })
+        (
+            proptest::option::of(hash()),
+            lsn(),
+            lsn(),
+            lsn(),
+            any::<u64>(),
+            verdict(),
+            lsn(),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(parent, fs, db, transcript, layer, verdict, ledger_pos, turn)| {
+                    Payload::Seal(SealRecord {
+                        parent,
+                        cut: StreamCut { fs, db, transcript },
+                        layer: LayerRef::new(layer),
+                        verdict,
+                        ledger_pos,
+                        turn: TurnId::new(turn),
+                    })
+                },
+            )
     }
     fn group() -> impl Strategy<Value = Payload> {
         (
@@ -457,7 +591,10 @@ mod tests {
             .prop_map(|(gid, members, deps, commit)| {
                 Payload::Group(GroupRecord {
                     gid: GroupId::new(gid),
-                    members: members.into_iter().map(|(stream, lsn)| Member { stream, lsn }).collect(),
+                    members: members
+                        .into_iter()
+                        .map(|(stream, lsn)| Member { stream, lsn })
+                        .collect(),
                     depends_on: deps.into_iter().map(GroupId::new).collect(),
                     commit,
                 })
@@ -476,20 +613,38 @@ mod tests {
             Just(Consequence::NoExternalMutation),
         ];
         let ids = (any::<u64>(), text(), blob());
-        (ids, blob(), dispatch, retry, consequence, blob(), proptest::option::of(any::<u64>()))
-            .prop_map(|((op, provider, request), footprint, dispatch, retry, consequence, authority, barrier)| {
-                Payload::Intent(IntentRecord {
-                    op: OpId::new(op),
-                    provider,
-                    request,
+        (
+            ids,
+            blob(),
+            dispatch,
+            retry,
+            consequence,
+            blob(),
+            proptest::option::of(any::<u64>()),
+        )
+            .prop_map(
+                |(
+                    (op, provider, request),
                     footprint,
                     dispatch,
                     retry,
                     consequence,
                     authority,
-                    barrier: barrier.map(BarrierId::new),
-                })
-            })
+                    barrier,
+                )| {
+                    Payload::Intent(IntentRecord {
+                        op: OpId::new(op),
+                        provider,
+                        request,
+                        footprint,
+                        dispatch,
+                        retry,
+                        consequence,
+                        authority,
+                        barrier: barrier.map(BarrierId::new),
+                    })
+                },
+            )
     }
     fn outcome() -> impl Strategy<Value = Payload> {
         let state = prop_oneof![
@@ -500,7 +655,11 @@ mod tests {
             Just(OutcomeState::ConfirmedNotApplied),
         ];
         (any::<u64>(), state, proptest::option::of(blob())).prop_map(|(op, state, evidence)| {
-            Payload::Outcome(OutcomeRecord { op: OpId::new(op), state, evidence })
+            Payload::Outcome(OutcomeRecord {
+                op: OpId::new(op),
+                state,
+                evidence,
+            })
         })
     }
     fn parent_seal() -> impl Strategy<Value = ParentSeal> {
@@ -517,15 +676,26 @@ mod tests {
         let origin = prop_oneof![
             Just(Origin::Void),
             parent_seal().prop_map(|parent| Origin::Fork { parent }),
-            (parent_seal(), authority()).prop_map(|(parent, authority)| Origin::Succession { parent, authority }),
+            (parent_seal(), authority())
+                .prop_map(|(parent, authority)| Origin::Succession { parent, authority }),
         ];
         (origin, any::<[u8; 16]>(), lsn()).prop_map(|(origin, ns, ledger_pos)| {
-            Payload::Lineage(LineageRecord { origin, namespace: Namespace::from_bytes(ns), ledger_pos })
+            Payload::Lineage(LineageRecord {
+                origin,
+                namespace: Namespace::from_bytes(ns),
+                ledger_pos,
+            })
         })
     }
     fn succession() -> impl Strategy<Value = Payload> {
-        (any::<[u8; 16]>(), any::<[u8; 16]>(), lsn(), hash(), authority()).prop_map(
-            |(c, ns, seal, seal_hash, authority)| {
+        (
+            any::<[u8; 16]>(),
+            any::<[u8; 16]>(),
+            lsn(),
+            hash(),
+            authority(),
+        )
+            .prop_map(|(c, ns, seal, seal_hash, authority)| {
                 Payload::Succession(SuccessionRecord {
                     successor: ChronicleId::from_bytes(c),
                     namespace: Namespace::from_bytes(ns),
@@ -533,23 +703,35 @@ mod tests {
                     seal_hash,
                     authority,
                 })
-            },
-        )
+            })
     }
     fn gap() -> impl Strategy<Value = Payload> {
         (lsn(), hash(), lsn(), hash()).prop_map(|(kept, kept_hash, resumes, resumes_hash)| {
-            Payload::Gap(GapRecord { kept, kept_hash, resumes, resumes_hash })
+            Payload::Gap(GapRecord {
+                kept,
+                kept_hash,
+                resumes,
+                resumes_hash,
+            })
         })
     }
     fn fs_shipped() -> impl Strategy<Value = Payload> {
         let base = prop_oneof![
             Just(StreamBase::Full),
             (lsn(), hash()).prop_map(|(lsn, hash)| StreamBase::Seal { lsn, hash }),
-            (parent_seal(), any::<u64>()).prop_map(|(parent, guid)| StreamBase::Origin { parent, guid }),
+            (parent_seal(), any::<u64>())
+                .prop_map(|(parent, guid)| StreamBase::Origin { parent, guid }),
         ];
         (lsn(), hash(), base, any::<u64>(), any::<u64>(), hash()).prop_map(
             |(seal, seal_hash, base, guid, bytes, digest)| {
-                Payload::FsShipped(FsShippedRecord { seal, seal_hash, base, guid, bytes, digest })
+                Payload::FsShipped(FsShippedRecord {
+                    seal,
+                    seal_hash,
+                    base,
+                    guid,
+                    bytes,
+                    digest,
+                })
             },
         )
     }
@@ -558,8 +740,15 @@ mod tests {
             Payload::Lineage(l) => l,
             _ => unreachable!(),
         });
-        let cseal = (lsn(), hash(), any::<u64>(), lsn())
-            .prop_map(|(lsn, hash, turn, ledger_pos)| CheckpointSeal { lsn, hash, turn: TurnId::new(turn), ledger_pos });
+        let cseal =
+            (lsn(), hash(), any::<u64>(), lsn()).prop_map(|(lsn, hash, turn, ledger_pos)| {
+                CheckpointSeal {
+                    lsn,
+                    hash,
+                    turn: TurnId::new(turn),
+                    ledger_pos,
+                }
+            });
         let fs = fs_shipped().prop_map(|p| match p {
             Payload::FsShipped(f) => f,
             _ => unreachable!(),
@@ -569,14 +758,33 @@ mod tests {
             Just(OutcomeState::DispatchAuthorized),
             Just(OutcomeState::OutcomeUnknown),
         ];
-        let open = (lsn(), intent(), proptest::option::of(state)).prop_map(|(lsn, i, state)| match i {
-            Payload::Intent(intent) => OpenEffect { lsn, intent, state },
-            _ => unreachable!(),
-        });
-        (lineage, lsn(), lsn(), proptest::option::of(cseal), proptest::option::of(fs), proptest::collection::vec(open, 0..3), any::<u64>())
-            .prop_map(|(lineage, transcript, effect, seal, fs_shipped, open, next_op)| {
-                Payload::Checkpoint(Box::new(CheckpointRecord { lineage, transcript, effect, seal, fs_shipped, open, next_op }))
-            })
+        let open =
+            (lsn(), intent(), proptest::option::of(state)).prop_map(|(lsn, i, state)| match i {
+                Payload::Intent(intent) => OpenEffect { lsn, intent, state },
+                _ => unreachable!(),
+            });
+        (
+            lineage,
+            lsn(),
+            lsn(),
+            proptest::option::of(cseal),
+            proptest::option::of(fs),
+            proptest::collection::vec(open, 0..3),
+            any::<u64>(),
+        )
+            .prop_map(
+                |(lineage, transcript, effect, seal, fs_shipped, open, next_op)| {
+                    Payload::Checkpoint(Box::new(CheckpointRecord {
+                        lineage,
+                        transcript,
+                        effect,
+                        seal,
+                        fs_shipped,
+                        open,
+                        next_op,
+                    }))
+                },
+            )
     }
     fn payload() -> impl Strategy<Value = Payload> {
         prop_oneof![
@@ -656,9 +864,16 @@ mod tests {
     fn unknown_payload_tag() {
         assert_eq!(
             Payload::decode(&[10]),
-            Err(DecodeError::BadTag { at: 0, what: "payload", tag: 10 })
+            Err(DecodeError::BadTag {
+                at: 0,
+                what: "payload",
+                tag: 10
+            })
         );
-        assert_eq!(Payload::decode(&[]), Err(DecodeError::Truncated { at: 0, need: 1 }));
+        assert_eq!(
+            Payload::decode(&[]),
+            Err(DecodeError::Truncated { at: 0, need: 1 })
+        );
     }
 
     #[test]
@@ -671,7 +886,10 @@ mod tests {
         })
         .canon_bytes();
         *bytes.last_mut().unwrap() = 2;
-        assert!(matches!(Payload::decode(&bytes), Err(DecodeError::BadTag { what: "bool", .. })));
+        assert!(matches!(
+            Payload::decode(&bytes),
+            Err(DecodeError::BadTag { what: "bool", .. })
+        ));
     }
 
     #[test]
@@ -681,13 +899,19 @@ mod tests {
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert_eq!(
             Payload::decode(&bytes),
-            Err(DecodeError::Truncated { at: 9, need: u64::MAX })
+            Err(DecodeError::Truncated {
+                at: 9,
+                need: u64::MAX
+            })
         );
         // Group claiming u64::MAX members.
         let mut bytes = vec![1];
         bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        assert!(matches!(Payload::decode(&bytes), Err(DecodeError::Truncated { .. })));
+        assert!(matches!(
+            Payload::decode(&bytes),
+            Err(DecodeError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -699,7 +923,10 @@ mod tests {
                     seal: Lsn::new(1),
                     seal_hash: HashVal::GENESIS,
                 },
-                authority: Authority { actor: "ab".into(), reason: String::new() },
+                authority: Authority {
+                    actor: "ab".into(),
+                    reason: String::new(),
+                },
             },
             namespace: Namespace::from_bytes([0; 16]),
             ledger_pos: Lsn::new(0),
@@ -708,7 +935,10 @@ mod tests {
         // tag(1) + origin tag(1) + parent(16+8+32) + actor len(8) = 66: "ab" starts there.
         assert_eq!(&bytes[66..68], b"ab");
         bytes[66] = 0xFF;
-        assert_eq!(Payload::decode(&bytes), Err(DecodeError::BadUtf8 { at: 66 }));
+        assert_eq!(
+            Payload::decode(&bytes),
+            Err(DecodeError::BadUtf8 { at: 66 })
+        );
     }
 
     #[test]

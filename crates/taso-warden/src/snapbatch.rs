@@ -47,7 +47,9 @@ use std::sync::{mpsc, Mutex};
 
 use taso_core::envelope::{HashVal, Lsn};
 
-use crate::zfs::{parse_line_for, Dataset, Runner, Snapshot, ZfsError, LIST_COLUMNS, SEAL_PROPERTY};
+use crate::zfs::{
+    parse_line_for, Dataset, Runner, Snapshot, ZfsError, LIST_COLUMNS, SEAL_PROPERTY,
+};
 
 /// The channel program.  Arguments: pairs of (snapshot name, seal hash).
 /// Returns a table: snapshot name → `{err, guid, txg}`; `guid` and `txg`
@@ -127,7 +129,12 @@ impl SnapBatch {
         hash: HashVal,
     ) -> Result<Snapshot, ZfsError> {
         let (answer, rx) = mpsc::channel();
-        let job = Job { dataset: dataset.clone(), seal, hash, answer };
+        let job = Job {
+            dataset: dataset.clone(),
+            seal,
+            hash,
+            answer,
+        };
         let lead = {
             let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.jobs.push(job);
@@ -137,7 +144,9 @@ impl SnapBatch {
             self.lead(runner);
         }
         rx.recv().unwrap_or_else(|_| {
-            Err(ZfsError::Spawn("the snapshot batch leader is gone".to_string()))
+            Err(ZfsError::Spawn(
+                "the snapshot batch leader is gone".to_string(),
+            ))
         })
     }
 
@@ -166,14 +175,18 @@ impl SnapBatch {
                 }
                 // One Seal per dataset per batch; the rest wait.
                 let mut seen = BTreeSet::new();
-                let (now, later): (Vec<Job>, Vec<Job>) =
-                    std::mem::take(&mut q.jobs).into_iter().partition(|j| seen.insert(j.dataset.as_str().to_string()));
+                let (now, later): (Vec<Job>, Vec<Job>) = std::mem::take(&mut q.jobs)
+                    .into_iter()
+                    .partition(|j| seen.insert(j.dataset.as_str().to_string()));
                 q.jobs = later;
                 now
             };
             let mut by_pool: BTreeMap<String, Vec<Job>> = BTreeMap::new();
             for job in jobs {
-                by_pool.entry(job.dataset.pool().to_string()).or_default().push(job);
+                by_pool
+                    .entry(job.dataset.pool().to_string())
+                    .or_default()
+                    .push(job);
             }
             for (pool, jobs) in by_pool {
                 self.run(runner, &pool, jobs);
@@ -184,12 +197,18 @@ impl SnapBatch {
     /// One channel program for `jobs` (all in `pool`), one list, answers.
     fn run(&self, runner: &dyn Runner, pool: &str, jobs: Vec<Job>) {
         #[cfg(test)]
-        self.programs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.programs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let names: Vec<String> = jobs.iter().map(Job::name).collect();
 
         let program = {
             let _t = crate::timing::span("zfs.program");
-            let mut args = vec!["program".to_string(), "-j".to_string(), pool.to_string(), "-".to_string()];
+            let mut args = vec![
+                "program".to_string(),
+                "-j".to_string(),
+                pool.to_string(),
+                "-".to_string(),
+            ];
             for (job, name) in jobs.iter().zip(&names) {
                 args.push(name.clone());
                 args.push(job.hash.to_string());
@@ -204,8 +223,10 @@ impl SnapBatch {
         };
         let listed = names.iter().any(needs_list).then(|| {
             let _t = crate::timing::span("zfs.batch_list");
-            let mut args: Vec<String> =
-                ["list", "-H", "-p", "-t", "snapshot", "-o", LIST_COLUMNS].iter().map(|s| s.to_string()).collect();
+            let mut args: Vec<String> = ["list", "-H", "-p", "-t", "snapshot", "-o", LIST_COLUMNS]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
             args.extend(names.iter().filter(|n| needs_list(n)).cloned());
             // Missing names make `zfs list` exit non-zero but it still
             // prints the others: read stdout whatever the status.
@@ -234,7 +255,11 @@ type Report = BTreeMap<String, Entry>;
 fn run_program(runner: &dyn Runner, args: Vec<String>) -> Result<Report, ZfsError> {
     let out = runner.run_input(&args, &mut Cursor::new(PROGRAM.as_bytes()))?;
     if !out.success {
-        return Err(ZfsError::Exit { args, code: out.code, stderr: out.stderr });
+        return Err(ZfsError::Exit {
+            args,
+            code: out.code,
+            stderr: out.stderr,
+        });
     }
     parse_report(&out.stdout)
 }
@@ -243,14 +268,24 @@ fn run_program(runner: &dyn Runner, args: Vec<String>) -> Result<Report, ZfsErro
 /// "txg": t}, ...}}`.  ZFS's Lua integers are 64-bit signed, so a guid
 /// above `i64::MAX` arrives negative; it is read back as the same bits.
 pub(crate) fn parse_report(stdout: &str) -> Result<Report, ZfsError> {
-    let bad = |why| ZfsError::Parse { line: stdout.trim().to_string(), why };
-    let v: serde_json::Value = serde_json::from_str(stdout).map_err(|_| bad("zfs program output is not JSON"))?;
-    let table = v.get("return").and_then(|r| r.as_object()).ok_or_else(|| bad("no return table"))?;
+    let bad = |why| ZfsError::Parse {
+        line: stdout.trim().to_string(),
+        why,
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(stdout).map_err(|_| bad("zfs program output is not JSON"))?;
+    let table = v
+        .get("return")
+        .and_then(|r| r.as_object())
+        .ok_or_else(|| bad("no return table"))?;
     let int = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64));
     table
         .iter()
         .map(|(k, v)| {
-            let err = v.get("err").and_then(|e| e.as_i64()).ok_or_else(|| bad("an entry has no integer err"))?;
+            let err = v
+                .get("err")
+                .and_then(|e| e.as_i64())
+                .ok_or_else(|| bad("an entry has no integer err"))?;
             let made = match (v.get("guid").and_then(int), v.get("txg").and_then(int)) {
                 (Some(g), Some(t)) if err == 0 => Some((g, t)),
                 _ => None,
@@ -270,16 +305,35 @@ fn decide(
     let entry = program.as_ref().ok().and_then(|r| r.get(name).copied());
     match entry {
         Some(Entry { err: EEXIST, .. }) => return Err(ZfsError::AlreadyExists(name.to_string())),
-        Some(Entry { err: 0, made: Some((guid, createtxg)) }) => {
-            return Ok(Snapshot { dataset: job.dataset.clone(), seal: job.seal, createtxg, guid, seal_hash: Some(job.hash) })
+        Some(Entry {
+            err: 0,
+            made: Some((guid, createtxg)),
+        }) => {
+            return Ok(Snapshot {
+                dataset: job.dataset.clone(),
+                seal: job.seal,
+                createtxg,
+                guid,
+                seal_hash: Some(job.hash),
+            })
         }
-        Some(Entry { err, .. }) if err != 0 => return Err(ZfsError::Channel { name: name.to_string(), errno: err }),
+        Some(Entry { err, .. }) if err != 0 => {
+            return Err(ZfsError::Channel {
+                name: name.to_string(),
+                errno: err,
+            })
+        }
         _ => {}
     }
     // Unknown: the list decides.
     let stdout = match listed {
         Some(l) => l.as_ref().map_err(Clone::clone)?,
-        None => return Err(ZfsError::Parse { line: name.to_string(), why: "no list for an unknown snapshot" }),
+        None => {
+            return Err(ZfsError::Parse {
+                line: name.to_string(),
+                why: "no list for an unknown snapshot",
+            })
+        }
     };
     // The list names only the batch's snapshots, one per dataset, so the
     // line of this job's dataset is this job's snapshot.
@@ -294,7 +348,10 @@ fn decide(
         Some(_) => Err(ZfsError::SealMismatch(name.to_string())),
         None => Err(match program {
             Err(e) => e.clone(),
-            Ok(_) => ZfsError::Parse { line: name.to_string(), why: "zfs program did not report this snapshot" },
+            Ok(_) => ZfsError::Parse {
+                line: name.to_string(),
+                why: "zfs program did not report this snapshot",
+            },
         }),
     }
 }
@@ -321,10 +378,30 @@ mod tests {
                 "p/c@taso-seal-3": {"err": 0}, "p/d@taso-seal-4": {"err": 5, "guid": 1, "txg": 1}}}"#,
         )
         .unwrap();
-        assert_eq!(r["p/a@taso-seal-1"], Entry { err: 0, made: Some((u64::MAX - 1, 7)) });
-        assert_eq!(r["p/b@taso-seal-2"], Entry { err: 17, made: None });
-        assert_eq!(r["p/c@taso-seal-3"], Entry { err: 0, made: None }, "no values: unknown");
-        assert_eq!(r["p/d@taso-seal-4"], Entry { err: 5, made: None }, "values only count with err 0");
+        assert_eq!(
+            r["p/a@taso-seal-1"],
+            Entry {
+                err: 0,
+                made: Some((u64::MAX - 1, 7))
+            }
+        );
+        assert_eq!(
+            r["p/b@taso-seal-2"],
+            Entry {
+                err: 17,
+                made: None
+            }
+        );
+        assert_eq!(
+            r["p/c@taso-seal-3"],
+            Entry { err: 0, made: None },
+            "no values: unknown"
+        );
+        assert_eq!(
+            r["p/d@taso-seal-4"],
+            Entry { err: 5, made: None },
+            "values only count with err 0"
+        );
         assert!(parse_report("Channel program fully executed").is_err());
         assert!(parse_report(r#"{"return": {"x": "zero"}}"#).is_err());
         assert!(parse_report(r#"{"return": {"x": {"guid": 1}}}"#).is_err());
@@ -356,14 +433,18 @@ mod tests {
     impl Runner for FakeZfs {
         fn run(&self, args: &[String]) -> Result<Output, ZfsError> {
             self.calls.lock().unwrap().push(args.to_vec());
-            assert_eq!(&args[..7], &["list", "-H", "-p", "-t", "snapshot", "-o", LIST_COLUMNS]);
+            assert_eq!(
+                &args[..7],
+                &["list", "-H", "-p", "-t", "snapshot", "-o", LIST_COLUMNS]
+            );
             let snaps = self.snaps.lock().unwrap();
             let mut stdout = String::new();
             let mut missing = false;
             for name in &args[7..] {
                 match snaps.get(name) {
                     Some((txg, guid, b)) => {
-                        stdout += &format!("{name}\t{txg}\t{guid}\t{}\n", b.as_deref().unwrap_or("-"))
+                        stdout +=
+                            &format!("{name}\t{txg}\t{guid}\t{}\n", b.as_deref().unwrap_or("-"))
                     }
                     None => missing = true,
                 }
@@ -372,7 +453,11 @@ mod tests {
                 success: !missing,
                 code: Some(i32::from(missing)),
                 stdout,
-                stderr: if missing { "dataset does not exist".into() } else { String::new() },
+                stderr: if missing {
+                    "dataset does not exist".into()
+                } else {
+                    String::new()
+                },
             })
         }
 
@@ -388,16 +473,27 @@ mod tests {
             let txg = self.txg.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 100;
             let bind_fails = self.bind_fails.lock().unwrap().take();
             let binds_wrong = self.binds_wrong.lock().unwrap().take();
-            let no_props = self.no_props.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let no_props = self
+                .no_props
+                .swap(false, std::sync::atomic::Ordering::Relaxed);
             let dies_after = self.dies_after.lock().unwrap().pop_front().flatten();
             let mut snaps = self.snaps.lock().unwrap();
             let mut report = serde_json::Map::new();
             for (i, pair) in args[4..].chunks(2).enumerate() {
                 if dies_after == Some(i) {
-                    return Ok(Output { success: false, code: Some(1), stdout: String::new(), stderr: "out of instructions".into() });
+                    return Ok(Output {
+                        success: false,
+                        code: Some(1),
+                        stdout: String::new(),
+                        stderr: "out of instructions".into(),
+                    });
                 }
                 let (name, hash) = (&pair[0], &pair[1]);
-                assert!(name.starts_with(&format!("{}/", args[2])), "{name} is not in pool {}", args[2]);
+                assert!(
+                    name.starts_with(&format!("{}/", args[2])),
+                    "{name} is not in pool {}",
+                    args[2]
+                );
                 let entry = if snaps.contains_key(name) {
                     serde_json::json!({ "err": EEXIST })
                 } else if let Some(e) = bind_fails {
@@ -406,7 +502,10 @@ mod tests {
                     // Above i64::MAX, as real guids often are: Lua prints
                     // it as a negative integer.
                     let guid = 0xF000_0000_0000_0000 + snaps.len() as u64;
-                    snaps.insert(name.clone(), (txg, guid, Some(binds_wrong.clone().unwrap_or(hash.clone()))));
+                    snaps.insert(
+                        name.clone(),
+                        (txg, guid, Some(binds_wrong.clone().unwrap_or(hash.clone()))),
+                    );
                     if no_props {
                         serde_json::json!({ "err": 0 })
                     } else {
@@ -441,12 +540,25 @@ mod tests {
         let fake = FakeZfs::default();
         let zfs = driver(&fake);
         let s = zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)).unwrap();
-        assert_eq!((s.seal, s.seal_hash, s.createtxg), (Lsn::new(3), Some(h(3)), 100));
+        assert_eq!(
+            (s.seal, s.seal_hash, s.createtxg),
+            (Lsn::new(3), Some(h(3)), 100)
+        );
         assert_eq!(s.dataset, ds("p/v1"));
-        assert_eq!(s.guid, fake.snaps.lock().unwrap()[&s.name()].1, "a guid above i64::MAX survives");
+        assert_eq!(
+            s.guid,
+            fake.snaps.lock().unwrap()[&s.name()].1,
+            "a guid above i64::MAX survives"
+        );
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "one program, no list: {calls:?}");
-        assert_eq!(&calls[0][4..], &["p/v1@taso-seal-00000000000000000003".to_string(), h(3).to_string()]);
+        assert_eq!(
+            &calls[0][4..],
+            &[
+                "p/v1@taso-seal-00000000000000000003".to_string(),
+                h(3).to_string()
+            ]
+        );
     }
 
     #[test]
@@ -454,7 +566,10 @@ mod tests {
         let fake = FakeZfs::default();
         let zfs = driver(&fake);
         zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)).unwrap();
-        assert!(matches!(zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)), Err(ZfsError::AlreadyExists(_))));
+        assert!(matches!(
+            zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)),
+            Err(ZfsError::AlreadyExists(_))
+        ));
     }
 
     #[test]
@@ -463,7 +578,13 @@ mod tests {
         *fake.bind_fails.lock().unwrap() = Some(1);
         let zfs = driver(&fake);
         let e = zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)).unwrap_err();
-        assert_eq!(e, ZfsError::Channel { name: "p/v1@taso-seal-00000000000000000003".into(), errno: 1001 });
+        assert_eq!(
+            e,
+            ZfsError::Channel {
+                name: "p/v1@taso-seal-00000000000000000003".into(),
+                errno: 1001
+            }
+        );
         assert!(fake.snaps.lock().unwrap().is_empty());
         // And the next one works.
         zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)).unwrap();
@@ -472,20 +593,30 @@ mod tests {
     #[test]
     fn a_snapshot_bound_to_another_seal_is_a_mismatch() {
         let fake = FakeZfs::default();
-        fake.snaps.lock().unwrap().insert("p/v1@taso-seal-00000000000000000003".into(), (1, 2, Some(h(9).to_string())));
+        fake.snaps.lock().unwrap().insert(
+            "p/v1@taso-seal-00000000000000000003".into(),
+            (1, 2, Some(h(9).to_string())),
+        );
         // The program reports EEXIST for it: AlreadyExists, as for one.
         let zfs = driver(&fake);
-        assert!(matches!(zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)), Err(ZfsError::AlreadyExists(_))));
+        assert!(matches!(
+            zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)),
+            Err(ZfsError::AlreadyExists(_))
+        ));
     }
 
     /// No values reported: the list decides, and finds the snapshot.
     #[test]
     fn an_unknown_snapshot_is_listed() {
         let fake = FakeZfs::default();
-        fake.no_props.store(true, std::sync::atomic::Ordering::Relaxed);
+        fake.no_props
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let zfs = driver(&fake);
         let s = zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)).unwrap();
-        assert_eq!((s.seal_hash, s.guid), (Some(h(3)), fake.snaps.lock().unwrap()[&s.name()].1));
+        assert_eq!(
+            (s.seal_hash, s.guid),
+            (Some(h(3)), fake.snaps.lock().unwrap()[&s.name()].1)
+        );
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls.len(), 2, "program, then list: {calls:?}");
         assert_eq!(&calls[1][7..], &[s.name()]);
@@ -495,12 +626,15 @@ mod tests {
     #[test]
     fn a_wrong_binding_is_a_mismatch() {
         let fake = FakeZfs::default();
-        fake.no_props.store(true, std::sync::atomic::Ordering::Relaxed);
+        fake.no_props
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         *fake.binds_wrong.lock().unwrap() = Some(h(9).to_string());
         let zfs = driver(&fake);
         assert_eq!(
             zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)),
-            Err(ZfsError::SealMismatch("p/v1@taso-seal-00000000000000000003".into()))
+            Err(ZfsError::SealMismatch(
+                "p/v1@taso-seal-00000000000000000003".into()
+            ))
         );
     }
 
@@ -576,7 +710,9 @@ mod tests {
                 s.spawn(move || {
                     start.wait();
                     for t in 1..=TURNS {
-                        let snap = zfs.snapshot(&ds(&format!("p/v{v}")), Lsn::new(t), h(v)).unwrap();
+                        let snap = zfs
+                            .snapshot(&ds(&format!("p/v{v}")), Lsn::new(t), h(v))
+                            .unwrap();
                         assert_eq!((snap.seal, snap.seal_hash), (Lsn::new(t), Some(h(v))));
                     }
                 });
@@ -590,12 +726,30 @@ mod tests {
             }
         });
         assert_eq!(fake.snaps.lock().unwrap().len(), seals);
-        let programs = zfs.batch().unwrap().programs.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(programs < seals, "{programs} programs for {seals} Seals: nothing was batched");
-        for call in fake.calls.lock().unwrap().iter().filter(|c| c[0] == "program") {
+        let programs = zfs
+            .batch()
+            .unwrap()
+            .programs
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            programs < seals,
+            "{programs} programs for {seals} Seals: nothing was batched"
+        );
+        for call in fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c[0] == "program")
+        {
             let names: Vec<&String> = call[4..].iter().step_by(2).collect();
-            let datasets: BTreeSet<&str> = names.iter().map(|n| n.split('@').next().unwrap()).collect();
-            assert_eq!(datasets.len(), names.len(), "a dataset twice in one program: {call:?}");
+            let datasets: BTreeSet<&str> =
+                names.iter().map(|n| n.split('@').next().unwrap()).collect();
+            assert_eq!(
+                datasets.len(),
+                names.len(),
+                "a dataset twice in one program: {call:?}"
+            );
         }
     }
 
@@ -632,8 +786,14 @@ mod tests {
                 t.join().unwrap().unwrap();
             }
         });
-        let programs: Vec<Vec<String>> =
-            fake.calls.lock().unwrap().iter().filter(|c| c[0] == "program").cloned().collect();
+        let programs: Vec<Vec<String>> = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c[0] == "program")
+            .cloned()
+            .collect();
         assert_eq!(programs.len(), 3, "{programs:?}");
         assert_eq!(programs[1][2], "p");
         assert_eq!(programs[1].len(), 6);
@@ -674,7 +834,13 @@ mod tests {
                 t.join().unwrap().unwrap();
             }
         });
-        let programs = fake.calls.lock().unwrap().iter().filter(|c| c[0] == "program").count();
+        let programs = fake
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c[0] == "program")
+            .count();
         assert_eq!(programs, 3);
     }
 
@@ -699,7 +865,8 @@ mod tests {
         }
         let fake = FakeZfs::default();
         let (release, gate) = mpsc::channel();
-        let zfs = Zfs::with_runner(Panics(fake.clone(), Arc::new(Mutex::new(Some(gate))))).batched();
+        let zfs =
+            Zfs::with_runner(Panics(fake.clone(), Arc::new(Mutex::new(Some(gate))))).batched();
         std::thread::scope(|s| {
             let leader = {
                 let zfs = Clone::clone(&zfs);
@@ -727,7 +894,10 @@ mod tests {
             }
             release.send(()).unwrap();
             assert!(leader.join().unwrap().is_err(), "the leader panicked");
-            assert!(queued_one.join().unwrap().is_err(), "queued behind the panic: answered with an error");
+            assert!(
+                queued_one.join().unwrap().is_err(),
+                "queued behind the panic: answered with an error"
+            );
         });
         zfs.snapshot(&ds("p/c"), Lsn::new(1), h(3)).unwrap();
     }

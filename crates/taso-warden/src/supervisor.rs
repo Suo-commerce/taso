@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::daemon::{Node, Report, Stop, VesselConf, DaemonError};
+use crate::daemon::{DaemonError, Node, Report, Stop, VesselConf};
 use crate::source::{Guard, Refused, SourceError, VesselKey, VesselSource};
 
 /// How one Vessel's run is done; [`Node`] does it for real.
@@ -129,7 +129,9 @@ impl Timing {
     /// The delay before restart number `n` in a row (1 = the first).
     fn backoff(&self, n: u32) -> Duration {
         let factor = 1u32.checked_shl(n.saturating_sub(1)).unwrap_or(u32::MAX);
-        self.backoff_first.saturating_mul(factor).min(self.backoff_max)
+        self.backoff_first
+            .saturating_mul(factor)
+            .min(self.backoff_max)
     }
 }
 
@@ -148,7 +150,12 @@ enum State<O> {
     /// A restart waits until then.
     Waiting(Instant),
     /// A run is going.
-    Running { handle: JoinHandle<O>, stop: Stop, since: Instant, vc: VesselConf },
+    Running {
+        handle: JoinHandle<O>,
+        stop: Stop,
+        since: Instant,
+        vc: VesselConf,
+    },
     /// Ran and is not restarted (its policy, or stopped on purpose).
     Done,
 }
@@ -168,12 +175,24 @@ impl<R: RunVessel> Supervisor<R> {
     /// A supervisor running Vessels with `runner`, checking every set with
     /// `guard`.
     pub fn new(runner: Arc<R>, guard: Guard, timing: Timing) -> Self {
-        Self { runner, guard, timing, vessels: BTreeMap::new(), wanted: BTreeMap::new(), answered: false }
+        Self {
+            runner,
+            guard,
+            timing,
+            vessels: BTreeMap::new(),
+            wanted: BTreeMap::new(),
+            answered: false,
+        }
     }
 
     /// Run until a finite source is done, or `shutdown` is requested (see
     /// the module docs).  Every event goes to `on_event` as it happens.
-    pub fn run(&mut self, source: &mut dyn VesselSource, shutdown: &Stop, mut on_event: impl FnMut(Event<R::Out>)) {
+    pub fn run(
+        &mut self,
+        source: &mut dyn VesselSource,
+        shutdown: &Stop,
+        mut on_event: impl FnMut(Event<R::Out>),
+    ) {
         loop {
             if shutdown.requested() {
                 self.wanted.clear();
@@ -185,7 +204,11 @@ impl<R: RunVessel> Supervisor<R> {
                         for r in admitted.refused {
                             on_event(Event::Refused(r));
                         }
-                        self.wanted = admitted.set.into_iter().map(|vc| (*vc.id().as_bytes(), vc)).collect();
+                        self.wanted = admitted
+                            .set
+                            .into_iter()
+                            .map(|vc| (*vc.id().as_bytes(), vc))
+                            .collect();
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -200,8 +223,16 @@ impl<R: RunVessel> Supervisor<R> {
             self.reap(&mut on_event);
             self.converge(&mut on_event);
 
-            let idle = self.vessels.values().all(|s| matches!(s.state, State::Done));
-            if shutdown.requested() && self.vessels.values().all(|s| !matches!(s.state, State::Running { .. })) {
+            let idle = self
+                .vessels
+                .values()
+                .all(|s| matches!(s.state, State::Done));
+            if shutdown.requested()
+                && self
+                    .vessels
+                    .values()
+                    .all(|s| !matches!(s.state, State::Running { .. }))
+            {
                 return;
             }
             if source.is_finite() && self.answered && idle {
@@ -219,11 +250,18 @@ impl<R: RunVessel> Supervisor<R> {
     fn reap(&mut self, on_event: &mut impl FnMut(Event<R::Out>)) {
         let now = Instant::now();
         for (key, slot) in self.vessels.iter_mut() {
-            let finished = matches!(&slot.state, State::Running { handle, .. } if handle.is_finished());
+            let finished =
+                matches!(&slot.state, State::Running { handle, .. } if handle.is_finished());
             if !finished {
                 continue;
             }
-            let State::Running { handle, since, vc, stop } = std::mem::replace(&mut slot.state, State::Done) else {
+            let State::Running {
+                handle,
+                since,
+                vc,
+                stop,
+            } = std::mem::replace(&mut slot.state, State::Done)
+            else {
                 unreachable!()
             };
             if now.duration_since(since) >= self.timing.healthy {
@@ -250,7 +288,12 @@ impl<R: RunVessel> Supervisor<R> {
                 None => State::Done,
             };
             match out {
-                Some(out) => on_event(Event::Exited { vc, out, stopped, restart_in }),
+                Some(out) => on_event(Event::Exited {
+                    vc,
+                    out,
+                    stopped,
+                    restart_in,
+                }),
                 None => on_event(Event::Panicked { vc, restart_in }),
             }
         }
@@ -276,7 +319,11 @@ impl<R: RunVessel> Supervisor<R> {
             }
         });
         for (key, vc) in &self.wanted {
-            let slot = self.vessels.entry(*key).or_insert_with(|| Slot { vc: vc.clone(), state: State::Ready, streak: 0 });
+            let slot = self.vessels.entry(*key).or_insert_with(|| Slot {
+                vc: vc.clone(),
+                state: State::Ready,
+                streak: 0,
+            });
             // The latest good entry is used at the next start.
             slot.vc = vc.clone();
             let due = match &slot.state {
@@ -294,7 +341,12 @@ impl<R: RunVessel> Supervisor<R> {
                 std::thread::spawn(move || runner.run(&run_vc, &stop))
             };
             on_event(Event::Started(run_vc.clone()));
-            slot.state = State::Running { handle, stop, since: now, vc: run_vc };
+            slot.state = State::Running {
+                handle,
+                stop,
+                since: now,
+                vc: run_vc,
+            };
         }
     }
 }
@@ -322,7 +374,14 @@ mod tests {
     }
 
     fn vc(subject: &str, slot: u32, restart: Restart) -> VesselConf {
-        VesselConf { namespace: Namespace::from_bytes([7; 16]), subject: subject.into(), takeover: None, uid_slot: slot, restart, runtime: None }
+        VesselConf {
+            namespace: Namespace::from_bytes([7; 16]),
+            subject: subject.into(),
+            takeover: None,
+            uid_slot: slot,
+            restart,
+            runtime: None,
+        }
     }
 
     fn timing() -> Timing {
@@ -365,12 +424,21 @@ mod tests {
         fn with(script: &[(&str, &[Act])]) -> Arc<Self> {
             let f = Fake::default();
             for (s, acts) in script {
-                f.script.lock().unwrap().insert(s.to_string(), acts.iter().copied().collect());
+                f.script
+                    .lock()
+                    .unwrap()
+                    .insert(s.to_string(), acts.iter().copied().collect());
             }
             Arc::new(f)
         }
         fn runs_of(&self, s: &str) -> Vec<(Restart, Instant, Instant, bool)> {
-            self.runs.lock().unwrap().iter().filter(|r| r.0 == s).map(|r| (r.1, r.2, r.3, r.4)).collect()
+            self.runs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == s)
+                .map(|r| (r.1, r.2, r.3, r.4))
+                .collect()
         }
     }
 
@@ -386,10 +454,22 @@ mod tests {
                 }
             }
             let start = Instant::now();
-            let act = self.script.lock().unwrap().get_mut(&vc.subject).and_then(|q| q.pop_front()).unwrap_or(Act::UntilStop);
+            let act = self
+                .script
+                .lock()
+                .unwrap()
+                .get_mut(&vc.subject)
+                .and_then(|q| q.pop_front())
+                .unwrap_or(Act::UntilStop);
             let leave = |stopped: bool| {
                 *self.live.lock().unwrap().get_mut(&vc.subject).unwrap() -= 1;
-                self.runs.lock().unwrap().push((vc.subject.clone(), vc.restart, start, Instant::now(), stopped));
+                self.runs.lock().unwrap().push((
+                    vc.subject.clone(),
+                    vc.restart,
+                    start,
+                    Instant::now(),
+                    stopped,
+                ));
             };
             match act {
                 Act::Exit(ok) => {
@@ -484,7 +564,12 @@ mod tests {
     fn simple(e: Event<(Option<bool>, bool)>) -> E {
         match e {
             Event::Started(v) => E::Started(v.subject),
-            Event::Exited { vc, stopped, restart_in, .. } => E::Exited(vc.subject, stopped, restart_in.is_some()),
+            Event::Exited {
+                vc,
+                stopped,
+                restart_in,
+                ..
+            } => E::Exited(vc.subject, stopped, restart_in.is_some()),
             Event::Panicked { vc, restart_in } => E::Panicked(vc.subject, restart_in.is_some()),
             Event::Stopping(v) => E::Stopping(v.subject),
             Event::Refused(r) => E::Refused(r.subject),
@@ -499,10 +584,16 @@ mod tests {
     /// Run the supervisor on its own thread with a Live source; returns the
     /// source, the shutdown and the events so far.
     fn spawn_live(f: &Arc<Fake>) -> (Live, Stop, Arc<Mutex<Vec<E>>>, JoinHandle<()>) {
-        let (live, shutdown, events) = (Live::default(), Stop::new(), Arc::new(Mutex::new(Vec::new())));
+        let (live, shutdown, events) = (
+            Live::default(),
+            Stop::new(),
+            Arc::new(Mutex::new(Vec::new())),
+        );
         let h = {
             let (mut src, sd, ev, f) = (live.clone(), shutdown.clone(), events.clone(), f.clone());
-            std::thread::spawn(move || supervisor(&f).run(&mut src, &sd, |e| ev.lock().unwrap().push(simple(e))))
+            std::thread::spawn(move || {
+                supervisor(&f).run(&mut src, &sd, |e| ev.lock().unwrap().push(simple(e)))
+            })
         };
         (live, shutdown, events, h)
     }
@@ -519,14 +610,27 @@ mod tests {
 
     #[test]
     fn a_finite_source_runs_each_vessel_once_and_returns() {
-        let f = Fake::with(&[("a", &[Act::Exit(Some(true))]), ("b", &[Act::Exit(Some(false))])]);
-        let mut src = Scripted { steps: [Ok(Some(vec![vc("a", 0, Restart::Never), vc("b", 1, Restart::Never)]))].into(), finite: true };
+        let f = Fake::with(&[
+            ("a", &[Act::Exit(Some(true))]),
+            ("b", &[Act::Exit(Some(false))]),
+        ]);
+        let mut src = Scripted {
+            steps: [Ok(Some(vec![
+                vc("a", 0, Restart::Never),
+                vc("b", 1, Restart::Never),
+            ]))]
+            .into(),
+            finite: true,
+        };
         let mut ev = Vec::new();
         supervisor(&f).run(&mut src, &Stop::new(), |e| ev.push(simple(e)));
         assert_eq!(f.runs_of("a").len(), 1);
         assert_eq!(f.runs_of("b").len(), 1);
         assert!(ev.contains(&E::Exited("a".into(), false, false)));
-        assert!(ev.contains(&E::Exited("b".into(), false, false)), "never: a failure is not restarted");
+        assert!(
+            ev.contains(&E::Exited("b".into(), false, false)),
+            "never: a failure is not restarted"
+        );
     }
 
     #[test]
@@ -534,7 +638,10 @@ mod tests {
         // First poll: unchanged (no answer yet); then the set.  The loop must
         // not take "nothing runs" before the first answer as "done".
         let f = Fake::with(&[("a", &[Act::Exit(Some(true))])]);
-        let mut src = Scripted { steps: [Ok(None), Ok(Some(vec![vc("a", 0, Restart::Never)]))].into(), finite: true };
+        let mut src = Scripted {
+            steps: [Ok(None), Ok(Some(vec![vc("a", 0, Restart::Never)]))].into(),
+            finite: true,
+        };
         supervisor(&f).run(&mut src, &Stop::new(), |_| {});
         assert_eq!(f.runs_of("a").len(), 1);
     }
@@ -545,17 +652,27 @@ mod tests {
     fn on_failure_restarts_until_ok_with_growing_backoff() {
         let fail = Act::Exit(Some(false));
         let f = Fake::with(&[("a", &[fail, Act::Exit(None), fail, Act::Exit(Some(true))])]);
-        let mut src = Scripted { steps: [Ok(Some(vec![vc("a", 0, Restart::OnFailure)]))].into(), finite: true };
+        let mut src = Scripted {
+            steps: [Ok(Some(vec![vc("a", 0, Restart::OnFailure)]))].into(),
+            finite: true,
+        };
         let mut ev = Vec::new();
         supervisor(&f).run(&mut src, &Stop::new(), |e| ev.push(simple(e)));
         let runs = f.runs_of("a");
         assert_eq!(runs.len(), 4, "failed, never ran, failed, ok");
         // Gaps between runs grow: 5, 10, 20 ms (backoff_first doubling).
-        let gaps: Vec<Duration> = runs.windows(2).map(|w| w[1].1.duration_since(w[0].2)).collect();
+        let gaps: Vec<Duration> = runs
+            .windows(2)
+            .map(|w| w[1].1.duration_since(w[0].2))
+            .collect();
         for (gap, at_least) in gaps.iter().zip([5u64, 10, 20]) {
             assert!(*gap >= Duration::from_millis(at_least), "{gaps:?}");
         }
-        assert_eq!(ev.last(), Some(&E::Exited("a".into(), false, false)), "ok: no restart");
+        assert_eq!(
+            ev.last(),
+            Some(&E::Exited("a".into(), false, false)),
+            "ok: no restart"
+        );
     }
 
     /// The restart delays the supervisor announces: doubling while runs are
@@ -563,13 +680,30 @@ mod tests {
     #[test]
     fn a_healthy_run_resets_the_backoff() {
         let fail = Act::Exit(Some(false));
-        for (healthy, want) in [(Duration::from_secs(60), [5u64, 10, 20]), (Duration::ZERO, [5, 5, 5])] {
+        for (healthy, want) in [
+            (Duration::from_secs(60), [5u64, 10, 20]),
+            (Duration::ZERO, [5, 5, 5]),
+        ] {
             let f = Fake::with(&[("a", &[fail, fail, fail, Act::Exit(Some(true))])]);
-            let mut src = Scripted { steps: [Ok(Some(vec![vc("a", 0, Restart::OnFailure)]))].into(), finite: true };
+            let mut src = Scripted {
+                steps: [Ok(Some(vec![vc("a", 0, Restart::OnFailure)]))].into(),
+                finite: true,
+            };
             let mut delays = Vec::new();
-            let mut sup = Supervisor::new(f.clone(), Guard::new(runtime()), Timing { healthy, ..timing() });
+            let mut sup = Supervisor::new(
+                f.clone(),
+                Guard::new(runtime()),
+                Timing {
+                    healthy,
+                    ..timing()
+                },
+            );
             sup.run(&mut src, &Stop::new(), |e| {
-                if let Event::Exited { restart_in: Some(d), .. } = e {
+                if let Event::Exited {
+                    restart_in: Some(d),
+                    ..
+                } = e
+                {
                     delays.push(d.as_millis() as u64);
                 }
             });
@@ -591,11 +725,17 @@ mod tests {
         let f = Fake::with(&[("a", &[ok, ok, Act::UntilStop])]);
         let (live, shutdown, events, h) = spawn_live(&f);
         live.push(Ok(Some(vec![vc("a", 0, Restart::Always)])));
-        wait_for("a third run", || f.live.lock().unwrap().get("a") == Some(&1) && f.runs_of("a").len() == 2);
+        wait_for("a third run", || {
+            f.live.lock().unwrap().get("a") == Some(&1) && f.runs_of("a").len() == 2
+        });
         live.push(Ok(Some(vec![])));
         wait_for("the stop", || f.runs_of("a").len() == 3);
         std::thread::sleep(Duration::from_millis(60)); // longer than any backoff
-        assert_eq!(f.runs_of("a").len(), 3, "a Vessel stopped on purpose is not restarted");
+        assert_eq!(
+            f.runs_of("a").len(),
+            3,
+            "a Vessel stopped on purpose is not restarted"
+        );
         assert!(f.runs_of("a")[2].3, "the third run ended on its stop");
         shutdown.request();
         h.join().unwrap();
@@ -616,10 +756,15 @@ mod tests {
         wait_for("a to run", || f.live.lock().unwrap().get("a") == Some(&1));
         live.push(Ok(Some(vec![])));
         live.push(Ok(Some(vec![vc("a", 0, Restart::Never)])));
-        wait_for("a second run", || f.runs_of("a").len() == 1 && f.live.lock().unwrap().get("a") == Some(&1));
+        wait_for("a second run", || {
+            f.runs_of("a").len() == 1 && f.live.lock().unwrap().get("a") == Some(&1)
+        });
         shutdown.request();
         h.join().unwrap();
-        assert!(!*f.overlap.lock().unwrap(), "two runs of one Vessel overlapped");
+        assert!(
+            !*f.overlap.lock().unwrap(),
+            "two runs of one Vessel overlapped"
+        );
         assert_eq!(f.runs_of("a").len(), 2);
     }
 
@@ -634,14 +779,26 @@ mod tests {
         for _ in 0..20 {
             live.push(Err("api server unreachable".into()));
         }
-        wait_for("the failures to be read", || live.0.lock().unwrap().is_empty());
+        wait_for("the failures to be read", || {
+            live.0.lock().unwrap().is_empty()
+        });
         assert_eq!(f.live.lock().unwrap().get("a"), Some(&1), "a still runs");
         assert!(f.runs_of("a").is_empty(), "a was not stopped");
         live.push(Ok(Some(vec![vc("b", 1, Restart::Never)])));
-        wait_for("b to run and a to stop", || f.live.lock().unwrap().get("b") == Some(&1) && f.runs_of("a").len() == 1);
+        wait_for("b to run and a to stop", || {
+            f.live.lock().unwrap().get("b") == Some(&1) && f.runs_of("a").len() == 1
+        });
         shutdown.request();
         h.join().unwrap();
-        assert!(events.lock().unwrap().iter().filter(|e| **e == E::SourceFailed).count() >= 20);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == E::SourceFailed)
+                .count()
+                >= 20
+        );
     }
 
     /// A run that ends while the source fails is not restarted until the
@@ -661,7 +818,9 @@ mod tests {
         let h = {
             let (f, sd) = (f.clone(), shutdown.clone());
             std::thread::spawn(move || {
-                wait_for("the second run", || f.live.lock().unwrap().get("a") == Some(&1) && f.runs_of("a").len() == 1);
+                wait_for("the second run", || {
+                    f.live.lock().unwrap().get("a") == Some(&1) && f.runs_of("a").len() == 1
+                });
                 sd.request();
             })
         };
@@ -671,7 +830,10 @@ mod tests {
         let runs = f.runs_of("a");
         assert_eq!(runs.len(), 2);
         // 30 failing polls at a 2 ms tick each passed before the restart.
-        assert!(runs[1].1.duration_since(started_at) >= Duration::from_millis(30 * 2), "restarted while the source failed");
+        assert!(
+            runs[1].1.duration_since(started_at) >= Duration::from_millis(30 * 2),
+            "restarted while the source failed"
+        );
     }
 
     /// A run that ends by itself after its stop was requested still counts
@@ -690,7 +852,10 @@ mod tests {
         h.join().unwrap();
         assert!(!f.runs_of("a")[0].3, "the run itself did not see the stop");
         let ev = events.lock().unwrap();
-        assert!(ev.contains(&E::Exited("a".into(), true, false)), "stopped, no restart: {ev:?}");
+        assert!(
+            ev.contains(&E::Exited("a".into(), true, false)),
+            "stopped, no restart: {ev:?}"
+        );
         assert_eq!(f.runs_of("a").len(), 1);
     }
 
@@ -698,9 +863,19 @@ mod tests {
 
     #[test]
     fn refused_entries_are_reported_and_never_run() {
-        let f = Fake::with(&[("a", &[Act::Exit(Some(true))]), ("b", &[Act::Exit(Some(true))])]);
+        let f = Fake::with(&[
+            ("a", &[Act::Exit(Some(true))]),
+            ("b", &[Act::Exit(Some(true))]),
+        ]);
         // b takes a's slot: refused.
-        let mut src = Scripted { steps: [Ok(Some(vec![vc("a", 3, Restart::Never), vc("b", 3, Restart::Never)]))].into(), finite: true };
+        let mut src = Scripted {
+            steps: [Ok(Some(vec![
+                vc("a", 3, Restart::Never),
+                vc("b", 3, Restart::Never),
+            ]))]
+            .into(),
+            finite: true,
+        };
         let mut ev = Vec::new();
         supervisor(&f).run(&mut src, &Stop::new(), |e| ev.push(simple(e)));
         let refused: Vec<&E> = ev.iter().filter(|e| matches!(e, E::Refused(_))).collect();
@@ -724,7 +899,11 @@ mod tests {
         h.join().unwrap();
         let runs = f.runs_of("a");
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].0, Restart::Never, "the running agent kept the entry it started with");
+        assert_eq!(
+            runs[0].0,
+            Restart::Never,
+            "the running agent kept the entry it started with"
+        );
     }
 
     /// The entry a Vessel starts with is its latest good one: a policy
@@ -737,12 +916,24 @@ mod tests {
         wait_for("a to run", || f.live.lock().unwrap().get("a") == Some(&1));
         // During the run: never -> always.  Under "never" an ok exit would end it.
         live.push(Ok(Some(vec![vc("a", 0, Restart::Always)])));
-        wait_for("a second run", || f.runs_of("a").len() == 1 && f.live.lock().unwrap().get("a") == Some(&1));
+        wait_for("a second run", || {
+            f.runs_of("a").len() == 1 && f.live.lock().unwrap().get("a") == Some(&1)
+        });
         shutdown.request();
         h.join().unwrap();
         let runs = f.runs_of("a");
-        assert_eq!((runs[0].0, runs[1].0), (Restart::Never, Restart::Always), "each run used the entry current at its start");
-        assert!(events.lock().unwrap().contains(&E::Exited("a".into(), false, true)), "the ok exit restarted under the new policy");
+        assert_eq!(
+            (runs[0].0, runs[1].0),
+            (Restart::Never, Restart::Always),
+            "each run used the entry current at its start"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&E::Exited("a".into(), false, true)),
+            "the ok exit restarted under the new policy"
+        );
     }
 
     // ── shutdown and panics ─────────────────────────────────────────
@@ -751,25 +942,47 @@ mod tests {
     fn shutdown_stops_every_vessel_and_waits_for_each() {
         let f = Fake::with(&[("a", &[Act::UntilStop]), ("b", &[Act::UntilStop])]);
         let (live, shutdown, _events, h) = spawn_live(&f);
-        live.push(Ok(Some(vec![vc("a", 0, Restart::Always), vc("b", 1, Restart::Always)])));
-        wait_for("both to run", || f.live.lock().unwrap().values().sum::<u32>() == 2);
+        live.push(Ok(Some(vec![
+            vc("a", 0, Restart::Always),
+            vc("b", 1, Restart::Always),
+        ])));
+        wait_for("both to run", || {
+            f.live.lock().unwrap().values().sum::<u32>() == 2
+        });
         shutdown.request();
         h.join().unwrap();
-        assert_eq!(f.live.lock().unwrap().values().sum::<u32>(), 0, "nothing runs after return");
-        assert!(f.runs_of("a")[0].3 && f.runs_of("b")[0].3, "both ended on their stop, none restarted");
+        assert_eq!(
+            f.live.lock().unwrap().values().sum::<u32>(),
+            0,
+            "nothing runs after return"
+        );
+        assert!(
+            f.runs_of("a")[0].3 && f.runs_of("b")[0].3,
+            "both ended on their stop, none restarted"
+        );
         assert_eq!(f.runs.lock().unwrap().len(), 2);
     }
 
     #[test]
     fn a_panicking_run_is_reported_and_counts_as_never_ran() {
-        let f = Fake::with(&[("a", &[Act::Panic, Act::Exit(Some(true))]), ("b", &[Act::Panic])]);
+        let f = Fake::with(&[
+            ("a", &[Act::Panic, Act::Exit(Some(true))]),
+            ("b", &[Act::Panic]),
+        ]);
         let mut src = Scripted {
-            steps: [Ok(Some(vec![vc("a", 0, Restart::OnFailure), vc("b", 1, Restart::Never)]))].into(),
+            steps: [Ok(Some(vec![
+                vc("a", 0, Restart::OnFailure),
+                vc("b", 1, Restart::Never),
+            ]))]
+            .into(),
             finite: true,
         };
         let mut ev = Vec::new();
         supervisor(&f).run(&mut src, &Stop::new(), |e| ev.push(simple(e)));
-        assert!(ev.contains(&E::Panicked("a".into(), true)), "on-failure restarts after a panic: {ev:?}");
+        assert!(
+            ev.contains(&E::Panicked("a".into(), true)),
+            "on-failure restarts after a panic: {ev:?}"
+        );
         assert!(ev.contains(&E::Panicked("b".into(), false)));
         assert_eq!(f.runs_of("a").len(), 2);
         assert_eq!(f.runs_of("b").len(), 1);

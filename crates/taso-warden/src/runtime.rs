@@ -60,20 +60,55 @@ pub const ID_RANGE: u32 = 65536;
 /// Syscalls refused with `EPERM`.
 pub const DENIED_SYSCALLS: &[&str] = &[
     // namespaces and mounts
-    "mount", "umount2", "pivot_root", "chroot", "unshare", "setns", "mount_setattr", "move_mount",
-    "open_tree", "fsopen", "fsconfig", "fsmount", "fspick",
+    "mount",
+    "umount2",
+    "pivot_root",
+    "chroot",
+    "unshare",
+    "setns",
+    "mount_setattr",
+    "move_mount",
+    "open_tree",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "fspick",
     // kernel modules, kexec, BPF, perf
-    "init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load", "bpf",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "kexec_load",
+    "kexec_file_load",
+    "bpf",
     "perf_event_open",
     // other processes' memory
-    "ptrace", "process_vm_readv", "process_vm_writev", "kcmp",
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    "kcmp",
     // kernel keyring
-    "keyctl", "add_key", "request_key",
+    "keyctl",
+    "add_key",
+    "request_key",
     // host-wide state
-    "reboot", "swapon", "swapoff", "settimeofday", "clock_settime", "clock_adjtime", "adjtimex",
-    "acct", "quotactl", "syslog", "vhangup", "iopl", "ioperm",
+    "reboot",
+    "swapon",
+    "swapoff",
+    "settimeofday",
+    "clock_settime",
+    "clock_adjtime",
+    "adjtimex",
+    "acct",
+    "quotactl",
+    "syslog",
+    "vhangup",
+    "iopl",
+    "ioperm",
     // handles that escape mounts, fault handling across processes
-    "open_by_handle_at", "name_to_handle_at", "userfaultfd", "lookup_dcookie",
+    "open_by_handle_at",
+    "name_to_handle_at",
+    "userfaultfd",
+    "lookup_dcookie",
 ];
 
 /// Everything needed to run one Vessel.
@@ -136,7 +171,10 @@ const RESERVED_ENV: &[&str] = &["PATH", "HOME", "TASO_FIELD"];
 pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
     let id_ok = !spec.id.is_empty()
         && spec.id.len() <= 128
-        && spec.id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        && spec
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
     if !id_ok {
         return Err(SpecError::BadId(spec.id.clone()));
     }
@@ -293,7 +331,10 @@ pub fn prepare_work_dir(work: &Path, host_uid_base: u32) -> io::Result<()> {
     if !m.file_type().is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} is not a directory (a symlink is not accepted)", work.display()),
+            format!(
+                "{} is not a directory (a symlink is not accepted)",
+                work.display()
+            ),
         ));
     }
     let (uid, gid) = (m.uid(), m.gid());
@@ -386,7 +427,10 @@ pub struct RuncCli {
 impl RuncCli {
     /// `runc` on `PATH`, keeping container state in `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { program: PathBuf::from("runc"), root: root.into() }
+        Self {
+            program: PathBuf::from("runc"),
+            root: root.into(),
+        }
     }
 }
 
@@ -397,7 +441,10 @@ impl RuncRunner for RuncCli {
         // first, as runc would (0700), so an empty root is just empty.
         {
             use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&self.root)?;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.root)?;
         }
         let out = Command::new(&self.program)
             .arg("--root")
@@ -439,7 +486,11 @@ impl<R: RuncRunner> Runc<R> {
         if ok {
             Ok(out)
         } else {
-            Err(io::Error::other(format!("runc {}: {}", args.join(" "), err.trim())))
+            Err(io::Error::other(format!(
+                "runc {}: {}",
+                args.join(" "),
+                err.trim()
+            )))
         }
     }
 
@@ -447,13 +498,16 @@ impl<R: RuncRunner> Runc<R> {
     /// it exited successfully and what runc and the agent printed on
     /// stderr (the reason, when it did not).  Used for one-shot Vessels.
     pub fn run(&self, bundle: &Path, id: &str) -> io::Result<(bool, String)> {
-        let (ok, _, err) = self.runner.run(&s(&["run", "--bundle", &bundle.to_string_lossy(), id]))?;
+        let (ok, _, err) =
+            self.runner
+                .run(&s(&["run", "--bundle", &bundle.to_string_lossy(), id]))?;
         Ok((ok, err))
     }
 
     /// Create the container (not started).
     pub fn create(&self, bundle: &Path, id: &str) -> io::Result<()> {
-        self.ok(s(&["create", "--bundle", &bundle.to_string_lossy(), id])).map(|_| ())
+        self.ok(s(&["create", "--bundle", &bundle.to_string_lossy(), id]))
+            .map(|_| ())
     }
 
     /// Start a created container.
@@ -482,7 +536,8 @@ impl<R: RuncRunner> Runc<R> {
     /// sweep must not miss a container because its entry was odd.
     pub fn list(&self) -> io::Result<Vec<(String, Status)>> {
         let out = self.ok(s(&["list", "--format", "json"]))?;
-        let bad = |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("runc list: {why}"));
+        let bad =
+            |why: String| io::Error::new(io::ErrorKind::InvalidData, format!("runc list: {why}"));
         let v: Value = if out.trim().is_empty() {
             Value::Null
         } else {
@@ -496,8 +551,13 @@ impl<R: RuncRunner> Runc<R> {
         entries
             .iter()
             .map(|e| {
-                let id = e["id"].as_str().ok_or_else(|| bad(format!("entry without an id: {e}")))?;
-                Ok((id.to_string(), Status::parse(e["status"].as_str().unwrap_or(""))))
+                let id = e["id"]
+                    .as_str()
+                    .ok_or_else(|| bad(format!("entry without an id: {e}")))?;
+                Ok((
+                    id.to_string(),
+                    Status::parse(e["status"].as_str().unwrap_or("")),
+                ))
             })
             .collect()
     }
@@ -552,32 +612,59 @@ mod tests {
     }
 
     fn mount<'a>(c: &'a Value, dest: &str) -> &'a Value {
-        c["mounts"].as_array().unwrap().iter().find(|m| m["destination"] == dest).unwrap()
+        c["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["destination"] == dest)
+            .unwrap()
     }
 
     #[test]
     fn isolation_rules_are_in_the_config() {
         let c = oci_config(&spec()).unwrap();
         // User namespace with an unprivileged range.
-        let ns: Vec<&str> = c["linux"]["namespaces"].as_array().unwrap().iter().map(|n| n["type"].as_str().unwrap()).collect();
+        let ns: Vec<&str> = c["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap())
+            .collect();
         for want in ["user", "network", "pid", "mount", "ipc", "uts", "cgroup"] {
             assert!(ns.contains(&want), "namespace {want}");
         }
         assert_eq!(c["linux"]["uidMappings"][0]["hostID"], 200_000);
         assert_eq!(c["linux"]["uidMappings"][0]["size"], ID_RANGE);
         // A new network namespace with no path: empty, not the host's.
-        let net = c["linux"]["namespaces"].as_array().unwrap().iter().find(|n| n["type"] == "network").unwrap();
+        let net = c["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "network")
+            .unwrap();
         assert!(net.get("path").is_none());
         // No capabilities, no new privileges.
-        for set in ["bounding", "effective", "inheritable", "permitted", "ambient"] {
+        for set in [
+            "bounding",
+            "effective",
+            "inheritable",
+            "permitted",
+            "ambient",
+        ] {
             assert_eq!(c["process"]["capabilities"][set], json!([]), "{set}");
         }
         assert_eq!(c["process"]["noNewPrivileges"], true);
         // Read-only root; writable only /work and /tmp; the socket bound in.
         assert_eq!(c["root"]["readonly"], true);
         assert_eq!(mount(&c, WORK_DIR)["source"], "/tasotest/vessel/v-ab12cd34");
-        assert!(mount(&c, WORK_DIR)["options"].as_array().unwrap().contains(&json!("nosuid")));
-        assert_eq!(mount(&c, FIELD_SOCKET)["source"], "/run/taso/v/ab12cd34.sock");
+        assert!(mount(&c, WORK_DIR)["options"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("nosuid")));
+        assert_eq!(
+            mount(&c, FIELD_SOCKET)["source"],
+            "/run/taso/v/ab12cd34.sock"
+        );
         assert_eq!(c["process"]["cwd"], WORK_DIR);
         // Resources.
         assert_eq!(c["linux"]["resources"]["pids"]["limit"], 512);
@@ -593,22 +680,41 @@ mod tests {
             .iter()
             .map(|n| n.as_str().unwrap())
             .collect();
-        for must in ["mount", "unshare", "setns", "ptrace", "bpf", "init_module", "keyctl", "open_by_handle_at"] {
+        for must in [
+            "mount",
+            "unshare",
+            "setns",
+            "ptrace",
+            "bpf",
+            "init_module",
+            "keyctl",
+            "open_by_handle_at",
+        ] {
             assert!(names.contains(&must), "{must}");
         }
-        assert_eq!(c["linux"]["seccomp"]["syscalls"][0]["action"], "SCMP_ACT_ERRNO");
+        assert_eq!(
+            c["linux"]["seccomp"]["syscalls"][0]["action"],
+            "SCMP_ACT_ERRNO"
+        );
     }
 
     #[test]
     fn environment_is_only_what_the_spec_says() {
         // Built only from the spec: nothing from the Warden's environment.
         let c = oci_config(&spec()).unwrap();
-        let env: Vec<&str> = c["process"]["env"].as_array().unwrap().iter().map(|e| e.as_str().unwrap()).collect();
+        let env: Vec<&str> = c["process"]["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect();
         assert_eq!(env.len(), 4);
         assert!(env.contains(&"TASO_FIELD=/run/taso/field.sock"));
         assert!(env.contains(&"HOME=/work"));
         assert!(env.contains(&"HERMES_MODE=agent"));
-        assert!(!env.iter().any(|e| e.starts_with("UPCLOUD_TOKEN") || e.starts_with("AWS_")));
+        assert!(!env
+            .iter()
+            .any(|e| e.starts_with("UPCLOUD_TOKEN") || e.starts_with("AWS_")));
     }
 
     #[test]
@@ -616,23 +722,46 @@ mod tests {
         let mut sp = spec();
         sp.landlock_shim = Some("/usr/lib/taso/landlock".into());
         let c = oci_config(&sp).unwrap();
-        assert_eq!(c["process"]["args"], json!(["/usr/lib/taso/landlock", "--", "/usr/bin/hermes", "--serve"]));
+        assert_eq!(
+            c["process"]["args"],
+            json!(["/usr/lib/taso/landlock", "--", "/usr/bin/hermes", "--serve"])
+        );
     }
 
     #[test]
     fn invalid_specs_are_refused() {
         type Case = (Box<dyn Fn(&mut VesselSpec)>, fn(&SpecError) -> bool);
         let cases: Vec<Case> = vec![
-            (Box::new(|s| s.id = "../x".into()), |e| matches!(e, SpecError::BadId(_))),
-            (Box::new(|s| s.id = String::new()), |e| matches!(e, SpecError::BadId(_))),
-            (Box::new(|s| s.work = "relative".into()), |e| matches!(e, SpecError::NotAbsolute(_))),
-            (Box::new(|s| s.args.clear()), |e| matches!(e, SpecError::NoArgs)),
-            (Box::new(|s| s.host_uid_base = 0), |e| matches!(e, SpecError::BadUidRange(_))),
-            (Box::new(|s| s.host_uid_base = u32::MAX - 10), |e| matches!(e, SpecError::BadUidRange(_))),
-            (Box::new(|s| s.env = vec!["PATH=/evil".into()]), |e| matches!(e, SpecError::BadEnv(_))),
-            (Box::new(|s| s.env = vec!["TASO_FIELD=/x".into()]), |e| matches!(e, SpecError::BadEnv(_))),
-            (Box::new(|s| s.env = vec!["NOEQUALS".into()]), |e| matches!(e, SpecError::BadEnv(_))),
-            (Box::new(|s| s.env = vec!["BAD-KEY=1".into()]), |e| matches!(e, SpecError::BadEnv(_))),
+            (Box::new(|s| s.id = "../x".into()), |e| {
+                matches!(e, SpecError::BadId(_))
+            }),
+            (Box::new(|s| s.id = String::new()), |e| {
+                matches!(e, SpecError::BadId(_))
+            }),
+            (Box::new(|s| s.work = "relative".into()), |e| {
+                matches!(e, SpecError::NotAbsolute(_))
+            }),
+            (Box::new(|s| s.args.clear()), |e| {
+                matches!(e, SpecError::NoArgs)
+            }),
+            (Box::new(|s| s.host_uid_base = 0), |e| {
+                matches!(e, SpecError::BadUidRange(_))
+            }),
+            (Box::new(|s| s.host_uid_base = u32::MAX - 10), |e| {
+                matches!(e, SpecError::BadUidRange(_))
+            }),
+            (Box::new(|s| s.env = vec!["PATH=/evil".into()]), |e| {
+                matches!(e, SpecError::BadEnv(_))
+            }),
+            (Box::new(|s| s.env = vec!["TASO_FIELD=/x".into()]), |e| {
+                matches!(e, SpecError::BadEnv(_))
+            }),
+            (Box::new(|s| s.env = vec!["NOEQUALS".into()]), |e| {
+                matches!(e, SpecError::BadEnv(_))
+            }),
+            (Box::new(|s| s.env = vec!["BAD-KEY=1".into()]), |e| {
+                matches!(e, SpecError::BadEnv(_))
+            }),
         ];
         for (i, (mutate, is)) in cases.into_iter().enumerate() {
             let mut sp = spec();
@@ -651,7 +780,10 @@ mod tests {
         for d in REQUIRED_DIRS {
             std::fs::create_dir_all(dir.path().join(d)).unwrap();
         }
-        assert_eq!(check_rootfs(dir.path()), vec!["/run/taso/field.sock".to_string()]);
+        assert_eq!(
+            check_rootfs(dir.path()),
+            vec!["/run/taso/field.sock".to_string()]
+        );
         std::fs::write(dir.path().join("run/taso/field.sock"), b"").unwrap();
         assert!(check_rootfs(dir.path()).is_empty());
     }
@@ -681,13 +813,21 @@ mod tests {
 
     fn fake(replies: &[(bool, &str, &str)]) -> Runc<Fake> {
         let f = Fake::default();
-        *f.replies.borrow_mut() = replies.iter().map(|(a, b, c)| (*a, b.to_string(), c.to_string())).collect();
+        *f.replies.borrow_mut() = replies
+            .iter()
+            .map(|(a, b, c)| (*a, b.to_string(), c.to_string()))
+            .collect();
         Runc::new(f)
     }
 
     #[test]
     fn driver_builds_exact_arguments() {
-        let r = fake(&[(true, "", ""), (true, "", ""), (true, "", ""), (true, "", "")]);
+        let r = fake(&[
+            (true, "", ""),
+            (true, "", ""),
+            (true, "", ""),
+            (true, "", ""),
+        ]);
         r.create(Path::new("/b"), "v1").unwrap();
         r.start("v1").unwrap();
         r.kill("v1").unwrap();
@@ -706,7 +846,11 @@ mod tests {
     #[test]
     fn state_parses_and_unknown_is_none() {
         let r = fake(&[
-            (true, r#"{"ociVersion":"1.2.0","id":"v1","pid":42,"status":"running"}"#, ""),
+            (
+                true,
+                r#"{"ociVersion":"1.2.0","id":"v1","pid":42,"status":"running"}"#,
+                "",
+            ),
             (false, "", "container does not exist"),
             (false, "", "permission denied"),
         ]);
@@ -718,32 +862,59 @@ mod tests {
     #[test]
     fn list_parses_entries_and_empty_roots() {
         let r = fake(&[
-            (true, r#"[{"id":"a","status":"running","pid":7},{"id":"b","status":"stopped"}]"#, ""),
+            (
+                true,
+                r#"[{"id":"a","status":"running","pid":7},{"id":"b","status":"stopped"}]"#,
+                "",
+            ),
             (true, "null\n", ""),
             (true, "", ""),
             (true, "[]", ""),
         ]);
-        assert_eq!(r.list().unwrap(), vec![("a".into(), Status::Running), ("b".into(), Status::Stopped)]);
+        assert_eq!(
+            r.list().unwrap(),
+            vec![("a".into(), Status::Running), ("b".into(), Status::Stopped)]
+        );
         assert_eq!(r.list().unwrap(), vec![]);
         assert_eq!(r.list().unwrap(), vec![]);
         assert_eq!(r.list().unwrap(), vec![]);
-        assert_eq!(*r.runner.calls.borrow(), vec![s(&["list", "--format", "json"]); 4]);
+        assert_eq!(
+            *r.runner.calls.borrow(),
+            vec![s(&["list", "--format", "json"]); 4]
+        );
     }
 
     #[test]
     fn list_refuses_what_it_cannot_read() {
-        for out in [r#"[{"status":"running"}]"#, r#"[{"id":7}]"#, r#"{"id":"a"}"#, "not json"] {
+        for out in [
+            r#"[{"status":"running"}]"#,
+            r#"[{"id":7}]"#,
+            r#"{"id":"a"}"#,
+            "not json",
+        ] {
             let r = fake(&[(true, out, "")]);
-            assert_eq!(r.list().unwrap_err().kind(), io::ErrorKind::InvalidData, "{out}");
+            assert_eq!(
+                r.list().unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{out}"
+            );
         }
         let r = fake(&[(false, "", "permission denied")]);
-        assert!(r.list().unwrap_err().to_string().contains("permission denied"));
+        assert!(r
+            .list()
+            .unwrap_err()
+            .to_string()
+            .contains("permission denied"));
     }
 
     #[test]
     fn sweep_deletes_every_container_and_reports_failures() {
         let r = fake(&[
-            (true, r#"[{"id":"a","status":"running"},{"id":"b","status":"created"},{"id":"c","status":"stopped"}]"#, ""),
+            (
+                true,
+                r#"[{"id":"a","status":"running"},{"id":"b","status":"created"},{"id":"c","status":"stopped"}]"#,
+                "",
+            ),
             (true, "", ""),
             (false, "", "device busy"),
             (true, "", ""),
@@ -776,11 +947,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("a/runc");
-        let cli = RuncCli { program: "true".into(), root: root.clone() };
+        let cli = RuncCli {
+            program: "true".into(),
+            root: root.clone(),
+        };
         let (ok, _, _) = cli.run(&s(&["list"])).unwrap();
         assert!(ok);
         assert!(root.is_dir());
-        assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         // An existing root is left as it is.
         cli.run(&s(&["list"])).unwrap();
     }
@@ -819,9 +996,17 @@ mod tests {
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
         let e = prepare_work_dir(dir.path(), 200_000).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
-        assert!(e.to_string().contains("not by this Vessel's range (200000)"), "{e}");
+        assert!(
+            e.to_string()
+                .contains("not by this Vessel's range (200000)"),
+            "{e}"
+        );
         assert_eq!(owner(dir.path()), before, "owner unchanged");
-        assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode(), mode, "mode unchanged");
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode(),
+            mode,
+            "mode unchanged"
+        );
     }
 
     #[test]
@@ -829,10 +1014,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f");
         std::fs::write(&file, b"").unwrap();
-        assert_eq!(prepare_work_dir(&file, 200_000).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            prepare_work_dir(&file, 200_000).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         let link = dir.path().join("l");
         std::os::unix::fs::symlink(dir.path(), &link).unwrap();
-        assert_eq!(prepare_work_dir(&link, 200_000).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            prepare_work_dir(&link, 200_000).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
         assert!(prepare_work_dir(&dir.path().join("missing"), 200_000).is_err());
     }
 
@@ -848,21 +1039,42 @@ mod tests {
         std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
         prepare_work_dir(dir.path(), 200_000).unwrap();
         assert_eq!(owner(dir.path()), (200_000, 200_000));
-        assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777, 0o750);
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
         prepare_work_dir(dir.path(), 200_000).unwrap();
-        assert_eq!(owner(dir.path()), (200_000, 200_000), "prepared again: unchanged");
+        assert_eq!(
+            owner(dir.path()),
+            (200_000, 200_000),
+            "prepared again: unchanged"
+        );
         // The next slot's range, as after a slot change: refused.
-        assert_eq!(prepare_work_dir(dir.path(), 200_000 + 65_536).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            prepare_work_dir(dir.path(), 200_000 + 65_536)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
         // Half ours.
         std::os::unix::fs::chown(dir.path(), Some(200_000), Some(0)).unwrap();
-        assert_eq!(prepare_work_dir(dir.path(), 200_000).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            prepare_work_dir(dir.path(), 200_000).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
         std::os::unix::fs::chown(dir.path(), Some(0), Some(200_000)).unwrap();
-        assert_eq!(prepare_work_dir(dir.path(), 200_000).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            prepare_work_dir(dir.path(), 200_000).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
     fn missing_runc_says_so() {
-        let cli = RuncCli { program: "/nonexistent/runc".into(), root: "/tmp".into() };
+        let cli = RuncCli {
+            program: "/nonexistent/runc".into(),
+            root: "/tmp".into(),
+        };
         let e = Runc::new(cli).start("v1").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
         assert!(e.to_string().contains("is runc installed?"), "{e}");
@@ -956,21 +1168,47 @@ while read l; do echo "$l"; done < /proc/self/status > /work/status
             let out = std::fs::read_to_string(work.join("out")).unwrap();
             println!("out:\n{out}");
             assert!(out.contains("work-ok"));
-            assert!(out.contains("root-ro"), "the root filesystem must be read-only");
+            assert!(
+                out.contains("root-ro"),
+                "the root filesystem must be read-only"
+            );
             assert!(out.contains("sock-ok"), "the Field socket must be bound in");
 
             let net = std::fs::read_to_string(work.join("net")).unwrap();
-            let ifaces: Vec<&str> = net.lines().skip(2).filter_map(|l| l.split(':').next()).map(str::trim).collect();
+            let ifaces: Vec<&str> = net
+                .lines()
+                .skip(2)
+                .filter_map(|l| l.split(':').next())
+                .map(str::trim)
+                .collect();
             println!("interfaces: {ifaces:?}");
-            assert_eq!(ifaces, vec!["lo"], "only loopback in the Vessel's network namespace");
+            assert_eq!(
+                ifaces,
+                vec!["lo"],
+                "only loopback in the Vessel's network namespace"
+            );
 
             let uid = std::fs::read_to_string(work.join("uid")).unwrap();
             let map: Vec<&str> = uid.split_whitespace().collect();
             assert_eq!(map, vec!["0", "200000", "65536"]);
 
             let status = std::fs::read_to_string(work.join("status")).unwrap();
-            let field = |k: &str| status.lines().find(|l| l.starts_with(k)).unwrap().split_whitespace().nth(1).unwrap().to_string();
-            println!("CapEff {} Seccomp {} NoNewPrivs {}", field("CapEff:"), field("Seccomp:"), field("NoNewPrivs:"));
+            let field = |k: &str| {
+                status
+                    .lines()
+                    .find(|l| l.starts_with(k))
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_string()
+            };
+            println!(
+                "CapEff {} Seccomp {} NoNewPrivs {}",
+                field("CapEff:"),
+                field("Seccomp:"),
+                field("NoNewPrivs:")
+            );
             assert_eq!(field("CapEff:"), "0000000000000000");
             assert_eq!(field("CapBnd:"), "0000000000000000");
             assert_eq!(field("Seccomp:"), "2", "seccomp filter mode");
@@ -1024,15 +1262,26 @@ while read l; do echo "$l"; done < /proc/self/status > /work/status
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 let l = runc.list().unwrap();
-                if l.iter().any(|(id, st)| id == &spec.id && *st == Status::Running) {
+                if l.iter()
+                    .any(|(id, st)| id == &spec.id && *st == Status::Running)
+                {
                     break;
                 }
-                assert!(std::time::Instant::now() < deadline, "the container never ran: {l:?}");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the container never ran: {l:?}"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
 
             let swept = runc.sweep().unwrap();
-            assert_eq!(swept, Swept { deleted: vec![spec.id.clone()], failed: vec![] });
+            assert_eq!(
+                swept,
+                Swept {
+                    deleted: vec![spec.id.clone()],
+                    failed: vec![]
+                }
+            );
             assert_eq!(runc.list().unwrap(), vec![]);
             assert_eq!(runc.state(&spec.id).unwrap(), None);
             let (ok, _) = agent.join().unwrap().unwrap();

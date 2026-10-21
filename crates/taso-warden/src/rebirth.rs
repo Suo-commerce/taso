@@ -81,9 +81,19 @@ pub struct Reborn {
 
 impl fmt::Display for Reborn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "reborn at epoch {} from anchor lsn {}", self.epoch.get(), self.anchor.lsn.get())?;
+        write!(
+            f,
+            "reborn at epoch {} from anchor lsn {}",
+            self.epoch.get(),
+            self.anchor.lsn.get()
+        )?;
         if let Some((kept, head)) = self.gap {
-            write!(f, ", records {}..={} lost", kept.lsn.get() + 1, head.lsn.get())?;
+            write!(
+                f,
+                ", records {}..={} lost",
+                kept.lsn.get() + 1,
+                head.lsn.get()
+            )?;
         }
         match self.dataset_at {
             Some(s) => write!(f, ", dataset at Seal {}", s.lsn.get()),
@@ -103,7 +113,14 @@ impl<P: Pool> Host<P> {
         packs: &Packs<S, X>,
     ) -> Result<(Vessel<P::Layers>, Reborn), VesselError> {
         let o = self.coord.ownership(id).map_err(VesselError::Coord)?;
-        let claim = if o.holder == self.warden { Claim::Mine } else { Claim::TakeOver { from: o.holder, epoch: o.epoch } };
+        let claim = if o.holder == self.warden {
+            Claim::Mine
+        } else {
+            Claim::TakeOver {
+                from: o.holder,
+                epoch: o.epoch,
+            }
+        };
         self.rebirth_as(id, packs, claim)
     }
 
@@ -125,15 +142,22 @@ impl<P: Pool> Host<P> {
 
         // 2. Fence, on the claim: from here on the anchor cannot move
         //    under us, and a stale decision changes nothing.
-        let expected = Chronicle::<P::Layers>::expected(self.coord.as_ref(), id, self.warden, claim).map_err(VesselError::Coord)?;
-        self.coord.transfer_if(id, self.warden, expected).map_err(VesselError::Coord)?;
+        let expected =
+            Chronicle::<P::Layers>::expected(self.coord.as_ref(), id, self.warden, claim)
+                .map_err(VesselError::Coord)?;
+        self.coord
+            .transfer_if(id, self.warden, expected)
+            .map_err(VesselError::Coord)?;
 
         // 3. The anchor may have moved between the check and the fence
         //    (the holder shipped more): verify again against what is
         //    anchored now.  This second check is the one that counts.
         let anchored_now = self.coord.shipped(id).map_err(VesselError::Coord)?;
-        let (anchor, chain, lineage) =
-            if anchored_now == anchor { (anchor, chain, lineage) } else { self.verify(id, packs, &dataset)? };
+        let (anchor, chain, lineage) = if anchored_now == anchor {
+            (anchor, chain, lineage)
+        } else {
+            self.verify(id, packs, &dataset)?
+        };
 
         // 4. The dataset.
         let here = self.seals_here(&dataset)?;
@@ -148,20 +172,42 @@ impl<P: Pool> Host<P> {
             let mut stream = packs
                 .open_fs(s)
                 .map_err(VesselError::Pack)?
-                .ok_or_else(|| VesselError::LocalState(format!("no pack holds the fs of Seal {}", to.0.get())))?;
+                .ok_or_else(|| {
+                    VesselError::LocalState(format!("no pack holds the fs of Seal {}", to.0.get()))
+                })?;
             let guid = match s.fs.base {
                 FsBase::Full => self.pool.receive(&dataset, None, to, &mut stream),
-                FsBase::Seal(prev) => self.pool.receive(&dataset, Some((prev.lsn, prev.hash)), to, &mut stream),
-                FsBase::Origin { chronicle, seal, guid } => {
-                    let parent = ParentSeal { chronicle, seal: seal.lsn, seal_hash: seal.hash };
+                FsBase::Seal(prev) => {
+                    self.pool
+                        .receive(&dataset, Some((prev.lsn, prev.hash)), to, &mut stream)
+                }
+                FsBase::Origin {
+                    chronicle,
+                    seal,
+                    guid,
+                } => {
+                    let parent = ParentSeal {
+                        chronicle,
+                        seal: seal.lsn,
+                        seal_hash: seal.hash,
+                    };
                     self.parent_present(&parent)?;
-                    let base = CloneBase { dataset: parent_ds(&parent), seal: seal.lsn, hash: seal.hash, guid };
+                    let base = CloneBase {
+                        dataset: parent_ds(&parent),
+                        seal: seal.lsn,
+                        hash: seal.hash,
+                        guid,
+                    };
                     self.pool.receive_clone(&dataset, &base, to, &mut stream)
                 }
             }
             .map_err(VesselError::Pool)?;
             if guid != s.fs.guid {
-                return Err(VesselError::WrongSnapshot { seal: to.0, expected: s.fs.guid, got: guid });
+                return Err(VesselError::WrongSnapshot {
+                    seal: to.0,
+                    expected: s.fs.guid,
+                    got: guid,
+                });
             }
         }
         if chain.seals.is_empty() {
@@ -214,11 +260,18 @@ impl<P: Pool> Host<P> {
         let chain = packs.chain(Some(anchor)).map_err(VesselError::Pack)?;
         let lineage = match chain.frames.first().map(|f| Payload::decode(&f.payload)) {
             Some(Ok(Payload::Lineage(l))) => l,
-            _ => return Err(VesselError::NotAVessel("lsn 1 of the shipped chain is not a Lineage record")),
+            _ => {
+                return Err(VesselError::NotAVessel(
+                    "lsn 1 of the shipped chain is not a Lineage record",
+                ))
+            }
         };
         let here = self.seals_here(dataset)?;
-        let named: Vec<(Lsn, taso_core::envelope::HashVal)> =
-            chain.seals.iter().map(|s| (s.fs.to.lsn, s.fs.to.hash)).collect();
+        let named: Vec<(Lsn, taso_core::envelope::HashVal)> = chain
+            .seals
+            .iter()
+            .map(|s| (s.fs.to.lsn, s.fs.to.hash))
+            .collect();
         if let Some(stray) = here.iter().find(|s| !named.contains(s)) {
             return Err(VesselError::LocalState(format!(
                 "{dataset} has Seal {} that the shipped chain does not name",
@@ -226,11 +279,24 @@ impl<P: Pool> Host<P> {
             )));
         }
         for s in &chain.seals {
-            if let FsBase::Origin { chronicle, seal, .. } = s.fs.base {
-                self.parent_present(&ParentSeal { chronicle, seal: seal.lsn, seal_hash: seal.hash })?;
+            if let FsBase::Origin {
+                chronicle, seal, ..
+            } = s.fs.base
+            {
+                self.parent_present(&ParentSeal {
+                    chronicle,
+                    seal: seal.lsn,
+                    seal_hash: seal.hash,
+                })?;
             }
         }
-        if chain.seals.is_empty() && self.pool.info(dataset).map_err(VesselError::Pool)?.is_none() {
+        if chain.seals.is_empty()
+            && self
+                .pool
+                .info(dataset)
+                .map_err(VesselError::Pool)?
+                .is_none()
+        {
             if let Origin::Fork { parent } | Origin::Succession { parent, .. } = lineage.origin {
                 self.parent_present(&parent)?;
             }
@@ -240,8 +306,16 @@ impl<P: Pool> Host<P> {
 
     /// The Seal snapshots of `dataset` on this node; none if the dataset is
     /// not here (`zfs list` fails on a dataset that does not exist).
-    fn seals_here(&self, dataset: &crate::zfs::Dataset) -> Result<Vec<(Lsn, taso_core::envelope::HashVal)>, VesselError> {
-        if self.pool.info(dataset).map_err(VesselError::Pool)?.is_none() {
+    fn seals_here(
+        &self,
+        dataset: &crate::zfs::Dataset,
+    ) -> Result<Vec<(Lsn, taso_core::envelope::HashVal)>, VesselError> {
+        if self
+            .pool
+            .info(dataset)
+            .map_err(VesselError::Pool)?
+            .is_none()
+        {
             return Ok(Vec::new());
         }
         self.pool.layers(dataset).list().map_err(VesselError::Pool)
@@ -249,7 +323,10 @@ impl<P: Pool> Host<P> {
 
     /// The parent's Seal snapshot must be on this node with its hash.
     fn parent_present(&self, parent: &ParentSeal) -> Result<(), VesselError> {
-        if self.seals_here(&self.dataset_for(parent.chronicle))?.contains(&(parent.seal, parent.seal_hash)) {
+        if self
+            .seals_here(&self.dataset_for(parent.chronicle))?
+            .contains(&(parent.seal, parent.seal_hash))
+        {
             Ok(())
         } else {
             Err(VesselError::ParentMissing(*parent))
@@ -257,15 +334,31 @@ impl<P: Pool> Host<P> {
     }
 
     /// No section shipped: the dataset is what the Vessel was born as.
-    fn as_born(&self, lineage: &LineageRecord, dataset: &crate::zfs::Dataset) -> Result<(), VesselError> {
-        if self.pool.info(dataset).map_err(VesselError::Pool)?.is_some() {
+    fn as_born(
+        &self,
+        lineage: &LineageRecord,
+        dataset: &crate::zfs::Dataset,
+    ) -> Result<(), VesselError> {
+        if self
+            .pool
+            .info(dataset)
+            .map_err(VesselError::Pool)?
+            .is_some()
+        {
             return Ok(()); // made by an interrupted rebirth; the open checks it
         }
         match lineage.origin {
             Origin::Void => self.pool.create(dataset).map(|_| ()),
             Origin::Fork { parent } | Origin::Succession { parent, .. } => {
                 self.parent_present(&parent)?;
-                self.pool.clone(&self.dataset_for(parent.chronicle), parent.seal, parent.seal_hash, dataset).map(|_| ())
+                self.pool
+                    .clone(
+                        &self.dataset_for(parent.chronicle),
+                        parent.seal,
+                        parent.seal_hash,
+                        dataset,
+                    )
+                    .map(|_| ())
             }
         }
         .map_err(VesselError::Pool)
@@ -296,7 +389,9 @@ mod tests {
         }
     }
     fn said(d: &Dataset, from: Option<&str>, to: Lsn) -> Vec<u8> {
-        format!("{d} from {from:?} to {} ", to.get()).repeat(500).into_bytes()
+        format!("{d} from {from:?} to {} ", to.get())
+            .repeat(500)
+            .into_bytes()
     }
 
     /// Nodes sharing one coordinator and one pack store, each with its own
@@ -323,12 +418,24 @@ mod tests {
         }
         /// A node's view of the store: a fresh `Packs` (fresh cache).
         fn packs(&self, id: ChronicleId) -> Packs<LocalStore, Says> {
-            Packs::new(LocalStore::new(self.tmp.path().join("store")), Says, "vessels", id).unwrap()
+            Packs::new(
+                LocalStore::new(self.tmp.path().join("store")),
+                Says,
+                "vessels",
+                id,
+            )
+            .unwrap()
         }
     }
 
     fn snap<L: Layers>(v: &Vessel<L>, seal: Position) -> Snapshot {
-        Snapshot { dataset: v.dataset().clone(), seal: seal.lsn, createtxg: 1, guid: fake_guid(seal.lsn), seal_hash: Some(seal.hash) }
+        Snapshot {
+            dataset: v.dataset().clone(),
+            seal: seal.lsn,
+            createtxg: 1,
+            guid: fake_guid(seal.lsn),
+            seal_hash: Some(seal.hash),
+        }
     }
 
     fn raw(n: u8) -> Payload {
@@ -338,7 +445,14 @@ mod tests {
     /// A turn: a record, then a Seal.
     fn turn<L: Layers>(v: &mut Vessel<L>, n: u8) -> Position {
         v.append(Stream::Fs, raw(n)).unwrap();
-        v.seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), TurnId::new(n as u64)).unwrap().seal
+        v.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(n as u64),
+        )
+        .unwrap()
+        .seal
     }
 
     /// Ship the log to the tail and anchor it, without a Seal (what a
@@ -346,11 +460,18 @@ mod tests {
     fn flush<L: Layers>(n: &Nodes, v: &Vessel<L>, warden: u64) {
         let c = v.chronicle();
         n.packs(v.id()).ship_log(&c.segments(), c.tail()).unwrap();
-        n.coord.advance_shipped(WardenId::new(warden), v.id(), c.epoch(), c.tail()).unwrap();
+        n.coord
+            .advance_shipped(WardenId::new(warden), v.id(), c.epoch(), c.tail())
+            .unwrap();
     }
 
     fn lsns<L: Layers>(v: &Vessel<L>) -> Vec<u64> {
-        v.chronicle().frames().unwrap().iter().map(|f| f.envelope.lsn.get()).collect()
+        v.chronicle()
+            .frames()
+            .unwrap()
+            .iter()
+            .map(|f| f.envelope.lsn.get())
+            .collect()
     }
 
     #[test]
@@ -374,18 +495,33 @@ mod tests {
         assert_eq!(r.gap, Some((anchor, head)));
         assert!(r.missing_layers.is_empty());
         let ds = b.dataset_for(v.id());
-        assert_eq!(b.pool.snaps_of(ds.as_str()), vec![(s1.lsn, s1.hash), (s2.lsn, s2.hash)]);
+        assert_eq!(
+            b.pool.snaps_of(ds.as_str()),
+            vec![(s1.lsn, s1.hash), (s2.lsn, s2.hash)]
+        );
         assert_eq!(
             b.pool.received_of(ds.as_str()),
-            vec![said(&ds, None, s1.lsn), said(&ds, Some(&ds.seal_snapshot(s1.lsn)), s2.lsn)]
+            vec![
+                said(&ds, None, s1.lsn),
+                said(&ds, Some(&ds.seal_snapshot(s1.lsn)), s2.lsn)
+            ]
         );
         assert_eq!(w.lineage(), v.lineage());
         assert_eq!(w.last_seal(), Some(s2));
         assert_eq!(w.tail().lsn, head.lsn.next(), "the Gap record");
-        let kept: Vec<_> = v.chronicle().frames().unwrap().into_iter().filter(|f| f.envelope.lsn <= anchor.lsn).collect();
+        let kept: Vec<_> = v
+            .chronicle()
+            .frames()
+            .unwrap()
+            .into_iter()
+            .filter(|f| f.envelope.lsn <= anchor.lsn)
+            .collect();
         assert_eq!(w.chronicle().frames().unwrap()[..kept.len()], kept[..]);
         // The old holder is fenced.
-        assert!(matches!(v.append(Stream::Fs, raw(9)), Err(VesselError::Chronicle(ChronicleError::Refused(_)))));
+        assert!(matches!(
+            v.append(Stream::Fs, raw(9)),
+            Err(VesselError::Chronicle(ChronicleError::Refused(_)))
+        ));
     }
 
     #[test]
@@ -394,7 +530,8 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
-        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
         let (w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
         assert_eq!((r.gap, r.anchor), (None, v.tail()));
         assert_eq!(w.tail(), v.tail());
@@ -406,7 +543,10 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         turn(&mut v, 1);
-        assert!(matches!(b.rebirth(v.id(), &n.packs(v.id())), Err(VesselError::NothingShipped(_))));
+        assert!(matches!(
+            b.rebirth(v.id(), &n.packs(v.id())),
+            Err(VesselError::NothingShipped(_))
+        ));
     }
 
     /// The log was shipped by a dispatch flush, but no Seal: the dataset
@@ -434,14 +574,25 @@ mod tests {
         let ts = turn(&mut t, 1);
         let mut c = a.fork(&t, ts, b"child").unwrap();
         let cs = turn(&mut c, 2);
-        c.publish_seal(&n.packs(c.id()), &snap(&c, cs), Some(&snap(&t, ts))).unwrap();
-        let parent = ParentSeal { chronicle: t.id(), seal: ts.lsn, seal_hash: ts.hash };
-        assert!(matches!(b.rebirth(c.id(), &n.packs(c.id())), Err(VesselError::ParentMissing(p)) if p == parent));
-        b.pool.put_snapshot(b.dataset_for(t.id()).as_str(), ts.lsn, ts.hash);
+        c.publish_seal(&n.packs(c.id()), &snap(&c, cs), Some(&snap(&t, ts)))
+            .unwrap();
+        let parent = ParentSeal {
+            chronicle: t.id(),
+            seal: ts.lsn,
+            seal_hash: ts.hash,
+        };
+        assert!(
+            matches!(b.rebirth(c.id(), &n.packs(c.id())), Err(VesselError::ParentMissing(p)) if p == parent)
+        );
+        b.pool
+            .put_snapshot(b.dataset_for(t.id()).as_str(), ts.lsn, ts.hash);
         let (w, r) = b.rebirth(c.id(), &n.packs(c.id())).unwrap();
         assert_eq!(r.received, vec![cs.lsn]);
         let info = b.pool.info(w.dataset()).unwrap().unwrap();
-        assert_eq!(info.origin, Some(b.dataset_for(t.id()).seal_snapshot(ts.lsn)));
+        assert_eq!(
+            info.origin,
+            Some(b.dataset_for(t.id()).seal_snapshot(ts.lsn))
+        );
         assert_eq!(info.parent, Some(ts.hash));
     }
 
@@ -455,11 +606,18 @@ mod tests {
         let mut c = a.fork(&t, ts, b"child").unwrap();
         c.append(Stream::Fs, raw(2)).unwrap();
         flush(&n, &c, 1);
-        assert!(matches!(b.rebirth(c.id(), &n.packs(c.id())), Err(VesselError::ParentMissing(_))));
-        b.pool.put_snapshot(b.dataset_for(t.id()).as_str(), ts.lsn, ts.hash);
+        assert!(matches!(
+            b.rebirth(c.id(), &n.packs(c.id())),
+            Err(VesselError::ParentMissing(_))
+        ));
+        b.pool
+            .put_snapshot(b.dataset_for(t.id()).as_str(), ts.lsn, ts.hash);
         let (w, r) = b.rebirth(c.id(), &n.packs(c.id())).unwrap();
         assert_eq!(r.dataset_at, None);
-        assert_eq!(b.pool.info(w.dataset()).unwrap().unwrap().parent, Some(ts.hash));
+        assert_eq!(
+            b.pool.info(w.dataset()).unwrap().unwrap().parent,
+            Some(ts.hash)
+        );
     }
 
     /// A Seal whose section was put but never named (a crash before its
@@ -474,7 +632,9 @@ mod tests {
         let s1 = turn(&mut v, 1);
         v.publish_seal(&pa, &snap(&v, s1), None).unwrap();
         let s2 = turn(&mut v, 2);
-        pa.ship_seal(&v.chronicle().segments(), &snap(&v, s2), None).unwrap().unwrap();
+        pa.ship_seal(&v.chronicle().segments(), &snap(&v, s2), None)
+            .unwrap()
+            .unwrap();
         flush(&n, &v, 1);
         let (w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
         assert_eq!((r.received.clone(), r.dataset_at), (vec![s1.lsn], Some(s1)));
@@ -491,7 +651,8 @@ mod tests {
         let (a, b, c) = (n.host(1), n.host(2), n.host(3));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
-        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
         v.append(Stream::Fs, raw(2)).unwrap(); // lost
         let pb = n.packs(v.id());
         let (mut w, rb) = b.rebirth(v.id(), &pb).unwrap();
@@ -504,8 +665,14 @@ mod tests {
         assert_eq!(rc.dataset_at, Some(s3));
         let lost_on_a = s1.lsn.get() + 2; // the FsShipped record of s1 is kept; raw(2) is lost
         assert!(!lsns(&x).contains(&lost_on_a));
-        assert_eq!(lsns(&x)[..lsns(&w).len() - 1], lsns(&w)[..lsns(&w).len() - 1]);
-        assert!(matches!(w.append(Stream::Fs, raw(9)), Err(VesselError::Chronicle(ChronicleError::Refused(_)))));
+        assert_eq!(
+            lsns(&x)[..lsns(&w).len() - 1],
+            lsns(&w)[..lsns(&w).len() - 1]
+        );
+        assert!(matches!(
+            w.append(Stream::Fs, raw(9)),
+            Err(VesselError::Chronicle(ChronicleError::Refused(_)))
+        ));
         // C's log reopens as written.
         let id = v.id();
         drop(x);
@@ -528,12 +695,19 @@ mod tests {
         v.publish_seal(&pa, &snap(&v, s2), None).unwrap();
         // The state directory cannot be made: the log is not restored.
         std::fs::write(&b.state_dir, b"in the way").unwrap();
-        assert!(matches!(b.rebirth(v.id(), &n.packs(v.id())), Err(VesselError::Chronicle(_))));
+        assert!(matches!(
+            b.rebirth(v.id(), &n.packs(v.id())),
+            Err(VesselError::Chronicle(_))
+        ));
         let ds = b.dataset_for(v.id());
         assert_eq!(b.pool.received_of(ds.as_str()).len(), 2);
         std::fs::remove_file(&b.state_dir).unwrap();
         let (w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
-        assert_eq!(b.pool.received_of(ds.as_str()).len(), 2, "not received again");
+        assert_eq!(
+            b.pool.received_of(ds.as_str()).len(),
+            2,
+            "not received again"
+        );
         assert_eq!((r.dataset_at, w.last_seal()), (Some(s2), Some(s2)));
     }
 
@@ -548,28 +722,61 @@ mod tests {
     }
 
     impl Coord for AfterShipped {
-        fn register(&self, c: ChronicleId, h: WardenId) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
+        fn register(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+        ) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
             self.inner.register(c, h)
         }
-        fn append(&self, w: WardenId, e: &taso_core::envelope::Envelope) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
+        fn append(
+            &self,
+            w: WardenId,
+            e: &taso_core::envelope::Envelope,
+        ) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
             self.inner.append(w, e)
         }
-        fn append_batch(&self, w: WardenId, es: &[taso_core::envelope::Envelope]) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
+        fn append_batch(
+            &self,
+            w: WardenId,
+            es: &[taso_core::envelope::Envelope],
+        ) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
             self.inner.append_batch(w, es)
         }
-        fn transfer_if(&self, c: ChronicleId, h: WardenId, e: (WardenId, Epoch)) -> Result<Epoch, crate::coordinator::CoordError> {
+        fn transfer_if(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+            e: (WardenId, Epoch),
+        ) -> Result<Epoch, crate::coordinator::CoordError> {
             self.inner.transfer_if(c, h, e)
         }
-        fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, crate::coordinator::CoordError> {
+        fn transfer(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+        ) -> Result<Epoch, crate::coordinator::CoordError> {
             self.inner.transfer(c, h)
         }
-        fn ownership(&self, c: ChronicleId) -> Result<taso_core::model::Ownership, crate::coordinator::CoordError> {
+        fn ownership(
+            &self,
+            c: ChronicleId,
+        ) -> Result<taso_core::model::Ownership, crate::coordinator::CoordError> {
             self.inner.ownership(c)
         }
-        fn head(&self, c: ChronicleId) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
+        fn head(
+            &self,
+            c: ChronicleId,
+        ) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
             self.inner.head(c)
         }
-        fn advance_shipped(&self, w: WardenId, c: ChronicleId, e: Epoch, to: Position) -> Result<Position, crate::coordinator::CoordError> {
+        fn advance_shipped(
+            &self,
+            w: WardenId,
+            c: ChronicleId,
+            e: Epoch,
+            to: Position,
+        ) -> Result<Position, crate::coordinator::CoordError> {
             self.inner.advance_shipped(w, c, e, to)
         }
         fn shipped(&self, c: ChronicleId) -> Result<Position, crate::coordinator::CoordError> {
@@ -593,17 +800,21 @@ mod tests {
         let a = n.host(1);
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
-        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
         // Shipped, not yet anchored: A is about to report it.
         v.append(Stream::Fs, raw(2)).unwrap();
         let (id, epoch, tail) = (v.id(), v.chronicle().epoch(), v.tail());
-        n.packs(id).ship_log(&v.chronicle().segments(), tail).unwrap();
+        n.packs(id)
+            .ship_log(&v.chronicle().segments(), tail)
+            .unwrap();
         let before = n.coord.shipped(id).unwrap();
         assert!(before.lsn < tail.lsn);
         let coord = Arc::new(AfterShipped {
             inner: n.coord.clone(),
             then: std::sync::Mutex::new(Some(Box::new(move |c: &Coordinator| {
-                c.advance_shipped(WardenId::new(1), id, epoch, tail).unwrap();
+                c.advance_shipped(WardenId::new(1), id, epoch, tail)
+                    .unwrap();
             }))),
         });
         let b = Host { coord, ..n.host(2) };
@@ -611,7 +822,10 @@ mod tests {
         assert_eq!(r.anchor, tail, "the second check counted");
         assert_eq!(r.dataset_at, Some(s1));
         // Fenced now: A's next report is refused.
-        assert!(n.coord.advance_shipped(WardenId::new(1), id, epoch, tail).is_err());
+        assert!(n
+            .coord
+            .advance_shipped(WardenId::new(1), id, epoch, tail)
+            .is_err());
     }
 
     /// A rebirth that cannot succeed fences nobody (F5): nothing shipped,
@@ -622,9 +836,16 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let before = n.coord.ownership(v.id()).unwrap();
-        assert!(matches!(b.rebirth(v.id(), &n.packs(v.id())), Err(VesselError::NothingShipped(_))));
+        assert!(matches!(
+            b.rebirth(v.id(), &n.packs(v.id())),
+            Err(VesselError::NothingShipped(_))
+        ));
         let after = n.coord.ownership(v.id()).unwrap();
-        assert_eq!((after.holder, after.epoch), (before.holder, before.epoch), "not fenced");
+        assert_eq!(
+            (after.holder, after.epoch),
+            (before.holder, before.epoch),
+            "not fenced"
+        );
         assert!(v.append(Stream::Fs, raw(1)).is_ok(), "A keeps appending");
     }
 
@@ -657,8 +878,12 @@ mod tests {
         v.publish_seal(&pa, &snap(&v, s1), None).unwrap();
         let ds = b.dataset_for(v.id());
         // A snapshot the chain does not name.
-        b.pool.put_snapshot(ds.as_str(), Lsn::new(99), HashVal::from_bytes([9; 32]));
-        assert!(matches!(b.rebirth(v.id(), &n.packs(v.id())), Err(VesselError::LocalState(_))));
+        b.pool
+            .put_snapshot(ds.as_str(), Lsn::new(99), HashVal::from_bytes([9; 32]));
+        assert!(matches!(
+            b.rebirth(v.id(), &n.packs(v.id())),
+            Err(VesselError::LocalState(_))
+        ));
         b.pool.remove(ds.as_str());
         // A log that does not end at the anchor.
         let frames = v.chronicle().frames().unwrap();
@@ -676,13 +901,21 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
-        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
         let mut reg = Registry::new();
         reg.register(Box::new(FakeProvider::new("mail")));
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), a.warden);
         let (mut fx, _) = Effects::open(reg, Box::new(publisher), &mut v).unwrap();
-        let call = Call { operation: "send".into(), args: b"someone".to_vec() };
-        assert_eq!(fx.dispatch_until(&mut v, "mail", call, Some(CrashAfter::Published)).unwrap(), None);
+        let call = Call {
+            operation: "send".into(),
+            args: b"someone".to_vec(),
+        };
+        assert_eq!(
+            fx.dispatch_until(&mut v, "mail", call, Some(CrashAfter::Published))
+                .unwrap(),
+            None
+        );
 
         let (mut w, _) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
         let mut reg = Registry::new();
@@ -704,22 +937,48 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
-        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
         let s2 = turn(&mut v, 2);
-        v.publish_seal(&n.packs(v.id()), &snap(&v, s2), None).unwrap();
-        assert_eq!(v.navigate(&n.packs(v.id()), s2.lsn).unwrap(), Navigation::Consistent(vec![]));
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s2), None)
+            .unwrap();
+        assert_eq!(
+            v.navigate(&n.packs(v.id()), s2.lsn).unwrap(),
+            Navigation::Consistent(vec![])
+        );
         v.append(Stream::Fs, raw(3)).unwrap(); // never shipped: lost
 
         let (mut w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
         assert!(r.gap.is_some());
         for s in [s1, s2] {
-            assert_eq!(w.navigate(&n.packs(w.id()), s.lsn).unwrap(), Navigation::Consistent(vec![]), "{s:?}");
+            assert_eq!(
+                w.navigate(&n.packs(w.id()), s.lsn).unwrap(),
+                Navigation::Consistent(vec![]),
+                "{s:?}"
+            );
         }
         let why = "reborn: 1 record lost".to_string();
-        let s3 = w.seal(StreamCut::EMPTY, Verdict::Unverified(why.clone()), Lsn::new(0), TurnId::new(3)).unwrap().seal;
-        assert_eq!(w.navigate(&n.packs(w.id()), s3.lsn).unwrap(), Navigation::Insufficient(vec![Reason::MissingVerification(why)]));
-        assert_eq!(w.navigate(&n.packs(w.id()), s2.lsn).unwrap(), Navigation::Consistent(vec![]));
-        assert!(matches!(v.navigate(&n.packs(v.id()), s2.lsn).unwrap(), Navigation::Inconsistent(_)));
+        let s3 = w
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Unverified(why.clone()),
+                Lsn::new(0),
+                TurnId::new(3),
+            )
+            .unwrap()
+            .seal;
+        assert_eq!(
+            w.navigate(&n.packs(w.id()), s3.lsn).unwrap(),
+            Navigation::Insufficient(vec![Reason::MissingVerification(why)])
+        );
+        assert_eq!(
+            w.navigate(&n.packs(w.id()), s2.lsn).unwrap(),
+            Navigation::Consistent(vec![])
+        );
+        assert!(matches!(
+            v.navigate(&n.packs(v.id()), s2.lsn).unwrap(),
+            Navigation::Inconsistent(_)
+        ));
     }
 
     /// An effect sent before the node died, its outcome never shipped:
@@ -732,26 +991,46 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
-        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None).unwrap();
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
         let mut reg = Registry::new();
         reg.register(Box::new(FakeProvider::new("mail")));
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), a.warden);
         let (mut fx, _) = Effects::open(reg, Box::new(publisher), &mut v).unwrap();
-        let call = Call { operation: "send".into(), args: b"someone".to_vec() };
-        assert!(fx.dispatch_until(&mut v, "mail", call, None).unwrap().is_some(), "sent and applied");
+        let call = Call {
+            operation: "send".into(),
+            args: b"someone".to_vec(),
+        };
+        assert!(
+            fx.dispatch_until(&mut v, "mail", call, None)
+                .unwrap()
+                .is_some(),
+            "sent and applied"
+        );
         let known = v.navigate(&n.packs(v.id()), s1.lsn).unwrap();
-        let Navigation::Consistent(obligations) = &known else { panic!("{known:?}") };
-        let [o] = obligations[..] else { panic!("{obligations:?}") };
+        let Navigation::Consistent(obligations) = &known else {
+            panic!("{known:?}")
+        };
+        let [o] = obligations[..] else {
+            panic!("{obligations:?}")
+        };
 
         let (mut w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
         assert!(r.gap.is_some(), "the applied outcome was not shipped");
-        assert_eq!(w.navigate(&n.packs(w.id()), s1.lsn).unwrap(), Navigation::Insufficient(vec![Reason::MissingOutcome(o.op)]));
+        assert_eq!(
+            w.navigate(&n.packs(w.id()), s1.lsn).unwrap(),
+            Navigation::Insufficient(vec![Reason::MissingOutcome(o.op)])
+        );
         let mut reg = Registry::new();
         reg.register(Box::new(FakeProvider::new("mail")));
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), b.warden);
         let (_fx, rec) = Effects::open(reg, Box::new(publisher), &mut w).unwrap();
         assert_eq!(rec.settled, vec![o.op]);
-        assert_eq!(w.navigate(&n.packs(w.id()), s1.lsn).unwrap(), known, "reconciled: the same answer as before the gap");
+        assert_eq!(
+            w.navigate(&n.packs(w.id()), s1.lsn).unwrap(),
+            known,
+            "reconciled: the same answer as before the gap"
+        );
     }
 
     // ── on a real pool ──────────────────────────────────────────────
@@ -765,13 +1044,20 @@ mod tests {
 
         fn zfs_ok(args: &[&str]) -> String {
             let out = Command::new("zfs").args(args).output().expect("run zfs");
-            assert!(out.status.success(), "zfs {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "zfs {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout).into_owned()
         }
 
         fn mounted(ds: &Dataset) -> std::path::PathBuf {
             let _ = Command::new("zfs").args(["mount", ds.as_str()]).output();
-            std::path::PathBuf::from(zfs_ok(&["get", "-H", "-o", "value", "mountpoint", ds.as_str()]).trim())
+            std::path::PathBuf::from(
+                zfs_ok(&["get", "-H", "-o", "value", "mountpoint", ds.as_str()]).trim(),
+            )
         }
 
         fn host(root: &str, state: &Path, coord: Arc<Coordinator>, w: u64) -> Host<Zfs<Cli>> {
@@ -784,8 +1070,14 @@ mod tests {
             }
         }
 
-        fn seal_snapshot(z: &Zfs<Cli>, v: &Vessel<crate::chronicle::ZfsLayers<Cli>>, seal: Position) -> Snapshot {
-            z.get(v.dataset(), seal.lsn).unwrap().expect("the Seal's snapshot")
+        fn seal_snapshot(
+            z: &Zfs<Cli>,
+            v: &Vessel<crate::chronicle::ZfsLayers<Cli>>,
+            seal: Position,
+        ) -> Snapshot {
+            z.get(v.dataset(), seal.lsn)
+                .unwrap()
+                .expect("the Seal's snapshot")
         }
 
         /// Node A writes, seals and publishes twice, then writes more and
@@ -802,7 +1094,9 @@ mod tests {
             struct Cleanup(String);
             impl Drop for Cleanup {
                 fn drop(&mut self) {
-                    let _ = Command::new("zfs").args(["destroy", "-R", &self.0]).status();
+                    let _ = Command::new("zfs")
+                        .args(["destroy", "-R", &self.0])
+                        .status();
                 }
             }
             let _c = Cleanup(root.clone());
@@ -811,34 +1105,56 @@ mod tests {
             zfs_ok(&["create", &rb]);
             let tmp = tempfile::tempdir().unwrap();
             let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
-            let (a, b) = (host(&ra, tmp.path(), coord.clone(), 1), host(&rb, tmp.path(), coord.clone(), 2));
+            let (a, b) = (
+                host(&ra, tmp.path(), coord.clone(), 1),
+                host(&rb, tmp.path(), coord.clone(), 2),
+            );
             let z = Zfs::cli();
-            let packs = |id| Packs::new(LocalStore::new(tmp.path().join("store")), ZfsSend::default(), "vessels", id).unwrap();
+            let packs = |id| {
+                Packs::new(
+                    LocalStore::new(tmp.path().join("store")),
+                    ZfsSend::default(),
+                    "vessels",
+                    id,
+                )
+                .unwrap()
+            };
 
             // ── a Vessel born from the void ──
             let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
             let ma = mounted(v.dataset());
             std::fs::write(ma.join("notes.txt"), b"one").unwrap();
             let s1 = turn(&mut v, 1);
-            v.publish_seal(&packs(v.id()), &seal_snapshot(&z, &v, s1), None).unwrap();
+            v.publish_seal(&packs(v.id()), &seal_snapshot(&z, &v, s1), None)
+                .unwrap();
             std::fs::write(ma.join("notes.txt"), b"two").unwrap();
             std::fs::write(ma.join("big.bin"), vec![7u8; 1 << 20]).unwrap();
             let s2 = turn(&mut v, 2);
             let g2 = seal_snapshot(&z, &v, s2).guid;
-            v.publish_seal(&packs(v.id()), &seal_snapshot(&z, &v, s2), None).unwrap();
+            v.publish_seal(&packs(v.id()), &seal_snapshot(&z, &v, s2), None)
+                .unwrap();
             std::fs::write(ma.join("notes.txt"), b"three, never sealed").unwrap();
             v.append(Stream::Fs, raw(3)).unwrap();
 
             let started = std::time::Instant::now();
             let (w, r) = b.rebirth(v.id(), &packs(v.id())).unwrap();
             println!("void-born: {r} in {:?}", started.elapsed());
-            assert_eq!((r.received.clone(), r.dataset_at), (vec![s1.lsn, s2.lsn], Some(s2)));
+            assert_eq!(
+                (r.received.clone(), r.dataset_at),
+                (vec![s1.lsn, s2.lsn], Some(s2))
+            );
             assert!(r.gap.is_some());
             assert_eq!(z.get(w.dataset(), s2.lsn).unwrap().unwrap().guid, g2);
             let mb = mounted(w.dataset());
             assert_eq!(std::fs::read(mb.join("notes.txt")).unwrap(), b"two");
-            assert_eq!(std::fs::read(mb.join("big.bin")).unwrap(), vec![7u8; 1 << 20]);
-            assert!(matches!(v.append(Stream::Fs, raw(9)), Err(VesselError::Chronicle(ChronicleError::Refused(_)))));
+            assert_eq!(
+                std::fs::read(mb.join("big.bin")).unwrap(),
+                vec![7u8; 1 << 20]
+            );
+            assert!(matches!(
+                v.append(Stream::Fs, raw(9)),
+                Err(VesselError::Chronicle(ChronicleError::Refused(_)))
+            ));
 
             // ── a Vessel forked from a Template ──
             let (mut t, _) = a.ensure(ns(1), b"template").unwrap();
@@ -846,20 +1162,34 @@ mod tests {
             let ts = turn(&mut t, 1);
             let tsnap = seal_snapshot(&z, &t, ts);
             // The Template is on B first, keeping its guid.
-            let sent = Command::new("zfs").args(["send", &t.dataset().seal_snapshot(ts.lsn)]).output().unwrap();
+            let sent = Command::new("zfs")
+                .args(["send", &t.dataset().seal_snapshot(ts.lsn)])
+                .output()
+                .unwrap();
             assert!(sent.status.success());
-            let tb = z.receive(&b.dataset_for(t.id()), None, (ts.lsn, ts.hash), &mut &sent.stdout[..]).unwrap();
+            let tb = z
+                .receive(
+                    &b.dataset_for(t.id()),
+                    None,
+                    (ts.lsn, ts.hash),
+                    &mut &sent.stdout[..],
+                )
+                .unwrap();
             assert_eq!(tb.guid, tsnap.guid);
             let mut c = a.fork(&t, ts, b"child").unwrap();
             std::fs::write(mounted(c.dataset()).join("mine.txt"), b"child").unwrap();
             let cs = turn(&mut c, 2);
-            c.publish_seal(&packs(c.id()), &seal_snapshot(&z, &c, cs), Some(&tsnap)).unwrap();
+            c.publish_seal(&packs(c.id()), &seal_snapshot(&z, &c, cs), Some(&tsnap))
+                .unwrap();
             let (x, r) = b.rebirth(c.id(), &packs(c.id())).unwrap();
             println!("forked: {r}");
             let mx = mounted(x.dataset());
             assert_eq!(std::fs::read(mx.join("base.txt")).unwrap(), b"template");
             assert_eq!(std::fs::read(mx.join("mine.txt")).unwrap(), b"child");
-            assert!(matches!(c.append(Stream::Fs, raw(9)), Err(VesselError::Chronicle(ChronicleError::Refused(_)))));
+            assert!(matches!(
+                c.append(Stream::Fs, raw(9)),
+                Err(VesselError::Chronicle(ChronicleError::Refused(_)))
+            ));
         }
     }
 }

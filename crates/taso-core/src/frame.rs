@@ -130,7 +130,11 @@ mod tests {
     fn interrupted_reads_are_retried() {
         let mut framed = Vec::new();
         write_frame(&mut framed, b"hello").unwrap();
-        let mut r = Interrupting { data: framed, at: 0, interrupt: false };
+        let mut r = Interrupting {
+            data: framed,
+            at: 0,
+            interrupt: false,
+        };
         assert_eq!(read_frame(&mut r).unwrap(), Some(b"hello".to_vec()));
         assert_eq!(read_frame(&mut r).unwrap(), None);
     }
@@ -139,14 +143,22 @@ mod tests {
     fn oversized_frames_are_refused_before_allocation() {
         let mut wire = (MAX_FRAME + 1).to_be_bytes().to_vec();
         wire.extend_from_slice(&[0; 16]);
-        assert!(matches!(read_frame(&mut Cursor::new(wire)), Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 1));
+        assert!(
+            matches!(read_frame(&mut Cursor::new(wire)), Err(FrameError::TooLarge(n)) if n == MAX_FRAME + 1)
+        );
         // Exactly MAX_FRAME is the largest accepted length.
         let mut wire = MAX_FRAME.to_be_bytes().to_vec();
         wire.extend_from_slice(&[0; 3]);
-        assert!(matches!(read_frame(&mut Cursor::new(wire)), Err(FrameError::Io(_))), "accepted, then short");
+        assert!(
+            matches!(read_frame(&mut Cursor::new(wire)), Err(FrameError::Io(_))),
+            "accepted, then short"
+        );
         let mut sink = Vec::new();
         let big = vec![0u8; MAX_FRAME as usize + 1];
-        assert!(matches!(write_frame(&mut sink, &big), Err(FrameError::TooLarge(_))));
+        assert!(matches!(
+            write_frame(&mut sink, &big),
+            Err(FrameError::TooLarge(_))
+        ));
         assert!(sink.is_empty(), "nothing written for a refused frame");
     }
 
@@ -183,9 +195,15 @@ mod tests {
 
     #[test]
     fn end_of_stream_inside_a_frame_is_an_error() {
-        assert!(matches!(read_frame(&mut Cursor::new(vec![0, 0])), Err(FrameError::Io(_))));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(vec![0, 0])),
+            Err(FrameError::Io(_))
+        ));
         let mut wire = 10u32.to_be_bytes().to_vec();
         wire.extend_from_slice(&[1, 2, 3]);
-        assert!(matches!(read_frame(&mut Cursor::new(wire)), Err(FrameError::Io(_))));
+        assert!(matches!(
+            read_frame(&mut Cursor::new(wire)),
+            Err(FrameError::Io(_))
+        ));
     }
 }

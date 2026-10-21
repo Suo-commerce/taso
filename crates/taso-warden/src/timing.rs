@@ -33,14 +33,22 @@ pub struct Span {
 
 /// Start a span named `name`.
 pub fn span(name: &'static str) -> Span {
-    Span { name, start: ENABLED.load(Ordering::Relaxed).then(Instant::now) }
+    Span {
+        name,
+        start: ENABLED.load(Ordering::Relaxed).then(Instant::now),
+    }
 }
 
 impl Drop for Span {
     fn drop(&mut self) {
         if let Some(start) = self.start {
             let us = start.elapsed().as_micros() as u64;
-            SPANS.lock().unwrap_or_else(|e| e.into_inner()).entry(self.name).or_default().push(us);
+            SPANS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(self.name)
+                .or_default()
+                .push(us);
         }
     }
 }
@@ -60,7 +68,10 @@ pub fn quantile(v: &[u64], q: f64) -> u64 {
 
 /// One line per span: count, p50, p95, p99 and max, in milliseconds.
 pub fn report(spans: &BTreeMap<&'static str, Vec<u64>>) -> String {
-    let mut out = format!("{:<22} {:>6} {:>9} {:>9} {:>9} {:>9}\n", "span", "n", "p50 ms", "p95 ms", "p99 ms", "max ms");
+    let mut out = format!(
+        "{:<22} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+        "span", "n", "p50 ms", "p95 ms", "p99 ms", "max ms"
+    );
     for (name, v) in spans {
         let mut v = v.clone();
         v.sort_unstable();

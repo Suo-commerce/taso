@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, HashSet};
 use crate::envelope::Stream;
 use crate::model::{AppendError, Coordinator, WardenModel};
 use crate::record::{
-    BarrierId, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord,
-    OutcomeState, Payload, RetryPolicy,
+    BarrierId, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord, OutcomeState, Payload,
+    RetryPolicy,
 };
 
 // ── CrashPoint ─────────────────────────────────────────────────────
@@ -157,7 +157,10 @@ impl Default for AdapterModel {
 impl AdapterModel {
     /// Create a fresh adapter model.
     pub fn new() -> Self {
-        Self { next_op: 1, next_barrier: 1 }
+        Self {
+            next_op: 1,
+            next_barrier: 1,
+        }
     }
 
     /// Resume from existing state by scanning the coordinator log.
@@ -180,7 +183,10 @@ impl AdapterModel {
                 max_op = max_op.max(outcome.op.get());
             }
         }
-        Self { next_op: max_op + 1, next_barrier: max_barrier + 1 }
+        Self {
+            next_op: max_op + 1,
+            next_barrier: max_barrier + 1,
+        }
     }
 
     /// Dispatch an effect following the v0.4 §7.2 sequence.
@@ -254,17 +260,13 @@ impl AdapterModel {
 
         // Step 3: dispatch to provider.
         if crash_at == Some(CrashPoint::DuringDispatchNotReceived) {
-            return Err(DispatchError::Crash(
-                CrashPoint::DuringDispatchNotReceived,
-            ));
+            return Err(DispatchError::Crash(CrashPoint::DuringDispatchNotReceived));
         }
 
         Self::do_dispatch(provider, op, &retry);
 
         if crash_at == Some(CrashPoint::DuringDispatchReceived) {
-            return Err(DispatchError::Crash(
-                CrashPoint::DuringDispatchReceived,
-            ));
+            return Err(DispatchError::Crash(CrashPoint::DuringDispatchReceived));
         }
 
         if crash_at == Some(CrashPoint::AfterDispatch) {
@@ -340,8 +342,7 @@ impl AdapterModel {
 
             match state {
                 // Terminal — nothing to do.
-                Some(OutcomeState::ConfirmedApplied)
-                | Some(OutcomeState::ConfirmedNotApplied) => {}
+                Some(OutcomeState::ConfirmedApplied) | Some(OutcomeState::ConfirmedNotApplied) => {}
 
                 // No outcome: dispatch was never authorized.
                 None | Some(OutcomeState::Prepared) => {
@@ -350,62 +351,37 @@ impl AdapterModel {
                         state: OutcomeState::ConfirmedNotApplied,
                         evidence: Some(b"reconcile:no-dispatch".to_vec()),
                     };
-                    warden.append(
-                        coord,
-                        Stream::Effect,
-                        Payload::Outcome(outcome),
-                    )?;
+                    warden.append(coord, Stream::Effect, Payload::Outcome(outcome))?;
                 }
 
                 // Dispatch was authorized or outcome is unknown.
-                Some(OutcomeState::DispatchAuthorized)
-                | Some(OutcomeState::OutcomeUnknown) => {
+                Some(OutcomeState::DispatchAuthorized) | Some(OutcomeState::OutcomeUnknown) => {
                     match &info.retry {
                         RetryPolicy::ProviderDeduplicated { key } => {
                             provider.dispatch_dedup(info.op, key);
                             let outcome = OutcomeRecord {
                                 op: info.op,
                                 state: OutcomeState::ConfirmedApplied,
-                                evidence: Some(
-                                    b"reconcile:reissued".to_vec(),
-                                ),
+                                evidence: Some(b"reconcile:reissued".to_vec()),
                             };
-                            warden.append(
-                                coord,
-                                Stream::Effect,
-                                Payload::Outcome(outcome),
-                            )?;
+                            warden.append(coord, Stream::Effect, Payload::Outcome(outcome))?;
                         }
                         RetryPolicy::Queryable { probe } => {
                             if provider.query(probe) {
                                 let outcome = OutcomeRecord {
                                     op: info.op,
                                     state: OutcomeState::ConfirmedApplied,
-                                    evidence: Some(
-                                        b"reconcile:query-applied".to_vec(),
-                                    ),
+                                    evidence: Some(b"reconcile:query-applied".to_vec()),
                                 };
-                                warden.append(
-                                    coord,
-                                    Stream::Effect,
-                                    Payload::Outcome(outcome),
-                                )?;
+                                warden.append(coord, Stream::Effect, Payload::Outcome(outcome))?;
                             } else {
-                                provider
-                                    .dispatch_queryable(info.op, probe);
+                                provider.dispatch_queryable(info.op, probe);
                                 let outcome = OutcomeRecord {
                                     op: info.op,
                                     state: OutcomeState::ConfirmedApplied,
-                                    evidence: Some(
-                                        b"reconcile:query-dispatched"
-                                            .to_vec(),
-                                    ),
+                                    evidence: Some(b"reconcile:query-dispatched".to_vec()),
                                 };
-                                warden.append(
-                                    coord,
-                                    Stream::Effect,
-                                    Payload::Outcome(outcome),
-                                )?;
+                                warden.append(coord, Stream::Effect, Payload::Outcome(outcome))?;
                             }
                         }
                         RetryPolicy::UnsafeToRetry => {
@@ -415,11 +391,7 @@ impl AdapterModel {
                                     state: OutcomeState::OutcomeUnknown,
                                     evidence: None,
                                 };
-                                warden.append(
-                                    coord,
-                                    Stream::Effect,
-                                    Payload::Outcome(outcome),
-                                )?;
+                                warden.append(coord, Stream::Effect, Payload::Outcome(outcome))?;
                             }
                             if let Some(barrier) = info.barrier {
                                 obligations.push(Obligation {
@@ -437,11 +409,7 @@ impl AdapterModel {
     }
 
     /// Dispatch to the provider based on the retry policy.
-    fn do_dispatch(
-        provider: &mut FakeProvider,
-        op: OpId,
-        retry: &RetryPolicy,
-    ) {
+    fn do_dispatch(provider: &mut FakeProvider, op: OpId, retry: &RetryPolicy) {
         match retry {
             RetryPolicy::ProviderDeduplicated { key } => {
                 provider.dispatch_dedup(op, key);
@@ -500,7 +468,9 @@ mod tests {
     }
 
     fn queryable_retry(probe: &[u8]) -> RetryPolicy {
-        RetryPolicy::Queryable { probe: probe.to_vec() }
+        RetryPolicy::Queryable {
+            probe: probe.to_vec(),
+        }
     }
 
     const ALL_CRASH_POINTS: [CrashPoint; 5] = [
@@ -600,17 +570,15 @@ mod tests {
             Consequence::Irreversible,
             Some(CrashPoint::AfterIntent),
         );
-        assert_eq!(
-            result,
-            Err(DispatchError::Crash(CrashPoint::AfterIntent))
-        );
+        assert_eq!(result, Err(DispatchError::Crash(CrashPoint::AfterIntent)));
         assert_eq!(provider.effect_count(OpId::new(1)), 0);
 
         // Recover and reconcile.
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert!(obligations.is_empty());
         // No dispatch ever happened; reconciled to ConfirmedNotApplied.
@@ -640,8 +608,9 @@ mod tests {
 
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert!(obligations.is_empty());
         // Reconcile re-dispatched via dedup key.
@@ -671,8 +640,9 @@ mod tests {
 
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert!(obligations.is_empty());
         assert_eq!(provider.effect_count(OpId::new(1)), 1);
@@ -702,8 +672,9 @@ mod tests {
 
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert!(obligations.is_empty());
         // Dedup key prevents duplicate — still exactly 1.
@@ -725,16 +696,14 @@ mod tests {
             Consequence::Irreversible,
             Some(CrashPoint::AfterDispatch),
         );
-        assert_eq!(
-            result,
-            Err(DispatchError::Crash(CrashPoint::AfterDispatch))
-        );
+        assert_eq!(result, Err(DispatchError::Crash(CrashPoint::AfterDispatch)));
         assert_eq!(provider.effect_count(OpId::new(1)), 1);
 
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert!(obligations.is_empty());
         assert_eq!(provider.effect_count(OpId::new(1)), 1);
@@ -860,8 +829,9 @@ mod tests {
 
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert!(obligations.is_empty());
         // Query found the effect; no duplicate dispatch.
@@ -889,8 +859,9 @@ mod tests {
 
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert!(obligations.is_empty());
         // Query found nothing; reconcile dispatched.
@@ -919,8 +890,9 @@ mod tests {
 
         let mut w = recover(&coord);
         let adapter = AdapterModel::resume(&coord);
-        let obligations =
-            adapter.reconcile(&mut w, &mut coord, &mut provider).unwrap();
+        let obligations = adapter
+            .reconcile(&mut w, &mut coord, &mut provider)
+            .unwrap();
 
         assert_eq!(obligations.len(), 1);
         assert_eq!(obligations[0].op, OpId::new(1));

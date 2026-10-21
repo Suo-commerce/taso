@@ -69,12 +69,16 @@ pub fn valid_key(key: &str) -> bool {
             !c.is_empty()
                 && c != "."
                 && c != ".."
-                && c.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         })
 }
 
 fn bad_key(key: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidInput, format!("invalid object key {key:?}"))
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid object key {key:?}"),
+    )
 }
 
 /// An [`ObjectStore`] in a local directory.
@@ -149,7 +153,9 @@ impl ObjectStore for LocalStore {
             };
             for entry in entries {
                 let entry = entry?;
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
                 if name.starts_with(TMP_PREFIX) {
                     continue;
                 }
@@ -189,7 +195,9 @@ pub struct ZfsSend {
 
 impl Default for ZfsSend {
     fn default() -> Self {
-        Self { program: PathBuf::from("zfs") }
+        Self {
+            program: PathBuf::from("zfs"),
+        }
     }
 }
 
@@ -201,9 +209,16 @@ impl Sender for ZfsSend {
             cmd.arg("-i").arg(f);
         }
         cmd.arg(dataset.seal_snapshot(to));
-        let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
         let stdout = child.stdout.take().expect("piped");
-        Ok(Box::new(ChildReader { child: Some(child), stdout }))
+        Ok(Box::new(ChildReader {
+            child: Some(child),
+            stdout,
+        }))
     }
 }
 
@@ -225,7 +240,10 @@ impl Read for ChildReader {
                 }
                 let status = child.wait()?;
                 if !status.success() {
-                    return Err(io::Error::other(format!("zfs send failed ({status}): {}", err.trim())));
+                    return Err(io::Error::other(format!(
+                        "zfs send failed ({status}): {}",
+                        err.trim()
+                    )));
                 }
             }
         }
@@ -250,7 +268,11 @@ mod tests {
 
     #[test]
     fn keys_are_validated() {
-        for ok in ["a", "a/b.c", "vessels/ab12/pack/00000000000000000001-00000000000000000000-00000000000000000000"] {
+        for ok in [
+            "a",
+            "a/b.c",
+            "vessels/ab12/pack/00000000000000000001-00000000000000000000-00000000000000000000",
+        ] {
             assert!(valid_key(ok), "{ok}");
         }
         for bad in ["", "/a", "a/", "a//b", "a/../b", "./a", "a b", "a\\b"] {
@@ -269,13 +291,23 @@ mod tests {
         assert!(!store.exists("a/b").unwrap());
         assert_eq!(store.put("a/b", &mut &b"hello"[..]).unwrap(), 5);
         let mut v = Vec::new();
-        store.get("a/b").unwrap().unwrap().read_to_end(&mut v).unwrap();
+        store
+            .get("a/b")
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut v)
+            .unwrap();
         assert_eq!(v, b"hello");
         assert!(store.exists("a/b").unwrap());
         // A second put replaces the object whole.
         store.put("a/b", &mut &b"bye"[..]).unwrap();
         let mut v = Vec::new();
-        store.get("a/b").unwrap().unwrap().read_to_end(&mut v).unwrap();
+        store
+            .get("a/b")
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut v)
+            .unwrap();
         assert_eq!(v, b"bye");
     }
 
@@ -283,12 +315,22 @@ mod tests {
     fn list_returns_every_key_under_a_prefix_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path());
-        for k in ["v/ab/pack/00000000000000000010", "v/ab/pack/00000000000000000002", "v/ab/fs/x.meta", "v/abc/pack/1", "w/1"] {
+        for k in [
+            "v/ab/pack/00000000000000000010",
+            "v/ab/pack/00000000000000000002",
+            "v/ab/fs/x.meta",
+            "v/abc/pack/1",
+            "w/1",
+        ] {
             store.put(k, &mut &b"x"[..]).unwrap();
         }
         assert_eq!(
             store.list("v/ab").unwrap(),
-            vec!["v/ab/fs/x.meta", "v/ab/pack/00000000000000000002", "v/ab/pack/00000000000000000010"],
+            vec![
+                "v/ab/fs/x.meta",
+                "v/ab/pack/00000000000000000002",
+                "v/ab/pack/00000000000000000010"
+            ],
         );
         // `v/ab` is a directory boundary: `v/abc` is not under it.
         assert_eq!(store.list("v/ab/pack").unwrap().len(), 2);
@@ -304,7 +346,11 @@ mod tests {
         let store = LocalStore::new(dir.path());
         store.put("v/a/1", &mut &b"x"[..]).unwrap();
         // A put in progress (or one a crash left behind).
-        fs::write(dir.path().join("v/a").join(format!("{TMP_PREFIX}9-9")), b"partial").unwrap();
+        fs::write(
+            dir.path().join("v/a").join(format!("{TMP_PREFIX}9-9")),
+            b"partial",
+        )
+        .unwrap();
         // A file put() could never have made.
         fs::write(dir.path().join("v/a/has space"), b"?").unwrap();
         assert_eq!(store.list("v/a").unwrap(), vec!["v/a/1"]);
