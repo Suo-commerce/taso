@@ -1245,6 +1245,29 @@ mod tests {
             }
         }
 
+        /// Copy the host program `prog` into `root` at `prog`'s own path
+        /// (not where a symlink at that path points: on a host whose
+        /// coreutils are links into another package, the target's path does
+        /// not exist inside the Vessel), and the libraries `ldd` names at
+        /// theirs.  The file is copied under the name it is called by, which
+        /// is also what a multi-call binary dispatches on.
+        fn add_binary(root: &Path, prog: &str) {
+            let real = std::fs::canonicalize(prog).unwrap();
+            let ldd = Command::new("ldd").arg(&real).output().unwrap();
+            let libs = String::from_utf8_lossy(&ldd.stdout)
+                .split_whitespace()
+                .filter(|t| t.starts_with('/'))
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            let to = |f: &Path| root.join(f.strip_prefix("/").unwrap());
+            let copies = std::iter::once((real.clone(), to(Path::new(prog))))
+                .chain(libs.iter().map(|l| (l.clone(), to(l))));
+            for (from, dst) in copies {
+                std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+                std::fs::copy(&from, &dst).unwrap();
+            }
+        }
+
         const AGENT: &str = r#"
 echo work-ok > /work/out
 if (echo x > /escape) 2>/dev/null; then echo root-rw >> /work/out; else echo root-ro >> /work/out; fi
@@ -1417,6 +1440,190 @@ while read l; do echo "$l"; done < /proc/self/status > /work/status
             assert_eq!(runc.state(&spec.id).unwrap(), None);
             let (ok, _) = agent.join().unwrap().unwrap();
             assert!(!ok, "a swept agent was killed, it did not exit cleanly");
+        }
+
+        /// A loop-mounted ext4, unmounted and detached on drop (also when
+        /// the test fails).
+        struct LoopFs {
+            mnt: PathBuf,
+            dev: String,
+        }
+
+        impl LoopFs {
+            fn new(img: &Path, mnt: &Path) -> Self {
+                let ok = |c: &mut Command| {
+                    let o = c.output().unwrap();
+                    assert!(
+                        o.status.success(),
+                        "{c:?}: {}",
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                };
+                std::fs::File::create(img)
+                    .unwrap()
+                    .set_len(256 << 20)
+                    .unwrap();
+                ok(Command::new("mkfs.ext4").args(["-q", "-F"]).arg(img));
+                let dev = ok(Command::new("losetup").args(["--find", "--show"]).arg(img));
+                std::fs::create_dir_all(mnt).unwrap();
+                let fs = LoopFs {
+                    mnt: mnt.to_path_buf(),
+                    dev,
+                };
+                ok(Command::new("mount").arg(&fs.dev).arg(mnt));
+                fs
+            }
+        }
+
+        impl Drop for LoopFs {
+            fn drop(&mut self) {
+                let _ = Command::new("umount").arg(&self.mnt).status();
+                let _ = Command::new("losetup").args(["-d", &self.dev]).status();
+            }
+        }
+
+        /// F6 step 2: a Vessel in slot B runs under real runc over files a
+        /// parent in slot A left on an ext4, through `oci_config`'s idmapped
+        /// `/work`.  Predictions (written before the first run, 2026-10-21):
+        ///
+        /// - Q1 runc 1.4 accepts the mount mapping (`ridmap`) next to the
+        ///   container's own user namespace; the agent exits 0.
+        /// - Q2 inside, `/work` shows as 0:0 and `home/notes` as 1000:1000.
+        /// - Q3 the container's root creates `/work/new`; on disk it is A+0.
+        /// - Q4 host root's file shows as 65534:65534 and is not writable.
+        /// - Q5 the container's uid_map is `0 B 65536`, untouched.
+        /// - Q6 the container's root (no capabilities) cannot write into
+        ///   `home/` (1000's, 0755): a fork gets a birth's powers, no more.
+        /// - Q7 nothing on disk was re-owned: no chown pass happened.
+        #[test]
+        #[ignore = "needs runc, root, mkfs.ext4 and a loop device"]
+        fn fork_in_another_slot_runs_over_parents_files_under_runc() {
+            const A: u32 = 200_000 + ID_RANGE; // slot 1: the parent
+            const B: u32 = 200_000 + 2 * ID_RANGE; // slot 2: the child
+            const OVERFLOW: u32 = 65534;
+
+            let dir = tempfile::tempdir().unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            let rootfs = dir.path().join("rootfs");
+            tiny_rootfs(&rootfs);
+            add_binary(&rootfs, "/usr/bin/stat");
+            let disk = LoopFs::new(&dir.path().join("disk.img"), &dir.path().join("disk"));
+            let work = disk.mnt.clone();
+
+            // The parent's files, as a Vessel in slot A leaves them.
+            let own = |p: &Path, id: u32, mode: u32| {
+                std::os::unix::fs::chown(p, Some(id), Some(id)).unwrap();
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+            };
+            own(&work, A, 0o750);
+            std::fs::create_dir(work.join("home")).unwrap();
+            own(&work.join("home"), A + 1000, 0o755);
+            std::fs::write(work.join("home/notes"), b"parent\n").unwrap();
+            own(&work.join("home/notes"), A + 1000, 0o644);
+            std::fs::write(work.join("rootfile"), b"host\n").unwrap();
+            own(&work.join("rootfile"), 0, 0o644);
+            let before: Vec<(PathBuf, u32, u32)> = ["", "home", "home/notes", "rootfile"]
+                .iter()
+                .map(|r| {
+                    let m = std::fs::symlink_metadata(work.join(r)).unwrap();
+                    (work.join(r), m.uid(), m.gid())
+                })
+                .collect();
+
+            let sock = dir.path().join("field.sock");
+            let _listener = UnixListener::bind(&sock).unwrap();
+            let agent = r#"
+o=/work/out
+: > $o
+if stat -c %u /work >/dev/null 2>/work/stat.err; then echo "stat ok" >> $o; else echo "stat broken" >> $o; fi
+echo "work $(stat -c %u:%g /work)" >> $o
+echo "home $(stat -c %u:%g /work/home)" >> $o
+echo "notes $(stat -c %u:%g /work/home/notes)" >> $o
+echo "rootfile $(stat -c %u:%g /work/rootfile)" >> $o
+if (echo x >> /work/rootfile) 2>/dev/null; then echo "rootfile-write yes" >> $o; else echo "rootfile-write no" >> $o; fi
+if (echo x > /work/home/by-child) 2>/dev/null; then echo "home-write yes" >> $o; else echo "home-write no" >> $o; fi
+echo child > /work/new && echo "new $(stat -c %u:%g /work/new)" >> $o
+while read a b c; do echo "uidmap $a $b $c" >> $o; done < /proc/self/uid_map
+"#;
+            let spec = VesselSpec {
+                id: format!("taso-f6-{}", std::process::id()),
+                rootfs,
+                work: work.clone(),
+                socket: sock,
+                host_uid_base: B,
+                disk_uid_base: Some(A),
+                args: vec!["/bin/sh".into(), "-c".into(), agent.into()],
+                env: vec![],
+                landlock_shim: None,
+                memory_bytes: Some(256 << 20),
+                pids: Some(64),
+            };
+            let bundle = dir.path().join("bundle");
+            write_bundle(&bundle, &spec).unwrap();
+            let runc = Runc::new(RuncCli::new(dir.path().join("runc-state")));
+            let (ok, err) = runc.run(&bundle, &spec.id).unwrap();
+            let _ = runc.delete(&spec.id);
+            assert!(ok, "Q1 missed: runc refused or the agent failed: {err}");
+
+            let out = std::fs::read_to_string(work.join("out")).unwrap();
+            println!("inside the Vessel:\n{out}");
+            let get = |k: &str| {
+                out.lines()
+                    .find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix(' ')))
+                    .unwrap_or_else(|| panic!("no {k:?} line"))
+                    .to_string()
+            };
+            // A broken tool inside the Vessel is the test's own failure, not
+            // a missed prediction: say so, with what stat printed.
+            assert_eq!(
+                get("stat"),
+                "ok",
+                "test setup: stat does not run inside the Vessel: {}",
+                std::fs::read_to_string(work.join("stat.err")).unwrap_or_default()
+            );
+            assert_eq!(get("work"), "0:0", "Q2: /work as the child's root");
+            assert_eq!(
+                get("notes"),
+                "1000:1000",
+                "Q2: the parent's 1000 as the child's"
+            );
+            assert_eq!(get("new"), "0:0", "Q3: created as the child's root");
+            let disk_new = std::fs::metadata(work.join("new")).unwrap();
+            assert_eq!(
+                (disk_new.uid(), disk_new.gid()),
+                (A, A),
+                "Q3: on disk, the parent's range"
+            );
+            assert_eq!(
+                get("rootfile"),
+                format!("{OVERFLOW}:{OVERFLOW}"),
+                "Q4: unmapped"
+            );
+            assert_eq!(
+                get("rootfile-write"),
+                "no",
+                "Q4: host root's file not writable"
+            );
+            assert_eq!(
+                std::fs::read(work.join("rootfile")).unwrap(),
+                b"host\n",
+                "Q4"
+            );
+            assert_eq!(get("uidmap"), format!("0 {B} {ID_RANGE}"), "Q5");
+            assert_eq!(get("home-write"), "no", "Q6: no more than a birth");
+            assert!(!work.join("home/by-child").exists(), "Q6");
+            for (p, uid, gid) in &before {
+                let m = std::fs::symlink_metadata(p).unwrap();
+                assert_eq!(
+                    (m.uid(), m.gid()),
+                    (*uid, *gid),
+                    "Q7: {} re-owned",
+                    p.display()
+                );
+            }
+            drop(disk);
         }
     }
 }
