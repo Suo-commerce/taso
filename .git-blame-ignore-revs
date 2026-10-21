@@ -1,0 +1,6 @@
+# Commits git blame skips: whole-tree mechanical changes, never a
+# change in behaviour.  GitHub reads this file; locally, once per clone:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# cargo fmt --all: the workspace in rustfmt's default style (2026-10-21)
+ecd5e31b5dac9c74f1599c33b6facc3e6fe4ca5b
