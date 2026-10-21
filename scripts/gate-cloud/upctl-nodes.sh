@@ -3,15 +3,19 @@
 # taso-b, ...) from a terminal instead of the console.  Runs where your
 # UpCloud credentials are (the laptop), never on a gate node.
 #
+#   export UPCLOUD_TOKEN=$(cat ~/.config/upcloud-token)
 #   scripts/gate-cloud/upctl-nodes.sh check
 #   scripts/gate-cloud/upctl-nodes.sh create a b       # taso-a, taso-b
 #   scripts/gate-cloud/upctl-nodes.sh list
 #   scripts/gate-cloud/upctl-nodes.sh delete a b       # shows what it would delete
 #   scripts/gate-cloud/upctl-nodes.sh delete --yes a b # deletes them
 #
-# Needs upctl (UpCloud's CLI, 3.x) logged in, either `upctl account login
-# --with-token` (system keyring) or UPCLOUD_TOKEN in the environment, and
-# jq.  The token never goes to a node, the repo or a chat.
+# Needs upctl (UpCloud's CLI, 3.x; 3.37.0 checked) and jq.  The API token
+# (UpCloud Hub -> API tokens) lives in ~/.config/upcloud-token, mode 600,
+# and is given to upctl as UPCLOUD_TOKEN: it never goes to a node, the repo
+# or a chat.  (`upctl account login --with-token` also works, but it reads
+# the token from stdin without a prompt and stores it in the system
+# keyring, marked experimental in upctl; on 2026-10-21 it looked stuck.)
 #
 # What it does, and why (lessons of 2026-10-20/21):
 #   create  One server per name: hostname taso-<name>, title "taso gate
@@ -66,7 +70,7 @@ preflight() {
     command -v "$UPCTL" >/dev/null || die "upctl not found (UpCloud's CLI: github.com/UpCloudLtd/upcloud-cli)"
     command -v jq >/dev/null || die "jq not found"
     "$UPCTL" version >/dev/null 2>&1 || die "upctl does not run"
-    "$UPCTL" account show >/dev/null 2>&1 || die "upctl is not logged in: upctl account login --with-token (or set UPCLOUD_TOKEN)"
+    "$UPCTL" account show >/dev/null 2>&1 || die "upctl has no credentials: export UPCLOUD_TOKEN=\$(cat ~/.config/upcloud-token)"
 }
 
 resolve_plan() {
