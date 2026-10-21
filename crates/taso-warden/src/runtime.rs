@@ -366,10 +366,52 @@ pub fn check_rootfs(rootfs: &Path) -> Vec<String> {
 /// Anything else is refused with `PermissionDenied` and **nothing is
 /// changed**: another Vessel's range (a slot that changed, or a dataset that
 /// is not this Vessel's), a stray owner, or a fork from a parent in another
-/// slot (whose files are the parent's range).  A path that is not a plain
-/// directory (a symlink included) is refused with `InvalidInput`.
+/// slot (whose files are the parent's range: see [`work_dir_range`]).  A
+/// path that is not a plain directory (a symlink included) is refused with
+/// `InvalidInput`.
 pub fn prepare_work_dir(work: &Path, host_uid_base: u32) -> io::Result<()> {
+    work_dir_range(work, host_uid_base, None).map(|_| ())
+}
+
+/// [`prepare_work_dir`] for a Vessel that may run over files of another
+/// range, and which range they are: the `disk_uid_base` to run it with
+/// ([`VesselSpec::disk_uid_base`]).
+///
+/// `inherited` is the disk range of the Vessel's lineage when it is a fork
+/// or succession (its parent's, checked by the caller against the lineage),
+/// `None` for a Vessel born from the void.  The top directory's owner now
+/// marks the dataset's **disk range**, set once when it is first prepared
+/// and never changed (fencing review F6, decisions D2/D3 of 2026-10-21):
+/// - fresh (0:0): prepared into the Vessel's own range as before, mode 0750;
+///   returns `host_uid_base`.  A fork of its parent's birth Seal is fresh,
+///   so it becomes its own and needs no idmapping;
+/// - owned by exactly `host_uid_base`: returns `host_uid_base`, unchanged;
+/// - owned by exactly the `inherited` range: returns it, and **nothing on
+///   disk is changed** (not the owner, not the mode): the work mount is
+///   idmapped instead;
+/// - anything else: refused with `PermissionDenied`, nothing changed.
+///
+/// An `inherited` range that is 0, wraps, or partly overlaps the Vessel's
+/// own is refused with `InvalidInput` before anything is read (the same
+/// rule as [`oci_config`]); one equal to `host_uid_base` is the same as
+/// `None`.
+pub fn work_dir_range(work: &Path, host_uid_base: u32, inherited: Option<u32>) -> io::Result<u32> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let usable = |b: u32| b != 0 && b.checked_add(ID_RANGE).is_some();
+    let inherited = match inherited {
+        Some(d) if d != host_uid_base => {
+            if !usable(d) || d.abs_diff(host_uid_base) < ID_RANGE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "inherited uid range {d} is not usable next to this Vessel's ({host_uid_base})"
+                    ),
+                ));
+            }
+            Some(d)
+        }
+        _ => None,
+    };
     let m = std::fs::symlink_metadata(work)?;
     if !m.file_type().is_dir() {
         return Err(io::Error::new(
@@ -381,20 +423,27 @@ pub fn prepare_work_dir(work: &Path, host_uid_base: u32) -> io::Result<()> {
         ));
     }
     let (uid, gid) = (m.uid(), m.gid());
-    let fresh = uid == 0 && gid == 0;
-    let ours = uid == host_uid_base && gid == host_uid_base;
-    if !fresh && !ours {
+    let is = |b: u32| uid == b && gid == b;
+    if let Some(d) = inherited.filter(|d| is(*d)) {
+        return Ok(d);
+    }
+    if !is(0) && !is(host_uid_base) {
+        let lineage = match inherited {
+            Some(d) => format!(", nor its lineage's ({d})"),
+            None => String::new(),
+        };
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} is owned by {uid}:{gid}, not by this Vessel's range ({host_uid_base}) nor fresh (0:0): \
+                "{} is owned by {uid}:{gid}, not by this Vessel's range ({host_uid_base}){lineage} nor fresh (0:0): \
                  another Vessel's dataset, or its uid_slot changed; refusing to run it here",
                 work.display()
             ),
         ));
     }
     std::os::unix::fs::chown(work, Some(host_uid_base), Some(host_uid_base))?;
-    std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o750))
+    std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o750))?;
+    Ok(host_uid_base)
 }
 
 /// Write `config.json` for `spec` into `bundle` (created if missing).
@@ -1196,6 +1245,117 @@ mod tests {
             prepare_work_dir(dir.path(), 200_000).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    // ── work_dir_range: forks over their lineage's range (F6 step 3a) ──
+
+    /// Slot 1 (a parent: the lineage's disk range), slot 2 (its child),
+    /// slot 3 (anyone else), over the deploy base 200000.
+    const PARENT: u32 = 200_000 + ID_RANGE;
+    const CHILD: u32 = 200_000 + 2 * ID_RANGE;
+    const OTHER: u32 = 200_000 + 3 * ID_RANGE;
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn inherited_range_is_checked_before_anything_is_read() {
+        let missing = Path::new("/nonexistent/taso-f6");
+        for d in [0, u32::MAX - 10, CHILD - 1, CHILD + ID_RANGE - 1] {
+            assert_eq!(
+                work_dir_range(missing, CHILD, Some(d)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "inherited {d}"
+            );
+        }
+        // A good range, or the Vessel's own (= None): the path is read.
+        for d in [Some(PARENT), Some(CHILD), None] {
+            assert_eq!(
+                work_dir_range(missing, CHILD, d).unwrap_err().kind(),
+                io::ErrorKind::NotFound,
+                "{d:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "needs root"]
+    fn fork_runs_over_its_lineages_range_and_nothing_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(running_as_root(), "run as root");
+        let dir = tempfile::tempdir().unwrap();
+        // As the parent left it; an unusual mode, to see it is not touched.
+        std::os::unix::fs::chown(dir.path(), Some(PARENT), Some(PARENT)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                work_dir_range(dir.path(), CHILD, Some(PARENT)).unwrap(),
+                PARENT
+            );
+            assert_eq!(owner(dir.path()), (PARENT, PARENT), "owner unchanged");
+            assert_eq!(mode(dir.path()), 0o700, "mode unchanged");
+        }
+        // Without the lineage it is another range's dataset, as before.
+        assert_eq!(
+            work_dir_range(dir.path(), CHILD, None).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            prepare_work_dir(dir.path(), CHILD).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(owner(dir.path()), (PARENT, PARENT));
+    }
+
+    #[test]
+    #[ignore = "needs root"]
+    fn fork_of_a_birth_seal_becomes_its_own() {
+        assert!(running_as_root(), "run as root");
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
+        assert_eq!(
+            work_dir_range(dir.path(), CHILD, Some(PARENT)).unwrap(),
+            CHILD
+        );
+        assert_eq!(owner(dir.path()), (CHILD, CHILD));
+        assert_eq!(mode(dir.path()), 0o750);
+        // From then on it is the child's own: accepted with or without the
+        // lineage, and the parent's range no longer matches it.
+        assert_eq!(
+            work_dir_range(dir.path(), CHILD, Some(PARENT)).unwrap(),
+            CHILD
+        );
+        assert_eq!(work_dir_range(dir.path(), CHILD, None).unwrap(), CHILD);
+        assert_eq!(owner(dir.path()), (CHILD, CHILD));
+    }
+
+    #[test]
+    #[ignore = "needs root"]
+    fn a_fork_refuses_any_other_range_and_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(running_as_root(), "run as root");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (uid, gid) in [
+            (OTHER, OTHER), // a third range: not this lineage's
+            (PARENT, 0),    // half the parent's
+            (0, PARENT),
+            (PARENT, CHILD), // mixed
+            (CHILD, PARENT),
+        ] {
+            std::os::unix::fs::chown(dir.path(), Some(uid), Some(gid)).unwrap();
+            assert_eq!(
+                work_dir_range(dir.path(), CHILD, Some(PARENT))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied,
+                "{uid}:{gid}"
+            );
+            assert_eq!(owner(dir.path()), (uid, gid), "{uid}:{gid} unchanged");
+            assert_eq!(mode(dir.path()), 0o700, "{uid}:{gid} mode unchanged");
+        }
     }
 
     #[test]
