@@ -43,7 +43,12 @@
 //!    it is one call — once the ownership moved, the instruction no
 //!    longer matches and refuses itself, so a daemon restarted with it
 //!    left in cannot fence anyone again (fencing review F2).  An entry
-//!    naming this Warden as the holder is spent and ignored.
+//!    naming this Warden as the holder is spent and ignored.  A takeover
+//!    for a Vessel nobody holds (the coordinator does not know it, or its
+//!    birth never finished) is refused, not turned into a birth: the
+//!    operator expected an existing Vessel, and starting an empty one
+//!    there would hide a wrong coordinator or a wrong node (decided
+//!    2026-10-21).  Without the takeover it is born as usual.
 //! 2. **Settle the state** ([`settle`]).  A Vessel with no Seal takes its
 //!    birth Seal (turn 0, [`Vessel::seal_birth`]) before anything else:
 //!    every Vessel has a Seal before its agent first runs.  Then the
@@ -1072,10 +1077,23 @@ pub enum Known {
 }
 
 /// How the Vessel starts (see the module docs).  A takeover must name
-/// the ownership read, exactly; one that names this Warden is spent.
+/// the ownership read, exactly; one that names this Warden is spent; one
+/// for a Vessel nobody holds is refused.
 pub fn decide(known: Known, local_state: bool, me: WardenId, takeover: Option<TakeOver>) -> Start {
     match known {
-        Known::No | Known::Unborn => Start::Birth,
+        Known::No | Known::Unborn => match takeover {
+            None => Start::Birth,
+            Some(t) => Start::Refuse(format!(
+                "takeover names Warden {} at epoch {}, but nobody holds the Vessel ({}): nothing to take over, nothing started; without \"takeover\" it is born here",
+                t.holder.get(),
+                t.epoch.get(),
+                if known == Known::No {
+                    "the coordinator does not know it"
+                } else {
+                    "its birth never finished"
+                }
+            )),
+        },
         Known::Held(holder, epoch) if holder != me => match takeover {
             None => Start::Refuse(format!(
                 "held by Warden {} at epoch {}; to fence it and take the Vessel over, set \"takeover\": {{\"holder\": {}, \"epoch\": {}}}",
@@ -2973,10 +2991,24 @@ mod tests {
             holder: me,
             epoch: e3,
         });
+        // Nobody holds it: born, unless a takeover expected a holder
+        // (decided 2026-10-21: refused, never an empty Vessel instead).
         for local in [false, true] {
-            for takeover in [None, exact, stale] {
-                assert_eq!(decide(Known::No, local, me, takeover), Start::Birth);
-                assert_eq!(decide(Known::Unborn, local, me, takeover), Start::Birth);
+            assert_eq!(decide(Known::No, local, me, None), Start::Birth);
+            assert_eq!(decide(Known::Unborn, local, me, None), Start::Birth);
+            for takeover in [exact, stale, wrong, spent] {
+                for (known, why_part) in [
+                    (Known::No, "the coordinator does not know it"),
+                    (Known::Unborn, "its birth never finished"),
+                ] {
+                    let Start::Refuse(why) = decide(known, local, me, takeover) else {
+                        panic!("{known:?} {takeover:?}")
+                    };
+                    assert!(
+                        why.contains("nobody holds the Vessel") && why.contains(why_part),
+                        "{why}"
+                    );
+                }
             }
         }
         // Mine: any takeover entry is spent or irrelevant.
