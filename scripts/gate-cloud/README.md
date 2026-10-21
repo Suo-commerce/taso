@@ -174,22 +174,32 @@ FI-HEL2); every address below is a utility address.
 
 ## Creating a node
 
-1. Console → **Deploy server**: Ubuntu 26.04 (kernel 7.0 has ublk), the
-   same plan as taso-test, zone FI-HEL1, your SSH key.  Click deploy
-   **once** and check the server list afterwards: the button fired twice
-   on 2026-10-20, and the duplicates bill hourly too.
-2. From the hub, note the node's utility address and check you can log in
-   (the prompt still shows the image's hostname until the role sets it):
-   ```
-   ssh root@<node public ip> 'ip -br -4 addr | grep " 10\."; uname -r'
-   ```
-3. On the node, first the security updates (a fresh image predates them:
-   the emSign root removed from `ca-certificates`, 2026-10-21), then the
-   repo:
-   ```
-   apt-get update -q && apt-get upgrade -y -q
-   git clone https://github.com/Suo-commerce/taso.git /root/taso
-   ```
+From the laptop, with `scripts/gate-cloud/upctl-nodes.sh` (UpCloud's CLI
+`upctl` and `jq` installed; the API token from UpCloud Hub → API tokens in
+`~/.config/upcloud-token`, mode 600):
+```
+export UPCLOUD_TOKEN=$(cat ~/.config/upcloud-token)
+scripts/gate-cloud/upctl-nodes.sh check        # read-only: plan, template, key
+scripts/gate-cloud/upctl-nodes.sh create a b   # taso-a, taso-b
+```
+It creates each node with the hub's plan, Ubuntu 26.04 and your key, and
+a first-boot script that installs the security updates (a fresh image
+predates them: the emSign root removed from `ca-certificates`,
+2026-10-21).  It refuses a name that exists and checks that exactly one
+server was made (the console's deploy button fired twice on 2026-10-20).
+It prints each node's public and utility address.  `list` shows the gate
+nodes; `delete a b` shows what it would delete, `delete --yes a b`
+deletes them (gate nodes only, by UUID; the hub never).
+
+Then, on each node, the repo:
+```
+git clone https://github.com/Suo-commerce/taso.git /root/taso
+```
+
+By hand instead (the console): Deploy server, Ubuntu 26.04, the hub's
+plan, FI-HEL1, your SSH key; click deploy **once** and check the server
+list for duplicates; on the node `apt-get update -q && apt-get upgrade -y
+-q` before anything else.
 
 ## Setting up (as root, from `/root/taso`)
 
