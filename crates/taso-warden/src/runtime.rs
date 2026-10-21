@@ -1245,20 +1245,26 @@ mod tests {
             }
         }
 
-        /// Copy the host program `prog` and the libraries `ldd` names into
-        /// `root`, at the same paths.
+        /// Copy the host program `prog` into `root` at `prog`'s own path
+        /// (not where a symlink at that path points: on a host whose
+        /// coreutils are links into another package, the target's path does
+        /// not exist inside the Vessel), and the libraries `ldd` names at
+        /// theirs.  The file is copied under the name it is called by, which
+        /// is also what a multi-call binary dispatches on.
         fn add_binary(root: &Path, prog: &str) {
-            let p = std::fs::canonicalize(prog).unwrap();
-            let ldd = Command::new("ldd").arg(&p).output().unwrap();
+            let real = std::fs::canonicalize(prog).unwrap();
+            let ldd = Command::new("ldd").arg(&real).output().unwrap();
             let libs = String::from_utf8_lossy(&ldd.stdout)
                 .split_whitespace()
                 .filter(|t| t.starts_with('/'))
                 .map(PathBuf::from)
                 .collect::<Vec<_>>();
-            for f in std::iter::once(&p).chain(&libs) {
-                let dst = root.join(f.strip_prefix("/").unwrap());
+            let to = |f: &Path| root.join(f.strip_prefix("/").unwrap());
+            let copies = std::iter::once((real.clone(), to(Path::new(prog))))
+                .chain(libs.iter().map(|l| (l.clone(), to(l))));
+            for (from, dst) in copies {
                 std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
-                std::fs::copy(f, dst).unwrap();
+                std::fs::copy(&from, &dst).unwrap();
             }
         }
 
@@ -1531,6 +1537,7 @@ while read l; do echo "$l"; done < /proc/self/status > /work/status
             let agent = r#"
 o=/work/out
 : > $o
+if stat -c %u /work >/dev/null 2>/work/stat.err; then echo "stat ok" >> $o; else echo "stat broken" >> $o; fi
 echo "work $(stat -c %u:%g /work)" >> $o
 echo "home $(stat -c %u:%g /work/home)" >> $o
 echo "notes $(stat -c %u:%g /work/home/notes)" >> $o
@@ -1568,6 +1575,14 @@ while read a b c; do echo "uidmap $a $b $c" >> $o; done < /proc/self/uid_map
                     .unwrap_or_else(|| panic!("no {k:?} line"))
                     .to_string()
             };
+            // A broken tool inside the Vessel is the test's own failure, not
+            // a missed prediction: say so, with what stat printed.
+            assert_eq!(
+                get("stat"),
+                "ok",
+                "test setup: stat does not run inside the Vessel: {}",
+                std::fs::read_to_string(work.join("stat.err")).unwrap_or_default()
+            );
             assert_eq!(get("work"), "0:0", "Q2: /work as the child's root");
             assert_eq!(
                 get("notes"),
