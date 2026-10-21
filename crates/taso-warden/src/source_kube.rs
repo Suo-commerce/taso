@@ -62,16 +62,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
-use taso_core::envelope::Epoch;
+use taso_core::envelope::{Epoch, Lsn};
 use taso_core::model::WardenId;
 use taso_core::record::Namespace;
 
 use crate::daemon::{
-    check_env, check_quiescence, valid_kube_namespace, KubeSourceConf, Restart, RuntimeConf,
-    TakeOver, VesselConf, VesselRuntime,
+    check_env, check_quiescence, valid_kube_namespace, ForkConf, KubeSourceConf, Restart,
+    RuntimeConf, TakeOver, VesselConf, VesselRuntime,
 };
 use crate::kube::{valid_name, Kube, KubeError, Resource};
 use crate::source::{SourceError, VesselKey, VesselSource};
+use crate::vessel::SealAt;
 
 /// The `Vessel` resource (`deploy/k8s/vessel-crd.yaml`).
 pub const VESSELS: Resource = Resource {
@@ -284,6 +285,7 @@ impl<L: ListVessels> KubeSource<L> {
                 "uidSlot",
                 "node",
                 "takeover",
+                "fork",
                 "rootfs",
                 "args",
                 "env",
@@ -328,6 +330,11 @@ impl<L: ListVessels> KubeSource<L> {
         let takeover = match spec.get("takeover") {
             None | Some(Value::Null) => None,
             Some(t) => Some(takeover(t)?),
+        };
+        // A fork (F6): its parent is a subject of the same tenant.
+        let fork = match spec.get("fork") {
+            None | Some(Value::Null) => None,
+            Some(f) => Some(fork(f, subject)?),
         };
 
         // D2.
@@ -397,7 +404,7 @@ impl<L: ListVessels> KubeSource<L> {
         }
 
         let vc = VesselConf {
-            fork: None, // Kubernetes forks: not yet (the CRD has no field)
+            fork,
             namespace: tenant,
             subject: subject.to_string(),
             takeover,
@@ -475,6 +482,35 @@ fn object_ref(item: &Value) -> Result<ObjectRef, String> {
         name: name.into(),
         uid: uid.into(),
         generation,
+    })
+}
+
+/// `spec.fork`: `{"parent": <subject>, "seal": "last" | "<lsn>"}`, `seal`
+/// defaulting to "last" (the CRD's shape; the daemon's own config takes the
+/// lsn as a number).  A Vessel is never its own parent.
+fn fork(v: &Value, subject: &str) -> Result<ForkConf, String> {
+    let o = v.as_object().ok_or("spec.fork must be {parent, seal}")?;
+    known_keys(o, "spec.fork", &["parent", "seal"])?;
+    let parent = o
+        .get("parent")
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty() && p.len() <= 256)
+        .ok_or("spec.fork.parent must be a subject of 1 to 256 bytes")?;
+    if parent == subject {
+        return Err("spec.fork.parent is the Vessel itself".into());
+    }
+    let seal = match o.get("seal") {
+        None | Some(Value::Null) => SealAt::Last,
+        Some(Value::String(s)) if s == "last" => SealAt::Last,
+        Some(Value::String(s)) => match s.parse::<u64>() {
+            Ok(l) if l >= 1 && !s.starts_with('0') => SealAt::At(Lsn::new(l)),
+            _ => return Err("spec.fork.seal must be \"last\" or an lsn of at least 1".into()),
+        },
+        Some(_) => return Err("spec.fork.seal must be \"last\" or an lsn of at least 1".into()),
+    };
+    Ok(ForkConf {
+        parent: parent.to_string(),
+        seal,
     })
 }
 
@@ -771,6 +807,52 @@ mod tests {
         let rt = vc.runtime.unwrap();
         assert_eq!((rt.memory_bytes, rt.pids), (Some(256 << 20), Some(512)));
         assert_eq!((rt.env, rt.quiescence), (Some(vec![]), Some(vec![])));
+    }
+
+    /// spec.fork (F6): the parent's subject and which Seal, "last" by
+    /// default; the same ForkConf as the daemon's static config.
+    #[test]
+    fn a_fork_resource_becomes_a_forked_vessel() {
+        let f = fixture();
+        assert_eq!(one(&f, json!({})).unwrap().fork, None);
+        for (fork, want) in [
+            (json!({ "parent": "p" }), SealAt::Last),
+            (json!({ "parent": "p", "seal": "last" }), SealAt::Last),
+            (
+                json!({ "parent": "p", "seal": "12" }),
+                SealAt::At(Lsn::new(12)),
+            ),
+        ] {
+            let vc = one(&f, json!({ "fork": fork.clone() })).unwrap();
+            assert_eq!(
+                vc.fork,
+                Some(ForkConf {
+                    parent: "p".into(),
+                    seal: want
+                }),
+                "{fork}"
+            );
+        }
+        for (fork, says) in [
+            (json!("p"), "must be {parent, seal}"),
+            (json!({}), "spec.fork.parent must be"),
+            (json!({ "parent": "" }), "spec.fork.parent must be"),
+            (json!({ "parent": "v1" }), "is the Vessel itself"),
+            (json!({ "parent": "p", "seal": "0" }), "\"last\" or an lsn"),
+            (
+                json!({ "parent": "p", "seal": "007" }),
+                "\"last\" or an lsn",
+            ),
+            (
+                json!({ "parent": "p", "seal": "first" }),
+                "\"last\" or an lsn",
+            ),
+            (json!({ "parent": "p", "seal": 12 }), "\"last\" or an lsn"),
+            (json!({ "parent": "p", "sael": "last" }), "unknown"),
+        ] {
+            let e = one(&f, json!({ "fork": fork.clone() })).unwrap_err();
+            assert!(e.contains(says), "{fork}: {e}");
+        }
     }
 
     #[test]

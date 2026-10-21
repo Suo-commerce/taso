@@ -81,6 +81,9 @@ spec:
             spec:
               type: object
               required: [tenant, subject, uidSlot, node, rootfs, args]
+              x-kubernetes-validations:
+                - rule: has(self.fork) == has(oldSelf.fork)
+                  message: fork is fixed once set (give it when the Vessel is created)
               properties:
                 tenant:
                   type: string
@@ -125,6 +128,32 @@ spec:
                     spec.takeover.
                   minLength: 1
                   maxLength: 253
+                fork:
+                  type: object
+                  description: >-
+                    Fork this Vessel from another of the same tenant instead
+                    of a birth from the void: its first start forks it from
+                    the parent's accepted Seal, read from the parent's log on
+                    this node (the parent must have run on spec.node), and it
+                    runs over the parent's files through an idmapped mount in
+                    its own uidSlot.  Its turns continue the parent's.  Fixed
+                    once set, and only at creation.
+                  required: [parent]
+                  properties:
+                    parent:
+                      type: string
+                      description: The parent's subject (same tenant).
+                      minLength: 1
+                      maxLength: 256
+                    seal:
+                      type: string
+                      description: >-
+                        Which accepted Seal: "last" (the default: the newest
+                        when the fork is made) or an lsn.
+                      pattern: '^(last|[1-9][0-9]{0,18})$'
+                  x-kubernetes-validations:
+                    - rule: self == oldSelf
+                      message: fork is fixed once set
                 takeover:
                   type: object
                   description: >-
