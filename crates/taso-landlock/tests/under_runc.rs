@@ -71,6 +71,7 @@ fn run(shim: bool) -> String {
         work: work.clone(),
         socket: sock,
         host_uid_base: base,
+        disk_uid_base: None,
         args: vec!["/bin/sh".into(), "-c".into(), AGENT.into()],
         env: vec![],
         landlock_shim: shim.then(|| SHIM_IN_ROOTFS.to_string()),

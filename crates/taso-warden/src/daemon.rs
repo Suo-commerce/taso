@@ -1750,6 +1750,8 @@ impl Node {
             work: mount.clone(),
             socket: socket.path().to_path_buf(),
             host_uid_base: uid,
+            // Births only (F6 step 3 sets the parent's range for cross-slot forks).
+            disk_uid_base: None,
             args: rt.args.clone(),
             env: rt.env.clone(),
             landlock_shim: rt.landlock_shim.clone(),
