@@ -88,8 +88,13 @@
 //!   durable; with them ext4 flushes at each journal commit and the store
 //!   commits a group there.  This is what makes the store's durability
 //!   rule (durable at flush) the disk's.
-//! - Requests of up to `--io-kib` (512 KiB by default); the device reports
-//!   that as its I/O size, which mkfs.ext4 and device-mapper build on.
+//! - Requests of up to `--io-kib` (512 KiB by default): that is the
+//!   largest request (`max_sectors_kb`) and the size of each queue's
+//!   buffer.  The I/O sizes the device reports are 4 KiB, minimum and
+//!   optimal alike (`minimum_io_size`, `optimal_io_size`), so mkfs.ext4
+//!   sets no RAID stride or stripe width and device-mapper sees a plain
+//!   4 KiB disk.  (An earlier version of this comment said mkfs.ext4 built
+//!   on the 512 KiB; it does not read the maximum.)
 //! - Non-rotational, which it is (no seek cost).  ext4 allocates
 //!   differently on non-rotational devices; one effect: xfstests
 //!   generic/347 fails on any non-rotational device, ours and loop alike
