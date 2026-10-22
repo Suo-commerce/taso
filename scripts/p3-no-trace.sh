@@ -159,14 +159,14 @@ json.dump({
 PY
 }
 
-# config_child <subject> <parent-subject> <out-file>
+# config_child <subject> <parent-subject> <uid-slot> <out-file>
 config_child() {
-    local subject="$1" parent="$2" out="$3"
-    python3 - "$subject" "$parent" "$out" \
+    local subject="$1" parent="$2" uid_slot="$3" out="$4"
+    python3 - "$subject" "$parent" "$uid_slot" "$out" \
              "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$EFFECTS" <<'PY'
 import json, sys
-subject, parent, out = sys.argv[1], sys.argv[2], sys.argv[3]
-sock, base, work, rootfs, ns, landlock, effects = sys.argv[4:11]
+subject, parent, uid_slot, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sock, base, work, rootfs, ns, landlock, effects = sys.argv[5:12]
 rt = {
     "rootfs": rootfs,
     "host_uid_base": 200000,
@@ -188,7 +188,7 @@ json.dump({
     "runtime": rt,
     "vessels": [{"namespace": ns, "subject": subject,
                  "fork": {"parent": parent, "seal": "last"},
-                 "uid_slot": 0}],
+                 "uid_slot": int(uid_slot)}],
 }, open(out, "w"), indent=1)
 PY
 }
@@ -271,7 +271,7 @@ for k in $(seq 1 "$N"); do
     # b. N forks, each declares $EFFECTS effects (held).
     for f in $(seq 0 $((FORKS - 1))); do
         child_subj="p3-$RUN-$k-child-$f"
-        config_child "$child_subj" "$parent_subj" "$WORK/child-$k-$f.json"
+        config_child "$child_subj" "$parent_subj" "$((f + 1))" "$WORK/child-$k-$f.json"
         run_daemon "$WORK/child-$k-$f.json" "$OUT/child-$k-$f.out" "$OUT/child-$k-$f.err"
         child_ds=$(vessel_ds "$OUT/child-$k-$f.err")
         echo "  child $f: $child_ds"
