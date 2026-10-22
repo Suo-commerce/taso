@@ -66,7 +66,7 @@
 //!    dies before turn 1).
 //! 4. **Effects**: the engine is opened (and reconciles) with the pack
 //!    publisher: no effect is sent before its authorization is shipped.
-//!    No adapters are registered yet (P3), so effect requests are refused.
+//!    Taso never sends; the sender's contract is in `docs/relay.md`.
 //! 5. **Field socket** at `<run_dir>/v-<id>/field.sock`, owned by the
 //!    Vessel's mapped root so the agent can connect.  Each Vessel has its
 //!    own host uid/gid range ([`VesselConf::uid_slot`]); the dataset's

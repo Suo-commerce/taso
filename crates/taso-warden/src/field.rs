@@ -24,8 +24,8 @@
 //! - **Effect** requests go through the effect engine
 //!   ([`Session::with_effects`]): intent before dispatch, outcomes
 //!   recorded, authority withheld while anything is unresolved.  Without
-//!   an engine they are refused before dispatch — an effect with no
-//!   adapter is refused, never guessed at (v0.4 §7.1).
+//!   an engine they are refused before dispatch (v0.4 §7.1).  Taso
+//!   never sends; the sender's contract is in `docs/relay.md`.
 //! - **Quiescence is verified** when a [`Watch`] is given
 //!   ([`Session::with_watch`]): sampled at `TurnEnd`, sampled again once
 //!   the layer is frozen; if a database moved in between, the layer is
