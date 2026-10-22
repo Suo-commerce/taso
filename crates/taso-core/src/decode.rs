@@ -20,8 +20,8 @@ use crate::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use crate::record::{
     Authority, BarrierId, CheckpointRecord, CheckpointSeal, Consequence, Dispatch, FsShippedRecord,
     GapRecord, GroupId, GroupRecord, IntentRecord, LayerRef, LineageRecord, Member, Namespace,
-    OpId, OpenEffect, Origin, OutcomeRecord, OutcomeState, ParentSeal, Payload, RetryPolicy,
-    SealRecord, StreamBase, StreamCut, SuccessionRecord, TaintKind, TurnId, Verdict,
+    OpId, OpenEffect, Origin, OutcomeRecord, OutcomeState, ParentSeal, Payload, PromotionRecord,
+    RetryPolicy, SealRecord, StreamBase, StreamCut, SuccessionRecord, TaintKind, TurnId, Verdict,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -340,6 +340,7 @@ impl<'a> Reader<'a> {
             (_, 2) => OutcomeState::OutcomeUnknown,
             (_, 3) => OutcomeState::ConfirmedApplied,
             (_, 4) => OutcomeState::ConfirmedNotApplied,
+            (_, 5) => OutcomeState::Proposed,
             (at, tag) => {
                 return Err(DecodeError::BadTag {
                     at,
@@ -478,6 +479,15 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn promotion(&mut self) -> R<PromotionRecord> {
+        Ok(PromotionRecord {
+            child: self.chronicle()?,
+            seal: self.lsn()?,
+            seal_hash: self.hash()?,
+            ledger_pos: self.lsn()?,
+        })
+    }
+
     fn payload(&mut self) -> R<Payload> {
         Ok(match self.tag()? {
             (_, 0) => Payload::Seal(self.seal()?),
@@ -490,6 +500,7 @@ impl<'a> Reader<'a> {
             (_, 7) => Payload::Gap(self.gap()?),
             (_, 8) => Payload::FsShipped(self.fs_shipped()?),
             (_, 9) => Payload::Checkpoint(Box::new(self.checkpoint()?)),
+            (_, 10) => Payload::Promotion(self.promotion()?),
             (at, tag) => {
                 return Err(DecodeError::BadTag {
                     at,
@@ -653,6 +664,7 @@ mod tests {
             Just(OutcomeState::OutcomeUnknown),
             Just(OutcomeState::ConfirmedApplied),
             Just(OutcomeState::ConfirmedNotApplied),
+            Just(OutcomeState::Proposed),
         ];
         (any::<u64>(), state, proptest::option::of(blob())).prop_map(|(op, state, evidence)| {
             Payload::Outcome(OutcomeRecord {
@@ -786,6 +798,16 @@ mod tests {
                 },
             )
     }
+    fn promotion() -> impl Strategy<Value = Payload> {
+        (any::<[u8; 16]>(), lsn(), hash(), lsn()).prop_map(|(c, seal, seal_hash, ledger_pos)| {
+            Payload::Promotion(PromotionRecord {
+                child: ChronicleId::from_bytes(c),
+                seal,
+                seal_hash,
+                ledger_pos,
+            })
+        })
+    }
     fn payload() -> impl Strategy<Value = Payload> {
         prop_oneof![
             seal(),
@@ -797,7 +819,8 @@ mod tests {
             succession(),
             gap(),
             fs_shipped(),
-            checkpoint()
+            checkpoint(),
+            promotion()
         ]
     }
 
@@ -863,11 +886,11 @@ mod tests {
     #[test]
     fn unknown_payload_tag() {
         assert_eq!(
-            Payload::decode(&[10]),
+            Payload::decode(&[11]),
             Err(DecodeError::BadTag {
                 at: 0,
                 what: "payload",
-                tag: 10
+                tag: 11
             })
         );
         assert_eq!(
@@ -987,5 +1010,58 @@ mod tests {
                 "{what}"
             );
         }
+    }
+
+    // ── P3: Promotion and Proposed ──────────────────────────────────
+
+    /// The Promotion payload (tag 10) decodes to what was encoded, byte
+    /// for byte, including the whole record: a truncated or extended one
+    /// is refused like any other.
+    #[test]
+    fn promotion_round_trips_and_is_strict() {
+        let p = Payload::Promotion(PromotionRecord {
+            child: ChronicleId::from_bytes([4; 16]),
+            seal: Lsn::new(21),
+            seal_hash: HashVal::from_bytes([21; 32]),
+            ledger_pos: Lsn::new(17),
+        });
+        let bytes = p.canon_bytes();
+        // tag 1 + child 16 + seal 8 + hash 32 + ledger_pos 8
+        assert_eq!(bytes.len(), 65);
+        assert_eq!(Payload::decode(&bytes), Ok(p));
+        assert_eq!(
+            Payload::decode(&bytes[..64]),
+            Err(DecodeError::Truncated { at: 57, need: 8 })
+        );
+        let mut longer = bytes;
+        longer.push(0);
+        assert_eq!(
+            Payload::decode(&longer),
+            Err(DecodeError::Trailing { at: 65, extra: 1 })
+        );
+    }
+
+    /// `Proposed` (state tag 5) decodes; the next tag does not, and the
+    /// refusal names the type so a reader of an older binary sees
+    /// "outcome state 6", not a generic failure.
+    #[test]
+    fn proposed_decodes_and_the_next_state_tag_is_refused() {
+        let p = Payload::Outcome(OutcomeRecord {
+            op: OpId::new(3),
+            state: OutcomeState::Proposed,
+            evidence: None,
+        });
+        let mut bytes = p.canon_bytes();
+        assert_eq!(Payload::decode(&bytes), Ok(p));
+        // Outcome: tag, op 8 -> state tag at 9.
+        bytes[9] = 6;
+        assert_eq!(
+            Payload::decode(&bytes),
+            Err(DecodeError::BadTag {
+                at: 9,
+                what: "outcome state",
+                tag: 6
+            })
+        );
     }
 }
