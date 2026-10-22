@@ -4,17 +4,24 @@
 //! Taso keeps the record of every effect a Vessel asks for; it never
 //! decides whether to send one and never sends one.  This is the
 //! transactional outbox: the ledger holds the outgoing request durably,
-//! with the state it belongs to, and a separate relay sends it.  In this
-//! repository the relay is the reference runner's dispatch
-//! ([`crate::effects`]); any caller may be one.
+//! with the state it belongs to, and whoever is outside sends what the
+//! ledger has released (P3, 2026-10-22: no adapter and no sender live in
+//! this repository; `docs/relay.md` is the sender's contract).
 //!
 //! # What the ledger guarantees
 //!
-//! - **Intent before dispatch.**  [`Ledger::authorize`] appends the
-//!   `Intent` (with the exact request bytes) and `DispatchAuthorized` in
-//!   one write, one fsync, one CAS.  Both or neither are accepted.  The
-//!   barrier is the intent's own lsn unless the consequence is
-//!   `NoExternalMutation`.
+//! - **Intent before release.**  [`Ledger::release`] appends the
+//!   `Intent` (with the exact request bytes, as the caller declared it)
+//!   and `DispatchAuthorized` in one write, one fsync, one CAS.  Both or
+//!   neither are accepted.  The barrier is the intent's own lsn unless
+//!   the consequence is `NoExternalMutation`.
+//! - **Held, not released.**  A Vessel that may not release effects (a
+//!   fork, unless its entry says otherwise) records the same intent with
+//!   `Proposed` instead ([`Ledger::propose`]): durable, shipped with the
+//!   rest, never an obligation, and never released by that Vessel.  Its
+//!   parent may adopt it ([`Ledger::adopt`]): a released intent of the
+//!   parent's own, with a new op id, whose `authority` names the child,
+//!   its Seal and the child's op ([`AdoptedFrom`]).
 //! - **Off the node before anything is sent.**
 //!   [`Ledger::ship_before_send`] publishes the ledger up to its tail
 //!   ([`Publish`]): shipped and recorded as the coordinator's shipped
@@ -40,7 +47,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use taso_core::canon::Canonical;
-use taso_core::envelope::{ChronicleId, Epoch, Stream};
+use taso_core::envelope::{ChronicleId, Epoch, Lsn, Stream};
 use taso_core::record::{
     Authority, BarrierId, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord, OutcomeState,
     Payload, RetryPolicy,
@@ -114,12 +121,13 @@ impl Publish for AlwaysPublish {
 
 // ── Types ───────────────────────────────────────────────────────────
 
-/// An effect the caller wants authorized: everything its intent records
-/// except the op id and the barrier, which the ledger assigns.
+/// An effect as the caller declares it: everything its intent records
+/// except the op id and the barrier, which the ledger assigns.  Taso
+/// records the declaration; whether it is honest is the caller's policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Proposed {
-    /// The provider that will send it, and re-issue or probe it on
-    /// reconciliation.
+pub struct Declared {
+    /// The provider that will send it (a namespace to the ledger), and
+    /// re-issues or probes it after a crash.
     pub provider: String,
     /// The exact request that will be sent.
     pub request: Vec<u8>,
@@ -135,7 +143,28 @@ pub struct Proposed {
     pub authority: Vec<u8>,
 }
 
-/// An effect the ledger has authorized.
+/// Where an adopted intent came from: written as the parent's
+/// `authority`, so every released effect traces back to the proposal it
+/// was (canonical bytes, [`AdoptedFrom::canon_bytes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdoptedFrom {
+    /// The child that proposed it.
+    pub child: ChronicleId,
+    /// The child's Seal the promotion was made at.
+    pub seal: Lsn,
+    /// The child's op id of the proposal.
+    pub op: OpId,
+}
+
+impl Canonical for AdoptedFrom {
+    fn canon(&self, out: &mut taso_core::canon::Canon) {
+        self.child.canon(out);
+        self.seal.canon(out);
+        self.op.canon(out);
+    }
+}
+
+/// An effect the ledger has released (or, from [`Ledger::propose`], held).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Authorized {
     /// Its op id.
@@ -227,28 +256,76 @@ impl Ledger {
         self.open.iter().copied().collect()
     }
 
-    /// The op id the next [`Ledger::authorize`] will assign.  A caller
-    /// that derives anything from it (a deduplication key) reads it here
-    /// first; nothing is consumed until the effect is authorized.
+    /// The op id the next [`Ledger::release`] or [`Ledger::propose`] will
+    /// assign.  A caller that derives anything from it (a deduplication
+    /// key) reads it here first; nothing is consumed until the effect is
+    /// recorded.
     pub fn next_op(&self) -> OpId {
         OpId::new(self.next_op)
     }
 
-    /// Record the intent and its authorization together: one write, one
-    /// fsync, one CAS.  A crash during it leaves both or neither accepted.
-    pub fn authorize<L: Layers>(
+    /// Record the intent and its release together: one write, one fsync,
+    /// one CAS.  A crash during it leaves both or neither accepted.  From
+    /// here on a sender may act on it.
+    pub fn release<L: Layers>(
         &mut self,
         vessel: &mut Vessel<L>,
-        p: &Proposed,
+        d: &Declared,
     ) -> Result<Authorized, VesselError> {
-        let a = self.assign(vessel, p);
-        let t = crate::timing::span("effect.authorize");
+        self.write(
+            vessel,
+            d,
+            OutcomeState::DispatchAuthorized,
+            "effect.release",
+        )
+    }
+
+    /// Record the intent as a held proposal: `Intent` and `Proposed`
+    /// together, one write, one fsync, one CAS.  Durable like a release,
+    /// never an obligation, and never released by this Vessel: only its
+    /// parent may adopt it.
+    pub fn propose<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        d: &Declared,
+    ) -> Result<Authorized, VesselError> {
+        self.write(vessel, d, OutcomeState::Proposed, "effect.propose")
+    }
+
+    /// Adopt a child's proposal: release it as this Vessel's own intent
+    /// (new op id, own barrier), with `from` as its `authority`.  The
+    /// request, footprint, retry and consequence are the child's,
+    /// unchanged; the child's Chronicle is not touched.
+    pub fn adopt<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        from: AdoptedFrom,
+        proposal: &IntentRecord,
+    ) -> Result<Authorized, VesselError> {
+        let d = Declared {
+            provider: proposal.provider.clone(),
+            request: proposal.request.clone(),
+            footprint: proposal.footprint.clone(),
+            dispatch: proposal.dispatch,
+            retry: proposal.retry.clone(),
+            consequence: proposal.consequence,
+            authority: from.canon_bytes(),
+        };
+        self.write(vessel, &d, OutcomeState::DispatchAuthorized, "effect.adopt")
+    }
+
+    fn write<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        d: &Declared,
+        state: OutcomeState,
+        span: &'static str,
+    ) -> Result<Authorized, VesselError> {
+        let a = self.assign(vessel, d);
+        let t = crate::timing::span(span);
         vessel.append_batch(vec![
-            (Stream::Effect, Payload::Intent(intent(a, p))),
-            (
-                Stream::Effect,
-                outcome(a.op, OutcomeState::DispatchAuthorized, None),
-            ),
+            (Stream::Effect, Payload::Intent(intent(a, d))),
+            (Stream::Effect, outcome(a.op, state, None)),
         ])?;
         drop(t);
         Ok(a)
@@ -262,10 +339,10 @@ impl Ledger {
     pub fn append_intent_alone<L: Layers>(
         &mut self,
         vessel: &mut Vessel<L>,
-        p: &Proposed,
+        d: &Declared,
     ) -> Result<Authorized, VesselError> {
-        let a = self.assign(vessel, p);
-        vessel.append(Stream::Effect, Payload::Intent(intent(a, p)))?;
+        let a = self.assign(vessel, d);
+        vessel.append(Stream::Effect, Payload::Intent(intent(a, d)))?;
         Ok(a)
     }
 
@@ -402,12 +479,12 @@ impl Ledger {
     // ── internals ───────────────────────────────────────────────────
 
     /// Take the next op id; the barrier is the lsn the intent will get.
-    fn assign<L: Layers>(&mut self, vessel: &Vessel<L>, p: &Proposed) -> Authorized {
+    fn assign<L: Layers>(&mut self, vessel: &Vessel<L>, d: &Declared) -> Authorized {
         let op = OpId::new(self.next_op);
         self.next_op += 1;
         let lsn = vessel.tail().lsn.next();
         let barrier =
-            (p.consequence != Consequence::NoExternalMutation).then(|| BarrierId::new(lsn.get()));
+            (d.consequence != Consequence::NoExternalMutation).then(|| BarrierId::new(lsn.get()));
         Authorized { op, barrier }
     }
 
@@ -433,15 +510,15 @@ impl Ledger {
         let summary = crate::summary::Summary::of(&frames)
             .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
         self.next_op = self.next_op.max(summary.next_op);
+        // Held proposals are not visited: they are nobody's obligation
+        // here, and only the parent may release them.
         let intents: BTreeMap<OpId, IntentRecord> = summary
-            .open
-            .iter()
-            .map(|(op, e)| (*op, e.intent.clone()))
+            .obligations()
+            .map(|e| (e.intent.op, e.intent.clone()))
             .collect();
         let latest: BTreeMap<OpId, OutcomeState> = summary
-            .open
-            .iter()
-            .filter_map(|(op, e)| e.state.map(|s| (*op, s)))
+            .obligations()
+            .filter_map(|e| e.state.map(|s| (e.intent.op, s)))
             .collect();
 
         let mut report = Reconciled::default();
@@ -478,16 +555,16 @@ impl Ledger {
     }
 }
 
-fn intent(a: Authorized, p: &Proposed) -> IntentRecord {
+fn intent(a: Authorized, d: &Declared) -> IntentRecord {
     IntentRecord {
         op: a.op,
-        provider: p.provider.clone(),
-        request: p.request.clone(),
-        footprint: p.footprint.clone(),
-        dispatch: p.dispatch,
-        retry: p.retry.clone(),
-        consequence: p.consequence,
-        authority: p.authority.clone(),
+        provider: d.provider.clone(),
+        request: d.request.clone(),
+        footprint: d.footprint.clone(),
+        dispatch: d.dispatch,
+        retry: d.retry.clone(),
+        consequence: d.consequence,
+        authority: d.authority.clone(),
         barrier: a.barrier,
     }
 }
@@ -530,8 +607,8 @@ mod tests {
         e.host.ensure(ns(1), b"u").unwrap().0
     }
 
-    fn proposed(request: &str, consequence: Consequence) -> Proposed {
-        Proposed {
+    fn declared(request: &str, consequence: Consequence) -> Declared {
+        Declared {
             provider: "mail".into(),
             request: request.as_bytes().to_vec(),
             footprint: Vec::new(),
@@ -595,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn authorize_writes_the_intent_and_its_authorization_together() {
+    fn release_writes_the_intent_and_its_release_together() {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, r) = open(&mut v);
@@ -604,7 +681,7 @@ mod tests {
         let intent_lsn = v.tail().lsn.next();
 
         let a = l
-            .authorize(&mut v, &proposed("send bob", Consequence::Irreversible))
+            .release(&mut v, &declared("send bob", Consequence::Irreversible))
             .unwrap();
         assert_eq!(
             a,
@@ -630,7 +707,7 @@ mod tests {
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
         let a = l
-            .authorize(&mut v, &proposed("read", Consequence::NoExternalMutation))
+            .release(&mut v, &declared("read", Consequence::NoExternalMutation))
             .unwrap();
         assert_eq!(a.barrier, None);
         // An unknown answer without a barrier opens no obligation.
@@ -644,7 +721,7 @@ mod tests {
         let mut v = vessel(&e);
         let (mut l, _) = Ledger::open(Box::new(NeverPublish), &mut v, cannot_settle).unwrap();
         let a = l
-            .authorize(&mut v, &proposed("send bob", Consequence::Irreversible))
+            .release(&mut v, &declared("send bob", Consequence::Irreversible))
             .unwrap();
         let reason = l.ship_before_send(&mut v, &a).unwrap().unwrap_err();
         assert_eq!(reason, "ledger not shipped: store unavailable");
@@ -667,7 +744,7 @@ mod tests {
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
         let a = l
-            .authorize(&mut v, &proposed("send bob", Consequence::Irreversible))
+            .release(&mut v, &declared("send bob", Consequence::Irreversible))
             .unwrap();
         let tail = v.tail();
         assert_eq!(l.ship_before_send(&mut v, &a).unwrap(), Ok(()));
@@ -680,7 +757,7 @@ mod tests {
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
         let a = l
-            .authorize(&mut v, &proposed("a", Consequence::Irreversible))
+            .release(&mut v, &declared("a", Consequence::Irreversible))
             .unwrap();
         l.record(&mut v, a.op, a.barrier, &Answer::Unknown).unwrap();
         assert_eq!(l.open_obligations(), vec![a.op]);
@@ -703,7 +780,7 @@ mod tests {
         let e = env();
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
-        l.append_intent_alone(&mut v, &proposed("send bob", Consequence::Irreversible))
+        l.append_intent_alone(&mut v, &declared("send bob", Consequence::Irreversible))
             .unwrap();
         drop((l, v));
 
@@ -727,7 +804,7 @@ mod tests {
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
         let a = l
-            .authorize(&mut v, &proposed("fire", Consequence::Irreversible))
+            .release(&mut v, &declared("fire", Consequence::Irreversible))
             .unwrap();
         drop((l, v));
 
@@ -783,7 +860,7 @@ mod tests {
         let mut v = vessel(&e);
         let (mut l, _) = open(&mut v);
         let a = l
-            .authorize(&mut v, &proposed("a", Consequence::Irreversible))
+            .release(&mut v, &declared("a", Consequence::Irreversible))
             .unwrap();
         l.record(
             &mut v,
@@ -799,5 +876,105 @@ mod tests {
         let (l, r) = Ledger::open(Box::new(AlwaysPublish), &mut v, no_settle).unwrap();
         assert_eq!(r, Reconciled::default());
         assert_eq!(l.next_op(), OpId::new(2));
+    }
+
+    // ── P3: held proposals and adoption ─────────────────────────────
+
+    /// A proposal is written like a release (intent and state together),
+    /// but its state is `Proposed`, and the ledger never treats it as
+    /// released: on reopen it is not visited, not an obligation, and
+    /// authority is granted.  Its op id is consumed like any other.
+    #[test]
+    fn a_proposal_is_durable_held_and_never_an_obligation() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut l, _) = open(&mut v);
+        let intent_lsn = v.tail().lsn.next();
+        let a = l
+            .propose(&mut v, &declared("pay 10", Consequence::Irreversible))
+            .unwrap();
+        assert_eq!(
+            a,
+            Authorized {
+                op: OpId::new(1),
+                barrier: Some(BarrierId::new(intent_lsn.get()))
+            }
+        );
+        assert_eq!(records(&v).len(), 2, "one batch: intent and Proposed");
+        assert_eq!(outcomes(&v), vec![(1, OutcomeState::Proposed)]);
+        assert!(l.authorized(), "a held proposal withholds nothing");
+        drop((l, v));
+
+        let mut v = vessel(&e);
+        let (l, r) = Ledger::open(Box::new(AlwaysPublish), &mut v, no_settle).unwrap();
+        assert_eq!(r, Reconciled::default(), "not visited, not open");
+        assert!(l.authorized());
+        assert_eq!(l.next_op(), OpId::new(2));
+        assert_eq!(
+            outcomes(&v),
+            vec![(1, OutcomeState::Proposed)],
+            "reconcile wrote nothing about it"
+        );
+    }
+
+    /// Adopting a proposal releases a copy as this Vessel's own: a new op
+    /// id and barrier, the child's request bytes unchanged, and the
+    /// authority naming the child, its Seal and its op.
+    #[test]
+    fn adopting_a_proposal_releases_it_as_this_vessels_own() {
+        let e = env();
+        // The child proposes.
+        let mut child = e.host.ensure(ns(1), b"child").unwrap().0;
+        let (mut cl, _) = open(&mut child);
+        cl.propose(&mut child, &declared("pay 10", Consequence::Irreversible))
+            .unwrap();
+        let proposal = records(&child)
+            .into_iter()
+            .find_map(|p| match p {
+                Payload::Intent(i) => Some(i),
+                _ => None,
+            })
+            .unwrap();
+        let child_id = child.chronicle().id();
+        drop((cl, child));
+
+        // The parent adopts it.
+        let mut v = vessel(&e);
+        let (mut l, _) = open(&mut v);
+        l.release(&mut v, &declared("earlier", Consequence::Irreversible))
+            .unwrap();
+        let from = AdoptedFrom {
+            child: child_id,
+            seal: Lsn::new(7),
+            op: proposal.op,
+        };
+        let intent_lsn = v.tail().lsn.next();
+        let a = l.adopt(&mut v, from, &proposal).unwrap();
+        assert_eq!(a.op, OpId::new(2), "a new op id of the parent's");
+        assert_eq!(a.barrier, Some(BarrierId::new(intent_lsn.get())));
+        let adopted = records(&v)
+            .into_iter()
+            .filter_map(|p| match p {
+                Payload::Intent(i) if i.op == a.op => Some(i),
+                _ => None,
+            })
+            .next()
+            .unwrap();
+        assert_eq!(adopted.request, proposal.request);
+        assert_eq!(adopted.retry, proposal.retry);
+        assert_eq!(adopted.consequence, proposal.consequence);
+        assert_eq!(adopted.authority, from.canon_bytes());
+        assert_ne!(adopted.authority, proposal.authority);
+        assert_eq!(
+            outcomes(&v).last(),
+            Some(&(2, OutcomeState::DispatchAuthorized)),
+            "released, so a sender may act on it"
+        );
+        // Released and unsettled: an obligation on reopen, unlike the
+        // child's proposal.
+        drop((l, v));
+        let mut v = vessel(&e);
+        let (_, r) = open(&mut v);
+        assert_eq!(r.open, vec![OpId::new(1), OpId::new(2)]);
     }
 }
