@@ -204,12 +204,13 @@ vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset
     echo "$ds"
 }
 
-# Run daemon, show stderr on failure.
+# Run daemon, show stdout+stderr on failure.
 run_daemon() {
     local cfg="$1" out="$2" err="$3"
     if ! "$WORK/bin/taso-wardend" "$cfg" >"$out" 2>"$err"; then
         echo "daemon failed (config $cfg):" >&2
-        tail -20 "$err" >&2
+        echo "-- stderr:" >&2; tail -20 "$err" >&2
+        echo "-- stdout:" >&2; tail -20 "$out" >&2
         return 1
     fi
 }
