@@ -390,6 +390,7 @@ mod tests {
             runtime: None,
             effects: None,
             promote: None,
+            forks: None,
         }
     }
 

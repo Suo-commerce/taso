@@ -112,6 +112,125 @@ impl VesselSource for StaticSource {
     }
 }
 
+/// Children asked for over the Field (P3 D1), by the Warden's Vessels'
+/// sessions: entries the Warden made itself ([`crate::daemon::ForksConf`]).
+/// Shared by clones; [`WithRequested`] adds them to a source's set.
+#[derive(Clone, Debug, Default)]
+pub struct Requested(std::sync::Arc<std::sync::Mutex<RequestedState>>);
+
+#[derive(Debug, Default)]
+struct RequestedState {
+    entries: BTreeMap<VesselKey, VesselConf>,
+    /// Added since the source last reported them.
+    unreported: bool,
+}
+
+impl Requested {
+    /// A registry with nothing in it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RequestedState> {
+        // A panic while holding it cannot leave the map half-changed.
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Add `vc`.  False (and nothing changed) if an entry with its Vessel
+    /// id is already here.
+    pub fn add(&self, vc: VesselConf) -> bool {
+        let mut st = self.lock();
+        let key = *vc.id().as_bytes();
+        if st.entries.contains_key(&key) {
+            return false;
+        }
+        st.entries.insert(key, vc);
+        st.unreported = true;
+        true
+    }
+
+    /// True if an entry with Vessel id `key` is here.
+    pub fn contains(&self, key: &VesselKey) -> bool {
+        self.lock().entries.contains_key(key)
+    }
+
+    /// Every entry, sorted by key.
+    pub fn entries(&self) -> Vec<VesselConf> {
+        self.lock().entries.values().cloned().collect()
+    }
+
+    fn unreported(&self) -> bool {
+        self.lock().unreported
+    }
+
+    /// The entries, if any were added since the last call.
+    fn take_changed(&self) -> Option<Vec<VesselConf>> {
+        let mut st = self.lock();
+        if !std::mem::take(&mut st.unreported) {
+            return None;
+        }
+        Some(st.entries.values().cloned().collect())
+    }
+}
+
+/// A source's set plus the [`Requested`] children (each goes through the
+/// [`Guard`] like any entry).  A child whose Vessel id the source lists
+/// itself is the source's entry.  Requested children are reported only
+/// once the source has answered: a set without the source's entries
+/// would stop its Vessels.
+pub struct WithRequested<'s> {
+    inner: &'s mut dyn VesselSource,
+    requested: Requested,
+    /// The source's last answer.
+    last: Option<Vec<VesselConf>>,
+}
+
+impl<'s> WithRequested<'s> {
+    /// `inner`'s set plus `requested`.
+    pub fn new(inner: &'s mut dyn VesselSource, requested: Requested) -> Self {
+        Self {
+            inner,
+            requested,
+            last: None,
+        }
+    }
+}
+
+impl VesselSource for WithRequested<'_> {
+    fn poll(&mut self, wait: Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+        let changed = match self.inner.poll(wait)? {
+            Some(set) => {
+                self.last = Some(set);
+                true
+            }
+            None => false,
+        };
+        let Some(last) = &self.last else {
+            return Ok(None);
+        };
+        let children = match self.requested.take_changed() {
+            Some(c) => c,
+            None if changed => self.requested.entries(),
+            None => return Ok(None),
+        };
+        let listed: std::collections::BTreeSet<VesselKey> =
+            last.iter().map(|vc| *vc.id().as_bytes()).collect();
+        let mut set = last.clone();
+        set.extend(
+            children
+                .into_iter()
+                .filter(|vc| !listed.contains(vc.id().as_bytes())),
+        );
+        Ok(Some(set))
+    }
+
+    /// Finite while the source is and no child waits to be reported (a
+    /// child asked for by a run that has just ended must still run).
+    fn is_finite(&self) -> bool {
+        self.inner.is_finite() && !self.requested.unreported()
+    }
+}
+
 /// A Vessel's key: its Chronicle id.
 pub type VesselKey = [u8; 16];
 
@@ -455,7 +574,74 @@ mod tests {
             runtime: None,
             effects: None,
             promote: None,
+            forks: None,
         }
+    }
+
+    fn names(set: &[VesselConf]) -> Vec<&str> {
+        let mut v: Vec<&str> = set.iter().map(|vc| vc.subject.as_str()).collect();
+        v.sort();
+        v
+    }
+
+    /// Requested children join the source's set once it has answered, are
+    /// reported again with every new answer, and keep a finite source
+    /// from ending until they are reported.  One entry per Vessel id: the
+    /// source's own entry wins, and a second request for an id is refused.
+    #[test]
+    fn requested_children_join_the_sources_set() {
+        let z = Duration::ZERO;
+        let req = Requested::new();
+        let mut inner = StaticSource::new(vec![vc("p", 1)]);
+        let mut src = WithRequested::new(&mut inner, req.clone());
+        assert!(src.is_finite());
+        assert_eq!(names(&src.poll(z).unwrap().unwrap()), vec!["p"]);
+        assert_eq!(src.poll(z).unwrap(), None);
+
+        assert!(req.add(vc("p-fork-5", 5)));
+        assert!(!req.add(vc("p-fork-5", 6)), "one entry per Vessel id");
+        assert!(req.contains(vc("p-fork-5", 5).id().as_bytes()));
+        // Not finite until the child is reported: a run that asked for it
+        // may already have ended.
+        assert!(!src.is_finite());
+        assert_eq!(names(&src.poll(z).unwrap().unwrap()), vec!["p", "p-fork-5"]);
+        assert!(src.is_finite());
+        assert_eq!(src.poll(z).unwrap(), None);
+
+        // A child the source lists itself is the source's entry.
+        assert!(req.add(vc("p", 9)));
+        let set = src.poll(z).unwrap().unwrap();
+        assert_eq!(names(&set), vec!["p", "p-fork-5"]);
+        assert_eq!(set.iter().find(|v| v.subject == "p").unwrap().uid_slot, 1);
+    }
+
+    /// A child asked for before the source ever answered waits for that
+    /// answer: a set of children alone would stop the source's Vessels.
+    #[test]
+    fn requested_children_wait_for_the_sources_first_answer() {
+        struct Late(u32, Vec<VesselConf>);
+        impl VesselSource for Late {
+            fn poll(&mut self, _: Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+                if self.0 > 0 {
+                    self.0 -= 1;
+                    return Ok(None);
+                }
+                Ok(Some(std::mem::take(&mut self.1)))
+            }
+            fn is_finite(&self) -> bool {
+                false
+            }
+        }
+        let req = Requested::new();
+        req.add(vc("c", 5));
+        let mut inner = Late(2, vec![vc("p", 1)]);
+        let mut src = WithRequested::new(&mut inner, req);
+        assert_eq!(src.poll(Duration::ZERO).unwrap(), None);
+        assert_eq!(src.poll(Duration::ZERO).unwrap(), None);
+        assert_eq!(
+            names(&src.poll(Duration::ZERO).unwrap().unwrap()),
+            vec!["c", "p"]
+        );
     }
 
     fn subjects(a: &Admitted) -> Vec<(String, u32)> {

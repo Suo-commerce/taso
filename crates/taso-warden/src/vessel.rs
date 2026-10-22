@@ -238,6 +238,15 @@ pub enum VesselError {
         /// This Vessel's last Seal now.
         last: Option<Position>,
     },
+    /// Promotion: a child was already promoted at this Vessel's last Seal
+    /// (one choice per fork point: a second would adopt a sibling's
+    /// futures too, or the same ones twice).
+    AlreadyPromoted {
+        /// The child promoted.
+        child: ChronicleId,
+        /// At its Seal.
+        seal: Lsn,
+    },
     /// Succession needs a Seal, and the Vessel has none.
     NoSeal,
     /// Succession needs the tail to be the last Seal.
@@ -312,6 +321,12 @@ impl fmt::Display for VesselError {
                 Some(l) => write!(f, "cannot promote: this vessel sealed again (lsn {}) since the fork at lsn {}", l.lsn.get(), fork.lsn.get()),
                 None => write!(f, "cannot promote: this vessel has no Seal, the fork names lsn {}", fork.lsn.get()),
             },
+            Self::AlreadyPromoted { child, seal } => write!(
+                f,
+                "cannot promote: {} was already promoted at its Seal lsn {} since this vessel's last Seal",
+                hex(child),
+                seal.get()
+            ),
             Self::NoSeal => write!(f, "vessel has no Seal"),
             Self::AlreadySealed(p) => write!(f, "vessel already has a Seal (lsn {}): no birth Seal", p.lsn.get()),
             Self::NotPristine(tail) => write!(
@@ -1284,8 +1299,9 @@ impl<L: Layers> Vessel<L> {
     /// unless `child` is a fork of this Vessel ([`VesselError::NotMyFork`])
     /// made at this Vessel's last Seal ([`VesselError::ParentMoved`]: a
     /// parent that sealed again has moved on, and the child's work no
-    /// longer continues its state), and the child's Seal is proven from
-    /// its log ([`ReadLog::prove`]).
+    /// longer continues its state), no child was promoted since that Seal
+    /// ([`VesselError::AlreadyPromoted`]: one choice per fork point), and
+    /// the child's Seal is proven from its log ([`ReadLog::prove`]).
     ///
     /// Writes exactly one [`PromotionRecord`] on `Ctl` and returns it with
     /// the child's proposals it names (open-at-S, in op order); adopting
@@ -1308,6 +1324,17 @@ impl<L: Layers> Vessel<L> {
         let last = self.last_seal();
         if last != Some(fork) {
             return Err(VesselError::ParentMoved { fork, last });
+        }
+        for f in self.frames()? {
+            if f.envelope.lsn <= fork.lsn {
+                continue;
+            }
+            if let Payload::Promotion(p) = decode(&f)? {
+                return Err(VesselError::AlreadyPromoted {
+                    child: p.child,
+                    seal: p.seal,
+                });
+            }
         }
         let (seal, ledger_pos) = child.prove(at)?;
         let proposals = child.proposals(ledger_pos)?;
@@ -2261,6 +2288,36 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|f| matches!(decode(f), Ok(Payload::Promotion(_)))));
+    }
+
+    /// One choice per fork point: once a child is promoted at the parent's
+    /// last Seal, neither a sibling nor the same child is promoted again
+    /// until the parent seals; nothing more is written.
+    #[test]
+    fn a_second_promotion_at_one_fork_point_is_refused() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        seal(&mut p);
+        let (a, aseal) = child_with_proposals(&e, p.id(), b"a", 1, 0);
+        let (b, _) = child_with_proposals(&e, p.id(), b"b", 1, 0);
+        p.promote(&e.host.read_log_of(a).unwrap(), SealAt::Last)
+            .unwrap();
+        let count = |p: &Vessel<_>| {
+            p.chronicle()
+                .frames()
+                .unwrap()
+                .iter()
+                .filter(|f| matches!(decode(f), Ok(Payload::Promotion(_))))
+                .count()
+        };
+        for c in [b, a] {
+            assert!(matches!(
+                p.promote(&e.host.read_log_of(c).unwrap(), SealAt::Last),
+                Err(VesselError::AlreadyPromoted { child, seal })
+                    if child == a && seal == aseal.lsn
+            ));
+        }
+        assert_eq!(count(&p), 1);
     }
 
     // ── publishing a Seal ───────────────────────────────────────────

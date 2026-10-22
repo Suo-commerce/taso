@@ -144,6 +144,14 @@ This property is verified by the no-trace gate
 (`scripts/p3-no-trace.sh`): N forks, one promoted, the parent's
 released effects are exactly that child's — and only that child's.
 
+The agent may ask for forks and the promotion itself, over the Field
+(`Fork { seal }`, `Promote { child, seal }`; decision D1).  These are
+requests: the Warden picks the child's uid slot from the Vessel's
+config entry (`"forks": {"slots": [...]}`, one child per slot), the
+child always holds, and only one child is promoted per fork point.  A
+sender is not involved in either; it only ever sees the adopted
+effects, on the parent's `Open` list, like any other.
+
 ## Building a relay
 
 A minimal relay is a loop:

@@ -407,6 +407,7 @@ impl<L: ListVessels> KubeSource<L> {
             fork,
             effects: None,
             promote: None,
+            forks: None,
             namespace: tenant,
             subject: subject.to_string(),
             takeover,
