@@ -405,6 +405,7 @@ impl<L: ListVessels> KubeSource<L> {
 
         let vc = VesselConf {
             fork,
+            effects: None,
             namespace: tenant,
             subject: subject.to_string(),
             takeover,

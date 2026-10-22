@@ -388,6 +388,7 @@ mod tests {
             uid_slot: 1,
             restart: Restart::Always,
             runtime: None,
+            effects: None,
         }
     }
 

@@ -453,6 +453,7 @@ mod tests {
             uid_slot: slot,
             restart: Restart::Never,
             runtime: None,
+            effects: None,
         }
     }
 
