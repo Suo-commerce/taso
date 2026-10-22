@@ -592,6 +592,54 @@ impl<P: Pool> Host<P> {
         })
     }
 
+    /// The turn of `vessel`'s birth Seal: [`BIRTH_TURN`] if it was born
+    /// from the void; for a fork or succession the turn of the parent's
+    /// Seal its Lineage names, read from the parent's local log and checked
+    /// against that Seal's hash (the child continues the parent's count).
+    ///
+    /// The birth Seal is taken right after the Lineage record (and taken
+    /// again after a crash in between), on the node that made the fork,
+    /// which had the parent's log; a parent's Seal that is not here, or
+    /// does not match, is refused ([`VesselError::ParentNotProven`]) rather
+    /// than guessed.
+    pub fn birth_turn(&self, vessel: &Vessel<P::Layers>) -> Result<TurnId, VesselError> {
+        let Some(ps) = vessel.lineage().origin.parent().copied() else {
+            return Ok(BIRTH_TURN);
+        };
+        let not =
+            |why: String| VesselError::ParentNotProven(format!("the birth Seal's turn: {why}"));
+        let dir = self.dir_for(ps.chronicle);
+        if !dir.exists() {
+            return Err(not(format!(
+                "the parent {} has no local log on this node",
+                hex(&ps.chronicle)
+            )));
+        }
+        let frames = crate::chronicle::read_log(&dir)?;
+        if let Some(f) = frames.iter().find(|f| f.envelope.lsn == ps.seal) {
+            if f.envelope.hash != ps.seal_hash || f.envelope.stream != Stream::Ctl {
+                return Err(not(format!(
+                    "the parent's record at lsn {} is not the Seal the Lineage names",
+                    ps.seal.get()
+                )));
+            }
+            return match decode(f)? {
+                Payload::Seal(s) => Ok(s.turn),
+                _ => Err(not(format!(
+                    "the parent's record at lsn {} is not a Seal",
+                    ps.seal.get()
+                ))),
+            };
+        }
+        match summary(&frames)?.seal {
+            Some(c) if c.lsn == ps.seal && c.hash == ps.seal_hash => Ok(c.turn),
+            _ => Err(not(format!(
+                "the parent's Seal at lsn {} is not in its local log",
+                ps.seal.get()
+            ))),
+        }
+    }
+
     /// Move `old`'s state to a new identity, `subject` in `namespace`.
     ///
     /// Returns the successor and the now closed predecessor.  Calling it
@@ -905,8 +953,11 @@ pub struct Succeeded<L: Layers> {
     pub predecessor: Vessel<L>,
 }
 
-/// The turn of the birth Seal ([`Vessel::seal_birth`]).  It belongs to
-/// the Warden: an agent's turns start at 1.
+/// The turn of a void-born Vessel's birth Seal ([`Vessel::seal_birth`]).
+/// It belongs to the Warden: an agent's turns start at 1.  A fork or
+/// succession's birth Seal carries its parent's turn instead
+/// ([`Host::birth_turn`]): its state continues the parent's, so does the
+/// count (decision of 2026-10-21).
 pub const BIRTH_TURN: TurnId = TurnId::new(0);
 
 /// A succession that may have stopped after closing the predecessor
@@ -1094,6 +1145,13 @@ impl<L: Layers> Vessel<L> {
     /// leaves exactly the pristine case, so taking it again is the
     /// recovery.
     pub fn seal_birth(&mut self) -> Result<Sealed, VesselError> {
+        self.seal_birth_at(BIRTH_TURN)
+    }
+
+    /// [`Vessel::seal_birth`] at `turn`: [`BIRTH_TURN`] for a Vessel born
+    /// from the void, its parent's Seal's turn for a fork or succession
+    /// ([`Host::birth_turn`]), so the agent continues the parent's count.
+    pub fn seal_birth_at(&mut self, turn: TurnId) -> Result<Sealed, VesselError> {
         self.writable()?;
         if let Some(s) = self.last_seal() {
             return Err(VesselError::AlreadySealed(s));
@@ -1104,7 +1162,7 @@ impl<L: Layers> Vessel<L> {
         }
         Ok(self
             .chronicle
-            .seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), BIRTH_TURN)?)
+            .seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), turn)?)
     }
 
     /// Roll the state back to the newest Seal whose layer is here
@@ -1702,6 +1760,68 @@ pub(crate) mod tests {
         drop(v);
         let (v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
         assert_eq!(v.last_seal(), Some(b));
+    }
+
+    fn seal_at_turn<L: Layers>(v: &mut Vessel<L>, turn: u64) -> Position {
+        v.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(turn),
+        )
+        .unwrap()
+        .seal
+    }
+
+    /// The turn a birth Seal takes (decision 2026-10-21: a fork continues
+    /// its parent's count): 0 from the void; the parent's Seal's turn for a
+    /// fork, also when that Seal was the parent's birth Seal (0) or an older
+    /// one; the predecessor's for a succession.
+    #[test]
+    fn a_birth_seal_continues_the_parents_turn() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"parent").unwrap();
+        assert_eq!(e.host.birth_turn(&p).unwrap(), BIRTH_TURN);
+        let birth = p.seal_birth().unwrap().seal;
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s3 = seal_at_turn(&mut p, 3);
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let s7 = seal_at_turn(&mut p, 7);
+        for (at, subject, want) in [
+            (s7, &b"c7"[..], 7),
+            (s3, &b"c3"[..], 3),
+            (birth, &b"c0"[..], 0),
+        ] {
+            let mut c = e.host.fork(&p, at, subject).unwrap();
+            let t = e.host.birth_turn(&c).unwrap();
+            assert_eq!(t.get(), want, "fork from the Seal at lsn {}", at.lsn.get());
+            let b = c.seal_birth_at(t).unwrap().seal;
+            assert_eq!(seal_record(&c, b).turn.get(), want);
+        }
+        // A succession continues the predecessor's count.
+        let Succeeded { successor, .. } = e.host.succeed(p, ns(1), b"next", auth(), false).unwrap();
+        assert_eq!(e.host.birth_turn(&successor).unwrap().get(), 7);
+    }
+
+    #[test]
+    fn a_birth_turn_is_never_guessed() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"parent").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s = seal_at_turn(&mut p, 4);
+        let c = e.host.fork(&p, s, b"child").unwrap();
+        let pid = p.id();
+        drop(p);
+        // The parent's log moved away: refused, not turn 0.
+        let dir = e.host.dir_for(pid);
+        let away = dir.with_extension("away");
+        std::fs::rename(&dir, &away).unwrap();
+        assert!(matches!(
+            e.host.birth_turn(&c),
+            Err(VesselError::ParentNotProven(w)) if w.contains("no local log")
+        ));
+        std::fs::rename(&away, &dir).unwrap();
+        assert_eq!(e.host.birth_turn(&c).unwrap().get(), 4);
     }
 
     /// A fork's birth Seal freezes the parent's Seal state as its own

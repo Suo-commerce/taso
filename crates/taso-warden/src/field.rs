@@ -171,7 +171,10 @@ impl<'v, L: Layers> Session<'v, L> {
     }
 
     /// The last turn sealed, if any, counting the birth Seal (turn 0,
-    /// [`BIRTH_TURN`]).  `Hello` reports the birth Seal as no turn.
+    /// [`BIRTH_TURN`], for a Vessel born from the void; a fork's or
+    /// succession's birth Seal carries its parent's turn).  `Hello`
+    /// reports a turn-0 birth Seal as no turn, and a fork's as its parent's
+    /// last turn, so the agent continues the count.
     pub fn last_sealed_turn(&self) -> Option<u64> {
         self.last_sealed_turn
     }
@@ -518,6 +521,56 @@ mod tests {
             }
         );
         assert!(is_error(&s.handle(hello()), ErrorCode::BadHello));
+    }
+
+    /// A fork whose birth Seal carries its parent's turn (5): Hello says
+    /// the agent resumes after 5, and its next turn must be after it.
+    #[test]
+    fn a_fork_continues_its_parents_turns() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"parent").unwrap();
+        let s = p
+            .seal(
+                taso_core::record::StreamCut::EMPTY,
+                Verdict::Clean,
+                taso_core::envelope::Lsn::new(0),
+                taso_core::record::TurnId::new(5),
+            )
+            .unwrap()
+            .seal;
+        let mut c = e.host.fork(&p, s, b"child").unwrap();
+        let t = e.host.birth_turn(&c).unwrap();
+        c.seal_birth_at(t).unwrap();
+        let mut session = Session::new(&mut c, Verdict::Clean).unwrap();
+        assert_eq!(
+            session.handle(hello()),
+            Reply::Hello {
+                version: VERSION,
+                last_sealed_turn: Some(5)
+            }
+        );
+        for turn in [1, 5] {
+            assert!(
+                is_error(
+                    &session.handle(Request::TurnEnd {
+                        turn,
+                        quiescent: true
+                    }),
+                    ErrorCode::Malformed
+                ),
+                "turn {turn} is not after the parent's 5"
+            );
+        }
+        assert!(matches!(
+            session.handle(Request::TurnEnd {
+                turn: 6,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                turn: 6,
+                sealed: Some(_)
+            }
+        ));
     }
 
     #[test]
