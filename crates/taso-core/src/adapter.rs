@@ -341,8 +341,11 @@ impl AdapterModel {
             let state = outcomes.get(&op_id).copied();
 
             match state {
-                // Terminal — nothing to do.
-                Some(OutcomeState::ConfirmedApplied) | Some(OutcomeState::ConfirmedNotApplied) => {}
+                // Terminal — nothing to do.  A held proposal is terminal
+                // here too: only its parent may release it (P3).
+                Some(OutcomeState::ConfirmedApplied)
+                | Some(OutcomeState::ConfirmedNotApplied)
+                | Some(OutcomeState::Proposed) => {}
 
                 // No outcome: dispatch was never authorized.
                 None | Some(OutcomeState::Prepared) => {

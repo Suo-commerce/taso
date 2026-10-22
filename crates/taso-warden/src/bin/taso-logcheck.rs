@@ -107,6 +107,19 @@ fn describe(v: &mut Value, payload: Option<Payload>) {
         Some(Payload::Succession(_)) => "succession",
         Some(Payload::FsShipped(_)) => "fs_shipped",
         Some(Payload::Checkpoint(_)) => "checkpoint",
+        Some(Payload::Promotion(p)) => {
+            let child: String = p
+                .child
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            o.insert("child".into(), json!(child));
+            o.insert("seal".into(), json!(p.seal.get()));
+            o.insert("seal_hash".into(), json!(p.seal_hash.to_string()));
+            o.insert("ledger_pos".into(), json!(p.ledger_pos.get()));
+            "promotion"
+        }
         Some(Payload::Group(_)) => "group",
         Some(Payload::Intent(_)) => "intent",
         Some(Payload::Outcome(_)) => "outcome",
