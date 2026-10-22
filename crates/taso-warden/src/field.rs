@@ -65,13 +65,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use taso_core::envelope::{Lsn, Stream};
-use taso_core::record::{Payload, StreamCut, TurnId, Verdict};
+use taso_core::record::{OpId, Payload, StreamCut, TurnId, Verdict};
 use taso_field::protocol::{
-    recv_request, send_reply, EffectResult, ErrorCode, ProtocolError, Reply, Request, VERSION,
+    recv_request, send_reply, EffectResult, ErrorCode, OpenEffect, Outcome, ProtocolError, Reply,
+    Request, VERSION,
 };
 
 use crate::chronicle::{ChronicleError, Layers};
-use crate::effects::Effects;
+use crate::effects::{Asked, Effects};
+use crate::ledger::{Answer, Declared};
 use crate::quiesce::{verify, Watch};
 use crate::segment::Position;
 use crate::vessel::{Vessel, VesselError, BIRTH_TURN};
@@ -246,8 +248,11 @@ impl<'v, L: Layers> Session<'v, L> {
                 Request::Effect {
                     call,
                     provider,
-                    operation,
-                    args,
+                    request,
+                    footprint,
+                    retry,
+                    consequence,
+                    authority,
                 },
             ) => {
                 if self.effects.is_none() {
@@ -264,17 +269,87 @@ impl<'v, L: Layers> Session<'v, L> {
                 if let Some(seal) = self.unpublished {
                     self.run_hook(seal);
                 }
-                // Field v1 carries no declaration (retry, consequence): the
-                // engine cannot record what it was not told.  Refused until
-                // v2 (P3 file 6); nothing is recorded.
-                let _ = (operation, args);
-                Reply::Effect {
-                    call,
-                    result: EffectResult::Refused {
-                        reason: format!(
-                            "Field v{VERSION} cannot declare an effect's retry and consequence; provider {provider:?} needs Field v2"
-                        ),
+                let Some(fx) = self.effects.as_deref_mut() else {
+                    unreachable!("checked above")
+                };
+                let d = Declared {
+                    provider,
+                    request,
+                    footprint,
+                    dispatch: taso_core::record::Dispatch::Immediate,
+                    retry,
+                    consequence,
+                    authority,
+                };
+                let before = self.vessel.tail();
+                let asked = fx.ask(self.vessel, &d);
+                if self.vessel.tail() != before {
+                    self.ledger = self.vessel.tail().lsn;
+                }
+                match asked {
+                    Ok(Asked::Released { op }) => Reply::Effect {
+                        call,
+                        result: EffectResult::Released { op: op.get() },
                     },
+                    Ok(Asked::Held { op }) => Reply::Effect {
+                        call,
+                        result: EffectResult::Held { op: op.get() },
+                    },
+                    Ok(Asked::Refused { reason }) => Reply::Effect {
+                        call,
+                        result: EffectResult::Refused { reason },
+                    },
+                    Err(e) => vessel_error(e),
+                }
+            }
+            (true, Request::Outcome { op, result }) => {
+                let Some(fx) = self.effects.as_deref_mut() else {
+                    return Reply::Outcome {
+                        op,
+                        refused: Some("no effect engine".into()),
+                    };
+                };
+                let answer = match result {
+                    Outcome::Applied { receipt } => Answer::Applied { receipt },
+                    Outcome::NotApplied { reason } => Answer::NotApplied { reason },
+                    Outcome::Unknown => Answer::Unknown,
+                };
+                let before = self.vessel.tail();
+                let r = fx.report(self.vessel, OpId::new(op), &answer);
+                if self.vessel.tail() != before {
+                    self.ledger = self.vessel.tail().lsn;
+                }
+                match r {
+                    Ok(()) => Reply::Outcome { op, refused: None },
+                    Err(crate::effects::ReportError::NotReleased(_)) => Reply::Outcome {
+                        op,
+                        refused: Some(format!(
+                            "op {op} is not a released, unsettled effect of this vessel"
+                        )),
+                    },
+                    Err(crate::effects::ReportError::Vessel(e)) => vessel_error(e),
+                }
+            }
+            (true, Request::Open) => {
+                let Some(fx) = self.effects.as_deref() else {
+                    return Reply::Open {
+                        effects: Vec::new(),
+                    };
+                };
+                match fx.released(self.vessel) {
+                    Ok(released) => Reply::Open {
+                        effects: released
+                            .into_iter()
+                            .map(|r| OpenEffect {
+                                op: r.intent.op.get(),
+                                provider: r.intent.provider,
+                                request: r.intent.request,
+                                retry: r.intent.retry,
+                                unknown: r.state == taso_core::record::OutcomeState::OutcomeUnknown,
+                            })
+                            .collect(),
+                    },
+                    Err(e) => vessel_error(e),
                 }
             }
             (true, Request::TurnEnd { turn, quiescent }) => self.turn_end(turn, quiescent),
@@ -860,7 +935,6 @@ mod tests {
     /// the effect goes out if the retry lands.  The publisher refuses
     /// while the Seal is unpublished, as `ship_log` does (F4).
     #[test]
-    #[ignore = "Field v1 cannot declare an effect; rewritten for v2 in P3 file 7"]
     fn a_failed_publish_is_retried_before_an_effect() {
         use std::cell::Cell;
         use std::rc::Rc;
@@ -901,12 +975,7 @@ mod tests {
                 }
             }
         }
-        let mail = |call| Request::Effect {
-            call,
-            provider: "mail".into(),
-            operation: "send".into(),
-            args: b"bob".to_vec(),
-        };
+        let mail = |call| declare(call, "mail", b"send bob");
 
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
@@ -940,16 +1009,16 @@ mod tests {
         assert!(matches!(
             s.handle(mail(1)),
             Reply::Effect {
-                result: EffectResult::Refused { .. } | EffectResult::NotApplied { .. },
+                result: EffectResult::Refused { .. },
                 ..
             }
         ));
         assert_eq!(s.after_seal_failures().0, 2);
-        // Retry lands: the effect goes out, in the same turn.
+        // Retry lands: the effect is released, in the same turn.
         assert!(matches!(
             s.handle(mail(2)),
             Reply::Effect {
-                result: EffectResult::Applied { .. },
+                result: EffectResult::Released { .. },
                 ..
             }
         ));
@@ -1005,12 +1074,7 @@ mod tests {
         });
         s.after_reply();
         assert_eq!(s.unpublished, None);
-        s.handle(Request::Effect {
-            call: 1,
-            provider: "mail".into(),
-            operation: "send".into(),
-            args: b"bob".to_vec(),
-        });
+        s.handle(declare(1, "mail", b"send bob"));
         drop(s);
         let seen: Vec<u64> = hook.seen.iter().map(|p| p.lsn.get()).collect();
         assert_eq!(seen.len(), 2, "turn 1 once (failed), turn 2 once: {seen:?}");
@@ -1153,19 +1217,29 @@ mod tests {
         );
     }
 
+    /// A declared effect: an irreversible, deduplicated request.
+    fn declare(call: u64, provider: &str, request: &[u8]) -> Request {
+        Request::Effect {
+            call,
+            provider: provider.into(),
+            request: request.to_vec(),
+            footprint: Vec::new(),
+            retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
+                key: request.to_vec(),
+            },
+            consequence: taso_core::record::Consequence::Irreversible,
+            authority: b"user".to_vec(),
+        }
+    }
+
     #[test]
-    fn effects_are_refused_without_an_adapter_and_record_nothing() {
+    fn effects_are_refused_without_an_engine_and_record_nothing() {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let tail = v.tail();
         let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
         s.handle(hello());
-        let r = s.handle(Request::Effect {
-            call: 3,
-            provider: "mail".into(),
-            operation: "send".into(),
-            args: b"{\"consequence\":\"none\"}".to_vec(),
-        });
+        let r = s.handle(declare(3, "mail", b"send bob"));
         assert!(matches!(
             r,
             Reply::Effect {
@@ -1173,13 +1247,33 @@ mod tests {
                 result: EffectResult::Refused { .. }
             }
         ));
+        assert!(matches!(
+            s.handle(Request::Outcome {
+                op: 1,
+                result: Outcome::Unknown
+            }),
+            Reply::Outcome {
+                op: 1,
+                refused: Some(_)
+            }
+        ));
+        assert_eq!(
+            s.handle(Request::Open),
+            Reply::Open {
+                effects: Vec::new()
+            }
+        );
         drop(s);
         assert_eq!(v.tail(), tail);
     }
 
+    /// A dispatcher over the Field: a declared effect is released, listed
+    /// as open with its exact request bytes and key, reported by the
+    /// sender and then gone from the list; a report on an op that is not
+    /// open is refused and records nothing; the Seal's ledger_pos covers
+    /// the effect records.
     #[test]
-    #[ignore = "Field v1 cannot declare an effect; rewritten for v2 in P3 file 7"]
-    fn effects_dispatch_through_the_engine() {
+    fn effects_are_released_listed_and_reported_over_the_field() {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let (mut fx, _) = Effects::open(
@@ -1192,32 +1286,57 @@ mod tests {
             .unwrap()
             .with_effects(&mut fx);
         s.handle(hello());
-        let r = s.handle(Request::Effect {
-            call: 1,
-            provider: "mail".into(),
-            operation: "send".into(),
-            args: b"bob".to_vec(),
-        });
-        assert!(matches!(
-            r,
+        assert_eq!(
+            s.handle(declare(1, "mail", b"send bob")),
             Reply::Effect {
                 call: 1,
-                result: EffectResult::Applied { .. }
+                result: EffectResult::Released { op: 1 }
             }
-        ));
-        let r = s.handle(Request::Effect {
-            call: 2,
-            provider: "http".into(),
-            operation: "get".into(),
-            args: b"x".to_vec(),
-        });
+        );
+        assert_eq!(
+            s.handle(Request::Open),
+            Reply::Open {
+                effects: vec![OpenEffect {
+                    op: 1,
+                    provider: "mail".into(),
+                    request: b"send bob".to_vec(),
+                    retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
+                        key: b"send bob".to_vec()
+                    },
+                    unknown: false,
+                }]
+            }
+        );
+        let tail = s.vessel.tail();
         assert!(matches!(
-            r,
-            Reply::Effect {
-                call: 2,
-                result: EffectResult::Refused { .. }
+            s.handle(Request::Outcome {
+                op: 7,
+                result: Outcome::Unknown
+            }),
+            Reply::Outcome {
+                op: 7,
+                refused: Some(_)
             }
         ));
+        assert_eq!(s.vessel.tail(), tail, "a refused report records nothing");
+        assert_eq!(
+            s.handle(Request::Outcome {
+                op: 1,
+                result: Outcome::Applied {
+                    receipt: b"ok".to_vec()
+                }
+            }),
+            Reply::Outcome {
+                op: 1,
+                refused: None
+            }
+        );
+        assert_eq!(
+            s.handle(Request::Open),
+            Reply::Open {
+                effects: Vec::new()
+            }
+        );
         // The Seal's ledger_pos covers the effect records.
         s.handle(Request::TurnEnd {
             turn: 1,
@@ -1234,6 +1353,43 @@ mod tests {
             panic!()
         };
         assert_eq!(rec.ledger_pos, last_effect.envelope.lsn);
+    }
+
+    /// A holder over the Field: the same declaration is held, never
+    /// listed as open, and a report on it is refused.
+    #[test]
+    fn a_holders_effects_are_held_over_the_field() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let (mut fx, _) =
+            Effects::open(Mode::Hold, Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        assert_eq!(
+            s.handle(declare(1, "pay", b"pay 10")),
+            Reply::Effect {
+                call: 1,
+                result: EffectResult::Held { op: 1 }
+            }
+        );
+        assert_eq!(
+            s.handle(Request::Open),
+            Reply::Open {
+                effects: Vec::new()
+            }
+        );
+        assert!(matches!(
+            s.handle(Request::Outcome {
+                op: 1,
+                result: Outcome::Applied { receipt: vec![] }
+            }),
+            Reply::Outcome {
+                op: 1,
+                refused: Some(_)
+            }
+        ));
     }
 
     #[test]

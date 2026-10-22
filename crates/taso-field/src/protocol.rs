@@ -4,21 +4,29 @@
 //! # What crosses, and what cannot
 //!
 //! The Vessel sends [`Request`]s, the Warden answers each with exactly one
-//! [`Reply`], in order.  Four things cross:
+//! [`Reply`], in order.  Six things cross (v2, P3 2026-10-22):
 //!
 //! - **Hello**: protocol version.  The client does *not* say which Vessel
 //!   it is; the Warden knows that from which socket it is (each Vessel has
 //!   its own, in its own namespace).  There is no identity field to spoof.
-//! - **Effect**: `provider`, `operation`, opaque `args`.  There are no
-//!   fields for consequence, footprint, retry or class — the Warden's
-//!   adapter assigns all of them (v0.4 §7.1), so a tool cannot declare
-//!   anything, because the protocol has nowhere to put it.
+//! - **Effect**: the caller's declaration of an outside effect — the
+//!   `provider` (a namespace), the exact `request` bytes a sender will
+//!   send, the `footprint`, the `retry` policy, the `consequence` and the
+//!   `authority` that permitted it.  Taso records the declaration as
+//!   given and answers *released*, *held* or *refused*; whether the
+//!   declaration is honest is the caller's policy, in front of the Field,
+//!   never the model's.  There is no adapter: Taso never sends.
+//! - **Outcome**: the sender's report on a released effect.
+//! - **Open**: the released, unsettled effects, for a sender to act on.
 //! - **Transcript**: one opaque transcript entry, recorded as a Chronicle
 //!   record.  A quiescent restart rebuilds the agent from the transcript
 //!   (v0.4 §5.4).
 //! - **TurnEnd**: the harness's turn boundary and whether it is quiescent
 //!   (no open database transaction); the Warden seals there if it may
 //!   (v1.0 §3).
+//!
+//! v1 (one `Effect` shape, no declaration, `Applied`/`NotApplied`/
+//! `Unknown` results) is not spoken any more: a v1 `Hello` is refused.
 //!
 //! # Framing and encoding
 //!
@@ -34,9 +42,10 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 use taso_core::frame::{self, FrameError};
+use taso_core::record::{Consequence, OpId, RetryPolicy};
 
 /// The protocol version this crate speaks.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Largest frame body accepted, in bytes ([`taso_core::frame`]).
 pub use taso_core::frame::MAX_FRAME;
@@ -51,17 +60,25 @@ pub enum Request {
         /// The client's protocol version.
         version: u16,
     },
-    /// Ask for an external effect (tag 1).
+    /// Declare an outside effect (tag 1).
     Effect {
         /// Client-chosen correlation id, echoed in the reply.  Not an
-        /// operation identity: the adapter assigns that.
+        /// operation identity: the ledger assigns that.
         call: u64,
-        /// Which provider (`"mail"`, `"http"`, `"git"`, …).
+        /// Which provider (`"mail"`, `"http"`, `"git"`, …): a namespace
+        /// to Taso, meaningful to the sender.
         provider: String,
-        /// Which operation of that provider.
-        operation: String,
-        /// The operation's arguments, opaque to the protocol.
-        args: Vec<u8>,
+        /// The exact request a sender will send, opaque.  Durable with the
+        /// intent, so it can be re-sent byte for byte after a crash.
+        request: Vec<u8>,
+        /// Canonical resource set, opaque.
+        footprint: Vec<u8>,
+        /// How it can be retried after a crash.
+        retry: RetryPolicy,
+        /// What it does to the world.
+        consequence: Consequence,
+        /// Which credential or lease permits it (a name, opaque).
+        authority: Vec<u8>,
     },
     /// Record one transcript entry (tag 2).
     Transcript {
@@ -75,6 +92,32 @@ pub enum Request {
         /// True if the harness has no open database transaction.
         quiescent: bool,
     },
+    /// The sender's report on a released effect (tag 4).
+    Outcome {
+        /// The op reported on.
+        op: u64,
+        /// What happened.
+        result: Outcome,
+    },
+    /// List the released, unsettled effects (tag 5).
+    Open,
+}
+
+/// What a sender reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// It happened (tag 0).
+    Applied {
+        /// Provider receipt, opaque.
+        receipt: Vec<u8>,
+    },
+    /// It did not happen (tag 1).
+    NotApplied {
+        /// Why.
+        reason: String,
+    },
+    /// No answer, or an ambiguous one (tag 2).
+    Unknown,
 }
 
 /// Warden → Vessel: exactly one per request, in order.
@@ -115,30 +158,59 @@ pub enum Reply {
         /// Why, for people.
         message: String,
     },
+    /// Answer to `Outcome` (tag 5).
+    Outcome {
+        /// The op.
+        op: u64,
+        /// `None`: recorded.  `Some(why)`: refused (not a released,
+        /// unsettled effect of this Vessel); nothing recorded.
+        refused: Option<String>,
+    },
+    /// Answer to `Open` (tag 6): the released, unsettled effects, in op
+    /// order.
+    Open {
+        /// What a sender may act on.
+        effects: Vec<OpenEffect>,
+    },
 }
 
-/// The result of an effect request.
+/// The result of an effect declaration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EffectResult {
-    /// The provider confirmed it happened (tag 0).
-    Applied {
-        /// Provider receipt, opaque.
-        receipt: Vec<u8>,
+    /// Recorded and released: a sender may act on it (tag 0).
+    Released {
+        /// The op id the sender reports against.
+        op: u64,
     },
-    /// The provider confirmed it did not happen (tag 1).
-    NotApplied {
-        /// Why.
-        reason: String,
+    /// Recorded and held: this Vessel may not release effects; only its
+    /// parent, by promotion (tag 1).
+    Held {
+        /// The op id in this Vessel's Chronicle.
+        op: u64,
     },
-    /// It may or may not have happened; the Warden will reconcile it before
-    /// granting effect authority again (tag 2).
-    Unknown,
-    /// Refused before dispatch: no adapter, quota, no effect authority
-    /// (tag 3).
+    /// Not released: no effect authority, quota, or the ledger could not
+    /// be shipped (tag 2).
     Refused {
         /// Why.
         reason: String,
     },
+}
+
+/// A released effect a sender may act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenEffect {
+    /// Its op id.
+    pub op: u64,
+    /// The provider it was declared for.
+    pub provider: String,
+    /// The exact request bytes to send.
+    pub request: Vec<u8>,
+    /// How it may be retried: the dedup key or probe is here.
+    pub retry: RetryPolicy,
+    /// True if it was acted on once already and the outcome was lost
+    /// (reconciled unknown): probe or re-send with the same key, never
+    /// send afresh.
+    pub unknown: bool,
 }
 
 /// Why a request was refused.
@@ -277,6 +349,20 @@ impl Out {
             Some(x) => self.u8(1).u64(x),
         }
     }
+    fn retry(&mut self, r: &RetryPolicy) -> &mut Self {
+        match r {
+            RetryPolicy::ProviderDeduplicated { key } => self.u8(0).bytes(key),
+            RetryPolicy::Queryable { probe } => self.u8(1).bytes(probe),
+            RetryPolicy::UnsafeToRetry => self.u8(2),
+        }
+    }
+    fn consequence(&mut self, c: &Consequence) -> &mut Self {
+        match c {
+            Consequence::Irreversible => self.u8(0),
+            Consequence::Compensatable { by } => self.u8(1).u64(by.get()),
+            Consequence::NoExternalMutation => self.u8(2),
+        }
+    }
 }
 
 impl Request {
@@ -290,16 +376,37 @@ impl Request {
             Self::Effect {
                 call,
                 provider,
-                operation,
-                args,
+                request,
+                footprint,
+                retry,
+                consequence,
+                authority,
             } => {
-                o.u8(1).u64(*call).str(provider).str(operation).bytes(args);
+                o.u8(1)
+                    .u64(*call)
+                    .str(provider)
+                    .bytes(request)
+                    .bytes(footprint)
+                    .retry(retry)
+                    .consequence(consequence)
+                    .bytes(authority);
             }
             Self::Transcript { entry } => {
                 o.u8(2).bytes(entry);
             }
             Self::TurnEnd { turn, quiescent } => {
                 o.u8(3).u64(*turn).bool(*quiescent);
+            }
+            Self::Outcome { op, result } => {
+                o.u8(4).u64(*op);
+                match result {
+                    Outcome::Applied { receipt } => o.u8(0).bytes(receipt),
+                    Outcome::NotApplied { reason } => o.u8(1).str(reason),
+                    Outcome::Unknown => o.u8(2),
+                };
+            }
+            Self::Open => {
+                o.u8(5);
             }
         }
         o.0
@@ -313,14 +420,31 @@ impl Request {
             1 => Self::Effect {
                 call: r.u64()?,
                 provider: r.string()?,
-                operation: r.string()?,
-                args: r.bytes()?,
+                request: r.bytes()?,
+                footprint: r.bytes()?,
+                retry: r.retry()?,
+                consequence: r.consequence()?,
+                authority: r.bytes()?,
             },
             2 => Self::Transcript { entry: r.bytes()? },
             3 => Self::TurnEnd {
                 turn: r.u64()?,
                 quiescent: r.bool()?,
             },
+            4 => Self::Outcome {
+                op: r.u64()?,
+                result: match r.tag()? {
+                    0 => Outcome::Applied {
+                        receipt: r.bytes()?,
+                    },
+                    1 => Outcome::NotApplied {
+                        reason: r.string()?,
+                    },
+                    2 => Outcome::Unknown,
+                    _ => return Err(r.bad_tag("unknown outcome tag")),
+                },
+            },
+            5 => Self::Open,
             _ => return Err(r.bad_tag("unknown request tag")),
         };
         r.finish()?;
@@ -342,10 +466,9 @@ impl Reply {
             Self::Effect { call, result } => {
                 o.u8(1).u64(*call);
                 match result {
-                    EffectResult::Applied { receipt } => o.u8(0).bytes(receipt),
-                    EffectResult::NotApplied { reason } => o.u8(1).str(reason),
-                    EffectResult::Unknown => o.u8(2),
-                    EffectResult::Refused { reason } => o.u8(3).str(reason),
+                    EffectResult::Released { op } => o.u8(0).u64(*op),
+                    EffectResult::Held { op } => o.u8(1).u64(*op),
+                    EffectResult::Refused { reason } => o.u8(2).str(reason),
                 };
             }
             Self::Recorded { lsn } => {
@@ -356,6 +479,23 @@ impl Reply {
             }
             Self::Error { code, message } => {
                 o.u8(4).u8(*code as u8).str(message);
+            }
+            Self::Outcome { op, refused } => {
+                o.u8(5).u64(*op);
+                match refused {
+                    None => o.u8(0),
+                    Some(why) => o.u8(1).str(why),
+                };
+            }
+            Self::Open { effects } => {
+                o.u8(6).u64(effects.len() as u64);
+                for e in effects {
+                    o.u64(e.op)
+                        .str(&e.provider)
+                        .bytes(&e.request)
+                        .retry(&e.retry)
+                        .bool(e.unknown);
+                }
             }
         }
         o.0
@@ -372,14 +512,9 @@ impl Reply {
             1 => {
                 let call = r.u64()?;
                 let result = match r.tag()? {
-                    0 => EffectResult::Applied {
-                        receipt: r.bytes()?,
-                    },
-                    1 => EffectResult::NotApplied {
-                        reason: r.string()?,
-                    },
-                    2 => EffectResult::Unknown,
-                    3 => EffectResult::Refused {
+                    0 => EffectResult::Released { op: r.u64()? },
+                    1 => EffectResult::Held { op: r.u64()? },
+                    2 => EffectResult::Refused {
                         reason: r.string()?,
                     },
                     _ => return Err(r.bad_tag("unknown effect result tag")),
@@ -404,6 +539,32 @@ impl Reply {
                     code,
                     message: r.string()?,
                 }
+            }
+            5 => Self::Outcome {
+                op: r.u64()?,
+                refused: match r.tag()? {
+                    0 => None,
+                    1 => Some(r.string()?),
+                    _ => return Err(r.bad_tag("option tag is not 0 or 1")),
+                },
+            },
+            6 => {
+                let n = r.u64()?;
+                // Every entry is at least 8 + 8 + 8 + 1 + 1 bytes.
+                if n > (r.b.len() - r.pos) as u64 / 26 {
+                    return Err(r.err(r.pos, "truncated"));
+                }
+                let mut effects = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    effects.push(OpenEffect {
+                        op: r.u64()?,
+                        provider: r.string()?,
+                        request: r.bytes()?,
+                        retry: r.retry()?,
+                        unknown: r.bool()?,
+                    });
+                }
+                Self::Open { effects }
             }
             _ => return Err(r.bad_tag("unknown reply tag")),
         };
@@ -496,6 +657,28 @@ impl<'a> In<'a> {
         String::from_utf8(raw.to_vec()).map_err(|_| self.err(at, "invalid UTF-8"))
     }
 
+    fn retry(&mut self) -> Result<RetryPolicy, ProtocolError> {
+        Ok(match self.tag()? {
+            0 => RetryPolicy::ProviderDeduplicated { key: self.bytes()? },
+            1 => RetryPolicy::Queryable {
+                probe: self.bytes()?,
+            },
+            2 => RetryPolicy::UnsafeToRetry,
+            _ => return Err(self.bad_tag("unknown retry tag")),
+        })
+    }
+
+    fn consequence(&mut self) -> Result<Consequence, ProtocolError> {
+        Ok(match self.tag()? {
+            0 => Consequence::Irreversible,
+            1 => Consequence::Compensatable {
+                by: OpId::new(self.u64()?),
+            },
+            2 => Consequence::NoExternalMutation,
+            _ => return Err(self.bad_tag("unknown consequence tag")),
+        })
+    }
+
     fn finish(&self) -> Result<(), ProtocolError> {
         if self.pos == self.b.len() {
             Ok(())
@@ -561,28 +744,79 @@ mod tests {
         "\\PC{0,16}"
     }
 
+    fn retry() -> impl Strategy<Value = RetryPolicy> {
+        prop_oneof![
+            blob().prop_map(|key| RetryPolicy::ProviderDeduplicated { key }),
+            blob().prop_map(|probe| RetryPolicy::Queryable { probe }),
+            Just(RetryPolicy::UnsafeToRetry),
+        ]
+    }
+
+    fn consequence() -> impl Strategy<Value = Consequence> {
+        prop_oneof![
+            Just(Consequence::Irreversible),
+            any::<u64>().prop_map(|by| Consequence::Compensatable { by: OpId::new(by) }),
+            Just(Consequence::NoExternalMutation),
+        ]
+    }
+
+    fn outcome() -> impl Strategy<Value = Outcome> {
+        prop_oneof![
+            blob().prop_map(|receipt| Outcome::Applied { receipt }),
+            text().prop_map(|reason| Outcome::NotApplied { reason }),
+            Just(Outcome::Unknown),
+        ]
+    }
+
     fn request() -> impl Strategy<Value = Request> {
         prop_oneof![
             any::<u16>().prop_map(|version| Request::Hello { version }),
-            (any::<u64>(), text(), text(), blob()).prop_map(|(call, provider, operation, args)| {
-                Request::Effect {
-                    call,
-                    provider,
-                    operation,
-                    args,
-                }
-            }),
+            (
+                any::<u64>(),
+                text(),
+                blob(),
+                blob(),
+                retry(),
+                consequence(),
+                blob()
+            )
+                .prop_map(
+                    |(call, provider, request, footprint, retry, consequence, authority)| {
+                        Request::Effect {
+                            call,
+                            provider,
+                            request,
+                            footprint,
+                            retry,
+                            consequence,
+                            authority,
+                        }
+                    }
+                ),
             blob().prop_map(|entry| Request::Transcript { entry }),
             (any::<u64>(), any::<bool>())
                 .prop_map(|(turn, quiescent)| Request::TurnEnd { turn, quiescent }),
+            (any::<u64>(), outcome()).prop_map(|(op, result)| Request::Outcome { op, result }),
+            Just(Request::Open),
         ]
+    }
+
+    fn open_effect() -> impl Strategy<Value = OpenEffect> {
+        (any::<u64>(), text(), blob(), retry(), any::<bool>()).prop_map(
+            |(op, provider, request, retry, unknown)| OpenEffect {
+                op,
+                provider,
+                request,
+                retry,
+                unknown,
+            },
+        )
     }
 
     fn reply() -> impl Strategy<Value = Reply> {
         let result = prop_oneof![
-            blob().prop_map(|receipt| EffectResult::Applied { receipt }),
-            text().prop_map(|reason| EffectResult::NotApplied { reason }),
-            Just(EffectResult::Unknown),
+            any::<u64>().prop_map(|op| EffectResult::Released { op }),
+            any::<u64>().prop_map(|op| EffectResult::Held { op }),
             text().prop_map(|reason| EffectResult::Refused { reason }),
         ];
         let code = prop_oneof![
@@ -604,6 +838,10 @@ mod tests {
             (any::<u64>(), proptest::option::of(any::<u64>()))
                 .prop_map(|(turn, sealed)| Reply::TurnEnd { turn, sealed }),
             (code, text()).prop_map(|(code, message)| Reply::Error { code, message }),
+            (any::<u64>(), proptest::option::of(text()))
+                .prop_map(|(op, refused)| Reply::Outcome { op, refused }),
+            proptest::collection::vec(open_effect(), 0..4)
+                .prop_map(|effects| Reply::Open { effects }),
         ]
     }
 
@@ -623,6 +861,7 @@ mod tests {
         #[test]
         fn truncated_or_extended_bodies_are_refused(
             req in request(),
+            rep in reply(),
             pick in any::<prop::sample::Index>(),
             extra in 1u8..=255,
         ) {
@@ -631,6 +870,11 @@ mod tests {
             let mut longer = b.clone();
             longer.push(extra);
             prop_assert!(Request::decode(&longer).is_err());
+            let b = rep.encode();
+            prop_assert!(Reply::decode(&b[..pick.index(b.len())]).is_err());
+            let mut longer = b.clone();
+            longer.push(extra);
+            prop_assert!(Reply::decode(&longer).is_err());
         }
 
         /// Random bodies that decode re-encode to exactly the same bytes.
@@ -660,19 +904,67 @@ mod tests {
         }
     }
 
+    /// An effect request is the caller's declaration, whole: tag, call,
+    /// provider, request, footprint, retry, consequence, authority, and
+    /// nothing else.  The exact bytes are pinned, so a sender written
+    /// against v2 stays right.
     #[test]
-    fn an_effect_request_has_no_place_for_a_declared_class() {
-        // The full encoding of an effect request is tag, call, provider,
-        // operation, args — nothing else.  A tool's "this is safe" can only
-        // ride inside `args`, which the protocol never interprets.
+    fn an_effect_request_is_the_declaration() {
         let req = Request::Effect {
             call: 7,
-            provider: "mail".into(),
-            operation: "send".into(),
-            args: b"{\"consequence\":\"none\"}".to_vec(),
+            provider: "pay".into(),
+            request: b"pay 10".to_vec(),
+            footprint: b"acct".to_vec(),
+            retry: RetryPolicy::ProviderDeduplicated {
+                key: b"k1".to_vec(),
+            },
+            consequence: Consequence::Irreversible,
+            authority: b"user".to_vec(),
         };
         let b = req.encode();
-        assert_eq!(b.len(), 1 + 8 + (8 + 4) + (8 + 4) + (8 + 22));
+        let mut want = vec![1u8];
+        want.extend_from_slice(&7u64.to_le_bytes());
+        for s in [&b"pay"[..], b"pay 10", b"acct"] {
+            want.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            want.extend_from_slice(s);
+        }
+        want.push(0); // ProviderDeduplicated
+        want.extend_from_slice(&2u64.to_le_bytes());
+        want.extend_from_slice(b"k1");
+        want.push(0); // Irreversible
+        want.extend_from_slice(&4u64.to_le_bytes());
+        want.extend_from_slice(b"user");
+        assert_eq!(b, want);
+        assert_eq!(Request::decode(&b).unwrap(), req);
+    }
+
+    /// A v1 effect body (tag, call, provider, operation, args) is not a v2
+    /// effect: it does not decode, so an old client cannot slip a
+    /// declaration-less effect past a v2 Warden.
+    #[test]
+    fn a_v1_effect_body_does_not_decode() {
+        let mut b = vec![1u8];
+        b.extend_from_slice(&7u64.to_le_bytes());
+        for s in [&b"mail"[..], b"send", b"bob"] {
+            b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            b.extend_from_slice(s);
+        }
+        assert!(Request::decode(&b).is_err());
+    }
+
+    /// `Open` refuses a count larger than the body could hold before
+    /// allocating.
+    #[test]
+    fn an_open_reply_with_an_impossible_count_is_refused() {
+        let mut b = vec![6u8];
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            Reply::decode(&b),
+            Err(ProtocolError::Malformed {
+                why: "truncated",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -737,8 +1029,11 @@ mod tests {
         let mut b = Request::Effect {
             call: 0,
             provider: "ab".into(),
-            operation: String::new(),
-            args: vec![],
+            request: vec![],
+            footprint: vec![],
+            retry: RetryPolicy::UnsafeToRetry,
+            consequence: Consequence::NoExternalMutation,
+            authority: vec![],
         }
         .encode();
         b[17] = 0xFF;
