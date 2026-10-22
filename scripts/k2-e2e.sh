@@ -24,6 +24,10 @@
 #                 the others run on
 #   6. kept       a running Vessel edited past a limit runs on, with the
 #                 same agent process, and its status says why
+#   6b. fork      a Vessel with spec.fork {parent: runner} reaches Running
+#                 with its own agent, its dataset a clone of one of
+#                 runner's Seal snapshots; the API server fixes fork once
+#                 set (a change and a late add are refused by CEL)
 #   7. sigterm    SIGTERM: the Warden stops every agent and exits 0; the last
 #                 status of each says it was stopped
 #   8. slots      a new Warden keeps every uid slot with the Vessel whose
@@ -255,11 +259,15 @@ fi
 vessel team-b clash $TB 1 116 | K apply -f - >>"$OUT/vessels.log" 2>&1
 refused_ok=1
 check_refused() {   # ns name reason-part sleep-ms
-    if ! wait_for 20 is_phase "$1" "$2" Refused; then
+    # One kubectl call reads phase and message so a daemon-level restart
+    # (Restart::Always) cannot flip the status between two reads.
+    is_refused_with() {
+        local pm; pm=$(K get vessel -n "$1" "$2" -o 'jsonpath={.status.phase} {.status.message}' 2>/dev/null) || return 1
+        [[ "$pm" == "Refused "* ]] && [[ "$pm" == *"$3"* ]]
+    }
+    if ! wait_for 20 is_refused_with "$1" "$2" "$3"; then
         refused_ok=0; fail refused "$1/$2 is '$(phase "$1" "$2")': $(message "$1" "$2")"; return
     fi
-    local m; m=$(message "$1" "$2")
-    case "$m" in *"$3"*) ;; *) refused_ok=0; fail refused "$1/$2: '$m' lacks '$3'"; return ;; esac
     if agent "$4" >/dev/null; then refused_ok=0; fail refused "$1/$2 is refused but its agent runs"; fi
 }
 check_refused team-a wrong-tenant 'not the tenant of namespace "team-a"' 110
@@ -318,6 +326,25 @@ if [ -n "$before" ]; then
     fi
 else
     fail kept "the Vessel to edit was not running"
+fi
+
+# ── 6b. fork ──────────────────────────────────────────────────────────
+vessel team-a runner-fork $TA 5 105 "fork: { parent: runner, seal: last }" | K apply -f - >>"$OUT/vessels.log" 2>&1
+if wait_for 60 is_phase team-a runner-fork Running && wait_for 30 agent 105; then
+    ds_of() { grep -o "\] $1: dataset [^ ]*\$" "$OUT/warden-1.log" | head -1 | sed 's/.*: dataset //'; }
+    pds=$(ds_of runner); cds=$(ds_of runner-fork)
+    origin=$(zfs get -H -o value origin "$cds" 2>/dev/null)
+    changed=0; added=0
+    K patch vessel -n team-a runner-fork --type merge -p '{"spec":{"fork":{"parent":"editme"}}}' >"$OUT/crd-fork-change.log" 2>&1 && changed=1
+    K patch vessel -n team-a editme --type merge -p '{"spec":{"fork":{"parent":"runner"}}}' >"$OUT/crd-fork-add.log" 2>&1 && added=1
+    if [ -n "$pds" ] && [[ "$origin" == "$pds@taso-seal-"* ]] && [ "$changed" = 0 ] && [ "$added" = 0 ] \
+        && grep -q "fork is fixed once set" "$OUT/crd-fork-change.log" && grep -q "fork is fixed once set" "$OUT/crd-fork-add.log"; then
+        pass fork "runner-fork Running, its dataset a clone of ${origin#"$BASE"/}; fork fixed once set (a change and a late add refused)"
+    else
+        fail fork "origin '$origin' (runner's dataset '$pds'); change accepted=$changed, late add accepted=$added; see $OUT/crd-fork-*.log"
+    fi
+else
+    fail fork "runner-fork is $(phase team-a runner-fork): $(message team-a runner-fork)"
 fi
 
 # ── 7. sigterm ────────────────────────────────────────────────────────
@@ -384,7 +411,7 @@ K get vessels -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,N
 {
     echo
     echo "K2 end to end ($(date -u +%FT%TZ), $(uname -r), envtest $ENVTEST_VERSION)"
-    for row in crd running refused elsewhere deleted kept sigterm slots resumed; do
+    for row in crd running refused elsewhere deleted kept fork sigterm slots resumed; do
         printf '  %-10s %s\n' "$row" "${RESULT[$row]:-not run}"
     done
     echo "results in $OUT"
