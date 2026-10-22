@@ -46,7 +46,7 @@ use taso_field::adapter::{Call, Plan, Probed, Registry, Sent};
 use taso_field::protocol::EffectResult;
 
 use crate::chronicle::Layers;
-use crate::ledger::{Answer, Ledger, Proposed};
+use crate::ledger::{Answer, Declared, Ledger};
 use crate::vessel::{Vessel, VesselError};
 
 pub use crate::ledger::{Publish, PublishError, Reconciled, ResolveError};
@@ -146,7 +146,7 @@ impl Effects {
             return Ok(None);
         }
         // 3. Intent and dispatch authorized, durable together.
-        let a = self.ledger.authorize(vessel, &proposed)?;
+        let a = self.ledger.release(vessel, &proposed)?;
         debug_assert_eq!(
             a.op, op,
             "the plan was made for the op id the ledger assigned"
@@ -237,8 +237,8 @@ fn settle<L: Layers>(
     Ok(true)
 }
 
-fn proposed(provider: &str, plan: &Plan) -> Proposed {
-    Proposed {
+fn proposed(provider: &str, plan: &Plan) -> Declared {
+    Declared {
         provider: provider.to_string(),
         request: plan.request.clone(),
         footprint: plan.footprint.clone(),
