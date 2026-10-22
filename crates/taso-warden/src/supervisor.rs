@@ -383,6 +383,7 @@ mod tests {
             restart,
             runtime: None,
             effects: None,
+            promote: None,
         }
     }
 

@@ -389,6 +389,7 @@ mod tests {
             restart: Restart::Always,
             runtime: None,
             effects: None,
+            promote: None,
         }
     }
 
