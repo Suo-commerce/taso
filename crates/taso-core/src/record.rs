@@ -764,6 +764,11 @@ pub struct CheckpointRecord {
     pub open: Vec<OpenEffect>,
     /// The next unused effect op id.
     pub next_op: u64,
+    /// A Promotion whose adoption is not finished: the last Promotion
+    /// record seen, kept until every proposal it names is recorded as
+    /// this Chronicle's own intent (P3).  Carried here so a prune can
+    /// never hide a half-done promotion from the reopen that finishes it.
+    pub promotion: Option<PromotionRecord>,
 }
 
 impl Canonical for CheckpointRecord {
@@ -775,6 +780,7 @@ impl Canonical for CheckpointRecord {
         out.option(self.fs_shipped.as_ref());
         out.seq(self.open.iter());
         out.u64(self.next_op);
+        out.option(self.promotion.as_ref());
     }
 }
 
@@ -1295,7 +1301,11 @@ mod tests {
     }
 
     /// The Checkpoint payload (tag 9) is pinned too: a change to its
-    /// encoding changes every hash after the first checkpoint.
+    /// encoding changes every hash after the first checkpoint.  Pinned
+    /// twice: without a pending promotion, and with one (P3, 2026-10-22:
+    /// the `promotion` field was added; a Checkpoint written before it
+    /// no longer decodes, which is a format change made before any
+    /// production log existed).
     #[test]
     fn checkpoint_hash_is_pinned() {
         let lineage = LineageRecord {
@@ -1331,11 +1341,29 @@ mod tests {
                 state: Some(OutcomeState::OutcomeUnknown),
             }],
             next_op: 5,
+            promotion: None,
         }));
-        assert_eq!(make_record(cp).envelope.hash.to_string(), PIN_CHECKPOINT);
+        assert_eq!(
+            make_record(cp.clone()).envelope.hash.to_string(),
+            PIN_CHECKPOINT[0]
+        );
+        let Payload::Checkpoint(mut pending) = cp else {
+            unreachable!()
+        };
+        pending.promotion = Some(promotion());
+        assert_eq!(
+            make_record(Payload::Checkpoint(pending))
+                .envelope
+                .hash
+                .to_string(),
+            PIN_CHECKPOINT[1]
+        );
     }
 
-    const PIN_CHECKPOINT: &str = "4e5931bb34a14d59173bc42ff795ac5131ddd98973ffa317b63763a7dc827748";
+    const PIN_CHECKPOINT: [&str; 2] = [
+        "cfd3905def40d7511b24598dcd2ee981b1526b698c145e0a169d5ffe9eaaa622",
+        "2f79df47f43767c538211083219317fca57e0d7956f09fad1060c9b60caa3171",
+    ];
 
     // ── Promotion (P3) ──────────────────────────────────────────────
 

@@ -381,6 +381,7 @@ impl<'a> Reader<'a> {
                 })
             })?,
             next_op: self.u64()?,
+            promotion: self.option(Self::promotion)?,
         })
     }
 
@@ -769,7 +770,12 @@ mod tests {
             Just(OutcomeState::Prepared),
             Just(OutcomeState::DispatchAuthorized),
             Just(OutcomeState::OutcomeUnknown),
+            Just(OutcomeState::Proposed),
         ];
+        let promo = promotion().prop_map(|p| match p {
+            Payload::Promotion(r) => r,
+            _ => unreachable!(),
+        });
         let open =
             (lsn(), intent(), proptest::option::of(state)).prop_map(|(lsn, i, state)| match i {
                 Payload::Intent(intent) => OpenEffect { lsn, intent, state },
@@ -783,9 +789,10 @@ mod tests {
             proptest::option::of(fs),
             proptest::collection::vec(open, 0..3),
             any::<u64>(),
+            proptest::option::of(promo),
         )
             .prop_map(
-                |(lineage, transcript, effect, seal, fs_shipped, open, next_op)| {
+                |(lineage, transcript, effect, seal, fs_shipped, open, next_op, promotion)| {
                     Payload::Checkpoint(Box::new(CheckpointRecord {
                         lineage,
                         transcript,
@@ -794,6 +801,7 @@ mod tests {
                         fs_shipped,
                         open,
                         next_op,
+                        promotion,
                     }))
                 },
             )

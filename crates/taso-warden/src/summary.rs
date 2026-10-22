@@ -166,6 +166,9 @@ impl Summary {
             fs_shipped: self.fs_shipped.clone(),
             open: self.open.values().cloned().collect(),
             next_op: self.next_op,
+            // Folded in by the next step (P3 file 3); nothing writes a
+            // Promotion yet.
+            promotion: None,
         })
     }
 }
