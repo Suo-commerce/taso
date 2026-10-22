@@ -32,6 +32,7 @@
 #              OUT (/root/taso-gate-p3-<time>)  KEEP (0)
 
 set -euo pipefail
+trap 'echo "FAILED at line $LINENO (exit $?)" >&2' ERR
 
 : "${TASO_ZFS_DATASET:?set TASO_ZFS_DATASET to a dataset the gate may use}"
 N=${N:-20}
@@ -193,7 +194,24 @@ PY
 }
 
 vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset
-    grep -o ': dataset [^ ]*$' "$1" | head -1 | sed 's/: dataset //'
+    local ds
+    ds=$(grep -o ': dataset [^ ]*$' "$1" | head -1 | sed 's/: dataset //' || true)
+    if [ -z "$ds" ]; then
+        echo "vessel_ds: no dataset found in $1; last 10 lines:" >&2
+        tail -10 "$1" >&2
+        return 1
+    fi
+    echo "$ds"
+}
+
+# Run daemon, show stderr on failure.
+run_daemon() {
+    local cfg="$1" out="$2" err="$3"
+    if ! "$WORK/bin/taso-wardend" "$cfg" >"$out" 2>"$err"; then
+        echo "daemon failed (config $cfg):" >&2
+        tail -20 "$err" >&2
+        return 1
+    fi
 }
 
 kill_runc() {   # clean up orphaned runc containers after SIGKILL
@@ -245,7 +263,7 @@ for k in $(seq 1 "$N"); do
 
     # a. Parent: seal one turn, no effects.
     config_parent "$parent_subj" "$WORK/parent-$k.json"
-    "$WORK/bin/taso-wardend" "$WORK/parent-$k.json" >"$OUT/parent-$k.out" 2>"$OUT/parent-$k.err"
+    run_daemon "$WORK/parent-$k.json" "$OUT/parent-$k.out" "$OUT/parent-$k.err"
     parent_ds=$(vessel_ds "$OUT/parent-$k.err")
     echo "  parent: $parent_ds"
 
@@ -253,7 +271,7 @@ for k in $(seq 1 "$N"); do
     for f in $(seq 0 $((FORKS - 1))); do
         child_subj="p3-$RUN-$k-child-$f"
         config_child "$child_subj" "$parent_subj" "$WORK/child-$k-$f.json"
-        "$WORK/bin/taso-wardend" "$WORK/child-$k-$f.json" >"$OUT/child-$k-$f.out" 2>"$OUT/child-$k-$f.err"
+        run_daemon "$WORK/child-$k-$f.json" "$OUT/child-$k-$f.out" "$OUT/child-$k-$f.err"
         child_ds=$(vessel_ds "$OUT/child-$k-$f.err")
         echo "  child $f: $child_ds"
     done
@@ -291,8 +309,7 @@ for k in $(seq 1 "$N"); do
     # d. Clean start with promote config: the daemon's already-promoted
     #    guard and finish_promotion handle all crash-recovery cases.
     kill_runc
-    "$WORK/bin/taso-wardend" "$WORK/parent-$k-promote.json" \
-        >"$OUT/parent-$k-final.out" 2>"$OUT/parent-$k-final.err"
+    run_daemon "$WORK/parent-$k-promote.json" "$OUT/parent-$k-final.out" "$OUT/parent-$k-final.err"
     echo "  final start done"
 
     # e. Read the parent's keys.log from its dataset.
