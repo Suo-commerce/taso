@@ -382,6 +382,7 @@ mod tests {
             uid_slot: slot,
             restart,
             runtime: None,
+            effects: None,
         }
     }
 

@@ -368,6 +368,31 @@ pub struct VesselConf {
     /// Forked from another Vessel on this node instead of born from the
     /// void ([`ForkConf`]); `None`: a birth.
     pub fork: Option<ForkConf>,
+    /// Whether its effects are released or held ([`EffectsConf`],
+    /// `"effects": "dispatch" | "hold"`); `None`: by origin (P3 D4: a
+    /// fork holds, a Vessel born from the void or by succession
+    /// dispatches).  A config entry may say otherwise; an agent never can.
+    pub effects: Option<EffectsConf>,
+}
+
+/// What a Vessel's entry says about its effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectsConf {
+    /// Released: a sender may act on them (`"dispatch"`).
+    Dispatch,
+    /// Held as proposals until a parent promotes (`"hold"`).
+    Hold,
+}
+
+impl EffectsConf {
+    /// The engine's mode for `origin`, with this entry's say if any.
+    pub fn mode(this: Option<Self>, origin: &taso_core::record::Origin) -> Mode {
+        match this {
+            Some(EffectsConf::Dispatch) => Mode::Dispatch,
+            Some(EffectsConf::Hold) => Mode::Hold,
+            None => Mode::of(origin),
+        }
+    }
 }
 
 /// A Vessel forked from another on this node (fencing review F6 step 3c,
@@ -1031,6 +1056,14 @@ impl Config {
                         fork: match x.get("fork") {
                             None | Some(Value::Null) => None,
                             Some(f) => Some(fork_conf(f)?),
+                        },
+                        effects: match x.get("effects") {
+                            None | Some(Value::Null) => None,
+                            Some(e) => match e.as_str() {
+                                Some("dispatch") => Some(EffectsConf::Dispatch),
+                                Some("hold") => Some(EffectsConf::Hold),
+                                _ => return Err(bad("\"effects\" must be \"dispatch\" or \"hold\"")),
+                            },
                         },
                     })
                 })
@@ -1870,12 +1903,44 @@ impl Node {
         }
         let effects_publisher =
             PackPublisher::new(self.packs(id)?, self.coord.clone(), self.config.warden);
-        // Who may release effects: by origin (a fork holds); an entry's
-        // own say comes in P3 file 8.
-        let mode = Mode::of(&vessel.lineage().origin);
+        // Who may release effects: the entry's say, else by origin (a
+        // fork holds).
+        let mode = EffectsConf::mode(vc.effects, &vessel.lineage().origin);
         let (mut effects, reconciled) =
             Effects::open(mode, Box::new(effects_publisher), &mut vessel)?;
-        self.log(vc, format_args!("effects reconciled: {reconciled:?}"));
+        self.log(
+            vc,
+            format_args!("effects ({mode:?}) reconciled: {reconciled:?}"),
+        );
+        // A promotion recorded but not adopted (the Warden died in
+        // between): finished before the agent runs, from the child's log
+        // on this node.  Without that log the Vessel does not start: it
+        // would run with the futures it chose not yet released.
+        if let Some(p) = effects.pending_promotion() {
+            let child = self.host().read_log_of(p.child).map_err(|e| {
+                DaemonError::Refused(format!(
+                    "a promotion of {} at its Seal lsn {} is recorded but not adopted, and its log cannot be read here: {e}",
+                    id_hex(p.child),
+                    p.seal.get()
+                ))
+            })?;
+            let adopted = effects.finish_promotion(&mut vessel, &child).map_err(|e| {
+                DaemonError::Refused(format!(
+                    "finishing the promotion of {} at its Seal lsn {}: {e:?}",
+                    id_hex(p.child),
+                    p.seal.get()
+                ))
+            })?;
+            self.log(
+                vc,
+                format_args!(
+                    "finished the promotion of {} at its Seal lsn {}: {} effect(s) adopted",
+                    id_hex(p.child),
+                    p.seal.get(),
+                    adopted.len()
+                ),
+            );
+        }
 
         // A reborn dataset was received unmounted.
         self.storage
@@ -2478,6 +2543,52 @@ mod tests {
         assert_eq!(c.vessels[1].fork, None);
     }
 
+    /// `"effects"` says whether a Vessel releases or holds; absent (or
+    /// null) it is by origin: a fork holds, a birth dispatches.
+    #[test]
+    fn an_effects_entry_is_parsed_and_defaults_by_origin() {
+        use taso_core::record::{Origin, ParentSeal};
+        let c = Config::parse(GOOD).unwrap();
+        assert!(c.vessels.iter().all(|v| v.effects.is_none()));
+        for (text, want) in [
+            ("dispatch", EffectsConf::Dispatch),
+            ("hold", EffectsConf::Hold),
+        ] {
+            let c = with(|v| v["vessels"][1]["effects"] = text.into()).unwrap();
+            assert_eq!(c.vessels[1].effects, Some(want), "{text}");
+        }
+        let c = with(|v| v["vessels"][1]["effects"] = Value::Null).unwrap();
+        assert_eq!(c.vessels[1].effects, None);
+        for bad in [
+            serde_json::json!("send"),
+            serde_json::json!(true),
+            serde_json::json!({}),
+        ] {
+            let e = with(|v| v["vessels"][1]["effects"] = bad.clone()).unwrap_err();
+            assert!(e.0.contains("\"dispatch\" or \"hold\""), "{bad}: {e}");
+        }
+
+        let fork = Origin::Fork {
+            parent: ParentSeal {
+                chronicle: ChronicleId::from_bytes([1; 16]),
+                seal: Lsn::new(1),
+                seal_hash: taso_core::envelope::HashVal::GENESIS,
+            },
+        };
+        assert_eq!(EffectsConf::mode(None, &Origin::Void), Mode::Dispatch);
+        assert_eq!(EffectsConf::mode(None, &fork), Mode::Hold);
+        assert_eq!(
+            EffectsConf::mode(Some(EffectsConf::Dispatch), &fork),
+            Mode::Dispatch,
+            "a fork meant to be its own agent"
+        );
+        assert_eq!(
+            EffectsConf::mode(Some(EffectsConf::Hold), &Origin::Void),
+            Mode::Hold,
+            "a birth that only proposes"
+        );
+    }
+
     #[test]
     fn bad_fork_entries_are_refused() {
         for (fork, says) in [
@@ -2786,6 +2897,7 @@ mod tests {
                 landlock,
                 ..Default::default()
             })),
+            effects: None,
         };
         let e = vc(Some(true)).effective(&rt, &[]).unwrap_err();
         assert!(e.contains("no runtime.landlock_shim"), "{e}");
@@ -2803,6 +2915,7 @@ mod tests {
         ] {
             let e = VesselConf {
                 fork: None,
+                effects: None,
                 runtime: Some(Box::new(own)),
                 ..vc(None)
             }
