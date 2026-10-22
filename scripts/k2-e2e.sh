@@ -259,11 +259,15 @@ fi
 vessel team-b clash $TB 1 116 | K apply -f - >>"$OUT/vessels.log" 2>&1
 refused_ok=1
 check_refused() {   # ns name reason-part sleep-ms
-    if ! wait_for 20 is_phase "$1" "$2" Refused; then
+    # One kubectl call reads phase and message so a daemon-level restart
+    # (Restart::Always) cannot flip the status between two reads.
+    is_refused_with() {
+        local pm; pm=$(K get vessel -n "$1" "$2" -o 'jsonpath={.status.phase} {.status.message}' 2>/dev/null) || return 1
+        [[ "$pm" == "Refused "* ]] && [[ "$pm" == *"$3"* ]]
+    }
+    if ! wait_for 20 is_refused_with "$1" "$2" "$3"; then
         refused_ok=0; fail refused "$1/$2 is '$(phase "$1" "$2")': $(message "$1" "$2")"; return
     fi
-    local m; m=$(message "$1" "$2")
-    case "$m" in *"$3"*) ;; *) refused_ok=0; fail refused "$1/$2: '$m' lacks '$3'"; return ;; esac
     if agent "$4" >/dev/null; then refused_ok=0; fail refused "$1/$2 is refused but its agent runs"; fi
 }
 check_refused team-a wrong-tenant 'not the tenant of namespace "team-a"' 110
