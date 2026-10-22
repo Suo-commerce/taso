@@ -20,7 +20,7 @@ use taso_core::decode::DecodeError;
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{
     CheckpointRecord, CheckpointSeal, FsShippedRecord, LineageRecord, OpId, OpenEffect,
-    OutcomeState, Payload, SuccessionRecord,
+    OutcomeState, Payload, PromotionRecord, SuccessionRecord,
 };
 
 use crate::segment::Frame;
@@ -40,10 +40,16 @@ pub struct Summary {
     pub seal: Option<CheckpointSeal>,
     /// The last FsShipped record.
     pub fs_shipped: Option<FsShippedRecord>,
-    /// Effects whose latest outcome is not terminal, by op.
+    /// Effects whose latest outcome is not terminal, by op: the
+    /// obligations ([`Summary::obligations`]) and, in a Vessel that may
+    /// not release effects, the held proposals ([`Summary::proposals`]),
+    /// which stay here so a prune never loses what a parent may adopt.
     pub open: BTreeMap<OpId, OpenEffect>,
     /// The next unused op id.
     pub next_op: u64,
+    /// The last Promotion record, until the step that adopts its
+    /// proposals clears it (P3 file 5); carried by the Checkpoint.
+    pub promotion: Option<PromotionRecord>,
     /// The lsn of the Checkpoint the fold started from, if any.
     pub from_checkpoint: Option<Lsn>,
 }
@@ -59,16 +65,25 @@ impl Default for Summary {
             fs_shipped: None,
             open: BTreeMap::new(),
             next_op: 0,
+            promotion: None,
             from_checkpoint: None,
         }
     }
 }
 
+/// Settled for good: nothing will ever be done about it.  `Proposed` is
+/// not here: it is terminal for the Vessel that wrote it, but its parent
+/// may still adopt it, so it stays in `open` (as a proposal, never an
+/// obligation).
 fn terminal(s: OutcomeState) -> bool {
     matches!(
         s,
         OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied
     )
+}
+
+fn proposed(e: &OpenEffect) -> bool {
+    e.state == Some(OutcomeState::Proposed)
 }
 
 impl Summary {
@@ -136,6 +151,7 @@ impl Summary {
                     })
                 }
                 Payload::FsShipped(r) => self.fs_shipped = Some(r),
+                Payload::Promotion(p) => self.promotion = Some(p),
                 Payload::Checkpoint(c) => {
                     *self = Summary {
                         lineage: Some(c.lineage),
@@ -146,6 +162,7 @@ impl Summary {
                         fs_shipped: c.fs_shipped,
                         open: c.open.into_iter().map(|e| (e.intent.op, e)).collect(),
                         next_op: c.next_op,
+                        promotion: c.promotion,
                         from_checkpoint: Some(lsn),
                     }
                 }
@@ -166,10 +183,21 @@ impl Summary {
             fs_shipped: self.fs_shipped.clone(),
             open: self.open.values().cloned().collect(),
             next_op: self.next_op,
-            // Folded in by the next step (P3 file 3); nothing writes a
-            // Promotion yet.
-            promotion: None,
+            promotion: self.promotion,
         })
+    }
+
+    /// The open effects somebody must still settle: released (or never
+    /// authorized) intents whose outcome is not terminal.  What effect
+    /// authority and reconciliation look at.
+    pub fn obligations(&self) -> impl Iterator<Item = &OpenEffect> {
+        self.open.values().filter(|e| !proposed(e))
+    }
+
+    /// The held proposals, in op order: what a parent adopts on
+    /// promotion.  Never an obligation of the Vessel that holds them.
+    pub fn proposals(&self) -> impl Iterator<Item = &OpenEffect> {
+        self.open.values().filter(|e| proposed(e))
     }
 }
 
@@ -193,6 +221,7 @@ mod tests {
         Outcome(u8, u8),
         Seal(u64),
         Shipped,
+        Promotion(u8),
     }
 
     fn step() -> impl Strategy<Value = Step> {
@@ -200,9 +229,10 @@ mod tests {
             Just(Step::Transcript),
             Just(Step::Fs),
             (0u8..6).prop_map(Step::Intent),
-            (0u8..6, 0u8..5).prop_map(|(op, s)| Step::Outcome(op, s)),
+            (0u8..6, 0u8..6).prop_map(|(op, s)| Step::Outcome(op, s)),
             (1u64..1000).prop_map(Step::Seal),
             Just(Step::Shipped),
+            (0u8..4).prop_map(Step::Promotion),
         ]
     }
 
@@ -213,7 +243,17 @@ mod tests {
             OutcomeState::OutcomeUnknown,
             OutcomeState::ConfirmedApplied,
             OutcomeState::ConfirmedNotApplied,
+            OutcomeState::Proposed,
         ][usize::from(n)]
+    }
+
+    fn promotion(child: u8) -> PromotionRecord {
+        PromotionRecord {
+            child: ChronicleId::from_bytes([child; 16]),
+            seal: Lsn::new(u64::from(child) + 1),
+            seal_hash: HashVal::from_bytes([child; 32]),
+            ledger_pos: Lsn::new(u64::from(child)),
+        }
     }
 
     fn intent(op: u8) -> IntentRecord {
@@ -308,6 +348,9 @@ mod tests {
                             digest: HashVal::from_bytes([3; 32]),
                         }),
                     )
+                }
+                Step::Promotion(child) => {
+                    self.push(Stream::Ctl, Payload::Promotion(promotion(*child)))
                 }
             }
         }
@@ -408,6 +451,67 @@ mod tests {
             Summary::default().checkpoint(),
             None,
             "no Lineage, no Checkpoint"
+        );
+    }
+
+    /// A held proposal is in `open` (so a Checkpoint carries it through a
+    /// prune) but is never an obligation; the two views partition `open`.
+    #[test]
+    fn proposals_are_kept_but_are_not_obligations() {
+        let mut l = Log::new();
+        for s in [
+            Step::Intent(1),
+            Step::Outcome(1, 5), // held
+            Step::Intent(2),
+            Step::Outcome(2, 1), // released
+            Step::Intent(3),
+            Step::Outcome(3, 5), // held
+            Step::Intent(4),     // never authorized
+        ] {
+            l.step(&s);
+        }
+        let ops = |it: Box<dyn Iterator<Item = &OpenEffect> + '_>| -> Vec<u64> {
+            it.map(|e| e.intent.op.get()).collect()
+        };
+        let s = Summary::of(&l.frames).unwrap();
+        assert_eq!(ops(Box::new(s.proposals())), vec![1, 3]);
+        assert_eq!(ops(Box::new(s.obligations())), vec![2, 4]);
+        assert_eq!(s.open.len(), 4);
+        // Through a Checkpoint and a prune, the same.
+        l.checkpoint();
+        let at = l.frames.len() - 1;
+        let pruned = Summary::of(&l.frames[at..]).unwrap();
+        assert_eq!(ops(Box::new(pruned.proposals())), vec![1, 3]);
+        assert_eq!(ops(Box::new(pruned.obligations())), vec![2, 4]);
+    }
+
+    /// The last Promotion is folded, carried by the Checkpoint, and a
+    /// later one replaces it.
+    #[test]
+    fn the_last_promotion_is_folded_and_survives_a_prune() {
+        let mut l = Log::new();
+        assert_eq!(Summary::of(&l.frames).unwrap().promotion, None);
+        l.step(&Step::Promotion(1));
+        l.step(&Step::Intent(1));
+        assert_eq!(
+            Summary::of(&l.frames).unwrap().promotion,
+            Some(promotion(1))
+        );
+        l.checkpoint();
+        let at = l.frames.len() - 1;
+        let cp = Payload::decode(&l.frames[at].payload).unwrap();
+        let Payload::Checkpoint(cp) = cp else {
+            unreachable!()
+        };
+        assert_eq!(cp.promotion, Some(promotion(1)));
+        assert_eq!(
+            Summary::of(&l.frames[at..]).unwrap().promotion,
+            Some(promotion(1))
+        );
+        l.step(&Step::Promotion(2));
+        assert_eq!(
+            Summary::of(&l.frames).unwrap().promotion,
+            Some(promotion(2))
         );
     }
 }
