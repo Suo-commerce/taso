@@ -24,11 +24,13 @@ mod tests {
     use std::time::Instant;
 
     use taso_core::envelope::{Lsn, Stream};
-    use taso_core::record::{Payload, StreamCut, TurnId, Verdict};
-    use taso_field::adapter::{Call, FakeProvider, Registry};
+    use taso_core::record::{
+        Consequence, Dispatch, Payload, RetryPolicy, StreamCut, TurnId, Verdict,
+    };
 
     use crate::chronicle::Layers;
-    use crate::effects::Effects;
+    use crate::effects::{Asked, Effects, Mode};
+    use crate::ledger::{Answer, Declared};
     use crate::pack::{PackPublisher, Packs};
     use crate::segment::Position;
     use crate::ship::{ByteStream, LocalStore, Sender};
@@ -106,19 +108,34 @@ mod tests {
         )
         .unwrap();
         let publisher = PackPublisher::new(packs, e.host.coord.clone(), e.host.warden);
-        let mut registry = Registry::new();
-        registry.register(Box::new(FakeProvider::new("mail")));
-        let (mut fx, _) = Effects::open(registry, Box::new(publisher), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut v).unwrap();
 
         timing::take();
         timing::enable(true);
         let start = Instant::now();
         for i in 0..count {
-            let call = Call {
-                operation: "send".into(),
-                args: format!("user-{i}").into_bytes(),
+            let d = Declared {
+                provider: "mail".into(),
+                request: format!("send user-{i}").into_bytes(),
+                footprint: Vec::new(),
+                dispatch: Dispatch::Immediate,
+                retry: RetryPolicy::ProviderDeduplicated {
+                    key: format!("user-{i}").into_bytes(),
+                },
+                consequence: Consequence::Irreversible,
+                authority: Vec::new(),
             };
-            fx.dispatch(&mut v, "mail", call).unwrap();
+            let Asked::Released { op } = fx.ask(&mut v, &d).unwrap() else {
+                panic!("not released")
+            };
+            fx.report(
+                &mut v,
+                op,
+                &Answer::Applied {
+                    receipt: b"ok".to_vec(),
+                },
+            )
+            .unwrap();
         }
         let wall = start.elapsed().as_secs_f64();
         timing::enable(false);

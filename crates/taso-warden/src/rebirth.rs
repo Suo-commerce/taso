@@ -369,7 +369,8 @@ impl<P: Pool> Host<P> {
 mod tests {
     use super::*;
     use crate::coordinator::{Coord, Coordinator};
-    use crate::effects::{CrashAfter, Effects};
+    use crate::effects::{Asked, Effects, Mode, Released};
+    use crate::ledger::{Answer, Declared};
     use crate::pack::PackPublisher;
     use crate::ship::{ByteStream, LocalStore};
     use crate::vessel::tests::{fake_guid, ns, FakePool};
@@ -378,8 +379,9 @@ mod tests {
     use std::sync::Arc;
     use taso_core::envelope::{HashVal, Stream};
     use taso_core::model::WardenId;
-    use taso_core::record::{StreamCut, TurnId, Verdict};
-    use taso_field::adapter::{Call, FakeProvider, Registry};
+    use taso_core::record::{
+        Consequence, Dispatch, OutcomeState, RetryPolicy, StreamCut, TurnId, Verdict,
+    };
 
     /// Streams that say what they are.
     struct Says;
@@ -892,38 +894,62 @@ mod tests {
         assert!(matches!(r, Some(VesselError::LocalState(_))), "{r:?}");
     }
 
-    /// An effect authorized and anchored, then the node died before the
-    /// send: on the new node nothing is sent until the engine reconciles
-    /// it, and then it is settled once.
+    fn mail(to: &str) -> Declared {
+        Declared {
+            provider: "mail".into(),
+            request: format!("send {to}").into_bytes(),
+            footprint: Vec::new(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::ProviderDeduplicated {
+                key: to.as_bytes().to_vec(),
+            },
+            consequence: Consequence::Irreversible,
+            authority: Vec::new(),
+        }
+    }
+
+    /// An effect released and anchored, then the node died before any
+    /// report: on the new node it is an open obligation, recorded unknown,
+    /// with the exact request bytes and key a sender needs to find out;
+    /// the sender's report settles it, and nothing was settled by Taso.
     #[test]
-    fn an_open_effect_is_reconciled_after_rebirth() {
+    fn a_released_effect_is_an_obligation_after_rebirth() {
         let n = Nodes::new();
         let (a, b) = (n.host(1), n.host(2));
         let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
         let s1 = turn(&mut v, 1);
         v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
             .unwrap();
-        let mut reg = Registry::new();
-        reg.register(Box::new(FakeProvider::new("mail")));
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), a.warden);
-        let (mut fx, _) = Effects::open(reg, Box::new(publisher), &mut v).unwrap();
-        let call = Call {
-            operation: "send".into(),
-            args: b"someone".to_vec(),
+        let (mut fx, _) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut v).unwrap();
+        let Asked::Released { op } = fx.ask(&mut v, &mail("someone")).unwrap() else {
+            panic!("not released")
         };
-        assert_eq!(
-            fx.dispatch_until(&mut v, "mail", call, Some(CrashAfter::Published))
-                .unwrap(),
-            None
-        );
 
         let (mut w, _) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
-        let mut reg = Registry::new();
-        reg.register(Box::new(FakeProvider::new("mail")));
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), b.warden);
-        let (fx, rec) = Effects::open(reg, Box::new(publisher), &mut w).unwrap();
-        assert_eq!(rec.settled.len(), 1, "{rec:?}");
-        assert!(rec.open.is_empty());
+        let (mut fx, rec) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut w).unwrap();
+        assert!(rec.settled.is_empty(), "Taso settles nothing: {rec:?}");
+        assert_eq!(rec.open, vec![op]);
+        assert!(!fx.authorized());
+        let released = fx.released(&w).unwrap();
+        assert_eq!(
+            released,
+            vec![Released {
+                intent: released[0].intent.clone(),
+                state: OutcomeState::OutcomeUnknown
+            }]
+        );
+        assert_eq!(released[0].intent.request, b"send someone");
+        fx.report(
+            &mut w,
+            op,
+            &Answer::NotApplied {
+                reason: "provider never saw the key".into(),
+            },
+        )
+        .unwrap();
+        assert!(fx.authorized());
         assert!(fx.open_obligations().is_empty());
     }
 
@@ -993,20 +1019,19 @@ mod tests {
         let s1 = turn(&mut v, 1);
         v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
             .unwrap();
-        let mut reg = Registry::new();
-        reg.register(Box::new(FakeProvider::new("mail")));
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), a.warden);
-        let (mut fx, _) = Effects::open(reg, Box::new(publisher), &mut v).unwrap();
-        let call = Call {
-            operation: "send".into(),
-            args: b"someone".to_vec(),
+        let (mut fx, _) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut v).unwrap();
+        let Asked::Released { op } = fx.ask(&mut v, &mail("someone")).unwrap() else {
+            panic!("not released")
         };
-        assert!(
-            fx.dispatch_until(&mut v, "mail", call, None)
-                .unwrap()
-                .is_some(),
-            "sent and applied"
-        );
+        fx.report(
+            &mut v,
+            op,
+            &Answer::Applied {
+                receipt: b"r".to_vec(),
+            },
+        )
+        .unwrap();
         let known = v.navigate(&n.packs(v.id()), s1.lsn).unwrap();
         let Navigation::Consistent(obligations) = &known else {
             panic!("{known:?}")
@@ -1021,15 +1046,22 @@ mod tests {
             w.navigate(&n.packs(w.id()), s1.lsn).unwrap(),
             Navigation::Insufficient(vec![Reason::MissingOutcome(o.op)])
         );
-        let mut reg = Registry::new();
-        reg.register(Box::new(FakeProvider::new("mail")));
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), b.warden);
-        let (_fx, rec) = Effects::open(reg, Box::new(publisher), &mut w).unwrap();
-        assert_eq!(rec.settled, vec![o.op]);
+        let (mut fx, rec) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut w).unwrap();
+        assert_eq!(rec.open, vec![o.op], "open until the sender says again");
+        // The sender reports what it knows (its key was applied).
+        fx.report(
+            &mut w,
+            o.op,
+            &Answer::Applied {
+                receipt: b"r".to_vec(),
+            },
+        )
+        .unwrap();
         assert_eq!(
             w.navigate(&n.packs(w.id()), s1.lsn).unwrap(),
             known,
-            "reconciled: the same answer as before the gap"
+            "reported: the same answer as before the gap"
         );
     }
 

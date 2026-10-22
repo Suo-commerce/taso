@@ -66,8 +66,8 @@ use taso_core::decode::DecodeError;
 use taso_core::envelope::{ChronicleHead, ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::{
-    vessel_id, Authority, LineageRecord, Namespace, OpId, Origin, ParentSeal, Payload, StreamCut,
-    SuccessionRecord, TurnId, Verdict,
+    vessel_id, Authority, LineageRecord, Namespace, OpId, OpenEffect, Origin, ParentSeal, Payload,
+    PromotionRecord, StreamCut, SuccessionRecord, TurnId, Verdict,
 };
 
 use crate::chronicle::{
@@ -224,9 +224,20 @@ pub enum VesselError {
     SealNotLocal(Position),
     /// The Seal is accepted but its layer is not on this node.
     LayerMissing(Position),
-    /// A fork from a parent's local log ([`Host::fork_from_log`]): the
-    /// Seal cannot be proven accepted from that log (why).
+    /// A fork from a parent's local log ([`Host::fork_from_log`]) or a
+    /// promotion ([`Vessel::promote`]): the Seal cannot be proven accepted
+    /// from that log (why).
     ParentNotProven(String),
+    /// Promotion: the log is not a fork of this Vessel.
+    NotMyFork(ChronicleId),
+    /// Promotion: this Vessel sealed again since the fork (M7: the parent
+    /// moved), so the child's futures no longer continue its state.
+    ParentMoved {
+        /// The Seal the child was forked from.
+        fork: Position,
+        /// This Vessel's last Seal now.
+        last: Option<Position>,
+    },
     /// Succession needs a Seal, and the Vessel has none.
     NoSeal,
     /// Succession needs the tail to be the last Seal.
@@ -295,7 +306,12 @@ impl fmt::Display for VesselError {
             Self::NotASeal(p) => write!(f, "lsn {} is not an accepted Seal", p.lsn.get()),
             Self::SealNotLocal(p) => write!(f, "the Seal at lsn {} was pruned from the local log", p.lsn.get()),
             Self::LayerMissing(p) => write!(f, "the layer of Seal {} is not on this node", p.lsn.get()),
-            Self::ParentNotProven(why) => write!(f, "cannot fork: {why}"),
+            Self::ParentNotProven(why) => write!(f, "cannot prove the Seal: {why}"),
+            Self::NotMyFork(c) => write!(f, "{} is not a fork of this vessel", hex(c)),
+            Self::ParentMoved { fork, last } => match last {
+                Some(l) => write!(f, "cannot promote: this vessel sealed again (lsn {}) since the fork at lsn {}", l.lsn.get(), fork.lsn.get()),
+                None => write!(f, "cannot promote: this vessel has no Seal, the fork names lsn {}", fork.lsn.get()),
+            },
             Self::NoSeal => write!(f, "vessel has no Seal"),
             Self::AlreadySealed(p) => write!(f, "vessel already has a Seal (lsn {}): no birth Seal", p.lsn.get()),
             Self::NotPristine(tail) => write!(
@@ -313,7 +329,7 @@ impl fmt::Display for VesselError {
             Self::CrossNamespace => write!(f, "succession across namespaces was not allowed"),
             Self::EmptyAuthority => write!(f, "succession needs an actor and a reason"),
             Self::SelfSuccession => write!(f, "a vessel cannot succeed itself"),
-            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap, FsShipped and Checkpoint records are reserved"),
+            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap, FsShipped, Checkpoint and Promotion records are reserved"),
             Self::NotThisSeal(why) => write!(f, "not a Seal of this vessel: {why}"),
             Self::NothingShipped(id) => write!(f, "nothing of vessel {} is shipped and anchored", hex(id)),
             Self::ParentMissing(p) => write!(
@@ -376,6 +392,96 @@ pub enum SealAt {
     Last,
     /// The one at this lsn.
     At(Lsn),
+}
+
+/// A Vessel's local log read without claiming it ([`Host::read_log_of`]).
+pub struct ReadLog {
+    /// Whose log.
+    pub chronicle: ChronicleId,
+    /// Its records, in lsn order, from lsn 1 or the newest Checkpoint.
+    pub frames: Vec<Frame>,
+    /// Its Lineage.
+    pub lineage: LineageRecord,
+    /// The coordinator's anchored head when it was read.
+    pub head: Position,
+}
+
+impl ReadLog {
+    /// The Seal `at` and its `ledger_pos`, proven accepted: the records
+    /// from it to the anchored head join hash to hash and end exactly at
+    /// the head.  Nothing unaccepted, and nothing from a log that was
+    /// tampered with after the fact, can pass.
+    pub fn prove(&self, at: SealAt) -> Result<(Position, Lsn), VesselError> {
+        let not = |why: String| VesselError::ParentNotProven(why);
+        let mut seals = Vec::new();
+        for f in &self.frames {
+            if f.envelope.stream == Stream::Ctl && f.envelope.lsn <= self.head.lsn {
+                if let Payload::Seal(_) = decode(f)? {
+                    seals.push(Position {
+                        lsn: f.envelope.lsn,
+                        hash: f.envelope.hash,
+                    });
+                }
+            }
+        }
+        let seal = match at {
+            SealAt::Last => seals.last().copied(),
+            SealAt::At(lsn) => seals.iter().copied().find(|p| p.lsn == lsn),
+        }
+        .ok_or_else(|| match at {
+            SealAt::Last => not("no accepted Seal in the local log".into()),
+            SealAt::At(lsn) => not(format!(
+                "lsn {} is not an accepted Seal in the local log",
+                lsn.get()
+            )),
+        })?;
+        let from = self
+            .frames
+            .iter()
+            .position(|f| f.envelope.lsn == seal.lsn)
+            .expect("the Seal was found among these frames");
+        let mut last = &self.frames[from];
+        for f in &self.frames[from + 1..] {
+            if last.envelope.lsn == self.head.lsn {
+                break;
+            }
+            let joins = f.envelope.chronicle == self.chronicle
+                && f.envelope.lsn.get() == last.envelope.lsn.get() + 1
+                && f.envelope.prev == last.envelope.hash;
+            if !joins {
+                return Err(not(format!(
+                    "the local log does not join at lsn {} (after {}): the Seal cannot be proven up to the anchored head",
+                    f.envelope.lsn.get(),
+                    last.envelope.lsn.get()
+                )));
+            }
+            last = f;
+        }
+        if last.envelope.lsn != self.head.lsn || last.envelope.hash != self.head.hash {
+            return Err(not(format!(
+                "the local log ends at lsn {}, not at its anchored head (lsn {}, that hash)",
+                last.envelope.lsn.get(),
+                self.head.lsn.get()
+            )));
+        }
+        let ledger_pos = seal_ledger_pos(&self.frames, seal)?;
+        Ok((seal, ledger_pos))
+    }
+
+    /// The held proposals settled by a Seal whose `ledger_pos` is given
+    /// (open-at-S): intents at or before it, in op order.  Later
+    /// proposals belong to a later Seal.  Folded from the whole log, so a
+    /// proposal carried only by a later Checkpoint is still found.
+    pub fn proposals(&self, ledger_pos: Lsn) -> Result<Vec<OpenEffect>, VesselError> {
+        let s = summary(&self.frames)?;
+        let mut proposals: Vec<OpenEffect> = s
+            .proposals()
+            .filter(|e| e.lsn <= ledger_pos)
+            .cloned()
+            .collect();
+        proposals.sort_by_key(|e| e.intent.op);
+        Ok(proposals)
+    }
 }
 
 impl<P: Pool> Host<P> {
@@ -486,40 +592,13 @@ impl<P: Pool> Host<P> {
         at: SealAt,
         subject: &[u8],
     ) -> Result<Vessel<P::Layers>, VesselError> {
-        let not = |why: String| VesselError::ParentNotProven(why);
-        let dir = self.dir_for(parent);
-        if !dir.exists() {
-            return Err(not(format!(
-                "the parent {} has no local log on this node",
-                hex(&parent)
-            )));
-        }
-        let frames = crate::chronicle::read_log(&dir)?;
-        if frames.is_empty() {
-            return Err(not(format!(
-                "the parent {} has no local log on this node",
-                hex(&parent)
-            )));
-        }
-        let (lineage, _) = read_lineage(&frames)?;
-        let head = self.coord.head(parent).map_err(VesselError::Coord)?;
-        let mut seals = Vec::new();
-        for f in &frames {
-            if f.envelope.stream == Stream::Ctl && f.envelope.lsn <= head.lsn {
-                if let Payload::Seal(_) = decode(f)? {
-                    seals.push(Position {
-                        lsn: f.envelope.lsn,
-                        hash: f.envelope.hash,
-                    });
-                }
-            }
-        }
+        let log = self.read_log_of(parent)?;
         // An interrupted fork: its dataset is already a clone of the Seal
         // it was started from.  "last" then means that Seal, not the
         // parent's newest now (the parent may have sealed again since);
         // an explicit lsn is left as asked, and one that is not the
         // dataset's is refused by `unborn` as a conflict.
-        let child_ds = self.dataset_for(vessel_id(lineage.namespace, subject));
+        let child_ds = self.dataset_for(vessel_id(log.lineage.namespace, subject));
         let started = self
             .pool
             .info(&child_ds)
@@ -529,54 +608,43 @@ impl<P: Pool> Host<P> {
             (SealAt::Last, Some((ds, lsn))) if ds == self.dataset_for(parent) => SealAt::At(lsn),
             (at, _) => at,
         };
-        let seal = match at {
-            SealAt::Last => seals.last().copied(),
-            SealAt::At(lsn) => seals.iter().copied().find(|p| p.lsn == lsn),
-        }
-        .ok_or_else(|| match at {
-            SealAt::Last => not("the parent has no accepted Seal in its local log".into()),
-            SealAt::At(lsn) => not(format!(
-                "lsn {} is not an accepted Seal in the parent's local log",
-                lsn.get()
-            )),
-        })?;
-        let from = frames
-            .iter()
-            .position(|f| f.envelope.lsn == seal.lsn)
-            .expect("the Seal was found among these frames");
-        let mut last = &frames[from];
-        for f in &frames[from + 1..] {
-            if last.envelope.lsn == head.lsn {
-                break;
-            }
-            let joins = f.envelope.chronicle == parent
-                && f.envelope.lsn.get() == last.envelope.lsn.get() + 1
-                && f.envelope.prev == last.envelope.hash;
-            if !joins {
-                return Err(not(format!(
-                    "the parent's local log does not join at lsn {} (after {}): the Seal cannot be proven up to the anchored head",
-                    f.envelope.lsn.get(),
-                    last.envelope.lsn.get()
-                )));
-            }
-            last = f;
-        }
-        if last.envelope.lsn != head.lsn || last.envelope.hash != head.hash {
-            return Err(not(format!(
-                "the parent's local log ends at lsn {}, not at its anchored head (lsn {}, that hash)",
-                last.envelope.lsn.get(),
-                head.lsn.get()
-            )));
-        }
-        let ledger_pos = seal_ledger_pos(&frames, seal)?;
+        let (seal, ledger_pos) = log.prove(at)?;
         self.fork_at(
             parent,
             &self.dataset_for(parent),
-            lineage.namespace,
+            log.lineage.namespace,
             seal,
             ledger_pos,
             subject,
         )
+    }
+
+    /// Another Vessel's local log, read without claiming it, with its
+    /// Lineage and the coordinator's anchored head: what a fork
+    /// ([`Host::fork_from_log`]) and a promotion ([`Vessel::promote`])
+    /// prove their Seal from.
+    pub fn read_log_of(&self, chronicle: ChronicleId) -> Result<ReadLog, VesselError> {
+        let not = |why: String| VesselError::ParentNotProven(why);
+        let dir = self.dir_for(chronicle);
+        let frames = if dir.exists() {
+            crate::chronicle::read_log(&dir)?
+        } else {
+            Vec::new()
+        };
+        if frames.is_empty() {
+            return Err(not(format!(
+                "{} has no local log on this node",
+                hex(&chronicle)
+            )));
+        }
+        let (lineage, _) = read_lineage(&frames)?;
+        let head = self.coord.head(chronicle).map_err(VesselError::Coord)?;
+        Ok(ReadLog {
+            chronicle,
+            frames,
+            lineage,
+            head: head.into(),
+        })
     }
 
     /// The common end of [`Host::fork`] and [`Host::fork_from_log`].
@@ -1111,6 +1179,7 @@ impl<L: Layers> Vessel<L> {
                 | Payload::Gap(_)
                 | Payload::FsShipped(_)
                 | Payload::Checkpoint(_)
+                | Payload::Promotion(_)
         ) {
             return Err(VesselError::ReservedPayload);
         }
@@ -1132,6 +1201,7 @@ impl<L: Layers> Vessel<L> {
                     | Payload::Gap(_)
                     | Payload::FsShipped(_)
                     | Payload::Checkpoint(_)
+                    | Payload::Promotion(_)
             )
         }) {
             return Err(VesselError::ReservedPayload);
@@ -1207,6 +1277,49 @@ impl<L: Layers> Vessel<L> {
         Ok(self
             .chronicle
             .seal_checked(cut, verdict, ledger_pos, turn, check)?)
+    }
+
+    /// Promote a fork: record in this Chronicle that it adopted the
+    /// child's futures as of the child's Seal `at` (P3, M7).  Refused
+    /// unless `child` is a fork of this Vessel ([`VesselError::NotMyFork`])
+    /// made at this Vessel's last Seal ([`VesselError::ParentMoved`]: a
+    /// parent that sealed again has moved on, and the child's work no
+    /// longer continues its state), and the child's Seal is proven from
+    /// its log ([`ReadLog::prove`]).
+    ///
+    /// Writes exactly one [`PromotionRecord`] on `Ctl` and returns it with
+    /// the child's proposals it names (open-at-S, in op order); adopting
+    /// them into this Vessel's ledger is the caller's next step
+    /// ([`crate::ledger::Ledger::adopt`]).  A reference, never a merge:
+    /// this Vessel keeps its one Lineage.
+    pub fn promote(
+        &mut self,
+        child: &ReadLog,
+        at: SealAt,
+    ) -> Result<(PromotionRecord, Vec<OpenEffect>), VesselError> {
+        self.writable()?;
+        let fork = match &child.lineage.origin {
+            Origin::Fork { parent } if parent.chronicle == self.id => Position {
+                lsn: parent.seal,
+                hash: parent.seal_hash,
+            },
+            _ => return Err(VesselError::NotMyFork(child.chronicle)),
+        };
+        let last = self.last_seal();
+        if last != Some(fork) {
+            return Err(VesselError::ParentMoved { fork, last });
+        }
+        let (seal, ledger_pos) = child.prove(at)?;
+        let proposals = child.proposals(ledger_pos)?;
+        let record = PromotionRecord {
+            child: child.chronicle,
+            seal: seal.lsn,
+            seal_hash: seal.hash,
+            ledger_pos,
+        };
+        self.chronicle
+            .append(Stream::Ctl, Payload::Promotion(record))?;
+        Ok((record, proposals))
     }
 
     /// Publish the Seal whose layer is `snapshot` (see the module docs):
@@ -2016,6 +2129,138 @@ pub(crate) mod tests {
             Err(VesselError::ReservedPayload)
         ));
         assert_eq!(v.tail(), tail, "nothing of a refused batch is written");
+        assert!(matches!(
+            v.append(
+                Stream::Ctl,
+                Payload::Promotion(PromotionRecord {
+                    child: ChronicleId::from_bytes([9; 16]),
+                    seal: Lsn::new(1),
+                    seal_hash: HashVal::GENESIS,
+                    ledger_pos: Lsn::new(0),
+                })
+            ),
+            Err(VesselError::ReservedPayload)
+        ));
+    }
+
+    // ── promotion (P3) ──────────────────────────────────────────────
+
+    /// The child records effects through its ledger as held proposals
+    /// and seals; `n` proposals, then the Seal, then `after` more.
+    fn child_with_proposals(
+        e: &Env,
+        pid: ChronicleId,
+        subject: &[u8],
+        n: u64,
+        after: u64,
+    ) -> (ChronicleId, Position) {
+        use crate::ledger::{AlwaysPublish, Declared, Ledger};
+        use taso_core::record::{Consequence, Dispatch, RetryPolicy};
+        let mut c = e.host.fork_from_log(pid, SealAt::Last, subject).unwrap();
+        c.seal_birth().unwrap();
+        let (mut l, _) = Ledger::open(Box::new(AlwaysPublish), &mut c, |_, _, i, _| {
+            panic!("nothing to settle: op {}", i.op.get())
+        })
+        .unwrap();
+        let d = |k: u64| Declared {
+            provider: "pay".into(),
+            request: format!("pay {k}").into_bytes(),
+            footprint: Vec::new(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::UnsafeToRetry,
+            consequence: Consequence::Irreversible,
+            authority: Vec::new(),
+        };
+        for k in 1..=n {
+            l.propose(&mut c, &d(k)).unwrap();
+        }
+        let ledger_pos = c.tail().lsn;
+        let s = c
+            .seal(StreamCut::EMPTY, Verdict::Clean, ledger_pos, TurnId::new(1))
+            .unwrap();
+        for k in 1..=after {
+            l.propose(&mut c, &d(100 + k)).unwrap();
+        }
+        (c.id(), s.seal)
+    }
+
+    #[test]
+    fn a_promotion_names_the_childs_seal_and_lists_its_proposals() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let fork = seal(&mut p);
+        let (cid, cseal) = child_with_proposals(&e, p.id(), b"child", 2, 1);
+        let log = e.host.read_log_of(cid).unwrap();
+        let (r, proposals) = p.promote(&log, SealAt::Last).unwrap();
+        assert_eq!((r.child, r.seal, r.seal_hash), (cid, cseal.lsn, cseal.hash));
+        // Open-at-S: the proposal after the Seal is not part of it.
+        let ops: Vec<u64> = proposals.iter().map(|e| e.intent.op.get()).collect();
+        assert_eq!(ops, vec![1, 2]);
+        assert!(proposals.iter().all(|e| e.lsn <= r.ledger_pos));
+        assert_eq!(proposals[0].intent.request, b"pay 1");
+        // Exactly one Promotion record, after the fork Seal, on Ctl; the
+        // parent still has one Lineage and is still writable.
+        let frames = p.chronicle().frames().unwrap();
+        let promos: Vec<&Frame> = frames
+            .iter()
+            .filter(|f| matches!(decode(f), Ok(Payload::Promotion(_))))
+            .collect();
+        assert_eq!(promos.len(), 1);
+        assert_eq!(promos[0].envelope.stream, Stream::Ctl);
+        assert!(promos[0].envelope.lsn > fork.lsn);
+        assert_eq!(p.lineage().origin, Origin::Void);
+        p.append(Stream::Fs, raw(2)).unwrap();
+        // The child's log was not touched.
+        assert_eq!(
+            e.host.read_log_of(cid).unwrap().frames.len(),
+            log.frames.len()
+        );
+    }
+
+    #[test]
+    fn promotion_refusals() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        seal(&mut p);
+        let (cid, _) = child_with_proposals(&e, p.id(), b"child", 1, 0);
+        let log = e.host.read_log_of(cid).unwrap();
+
+        // Not my fork: another Vessel, and a fork of someone else.
+        let (mut other, _) = e.host.ensure(ns(1), b"other").unwrap();
+        seal(&mut other);
+        assert!(matches!(
+            other.promote(&log, SealAt::Last),
+            Err(VesselError::NotMyFork(c)) if c == cid
+        ));
+        let (gid, _) = child_with_proposals(&e, other.id(), b"grand", 1, 0);
+        assert!(matches!(
+            p.promote(&e.host.read_log_of(gid).unwrap(), SealAt::Last),
+            Err(VesselError::NotMyFork(c)) if c == gid
+        ));
+
+        // A Seal that is not the child's is not proven.
+        assert!(matches!(
+            p.promote(&log, SealAt::At(Lsn::new(999))),
+            Err(VesselError::ParentNotProven(_))
+        ));
+
+        // M7: the parent sealed again since the fork.
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let moved = seal(&mut p);
+        let fork = log.lineage.origin.parent().copied().unwrap();
+        assert!(matches!(
+            p.promote(&log, SealAt::Last),
+            Err(VesselError::ParentMoved { fork: f, last: Some(l) })
+                if f.lsn == fork.seal && l == moved
+        ));
+        // Nothing was written by any refusal.
+        assert!(!p
+            .chronicle()
+            .frames()
+            .unwrap()
+            .iter()
+            .any(|f| matches!(decode(f), Ok(Payload::Promotion(_)))));
     }
 
     // ── publishing a Seal ───────────────────────────────────────────
@@ -3001,7 +3246,7 @@ pub(crate) mod tests {
         assert_eq!(s.last_sealed_turn(), Some(5));
         drop(s);
         let (_, report) = crate::effects::Effects::open(
-            taso_field::adapter::Registry::new(),
+            crate::effects::Mode::Dispatch,
             Box::new(crate::effects::AlwaysPublish),
             &mut v,
         )
