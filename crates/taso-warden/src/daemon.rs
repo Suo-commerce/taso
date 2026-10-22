@@ -373,6 +373,11 @@ pub struct VesselConf {
     /// fork holds, a Vessel born from the void or by succession
     /// dispatches).  A config entry may say otherwise; an agent never can.
     pub effects: Option<EffectsConf>,
+    /// Promote a fork at start time, before the agent runs
+    /// ([`PromoteConf`], `"promote": {"child": "<subject>", "seal":
+    /// "last"}`).  The child must be a fork of this Vessel, on this node.
+    /// Used by the no-trace gate (P3 file 10).
+    pub promote: Option<PromoteConf>,
 }
 
 /// What a Vessel's entry says about its effects.
@@ -413,6 +418,20 @@ pub struct ForkConf {
     /// The parent's subject (same namespace).
     pub parent: String,
     /// Which of its accepted Seals.
+    pub seal: SealAt,
+}
+
+/// Promote a fork at start time, before the agent runs
+/// (`"promote": {"child": "<subject>", "seal": "last" | <lsn>}`).
+/// The child (same namespace) must be a fork of this Vessel, on this
+/// node, with a sealed log.  The promotion is recorded and its
+/// proposals adopted before the Field socket opens, so the agent's
+/// first `Open` sees the released effects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromoteConf {
+    /// The child's subject (same namespace as this Vessel).
+    pub child: String,
+    /// Which of the child's accepted Seals to promote.
     pub seal: SealAt,
 }
 
@@ -805,6 +824,33 @@ fn fork_conf(f: &Value) -> Result<ForkConf, ConfigError> {
     Ok(ForkConf { parent, seal })
 }
 
+/// A Vessel's `"promote"` ([`PromoteConf`]).  Unknown keys are refused.
+fn promote_conf(p: &Value) -> Result<PromoteConf, ConfigError> {
+    only_keys(p, "promote", &["child", "seal"])?;
+    let child = string(p, "child")?;
+    if child.is_empty() {
+        return Err(bad("\"promote\": \"child\" must not be empty"));
+    }
+    let seal = match p.get("seal") {
+        None => SealAt::Last,
+        Some(Value::String(s)) if s == "last" => SealAt::Last,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(l) if l >= 1 => SealAt::At(Lsn::new(l)),
+            _ => {
+                return Err(bad(
+                    "\"promote\": \"seal\" must be \"last\" or an lsn of at least 1",
+                ))
+            }
+        },
+        Some(_) => {
+            return Err(bad(
+                "\"promote\": \"seal\" must be \"last\" or an lsn of at least 1",
+            ))
+        }
+    };
+    Ok(PromoteConf { child, seal })
+}
+
 /// A Vessel's own `"runtime"` in a static config.
 fn vessel_runtime(r: &Value) -> Result<VesselRuntime, ConfigError> {
     only_keys(
@@ -1064,6 +1110,10 @@ impl Config {
                                 Some("hold") => Some(EffectsConf::Hold),
                                 _ => return Err(bad("\"effects\" must be \"dispatch\" or \"hold\"")),
                             },
+                        },
+                        promote: match x.get("promote") {
+                            None | Some(Value::Null) => None,
+                            Some(p) => Some(promote_conf(p)?),
                         },
                     })
                 })
@@ -1940,6 +1990,60 @@ impl Node {
                     adopted.len()
                 ),
             );
+        }
+        // A config-driven promotion: the child is a fork of this Vessel,
+        // on this node, whose agent has already run and sealed.  Used by
+        // the no-trace gate (P3 file 10).
+        //
+        // Skipped when the child was already promoted (a previous start
+        // with the same config completed the promotion, or crash recovery
+        // above finished it).  Checked by looking for a Promotion record
+        // naming this child in the Ctl stream.
+        if let Some(pc) = &vc.promote {
+            let child_id = taso_core::record::vessel_id(vc.namespace, pc.child.as_bytes());
+            let frames = vessel
+                .chronicle()
+                .frames()
+                .map_err(|e| DaemonError::Io(format!("reading frames for promotion check: {e}")))?;
+            let already = frames.iter().any(|f| {
+                matches!(
+                    taso_core::record::Payload::decode(&f.payload),
+                    Ok(taso_core::record::Payload::Promotion(p)) if p.child == child_id
+                )
+            });
+            if already {
+                self.log(
+                    vc,
+                    format_args!(
+                        "promote: {} already promoted, skipping",
+                        pc.child
+                    ),
+                );
+            } else {
+                let child = self.host().read_log_of(child_id).map_err(|e| {
+                    DaemonError::Refused(format!(
+                        "promote: the child {:?} ({})'s log cannot be read here: {e}",
+                        pc.child,
+                        id_hex(child_id)
+                    ))
+                })?;
+                let (record, adopted) =
+                    effects.promote(&mut vessel, &child, pc.seal).map_err(|e| {
+                        DaemonError::Refused(format!(
+                            "promote: {} at {:?}: {e:?}",
+                            pc.child, pc.seal
+                        ))
+                    })?;
+                self.log(
+                    vc,
+                    format_args!(
+                        "promoted {} at Seal lsn {}: {} effect(s) adopted",
+                        id_hex(record.child),
+                        record.seal.get(),
+                        adopted.len()
+                    ),
+                );
+            }
         }
 
         // A reborn dataset was received unmounted.
@@ -2898,6 +3002,7 @@ mod tests {
                 ..Default::default()
             })),
             effects: None,
+            promote: None,
         };
         let e = vc(Some(true)).effective(&rt, &[]).unwrap_err();
         assert!(e.contains("no runtime.landlock_shim"), "{e}");

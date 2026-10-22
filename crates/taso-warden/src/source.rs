@@ -454,6 +454,7 @@ mod tests {
             restart: Restart::Never,
             runtime: None,
             effects: None,
+            promote: None,
         }
     }
 
