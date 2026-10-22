@@ -468,6 +468,10 @@ impl<P: Pool> Host<P> {
     /// step 3c: the daemon forks from a config entry).  Calling it again
     /// with the same arguments finishes an interrupted fork.
     ///
+    /// An interrupted fork from [`SealAt::Last`] is finished from the Seal
+    /// its half-made dataset was cloned from, also if the parent has sealed
+    /// again since.
+    ///
     /// The Seal ([`SealAt`]) must be **proven accepted**: the local log must
     /// run from its record, record by record (each `prev` the hash before
     /// it, consecutive lsns, the parent's id), to exactly the coordinator's
@@ -510,6 +514,21 @@ impl<P: Pool> Host<P> {
                 }
             }
         }
+        // An interrupted fork: its dataset is already a clone of the Seal
+        // it was started from.  "last" then means that Seal, not the
+        // parent's newest now (the parent may have sealed again since);
+        // an explicit lsn is left as asked, and one that is not the
+        // dataset's is refused by `unborn` as a conflict.
+        let child_ds = self.dataset_for(vessel_id(lineage.namespace, subject));
+        let started = self
+            .pool
+            .info(&child_ds)
+            .map_err(pool_err)?
+            .and_then(|i| i.origin_seal());
+        let at = match (at, started) {
+            (SealAt::Last, Some((ds, lsn))) if ds == self.dataset_for(parent) => SealAt::At(lsn),
+            (at, _) => at,
+        };
         let seal = match at {
             SealAt::Last => seals.last().copied(),
             SealAt::At(lsn) => seals.iter().copied().find(|p| p.lsn == lsn),
@@ -2602,6 +2621,45 @@ pub(crate) mod tests {
         let now = e.host.coord.ownership(pid).unwrap();
         assert_eq!((now.holder, now.epoch), (owner.holder, owner.epoch));
         p.append(Stream::Fs, raw(4)).unwrap();
+    }
+
+    /// An interrupted fork from "last" (its dataset already a clone of
+    /// the Seal it started from) is finished from that Seal even after the
+    /// parent sealed again; an explicit lsn that disagrees is refused.
+    #[test]
+    fn an_interrupted_fork_resumes_from_its_datasets_seal() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut p);
+        let pid = p.id();
+        // Interrupted after the clone, before the Chronicle: what unborn
+        // leaves when the Warden dies between its two steps.
+        let child_ds = e.host.dataset_for(vessel_id(ns(1), b"child"));
+        Pool::clone(
+            &e.host.pool,
+            &e.host.dataset_for(pid),
+            s1.lsn,
+            s1.hash,
+            &child_ds,
+        )
+        .unwrap();
+        // The parent moves on.
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let s2 = seal(&mut p);
+        assert_ne!(s1, s2);
+        // An explicit lsn other than the dataset's is a real conflict.
+        assert!(matches!(
+            e.host.fork_from_log(pid, SealAt::At(s2.lsn), b"child"),
+            Err(VesselError::DatasetConflict(_))
+        ));
+        // "last" finishes the fork from the Seal it started from.
+        let c = e.host.fork_from_log(pid, SealAt::Last, b"child").unwrap();
+        let ps = c.lineage().origin.parent().copied().unwrap();
+        assert_eq!(
+            (ps.chronicle, ps.seal, ps.seal_hash),
+            (pid, s1.lsn, s1.hash)
+        );
     }
 
     #[test]
