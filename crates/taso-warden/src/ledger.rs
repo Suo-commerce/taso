@@ -292,26 +292,64 @@ impl Ledger {
         self.write(vessel, d, OutcomeState::Proposed, "effect.propose")
     }
 
-    /// Adopt a child's proposal: release it as this Vessel's own intent
-    /// (new op id, own barrier), with `from` as its `authority`.  The
-    /// request, footprint, retry and consequence are the child's,
-    /// unchanged; the child's Chronicle is not touched.
+    /// Adopt a child's proposals, all in one write, one fsync, one CAS:
+    /// every one of them or none, so a promotion is never half adopted.
+    /// Each becomes this Vessel's own intent (new op id, own barrier),
+    /// with its [`AdoptedFrom`] as `authority`; the request, footprint,
+    /// retry and consequence are the child's, unchanged, and the child's
+    /// Chronicle is not touched.  Released (`DispatchAuthorized`) if this
+    /// Vessel may release effects; held (`Proposed`) again if not, so a
+    /// holder's adoption travels up to the Vessel that may.
     pub fn adopt<L: Layers>(
         &mut self,
         vessel: &mut Vessel<L>,
-        from: AdoptedFrom,
-        proposal: &IntentRecord,
-    ) -> Result<Authorized, VesselError> {
-        let d = Declared {
-            provider: proposal.provider.clone(),
-            request: proposal.request.clone(),
-            footprint: proposal.footprint.clone(),
-            dispatch: proposal.dispatch,
-            retry: proposal.retry.clone(),
-            consequence: proposal.consequence,
-            authority: from.canon_bytes(),
+        child: ChronicleId,
+        seal: Lsn,
+        proposals: &[IntentRecord],
+        held: bool,
+    ) -> Result<Vec<Authorized>, VesselError> {
+        let state = if held {
+            OutcomeState::Proposed
+        } else {
+            OutcomeState::DispatchAuthorized
         };
-        self.write(vessel, &d, OutcomeState::DispatchAuthorized, "effect.adopt")
+        let first_op = self.next_op;
+        let first_lsn = vessel.tail().lsn.next();
+        let mut records = Vec::with_capacity(proposals.len() * 2);
+        let mut out = Vec::with_capacity(proposals.len());
+        for (i, proposal) in proposals.iter().enumerate() {
+            let from = AdoptedFrom {
+                child,
+                seal,
+                op: proposal.op,
+            };
+            let d = Declared {
+                provider: proposal.provider.clone(),
+                request: proposal.request.clone(),
+                footprint: proposal.footprint.clone(),
+                dispatch: proposal.dispatch,
+                retry: proposal.retry.clone(),
+                consequence: proposal.consequence,
+                authority: from.canon_bytes(),
+            };
+            let op = OpId::new(first_op + i as u64);
+            // Each intent lands two records after the previous one.
+            let lsn = first_lsn.get() + 2 * i as u64;
+            let barrier =
+                (d.consequence != Consequence::NoExternalMutation).then(|| BarrierId::new(lsn));
+            let a = Authorized { op, barrier };
+            records.push((Stream::Effect, Payload::Intent(intent(a, &d))));
+            records.push((Stream::Effect, outcome(op, state, None)));
+            out.push(a);
+        }
+        if records.is_empty() {
+            return Ok(out);
+        }
+        let t = crate::timing::span("effect.adopt");
+        vessel.append_batch(records)?;
+        drop(t);
+        self.next_op = first_op + proposals.len() as u64;
+        Ok(out)
     }
 
     fn write<L: Layers>(
@@ -949,7 +987,18 @@ mod tests {
             op: proposal.op,
         };
         let intent_lsn = v.tail().lsn.next();
-        let a = l.adopt(&mut v, from, &proposal).unwrap();
+        let [a] = l
+            .adopt(
+                &mut v,
+                child_id,
+                Lsn::new(7),
+                std::slice::from_ref(&proposal),
+                false,
+            )
+            .unwrap()[..]
+        else {
+            panic!("one adopted")
+        };
         assert_eq!(a.op, OpId::new(2), "a new op id of the parent's");
         assert_eq!(a.barrier, Some(BarrierId::new(intent_lsn.get())));
         let adopted = records(&v)

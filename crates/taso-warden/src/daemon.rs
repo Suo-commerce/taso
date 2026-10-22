@@ -113,12 +113,11 @@ use std::time::Duration;
 use serde_json::Value;
 use taso_core::envelope::{ChronicleId, Epoch, Lsn};
 use taso_core::record::{vessel_id, Namespace, TurnId, Verdict};
-use taso_field::adapter::Registry;
 
 use crate::chronicle::Layers;
 use crate::chronicle::{Claim, LayerError, Recovery};
 use crate::coordinator::{Coord, CoordError};
-use crate::effects::Effects;
+use crate::effects::{Effects, Mode};
 use crate::field::{serve, AfterSeal, FieldSocket, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
@@ -1871,8 +1870,11 @@ impl Node {
         }
         let effects_publisher =
             PackPublisher::new(self.packs(id)?, self.coord.clone(), self.config.warden);
+        // Who may release effects: by origin (a fork holds); an entry's
+        // own say comes in P3 file 8.
+        let mode = Mode::of(&vessel.lineage().origin);
         let (mut effects, reconciled) =
-            Effects::open(Registry::new(), Box::new(effects_publisher), &mut vessel)?;
+            Effects::open(mode, Box::new(effects_publisher), &mut vessel)?;
         self.log(vc, format_args!("effects reconciled: {reconciled:?}"));
 
         // A reborn dataset was received unmounted.

@@ -75,7 +75,6 @@ use crate::effects::Effects;
 use crate::quiesce::{verify, Watch};
 use crate::segment::Position;
 use crate::vessel::{Vessel, VesselError, BIRTH_TURN};
-use taso_field::adapter::Call;
 
 // ── Session ─────────────────────────────────────────────────────────
 
@@ -255,7 +254,7 @@ impl<'v, L: Layers> Session<'v, L> {
                     return Reply::Effect {
                         call,
                         result: EffectResult::Refused {
-                            reason: format!("no adapter for provider {provider:?}"),
+                            reason: format!("no effect engine for provider {provider:?}"),
                         },
                     };
                 }
@@ -265,18 +264,17 @@ impl<'v, L: Layers> Session<'v, L> {
                 if let Some(seal) = self.unpublished {
                     self.run_hook(seal);
                 }
-                let Some(fx) = self.effects.as_deref_mut() else {
-                    unreachable!("checked above")
-                };
-                let before = self.vessel.tail();
-                match fx.dispatch(self.vessel, &provider, Call { operation, args }) {
-                    Ok(result) => {
-                        if self.vessel.tail() != before {
-                            self.ledger = self.vessel.tail().lsn;
-                        }
-                        Reply::Effect { call, result }
-                    }
-                    Err(e) => vessel_error(e),
+                // Field v1 carries no declaration (retry, consequence): the
+                // engine cannot record what it was not told.  Refused until
+                // v2 (P3 file 6); nothing is recorded.
+                let _ = (operation, args);
+                Reply::Effect {
+                    call,
+                    result: EffectResult::Refused {
+                        reason: format!(
+                            "Field v{VERSION} cannot declare an effect's retry and consequence; provider {provider:?} needs Field v2"
+                        ),
+                    },
                 }
             }
             (true, Request::TurnEnd { turn, quiescent }) => self.turn_end(turn, quiescent),
@@ -485,9 +483,9 @@ impl Drop for FieldSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::Mode;
     use crate::vessel::tests::{env, ns};
     use std::os::unix::net::UnixStream;
-    use taso_field::adapter::{FakeProvider, Registry};
     use taso_field::protocol::{recv_reply, send_request, write_frame};
 
     fn hello() -> Request {
@@ -862,6 +860,7 @@ mod tests {
     /// the effect goes out if the retry lands.  The publisher refuses
     /// while the Seal is unpublished, as `ship_log` does (F4).
     #[test]
+    #[ignore = "Field v1 cannot declare an effect; rewritten for v2 in P3 file 7"]
     fn a_failed_publish_is_retried_before_an_effect() {
         use std::cell::Cell;
         use std::rc::Rc;
@@ -912,9 +911,8 @@ mod tests {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let published = Rc::new(Cell::new(true));
-        let mut reg = Registry::new();
-        reg.register(Box::new(FakeProvider::new("mail")));
-        let (mut fx, _) = Effects::open(reg, Box::new(Strict(published.clone())), &mut v).unwrap();
+        let (mut fx, _) =
+            Effects::open(Mode::Dispatch, Box::new(Strict(published.clone())), &mut v).unwrap();
         // Two failures: the publish after the reply, and the first retry.
         let mut hook = Flaky {
             seen: Vec::new(),
@@ -972,10 +970,12 @@ mod tests {
     fn a_later_seal_replaces_the_retry() {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
-        let mut reg = Registry::new();
-        reg.register(Box::new(FakeProvider::new("mail")));
-        let (mut fx, _) =
-            Effects::open(reg, Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
         let mut hook = Hook {
             seen: Vec::new(),
             fail: true,
@@ -1178,13 +1178,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Field v1 cannot declare an effect; rewritten for v2 in P3 file 7"]
     fn effects_dispatch_through_the_engine() {
         let e = env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
-        let mut reg = Registry::new();
-        reg.register(Box::new(FakeProvider::new("mail")));
-        let (mut fx, _) =
-            Effects::open(reg, Box::new(crate::effects::AlwaysPublish), &mut v).unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
         let mut s = Session::new(&mut v, Verdict::Clean)
             .unwrap()
             .with_effects(&mut fx);

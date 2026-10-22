@@ -1,92 +1,194 @@
-//! The effect engine of the reference runner: dispatch over the ledger
-//! (v0.4 §7.2–7.4).
+//! The effect engine of the reference runner: the outbox over the ledger
+//! (v0.4 §7.2–7.4; P3, 2026-10-22).
 //!
-//! The record of every effect, and every rule about it that is storage,
-//! lives in [`crate::ledger`]: intent before dispatch, the ledger off the
-//! node before any send, every answer recorded, reconciliation before
-//! authority, operator resolution.  This module is the relay: it knows
-//! the providers (adapters), plans, sends and probes, and tells the ledger
-//! what happened at each step.
+//! Taso never sends.  The record of every effect, and every rule about it
+//! that is storage, lives in [`crate::ledger`]; this module is what one
+//! Vessel's Field session and daemon drive: it answers an effect request
+//! with *released*, *held* or *refused*, takes the sender's report of what
+//! happened, and promotes a fork.  Whoever sends reads what was released
+//! and reports back; `docs/relay.md` is that contract.
 //!
-//! # Dispatch
+//! # Asking ([`Effects::ask`])
 //!
-//! For one Field `Effect` request:
+//! For one declared effect:
 //!
-//! 1. No effect authority (an unresolved effect is open) → refused.
-//! 2. No adapter for the provider → refused.  The adapter's plan refuses
-//!    → refused.  A `Deferrable` plan is refused for now (dispatch at the
-//!    next Seal is not built yet).  Nothing is recorded for a refusal.
-//! 3. The ledger authorizes it ([`Ledger::authorize`]): `Intent` and
-//!    `DispatchAuthorized`, durable together.
-//! 4. The ledger is shipped ([`Ledger::ship_before_send`]).  If that
-//!    fails, nothing is sent: the ledger has recorded
-//!    `ConfirmedNotApplied` ("ledger not shipped"), which is returned.
-//! 5. The adapter sends exactly `plan.request`.
-//! 6. The answer is recorded ([`Ledger::record`]).
+//! 1. No effect authority (a released effect is unresolved) → refused.
+//!    Nothing is recorded for a refusal.
+//! 2. A Vessel that **dispatches** ([`Mode::Dispatch`]): the ledger
+//!    releases it ([`Ledger::release`]: `Intent` and `DispatchAuthorized`,
+//!    durable together), then ships the ledger
+//!    ([`Ledger::ship_before_send`]).  If the ship fails, the release is
+//!    withdrawn (`ConfirmedNotApplied`, "ledger not shipped") and the
+//!    answer is refused: nothing a sender may act on exists only on this
+//!    node.  Otherwise *released*: from here on a sender may act on it.
+//! 3. A Vessel that **holds** ([`Mode::Hold`], a fork by default): the
+//!    ledger records it as a proposal ([`Ledger::propose`]: `Intent` and
+//!    `Proposed`, durable together) and answers *held*.  Nothing is ever
+//!    released from this Chronicle; only its parent may adopt it.
 //!
-//! A crash anywhere leaves at worst an intent that reconciliation
-//! settles.
+//! # Reporting ([`Effects::report`])
 //!
-//! # Reconciliation (on open, before any authority)
+//! The sender reports `Applied`, `NotApplied` or `Unknown` for a released
+//! op; the ledger records it ([`Ledger::record`]).  An unknown outcome on
+//! a barrier intent withdraws effect authority until an operator resolves
+//! it ([`Effects::resolve`]).
 //!
-//! The ledger visits every unsettled intent and settles the never
-//! authorized ones itself.  For an authorized or unknown one, by its
-//! retry policy:
-//! - `ProviderDeduplicated` → ship, re-send the recorded request;
-//!   record what the provider says;
-//! - `Queryable` → probe; applied → `ConfirmedApplied`; not applied →
-//!   ship, send, record; unknown → stays open;
-//! - `UnsafeToRetry` → `OutcomeUnknown`, stays open: an operator
-//!   decides ([`Effects::resolve`]).
-//! - no adapter for its provider any more → stays open.
-//! - a ship that fails before a send → nothing is sent; stays open.
+//! # Reopening ([`Effects::open`])
+//!
+//! Reconciliation lists; it settles nothing itself.  A released intent
+//! with no terminal outcome is recorded `OutcomeUnknown` (that is the
+//! truth after a crash: one of two worlds) and is an open obligation
+//! until a sender reports or an operator resolves.  Held proposals are
+//! not visited.  A Promotion whose adoption did not happen is reported
+//! ([`Effects::pending_promotion`]) for the daemon to finish
+//! ([`Effects::finish_promotion`]).
+//!
+//! # Promoting ([`Effects::promote`])
+//!
+//! [`Vessel::promote`] writes the Promotion (refused if the parent moved
+//! or the child's Seal is not proven); the ledger is shipped; then every
+//! proposal the Promotion names is adopted in **one** batch
+//! ([`Ledger::adopt`]): all of them or none, so a crash leaves either the
+//! Promotion without its adoption (finished on reopen) or the whole
+//! adoption.  A sibling that was not promoted has no Promotion and no
+//! adopted intent: nothing of it was ever released.
 
-use taso_core::record::{Authority, Dispatch, IntentRecord, OpId, OutcomeState, RetryPolicy};
-use taso_field::adapter::{Call, Plan, Probed, Registry, Sent};
-use taso_field::protocol::EffectResult;
+use taso_core::envelope::Lsn;
+use taso_core::record::{Authority, IntentRecord, OpId, Origin, OutcomeState, PromotionRecord};
 
 use crate::chronicle::Layers;
-use crate::ledger::{Answer, Declared, Ledger};
-use crate::vessel::{Vessel, VesselError};
+use crate::ledger::{Answer, Authorized, Declared, Ledger};
+use crate::segment::Position;
+use crate::vessel::{ReadLog, SealAt, Vessel, VesselError};
 
 pub use crate::ledger::{Publish, PublishError, Reconciled, ResolveError};
 
 #[cfg(test)]
 pub(crate) use crate::ledger::AlwaysPublish;
 
-/// The effect engine of one Vessel.
-pub struct Effects {
-    registry: Registry,
-    ledger: Ledger,
+/// Whether this Vessel may release effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Its effects are released: a sender may act on them.
+    Dispatch,
+    /// Its effects are held as proposals: only its parent may release
+    /// them, by promotion.
+    Hold,
 }
 
-/// Where a test stops the dispatch sequence, simulating a crash after
-/// that step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) enum CrashAfter {
-    Intent,
-    Authorized,
-    Published,
-    Send,
+impl Mode {
+    /// The default by origin (D4): a fork holds, a Vessel born from the
+    /// void or by succession dispatches.  A config entry may override
+    /// it; an agent never can.
+    pub fn of(origin: &Origin) -> Self {
+        match origin {
+            Origin::Fork { .. } => Mode::Hold,
+            Origin::Void | Origin::Succession { .. } => Mode::Dispatch,
+        }
+    }
+}
+
+/// The answer to an effect request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Asked {
+    /// Recorded and released: a sender may act on it.
+    Released {
+        /// Its op id, which the sender reports against.
+        op: OpId,
+    },
+    /// Recorded and held: nothing may act on it until a parent promotes.
+    Held {
+        /// Its op id in this Chronicle.
+        op: OpId,
+    },
+    /// Not recorded (or, after a failed ship, recorded as not applied).
+    Refused {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// Why a sender's report was refused.
+#[derive(Debug)]
+pub enum ReportError {
+    /// The op is not a released, unsettled effect of this Vessel.
+    NotReleased(OpId),
+    /// Recording it failed.
+    Vessel(VesselError),
+}
+
+/// Why a promotion was refused or left unfinished.
+#[derive(Debug)]
+pub enum PromoteError {
+    /// [`Vessel::promote`] refused it (not my fork, parent moved, Seal
+    /// not proven) or recording failed; nothing was adopted.
+    Vessel(VesselError),
+    /// The Promotion is recorded but the ledger could not be shipped, so
+    /// nothing was adopted yet.  Calling [`Effects::finish_promotion`]
+    /// later finishes it.
+    NotShipped(PublishError),
+}
+
+impl From<VesselError> for PromoteError {
+    fn from(e: VesselError) -> Self {
+        PromoteError::Vessel(e)
+    }
+}
+
+/// A released, unsettled effect: what a sender reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Released {
+    /// The intent, with the exact request bytes and the retry policy.
+    pub intent: IntentRecord,
+    /// `DispatchAuthorized` (never acted on, as far as the ledger knows)
+    /// or `OutcomeUnknown` (acted on, outcome lost).
+    pub state: OutcomeState,
+}
+
+/// The effect engine of one Vessel.
+pub struct Effects {
+    mode: Mode,
+    ledger: Ledger,
+    /// Released ops a sender may still report on, with their barrier.
+    released: std::collections::BTreeMap<OpId, Option<taso_core::record::BarrierId>>,
+    pending: Option<PromotionRecord>,
 }
 
 impl Effects {
-    /// Start the engine on an opened Vessel: reconcile its ledger, then
-    /// grant effect authority if nothing is left open.  `publisher` ships
-    /// the ledger before every send, here and in reconciliation.
+    /// Start the engine on an opened Vessel: reconcile its ledger (every
+    /// released intent without a terminal outcome becomes an open
+    /// obligation, recorded `OutcomeUnknown` if it was not already), then
+    /// grant effect authority if nothing is open.  `publisher` ships the
+    /// ledger before every release and promotion.
     pub fn open<L: Layers>(
-        mut registry: Registry,
+        mode: Mode,
         publisher: Box<dyn Publish>,
         vessel: &mut Vessel<L>,
     ) -> Result<(Self, Reconciled), VesselError> {
-        let (ledger, r) = Ledger::open(publisher, vessel, |l, v, i, s| {
-            settle(&mut registry, l, v, i, s)
-        })?;
-        Ok((Self { registry, ledger }, r))
+        let (ledger, r) = Ledger::open(publisher, vessel, |l, v, i, s| l.mark_unknown(v, i.op, s))?;
+        let summary = summary(vessel)?;
+        let released = summary
+            .obligations()
+            .filter(|e| unsettled(e.state))
+            .map(|e| (e.intent.op, e.intent.barrier))
+            .collect();
+        Ok((
+            Self {
+                mode,
+                ledger,
+                released,
+                pending: summary.promotion,
+            },
+            r,
+        ))
     }
 
-    /// True if effects may be dispatched.
+    /// Whether this Vessel releases or holds.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// True if effects may be released: no open obligation.
     pub fn authorized(&self) -> bool {
         self.ledger.authorized()
     }
@@ -96,84 +198,77 @@ impl Effects {
         self.ledger.open_obligations()
     }
 
-    /// Run one effect request through the full sequence.
-    pub fn dispatch<L: Layers>(
-        &mut self,
-        vessel: &mut Vessel<L>,
-        provider: &str,
-        call: Call,
-    ) -> Result<EffectResult, VesselError> {
-        Ok(self
-            .dispatch_until(vessel, provider, call, None)?
-            .expect("not stopped"))
+    /// A Promotion recorded whose adoption has not happened.
+    pub fn pending_promotion(&self) -> Option<PromotionRecord> {
+        self.pending
     }
 
-    pub(crate) fn dispatch_until<L: Layers>(
+    /// Answer one declared effect: released, held or refused.
+    pub fn ask<L: Layers>(
         &mut self,
         vessel: &mut Vessel<L>,
-        provider: &str,
-        call: Call,
-        stop: Option<CrashAfter>,
-    ) -> Result<Option<EffectResult>, VesselError> {
+        d: &Declared,
+    ) -> Result<Asked, VesselError> {
         if !self.ledger.authorized() {
-            return Ok(Some(refused(format!(
-                "no effect authority: {} unresolved effect(s)",
-                self.ledger.open_obligations().len()
-            ))));
+            return Ok(Asked::Refused {
+                reason: format!(
+                    "no effect authority: {} unresolved effect(s)",
+                    self.ledger.open_obligations().len()
+                ),
+            });
         }
-        let Some(adapter) = self.registry.get_mut(provider) else {
-            return Ok(Some(refused(format!(
-                "no adapter for provider {provider:?}"
-            ))));
-        };
-        let op = self.ledger.next_op();
-        let plan = match adapter.plan(op, &call) {
-            Ok(p) => p,
-            Err(r) => return Ok(Some(refused(r.to_string()))),
-        };
-        if plan.dispatch == Dispatch::Deferrable {
-            return Ok(Some(refused(
-                "deferrable dispatch is not supported yet".into(),
-            )));
-        }
-        let proposed = proposed(provider, &plan);
-
         let _total = crate::timing::span("effect.total");
-        if stop == Some(CrashAfter::Intent) {
-            // Tests only: an intent accepted alone, as an older Warden that
-            // wrote them apart could leave it.  Recovery must still handle it.
-            self.ledger.append_intent_alone(vessel, &proposed)?;
-            return Ok(None);
+        match self.mode {
+            Mode::Hold => {
+                let a = self.ledger.propose(vessel, d)?;
+                Ok(Asked::Held { op: a.op })
+            }
+            Mode::Dispatch => {
+                let a = self.ledger.release(vessel, d)?;
+                // The release goes off the node before anyone may act on it.
+                match self.ledger.ship_before_send(vessel, &a)? {
+                    Ok(()) => {
+                        self.released.insert(a.op, a.barrier);
+                        Ok(Asked::Released { op: a.op })
+                    }
+                    Err(reason) => Ok(Asked::Refused { reason }),
+                }
+            }
         }
-        // 3. Intent and dispatch authorized, durable together.
-        let a = self.ledger.release(vessel, &proposed)?;
-        debug_assert_eq!(
-            a.op, op,
-            "the plan was made for the op id the ledger assigned"
-        );
-        if stop == Some(CrashAfter::Authorized) {
-            return Ok(None);
-        }
-        // 4. The authorization goes off the node before the request does.
-        if let Err(reason) = self.ledger.ship_before_send(vessel, &a)? {
-            return Ok(Some(EffectResult::NotApplied { reason }));
-        }
-        if stop == Some(CrashAfter::Published) {
-            return Ok(None);
-        }
-        // 5. Send exactly the recorded request.
-        let adapter = self.registry.get_mut(provider).expect("looked up above");
-        let t = crate::timing::span("effect.send");
-        let sent = adapter.send(a.op, &plan);
-        drop(t);
-        if stop == Some(CrashAfter::Send) {
-            return Ok(None);
-        }
-        // 6. Record what the provider said.
+    }
+
+    /// The released, unsettled effects, in op order: what a sender reads
+    /// and acts on.
+    pub fn released<L: Layers>(&self, vessel: &Vessel<L>) -> Result<Vec<Released>, VesselError> {
+        Ok(summary(vessel)?
+            .obligations()
+            .filter(|e| unsettled(e.state))
+            .map(|e| Released {
+                intent: e.intent.clone(),
+                state: e.state.expect("unsettled has a state"),
+            })
+            .collect())
+    }
+
+    /// The sender's report on a released effect.  Refused for an op that
+    /// is not released and unsettled.
+    pub fn report<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        op: OpId,
+        answer: &Answer,
+    ) -> Result<(), ReportError> {
+        let Some(&barrier) = self.released.get(&op) else {
+            return Err(ReportError::NotReleased(op));
+        };
         let _t = crate::timing::span("effect.outcome");
-        let answer = answer(sent);
-        self.ledger.record(vessel, a.op, a.barrier, &answer)?;
-        Ok(Some(result(answer)))
+        self.ledger
+            .record(vessel, op, barrier, answer)
+            .map_err(ReportError::Vessel)?;
+        if *answer != Answer::Unknown {
+            self.released.remove(&op);
+        }
+        Ok(())
     }
 
     /// Operator resolution of an open effect: record what really happened.
@@ -186,208 +281,166 @@ impl Effects {
         applied: bool,
         authority: Authority,
     ) -> Result<(), ResolveError> {
-        self.ledger.resolve(vessel, op, applied, authority)
+        self.ledger.resolve(vessel, op, applied, authority)?;
+        self.released.remove(&op);
+        Ok(())
     }
-}
 
-/// Settle one authorized-or-unknown intent during reconciliation.  `true`
-/// if it is now terminal.
-fn settle<L: Layers>(
-    registry: &mut Registry,
-    ledger: &mut Ledger,
-    vessel: &mut Vessel<L>,
-    i: &IntentRecord,
-    state: Option<OutcomeState>,
-) -> Result<bool, VesselError> {
-    let plan = Plan {
-        request: i.request.clone(),
-        footprint: i.footprint.clone(),
-        retry: i.retry.clone(),
-        consequence: i.consequence,
-        dispatch: i.dispatch,
-        authority: i.authority.clone(),
-    };
-    let Some(adapter) = registry.get_mut(&i.provider) else {
-        return ledger.mark_unknown(vessel, i.op, state);
-    };
-    // Whether this ends in a send; a probe decides for Queryable.
-    let must_send = match &i.retry {
-        RetryPolicy::ProviderDeduplicated { .. } => None,
-        RetryPolicy::Queryable { .. } => match adapter.probe(i.op, &plan) {
-            Probed::Applied { receipt } => Some(Sent::Applied { receipt }),
-            Probed::NotApplied => None,
-            Probed::Unknown => return ledger.mark_unknown(vessel, i.op, state),
-        },
-        RetryPolicy::UnsafeToRetry => return ledger.mark_unknown(vessel, i.op, state),
-    };
-    let sent = match must_send {
-        Some(answer) => answer,
-        None => {
-            // Nothing is sent from a ledger that is not off the node.
-            if ledger.ship(vessel).is_err() {
-                return ledger.mark_unknown(vessel, i.op, state);
-            }
-            adapter.send(i.op, &plan)
+    /// Promote a fork: record the Promotion ([`Vessel::promote`]), ship
+    /// the ledger, adopt every proposal it names in one batch.  Returns
+    /// the Promotion and the adopted ops.
+    pub fn promote<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        child: &ReadLog,
+        at: SealAt,
+    ) -> Result<(PromotionRecord, Vec<Authorized>), PromoteError> {
+        let _total = crate::timing::span("promote.total");
+        let (record, _) = vessel.promote(child, at)?;
+        self.pending = Some(record);
+        let adopted = self.finish_promotion(vessel, child)?;
+        Ok((record, adopted))
+    }
+
+    /// Finish a promotion whose adoption did not happen (a crash after the
+    /// Promotion was recorded, or a ship that failed): ship the ledger,
+    /// then adopt the proposals the pending Promotion names, in one
+    /// batch.  Nothing to do if no promotion is pending.  `child` is the
+    /// log the Promotion names, read again.
+    pub fn finish_promotion<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        child: &ReadLog,
+    ) -> Result<Vec<Authorized>, PromoteError> {
+        let Some(p) = self.pending else {
+            return Ok(Vec::new());
+        };
+        if child.chronicle != p.child {
+            return Err(PromoteError::Vessel(VesselError::NotMyFork(
+                child.chronicle,
+            )));
         }
-    };
-    if sent == Sent::Unknown {
-        return ledger.mark_unknown(vessel, i.op, state);
-    }
-    ledger.record(vessel, i.op, i.barrier, &answer(sent))?;
-    Ok(true)
-}
-
-fn proposed(provider: &str, plan: &Plan) -> Declared {
-    Declared {
-        provider: provider.to_string(),
-        request: plan.request.clone(),
-        footprint: plan.footprint.clone(),
-        dispatch: plan.dispatch,
-        retry: plan.retry.clone(),
-        consequence: plan.consequence,
-        authority: plan.authority.clone(),
-    }
-}
-
-fn answer(sent: Sent) -> Answer {
-    match sent {
-        Sent::Applied { receipt } => Answer::Applied { receipt },
-        Sent::NotApplied { reason } => Answer::NotApplied { reason },
-        Sent::Unknown => Answer::Unknown,
-    }
-}
-
-fn result(answer: Answer) -> EffectResult {
-    match answer {
-        Answer::Applied { receipt } => EffectResult::Applied { receipt },
-        Answer::NotApplied { reason } => EffectResult::NotApplied { reason },
-        Answer::Unknown => EffectResult::Unknown,
+        // The Promotion goes off the node before anything is adopted from
+        // it: an adoption only this node knew of could not be reconciled
+        // by whoever takes the Vessel over.
+        self.ledger.ship(vessel).map_err(PromoteError::NotShipped)?;
+        let seal = Position {
+            lsn: p.seal,
+            hash: p.seal_hash,
+        };
+        // The Seal must still be the one promoted: proven again from the
+        // child's log as it is now.
+        let (proven, ledger_pos) = child.prove(SealAt::At(seal.lsn))?;
+        if proven != seal || ledger_pos != p.ledger_pos {
+            return Err(PromoteError::Vessel(VesselError::NotASeal(seal)));
+        }
+        let proposals: Vec<IntentRecord> = child
+            .proposals(ledger_pos)?
+            .into_iter()
+            .map(|e| e.intent)
+            .collect();
+        let held = self.mode == Mode::Hold;
+        let adopted = self
+            .ledger
+            .adopt(vessel, p.child, p.seal, &proposals, held)?;
+        if !held {
+            for a in &adopted {
+                self.released.insert(a.op, a.barrier);
+            }
+        }
+        self.pending = None;
+        Ok(adopted)
     }
 }
 
-fn refused(reason: String) -> EffectResult {
-    EffectResult::Refused { reason }
+fn unsettled(state: Option<OutcomeState>) -> bool {
+    matches!(
+        state,
+        Some(OutcomeState::DispatchAuthorized | OutcomeState::OutcomeUnknown)
+    )
+}
+
+fn summary<L: Layers>(vessel: &Vessel<L>) -> Result<crate::summary::Summary, VesselError> {
+    let frames = vessel
+        .chronicle()
+        .frames()
+        .map_err(|e| VesselError::Chronicle(crate::chronicle::ChronicleError::Segment(e)))?;
+    crate::summary::Summary::of(&frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })
+}
+
+/// The highest ledger lsn, for a Seal's `ledger_pos`.
+pub fn ledger_pos<L: Layers>(vessel: &Vessel<L>) -> Result<Lsn, VesselError> {
+    Ok(summary(vessel)?.effect)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+//
+// The engine with no sender: what the store promises whoever sends, and
+// the no-trace property of forks.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::{Position, Segment};
+    use crate::segment::Segment;
     use crate::vessel::tests::{env, ns, Env, FakeLayers};
-    use proptest::prelude::*;
-    use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::cell::Cell;
+    use std::rc::Rc;
     use taso_core::canon::Canonical;
     use taso_core::envelope::{ChronicleId, Epoch, Stream};
-    use taso_core::record::{BarrierId, Consequence, Payload};
-    use taso_field::adapter::{Adapter, FakeProvider, Fault, Refusal};
+    use taso_core::record::{
+        BarrierId, Consequence, Dispatch, Payload, RetryPolicy, StreamCut, TurnId, Verdict,
+    };
 
-    /// What happened, in order, across the provider and the publisher.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    enum Ev {
-        /// A publish succeeded up to this lsn.
-        Published(taso_core::envelope::Lsn),
-        /// The provider was sent this request.
-        Sent(Vec<u8>),
+    /// A publisher that counts, and fails the next `fails` times.
+    struct Counting {
+        published: Rc<Cell<u32>>,
+        fails: Rc<Cell<u32>>,
     }
 
-    #[derive(Default)]
-    struct World {
-        timeline: Vec<Ev>,
-        /// The next this many publishes fail.
-        publish_fails: u32,
-    }
-
-    /// A fake provider that survives the Warden "crashing", and the world
-    /// it shares with the test publisher.
-    #[derive(Clone)]
-    struct Shared(Arc<Mutex<FakeProvider>>, Arc<Mutex<World>>);
-
-    /// A publisher that records into the shared world and fails on demand.
-    struct TestPublish(Arc<Mutex<World>>);
-
-    impl Publish for TestPublish {
+    impl Publish for Counting {
         fn publish(
             &mut self,
             _: ChronicleId,
             _: Epoch,
             _: &[&Segment],
-            upto: Position,
+            _: Position,
         ) -> Result<(), PublishError> {
-            let mut w = self.0.lock().unwrap();
-            if w.publish_fails > 0 {
-                w.publish_fails -= 1;
+            if self.fails.get() > 0 {
+                self.fails.set(self.fails.get() - 1);
                 return Err(PublishError("store unavailable".into()));
             }
-            w.timeline.push(Ev::Published(upto.lsn));
+            self.published.set(self.published.get() + 1);
             Ok(())
         }
     }
 
-    impl Shared {
-        fn new(name: &str) -> Self {
-            Self(
-                Arc::new(Mutex::new(FakeProvider::new(name))),
-                Arc::default(),
-            )
-        }
-        fn publisher(&self) -> Box<dyn Publish> {
-            Box::new(TestPublish(self.1.clone()))
-        }
-        fn fail_publish(&self, n: u32) {
-            self.1.lock().unwrap().publish_fails = n;
-        }
-        fn timeline(&self) -> Vec<Ev> {
-            self.1.lock().unwrap().timeline.clone()
-        }
-        fn fail_next(&self, f: Fault) {
-            self.0.lock().unwrap().fail_next(f);
-        }
-        fn applied(&self, request: &[u8]) -> usize {
-            self.0.lock().unwrap().applied(request)
-        }
-        fn no_duplicates(&self) -> bool {
-            self.0.lock().unwrap().no_duplicates()
-        }
-    }
-
-    impl Adapter for Shared {
-        fn provider(&self) -> &str {
-            "mail" // every Shared in these tests wraps a provider named "mail"
-        }
-        fn plan(&self, op: OpId, call: &Call) -> Result<Plan, Refusal> {
-            self.0.lock().unwrap().plan(op, call)
-        }
-        fn send(&mut self, op: OpId, plan: &Plan) -> Sent {
-            self.1
-                .lock()
-                .unwrap()
-                .timeline
-                .push(Ev::Sent(plan.request.clone()));
-            self.0.lock().unwrap().send(op, plan)
-        }
-        fn probe(&mut self, op: OpId, plan: &Plan) -> Probed {
-            self.0.lock().unwrap().probe(op, plan)
-        }
-    }
-
-    fn registry(p: &Shared) -> Registry {
-        let mut r = Registry::new();
-        r.register(Box::new(p.clone()));
-        r
-    }
-
-    fn call(op: &str, target: &str) -> Call {
-        Call {
-            operation: op.into(),
-            args: target.as_bytes().to_vec(),
-        }
+    fn counting(published: &Rc<Cell<u32>>, fails: &Rc<Cell<u32>>) -> Box<dyn Publish> {
+        Box::new(Counting {
+            published: published.clone(),
+            fails: fails.clone(),
+        })
     }
 
     fn vessel(e: &Env) -> Vessel<FakeLayers> {
         e.host.ensure(ns(1), b"u").unwrap().0
+    }
+
+    fn declared(request: &str, consequence: Consequence) -> Declared {
+        Declared {
+            provider: "pay".into(),
+            request: request.as_bytes().to_vec(),
+            footprint: Vec::new(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::ProviderDeduplicated {
+                key: request.as_bytes().to_vec(),
+            },
+            consequence,
+            authority: b"user".to_vec(),
+        }
+    }
+
+    fn pay(k: &str) -> Declared {
+        declared(k, Consequence::Irreversible)
     }
 
     /// Effect records, decoded, in order.
@@ -401,14 +454,28 @@ mod tests {
             .collect()
     }
 
-    fn states(v: &Vessel<FakeLayers>) -> Vec<OutcomeState> {
+    fn states(v: &Vessel<FakeLayers>) -> Vec<(u64, OutcomeState)> {
         ledger(v)
             .into_iter()
             .filter_map(|p| match p {
-                Payload::Outcome(o) => Some(o.state),
+                Payload::Outcome(o) => Some((o.op.get(), o.state)),
                 _ => None,
             })
             .collect()
+    }
+
+    fn intents(v: &Vessel<FakeLayers>) -> Vec<IntentRecord> {
+        ledger(v)
+            .into_iter()
+            .filter_map(|p| match p {
+                Payload::Intent(i) => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn open_dispatch(v: &mut Vessel<FakeLayers>) -> (Effects, Reconciled) {
+        Effects::open(Mode::Dispatch, Box::new(AlwaysPublish), v).unwrap()
     }
 
     fn auth() -> Authority {
@@ -418,469 +485,431 @@ mod tests {
         }
     }
 
-    /// Every send came after a successful publish that covered the
-    /// `DispatchAuthorized` record of its effect.
-    fn sent_only_after_publish(v: &Vessel<FakeLayers>, p: &Shared) -> Result<(), String> {
-        let mut op_of: BTreeMap<Vec<u8>, OpId> = BTreeMap::new();
-        let mut authorized_at: BTreeMap<OpId, u64> = BTreeMap::new();
-        for f in v.chronicle().frames().unwrap() {
-            if f.envelope.stream != Stream::Effect {
-                continue;
-            }
-            match Payload::decode(&f.payload).unwrap() {
-                Payload::Intent(i) => {
-                    op_of.insert(i.request, i.op);
-                }
-                Payload::Outcome(o) if o.state == OutcomeState::DispatchAuthorized => {
-                    authorized_at.entry(o.op).or_insert(f.envelope.lsn.get());
-                }
-                _ => {}
-            }
-        }
-        let mut published = 0;
-        for ev in p.timeline() {
-            match ev {
-                Ev::Published(l) => published = published.max(l.get()),
-                Ev::Sent(req) => {
-                    let op = op_of.get(&req).ok_or("a send without an intent")?;
-                    let at = authorized_at
-                        .get(op)
-                        .ok_or("a send without an authorization")?;
-                    if published < *at {
-                        return Err(format!(
-                            "{:?} sent with the ledger shipped to {published}, authorized at {at}",
-                            String::from_utf8_lossy(&req)
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    // ── dispatch ────────────────────────────────────────────────────
+    // ── asking and reporting ────────────────────────────────────────
 
     #[test]
-    fn intent_before_dispatch_then_outcome() {
+    fn a_release_is_recorded_and_shipped_before_it_is_answered() {
         let e = env();
-        let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, r) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
+        let published = Rc::new(Cell::new(0));
+        let fails = Rc::new(Cell::new(0));
+        let (mut fx, r) =
+            Effects::open(Mode::Dispatch, counting(&published, &fails), &mut v).unwrap();
         assert_eq!(r, Reconciled::default());
         let intent_lsn = v.tail().lsn.next();
-
-        let res = fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap();
-        assert!(matches!(res, EffectResult::Applied { .. }));
-        assert_eq!(p.applied(b"send bob"), 1);
-
-        let l = ledger(&v);
-        let Payload::Intent(i) = &l[0] else {
-            panic!("intent first")
-        };
-        assert_eq!(i.provider, "mail");
-        assert_eq!(i.request, b"send bob");
-        assert_eq!(i.consequence, Consequence::Irreversible);
         assert_eq!(
-            i.barrier,
-            Some(BarrierId::new(intent_lsn.get())),
-            "barrier = intent's own lsn"
+            fx.ask(&mut v, &pay("pay 1")).unwrap(),
+            Asked::Released { op: OpId::new(1) }
         );
+        assert_eq!(published.get(), 1, "shipped before the answer");
+        let [i] = &intents(&v)[..] else { panic!() };
+        assert_eq!(i.request, b"pay 1");
+        assert_eq!(i.barrier, Some(BarrierId::new(intent_lsn.get())));
+        assert_eq!(states(&v), vec![(1, OutcomeState::DispatchAuthorized)]);
+        assert_eq!(
+            fx.released(&v).unwrap(),
+            vec![Released {
+                intent: i.clone(),
+                state: OutcomeState::DispatchAuthorized
+            }]
+        );
+        assert!(
+            fx.authorized(),
+            "released is not an obligation until unknown"
+        );
+
+        // The sender reports.
+        fx.report(
+            &mut v,
+            OpId::new(1),
+            &Answer::Applied {
+                receipt: b"ok".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            states(&v).last(),
+            Some(&(1, OutcomeState::ConfirmedApplied))
+        );
+        assert!(fx.released(&v).unwrap().is_empty());
+        assert!(matches!(
+            fx.report(&mut v, OpId::new(1), &Answer::Unknown),
+            Err(ReportError::NotReleased(_))
+        ));
+        assert!(matches!(
+            fx.report(&mut v, OpId::new(9), &Answer::Unknown),
+            Err(ReportError::NotReleased(_))
+        ));
+    }
+
+    #[test]
+    fn a_failed_ship_withdraws_the_release_and_refuses() {
+        let e = env();
+        let mut v = vessel(&e);
+        let published = Rc::new(Cell::new(0));
+        let fails = Rc::new(Cell::new(1));
+        let (mut fx, _) =
+            Effects::open(Mode::Dispatch, counting(&published, &fails), &mut v).unwrap();
+        assert!(matches!(
+            fx.ask(&mut v, &pay("pay 1")).unwrap(),
+            Asked::Refused { reason } if reason.contains("not shipped")
+        ));
         assert_eq!(
             states(&v),
             vec![
-                OutcomeState::DispatchAuthorized,
-                OutcomeState::ConfirmedApplied
+                (1, OutcomeState::DispatchAuthorized),
+                (1, OutcomeState::ConfirmedNotApplied)
             ]
         );
-    }
-
-    #[test]
-    fn refusals_record_nothing() {
-        let e = env();
-        let p = Shared::new("mail");
-        let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        let tail = v.tail();
-        for (prov, c) in [
-            ("http", call("send", "bob")),
-            ("mail", call("format-disk", "x")),
-            ("mail", call("send", "")),
-        ] {
-            assert!(matches!(
-                fx.dispatch(&mut v, prov, c).unwrap(),
-                EffectResult::Refused { .. }
-            ));
-        }
-        assert_eq!(v.tail(), tail);
-    }
-
-    #[test]
-    fn no_mutation_has_no_barrier() {
-        let e = env();
-        let p = Shared::new("mail");
-        let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch(&mut v, "mail", call("read", "inbox")).unwrap();
-        let Payload::Intent(i) = &ledger(&v)[0] else {
-            panic!()
-        };
-        assert_eq!(i.barrier, None);
-    }
-
-    #[test]
-    fn unknown_outcome_withdraws_authority_until_an_operator_resolves() {
-        let e = env();
-        let p = Shared::new("mail");
-        let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        p.fail_next(Fault::ReplyLost);
-        assert_eq!(
-            fx.dispatch(&mut v, "mail", call("fire", "moon")).unwrap(),
-            EffectResult::Unknown
+        assert!(
+            fx.released(&v).unwrap().is_empty(),
+            "nothing a sender may act on"
         );
-        assert!(!fx.authorized());
-        assert!(matches!(
-            fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap(),
-            EffectResult::Refused { .. }
-        ));
-        assert_eq!(p.applied(b"send bob"), 0);
-
-        let op = fx.open_obligations()[0];
-        let empty = Authority {
-            actor: "jarmo".into(),
-            reason: " ".into(),
-        };
-        assert!(matches!(
-            fx.resolve(&mut v, op, true, empty),
-            Err(ResolveError::EmptyAuthority)
-        ));
-        assert!(matches!(
-            fx.resolve(&mut v, OpId::new(99), true, auth()),
-            Err(ResolveError::NotOpen(_))
-        ));
-        fx.resolve(&mut v, op, true, auth()).unwrap();
         assert!(fx.authorized());
-        let Some(Payload::Outcome(last)) = ledger(&v).pop() else {
-            panic!()
-        };
-        assert_eq!(last.state, OutcomeState::ConfirmedApplied);
         assert_eq!(
-            last.evidence,
-            Some(auth().canon_bytes()),
-            "the operator's authority is the evidence"
+            fx.ask(&mut v, &pay("pay 2")).unwrap(),
+            Asked::Released { op: OpId::new(2) }
         );
-        assert!(matches!(
-            fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap(),
-            EffectResult::Applied { .. }
-        ));
-    }
-
-    // ── crash points, then reopen and reconcile ─────────────────────
-
-    /// Dispatch until `stop`, "crash" (drop engine and Vessel), reopen,
-    /// reconcile.  Returns the reopened Vessel, engine and report.
-    fn crash_and_reopen(
-        e: &Env,
-        p: &Shared,
-        op: &str,
-        stop: CrashAfter,
-    ) -> (Vessel<FakeLayers>, Effects, Reconciled) {
-        let mut v = vessel(e);
-        let (mut fx, _) = Effects::open(registry(p), p.publisher(), &mut v).unwrap();
-        assert!(fx
-            .dispatch_until(&mut v, "mail", call(op, "x"), Some(stop))
-            .unwrap()
-            .is_none());
-        drop((fx, v));
-        let mut v = vessel(e);
-        let (fx, r) = Effects::open(registry(p), p.publisher(), &mut v).unwrap();
-        (v, fx, r)
     }
 
     #[test]
-    fn crash_after_intent_never_happened() {
+    fn an_unknown_report_withdraws_authority_until_an_operator_resolves() {
         let e = env();
-        let p = Shared::new("mail");
-        let (v, fx, r) = crash_and_reopen(&e, &p, "send", CrashAfter::Intent);
-        assert_eq!(r.settled, vec![OpId::new(1)]);
-        assert_eq!(p.applied(b"send x"), 0);
-        assert_eq!(states(&v), vec![OutcomeState::ConfirmedNotApplied]);
-        assert!(fx.authorized());
-    }
-
-    #[test]
-    fn dedup_is_reissued_exactly_once() {
-        for stop in [CrashAfter::Authorized, CrashAfter::Send] {
-            let e = env();
-            let p = Shared::new("mail");
-            let (v, fx, r) = crash_and_reopen(&e, &p, "send", stop);
-            assert_eq!(r.settled, vec![OpId::new(1)], "{stop:?}");
-            assert_eq!(p.applied(b"send x"), 1, "{stop:?}");
-            assert_eq!(*states(&v).last().unwrap(), OutcomeState::ConfirmedApplied);
-            assert!(fx.authorized());
-        }
-    }
-
-    #[test]
-    fn queryable_is_probed_and_only_sent_if_not_applied() {
-        for stop in [CrashAfter::Authorized, CrashAfter::Send] {
-            let e = env();
-            let p = Shared::new("mail");
-            let (_v, fx, r) = crash_and_reopen(&e, &p, "put", stop);
-            assert_eq!(r.settled, vec![OpId::new(1)], "{stop:?}");
-            assert_eq!(p.applied(b"put x"), 1, "{stop:?}");
-            assert!(fx.authorized());
-        }
-    }
-
-    #[test]
-    fn unsafe_stays_open_for_an_operator() {
-        let e = env();
-        let p = Shared::new("mail");
-        let (v, fx, r) = crash_and_reopen(&e, &p, "fire", CrashAfter::Send);
-        assert_eq!(r.open, vec![OpId::new(1)]);
-        assert_eq!(p.applied(b"fire x"), 1, "never re-sent");
-        assert_eq!(*states(&v).last().unwrap(), OutcomeState::OutcomeUnknown);
-        assert!(!fx.authorized());
-    }
-
-    #[test]
-    fn a_vanished_adapter_leaves_the_effect_open() {
-        let e = env();
-        let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch_until(
+        let (mut fx, _) = open_dispatch(&mut v);
+        fx.ask(&mut v, &pay("pay 1")).unwrap();
+        fx.report(&mut v, OpId::new(1), &Answer::Unknown).unwrap();
+        assert!(!fx.authorized());
+        assert_eq!(fx.open_obligations(), vec![OpId::new(1)]);
+        assert!(matches!(
+            fx.ask(&mut v, &pay("pay 2")).unwrap(),
+            Asked::Refused { reason } if reason.contains("no effect authority")
+        ));
+        // Still released: the sender may yet find out and report.
+        assert_eq!(
+            fx.released(&v).unwrap()[0].state,
+            OutcomeState::OutcomeUnknown
+        );
+        fx.report(
             &mut v,
-            "mail",
-            call("send", "x"),
-            Some(CrashAfter::Authorized),
+            OpId::new(1),
+            &Answer::NotApplied {
+                reason: "provider says never seen".into(),
+            },
         )
         .unwrap();
-        drop((fx, v));
-        let mut v = vessel(&e);
-        let (fx, r) = Effects::open(Registry::new(), p.publisher(), &mut v).unwrap();
-        assert_eq!(r.open, vec![OpId::new(1)]);
+        assert!(fx.authorized());
+
+        // Or an operator does.
+        fx.ask(&mut v, &pay("pay 3")).unwrap();
+        fx.report(&mut v, OpId::new(2), &Answer::Unknown).unwrap();
         assert!(!fx.authorized());
-        assert_eq!(p.applied(b"send x"), 0);
+        fx.resolve(&mut v, OpId::new(2), true, auth()).unwrap();
+        assert!(fx.authorized());
+        assert!(fx.released(&v).unwrap().is_empty());
     }
 
     #[test]
-    fn op_ids_continue_after_reopen() {
+    fn no_external_mutation_is_released_without_a_barrier() {
         let e = env();
-        let p = Shared::new("mail");
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch(&mut v, "mail", call("send", "a")).unwrap();
-        fx.dispatch(&mut v, "mail", call("send", "b")).unwrap();
+        let (mut fx, _) = open_dispatch(&mut v);
+        fx.ask(&mut v, &declared("read", Consequence::NoExternalMutation))
+            .unwrap();
+        assert_eq!(intents(&v)[0].barrier, None);
+        fx.report(&mut v, OpId::new(1), &Answer::Unknown).unwrap();
+        assert!(fx.authorized(), "no barrier, no obligation");
+    }
+
+    // ── reopening ───────────────────────────────────────────────────
+
+    /// Released, then the Warden died before any report: on reopen the
+    /// effect is an open obligation recorded unknown, nothing is settled
+    /// for it, and the sender's report still settles it.
+    #[test]
+    fn a_released_effect_without_a_report_is_an_obligation_after_a_crash() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut v);
+        fx.ask(&mut v, &pay("pay 1")).unwrap();
+        drop((fx, v));
+
+        let mut v = vessel(&e);
+        let (mut fx, r) = open_dispatch(&mut v);
+        assert_eq!(r.settled, vec![]);
+        assert_eq!(r.open, vec![OpId::new(1)]);
+        assert!(!fx.authorized());
+        assert_eq!(
+            states(&v),
+            vec![
+                (1, OutcomeState::DispatchAuthorized),
+                (1, OutcomeState::OutcomeUnknown)
+            ],
+            "the truth after a crash: unknown"
+        );
+        let [r] = &fx.released(&v).unwrap()[..] else {
+            panic!()
+        };
+        assert_eq!(r.intent.request, b"pay 1");
+        fx.report(
+            &mut v,
+            OpId::new(1),
+            &Answer::Applied {
+                receipt: b"k".to_vec(),
+            },
+        )
+        .unwrap();
+        assert!(fx.authorized());
+        // Op ids continue.
+        assert_eq!(
+            fx.ask(&mut v, &pay("pay 2")).unwrap(),
+            Asked::Released { op: OpId::new(2) }
+        );
+    }
+
+    #[test]
+    fn a_crash_after_the_intent_alone_never_happened() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut v);
+        fx.ledger
+            .append_intent_alone(&mut v, &pay("pay 1"))
+            .unwrap();
         drop((fx, v));
         let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch(&mut v, "mail", call("send", "c")).unwrap();
-        let ops: Vec<u64> = ledger(&v)
-            .into_iter()
-            .filter_map(|x| match x {
-                Payload::Intent(i) => Some(i.op.get()),
-                _ => None,
-            })
+        let (fx, r) = open_dispatch(&mut v);
+        assert_eq!(r.settled, vec![OpId::new(1)]);
+        assert!(fx.authorized());
+        assert_eq!(states(&v), vec![(1, OutcomeState::ConfirmedNotApplied)]);
+    }
+
+    // ── holding and promotion: the no-trace property ────────────────
+
+    /// A fork of `parent`'s last Seal, with `n` held proposals, sealed.
+    fn child(e: &Env, parent: &Vessel<FakeLayers>, subject: &[u8], n: u64) -> ChronicleId {
+        let mut c = e
+            .host
+            .fork_from_log(parent.id(), SealAt::Last, subject)
+            .unwrap();
+        c.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(Mode::Hold, Box::new(AlwaysPublish), &mut c).unwrap();
+        for k in 1..=n {
+            let name = String::from_utf8_lossy(subject).to_string();
+            assert_eq!(
+                fx.ask(&mut c, &pay(&format!("{name}: pay {k}"))).unwrap(),
+                Asked::Held { op: OpId::new(k) }
+            );
+        }
+        assert!(
+            fx.released(&c).unwrap().is_empty(),
+            "a holder releases nothing"
+        );
+        assert!(fx.authorized());
+        let pos = ledger_pos(&c).unwrap();
+        c.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(1))
+            .unwrap();
+        c.id()
+    }
+
+    /// N children fork, each proposes; one is promoted: the parent's
+    /// released set is exactly that child's proposals, and the other
+    /// children's Chronicles hold only `Proposed`.  Reopening every
+    /// Chronicle changes nothing.
+    #[test]
+    fn only_the_promoted_childs_proposals_are_released() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.append(Stream::Fs, Payload::Raw(vec![1])).unwrap();
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let kids: Vec<ChronicleId> = (1..=3u64)
+            .map(|k| child(&e, &p, format!("c{k}").as_bytes(), k))
             .collect();
-        assert_eq!(ops, vec![1, 2, 3]);
-    }
 
-    // ── publishing before every send ────────────────────────────────
-
-    #[test]
-    fn the_authorization_is_published_before_the_request_is_sent() {
-        let e = env();
-        let p = Shared::new("mail");
-        let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap();
-        fx.dispatch(&mut v, "mail", call("put", "x")).unwrap();
-        let t = p.timeline();
-        assert!(
-            matches!(t[0], Ev::Published(_)) && t[1] == Ev::Sent(b"send bob".to_vec()),
-            "{t:?}"
-        );
-        sent_only_after_publish(&v, &p).unwrap();
-    }
-
-    /// A publish that fails: nothing is sent, and "not applied" is the
-    /// recorded, returned truth.  Authority is unaffected.
-    #[test]
-    fn a_failed_publish_sends_nothing() {
-        let e = env();
-        let p = Shared::new("mail");
-        let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        p.fail_publish(1);
-        let r = fx.dispatch(&mut v, "mail", call("send", "bob")).unwrap();
-        assert!(
-            matches!(&r, EffectResult::NotApplied { reason } if reason.contains("ledger not shipped")),
-            "{r:?}"
-        );
-        assert_eq!(p.applied(b"send bob"), 0);
-        assert!(p.timeline().is_empty());
+        let published = Rc::new(Cell::new(0));
+        let fails = Rc::new(Cell::new(0));
+        let (mut fx, _) =
+            Effects::open(Mode::Dispatch, counting(&published, &fails), &mut p).unwrap();
+        let chosen = kids[1];
+        let log = e.host.read_log_of(chosen).unwrap();
+        let (record, adopted) = fx.promote(&mut p, &log, SealAt::Last).unwrap();
+        assert_eq!(record.child, chosen);
+        assert_eq!(adopted.len(), 2);
         assert_eq!(
-            states(&v),
-            vec![
-                OutcomeState::DispatchAuthorized,
-                OutcomeState::ConfirmedNotApplied
-            ]
+            published.get(),
+            1,
+            "the Promotion shipped before the adoption"
         );
-        assert!(fx.authorized());
-        // The next one goes through.
-        assert!(matches!(
-            fx.dispatch(&mut v, "mail", call("send", "carol")).unwrap(),
-            EffectResult::Applied { .. }
-        ));
-        sent_only_after_publish(&v, &p).unwrap();
+        assert_eq!(fx.pending_promotion(), None);
+
+        let released = fx.released(&p).unwrap();
+        let requests: Vec<&[u8]> = released
+            .iter()
+            .map(|r| r.intent.request.as_slice())
+            .collect();
+        assert_eq!(requests, [&b"c2: pay 1"[..], &b"c2: pay 2"[..]]);
+        for (r, k) in released.iter().zip(1u64..) {
+            assert_eq!(
+                r.intent.authority,
+                crate::ledger::AdoptedFrom {
+                    child: chosen,
+                    seal: record.seal,
+                    op: OpId::new(k)
+                }
+                .canon_bytes()
+            );
+            assert_eq!(r.state, OutcomeState::DispatchAuthorized);
+        }
+        // The adopted intents are this Vessel's: new op ids after the
+        // parent's own, each with its own barrier.
+        assert_eq!(adopted[0].op, OpId::new(1));
+        assert!(adopted.iter().all(|a| a.barrier.is_some()));
+
+        // The siblings: only Proposed, nothing released, nothing changed.
+        for (i, k) in kids.iter().enumerate() {
+            let (mut c, _) = e.host.open(*k).unwrap();
+            let (cfx, r) = Effects::open(Mode::Hold, Box::new(AlwaysPublish), &mut c).unwrap();
+            assert_eq!(r, Reconciled::default());
+            assert!(cfx.released(&c).unwrap().is_empty());
+            let s = states(&c);
+            assert_eq!(s.len(), i + 1);
+            assert!(s.iter().all(|(_, st)| *st == OutcomeState::Proposed));
+        }
+        // Nothing of the siblings is in the parent.
+        assert!(intents(&p).iter().all(|i| i.request.starts_with(b"c2: ")));
+        // The parent, reopened: the same released set, no pending promotion.
+        drop((fx, p));
+        let mut p = vessel(&e);
+        let (fx, _) = open_dispatch(&mut p);
+        assert_eq!(fx.pending_promotion(), None);
+        assert_eq!(fx.released(&p).unwrap().len(), 2);
     }
 
-    /// Reconciliation re-sends only after publishing; if it cannot, the
-    /// effect stays open and nothing is sent.
+    /// A crash after the Promotion, before the adoption: on reopen the
+    /// Promotion is pending, nothing is released, and finishing adopts
+    /// everything at once.  A second finish adopts nothing more.
     #[test]
-    fn reconcile_publishes_before_it_sends() {
+    fn a_promotion_cut_before_its_adoption_is_finished_on_reopen() {
         let e = env();
-        let p = Shared::new("mail");
-        let mut v = vessel(&e);
-        let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        fx.dispatch_until(
-            &mut v,
-            "mail",
-            call("send", "x"),
-            Some(CrashAfter::Authorized),
+        let mut p = vessel(&e);
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
         )
         .unwrap();
-        drop((fx, v));
-        // Reopen while the store is down: open, unsent.
-        p.fail_publish(1);
-        let mut v = vessel(&e);
-        let (fx, r) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        assert_eq!(r.open, vec![OpId::new(1)]);
-        assert!(!fx.authorized());
-        assert_eq!(p.applied(b"send x"), 0);
-        drop((fx, v));
-        // Reopen with the store back: published, then sent once.
-        let mut v = vessel(&e);
-        let (fx, r) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-        assert_eq!(r.settled, vec![OpId::new(1)]);
-        assert!(fx.authorized());
-        assert_eq!(p.applied(b"send x"), 1);
-        sent_only_after_publish(&v, &p).unwrap();
+        let c = child(&e, &p, b"c", 3);
+        let log = e.host.read_log_of(c).unwrap();
+        // The crash: the Promotion is recorded, the ship fails, nothing
+        // adopted.
+        let published = Rc::new(Cell::new(0));
+        let fails = Rc::new(Cell::new(1));
+        let (mut fx, _) =
+            Effects::open(Mode::Dispatch, counting(&published, &fails), &mut p).unwrap();
+        assert!(matches!(
+            fx.promote(&mut p, &log, SealAt::Last),
+            Err(PromoteError::NotShipped(_))
+        ));
+        assert!(intents(&p).is_empty(), "nothing adopted");
+        assert!(fx.pending_promotion().is_some());
+        drop((fx, p));
+
+        let mut p = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut p);
+        let pending = fx.pending_promotion().expect("the Promotion survived");
+        assert_eq!(pending.child, c);
+        assert!(fx.released(&p).unwrap().is_empty());
+        let adopted = fx.finish_promotion(&mut p, &log).unwrap();
+        assert_eq!(adopted.len(), 3);
+        assert_eq!(fx.pending_promotion(), None);
+        assert_eq!(fx.released(&p).unwrap().len(), 3);
+        assert!(fx.finish_promotion(&mut p, &log).unwrap().is_empty());
+        // Reopened: nothing pending, still three, not six.
+        drop((fx, p));
+        let mut p = vessel(&e);
+        let (fx, _) = open_dispatch(&mut p);
+        assert_eq!(fx.pending_promotion(), None);
+        assert_eq!(fx.released(&p).unwrap().len(), 3);
+        assert_eq!(intents(&p).len(), 3);
     }
 
-    /// A crash between the publish and the send: reconcile sends it once.
+    /// A holder that promotes its own fork adopts the grandchild's
+    /// proposals as proposals again: they travel up, never out.
     #[test]
-    fn crash_after_publish_is_sent_once() {
-        for op in ["send", "put"] {
-            let e = env();
-            let p = Shared::new("mail");
-            let (v, fx, r) = crash_and_reopen(&e, &p, op, CrashAfter::Published);
-            assert_eq!(r.settled, vec![OpId::new(1)], "{op}");
-            assert_eq!(p.applied(format!("{op} x").as_bytes()), 1, "{op}");
-            assert!(fx.authorized());
-            sent_only_after_publish(&v, &p).unwrap();
-        }
+    fn a_holder_adopts_as_held() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let mid = child(&e, &p, b"mid", 0);
+        let (mut m, _) = e.host.open(mid).unwrap();
+        let grand = child(&e, &m, b"grand", 2);
+        let (mut mfx, _) = Effects::open(Mode::Hold, Box::new(AlwaysPublish), &mut m).unwrap();
+        let log = e.host.read_log_of(grand).unwrap();
+        let (_, adopted) = mfx.promote(&mut m, &log, SealAt::Last).unwrap();
+        assert_eq!(adopted.len(), 2);
+        assert!(mfx.released(&m).unwrap().is_empty());
+        assert!(states(&m).iter().all(|(_, s)| *s == OutcomeState::Proposed));
+        assert!(mfx.authorized());
     }
 
-    // ── property: never a duplicate, never a silent loss ────────────
-
-    #[derive(Clone, Debug)]
-    struct Step {
-        op: &'static str,
-        fault: Fault,
-        crash: Option<CrashAfter>,
-        /// The next publish fails (the store or the coordinator is down).
-        publish_fails: bool,
+    #[test]
+    fn a_promotion_refused_adopts_nothing() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let c = child(&e, &p, b"c", 1);
+        // The parent moves on.
+        p.append(Stream::Fs, Payload::Raw(vec![1])).unwrap();
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(2),
+        )
+        .unwrap();
+        let (mut fx, _) = open_dispatch(&mut p);
+        let log = e.host.read_log_of(c).unwrap();
+        assert!(matches!(
+            fx.promote(&mut p, &log, SealAt::Last),
+            Err(PromoteError::Vessel(VesselError::ParentMoved { .. }))
+        ));
+        assert!(intents(&p).is_empty());
+        assert_eq!(fx.pending_promotion(), None);
     }
 
-    fn step() -> impl Strategy<Value = Step> {
-        let op = prop_oneof![Just("send"), Just("put"), Just("fire"), Just("read")];
-        let fault = prop_oneof![
-            Just(Fault::None),
-            Just(Fault::Lost),
-            Just(Fault::ReplyLost),
-            Just(Fault::Decline)
-        ];
-        let crash = prop_oneof![
-            3 => Just(None),
-            1 => Just(Some(CrashAfter::Intent)),
-            1 => Just(Some(CrashAfter::Authorized)),
-            1 => Just(Some(CrashAfter::Published)),
-            1 => Just(Some(CrashAfter::Send)),
-        ];
-        let publish_fails = prop_oneof![4 => Just(false), 1 => Just(true)];
-        (op, fault, crash, publish_fails).prop_map(|(op, fault, crash, publish_fails)| Step {
-            op,
-            fault,
-            crash,
-            publish_fails,
-        })
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig::with_cases(96))]
-
-        /// Any sequence of effects, provider faults, publish failures and
-        /// crashes: no request is ever applied twice, nothing is ever sent
-        /// before its authorization is published, and after every
-        /// reconciliation each intent is either terminal or an open
-        /// obligation.
-        #[test]
-        fn no_duplicates_and_nothing_silently_lost(steps in proptest::collection::vec(step(), 1..12)) {
-            let e = env();
-            let p = Shared::new("mail");
-            let mut v = vessel(&e);
-            let (mut fx, _) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-            for (n, s) in steps.iter().enumerate() {
-                if !fx.authorized() {
-                    // An operator checks the provider and records the truth.
-                    for op in fx.open_obligations() {
-                        let request = ledger(&v)
-                            .into_iter()
-                            .find_map(|x| match x {
-                                Payload::Intent(i) if i.op == op => Some(i.request),
-                                _ => None,
-                            })
-                            .unwrap();
-                        let applied = p.applied(&request) > 0;
-                        fx.resolve(&mut v, op, applied, auth()).unwrap();
-                    }
-                }
-                p.fail_next(s.fault);
-                p.fail_publish(s.publish_fails as u32);
-                let target = format!("t{n}");
-                let r = fx.dispatch_until(&mut v, "mail", call(s.op, &target), s.crash).unwrap();
-                if r.is_none() {
-                    drop((fx, v));
-                    v = vessel(&e);
-                    let (f, rec) = Effects::open(registry(&p), p.publisher(), &mut v).unwrap();
-                    fx = f;
-                    prop_assert_eq!(rec.open.clone(), fx.open_obligations());
-                }
-                prop_assert!(p.no_duplicates(), "a request was applied twice");
-                let order = sent_only_after_publish(&v, &p);
-                prop_assert!(order.is_ok(), "{:?}", order);
-            }
-            // Every intent ends terminal, or is an open barrier obligation.
-            let mut latest: BTreeMap<OpId, OutcomeState> = BTreeMap::new();
-            let mut barrier: BTreeMap<OpId, bool> = BTreeMap::new();
-            for x in ledger(&v) {
-                match x {
-                    Payload::Intent(i) => { barrier.insert(i.op, i.barrier.is_some()); }
-                    Payload::Outcome(o) => { latest.insert(o.op, o.state); }
-                    _ => {}
-                }
-            }
-            for (op, has_barrier) in barrier {
-                let terminal = matches!(
-                    latest.get(&op),
-                    Some(OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied)
-                );
-                let open = fx.open_obligations().contains(&op);
-                prop_assert!(terminal || open || !has_barrier, "op {:?} neither terminal nor open", op);
-            }
-        }
+    #[test]
+    fn mode_by_origin() {
+        assert_eq!(Mode::of(&Origin::Void), Mode::Dispatch);
+        let ps = taso_core::record::ParentSeal {
+            chronicle: ChronicleId::from_bytes([1; 16]),
+            seal: Lsn::new(1),
+            seal_hash: taso_core::envelope::HashVal::GENESIS,
+        };
+        assert_eq!(Mode::of(&Origin::Fork { parent: ps }), Mode::Hold);
+        assert_eq!(
+            Mode::of(&Origin::Succession {
+                parent: ps,
+                authority: auth()
+            }),
+            Mode::Dispatch
+        );
     }
 }

@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use taso_core::canon::Canonical;
 use taso_core::decode::DecodeError;
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{
@@ -47,8 +48,9 @@ pub struct Summary {
     pub open: BTreeMap<OpId, OpenEffect>,
     /// The next unused op id.
     pub next_op: u64,
-    /// The last Promotion record, until the step that adopts its
-    /// proposals clears it (P3 file 5); carried by the Checkpoint.
+    /// The last Promotion record whose adoption has not happened yet:
+    /// cleared by the first intent adopted from it; carried by the
+    /// Checkpoint in between.
     pub promotion: Option<PromotionRecord>,
     /// The lsn of the Checkpoint the fold started from, if any.
     pub from_checkpoint: Option<Lsn>,
@@ -115,6 +117,17 @@ impl Summary {
                 match decode()? {
                     Payload::Intent(intent) => {
                         self.next_op = self.next_op.max(intent.op.get().saturating_add(1));
+                        // The adoption that finishes the pending promotion:
+                        // an intent whose authority names its child and
+                        // Seal (the first 24 bytes of an `AdoptedFrom`).
+                        if let Some(p) = self.promotion {
+                            let mut from = taso_core::canon::Canon::default();
+                            p.child.canon(&mut from);
+                            p.seal.canon(&mut from);
+                            if intent.authority.starts_with(from.as_bytes()) {
+                                self.promotion = None;
+                            }
+                        }
                         self.open.insert(
                             intent.op,
                             OpenEffect {

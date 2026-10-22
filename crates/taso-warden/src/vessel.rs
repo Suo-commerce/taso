@@ -468,21 +468,12 @@ impl ReadLog {
         Ok((seal, ledger_pos))
     }
 
-    /// The held proposals settled by the Seal at `seal` (open-at-S): an
-    /// intent and its `Proposed` outcome both at or before `ledger_pos`,
-    /// in op order.  Later proposals belong to a later Seal.
-    pub fn proposals(
-        &self,
-        seal: Position,
-        ledger_pos: Lsn,
-    ) -> Result<Vec<OpenEffect>, VesselError> {
-        let upto: Vec<Frame> = self
-            .frames
-            .iter()
-            .filter(|f| f.envelope.lsn <= seal.lsn)
-            .cloned()
-            .collect();
-        let s = summary(&upto)?;
+    /// The held proposals settled by a Seal whose `ledger_pos` is given
+    /// (open-at-S): intents at or before it, in op order.  Later
+    /// proposals belong to a later Seal.  Folded from the whole log, so a
+    /// proposal carried only by a later Checkpoint is still found.
+    pub fn proposals(&self, ledger_pos: Lsn) -> Result<Vec<OpenEffect>, VesselError> {
+        let s = summary(&self.frames)?;
         let mut proposals: Vec<OpenEffect> = s
             .proposals()
             .filter(|e| e.lsn <= ledger_pos)
@@ -1319,7 +1310,7 @@ impl<L: Layers> Vessel<L> {
             return Err(VesselError::ParentMoved { fork, last });
         }
         let (seal, ledger_pos) = child.prove(at)?;
-        let proposals = child.proposals(seal, ledger_pos)?;
+        let proposals = child.proposals(ledger_pos)?;
         let record = PromotionRecord {
             child: child.chronicle,
             seal: seal.lsn,
@@ -3255,7 +3246,7 @@ pub(crate) mod tests {
         assert_eq!(s.last_sealed_turn(), Some(5));
         drop(s);
         let (_, report) = crate::effects::Effects::open(
-            taso_field::adapter::Registry::new(),
+            crate::effects::Mode::Dispatch,
             Box::new(crate::effects::AlwaysPublish),
             &mut v,
         )
