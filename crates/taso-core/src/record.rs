@@ -337,6 +337,12 @@ pub enum OutcomeState {
     ConfirmedApplied = 3,
     /// Provider confirmed the effect was not applied.
     ConfirmedNotApplied = 4,
+    /// Held: the intent is a proposal from a Vessel that may not release
+    /// effects (a fork, P3).  Terminal in that Chronicle.  Nothing reads
+    /// it as open, and no sender may act on it; it is released only by
+    /// the parent re-recording it as its own intent under a
+    /// [`PromotionRecord`].
+    Proposed = 5,
 }
 
 impl Canonical for OutcomeState {
@@ -626,6 +632,39 @@ impl Canonical for SuccessionRecord {
     }
 }
 
+// ── Promotion ───────────────────────────────────────────────────────
+
+/// A parent chose one of its forks (P3, M7): "this Vessel adopted the
+/// futures of `child` as of its Seal `seal`".  A `Ctl` record in the
+/// **parent's** Chronicle; the child's Chronicle is not touched.
+///
+/// It is a reference, never a merge: the parent keeps its one Lineage
+/// and stays a tree node.  The adopted proposals follow it as the
+/// parent's own intents (new op ids), each naming the child's op in
+/// its `authority`, so every released effect traces back to the
+/// proposal it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromotionRecord {
+    /// The chosen child.
+    pub child: ChronicleId,
+    /// The child's Seal the choice is made at: proposals at or before it
+    /// are adopted, later ones are not (open-at-S).
+    pub seal: Lsn,
+    /// That Seal record's hash in the child.
+    pub seal_hash: HashVal,
+    /// The child's highest ledger lsn at that Seal.
+    pub ledger_pos: Lsn,
+}
+
+impl Canonical for PromotionRecord {
+    fn canon(&self, out: &mut Canon) {
+        self.child.canon(out);
+        self.seal.canon(out);
+        self.seal_hash.canon(out);
+        self.ledger_pos.canon(out);
+    }
+}
+
 // ── Gap ─────────────────────────────────────────────────────────────
 
 /// Records `(kept, resumes]` were accepted, but are lost: they were never
@@ -870,6 +909,8 @@ pub enum Payload {
     /// A Checkpoint record: what readers need from the records before it,
     /// so older local segments can be removed (tag 9).
     Checkpoint(Box<CheckpointRecord>),
+    /// A Promotion record: the parent chose a fork at its Seal (tag 10).
+    Promotion(PromotionRecord),
 }
 
 impl Canonical for Payload {
@@ -913,6 +954,10 @@ impl Canonical for Payload {
             }
             Self::Checkpoint(r) => {
                 out.tag(9);
+                r.canon(out);
+            }
+            Self::Promotion(r) => {
+                out.tag(10);
                 r.canon(out);
             }
         }
@@ -1155,13 +1200,14 @@ mod tests {
     }
 
     #[test]
-    fn outcome_state_five_distinct() {
+    fn outcome_state_six_distinct() {
         let states = [
             OutcomeState::Prepared,
             OutcomeState::DispatchAuthorized,
             OutcomeState::OutcomeUnknown,
             OutcomeState::ConfirmedApplied,
             OutcomeState::ConfirmedNotApplied,
+            OutcomeState::Proposed,
         ];
         let enc: Vec<Vec<u8>> = states.iter().map(|s| s.canon_bytes()).collect();
         for i in 0..enc.len() {
@@ -1291,6 +1337,104 @@ mod tests {
 
     const PIN_CHECKPOINT: &str = "4e5931bb34a14d59173bc42ff795ac5131ddd98973ffa317b63763a7dc827748";
 
+    // ── Promotion (P3) ──────────────────────────────────────────────
+
+    fn promotion() -> PromotionRecord {
+        PromotionRecord {
+            child: ChronicleId::from_bytes([4; 16]),
+            seal: Lsn::new(21),
+            seal_hash: HashVal::from_bytes([21; 32]),
+            ledger_pos: Lsn::new(17),
+        }
+    }
+
+    #[test]
+    fn promotion_record_verifies() {
+        assert!(make_record(Payload::Promotion(promotion())).verify());
+    }
+
+    /// The Promotion payload (tag 10) and the `Proposed` outcome state
+    /// (tag 5) are additive: every pin above is unchanged, and these pin
+    /// the two new encodings.
+    #[test]
+    fn promotion_and_proposed_hashes_are_pinned() {
+        let proposed = Payload::Outcome(OutcomeRecord {
+            op: OpId::new(3),
+            state: OutcomeState::Proposed,
+            evidence: None,
+        });
+        let got: Vec<String> = [Payload::Promotion(promotion()), proposed]
+            .into_iter()
+            .map(|p| make_record(p).envelope.hash.to_string())
+            .collect();
+        assert_eq!(got, PINS_P3);
+    }
+
+    const PINS_P3: [&str; 2] = [
+        "79960c4a62fd764981fbe060c16e6436bdb7027cfe27b8ef2c8b58d1854604bb",
+        "f097668914148f83780cb092ba1631c01a19d3009af9be4ec3e8e85698000558",
+    ];
+
+    /// Each Promotion field changes the hash: a promotion of another
+    /// child, at another Seal, with another hash or ledger position is a
+    /// different record.
+    #[test]
+    fn every_promotion_field_is_bound_by_the_hash() {
+        let base = make_record(Payload::Promotion(promotion())).envelope.hash;
+        let variants = [
+            PromotionRecord {
+                child: ChronicleId::from_bytes([5; 16]),
+                ..promotion()
+            },
+            PromotionRecord {
+                seal: Lsn::new(22),
+                ..promotion()
+            },
+            PromotionRecord {
+                seal_hash: HashVal::from_bytes([22; 32]),
+                ..promotion()
+            },
+            PromotionRecord {
+                ledger_pos: Lsn::new(18),
+                ..promotion()
+            },
+        ];
+        for (i, v) in variants.into_iter().enumerate() {
+            let h = make_record(Payload::Promotion(v)).envelope.hash;
+            assert_ne!(h, base, "field {i} is not bound");
+        }
+    }
+
+    /// A Promotion is never mistaken for a Succession or a Lineage whose
+    /// parent names the same Seal: different tags, different bytes.
+    #[test]
+    fn promotion_is_distinct_from_the_other_cross_chronicle_records() {
+        let p = promotion();
+        let seal = ParentSeal {
+            chronicle: p.child,
+            seal: p.seal,
+            seal_hash: p.seal_hash,
+        };
+        let others = [
+            Payload::Lineage(LineageRecord {
+                origin: Origin::Fork { parent: seal },
+                namespace: ns(1),
+                ledger_pos: p.ledger_pos,
+            }),
+            Payload::Succession(SuccessionRecord {
+                successor: p.child,
+                namespace: ns(1),
+                seal: p.seal,
+                seal_hash: p.seal_hash,
+                authority: authority(),
+            }),
+        ];
+        let mine = Payload::Promotion(p).canon_bytes();
+        for o in others {
+            assert_ne!(mine, o.canon_bytes());
+        }
+    }
+
     const PINS_NEW: [&str; 4] = [
         "7c4f392fd70a68dcfbb1b8296cbb5da3391d1763687717f48d66dbdb19132b8a",
         "2ad30a34d7be8a1e1f31f13a6674cf947d7f818e06eb125c9972477b39aeeda8",
@@ -1373,6 +1517,7 @@ mod tests {
                 ns(1),
             ),
             succession_payload(),
+            Payload::Promotion(promotion()),
         ];
         let enc: Vec<Vec<u8>> = payloads.iter().map(|p| p.canon_bytes()).collect();
         for i in 0..enc.len() {
