@@ -364,7 +364,9 @@ mod tests {
                         turn: *turn,
                         sealed: (turn % 2 == 0).then_some(*turn),
                     },
-                    Request::Effect { .. } => unreachable!(),
+                    Request::Effect { .. } | Request::Outcome { .. } | Request::Open => {
+                        unreachable!()
+                    }
                 };
                 seen.push(req);
                 send_reply(&mut c, &reply).unwrap();
