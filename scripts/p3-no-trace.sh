@@ -80,8 +80,11 @@ trap cleanup EXIT
 ROOTFS=$WORK/rootfs
 copy_with_libs() {
     install -D -m 755 "$1" "$ROOTFS$2"
-    ldd "$1" | grep -o '/[^ ]*' | while read -r lib; do
-        install -D -m 755 "$lib" "$ROOTFS$lib"
+    local libs
+    libs=$(ldd "$1" 2>/dev/null | grep -o '/[^ ]*' || true)
+    local lib
+    for lib in $libs; do
+        [ -f "$lib" ] && install -D -m 755 "$lib" "$ROOTFS$lib"
     done
 }
 # The agent is p3-relay.py — needs python3 inside the rootfs.
@@ -98,9 +101,10 @@ if [ -d "$PY_LIB" ]; then
     cp -a "$PY_LIB" "$ROOTFS$PY_LIB"
 fi
 # Python C extensions (.so) may depend on libraries not linked by the
-# interpreter binary.  Copy their deps too.
-find "$ROOTFS$PY_LIB" -name '*.so' -exec ldd {} + 2>/dev/null \
-    | grep -o '/[^ ]*' | sort -u | while read -r lib; do
+# interpreter binary.  Copy their deps too (best-effort).
+_so_libs=$(find "$ROOTFS$PY_LIB" -name '*.so' -exec ldd {} + 2>/dev/null \
+    | grep -o '/[^ ]*' | sort -u || true)
+for lib in $_so_libs; do
     [ -f "$ROOTFS$lib" ] || install -D -m 755 "$lib" "$ROOTFS$lib" 2>/dev/null || true
 done
 
