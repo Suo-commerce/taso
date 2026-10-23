@@ -579,6 +579,58 @@ fn seal_at<D: Blkd>(
 impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
     type Layers = BlkLayers<D, M>;
 
+    fn adopt(
+        &self,
+        dataset: &Dataset,
+        base: (Lsn, HashVal),
+        to: (Lsn, HashVal),
+        stream: &mut dyn io::Read,
+    ) -> Result<u64, LayerError> {
+        // Out of use first: the branch's blocks change under its ext4.
+        {
+            let mut d = self.blkd.lock().unwrap();
+            let b = d
+                .find(dataset.as_str())?
+                .ok_or_else(|| format!("no dataset {dataset} to adopt into"))?;
+            if seal_at(&mut *d, b, to.0)?.is_none() {
+                if let Some(later) = d
+                    .seals(b)?
+                    .iter()
+                    .filter_map(|(_, t)| untag(t))
+                    .map(|(n, _)| n)
+                    .find(|n| *n > base.0)
+                {
+                    return Err(format!(
+                        "a later layer exists ({}); {} is not the newest",
+                        dataset.seal_snapshot(later),
+                        dataset.seal_snapshot(base.0)
+                    )
+                    .into());
+                }
+                let info = d.info(b)?;
+                let mp = self.mountpoint(dataset);
+                match (info.dev.as_ref(), self.mounts.source(&mp)?) {
+                    (Some(dev), Some(src)) if &src == dev => self.mounts.umount(&mp)?,
+                    (_, Some(src)) => {
+                        return Err(format!(
+                            "{} is mounted from {}, not from {dataset}'s device",
+                            mp.display(),
+                            src.display()
+                        )
+                        .into())
+                    }
+                    (_, None) => {}
+                }
+                if info.dev.is_some() {
+                    d.detach(b)?;
+                }
+            }
+        }
+        // The fork's increment from `base`, imported as this branch's own
+        // Seal layer `to` (the receive checks `base` and binds `to`).
+        Pool::receive(self, dataset, Some(base), to, stream)
+    }
+
     fn create(&self, dataset: &Dataset) -> Result<DatasetInfo, LayerError> {
         let mut d = self.blkd.lock().unwrap();
         if d.find(dataset.as_str())?.is_some() {

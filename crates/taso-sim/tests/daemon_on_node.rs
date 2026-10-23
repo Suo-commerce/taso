@@ -587,9 +587,9 @@ fn stats_of(node: &Node, subject: &str) -> Value {
 ///    each child continues the parent's turns, its effects are held, and
 ///    its own fork requests are refused (a child has no fork slots);
 /// 2. the parent again, promoting `-fork-4` then `-fork-5`: the first
-///    adopts exactly fork-4's 2 proposals as released effects (the
-///    agent's Result says pending for each; listing is the sender's), the
-///    second is refused (one choice per fork point).
+///    adopts fork-4's proposals and ends the run; the Warden starts the
+///    parent again and adopts fork-4's files first (C7): the agent resumes
+///    after fork-4's last turn, on fork-4's database.
 #[test]
 #[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
 fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
@@ -732,20 +732,25 @@ fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
         "agent failed: {:?}",
         r.agent
     );
+    // C7: the promotion ended the first run; the Warden started the parent
+    // again on fork-4's files.  What remains is the second run's: it
+    // resumed after fork-4's last turn, on fork-4's database, and its own
+    // asks to promote were refused (the adoption Seal is its last Seal).
     let p = stats_of(&n, "sim-3");
-    println!("parent, promoting: {p}");
-    let pr = p["promotions"].as_array().unwrap();
-    assert_eq!(pr[0]["child"], c4, "{p}");
-    let adopted = pr[0]["adopted"].as_array().expect("fork-4 promoted");
-    assert_eq!(adopted.len(), 2, "exactly fork-4's proposals: {p}");
-    assert!(
-        pr[1]["refused"]
-            .as_str()
-            .unwrap()
-            .contains("already promoted"),
-        "the sibling is refused: {p}"
+    println!("parent, after the promotion: {p}");
+    assert_eq!(
+        p["resumed_after"], 4,
+        "continues fork-4's turns (C7 Q2): {p}"
     );
-    // The agent reads what became of each adopted op (listing is the
-    // sender's, C5): released, no report yet.
-    assert_eq!(p["adopted_states"], json!(["Pending", "Pending"]), "{p}");
+    assert_eq!(p["turns"], json!([5, 5]), "{p}");
+    assert_eq!(
+        p["rows_in_db"], 5,
+        "fork-4's 4 rows (the parent's 2, the child's 2) and one more: {p}"
+    );
+    for pr in p["promotions"].as_array().unwrap() {
+        assert!(
+            pr["refused"].as_str().unwrap().contains("sealed again"),
+            "{p}"
+        );
+    }
 }

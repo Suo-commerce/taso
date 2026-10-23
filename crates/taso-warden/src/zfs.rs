@@ -922,6 +922,67 @@ impl<R: Runner> Zfs<R> {
         self.bind(snap, to.1)
     }
 
+    /// Adopt (P3 close-out C7): receive an increment made on *another*
+    /// dataset — a fork's state at its Seal, made from `dataset`'s Seal
+    /// snapshot `base` — as `dataset`'s own Seal snapshot `to`, and bind
+    /// it.  `base` must be `dataset`'s newest snapshot (the M7 condition)
+    /// and bound to its hash; refused before anything changes otherwise.
+    /// The dataset is unmounted first and left unmounted (`-u`); `-F`
+    /// rolls it back to `base` (its newest snapshot) before the receive, so
+    /// nothing written after `base` stands in the way.  If `to` already
+    /// exists, nothing is received and it is bound if needed.
+    pub fn receive_adopted(
+        &self,
+        dataset: &Dataset,
+        base: (Lsn, HashVal),
+        to: (Lsn, HashVal),
+        stream: &mut dyn Read,
+    ) -> Result<Snapshot, ZfsError> {
+        if let Some(existing) = self.get(dataset, to.0)? {
+            return self.bind(existing, to.1);
+        }
+        if self.dataset_info(dataset)?.is_none() {
+            return Err(ZfsError::NotFound(dataset.to_string()));
+        }
+        let snaps = self.list(dataset)?;
+        let base_name = dataset.seal_snapshot(base.0);
+        let found = snaps
+            .iter()
+            .find(|s| s.seal == base.0)
+            .ok_or_else(|| ZfsError::NotFound(base_name.clone()))?;
+        if found.seal_hash != Some(base.1) {
+            return Err(ZfsError::SealMismatch(base_name));
+        }
+        if snaps.last().map(|s| s.seal) != Some(base.0) {
+            return Err(ZfsError::NotLatest(base_name));
+        }
+        match self.run(vec!["unmount".to_string(), dataset.to_string()]) {
+            Ok(_) => {}
+            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("not currently mounted") => {}
+            Err(e) => return Err(e),
+        }
+        let target = dataset.seal_snapshot(to.0);
+        let args = vec![
+            "receive".to_string(),
+            "-u".to_string(),
+            "-F".to_string(),
+            target.clone(),
+        ];
+        let out = self.runner.run_input(&args, &mut HoldBack::new(stream))?;
+        if !out.success {
+            return Err(ZfsError::Exit {
+                args,
+                code: out.code,
+                stderr: out.stderr,
+            });
+        }
+        let snap = self.get(dataset, to.0)?.ok_or(ZfsError::Parse {
+            line: target,
+            why: "the adopted stream did not create the expected Seal snapshot",
+        })?;
+        self.bind(snap, to.1)
+    }
+
     /// Receive the first stream of a cloned Vessel: incremental from the
     /// parent's Seal snapshot `base`, into `dataset` as a clone of it, and
     /// bind the Seal snapshot it creates to `to`.  The dataset also gets

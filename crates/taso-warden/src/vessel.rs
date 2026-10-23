@@ -114,6 +114,19 @@ pub trait Pool {
         to: (Lsn, HashVal),
         stream: &mut dyn std::io::Read,
     ) -> Result<u64, LayerError>;
+    /// Adopt a fork's state (P3 close-out C7): receive an increment made
+    /// on the fork's dataset from `dataset`'s newest Seal snapshot `base`
+    /// as `dataset`'s Seal layer `to`, bound to its hash.  The dataset is
+    /// unmounted for it and left unmounted; what was written after `base`
+    /// is discarded.  Calling it again for a layer already there binds it
+    /// and returns.  Returns the layer's guid.
+    fn adopt(
+        &self,
+        dataset: &Dataset,
+        base: (Lsn, HashVal),
+        to: (Lsn, HashVal),
+        stream: &mut dyn std::io::Read,
+    ) -> Result<u64, LayerError>;
     /// Receive a stream that is incremental from another dataset's Seal
     /// snapshot (`base`, a Template's) into the new clone `dataset`.  As
     /// [`Pool::receive`] otherwise.
@@ -159,6 +172,16 @@ impl<R: Runner + Clone> Pool for Zfs<R> {
         stream: &mut dyn std::io::Read,
     ) -> Result<u64, LayerError> {
         Ok(Zfs::receive(self, dataset, from, to, stream)?.guid)
+    }
+
+    fn adopt(
+        &self,
+        dataset: &Dataset,
+        base: (Lsn, HashVal),
+        to: (Lsn, HashVal),
+        stream: &mut dyn std::io::Read,
+    ) -> Result<u64, LayerError> {
+        Ok(Zfs::receive_adopted(self, dataset, base, to, stream)?.guid)
     }
 
     fn receive_clone(
@@ -515,6 +538,82 @@ impl ReadLog {
 }
 
 impl<P: Pool> Host<P> {
+    /// Adopt a promoted child's files (P3 close-out C7, decided
+    /// 2026-10-23): the child's state at its Seal `T` is the parent's Seal
+    /// `S` plus exactly the child's changes (the M7 condition), so the
+    /// increment `S → T`, sent from the child's dataset, is received into
+    /// this Vessel's dataset as the layer of its next Seal — the
+    /// **adoption Seal**.  Layer first, then the record, as any Seal: a
+    /// crash in between leaves an orphan layer that the next open destroys,
+    /// and calling this again does it again.  The adoption Seal continues
+    /// the child's turn count, its `ledger_pos` covers the adopted intents,
+    /// its cut is this Vessel's.  The dataset is left unmounted (the
+    /// daemon mounts it before the agent runs).
+    ///
+    /// Refused unless `promotion` is the one pending
+    /// ([`Vessel::adoption_pending`]), the child is a fork of this Vessel
+    /// at its last Seal (the parent did not move), and the child's Seal is
+    /// proven from its local log.
+    pub fn adopt_files<S: Sender>(
+        &self,
+        vessel: &mut Vessel<P::Layers>,
+        promotion: &PromotionRecord,
+        child: &ReadLog,
+        sender: &S,
+    ) -> Result<Position, VesselError> {
+        if vessel.adoption_pending()? != Some(*promotion) {
+            return Err(VesselError::NotASeal(Position {
+                lsn: promotion.seal,
+                hash: promotion.seal_hash,
+            }));
+        }
+        let fork = match &child.lineage.origin {
+            Origin::Fork { parent } if parent.chronicle == vessel.id() => Position {
+                lsn: parent.seal,
+                hash: parent.seal_hash,
+            },
+            _ => return Err(VesselError::NotMyFork(child.chronicle)),
+        };
+        let last = vessel.last_seal();
+        if last != Some(fork) {
+            return Err(VesselError::ParentMoved { fork, last });
+        }
+        let (t, _) = child.prove(SealAt::At(promotion.seal))?;
+        if t.hash != promotion.seal_hash {
+            return Err(VesselError::NotASeal(t));
+        }
+        let turn = child
+            .frames
+            .iter()
+            .find(|f| f.envelope.lsn == t.lsn)
+            .map(decode)
+            .transpose()?
+            .and_then(|p| match p {
+                Payload::Seal(s) => Some(s.turn),
+                _ => None,
+            })
+            .ok_or(VesselError::NotASeal(t))?;
+        let summary = crate::summary::Summary::of(&vessel.frames()?)
+            .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+        let cut = StreamCut {
+            transcript: summary.transcript,
+            ..StreamCut::EMPTY
+        };
+        let child_ds = self.dataset_for(child.chronicle);
+        let from = vessel.dataset().seal_snapshot(fork.lsn);
+        let mut stream = sender
+            .send(&child_ds, Some(&from), t.lsn)
+            .map_err(|e| VesselError::Pool(LayerError::from(e)))?;
+        let dataset = vessel.dataset().clone();
+        let pool = &self.pool;
+        let sealed =
+            vessel.seal_with_layer(cut, Verdict::Clean, summary.effect, turn, |lsn, hash| {
+                pool.adopt(&dataset, (fork.lsn, fork.hash), (lsn, hash), &mut stream)
+                    .map(|_| ())
+            })?;
+        Ok(sealed.seal)
+    }
+
     /// The dataset of the Vessel `id`.
     pub fn dataset_for(&self, id: ChronicleId) -> Dataset {
         Dataset::new(&format!("{}/v-{}", self.root, hex(&id)))
@@ -1326,6 +1425,41 @@ impl<L: Layers> Vessel<L> {
             .seal_checked(cut, verdict, ledger_pos, turn, check)?)
     }
 
+    /// The Promotion whose files are not adopted yet (P3 close-out C7): a
+    /// Promotion record after this Vessel's last Seal.  Its adoption Seal
+    /// is the next Seal ([`Host::adopt_files`]); until then this Vessel
+    /// must take no other Seal (it would move, and the child's increment
+    /// would no longer apply).
+    pub fn adoption_pending(&self) -> Result<Option<PromotionRecord>, VesselError> {
+        let after = self.last_seal().map_or(Lsn::new(0), |s| s.lsn);
+        let mut pending = None;
+        for f in self.frames()? {
+            if f.envelope.lsn <= after || f.envelope.stream != Stream::Ctl {
+                continue;
+            }
+            if let Payload::Promotion(p) = decode(&f)? {
+                pending = Some(p);
+            }
+        }
+        Ok(pending)
+    }
+
+    /// A Seal whose layer `make(lsn, hash)` makes
+    /// ([`crate::chronicle::Chronicle::seal_with_layer`]).
+    pub fn seal_with_layer(
+        &mut self,
+        cut: StreamCut,
+        verdict: Verdict,
+        ledger_pos: Lsn,
+        turn: TurnId,
+        make: impl FnOnce(Lsn, HashVal) -> Result<(), LayerError>,
+    ) -> Result<Sealed, VesselError> {
+        self.writable()?;
+        Ok(self
+            .chronicle
+            .seal_with_layer(cut, verdict, ledger_pos, turn, make)?)
+    }
+
     /// Promote a fork: record in this Chronicle that it adopted the
     /// child's futures as of the child's Seal `at` (P3, M7).  Refused
     /// unless `child` is a fork of this Vessel ([`VesselError::NotMyFork`])
@@ -1775,6 +1909,24 @@ pub(crate) mod tests {
             d.snaps.insert(to.0, to.1);
             d.received.push(bytes);
             Ok(fake_guid(to.0))
+        }
+        fn adopt(
+            &self,
+            dataset: &Dataset,
+            base: (Lsn, HashVal),
+            to: (Lsn, HashVal),
+            stream: &mut dyn std::io::Read,
+        ) -> Result<u64, LayerError> {
+            // The newest layer must be `base` (the M7 condition).
+            let newest = self
+                .0
+                .borrow()
+                .get(&dataset.to_string())
+                .and_then(|d| d.snaps.iter().next_back().map(|(l, h)| (*l, *h)));
+            if newest != Some(base) && newest.map(|n| n.0) != Some(to.0) {
+                return Err("the base is not the newest layer".into());
+            }
+            self.receive(dataset, Some(base), to, stream)
         }
         fn receive_clone(
             &self,
@@ -2361,6 +2513,113 @@ pub(crate) mod tests {
             e.host.shipped_seal(p.id(), SealAt::At(Lsn::new(999))),
             Err(VesselError::ParentNotProven(_))
         ));
+    }
+
+    /// The child's state, as a stream: names what it was made from, and
+    /// fails part-way the first `fails` times.
+    struct Increment {
+        fails: std::cell::Cell<u32>,
+    }
+    impl crate::ship::Sender for Increment {
+        fn send(
+            &self,
+            d: &Dataset,
+            from: Option<&str>,
+            to: Lsn,
+        ) -> std::io::Result<crate::ship::ByteStream> {
+            let bytes = format!("{d} from {from:?} to {}", to.get()).into_bytes();
+            if self.fails.get() > 0 {
+                self.fails.set(self.fails.get() - 1);
+                struct Broken;
+                impl std::io::Read for Broken {
+                    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                        Err(std::io::Error::other("the stream broke"))
+                    }
+                }
+                return Ok(Box::new(Broken));
+            }
+            Ok(Box::new(std::io::Cursor::new(bytes)))
+        }
+    }
+
+    /// C7: after a promotion the child's files are adopted as the parent's
+    /// next Seal — the child's increment from the parent's Seal, received
+    /// into the parent; the adoption Seal continues the child's turn;
+    /// nothing is pending after it, and nothing is adopted twice.
+    #[test]
+    fn a_promoted_childs_files_become_the_parents_next_seal() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let fork = seal(&mut p);
+        let (cid, cseal) = child_with_proposals(&e, p.id(), b"child", 1, 0);
+        let log = e.host.read_log_of(cid).unwrap();
+        assert_eq!(p.adoption_pending().unwrap(), None);
+        let (record, _) = p.promote(&log, SealAt::Last).unwrap();
+        assert_eq!(p.adoption_pending().unwrap(), Some(record));
+
+        let sender = Increment {
+            fails: std::cell::Cell::new(0),
+        };
+        let adopted = e.host.adopt_files(&mut p, &record, &log, &sender).unwrap();
+        assert_eq!(p.last_seal(), Some(adopted));
+        assert_eq!(p.adoption_pending().unwrap(), None);
+        // The layer is the child's increment from the parent's fork Seal.
+        let want = format!(
+            "{} from {:?} to {}",
+            e.host.dataset_for(cid),
+            Some(p.dataset().seal_snapshot(fork.lsn)),
+            cseal.lsn.get()
+        );
+        assert_eq!(
+            e.host.pool.received_of(p.dataset().as_str()),
+            vec![want.into_bytes()]
+        );
+        // The adoption Seal continues the child's turns.
+        let child_turn = log
+            .frames
+            .iter()
+            .find(|f| f.envelope.lsn == cseal.lsn)
+            .and_then(|f| match decode(f) {
+                Ok(Payload::Seal(s)) => Some(s.turn),
+                _ => None,
+            })
+            .unwrap();
+        let frames = p.chronicle().frames().unwrap();
+        let last = frames
+            .iter()
+            .rev()
+            .find_map(|f| match decode(f) {
+                Ok(Payload::Seal(s)) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(last.turn, child_turn);
+        // Not again: nothing is pending.
+        assert!(e.host.adopt_files(&mut p, &record, &log, &sender).is_err());
+        assert_eq!(e.host.pool.received_of(p.dataset().as_str()).len(), 1);
+    }
+
+    /// C7's crash rule for the files: a stream that breaks leaves no Seal
+    /// and nothing pending changes; doing it again adopts.
+    #[test]
+    fn an_adoption_that_breaks_leaves_no_seal_and_is_done_again() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let fork = seal(&mut p);
+        let (cid, _) = child_with_proposals(&e, p.id(), b"child", 1, 0);
+        let log = e.host.read_log_of(cid).unwrap();
+        let (record, _) = p.promote(&log, SealAt::Last).unwrap();
+        let sender = Increment {
+            fails: std::cell::Cell::new(1),
+        };
+        assert!(e.host.adopt_files(&mut p, &record, &log, &sender).is_err());
+        assert_eq!(p.last_seal(), Some(fork), "no Seal was taken");
+        assert_eq!(p.adoption_pending().unwrap(), Some(record));
+        assert!(e.host.pool.received_of(p.dataset().as_str()).is_empty());
+        e.host.adopt_files(&mut p, &record, &log, &sender).unwrap();
+        assert_eq!(p.adoption_pending().unwrap(), None);
     }
 
     /// One choice per fork point: once a child is promoted at the parent's

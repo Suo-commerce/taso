@@ -160,6 +160,19 @@ impl Pool for Storage {
         }
     }
 
+    fn adopt(
+        &self,
+        dataset: &Dataset,
+        base: (Lsn, HashVal),
+        to: (Lsn, HashVal),
+        stream: &mut dyn io::Read,
+    ) -> Result<u64, LayerError> {
+        match self {
+            Self::Zfs(z) => Pool::adopt(z, dataset, base, to, stream),
+            Self::Blk(p) => p.adopt(dataset, base, to, stream),
+        }
+    }
+
     fn receive_clone(
         &self,
         dataset: &Dataset,
