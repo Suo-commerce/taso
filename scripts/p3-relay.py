@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""Reference relay and stub agent in one script (P3 file 10).
+"""Reference relay and stub agent in one script (P3 file 10; roles split
+for the sender socket, C5).
 
-Runs as the agent inside a Vessel container.  Speaks Field protocol v2
-over the per-Vessel Unix socket, declares effects, reads Open, reports
-outcomes, and writes results to the dataset so the gate can check them.
+As the agent (--role agent, inside a Vessel container, on its socket):
+declares effects, seals turns, writes declared.log; never lists or
+reports.  As the sender (--role sender, outside the Vessel, on the
+Warden's sender socket <run_dir>/senders/<vessel-id>.sock): reads Open,
+reports Applied for each, writes each released key.
 
-Usage (from within a Vessel container):
-    p3-relay.py [--effects N] [--provider PROV] [--socket PATH]
-                [--keys-file PATH] [--turns T]
+Usage:
+    p3-relay.py --role agent [--effects N] [--provider PROV] [--socket PATH]
+                [--declared-file PATH] [--turns T] [--wait-for PATH]
+    p3-relay.py --role sender --socket PATH [--keys-file PATH]
 
-  --effects N       number of effects to declare per turn (default 2)
-  --provider PROV   provider namespace for each effect (default "stub")
-  --socket PATH     Field socket (default /run/taso/field.sock)
-  --keys-file PATH  write each released effect's idempotency key here,
-                    one hex-encoded key per line (default /work/keys.log)
-  --turns T         number of turns to run (default 1)
+  --effects N        effects to declare per turn (default 2)
+  --provider PROV    provider namespace for each effect (default "stub")
+  --socket PATH      the socket (default /run/taso/field.sock)
+  --declared-file P  each declared key, hex, one per line
+                     (default /work/declared.log)
+  --wait-for PATH    after the turns, wait until PATH exists (the Warden
+                     serves the sender socket only while the agent runs)
+  --keys-file PATH   each released effect's key, hex, one per line
+                     (default /work/keys.log)
+  --turns T          number of turns (default 1)
 
 Wire protocol v2:
   Frame = u32 BE length + body.
@@ -28,6 +36,7 @@ import os
 import socket
 import struct
 import sys
+import time
 import uuid
 
 
@@ -305,28 +314,26 @@ def ask(sock, request_body):
     return decode_reply(body)
 
 
-def main():
-    p = argparse.ArgumentParser(description="P3 reference relay / stub agent")
-    p.add_argument("--effects", type=int, default=2, help="effects per turn")
-    p.add_argument("--provider", default="stub", help="provider namespace")
-    p.add_argument("--socket", default="/run/taso/field.sock", help="Field socket path")
-    p.add_argument("--keys-file", default="/work/keys.log", help="write idempotency keys here")
-    p.add_argument("--turns", type=int, default=1, help="number of turns")
-    args = p.parse_args()
-
+def connect(path):
+    """Connect and say Hello; returns the socket and the Hello reply."""
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.connect(args.socket)
-
-    # Hello
+    sock.connect(path)
     reply = ask(sock, encode_hello(2))
     if reply["type"] == "Error":
         print(f"Hello refused: {reply['code']}: {reply['message']}", file=sys.stderr)
         sys.exit(1)
     assert reply["type"] == "Hello", f"unexpected: {reply}"
     assert reply["version"] == 2, f"version mismatch: {reply['version']}"
-    resumed_after = reply["last_sealed_turn"]
+    return sock, reply
+
+
+def agent(args):
+    """The agent's role: declare effects, seal turns, write declared.log.
+    It never lists or reports: that is the sender's (C5)."""
+    sock, hello = connect(args.socket)
+    resumed_after = hello["last_sealed_turn"]
     first_turn = (resumed_after or 0) + 1
-    print(f"hello: version {reply['version']}, resumed_after={resumed_after}", file=sys.stderr)
+    print(f"hello: version {hello['version']}, resumed_after={resumed_after}", file=sys.stderr)
 
     # Declare effects, one turn at a time.
     declared = []  # (call, key_hex, op_or_none)
@@ -363,13 +370,26 @@ def main():
         print(f"turn {turn}: sealed={reply['sealed']}", file=sys.stderr)
 
     # Write declared keys so the gate can compare against promoted keys.
-    declared_path = os.path.join(os.path.dirname(args.keys_file), "declared.log")
-    with open(declared_path, "w") as df:
+    with open(args.declared_file, "w") as df:
         for _call, key_hex, _op, _result in declared:
             df.write(key_hex + "\n")
 
-    # ── Sender role: read Open, report outcomes, log keys ────────────
+    # Stay up until the sender is done (the Warden serves the sender's
+    # socket only while the agent runs).
+    if args.wait_for:
+        deadline = time.monotonic() + args.wait_timeout
+        while not os.path.exists(args.wait_for):
+            if time.monotonic() > deadline:
+                print(f"gave up waiting for {args.wait_for}", file=sys.stderr)
+                sys.exit(1)
+            time.sleep(0.05)
+    sock.close()
 
+
+def sender(args):
+    """The sender's role, on the Warden's sender socket: read Open, report
+    Applied for each, write each released effect's key."""
+    sock, _ = connect(args.socket)
     reply = ask(sock, encode_open())
     assert reply["type"] == "Open", f"unexpected: {reply}"
     released = reply["effects"]
@@ -381,7 +401,7 @@ def main():
     with open(args.keys_file, "w") as kf:
         for e in released:
             # The retry policy is ProviderDeduplicated; the key is
-            # the idempotency key we declared.
+            # the idempotency key the agent declared.
             kind, key_bytes = e["retry"]
             assert kind == "ProviderDeduplicated", f"unexpected retry: {kind}"
             kf.write(key_bytes.hex() + "\n")
@@ -394,20 +414,28 @@ def main():
                 print(f"  outcome op={e['op']} refused: {reply['refused']}", file=sys.stderr)
             else:
                 print(f"  outcome op={e['op']} recorded", file=sys.stderr)
-
-    # Write a summary for the gate.
-    summary = {
-        "declared": len(declared),
-        "released": len(released),
-        "keys_file": args.keys_file,
-        "results": {d[1]: d[3] for d in declared},  # key_hex -> "Released"|"Held"|"Refused"
-    }
-    summary_path = os.path.join(os.path.dirname(args.keys_file), "relay-summary.json")
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=1)
-    print(f"summary: {summary_path}", file=sys.stderr)
-
     sock.close()
+
+
+def main():
+    p = argparse.ArgumentParser(description="P3 reference relay / stub agent")
+    p.add_argument("--role", choices=["agent", "sender"], default="agent")
+    p.add_argument("--effects", type=int, default=2, help="effects per turn (agent)")
+    p.add_argument("--provider", default="stub", help="provider namespace (agent)")
+    p.add_argument("--socket", default="/run/taso/field.sock", help="Field socket path")
+    p.add_argument("--declared-file", default="/work/declared.log",
+                   help="write each declared key here (agent)")
+    p.add_argument("--wait-for", default=None,
+                   help="after the turns, wait until this file exists (agent)")
+    p.add_argument("--wait-timeout", type=float, default=120.0)
+    p.add_argument("--keys-file", default="/work/keys.log",
+                   help="write each released effect's key here (sender)")
+    p.add_argument("--turns", type=int, default=1, help="number of turns (agent)")
+    args = p.parse_args()
+    if args.role == "agent":
+        agent(args)
+    else:
+        sender(args)
 
 
 if __name__ == "__main__":

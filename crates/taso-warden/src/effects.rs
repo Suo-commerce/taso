@@ -160,6 +160,15 @@ impl From<VesselError> for PromoteError {
     }
 }
 
+/// What the local log says of one op ([`Effects::result`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpRecord {
+    /// Its latest outcome state; `None`: an intent with no outcome yet.
+    pub state: Option<OutcomeState>,
+    /// That outcome's evidence (a receipt, a reason), if any.
+    pub evidence: Option<Vec<u8>>,
+}
+
 /// A released, unsettled effect: what a sender reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Released {
@@ -324,6 +333,61 @@ impl Effects {
                 (r, before)
             })
             .collect())
+    }
+
+    /// What became of `op`, as this Vessel's local log says: its latest
+    /// outcome state and evidence (`None` state: an intent with no outcome
+    /// yet), or `None` if the op is not in the local log (never declared
+    /// here, or settled and pruned behind a Checkpoint).  Read-only: what
+    /// an agent asks about its own effect (C5), never a listing.
+    pub fn result<L: Layers>(
+        &self,
+        vessel: &Vessel<L>,
+        op: OpId,
+    ) -> Result<Option<OpRecord>, VesselError> {
+        let frames = vessel
+            .chronicle()
+            .frames()
+            .map_err(|e| VesselError::Chronicle(crate::chronicle::ChronicleError::Segment(e)))?;
+        let mut found = None;
+        for f in &frames {
+            if f.envelope.stream != taso_core::envelope::Stream::Effect {
+                continue;
+            }
+            let p = taso_core::record::Payload::decode(&f.payload).map_err(|error| {
+                VesselError::Decode {
+                    lsn: f.envelope.lsn,
+                    error,
+                }
+            })?;
+            match p {
+                taso_core::record::Payload::Intent(i) if i.op == op => {
+                    found = Some(OpRecord {
+                        state: None,
+                        evidence: None,
+                    })
+                }
+                taso_core::record::Payload::Outcome(o) if o.op == op && found.is_some() => {
+                    found = Some(OpRecord {
+                        state: Some(o.state),
+                        evidence: o.evidence,
+                    })
+                }
+                _ => {}
+            }
+        }
+        // A Checkpoint carries the ops still open: one of those whose
+        // intent was pruned is still known, as open.
+        if found.is_none() {
+            let s = summary(vessel)?;
+            if let Some(e) = s.open.get(&op) {
+                found = Some(OpRecord {
+                    state: e.state,
+                    evidence: None,
+                });
+            }
+        }
+        Ok(found)
     }
 
     /// The sender's report on a released effect.  Refused for an op that

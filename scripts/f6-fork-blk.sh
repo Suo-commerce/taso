@@ -59,8 +59,10 @@
 #                  ("may not fork"); the Warden exits 0
 #   R10 promote    phase 5: the first promotion adopts exactly the child's
 #                  1 proposal, the second is refused ("already promoted");
-#                  Open then lists 2 (the parent's own released effect of
-#                  phase 4 and the adopted one); the Warden exits 0
+#                  the agent's Result for the adopted op says Pending
+#                  (C5, 2026-10-23: Open is the sender's, an agent asks
+#                  Result; until then this row checked that Open listed 2);
+#                  the Warden exits 0
 #
 # Usage (root on a node with runc, cargo, python3, ublk and the installed
 # taso-blkd; node-setup.sh vessel-blk):
@@ -432,8 +434,8 @@ pr, why = p.get("promotions", []), []
 if len(pr) != 2 or pr[0].get("child") != "parent-fork-3" or len(pr[0].get("adopted", [])) != 1:
     why.append(f"first: {pr[:1]}")
 if len(pr) != 2 or "already promoted" not in pr[1].get("refused", ""): why.append(f"second: {pr[1:]}")
-if p.get("open_after_promote") != 2: why.append(f"Open lists {p.get('open_after_promote')} (want 2)")
-print("PASS (1 adopted, the second refused, Open 2)" if not why else "FAIL (" + "; ".join(why) + ")")
+if p.get("adopted_states") != ["Pending"]: why.append(f"adopted states {p.get('adopted_states')} (want ['Pending'])")
+print("PASS (1 adopted and pending, the second refused)" if not why else "FAIL (" + "; ".join(why) + ")")
 PY
 )
 if [ "$rc5" != 0 ]; then r10="FAIL (exit $rc5; ${r10})"
