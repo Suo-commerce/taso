@@ -953,18 +953,17 @@ mod tests {
         assert!(fx.open_obligations().is_empty());
     }
 
-    /// Investigation (P3 close-out, review finding 1): a promotion ships
-    /// its Promotion record but not the intents it adopts, yet lists them
-    /// as released at once.  Node A promotes and a relay could read the
-    /// adopted ops; A is lost; node B, from the store alone, finds the
-    /// Promotion pending and adopts the same requests again — and lists
-    /// them as fresh (`DispatchAuthorized`, not `OutcomeUnknown`), so a
-    /// relay cannot tell they were handed out before.
+    /// P3 close-out, review finding 1 (the gap test, inverted by its fix):
+    /// node A promotes; the adoption is shipped before a relay can see it.
+    /// A is lost; node B, from the store alone, finds the promotion done
+    /// (nothing pending, nothing adopted twice) and lists the adopted ops
+    /// as `OutcomeUnknown`: a relay is told they may have been acted on,
+    /// so an `UnsafeToRetry` effect is never sent afresh.
     ///
-    /// This test pins today's behaviour to confirm the gap; the fix
-    /// inverts it.
+    /// Before the fix (`5f43036`) B found the Promotion pending, adopted
+    /// the same requests again and listed them as fresh.
     #[test]
-    fn gap_adopted_but_unshipped_intents_are_released_again_after_rebirth() {
+    fn an_adoption_is_shipped_before_it_is_listed_so_a_rebirth_knows_it() {
         let n = Nodes::new();
         let (a, b) = (n.host(1), n.host(2));
         // The parent, one turn, published.
@@ -1010,63 +1009,26 @@ mod tests {
             .unwrap();
         let on_a = fx.released(&v).unwrap();
         assert_eq!(on_a.len(), 2);
-        assert!(on_a
-            .iter()
-            .all(|r| r.state == OutcomeState::DispatchAuthorized));
-        let ops_a: Vec<u64> = adopted.iter().map(|x| x.op.get()).collect();
-        // What the store holds of the parent: the Promotion, not the adoption.
-        let shipped = n.coord.head(v.id()).unwrap();
-        println!(
-            "A: adopted ops {ops_a:?}, parent tail lsn {}, coordinator head lsn {}",
-            v.tail().lsn.get(),
-            shipped.lsn.get()
-        );
+        assert!(fx.unlisted().is_empty());
 
-        // A is lost.  B: the parent from the store, then the child (whose
-        // first section needs the parent's Seal, now on B).
+        // A is lost.  B: the parent from the store alone.
         let (mut w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
-        println!("B: parent reborn, gap {:?}", r.gap);
-        b.rebirth(c.id(), &n.packs(c.id())).unwrap();
+        assert_eq!(r.gap, None, "everything listed on A was shipped");
         let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), b.warden);
-        let (mut fx, rec) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut w).unwrap();
-        println!(
-            "B: reconciled {rec:?}, pending {:?}",
-            fx.pending_promotion()
+        let (fx, rec) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut w).unwrap();
+        assert_eq!(fx.pending_promotion(), None, "the promotion is done");
+        let ops: Vec<taso_core::record::OpId> = adopted.iter().map(|x| x.op).collect();
+        assert_eq!(rec.open, ops, "open obligations until a sender reports");
+        let on_b = fx.released(&w).unwrap();
+        assert_eq!(
+            on_b.iter().map(|r| r.intent.op).collect::<Vec<_>>(),
+            ops,
+            "the same ops, not a second adoption"
         );
         assert!(
-            fx.pending_promotion().is_some(),
-            "the Promotion was shipped, its adoption was not"
+            on_b.iter().all(|r| r.state == OutcomeState::OutcomeUnknown),
+            "a relay is told they may have been acted on: {on_b:?}"
         );
-        let again = fx
-            .finish_promotion(&mut w, &b.read_log_of(c.id()).unwrap())
-            .unwrap();
-        let ops_b: Vec<u64> = again.iter().map(|x| x.op.get()).collect();
-        let on_b = fx.released(&w).unwrap();
-        println!(
-            "B: adopted again {ops_b:?}: {:?}",
-            on_b.iter()
-                .map(|r| (
-                    r.intent.op.get(),
-                    String::from_utf8_lossy(&r.intent.request).into_owned(),
-                    r.state
-                ))
-                .collect::<Vec<_>>()
-        );
-        // The hazard: the same two UnsafeToRetry requests, released again,
-        // and nothing tells a relay they were handed out on A.
-        assert_eq!(on_b.len(), 2);
-        assert_eq!(
-            on_b.iter()
-                .map(|r| r.intent.request.clone())
-                .collect::<Vec<_>>(),
-            on_a.iter()
-                .map(|r| r.intent.request.clone())
-                .collect::<Vec<_>>()
-        );
-        assert!(on_b
-            .iter()
-            .all(|r| r.state == OutcomeState::DispatchAuthorized
-                && r.intent.retry == RetryPolicy::UnsafeToRetry));
     }
 
     /// The Navigator on a reborn log (amendment 19): the Seals before the

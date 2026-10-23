@@ -2182,13 +2182,26 @@ impl Node {
                     p.seal.get()
                 ))
             })?;
-            let adopted = effects.finish_promotion(&mut vessel, &child).map_err(|e| {
-                DaemonError::Refused(format!(
-                    "finishing the promotion of {} at its Seal lsn {}: {e:?}",
-                    id_hex(p.child),
-                    p.seal.get()
-                ))
-            })?;
+            let adopted = match effects.finish_promotion(&mut vessel, &child) {
+                Ok(a) => a,
+                // Done; listed once a ship succeeds.
+                Err(crate::effects::PromoteError::AdoptionNotShipped {
+                    adopted, error, ..
+                }) => {
+                    self.log(
+                        vc,
+                        format_args!("the adoption is recorded but not shipped yet ({error}): not listed until it is"),
+                    );
+                    adopted
+                }
+                Err(e) => {
+                    return Err(DaemonError::Refused(format!(
+                        "finishing the promotion of {} at its Seal lsn {}: {e:?}",
+                        id_hex(p.child),
+                        p.seal.get()
+                    )))
+                }
+            };
             self.log(
                 vc,
                 format_args!(
@@ -2232,13 +2245,27 @@ impl Node {
                         id_hex(child_id)
                     ))
                 })?;
-                let (record, adopted) =
-                    effects.promote(&mut vessel, &child, pc.seal).map_err(|e| {
-                        DaemonError::Refused(format!(
+                let (record, adopted) = match effects.promote(&mut vessel, &child, pc.seal) {
+                    Ok(r) => r,
+                    // Done; listed once a ship succeeds.
+                    Err(crate::effects::PromoteError::AdoptionNotShipped {
+                        promotion,
+                        adopted,
+                        error,
+                    }) => {
+                        self.log(
+                            vc,
+                            format_args!("the adoption is recorded but not shipped yet ({error}): not listed until it is"),
+                        );
+                        (promotion, adopted)
+                    }
+                    Err(e) => {
+                        return Err(DaemonError::Refused(format!(
                             "promote: {} at {:?}: {e:?}",
                             pc.child, pc.seal
-                        ))
-                    })?;
+                        )))
+                    }
+                };
                 self.log(
                     vc,
                     format_args!(

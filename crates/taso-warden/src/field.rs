@@ -365,6 +365,12 @@ impl<'v, L: Layers> Session<'v, L> {
                 }
             }
             (true, Request::Open) => {
+                // Anything released but not yet shipped (an adoption whose
+                // ship failed) gets one more try; until it lands it is not
+                // listed.
+                if let Some(fx) = self.effects.as_deref_mut() {
+                    let _ = fx.ship_unlisted(self.vessel);
+                }
                 let Some(fx) = self.effects.as_deref() else {
                     return Reply::Open {
                         effects: Vec::new(),
@@ -447,6 +453,16 @@ impl<'v, L: Layers> Session<'v, L> {
         match r {
             Ok((record, adopted)) => PromoteResult::Promoted {
                 seal: record.seal.get(),
+                adopted: adopted.iter().map(|a| a.op.get()).collect(),
+            },
+            // Done; Open lists the adopted ops once a ship succeeds (it
+            // retries before each Open).
+            Err(crate::effects::PromoteError::AdoptionNotShipped {
+                promotion,
+                adopted,
+                ..
+            }) => PromoteResult::Promoted {
+                seal: promotion.seal.get(),
                 adopted: adopted.iter().map(|a| a.op.get()).collect(),
             },
             Err(crate::effects::PromoteError::Vessel(e)) => refused(e.to_string()),
@@ -1705,6 +1721,96 @@ mod tests {
         drop(s);
         assert_eq!(b.promoted.len(), 4);
         assert!(p.last_seal().unwrap().lsn.get() == fork_seal);
+    }
+
+    /// A store that is down from the `from`-th ship on, until `up` is set.
+    struct Down {
+        calls: std::rc::Rc<std::cell::Cell<u32>>,
+        from: u32,
+        up: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl crate::effects::Publish for Down {
+        fn publish(
+            &mut self,
+            _: taso_core::envelope::ChronicleId,
+            _: taso_core::envelope::Epoch,
+            _: &[&crate::segment::Segment],
+            _: Position,
+        ) -> Result<(), crate::effects::PublishError> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() >= self.from && !self.up.get() {
+                return Err(crate::effects::PublishError("store unavailable".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// The adoption's ship fails: the agent is told it is promoted (it
+    /// is: recorded, never undone), but Open lists none of it until a ship
+    /// succeeds; Open retries, and lists them once the store is back.
+    #[test]
+    fn an_adoption_not_yet_shipped_is_not_listed_until_it_is() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.seal_birth().unwrap();
+        let mut b = FakeBranches {
+            host: &e.host,
+            quota: 1,
+            children: Vec::new(),
+            promoted: Vec::new(),
+        };
+        let up = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Ship 1: the Promotion; ship 2: the adoption (down from there).
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(Down {
+                calls: Default::default(),
+                from: 2,
+                up: up.clone(),
+            }),
+            &mut p,
+        )
+        .unwrap();
+        {
+            let mut s = Session::new(&mut p, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx)
+                .with_branches(&mut b);
+            s.handle(hello());
+            assert!(matches!(
+                s.handle(Request::Fork { seal: None }),
+                Reply::Fork {
+                    result: ForkResult::Forked { .. }
+                }
+            ));
+        }
+        let mut children = std::mem::take(&mut b.children);
+        propose(&mut children[0], 2);
+        drop(children);
+
+        let mut s = Session::new(&mut p, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        let Reply::Promote {
+            result: PromoteResult::Promoted { adopted, .. },
+            ..
+        } = s.handle(Request::Promote {
+            child: "c1".into(),
+            seal: None,
+        })
+        else {
+            panic!("not promoted")
+        };
+        assert_eq!(adopted.len(), 2);
+        assert_eq!(s.handle(Request::Open), Reply::Open { effects: vec![] });
+        up.set(true);
+        let Reply::Open { effects } = s.handle(Request::Open) else {
+            panic!()
+        };
+        assert_eq!(effects.iter().map(|e| e.op).collect::<Vec<_>>(), adopted);
     }
 
     /// Without the Warden's `Branches` (or, for Promote, an engine),
