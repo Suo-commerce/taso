@@ -50,8 +50,22 @@
 //! proposal the Promotion names is adopted in **one** batch
 //! ([`Ledger::adopt`]): all of them or none, so a crash leaves either the
 //! Promotion without its adoption (finished on reopen) or the whole
-//! adoption.  A sibling that was not promoted has no Promotion and no
-//! adopted intent: nothing of it was ever released.
+//! adoption.  The adoption is shipped too before any of it is listed.  A
+//! sibling that was not promoted has no Promotion and no adopted intent:
+//! nothing of it was ever released.
+//!
+//! # Listing ([`Effects::released`]): only what is off the node
+//!
+//! A sender only ever sees a released effect whose record is shipped, so
+//! whoever takes the Vessel over knows of everything a sender may have
+//! acted on (review finding 1, 2026-10-23: an adoption listed before it
+//! was shipped could be adopted again, as fresh, after a rebirth).  A
+//! release is shipped before it is answered; an adoption is shipped after
+//! it is recorded, and until that ship succeeds its ops are *unlisted*
+//! ([`Effects::ship_unlisted`] retries); on reopen the released, unsettled
+//! ops are listed once a ship covering them succeeds.  Unlisted ops are
+//! recorded and stay so: a promotion is never undone, only its listing
+//! waits.
 
 use taso_core::envelope::Lsn;
 use taso_core::record::{Authority, IntentRecord, OpId, Origin, OutcomeState, PromotionRecord};
@@ -127,6 +141,17 @@ pub enum PromoteError {
     /// nothing was adopted yet.  Calling [`Effects::finish_promotion`]
     /// later finishes it.
     NotShipped(PublishError),
+    /// Adopted and recorded (the promotion is done), but the adoption
+    /// could not be shipped: its ops are not listed until a ship succeeds
+    /// ([`Effects::ship_unlisted`]).
+    AdoptionNotShipped {
+        /// The Promotion, done.
+        promotion: PromotionRecord,
+        /// The adopted ops.
+        adopted: Vec<Authorized>,
+        /// Why the ship failed.
+        error: PublishError,
+    },
 }
 
 impl From<VesselError> for PromoteError {
@@ -149,8 +174,12 @@ pub struct Released {
 pub struct Effects {
     mode: Mode,
     ledger: Ledger,
-    /// Released ops a sender may still report on, with their barrier.
+    /// Released ops a sender may still report on, with their barrier:
+    /// shipped, so listed.
     released: std::collections::BTreeMap<OpId, Option<taso_core::record::BarrierId>>,
+    /// Released ops recorded but not yet known shipped: not listed until a
+    /// ship succeeds.
+    unlisted: std::collections::BTreeMap<OpId, Option<taso_core::record::BarrierId>>,
     pending: Option<PromotionRecord>,
 }
 
@@ -167,20 +196,38 @@ impl Effects {
     ) -> Result<(Self, Reconciled), VesselError> {
         let (ledger, r) = Ledger::open(publisher, vessel, |l, v, i, s| l.mark_unknown(v, i.op, s))?;
         let summary = summary(vessel)?;
-        let released = summary
+        let unlisted = summary
             .obligations()
             .filter(|e| unsettled(e.state))
             .map(|e| (e.intent.op, e.intent.barrier))
             .collect();
-        Ok((
-            Self {
-                mode,
-                ledger,
-                released,
-                pending: summary.promotion,
-            },
-            r,
-        ))
+        let mut fx = Self {
+            mode,
+            ledger,
+            released: Default::default(),
+            unlisted,
+            pending: summary.promotion,
+        };
+        // Listed once a ship covers them (a failure leaves them unlisted
+        // until one does: [`Effects::ship_unlisted`]).
+        let _ = fx.ship_unlisted(vessel);
+        Ok((fx, r))
+    }
+
+    /// Ship the ledger if any released op is unlisted, and list them.
+    /// `Ok(false)`: nothing was unlisted.
+    pub fn ship_unlisted<L: Layers>(&mut self, vessel: &Vessel<L>) -> Result<bool, PublishError> {
+        if self.unlisted.is_empty() {
+            return Ok(false);
+        }
+        self.ledger.ship(vessel)?;
+        self.released.append(&mut self.unlisted);
+        Ok(true)
+    }
+
+    /// Released ops not yet listed (their ship has not succeeded).
+    pub fn unlisted(&self) -> Vec<OpId> {
+        self.unlisted.keys().copied().collect()
     }
 
     /// Whether this Vessel releases or holds.
@@ -228,6 +275,9 @@ impl Effects {
                 // The release goes off the node before anyone may act on it.
                 match self.ledger.ship_before_send(vessel, &a)? {
                     Ok(()) => {
+                        // The ship covered the whole log: anything
+                        // unlisted is off the node too.
+                        self.released.append(&mut self.unlisted);
                         self.released.insert(a.op, a.barrier);
                         Ok(Asked::Released { op: a.op })
                     }
@@ -237,12 +287,13 @@ impl Effects {
         }
     }
 
-    /// The released, unsettled effects, in op order: what a sender reads
-    /// and acts on.
+    /// The released, unsettled effects whose records are shipped, in op
+    /// order: what a sender reads and acts on.  Unlisted ones are not
+    /// among them ([`Effects::ship_unlisted`]).
     pub fn released<L: Layers>(&self, vessel: &Vessel<L>) -> Result<Vec<Released>, VesselError> {
         Ok(summary(vessel)?
             .obligations()
-            .filter(|e| unsettled(e.state))
+            .filter(|e| unsettled(e.state) && self.released.contains_key(&e.intent.op))
             .map(|e| Released {
                 intent: e.intent.clone(),
                 state: e.state.expect("unsettled has a state"),
@@ -283,6 +334,7 @@ impl Effects {
     ) -> Result<(), ResolveError> {
         self.ledger.resolve(vessel, op, applied, authority)?;
         self.released.remove(&op);
+        self.unlisted.remove(&op);
         Ok(())
     }
 
@@ -343,13 +395,25 @@ impl Effects {
         let adopted = self
             .ledger
             .adopt(vessel, p.child, p.seal, &proposals, held)?;
-        if !held {
-            for a in &adopted {
-                self.released.insert(a.op, a.barrier);
-            }
-        }
+        // Recorded: the promotion is done (the summary agrees).
         self.pending = None;
-        Ok(adopted)
+        if held {
+            // Proposals again: nothing a sender sees, nothing to list.
+            return Ok(adopted);
+        }
+        // Listed only once shipped: a rebirth must know of anything a
+        // sender may act on.
+        for a in &adopted {
+            self.unlisted.insert(a.op, a.barrier);
+        }
+        match self.ship_unlisted(vessel) {
+            Ok(_) => Ok(adopted),
+            Err(error) => Err(PromoteError::AdoptionNotShipped {
+                promotion: p,
+                adopted,
+                error,
+            }),
+        }
     }
 }
 
@@ -742,8 +806,8 @@ mod tests {
         assert_eq!(adopted.len(), 2);
         assert_eq!(
             published.get(),
-            1,
-            "the Promotion shipped before the adoption"
+            2,
+            "the Promotion shipped before the adoption, the adoption before it is listed"
         );
         assert_eq!(fx.pending_promotion(), None);
 
@@ -837,6 +901,87 @@ mod tests {
         assert_eq!(fx.pending_promotion(), None);
         assert_eq!(fx.released(&p).unwrap().len(), 3);
         assert_eq!(intents(&p).len(), 3);
+    }
+
+    /// The adoption's ship fails: the promotion is done (recorded, nothing
+    /// pending, never adopted twice), but nothing is listed until a ship
+    /// succeeds — also across a reopen while the store is still down.
+    #[test]
+    fn an_adoption_is_listed_only_once_shipped() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let c = child(&e, &p, b"c", 2);
+        let log = e.host.read_log_of(c).unwrap();
+        // The Promotion's ship (call 1) succeeds, the adoption's (call 2)
+        // fails.
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(FailsAt {
+                calls: Rc::new(Cell::new(0)),
+                at: 2,
+            }),
+            &mut p,
+        )
+        .unwrap();
+        let fx_promote = fx.promote(&mut p, &log, SealAt::Last).unwrap_err();
+        let PromoteError::AdoptionNotShipped { adopted, .. } = fx_promote else {
+            panic!("{fx_promote:?}")
+        };
+        assert_eq!(adopted.len(), 2);
+        assert_eq!(fx.pending_promotion(), None, "the promotion is done");
+        assert_eq!(intents(&p).len(), 2, "recorded");
+        assert!(fx.released(&p).unwrap().is_empty(), "not listed");
+        assert_eq!(fx.unlisted().len(), 2);
+        // A sender cannot report on what it was never shown.
+        assert!(matches!(
+            fx.report(&mut p, adopted[0].op, &Answer::Unknown),
+            Err(ReportError::NotReleased(_))
+        ));
+
+        // Reopened while the store is still down: still unlisted.
+        drop(fx);
+        let published = Rc::new(Cell::new(0));
+        let fails = Rc::new(Cell::new(1));
+        let (mut fx, _) =
+            Effects::open(Mode::Dispatch, counting(&published, &fails), &mut p).unwrap();
+        assert_eq!(fx.pending_promotion(), None);
+        assert!(fx.released(&p).unwrap().is_empty());
+        assert_eq!(fx.unlisted().len(), 2);
+        // The store is back: listed, and adopted once.
+        assert!(fx.ship_unlisted(&p).unwrap());
+        assert!(fx.unlisted().is_empty());
+        assert_eq!(fx.released(&p).unwrap().len(), 2);
+        assert!(!fx.ship_unlisted(&p).unwrap(), "nothing left to ship");
+        assert_eq!(intents(&p).len(), 2, "never adopted twice");
+    }
+
+    /// A publisher whose `at`-th call fails, every other succeeds.
+    struct FailsAt {
+        calls: Rc<Cell<u32>>,
+        at: u32,
+    }
+
+    impl Publish for FailsAt {
+        fn publish(
+            &mut self,
+            _: ChronicleId,
+            _: Epoch,
+            _: &[&Segment],
+            _: Position,
+        ) -> Result<(), PublishError> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == self.at {
+                return Err(PublishError("store unavailable".into()));
+            }
+            Ok(())
+        }
     }
 
     /// A holder that promotes its own fork adopts the grandchild's

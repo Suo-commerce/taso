@@ -488,6 +488,8 @@ mod tests {
                                 provider: "sim".into(),
                                 request: vec![],
                                 retry: RetryPolicy::UnsafeToRetry,
+                                consequence: Consequence::NoExternalMutation,
+                                authority: vec![],
                                 unknown: false,
                             };
                             2

@@ -25,19 +25,24 @@ building a relay.
      they can be re-sent byte for byte after a crash.
    - `retry`: the retry policy — how the sender may safely re-issue the
      request.
+   - `consequence` and `authority`: what it does to the world and what
+     permits it, as declared — what a sender needs to decide how to act.
    - `unknown`: true if this effect was acted on in a previous
      incarnation whose outcome was lost (the reconciler recorded
      `OutcomeUnknown`).  The sender must not blindly re-send; the
      retry policy says what is safe.
 
 2. **The durability guarantee.**  Every intent listed by `Open` has been
-   released to remote storage (shipped) before it was made visible.
-   A released intent that only existed on one node could never have been
-   sent, because it was never released.  A crash of the local node does
-   not lose it.
+   shipped to remote storage before it was made visible: a release
+   before it is answered, an adoption by promotion after it is recorded
+   (until that ship succeeds its ops are not listed).  So whoever takes
+   the Vessel over knows of everything a sender may have acted on, and
+   lists it as `unknown`; nothing listed is ever listed again as fresh.
+   A crash of the local node does not lose it.
 
 3. **The outbox invariant.**  An effect appears in `Open` exactly from
-   the moment it is released until a terminal outcome is recorded.  No
+   the moment it is released and shipped until a terminal outcome is
+   recorded.  No
    effect is ever released twice with the same `op`.
 
 ## What the sender must do

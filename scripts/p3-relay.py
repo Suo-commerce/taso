@@ -120,6 +120,16 @@ class Reader:
             return ("UnsafeToRetry", None)
         raise ValueError(f"bad retry tag {tag}")
 
+    def consequence(self):
+        tag = self.u8()
+        if tag == 0:
+            return ("Irreversible", None)
+        if tag == 1:
+            return ("Compensatable", self.u64())
+        if tag == 2:
+            return ("NoExternalMutation", None)
+        raise ValueError(f"bad consequence tag {tag}")
+
     def finish(self):
         if self.pos != len(self.data):
             raise ValueError(f"{len(self.data) - self.pos} trailing bytes")
@@ -272,6 +282,8 @@ def decode_reply(body):
                 "provider": r.string(),
                 "request": r.raw_bytes(),
                 "retry": r.retry(),
+                "consequence": r.consequence(),
+                "authority": r.raw_bytes(),
                 "unknown": r.bool_(),
             }
             effects.append(e)

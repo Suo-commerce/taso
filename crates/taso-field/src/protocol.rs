@@ -17,7 +17,9 @@
 //!   declaration is honest is the caller's policy, in front of the Field,
 //!   never the model's.  There is no adapter: Taso never sends.
 //! - **Outcome**: the sender's report on a released effect.
-//! - **Open**: the released, unsettled effects, for a sender to act on.
+//! - **Open**: the released, unsettled effects, for a sender to act on:
+//!   each with everything declared about it but the footprint (a sender
+//!   needs the consequence and the authority to decide how to act).
 //! - **Transcript**: one opaque transcript entry, recorded as a Chronicle
 //!   record.  A quiescent restart rebuilds the agent from the transcript
 //!   (v0.4 §5.4).
@@ -278,6 +280,10 @@ pub struct OpenEffect {
     pub request: Vec<u8>,
     /// How it may be retried: the dedup key or probe is here.
     pub retry: RetryPolicy,
+    /// What it does to the world, as declared.
+    pub consequence: Consequence,
+    /// Which credential or lease permits it, as declared (opaque).
+    pub authority: Vec<u8>,
     /// True if it was acted on once already and the outcome was lost
     /// (reconciled unknown): probe or re-send with the same key, never
     /// send afresh.
@@ -576,6 +582,8 @@ impl Reply {
                         .str(&e.provider)
                         .bytes(&e.request)
                         .retry(&e.retry)
+                        .consequence(&e.consequence)
+                        .bytes(&e.authority)
                         .bool(e.unknown);
                 }
             }
@@ -653,8 +661,8 @@ impl Reply {
             },
             6 => {
                 let n = r.u64()?;
-                // Every entry is at least 8 + 8 + 8 + 1 + 1 bytes.
-                if n > (r.b.len() - r.pos) as u64 / 26 {
+                // Every entry is at least 8 + 8 + 8 + 1 + 1 + 8 + 1 bytes.
+                if n > (r.b.len() - r.pos) as u64 / 35 {
                     return Err(r.err(r.pos, "truncated"));
                 }
                 let mut effects = Vec::with_capacity(n as usize);
@@ -664,6 +672,8 @@ impl Reply {
                         provider: r.string()?,
                         request: r.bytes()?,
                         retry: r.retry()?,
+                        consequence: r.consequence()?,
+                        authority: r.bytes()?,
                         unknown: r.bool()?,
                     });
                 }
@@ -942,15 +952,26 @@ mod tests {
     }
 
     fn open_effect() -> impl Strategy<Value = OpenEffect> {
-        (any::<u64>(), text(), blob(), retry(), any::<bool>()).prop_map(
-            |(op, provider, request, retry, unknown)| OpenEffect {
-                op,
-                provider,
-                request,
-                retry,
-                unknown,
-            },
+        (
+            any::<u64>(),
+            text(),
+            blob(),
+            retry(),
+            consequence(),
+            blob(),
+            any::<bool>(),
         )
+            .prop_map(
+                |(op, provider, request, retry, consequence, authority, unknown)| OpenEffect {
+                    op,
+                    provider,
+                    request,
+                    retry,
+                    consequence,
+                    authority,
+                    unknown,
+                },
+            )
     }
 
     fn reply() -> impl Strategy<Value = Reply> {
@@ -1142,6 +1163,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// An `Open` entry is pinned: op, provider, request, retry, then the
+    /// declared consequence and authority, then `unknown`.
+    #[test]
+    fn an_open_entry_carries_the_declaration() {
+        let rep = Reply::Open {
+            effects: vec![OpenEffect {
+                op: 3,
+                provider: "pay".into(),
+                request: b"pay 10".to_vec(),
+                retry: RetryPolicy::UnsafeToRetry,
+                consequence: Consequence::Compensatable { by: OpId::new(9) },
+                authority: b"user".to_vec(),
+                unknown: true,
+            }],
+        };
+        let mut want = vec![6u8];
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.extend_from_slice(&3u64.to_le_bytes());
+        for s in [&b"pay"[..], b"pay 10"] {
+            want.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            want.extend_from_slice(s);
+        }
+        want.push(2); // UnsafeToRetry
+        want.push(1); // Compensatable
+        want.extend_from_slice(&9u64.to_le_bytes());
+        want.extend_from_slice(&4u64.to_le_bytes());
+        want.extend_from_slice(b"user");
+        want.push(1); // unknown
+        assert_eq!(rep.encode(), want);
+        assert_eq!(Reply::decode(&want).unwrap(), rep);
     }
 
     /// `Open` refuses a count larger than the body could hold before

@@ -953,6 +953,84 @@ mod tests {
         assert!(fx.open_obligations().is_empty());
     }
 
+    /// P3 close-out, review finding 1 (the gap test, inverted by its fix):
+    /// node A promotes; the adoption is shipped before a relay can see it.
+    /// A is lost; node B, from the store alone, finds the promotion done
+    /// (nothing pending, nothing adopted twice) and lists the adopted ops
+    /// as `OutcomeUnknown`: a relay is told they may have been acted on,
+    /// so an `UnsafeToRetry` effect is never sent afresh.
+    ///
+    /// Before the fix (`5f43036`) B found the Promotion pending, adopted
+    /// the same requests again and listed them as fresh.
+    #[test]
+    fn an_adoption_is_shipped_before_it_is_listed_so_a_rebirth_knows_it() {
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        // The parent, one turn, published.
+        let (mut v, _) = a.ensure(ns(1), b"prime").unwrap();
+        let s1 = turn(&mut v, 1);
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
+        // A child forked there proposes two effects, seals and publishes.
+        let mut c = a.fork(&v, s1, b"child").unwrap();
+        let (mut cfx, _) =
+            Effects::open(Mode::Hold, Box::new(crate::effects::AlwaysPublish), &mut c).unwrap();
+        for to in ["alice", "bob"] {
+            let unsafe_mail = Declared {
+                retry: RetryPolicy::UnsafeToRetry,
+                ..mail(to)
+            };
+            assert!(matches!(
+                cfx.ask(&mut c, &unsafe_mail).unwrap(),
+                Asked::Held { .. }
+            ));
+        }
+        let cs = c
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                crate::effects::ledger_pos(&c).unwrap(),
+                TurnId::new(2),
+            )
+            .unwrap()
+            .seal;
+        c.publish_seal(&n.packs(c.id()), &snap(&c, cs), Some(&snap(&v, s1)))
+            .unwrap();
+
+        // Node A promotes; a relay reads Open: two released ops.
+        let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), a.warden);
+        let (mut fx, _) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut v).unwrap();
+        let (_, adopted) = fx
+            .promote(
+                &mut v,
+                &a.read_log_of(c.id()).unwrap(),
+                crate::vessel::SealAt::Last,
+            )
+            .unwrap();
+        let on_a = fx.released(&v).unwrap();
+        assert_eq!(on_a.len(), 2);
+        assert!(fx.unlisted().is_empty());
+
+        // A is lost.  B: the parent from the store alone.
+        let (mut w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
+        assert_eq!(r.gap, None, "everything listed on A was shipped");
+        let publisher = PackPublisher::new(n.packs(v.id()), n.coord.clone(), b.warden);
+        let (fx, rec) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut w).unwrap();
+        assert_eq!(fx.pending_promotion(), None, "the promotion is done");
+        let ops: Vec<taso_core::record::OpId> = adopted.iter().map(|x| x.op).collect();
+        assert_eq!(rec.open, ops, "open obligations until a sender reports");
+        let on_b = fx.released(&w).unwrap();
+        assert_eq!(
+            on_b.iter().map(|r| r.intent.op).collect::<Vec<_>>(),
+            ops,
+            "the same ops, not a second adoption"
+        );
+        assert!(
+            on_b.iter().all(|r| r.state == OutcomeState::OutcomeUnknown),
+            "a relay is told they may have been acted on: {on_b:?}"
+        );
+    }
+
     /// The Navigator on a reborn log (amendment 19): the Seals before the
     /// gap are judged as usual, the first after it is unverified, and the
     /// old holder's log no longer reaches the anchored head.
