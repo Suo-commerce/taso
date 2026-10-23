@@ -94,10 +94,15 @@
 //!
 //! # Not yet
 //!
-//! - Successions from a config entry (forks are: [`ForkConf`]), and forks
-//!   asked for by a running prime agent over its Field (P3: both will go
-//!   through [`Host::fork_from_log`]).  Kubernetes Vessels cannot be forks
-//!   yet: the CRD has no `fork` field.
+//! - Successions from a config entry (forks are: [`ForkConf`], and forks
+//!   asked for over the Field: [`ForksConf`]).
+//! - Children asked for over the Field are run by the Warden that made
+//!   them; a new Warden does not list them again.  What happens to them
+//!   then is the prime agent's call: their datasets, logs and slots stay,
+//!   so it can still promote one (a promotion reads the log, it does not
+//!   need the child running), or ask for new forks in its remaining
+//!   slots.  A child cut short by the restart stays at its last Seal and
+//!   keeps its slot.
 //!
 //! - A coordinator on another node: `remote` is a Unix socket, so across
 //!   nodes it is forwarded (e.g. `ssh -L local.sock:remote.sock`).
@@ -118,7 +123,7 @@ use crate::chronicle::Layers;
 use crate::chronicle::{Claim, LayerError, Recovery};
 use crate::coordinator::{Coord, CoordError};
 use crate::effects::{Effects, Mode};
-use crate::field::{serve, AfterSeal, FieldSocket, Session};
+use crate::field::{serve, AfterSeal, Branches, FieldSocket, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
@@ -128,11 +133,12 @@ use crate::runtime::{
 use crate::s3::{S3Config, S3Store};
 use crate::segment::Position;
 use crate::ship::{LocalStore, SharedStore};
-use crate::source::Held;
+use crate::source::{Held, Requested};
 use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
-use crate::vessel::{Ensured, Host, Pool, SealAt, Vessel, VesselError, BIRTH_TURN};
+use crate::vessel::{Ensured, Host, Pool, ReadLog, SealAt, Vessel, VesselError, BIRTH_TURN};
 use crate::zfs::{Dataset, Snapshot};
 use taso_core::model::WardenId;
+use taso_field::protocol::PromoteResult;
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -378,6 +384,51 @@ pub struct VesselConf {
     /// "last"}`).  The child must be a fork of this Vessel, on this node.
     /// Used by the no-trace gate (P3 file 10).
     pub promote: Option<PromoteConf>,
+    /// Forks its agent may ask for over the Field ([`ForksConf`],
+    /// `"forks": {"slots": [<uid slot>, ...]}`); `None`: none.  (Boxed,
+    /// as `runtime`.)
+    pub forks: Option<Box<ForksConf>>,
+}
+
+/// The forks a Vessel's agent may ask for over the Field (P3 D1: a
+/// request, never an authority).  Each request takes the first slot of
+/// `slots` that no child of this Vessel has taken yet, so the list is
+/// also the quota: one child per slot, a slot never given twice.  The
+/// child is an entry the Warden makes ([`ForksConf::child`]): named
+/// `<subject>-fork-<slot>`, forked from the Seal asked for, in this
+/// Vessel's namespace and runtime, effects always held, never restarted,
+/// and with no forks of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForksConf {
+    /// The uid slots its children may take, in order.
+    pub slots: Vec<u32>,
+}
+
+impl ForksConf {
+    /// The name of `parent`'s child in `slot`.
+    pub fn child_name(parent: &str, slot: u32) -> String {
+        format!("{parent}-fork-{slot}")
+    }
+
+    /// The entry of `parent`'s child in `slot`, forked from its Seal at
+    /// `seal`.
+    pub fn child(parent: &VesselConf, slot: u32, seal: Lsn) -> VesselConf {
+        VesselConf {
+            namespace: parent.namespace,
+            subject: Self::child_name(&parent.subject, slot),
+            takeover: None,
+            uid_slot: slot,
+            restart: Restart::Never,
+            runtime: parent.runtime.clone(),
+            fork: Some(ForkConf {
+                parent: parent.subject.clone(),
+                seal: SealAt::At(seal),
+            }),
+            effects: Some(EffectsConf::Hold),
+            promote: None,
+            forks: None,
+        }
+    }
 }
 
 /// What a Vessel's entry says about its effects.
@@ -825,6 +876,30 @@ fn fork_conf(f: &Value) -> Result<ForkConf, ConfigError> {
 }
 
 /// A Vessel's `"promote"` ([`PromoteConf`]).  Unknown keys are refused.
+fn forks_conf(f: &Value) -> Result<ForksConf, ConfigError> {
+    only_keys(f, "forks", &["slots"])?;
+    let Some(a) = field(f, "slots")?.as_array() else {
+        return Err(bad("\"forks\": \"slots\" must be an array of uid slots"));
+    };
+    if a.is_empty() {
+        return Err(bad(
+            "\"forks\": \"slots\" is empty (leave \"forks\" out for no forks)",
+        ));
+    }
+    let mut slots = Vec::new();
+    for x in a {
+        let s = x
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| bad("\"forks\": every slot must be an integer that fits a uid slot"))?;
+        if slots.contains(&s) {
+            return Err(bad(format!("\"forks\": slot {s} is listed twice")));
+        }
+        slots.push(s);
+    }
+    Ok(ForksConf { slots })
+}
+
 fn promote_conf(p: &Value) -> Result<PromoteConf, ConfigError> {
     only_keys(p, "promote", &["child", "seal"])?;
     let child = string(p, "child")?;
@@ -1115,6 +1190,10 @@ impl Config {
                             None | Some(Value::Null) => None,
                             Some(p) => Some(promote_conf(p)?),
                         },
+                        forks: match x.get("forks") {
+                            None | Some(Value::Null) => None,
+                            Some(f) => Some(Box::new(forks_conf(f)?)),
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, ConfigError>>()?,
@@ -1147,6 +1226,34 @@ impl Config {
                     "vessel {:?} cannot be forked from itself",
                     vc.subject
                 )));
+            }
+        }
+        // A fork slot is given to one child only, and never to a listed
+        // Vessel: every slot named anywhere is named once.
+        for vc in &vessels {
+            for &s in vc.forks.iter().flat_map(|f| &f.slots) {
+                let child = VesselConf {
+                    uid_slot: s,
+                    ..ForksConf::child(vc, s, Lsn::new(1))
+                };
+                if child.host_uid(&runtime).is_none() {
+                    return Err(bad(format!(
+                        "vessel {:?}: fork slot {s} does not fit above host_uid_base",
+                        vc.subject
+                    )));
+                }
+                if let Some(other) = slots.insert(s, vc.subject.clone()) {
+                    return Err(bad(format!(
+                        "vessel {:?}: fork slot {s} is also {other:?}'s",
+                        vc.subject
+                    )));
+                }
+                if !ids.insert(*child.id().as_bytes()) {
+                    return Err(bad(format!(
+                        "vessel {:?}: its fork {:?} is listed as a vessel too",
+                        vc.subject, child.subject
+                    )));
+                }
             }
         }
         Ok(Self {
@@ -1407,6 +1514,97 @@ impl AfterSeal<StorageLayers> for SealPublisher {
 }
 
 /// Whether the log already names a shipped `fs` section.
+/// A Vessel's Fork and Promote requests on this node ([`ForksConf`]).
+struct NodeBranches<'n> {
+    node: &'n Node,
+    vc: &'n VesselConf,
+}
+
+impl Branches<StorageLayers> for NodeBranches<'_> {
+    fn fork(
+        &mut self,
+        vessel: &Vessel<StorageLayers>,
+        at: SealAt,
+    ) -> Result<(String, u64), String> {
+        let Some(forks) = &self.vc.forks else {
+            return Err(format!(
+                "{:?} may not fork: its entry gives no uid slots for forks",
+                self.vc.subject
+            ));
+        };
+        let host = self.node.host();
+        // The first slot no child has taken: not asked for in this
+        // Warden's life, no Vessel of that name on this node, and no
+        // files of anyone's owned by its range.
+        let slot = forks.slots.iter().copied().find(|&slot| {
+            let id = vessel_id(
+                self.vc.namespace,
+                ForksConf::child_name(&self.vc.subject, slot).as_bytes(),
+            );
+            !self.node.requested.contains(id.as_bytes())
+                && !host.dir_for(id).exists()
+                && !self.node.held.iter().any(|h| h.slots.contains(&slot))
+        });
+        let Some(slot) = slot else {
+            return Err(format!(
+                "no fork slot left: all {} of {:?}'s are taken",
+                forks.slots.len(),
+                self.vc.subject
+            ));
+        };
+        let name = ForksConf::child_name(&self.vc.subject, slot);
+        let child = host
+            .fork_from_log(vessel.id(), at, name.as_bytes())
+            .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?;
+        let seal = child
+            .lineage()
+            .origin
+            .parent()
+            .map(|p| p.seal)
+            .ok_or_else(|| format!("the fork {name:?} has no parent in its Lineage"))?;
+        drop(child);
+        self.node
+            .requested
+            .add(ForksConf::child(self.vc, slot, seal));
+        self.node.log(
+            self.vc,
+            format_args!(
+                "forked {name:?} (uid slot {slot}) at Seal lsn {} on its agent's request",
+                seal.get()
+            ),
+        );
+        Ok((name, seal.get()))
+    }
+
+    fn child_log(
+        &mut self,
+        vessel: &Vessel<StorageLayers>,
+        child: &str,
+    ) -> Result<ReadLog, String> {
+        let id = vessel_id(vessel.namespace(), child.as_bytes());
+        self.node
+            .host()
+            .read_log_of(id)
+            .map_err(|e| format!("the log of {child:?} cannot be read here: {e}"))
+    }
+
+    fn promoted(&mut self, child: &str, result: &PromoteResult) {
+        match result {
+            PromoteResult::Promoted { seal, adopted } => self.node.log(
+                self.vc,
+                format_args!(
+                    "promoted {child:?} at Seal lsn {seal} on its agent's request: {} effect(s) adopted",
+                    adopted.len()
+                ),
+            ),
+            PromoteResult::Refused { reason } => self.node.log(
+                self.vc,
+                format_args!("promotion of {child:?} refused: {reason}"),
+            ),
+        }
+    }
+}
+
 fn has_fs_shipped(vessel: &Vessel<StorageLayers>) -> Result<bool, DaemonError> {
     let frames = vessel
         .chronicle()
@@ -1693,6 +1891,10 @@ pub struct Node {
     run_lock: RunDirLock,
     /// What the pool held of each Vessel when the node started ([`held_on`]).
     held: Vec<Held>,
+    /// The children its Vessels' agents asked for over the Field: the
+    /// daemon runs them next to its source's entries
+    /// ([`crate::source::WithRequested`]).
+    requested: Requested,
 }
 
 impl Node {
@@ -1733,7 +1935,13 @@ impl Node {
             store,
             run_lock,
             held,
+            requested: Requested::new(),
         })
+    }
+
+    /// The children asked for over the Field (see [`ForksConf`]).
+    pub fn requested(&self) -> &Requested {
+        &self.requested
     }
 
     /// What the pool held of each Vessel when the node started: the seed of
@@ -2014,10 +2222,7 @@ impl Node {
             if already {
                 self.log(
                     vc,
-                    format_args!(
-                        "promote: {} already promoted, skipping",
-                        pc.child
-                    ),
+                    format_args!("promote: {} already promoted, skipping", pc.child),
                 );
             } else {
                 let child = self.host().read_log_of(child_id).map_err(|e| {
@@ -2170,9 +2375,11 @@ impl Node {
                 let dbs: Vec<&str> = rt.quiescence.iter().map(String::as_str).collect();
                 Some(Watch::new(&mount, &dbs).map_err(io("quiescence watch"))?)
             };
+            let mut branches = NodeBranches { node: self, vc };
             let mut session = Session::new(&mut vessel, verdict.clone())?
                 .with_effects(&mut effects)
-                .with_after_seal(&mut publisher);
+                .with_after_seal(&mut publisher)
+                .with_branches(&mut branches);
             if let Some(w) = watch {
                 session = session.with_watch(w);
             }
@@ -2723,6 +2930,91 @@ mod tests {
         }
     }
 
+    // ── forks asked for over the Field (P3 file 11, D1) ──────────────
+
+    /// `"forks": {"slots": [...]}` gives the agent's forks their slots, in
+    /// order; absent or null: none.  A child's entry is the Warden's own:
+    /// named after the slot, forked from the Seal asked for, held, never
+    /// restarted, no forks of its own, the parent's namespace and runtime.
+    #[test]
+    fn a_forks_entry_is_parsed_and_makes_held_children() {
+        let c = Config::parse(GOOD).unwrap();
+        assert!(c.vessels.iter().all(|v| v.forks.is_none()));
+        let c = with(|v| v["vessels"][1]["forks"] = Value::Null).unwrap();
+        assert_eq!(c.vessels[1].forks, None);
+        let c = with(|v| v["vessels"][0]["forks"] = serde_json::json!({"slots": [9, 8]})).unwrap();
+        assert_eq!(
+            c.vessels[0].forks,
+            Some(Box::new(ForksConf { slots: vec![9, 8] }))
+        );
+
+        let parent = &c.vessels[0];
+        let child = ForksConf::child(parent, 9, Lsn::new(4));
+        assert_eq!(
+            child,
+            VesselConf {
+                namespace: parent.namespace,
+                subject: "a-fork-9".into(),
+                takeover: None,
+                uid_slot: 9,
+                restart: Restart::Never,
+                runtime: parent.runtime.clone(),
+                fork: Some(ForkConf {
+                    parent: "a".into(),
+                    seal: SealAt::At(Lsn::new(4)),
+                }),
+                effects: Some(EffectsConf::Hold),
+                promote: None,
+                forks: None,
+            }
+        );
+        // Held whatever its origin says.
+        assert_eq!(
+            EffectsConf::mode(child.effects, &taso_core::record::Origin::Void),
+            Mode::Hold
+        );
+    }
+
+    /// Every slot is named once in a config (a Vessel's, or one fork
+    /// slot), fits the node, and a child's name is not a listed Vessel.
+    #[test]
+    fn bad_forks_entries_are_refused() {
+        for (vessel, forks, says) in [
+            (0, serde_json::json!([9]), "must be an object"),
+            (0, serde_json::json!({}), "missing \"slots\""),
+            (0, serde_json::json!({"slots": []}), "is empty"),
+            (0, serde_json::json!({"slots": 9}), "must be an array"),
+            (0, serde_json::json!({"slots": [-1]}), "must be an integer"),
+            (0, serde_json::json!({"slots": ["9"]}), "must be an integer"),
+            (0, serde_json::json!({"slots": [9, 9]}), "listed twice"),
+            (
+                0,
+                serde_json::json!({"slots": [9], "max": 1}),
+                "unknown key \"max\"",
+            ),
+            (0, serde_json::json!({"slots": [70000]}), "does not fit"),
+            (0, serde_json::json!({"slots": [7]}), "also \"b\"'s"),
+            (0, serde_json::json!({"slots": [0]}), "also \"a\"'s"),
+        ] {
+            let e = with(|v| v["vessels"][vessel]["forks"] = forks.clone()).unwrap_err();
+            assert!(e.0.contains(says), "{forks}: {}", e.0);
+        }
+        // Two Vessels' forks sharing a slot.
+        let e = with(|v| {
+            v["vessels"][0]["forks"] = serde_json::json!({"slots": [9]});
+            v["vessels"][1]["forks"] = serde_json::json!({"slots": [10, 9]});
+        })
+        .unwrap_err();
+        assert!(e.0.contains("fork slot 9 is also \"a\"'s"), "{}", e.0);
+        // A listed Vessel named like a child.
+        let e = with(|v| {
+            v["vessels"][0]["forks"] = serde_json::json!({"slots": [9]});
+            v["vessels"][1]["subject"] = "a-fork-9".into();
+        })
+        .unwrap_err();
+        assert!(e.0.contains("is listed as a vessel too"), "{}", e.0);
+    }
+
     #[test]
     fn a_fork_inherits_only_a_whole_slots_range() {
         let base = 200_000;
@@ -3003,6 +3295,7 @@ mod tests {
             })),
             effects: None,
             promote: None,
+            forks: None,
         };
         let e = vc(Some(true)).effective(&rt, &[]).unwrap_err();
         assert!(e.contains("no runtime.landlock_shim"), "{e}");

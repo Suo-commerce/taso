@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+taso-core = { path = "../taso-core" }
 taso-field = { path = "../taso-field" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = { workspace = true }

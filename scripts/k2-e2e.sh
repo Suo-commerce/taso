@@ -28,6 +28,15 @@
 #                 with its own agent, its dataset a clone of one of
 #                 runner's Seal snapshots; the API server fixes fork once
 #                 set (a change and a late add are refused by CEL)
+#   6c. forks     (P3 file 11) a Vessel with spec.forks {slots: [7, 8]}
+#                 whose agent asks for 3 forks over the Field: the Warden
+#                 makes asker-fork-7 and -8 (clones of one of its Seal
+#                 snapshots) and runs each to the end; their agents' own
+#                 asks are refused ("may not fork"), the parent's third and
+#                 every later one too ("no fork slot left"); a newcomer
+#                 asking for slot 8 is Refused (the guard binds a fork slot
+#                 to its child); a fork slot equal to the Vessel's own
+#                 uidSlot is refused by the API server (CEL)
 #   7. sigterm    SIGTERM: the Warden stops every agent and exits 0; the last
 #                 status of each says it was stopped
 #   8. slots      a new Warden keeps every uid slot with the Vessel whose
@@ -150,6 +159,10 @@ ln -s "$WORK/outside" "$RD/escape"    # D2: a symlink out of rootfs_dir
 # found by its command line.
 vessel() {
     local ns=$1 name=$2 tenant=$3 slot=$4 ms=$5; shift 5
+    # Set here, not as a default inside the heredoc: there its quotes are
+    # removed and the args become YAML integers (refused by the CRD).
+    local args=${ARGS_OF:-}
+    [ -n "$args" ] || args='[/usr/bin/taso-sim, --turns, "1000000", --turn-sleep-ms, "'"$ms"'", --txns, "1", --rows, "1"]'
     cat <<EOF
 apiVersion: taso.suocommerce.com/v1alpha1
 kind: Vessel
@@ -160,7 +173,7 @@ spec:
   uidSlot: $slot
   node: ${NODE_OF:-$NODE}
   rootfs: { path: ${ROOTFS_OF:-$R} }
-  args: [/usr/bin/taso-sim, --turns, "1000000", --turn-sleep-ms, "$ms", --txns, "1", --rows, "1"]
+  args: $args
 EOF
     for extra in "$@"; do echo "  $extra"; done
 }
@@ -347,6 +360,53 @@ else
     fail fork "runner-fork is $(phase team-a runner-fork): $(message team-a runner-fork)"
 fi
 
+# ── 6c. forks asked for over the Field ────────────────────────────────
+# Two turns, then three asks; restarted (always), each later run asks again.
+ARGS_OF='[/usr/bin/taso-sim, --turns, "2", --turn-sleep-ms, "106", --txns, "1", --rows, "1", --forks, "3"]' \
+    vessel team-a asker $TA 6 106 "forks: { slots: [7, 8] }" | K apply -f - >>"$OUT/vessels.log" 2>&1
+forked() { grep -q "\] asker: forked \"asker-fork-$1\" (uid slot $1) at Seal lsn [0-9]* on its agent's request" "$OUT/warden-1.log"; }
+child_done() { grep -q "\] asker-fork-$1: agent exited ok" "$OUT/warden-1.log"; }
+mount_of() { zfs get -H -o value mountpoint "$1"; }
+if wait_for 60 forked 7 && wait_for 30 forked 8 && wait_for 60 child_done 7 && wait_for 60 child_done 8; then
+    ds_of() { grep -o "\] $1: dataset [^ ]*\$" "$OUT/warden-1.log" | head -1 | sed 's/.*: dataset //'; }
+    pds=$(ds_of asker); why=""
+    for slot in 7 8; do
+        cds=$(ds_of "asker-fork-$slot")
+        origin=$(zfs get -H -o value origin "$cds" 2>/dev/null)
+        [[ "$origin" == "$pds@taso-seal-"* ]] || why="$why; asker-fork-$slot's origin '$origin'"
+        python3 - "$(mount_of "$cds")/sim-stats.json" >/dev/null 2>&1 <<'PY' || why="$why; asker-fork-$slot's own asks were not all refused (may not fork)"
+import json, sys
+f = json.load(open(sys.argv[1]))["forks"]
+sys.exit(0 if len(f) == 3 and all("may not fork" in x.get("refused", "") for x in f) else 1)
+PY
+    done
+    # A later run of the parent: every ask refused, the quota is spent.
+    spent() { python3 - "$(mount_of "$pds")/sim-stats.json" <<'PY'
+import json, sys
+try: f = json.load(open(sys.argv[1]))["forks"]
+except (OSError, ValueError, KeyError): sys.exit(1)
+sys.exit(0 if len(f) == 3 and all("no fork slot left" in x.get("refused", "") for x in f) else 1)
+PY
+    }
+    wait_for 30 spent || why="$why; no later run of asker saw 'no fork slot left'"
+    vessel team-b squatter $TB 8 118 | K apply -f - >>"$OUT/vessels.log" 2>&1
+    squatted() { local pm; pm=$(K get vessel -n team-b squatter -o 'jsonpath={.status.phase} {.status.message}' 2>/dev/null) || return 1; [[ "$pm" == "Refused "*"uid_slot 8 is bound to another Vessel"* ]]; }
+    wait_for 20 squatted || why="$why; squatter is '$(phase team-b squatter)': $(message team-b squatter)"
+    agent 118 >/dev/null && why="$why; squatter's agent runs"
+    if K patch vessel -n team-a asker --type merge -p '{"spec":{"forks":{"slots":[6]}}}' >"$OUT/crd-forks-own.log" 2>&1; then
+        why="$why; a fork slot equal to uidSlot was accepted"
+    elif ! grep -q "a fork slot cannot be the Vessel's own uidSlot" "$OUT/crd-forks-own.log"; then
+        why="$why; the own-slot patch failed for another reason: see $OUT/crd-forks-own.log"
+    fi
+    if [ -z "$why" ]; then
+        pass forks "asker-fork-7 and -8 made from asker's Seal and ran to the end; their asks and the spent quota refused; slot 8 refused to a newcomer; own slot refused by CEL"
+    else
+        fail forks "${why#; }"
+    fi
+else
+    fail forks "the forks were not made or did not finish: $(grep -c 'asker' "$OUT/warden-1.log") asker line(s) in $OUT/warden-1.log"
+fi
+
 # ── 7. sigterm ────────────────────────────────────────────────────────
 kill -TERM "$WARDEN_PID"
 code=""
@@ -411,7 +471,7 @@ K get vessels -A -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,N
 {
     echo
     echo "K2 end to end ($(date -u +%FT%TZ), $(uname -r), envtest $ENVTEST_VERSION)"
-    for row in crd running refused elsewhere deleted kept fork sigterm slots resumed; do
+    for row in crd running refused elsewhere deleted kept fork forks sigterm slots resumed; do
         printf '  %-10s %s\n' "$row" "${RESULT[$row]:-not run}"
     done
     echo "results in $OUT"

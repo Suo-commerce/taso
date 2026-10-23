@@ -16,6 +16,11 @@
 #   phase 3  a new Warden with both entries (parent slot 1, child slot 2):
 #            the source guard is seeded from the pool and the local logs
 #            (F6 step 3b), each runs $AGAIN_TURNS more turns
+#   phase 4  (P3 file 11, D1) the parent alone, with "forks": {"slots":
+#            [3]}: its agent runs 1 turn declaring 1 effect, then asks for
+#            2 forks over the Field; the Warden makes one child in slot 3
+#            and runs it, the agent's second ask is refused (the quota)
+#   phase 5  the parent again: its agent asks to promote that child, twice
 #
 # Rows, predictions written before the first run (2026-10-21):
 #   R1 forked     phase 2's log: "Forked from \"parent\" at Seal lsn L",
@@ -42,6 +47,20 @@
 #                 2026-10-21; its birth Seal carries the parent's turn T):
 #                 its agent was told it resumes after T, ran turns
 #                 T+1..T+$CHILD_TURNS, and its last Seal is at T+$CHILD_TURNS
+#
+# Rows added for P3 file 11, predictions written before the first run
+# (2026-10-22):
+#   R9 field-fork  phase 4: the parent's log says it forked
+#                  "parent-fork-3" (uid slot 3) at its last Seal on its
+#                  agent's request; the agent got that child, then "no fork
+#                  slot left"; the child ran in slot 3 over the lineage's
+#                  files (idmapped), continued the parent's turns, its
+#                  effect held (none released), its own 2 asks refused
+#                  ("may not fork"); the Warden exits 0
+#   R10 promote    phase 5: the first promotion adopts exactly the child's
+#                  1 proposal, the second is refused ("already promoted");
+#                  Open then lists 2 (the parent's own released effect of
+#                  phase 4 and the adopted one); the Warden exits 0
 #
 # Usage (root on a node with runc, cargo, python3, ublk and the installed
 # taso-blkd; node-setup.sh vessel-blk):
@@ -167,12 +186,14 @@ for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.05; done
 [ -S "$SOCK" ] || die "taso-coordd did not start; see $OUT/coordd.err"
 
 # config <out> <turns> <entry JSON>...: one Warden (1) over the installed
-# block log, every Vessel under $ROOT.
+# block log, every Vessel under $ROOT.  $EXTRA: more taso-sim arguments.
 config() {
     local out=$1 turns=$2; shift 2
     python3 - "$out" "$turns" "$@" <<PY
 import json, sys
+import os
 out, turns, entries = sys.argv[1], sys.argv[2], [json.loads(e) for e in sys.argv[3:]]
+extra = os.environ.get("EXTRA", "").split()
 json.dump({
     "warden": 1,
     "coordinator": {"remote": "$SOCK"},
@@ -187,7 +208,7 @@ json.dump({
         "host_uid_base": $BASE,
         "landlock_shim": "/usr/lib/taso/landlock" if "$LANDLOCK" == "1" else None,
         "args": ["/usr/bin/taso-sim", "--turns", turns, "--txns", "2", "--rows", "4",
-                 "--turn-sleep-ms", "50", "--stats", "/work/sim-stats.json"],
+                 "--turn-sleep-ms", "50", "--stats", "/work/sim-stats.json"] + extra,
         "memory_bytes": 268435456,
         "pids": 64,
     },
@@ -368,12 +389,65 @@ else
     row R7 "FAIL (exit $rc3; $refusals refusal(s); $idm idmapped line(s); ${r7:-sealed both})"
 fi
 
+# ── phase 4: forks asked for over the Field (P3 file 11) ───────────────
+PARENT_F='{"subject": "parent", "uid_slot": 1, "forks": {"slots": [3]}}'
+EXTRA="--effects 1 --forks 2" config "$WORK/p4.json" 1 "$PARENT_F"
+rc4=$(wardend phase4 "$WORK/p4.json")
+logcheck "$PID_HEX" "$OUT/parent-4.json"
+read -r P4_LSN P4_TURN < <(last_seal "$OUT/parent-4.json")
+FDS=$(dataset_of "$OUT/phase4.err" parent-fork-3)
+r9=$(python3 - "$WORK/mnt/$PDS/sim-stats.json" "$WORK/mnt/$FDS/sim-stats.json" "$P4_LSN" "$P4_TURN" <<'PY'
+import json, sys
+lsn, turn = int(sys.argv[3]), int(sys.argv[4])
+why = []
+try: p, c = (json.load(open(f)) for f in sys.argv[1:3])
+except (OSError, ValueError) as e: print(f"FAIL (sim-stats: {e})"); sys.exit()
+f = p.get("forks", [])
+if len(f) != 2 or f[0] != {"child": "parent-fork-3", "seal": lsn} or "no fork slot left" not in f[1].get("refused", ""):
+    why.append(f"the parent's asks: {f} (want parent-fork-3 at {lsn}, then no slot left)")
+if p.get("effects", {}).get("released") != 1: why.append(f"the parent's effects: {p.get('effects')}")
+if (c.get("resumed_after"), c.get("turns")) != (turn, [turn + 1, turn + 1]):
+    why.append(f"the child resumed after {c.get('resumed_after')}, turns {c.get('turns')} (want after {turn})")
+e = c.get("effects", {})
+if (e.get("held"), e.get("released")) != (1, 0): why.append(f"the child's effects: {e}")
+cf = c.get("forks", [])
+if len(cf) != 2 or not all("may not fork" in x.get("refused", "") for x in cf): why.append(f"the child's asks: {cf}")
+print("PASS (child at Seal lsn %d, held 1, quota and child refusals)" % lsn if not why else "FAIL (" + "; ".join(why) + ")")
+PY
+)
+if [ "$rc4" != 0 ]; then r9="FAIL (exit $rc4; ${r9})"
+elif ! grep -q "parent: forked \"parent-fork-3\" (uid slot 3) at Seal lsn $P4_LSN on its agent's request" "$OUT/phase4.err"; then r9="FAIL (no fork logged at lsn $P4_LSN; ${r9})"
+elif ! grep -q "parent-fork-3: its files are its lineage's range ($A): /work is idmapped" "$OUT/phase4.err"; then r9="FAIL (the child was not run idmapped; ${r9})"
+fi
+row R9 "$r9"
+
+# ── phase 5: the promotion asked for over the Field ────────────────────
+EXTRA="--promote parent-fork-3 --promote parent-fork-3" config "$WORK/p5.json" 1 "$PARENT_F"
+rc5=$(wardend phase5 "$WORK/p5.json")
+r10=$(python3 - "$WORK/mnt/$PDS/sim-stats.json" <<'PY'
+import json, sys
+try: p = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as e: print(f"FAIL (sim-stats: {e})"); sys.exit()
+pr, why = p.get("promotions", []), []
+if len(pr) != 2 or pr[0].get("child") != "parent-fork-3" or len(pr[0].get("adopted", [])) != 1:
+    why.append(f"first: {pr[:1]}")
+if len(pr) != 2 or "already promoted" not in pr[1].get("refused", ""): why.append(f"second: {pr[1:]}")
+if p.get("open_after_promote") != 2: why.append(f"Open lists {p.get('open_after_promote')} (want 2)")
+print("PASS (1 adopted, the second refused, Open 2)" if not why else "FAIL (" + "; ".join(why) + ")")
+PY
+)
+if [ "$rc5" != 0 ]; then r10="FAIL (exit $rc5; ${r10})"
+elif ! grep -q "parent: promoted \"parent-fork-3\" at Seal lsn [0-9]* on its agent's request: 1 effect(s) adopted" "$OUT/phase5.err"; then r10="FAIL (no promotion logged; ${r10})"
+fi
+row R10 "$r10"
+
 # ── summary ───────────────────────────────────────────────────────────
+ROWS="R1 R2 R3 R4 R5 R6 R7 R8 R9 R10"
 fails=0
-for r in R1 R2 R3 R4 R5 R6 R7 R8; do [[ "${ROW[$r]}" == PASS* ]] || fails=$((fails + 1)); done
+for r in $ROWS; do [[ "${ROW[$r]}" == PASS* ]] || fails=$((fails + 1)); done
 {
-    echo "f6-fork-blk $RUN: $((8 - fails))/8 rows passed"
-    for r in R1 R2 R3 R4 R5 R6 R7 R8; do printf '%-6s %s\n' "$r" "${ROW[$r]}"; done
+    echo "f6-fork-blk $RUN: $((10 - fails))/10 rows passed"
+    for r in $ROWS; do printf '%-6s %s\n' "$r" "${ROW[$r]}"; done
 } | tee "$OUT/summary.txt"
 echo "== results in $OUT"
 [ "$fails" = 0 ]

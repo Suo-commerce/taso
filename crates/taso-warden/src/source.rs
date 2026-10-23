@@ -15,6 +15,10 @@
 //!
 //! - **One entry per Vessel id**, and a slot range that fits above the
 //!   node's `host_uid_base`.
+//! - **A fork slot is its child's** (P3 file 11): a slot an entry gives
+//!   its agent's forks (`forks`) is bound to the one child that may take
+//!   it, from the entry's admission on and for good; another Vessel asking
+//!   for it is refused, and so is an entry whose fork slots another has.
 //! - **No two Vessels share a uid slot** — not at once, and not over time:
 //!   a slot whose range owns files on the node stays reserved for them,
 //!   also after their Vessel is removed.  "Over time" spans Warden
@@ -110,6 +114,141 @@ impl VesselSource for StaticSource {
     fn is_finite(&self) -> bool {
         true
     }
+}
+
+/// Children asked for over the Field (P3 D1), by the Warden's Vessels'
+/// sessions: entries the Warden made itself ([`crate::daemon::ForksConf`]).
+/// Shared by clones; [`WithRequested`] adds them to a source's set.
+#[derive(Clone, Debug, Default)]
+pub struct Requested(std::sync::Arc<std::sync::Mutex<RequestedState>>);
+
+#[derive(Debug, Default)]
+struct RequestedState {
+    entries: BTreeMap<VesselKey, VesselConf>,
+    /// Added since the source last reported them.
+    unreported: bool,
+}
+
+impl Requested {
+    /// A registry with nothing in it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RequestedState> {
+        // A panic while holding it cannot leave the map half-changed.
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Add `vc`.  False (and nothing changed) if an entry with its Vessel
+    /// id is already here.
+    pub fn add(&self, vc: VesselConf) -> bool {
+        let mut st = self.lock();
+        let key = *vc.id().as_bytes();
+        if st.entries.contains_key(&key) {
+            return false;
+        }
+        st.entries.insert(key, vc);
+        st.unreported = true;
+        true
+    }
+
+    /// True if an entry with Vessel id `key` is here.
+    pub fn contains(&self, key: &VesselKey) -> bool {
+        self.lock().entries.contains_key(key)
+    }
+
+    /// Every entry, sorted by key.
+    pub fn entries(&self) -> Vec<VesselConf> {
+        self.lock().entries.values().cloned().collect()
+    }
+
+    fn unreported(&self) -> bool {
+        self.lock().unreported
+    }
+
+    /// The entries, if any were added since the last call.
+    fn take_changed(&self) -> Option<Vec<VesselConf>> {
+        let mut st = self.lock();
+        if !std::mem::take(&mut st.unreported) {
+            return None;
+        }
+        Some(st.entries.values().cloned().collect())
+    }
+}
+
+/// A source's set plus the [`Requested`] children (each goes through the
+/// [`Guard`] like any entry).  A child whose Vessel id the source lists
+/// itself is the source's entry.  Requested children are reported only
+/// once the source has answered: a set without the source's entries
+/// would stop its Vessels.
+pub struct WithRequested<'s> {
+    inner: &'s mut dyn VesselSource,
+    requested: Requested,
+    /// The source's last answer.
+    last: Option<Vec<VesselConf>>,
+}
+
+impl<'s> WithRequested<'s> {
+    /// `inner`'s set plus `requested`.
+    pub fn new(inner: &'s mut dyn VesselSource, requested: Requested) -> Self {
+        Self {
+            inner,
+            requested,
+            last: None,
+        }
+    }
+}
+
+impl VesselSource for WithRequested<'_> {
+    fn poll(&mut self, wait: Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+        let changed = match self.inner.poll(wait)? {
+            Some(set) => {
+                self.last = Some(set);
+                true
+            }
+            None => false,
+        };
+        let Some(last) = &self.last else {
+            return Ok(None);
+        };
+        let children = match self.requested.take_changed() {
+            Some(c) => c,
+            None if changed => self.requested.entries(),
+            None => return Ok(None),
+        };
+        let listed: std::collections::BTreeSet<VesselKey> =
+            last.iter().map(|vc| *vc.id().as_bytes()).collect();
+        let mut set = last.clone();
+        set.extend(
+            children
+                .into_iter()
+                .filter(|vc| !listed.contains(vc.id().as_bytes())),
+        );
+        Ok(Some(set))
+    }
+
+    /// Finite while the source is and no child waits to be reported (a
+    /// child asked for by a run that has just ended must still run).
+    fn is_finite(&self) -> bool {
+        self.inner.is_finite() && !self.requested.unreported()
+    }
+}
+
+/// `vc`'s fork slots, each with the key of the only child that may take
+/// it ([`crate::daemon::ForksConf::child_name`]).
+fn fork_slots(vc: &VesselConf) -> Vec<(u32, VesselKey)> {
+    vc.forks
+        .iter()
+        .flat_map(|f| &f.slots)
+        .map(|&s| {
+            let name = crate::daemon::ForksConf::child_name(&vc.subject, s);
+            (
+                s,
+                *taso_core::record::vessel_id(vc.namespace, name.as_bytes()).as_bytes(),
+            )
+        })
+        .collect()
 }
 
 /// A Vessel's key: its Chronicle id.
@@ -399,7 +538,47 @@ impl Guard {
                     continue;
                 }
             }
+            // Its fork slots: each only ever its own child's.
+            let forks = fork_slots(vc);
+            let clash = forks.iter().find_map(|&(s, child)| {
+                if s == vc.uid_slot {
+                    return Some(format!("fork slot {s} is its own uid_slot"));
+                }
+                let fits = VesselConf {
+                    uid_slot: s,
+                    ..vc.clone()
+                }
+                .host_uid(&self.runtime)
+                .is_some();
+                if !fits {
+                    return Some(format!(
+                        "fork slot {s} does not fit above host_uid_base {}",
+                        self.runtime.host_uid_base
+                    ));
+                }
+                if self.slots.get(&s).is_some_and(|o| *o != child) {
+                    return Some(format!(
+                        "fork slot {s} is bound to another Vessel on this node"
+                    ));
+                }
+                if let Some(why) = self.blocked_slots.get(&s) {
+                    return Some(format!("fork slot {s} is not given: {why}"));
+                }
+                if slots_now.get(&s).is_some_and(|o| *o != child) {
+                    return Some(format!(
+                        "fork slot {s} is taken by another entry in this set"
+                    ));
+                }
+                None
+            });
+            if let Some(why) = clash {
+                refuse(vc, key, why, &self.running);
+                continue;
+            }
             slots_now.insert(vc.uid_slot, key);
+            for (s, child) in forks {
+                slots_now.insert(s, child);
+            }
             set.insert(key, vc.clone());
         }
 
@@ -408,14 +587,21 @@ impl Guard {
             if r.kept_previous {
                 let prev = self.running[&r.key].clone();
                 slots_now.insert(prev.uid_slot, r.key);
+                for (s, child) in fork_slots(&prev) {
+                    slots_now.insert(s, child);
+                }
                 set.entry(r.key).or_insert(prev);
             }
         }
 
-        // Record what runs now; bindings are kept for good.
+        // Record what runs now; bindings are kept for good (a fork slot is
+        // bound to the child that may take it, made or not).
         for (key, vc) in &set {
             self.slots.entry(vc.uid_slot).or_insert(*key);
             self.bound.entry(*key).or_insert(vc.uid_slot);
+            for (s, child) in fork_slots(vc) {
+                self.slots.entry(s).or_insert(child);
+            }
         }
         self.running = set.clone();
 
@@ -455,7 +641,139 @@ mod tests {
             runtime: None,
             effects: None,
             promote: None,
+            forks: None,
         }
+    }
+
+    fn names(set: &[VesselConf]) -> Vec<&str> {
+        let mut v: Vec<&str> = set.iter().map(|vc| vc.subject.as_str()).collect();
+        v.sort();
+        v
+    }
+
+    /// Requested children join the source's set once it has answered, are
+    /// reported again with every new answer, and keep a finite source
+    /// from ending until they are reported.  One entry per Vessel id: the
+    /// source's own entry wins, and a second request for an id is refused.
+    #[test]
+    fn requested_children_join_the_sources_set() {
+        let z = Duration::ZERO;
+        let req = Requested::new();
+        let mut inner = StaticSource::new(vec![vc("p", 1)]);
+        let mut src = WithRequested::new(&mut inner, req.clone());
+        assert!(src.is_finite());
+        assert_eq!(names(&src.poll(z).unwrap().unwrap()), vec!["p"]);
+        assert_eq!(src.poll(z).unwrap(), None);
+
+        assert!(req.add(vc("p-fork-5", 5)));
+        assert!(!req.add(vc("p-fork-5", 6)), "one entry per Vessel id");
+        assert!(req.contains(vc("p-fork-5", 5).id().as_bytes()));
+        // Not finite until the child is reported: a run that asked for it
+        // may already have ended.
+        assert!(!src.is_finite());
+        assert_eq!(names(&src.poll(z).unwrap().unwrap()), vec!["p", "p-fork-5"]);
+        assert!(src.is_finite());
+        assert_eq!(src.poll(z).unwrap(), None);
+
+        // A child the source lists itself is the source's entry.
+        assert!(req.add(vc("p", 9)));
+        let set = src.poll(z).unwrap().unwrap();
+        assert_eq!(names(&set), vec!["p", "p-fork-5"]);
+        assert_eq!(set.iter().find(|v| v.subject == "p").unwrap().uid_slot, 1);
+    }
+
+    fn with_forks(subject: &str, slot: u32, forks: &[u32]) -> VesselConf {
+        VesselConf {
+            forks: Some(Box::new(crate::daemon::ForksConf {
+                slots: forks.to_vec(),
+            })),
+            ..vc(subject, slot)
+        }
+    }
+
+    /// A fork slot is its child's: the child itself is admitted in it,
+    /// nobody else is (in the same set or later, also after the parent is
+    /// gone), and an entry whose fork slots another Vessel holds, or that
+    /// do not fit, is refused.
+    #[test]
+    fn fork_slots_are_their_childs_only() {
+        let mut g = Guard::new(runtime());
+        let child = |s: u32| VesselConf {
+            fork: Some(crate::daemon::ForkConf {
+                parent: "p".into(),
+                seal: crate::vessel::SealAt::Last,
+            }),
+            ..vc(&crate::daemon::ForksConf::child_name("p", s), s)
+        };
+        // The child before or after its parent in key order: both admitted.
+        let a = g.admit(vec![with_forks("p", 1, &[4, 5]), child(4), vc("x", 5)]);
+        assert_eq!(subjects(&a), [("p".into(), 1), ("p-fork-4".into(), 4)]);
+        assert_eq!(reasons(&a), [("x".into(), false)]);
+        assert!(
+            a.refused[0].reason.contains("taken by another entry"),
+            "{a:?}"
+        );
+        // Later, with the parent gone: slot 5 is still its child's.
+        let a = g.admit(vec![vc("x", 5)]);
+        assert!(
+            a.refused[0].reason.contains("bound to another Vessel"),
+            "{a:?}"
+        );
+        let a = g.admit(vec![child(5)]);
+        assert_eq!(subjects(&a), [("p-fork-5".into(), 5)]);
+
+        // An entry whose fork slot another Vessel holds, or that does not fit.
+        let mut g = Guard::new(runtime());
+        g.admit(vec![vc("y", 6)]);
+        for (forks, says) in [
+            (&[7, 6][..], "fork slot 6 is bound to another Vessel"),
+            (&[2][..], "fork slot 2 is its own uid_slot"),
+            (&[70_000][..], "fork slot 70000 does not fit"),
+        ] {
+            let a = g.admit(vec![vc("y", 6), with_forks("q", 2, forks)]);
+            assert_eq!(subjects(&a), [("y".into(), 6)]);
+            assert!(a.refused[0].reason.contains(says), "{forks:?}: {a:?}");
+        }
+        // Two entries naming one fork slot: the smaller Vessel id wins.
+        let mut g = Guard::new(runtime());
+        let (m, n) = (with_forks("m", 1, &[9]), with_forks("n", 2, &[9]));
+        let first = if m.id().as_bytes() < n.id().as_bytes() {
+            "m"
+        } else {
+            "n"
+        };
+        let a = g.admit(vec![m, n]);
+        assert_eq!(a.set.len(), 1);
+        assert_eq!(a.set[0].subject, first);
+    }
+
+    /// A child asked for before the source ever answered waits for that
+    /// answer: a set of children alone would stop the source's Vessels.
+    #[test]
+    fn requested_children_wait_for_the_sources_first_answer() {
+        struct Late(u32, Vec<VesselConf>);
+        impl VesselSource for Late {
+            fn poll(&mut self, _: Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+                if self.0 > 0 {
+                    self.0 -= 1;
+                    return Ok(None);
+                }
+                Ok(Some(std::mem::take(&mut self.1)))
+            }
+            fn is_finite(&self) -> bool {
+                false
+            }
+        }
+        let req = Requested::new();
+        req.add(vc("c", 5));
+        let mut inner = Late(2, vec![vc("p", 1)]);
+        let mut src = WithRequested::new(&mut inner, req);
+        assert_eq!(src.poll(Duration::ZERO).unwrap(), None);
+        assert_eq!(src.poll(Duration::ZERO).unwrap(), None);
+        assert_eq!(
+            names(&src.poll(Duration::ZERO).unwrap().unwrap()),
+            vec!["c", "p"]
+        );
     }
 
     fn subjects(a: &Admitted) -> Vec<(String, u32)> {

@@ -4,7 +4,7 @@
 //! # What crosses, and what cannot
 //!
 //! The Vessel sends [`Request`]s, the Warden answers each with exactly one
-//! [`Reply`], in order.  Six things cross (v2, P3 2026-10-22):
+//! [`Reply`], in order.  Eight things cross (v2, P3 2026-10-22):
 //!
 //! - **Hello**: protocol version.  The client does *not* say which Vessel
 //!   it is; the Warden knows that from which socket it is (each Vessel has
@@ -24,6 +24,16 @@
 //! - **TurnEnd**: the harness's turn boundary and whether it is quiescent
 //!   (no open database transaction); the Warden seals there if it may
 //!   (v1.0 §3).
+//! - **Fork**: ask for a child Vessel forked from one of this Vessel's
+//!   accepted Seals (decision D1: a request, never an authority).  The
+//!   Warden names the child, gives it a uid slot from this Vessel's
+//!   config entry (its quota), and the child always holds its effects.
+//! - **Promote**: ask the Warden to promote a child at one of its Seals:
+//!   the child's held proposals become this Vessel's released intents
+//!   (refused if this Vessel sealed again since the fork, M7).
+//!
+//! Fork and Promote were added to v2 without a version change: a Warden
+//! that does not know them answers `Malformed` and records nothing.
 //!
 //! v1 (one `Effect` shape, no declaration, `Applied`/`NotApplied`/
 //! `Unknown` results) is not spoken any more: a v1 `Hello` is refused.
@@ -101,6 +111,18 @@ pub enum Request {
     },
     /// List the released, unsettled effects (tag 5).
     Open,
+    /// Fork a child from one of this Vessel's accepted Seals (tag 6).
+    Fork {
+        /// The Seal's lsn; `None`: the newest.
+        seal: Option<u64>,
+    },
+    /// Promote a child at one of its accepted Seals (tag 7).
+    Promote {
+        /// The child's name, as the `Fork` reply gave it.
+        child: String,
+        /// The child's Seal lsn; `None`: its newest.
+        seal: Option<u64>,
+    },
 }
 
 /// What a sender reports.
@@ -171,6 +193,55 @@ pub enum Reply {
     Open {
         /// What a sender may act on.
         effects: Vec<OpenEffect>,
+    },
+    /// Answer to `Fork` (tag 7).
+    Fork {
+        /// What happened.
+        result: ForkResult,
+    },
+    /// Answer to `Promote` (tag 8).
+    Promote {
+        /// The child asked for.
+        child: String,
+        /// What happened.
+        result: PromoteResult,
+    },
+}
+
+/// The answer to a fork request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForkResult {
+    /// The child exists, forked from this Vessel's Seal at `seal` (tag 0).
+    Forked {
+        /// Its name: what `Promote` names it by.
+        child: String,
+        /// The parent Seal it was forked from.
+        seal: u64,
+    },
+    /// Not forked: no slot left, the Seal is not proven accepted, or this
+    /// Vessel may not fork (tag 1).  Nothing was made.
+    Refused {
+        /// Why.
+        reason: String,
+    },
+}
+
+/// The answer to a promotion request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromoteResult {
+    /// Promoted at the child's Seal `seal`: `adopted` are this Vessel's
+    /// new op ids, one per proposal, in op order (tag 0).
+    Promoted {
+        /// The child's Seal.
+        seal: u64,
+        /// The adopted ops.
+        adopted: Vec<u64>,
+    },
+    /// Not promoted (tag 1): nothing adopted.  If the reason says the
+    /// Promotion was recorded, it is finished at the Vessel's next start.
+    Refused {
+        /// Why.
+        reason: String,
     },
 }
 
@@ -408,6 +479,12 @@ impl Request {
             Self::Open => {
                 o.u8(5);
             }
+            Self::Fork { seal } => {
+                o.u8(6).opt_u64(*seal);
+            }
+            Self::Promote { child, seal } => {
+                o.u8(7).str(child).opt_u64(*seal);
+            }
         }
         o.0
     }
@@ -445,6 +522,11 @@ impl Request {
                 },
             },
             5 => Self::Open,
+            6 => Self::Fork { seal: r.opt_u64()? },
+            7 => Self::Promote {
+                child: r.string()?,
+                seal: r.opt_u64()?,
+            },
             _ => return Err(r.bad_tag("unknown request tag")),
         };
         r.finish()?;
@@ -496,6 +578,27 @@ impl Reply {
                         .retry(&e.retry)
                         .bool(e.unknown);
                 }
+            }
+            Self::Fork { result } => {
+                o.u8(7);
+                match result {
+                    ForkResult::Forked { child, seal } => o.u8(0).str(child).u64(*seal),
+                    ForkResult::Refused { reason } => o.u8(1).str(reason),
+                };
+            }
+            Self::Promote { child, result } => {
+                o.u8(8).str(child);
+                match result {
+                    PromoteResult::Promoted { seal, adopted } => {
+                        o.u8(0).u64(*seal).u64(adopted.len() as u64);
+                        for op in adopted {
+                            o.u64(*op);
+                        }
+                    }
+                    PromoteResult::Refused { reason } => {
+                        o.u8(1).str(reason);
+                    }
+                };
             }
         }
         o.0
@@ -565,6 +668,40 @@ impl Reply {
                     });
                 }
                 Self::Open { effects }
+            }
+            7 => Self::Fork {
+                result: match r.tag()? {
+                    0 => ForkResult::Forked {
+                        child: r.string()?,
+                        seal: r.u64()?,
+                    },
+                    1 => ForkResult::Refused {
+                        reason: r.string()?,
+                    },
+                    _ => return Err(r.bad_tag("unknown fork result tag")),
+                },
+            },
+            8 => {
+                let child = r.string()?;
+                let result = match r.tag()? {
+                    0 => {
+                        let seal = r.u64()?;
+                        let n = r.u64()?;
+                        if n > (r.b.len() - r.pos) as u64 / 8 {
+                            return Err(r.err(r.pos, "truncated"));
+                        }
+                        let mut adopted = Vec::with_capacity(n as usize);
+                        for _ in 0..n {
+                            adopted.push(r.u64()?);
+                        }
+                        PromoteResult::Promoted { seal, adopted }
+                    }
+                    1 => PromoteResult::Refused {
+                        reason: r.string()?,
+                    },
+                    _ => return Err(r.bad_tag("unknown promote result tag")),
+                };
+                Self::Promote { child, result }
             }
             _ => return Err(r.bad_tag("unknown reply tag")),
         };
@@ -798,6 +935,9 @@ mod tests {
                 .prop_map(|(turn, quiescent)| Request::TurnEnd { turn, quiescent }),
             (any::<u64>(), outcome()).prop_map(|(op, result)| Request::Outcome { op, result }),
             Just(Request::Open),
+            proptest::option::of(any::<u64>()).prop_map(|seal| Request::Fork { seal }),
+            (text(), proptest::option::of(any::<u64>()))
+                .prop_map(|(child, seal)| Request::Promote { child, seal }),
         ]
     }
 
@@ -842,6 +982,20 @@ mod tests {
                 .prop_map(|(op, refused)| Reply::Outcome { op, refused }),
             proptest::collection::vec(open_effect(), 0..4)
                 .prop_map(|effects| Reply::Open { effects }),
+            prop_oneof![
+                (text(), any::<u64>()).prop_map(|(child, seal)| ForkResult::Forked { child, seal }),
+                text().prop_map(|reason| ForkResult::Refused { reason }),
+            ]
+            .prop_map(|result| Reply::Fork { result }),
+            (
+                text(),
+                prop_oneof![
+                    (any::<u64>(), proptest::collection::vec(any::<u64>(), 0..4))
+                        .prop_map(|(seal, adopted)| PromoteResult::Promoted { seal, adopted }),
+                    text().prop_map(|reason| PromoteResult::Refused { reason }),
+                ]
+            )
+                .prop_map(|(child, result)| Reply::Promote { child, result }),
         ]
     }
 
@@ -950,6 +1104,44 @@ mod tests {
             b.extend_from_slice(s);
         }
         assert!(Request::decode(&b).is_err());
+    }
+
+    /// Fork and Promote bodies are pinned: tag, then the option tag and
+    /// lsn (`None`: the newest Seal), the child's name before it.
+    #[test]
+    fn fork_and_promote_requests_are_pinned() {
+        assert_eq!(Request::Fork { seal: None }.encode(), vec![6, 0]);
+        let mut want = vec![6, 1];
+        want.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(Request::Fork { seal: Some(9) }.encode(), want);
+        let mut want = vec![7];
+        want.extend_from_slice(&2u64.to_le_bytes());
+        want.extend_from_slice(b"c1");
+        want.push(0);
+        let req = Request::Promote {
+            child: "c1".into(),
+            seal: None,
+        };
+        assert_eq!(req.encode(), want);
+        assert_eq!(Request::decode(&want).unwrap(), req);
+    }
+
+    /// A `Promote` reply refuses a count larger than the body could hold
+    /// before allocating.
+    #[test]
+    fn a_promote_reply_with_an_impossible_count_is_refused() {
+        let mut b = vec![8u8];
+        b.extend_from_slice(&0u64.to_le_bytes()); // child ""
+        b.push(0);
+        b.extend_from_slice(&1u64.to_le_bytes()); // seal
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            Reply::decode(&b),
+            Err(ProtocolError::Malformed {
+                why: "truncated",
+                ..
+            })
+        ));
     }
 
     /// `Open` refuses a count larger than the body could hold before

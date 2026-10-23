@@ -52,7 +52,7 @@ use taso_warden::daemon::{
     Config, CoordConf, DaemonError, KubeSourceConf, Node, Report, SourceConf, Stop,
 };
 use taso_warden::kube::{Kube, KubeConfig};
-use taso_warden::source::{Guard, StaticSource};
+use taso_warden::source::{Guard, StaticSource, WithRequested};
 use taso_warden::source_kube::{KubeSource, DEFAULT_TICK};
 use taso_warden::status_kube::StatusWriter;
 use taso_warden::supervisor::{Event, Supervisor, Timing};
@@ -175,7 +175,8 @@ fn main() -> ExitCode {
         None => {
             // A static source is finite: the loop ends once every Vessel is
             // done and none waits to restart.
-            let mut source = StaticSource::new(node.config.vessels.clone());
+            let mut inner = StaticSource::new(node.config.vessels.clone());
+            let mut source = WithRequested::new(&mut inner, node.requested().clone());
             supervisor.run(&mut source, &shutdown, |event| {
                 report(&node, &event, &mut last)
             });
@@ -188,10 +189,11 @@ fn main() -> ExitCode {
                 k.node,
                 k.tenants.len()
             );
-            let mut source =
+            let mut inner =
                 KubeSource::new(list, k.clone(), node.config.runtime.clone(), DEFAULT_TICK);
             let writer =
-                StatusWriter::spawn(status, source.view(), k.node.clone(), warden, STATUS_TICK);
+                StatusWriter::spawn(status, inner.view(), k.node.clone(), warden, STATUS_TICK);
+            let mut source = WithRequested::new(&mut inner, node.requested().clone());
             // Infinite: the loop returns only once a stop was asked for and
             // every run has ended.
             supervisor.run(&mut source, &shutdown, |event| {

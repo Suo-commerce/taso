@@ -51,6 +51,15 @@
 //!   the effect is refused as before.  Once per request: no loop, no wait.
 //!   A later Seal published replaces the retry (a named Seal covers every
 //!   Seal before it).
+//! - **Fork and Promote are requests, never authorities** (decision D1).
+//!   The session hands them to the Warden's [`Branches`]
+//!   ([`Session::with_branches`]), which keeps the mechanical limits:
+//!   which slots a child may take (its quota), that a child always holds
+//!   its effects, which Seal is proven.  A promotion goes through the
+//!   effect engine ([`Effects::promote`]): refused if this Vessel sealed
+//!   again since the fork (M7) or already promoted a child there.  Without
+//!   `Branches` (or, for Promote, an engine) both are refused and nothing
+//!   is recorded.
 //! - A malformed body is answered with `Malformed` and the connection
 //!   continues (the frame boundary is intact); a broken frame or a socket
 //!   error ends the connection.
@@ -67,8 +76,8 @@ use std::time::Duration;
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{OpId, Payload, StreamCut, TurnId, Verdict};
 use taso_field::protocol::{
-    recv_request, send_reply, EffectResult, ErrorCode, OpenEffect, Outcome, ProtocolError, Reply,
-    Request, VERSION,
+    recv_request, send_reply, EffectResult, ErrorCode, ForkResult, OpenEffect, Outcome,
+    PromoteResult, ProtocolError, Reply, Request, VERSION,
 };
 
 use crate::chronicle::{ChronicleError, Layers};
@@ -76,7 +85,7 @@ use crate::effects::{Asked, Effects};
 use crate::ledger::{Answer, Declared};
 use crate::quiesce::{verify, Watch};
 use crate::segment::Position;
-use crate::vessel::{Vessel, VesselError, BIRTH_TURN};
+use crate::vessel::{ReadLog, SealAt, Vessel, VesselError, BIRTH_TURN};
 
 // ── Session ─────────────────────────────────────────────────────────
 
@@ -85,6 +94,22 @@ pub trait AfterSeal<L: Layers> {
     /// `seal` was just accepted on `vessel`.  An error is reported, not
     /// fatal: the Seal stands.
     fn after_seal(&mut self, vessel: &mut Vessel<L>, seal: Position) -> Result<(), String>;
+}
+
+/// How a session's Fork and Promote requests reach the Warden (the
+/// daemon: [`crate::daemon`]).  A refusal is a reason for the agent;
+/// nothing is made.
+pub trait Branches<L: Layers> {
+    /// Fork a child of `vessel` from its accepted Seal `at`.  Returns the
+    /// child's name and the Seal lsn it was forked from.
+    fn fork(&mut self, vessel: &Vessel<L>, at: SealAt) -> Result<(String, u64), String>;
+
+    /// The local log of `vessel`'s child `child` (by the name `fork`
+    /// gave), read without claiming it.
+    fn child_log(&mut self, vessel: &Vessel<L>, child: &str) -> Result<ReadLog, String>;
+
+    /// A promotion of `child` was answered `result` (for the Warden's log).
+    fn promoted(&mut self, _child: &str, _result: &PromoteResult) {}
 }
 
 /// One conversation with a Vessel's harness.
@@ -104,6 +129,8 @@ pub struct Session<'v, L: Layers> {
     watch: Option<Watch>,
     /// Runs after each Seal.
     after_seal: Option<&'v mut dyn AfterSeal<L>>,
+    /// Forks and promotions, if this Vessel may ask for them.
+    branches: Option<&'v mut dyn Branches<L>>,
     /// How many times it failed, and the last reason.
     after_seal_failures: u64,
     last_after_seal_error: Option<String>,
@@ -138,6 +165,7 @@ impl<'v, L: Layers> Session<'v, L> {
             effects: None,
             watch: None,
             after_seal: None,
+            branches: None,
             after_seal_failures: 0,
             last_after_seal_error: None,
             pending_seal: None,
@@ -160,6 +188,12 @@ impl<'v, L: Layers> Session<'v, L> {
     /// Run `hook` after each Seal.
     pub fn with_after_seal(mut self, hook: &'v mut dyn AfterSeal<L>) -> Self {
         self.after_seal = Some(hook);
+        self
+    }
+
+    /// Hand Fork and Promote requests to `branches`.
+    pub fn with_branches(mut self, branches: &'v mut dyn Branches<L>) -> Self {
+        self.branches = Some(branches);
         self
     }
 
@@ -353,6 +387,70 @@ impl<'v, L: Layers> Session<'v, L> {
                 }
             }
             (true, Request::TurnEnd { turn, quiescent }) => self.turn_end(turn, quiescent),
+            (true, Request::Fork { seal }) => Reply::Fork {
+                result: self.fork(seal),
+            },
+            (true, Request::Promote { child, seal }) => {
+                let result = self.promote(&child, seal);
+                if let Some(b) = self.branches.as_deref_mut() {
+                    b.promoted(&child, &result);
+                }
+                Reply::Promote { child, result }
+            }
+        }
+    }
+
+    fn fork(&mut self, seal: Option<u64>) -> ForkResult {
+        let refused = |reason: String| ForkResult::Refused { reason };
+        if self.branches.is_none() {
+            return refused("this Warden makes no forks for this vessel".into());
+        }
+        // The Seal must be anchored to be proven; one whose publish failed
+        // gets one more try first (as before an effect, F4b).
+        if let Some(seal) = self.unpublished {
+            self.run_hook(seal);
+        }
+        let Some(b) = self.branches.as_deref_mut() else {
+            unreachable!("checked above")
+        };
+        match b.fork(self.vessel, at(seal)) {
+            Ok((child, seal)) => ForkResult::Forked { child, seal },
+            Err(reason) => refused(reason),
+        }
+    }
+
+    fn promote(&mut self, child: &str, seal: Option<u64>) -> PromoteResult {
+        let refused = |reason: String| PromoteResult::Refused { reason };
+        if self.branches.is_none() || self.effects.is_none() {
+            return refused("this Warden promotes no forks for this vessel".into());
+        }
+        // The Promotion is shipped before anything is adopted, and the log
+        // cannot ship past an unpublished Seal: one more try first (F4b).
+        if let Some(seal) = self.unpublished {
+            self.run_hook(seal);
+        }
+        let (Some(b), Some(fx)) = (self.branches.as_deref_mut(), self.effects.as_deref_mut())
+        else {
+            return refused("this Warden promotes no forks for this vessel".into());
+        };
+        let log = match b.child_log(self.vessel, child) {
+            Ok(l) => l,
+            Err(reason) => return refused(reason),
+        };
+        let before = self.vessel.tail();
+        let r = fx.promote(self.vessel, &log, at(seal));
+        if self.vessel.tail() != before {
+            self.ledger = self.vessel.tail().lsn;
+        }
+        match r {
+            Ok((record, adopted)) => PromoteResult::Promoted {
+                seal: record.seal.get(),
+                adopted: adopted.iter().map(|a| a.op.get()).collect(),
+            },
+            Err(crate::effects::PromoteError::Vessel(e)) => refused(e.to_string()),
+            Err(crate::effects::PromoteError::NotShipped(e)) => refused(format!(
+                "the Promotion is recorded but the ledger could not be shipped ({e}); nothing is adopted until it is finished at this vessel's next start"
+            )),
         }
     }
 
@@ -431,6 +529,14 @@ fn vessel_error(e: VesselError) -> Reply {
         _ => ErrorCode::Internal,
     };
     error(code, e.to_string())
+}
+
+/// The wire's Seal choice: `None` is the newest.
+fn at(seal: Option<u64>) -> SealAt {
+    match seal {
+        None => SealAt::Last,
+        Some(l) => SealAt::At(Lsn::new(l)),
+    }
 }
 
 // ── Serving ─────────────────────────────────────────────────────────
@@ -1390,6 +1496,277 @@ mod tests {
                 refused: Some(_)
             }
         ));
+    }
+
+    /// The daemon's part, on the test host: a child per request, named
+    /// `c1`, `c2`, …, kept open for the test to run; at most `quota`.
+    struct FakeBranches<'h> {
+        host: &'h crate::vessel::Host<crate::vessel::tests::FakePool>,
+        quota: usize,
+        children: Vec<Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>>,
+        promoted: Vec<(String, PromoteResult)>,
+    }
+
+    impl Branches<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>
+        for FakeBranches<'_>
+    {
+        fn fork(
+            &mut self,
+            vessel: &Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>,
+            at: SealAt,
+        ) -> Result<(String, u64), String> {
+            if self.children.len() == self.quota {
+                return Err("no fork slot left".into());
+            }
+            let name = format!("c{}", self.children.len() + 1);
+            let c = self
+                .host
+                .fork_from_log(vessel.id(), at, name.as_bytes())
+                .map_err(|e| e.to_string())?;
+            let seal = c.lineage().origin.parent().unwrap().seal.get();
+            self.children.push(c);
+            Ok((name, seal))
+        }
+
+        fn child_log(
+            &mut self,
+            vessel: &Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>,
+            child: &str,
+        ) -> Result<ReadLog, String> {
+            self.host
+                .read_log_of(taso_core::record::vessel_id(
+                    vessel.namespace(),
+                    child.as_bytes(),
+                ))
+                .map_err(|e| e.to_string())
+        }
+
+        fn promoted(&mut self, child: &str, result: &PromoteResult) {
+            self.promoted.push((child.into(), result.clone()));
+        }
+    }
+
+    /// A child (always held) records `n` proposals and seals one turn.
+    fn propose<L: Layers>(c: &mut Vessel<L>, n: u64) {
+        let (mut fx, _) =
+            Effects::open(Mode::Hold, Box::new(crate::effects::AlwaysPublish), c).unwrap();
+        let mut s = Session::new(c, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        let Reply::Hello {
+            last_sealed_turn, ..
+        } = s.handle(hello())
+        else {
+            panic!("no hello")
+        };
+        for k in 0..n {
+            let req = format!("child-{k}").into_bytes();
+            assert!(matches!(
+                s.handle(declare(k, "pay", &req)),
+                Reply::Effect {
+                    result: EffectResult::Held { .. },
+                    ..
+                }
+            ));
+        }
+        let turn = last_sealed_turn.unwrap_or(0) + 1;
+        assert!(matches!(
+            s.handle(Request::TurnEnd {
+                turn,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                sealed: Some(_),
+                ..
+            }
+        ));
+    }
+
+    /// D1 over the Field: the agent asks, the Warden's `Branches` makes
+    /// the child (its quota refuses the rest); a promotion adopts that
+    /// child's held proposals as this Vessel's released effects, and a
+    /// second promotion at the same fork point — the sibling — is refused
+    /// with nothing adopted (C1: the unchosen future touched nothing).
+    #[test]
+    fn forks_and_promotions_are_asked_for_over_the_field() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.seal_birth().unwrap();
+        let mut b = FakeBranches {
+            host: &e.host,
+            quota: 2,
+            children: Vec::new(),
+            promoted: Vec::new(),
+        };
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut p,
+        )
+        .unwrap();
+        let fork_seal = {
+            let mut s = Session::new(&mut p, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx)
+                .with_branches(&mut b);
+            s.handle(hello());
+            let Reply::TurnEnd {
+                sealed: Some(seal), ..
+            } = s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true,
+            })
+            else {
+                panic!("turn 1 not sealed")
+            };
+            for want in ["c1", "c2"] {
+                assert_eq!(
+                    s.handle(Request::Fork { seal: None }),
+                    Reply::Fork {
+                        result: ForkResult::Forked {
+                            child: want.into(),
+                            seal
+                        }
+                    }
+                );
+            }
+            // The quota is the Warden's, not the agent's.
+            assert!(matches!(
+                s.handle(Request::Fork { seal: None }),
+                Reply::Fork {
+                    result: ForkResult::Refused { .. }
+                }
+            ));
+            seal
+        };
+        let mut children = std::mem::take(&mut b.children);
+        propose(&mut children[0], 2);
+        propose(&mut children[1], 1);
+        let c1_seal = children[0].last_seal().unwrap().lsn.get();
+        drop(children);
+
+        let mut s = Session::new(&mut p, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        assert_eq!(s.handle(Request::Open), Reply::Open { effects: vec![] });
+        let Reply::Promote {
+            child,
+            result: PromoteResult::Promoted { seal, adopted },
+        } = s.handle(Request::Promote {
+            child: "c1".into(),
+            seal: None,
+        })
+        else {
+            panic!("c1 not promoted")
+        };
+        assert_eq!((child.as_str(), seal, adopted.len()), ("c1", c1_seal, 2));
+        let Reply::Open { effects } = s.handle(Request::Open) else {
+            panic!()
+        };
+        assert_eq!(effects.iter().map(|e| e.op).collect::<Vec<_>>(), adopted);
+        assert!(effects
+            .iter()
+            .all(|e| e.request.starts_with(b"child-") && !e.unknown));
+        // The sibling, and c1 again: one choice per fork point.
+        for c in ["c2", "c1"] {
+            assert!(matches!(
+                s.handle(Request::Promote {
+                    child: c.into(),
+                    seal: None
+                }),
+                Reply::Promote {
+                    result: PromoteResult::Refused { .. },
+                    ..
+                }
+            ));
+        }
+        let Reply::Open { effects: after } = s.handle(Request::Open) else {
+            panic!()
+        };
+        assert_eq!(after, effects, "nothing of the sibling's was adopted");
+        // Not a child of this Vessel: refused.
+        assert!(matches!(
+            s.handle(Request::Promote {
+                child: "nobody".into(),
+                seal: None
+            }),
+            Reply::Promote {
+                result: PromoteResult::Refused { .. },
+                ..
+            }
+        ));
+        drop(s);
+        assert_eq!(b.promoted.len(), 4);
+        assert!(p.last_seal().unwrap().lsn.get() == fork_seal);
+    }
+
+    /// Without the Warden's `Branches` (or, for Promote, an engine),
+    /// Fork and Promote are refused and nothing is recorded.
+    #[test]
+    fn forks_and_promotions_without_branches_are_refused() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut b = FakeBranches {
+            host: &e.host,
+            quota: 1,
+            children: Vec::new(),
+            promoted: Vec::new(),
+        };
+        {
+            let mut s = Session::new(&mut v, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx);
+            assert!(is_error(
+                &s.handle(Request::Fork { seal: None }),
+                ErrorCode::BadHello
+            ));
+            s.handle(hello());
+            let tail = s.vessel.tail();
+            assert!(matches!(
+                s.handle(Request::Fork { seal: None }),
+                Reply::Fork {
+                    result: ForkResult::Refused { .. }
+                }
+            ));
+            assert!(matches!(
+                s.handle(Request::Promote {
+                    child: "c1".into(),
+                    seal: None
+                }),
+                Reply::Promote {
+                    result: PromoteResult::Refused { .. },
+                    ..
+                }
+            ));
+            assert_eq!(s.vessel.tail(), tail);
+        }
+        // Branches without an engine: Promote is refused before the child
+        // is even looked at.
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_branches(&mut b);
+        s.handle(hello());
+        assert!(matches!(
+            s.handle(Request::Promote {
+                child: "c1".into(),
+                seal: None
+            }),
+            Reply::Promote {
+                result: PromoteResult::Refused { .. },
+                ..
+            }
+        ));
+        drop(s);
+        assert!(b.promoted.len() == 1 && b.children.is_empty());
     }
 
     #[test]

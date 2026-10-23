@@ -10,6 +10,9 @@
 //! 3. node B, taking over: reborn from the store, the agent resumes after
 //!    turn 10 with the database as of the last Seal;
 //! 4. node A again, not taking over: refused.
+//!
+//! Also W1 (the supervisor on a real node) and P3 file 11 (forks and a
+//! promotion asked for over the Field).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,8 +20,10 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use taso_warden::coordinator::{Coord, Coordinator};
-use taso_warden::daemon::{Config, DaemonError, Node, Report, Restart, Start, Stop, VesselConf};
-use taso_warden::source::{Guard, SourceError, VesselSource};
+use taso_warden::daemon::{
+    Config, DaemonError, ForksConf, Node, Report, Restart, Start, Stop, VesselConf,
+};
+use taso_warden::source::{Guard, SourceError, StaticSource, VesselSource, WithRequested};
 use taso_warden::storage::Storage;
 use taso_warden::supervisor::{Event, Supervisor, Timing};
 use taso_warden::zfs::Zfs;
@@ -554,4 +559,192 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     shutdown.request();
     sup.join().unwrap();
     assert_eq!(taso_sim_processes(), 0);
+}
+
+// ── P3 file 11: forks and a promotion asked for over the Field ────────
+
+/// sim-stats.json of the Vessel `subject` under `node`'s root.
+fn stats_of(node: &Node, subject: &str) -> Value {
+    let id = taso_core::record::vessel_id(node.config.vessels[0].namespace, subject.as_bytes());
+    let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let ds = format!("{}/v-{hex}", node.config.root);
+    let out = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", "mountpoint", &ds])
+        .output()
+        .unwrap();
+    let mount = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+    serde_json::from_str(&std::fs::read_to_string(mount.join("sim-stats.json")).unwrap())
+        .unwrap_or_else(|e| panic!("{subject}'s stats: {e}"))
+}
+
+/// D1 on real ZFS and runc, one node, the daemon's own source path
+/// (`WithRequested` over the config's list):
+///
+/// 1. the parent (slot 3, `"forks": {"slots": [4, 5]}`) runs 2 turns and
+///    asks for 3 forks: two are made (`sim-3-fork-4`, `-5`, from its last
+///    Seal), the third is refused (its quota); the Warden runs each child
+///    in its own slot, held, and does not return before they are done;
+///    each child continues the parent's turns, its effects are held, and
+///    its own fork requests are refused (a child has no fork slots);
+/// 2. the parent again, promoting `-fork-4` then `-fork-5`: the first
+///    adopts exactly fork-4's 2 proposals as released effects (Open lists
+///    those 2), the second is refused (one choice per fork point).
+#[test]
+#[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
+fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
+    let base = format!(
+        "{}/d1-{}",
+        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
+        std::process::id()
+    );
+    for ds in [base.clone(), format!("{base}/a")] {
+        assert!(Command::new("zfs")
+            .args(["create", &ds])
+            .status()
+            .unwrap()
+            .success());
+    }
+    let _c = Cleanup(base.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    rootfs(&tmp.path().join("rootfs"));
+    let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
+    let node = |sim: &[&str]| {
+        let mut c = config_with(tmp.path(), &base, "a", 1, None, "sim-3", sim);
+        c.vessels[0].forks = Some(Box::new(ForksConf { slots: vec![4, 5] }));
+        Arc::new(Node::new(c, coord.clone(), Storage::Zfs(Zfs::cli().batched())).unwrap())
+    };
+    let (c4, c5) = ("sim-3-fork-4", "sim-3-fork-5");
+
+    // 1. Two turns, then three forks asked for; children run, then the
+    //    supervisor returns (a finite source with nothing left).
+    {
+        let n = node(&[
+            "--turns",
+            "2",
+            "--txns",
+            "1",
+            "--rows",
+            "1",
+            "--effects",
+            "1",
+            "--forks",
+            "3",
+        ]);
+        let mut inner = StaticSource::new(n.config.vessels.clone());
+        let mut source = WithRequested::new(&mut inner, n.requested().clone());
+        let timing = Timing {
+            tick: std::time::Duration::from_millis(50),
+            ..Timing::default()
+        };
+        let mut ran: Vec<(String, u32, Report)> = Vec::new();
+        Supervisor::new(n.clone(), Guard::new(n.config.runtime.clone()), timing).run(
+            &mut source,
+            &Stop::new(),
+            |e: Event<Result<Report, DaemonError>>| match e {
+                Event::Exited { vc, out, .. } => {
+                    let r = out.unwrap_or_else(|e| panic!("{}: {e}", vc.subject));
+                    println!("{} ended: {r:?}", vc.subject);
+                    ran.push((vc.subject.clone(), vc.uid_slot, r));
+                }
+                Event::Refused(r) => panic!("refused: {r:?}"),
+                Event::Panicked { vc, .. } => panic!("{} panicked", vc.subject),
+                _ => {}
+            },
+        );
+        let mut who: Vec<(&str, u32)> =
+            ran.iter().map(|(s, slot, _)| (s.as_str(), *slot)).collect();
+        who.sort();
+        assert_eq!(
+            who,
+            [("sim-3", 3), (c4, 4), (c5, 5)],
+            "the parent and both children ran"
+        );
+        for (s, _, r) in &ran {
+            assert!(
+                r.agent.as_ref().is_some_and(|a| a.0),
+                "{s}'s agent failed: {:?}",
+                r.agent
+            );
+        }
+
+        let p = stats_of(&n, "sim-3");
+        println!("parent: {p}");
+        assert_eq!(p["effects"]["released"], 2, "{p}");
+        let forks = p["forks"].as_array().unwrap();
+        assert_eq!(
+            (forks[0]["child"].as_str(), forks[1]["child"].as_str()),
+            (Some(c4), Some(c5)),
+            "{p}"
+        );
+        assert_eq!(
+            forks[0]["seal"], forks[1]["seal"],
+            "both from its last Seal: {p}"
+        );
+        assert!(
+            forks[2]["refused"]
+                .as_str()
+                .unwrap()
+                .contains("no fork slot left"),
+            "the quota: {p}"
+        );
+        for c in [c4, c5] {
+            let s = stats_of(&n, c);
+            println!("{c}: {s}");
+            assert_eq!(s["resumed_after"], 2, "continues the parent's turns: {s}");
+            assert_eq!(s["turns"], json!([3, 4]), "{s}");
+            assert_eq!(
+                (
+                    s["effects"]["held"].clone(),
+                    s["effects"]["released"].clone()
+                ),
+                (json!(2), json!(0)),
+                "a child holds: {s}"
+            );
+            assert_eq!(s["rows_in_db"], 4, "the parent's rows, then its own: {s}");
+            for f in s["forks"].as_array().unwrap() {
+                assert!(
+                    f["refused"].as_str().unwrap().contains("may not fork"),
+                    "a child has no fork slots: {s}"
+                );
+            }
+        }
+    }
+
+    // 2. The parent again: promote fork-4, then fork-5.
+    let n = node(&[
+        "--turns",
+        "1",
+        "--txns",
+        "1",
+        "--rows",
+        "1",
+        "--promote",
+        c4,
+        "--promote",
+        c5,
+    ]);
+    let r = n.run_vessel(&n.config.vessels[0]).unwrap();
+    assert!(
+        r.agent.as_ref().is_some_and(|a| a.0),
+        "agent failed: {:?}",
+        r.agent
+    );
+    let p = stats_of(&n, "sim-3");
+    println!("parent, promoting: {p}");
+    let pr = p["promotions"].as_array().unwrap();
+    assert_eq!(pr[0]["child"], c4, "{p}");
+    let adopted = pr[0]["adopted"].as_array().expect("fork-4 promoted");
+    assert_eq!(adopted.len(), 2, "exactly fork-4's proposals: {p}");
+    assert!(
+        pr[1]["refused"]
+            .as_str()
+            .unwrap()
+            .contains("already promoted"),
+        "the sibling is refused: {p}"
+    );
+    // Its own 2 released effects (no sender reported on them) and the 2
+    // adopted ones; nothing of fork-5's.
+    assert_eq!(p["open_after_promote"], 4, "{p}");
 }
