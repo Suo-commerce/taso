@@ -159,6 +159,10 @@ ln -s "$WORK/outside" "$RD/escape"    # D2: a symlink out of rootfs_dir
 # found by its command line.
 vessel() {
     local ns=$1 name=$2 tenant=$3 slot=$4 ms=$5; shift 5
+    # Set here, not as a default inside the heredoc: there its quotes are
+    # removed and the args become YAML integers (refused by the CRD).
+    local args=${ARGS_OF:-}
+    [ -n "$args" ] || args='[/usr/bin/taso-sim, --turns, "1000000", --turn-sleep-ms, "'"$ms"'", --txns, "1", --rows, "1"]'
     cat <<EOF
 apiVersion: taso.suocommerce.com/v1alpha1
 kind: Vessel
@@ -169,7 +173,7 @@ spec:
   uidSlot: $slot
   node: ${NODE_OF:-$NODE}
   rootfs: { path: ${ROOTFS_OF:-$R} }
-  args: ${ARGS_OF:-[/usr/bin/taso-sim, --turns, "1000000", --turn-sleep-ms, "$ms", --txns, "1", --rows, "1"]}
+  args: $args
 EOF
     for extra in "$@"; do echo "  $extra"; done
 }
