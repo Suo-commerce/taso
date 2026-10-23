@@ -745,7 +745,7 @@ fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
             .contains("already promoted"),
         "the sibling is refused: {p}"
     );
-    // Its own 2 released effects (no sender reported on them) and the 2
-    // adopted ones; nothing of fork-5's.
-    assert_eq!(p["open_after_promote"], 4, "{p}");
+    // The agent reads what became of each adopted op (listing is the
+    // sender's, C5): released, no report yet.
+    assert_eq!(p["adopted_states"], json!(["Pending", "Pending"]), "{p}");
 }
