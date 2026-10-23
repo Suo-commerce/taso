@@ -949,6 +949,7 @@ impl<R: Runner> Zfs<R> {
         child: &Dataset,
         child_seal: Lsn,
     ) -> Result<Snapshot, ZfsError> {
+        let checks = crate::timing::span("adopt.checks");
         if let Some(existing) = self.get(dataset, to.0)? {
             return self.bind(existing, to.1);
         }
@@ -973,10 +974,16 @@ impl<R: Runner> Zfs<R> {
         let no_mount = |d: &Dataset| ZfsError::Copy(format!("{d} has no mountpoint"));
         let dest = info.mountpoint.ok_or_else(|| no_mount(dataset))?;
         let child_mp = child_info.mountpoint.ok_or_else(|| no_mount(child))?;
+        drop(checks);
+        let t = crate::timing::span("adopt.rollback");
         self.run(vec!["rollback".to_string(), base_name.clone()])?;
+        drop(t);
+        let t = crate::timing::span("adopt.mount");
         self.ensure_mounted(dataset)?;
         self.ensure_mounted(child)?;
+        drop(t);
         let child_snap = child.seal_snapshot(child_seal);
+        let t = crate::timing::span("adopt.diff");
         let diff = self.run(vec![
             "diff".to_string(),
             "-H".to_string(),
@@ -986,10 +993,14 @@ impl<R: Runner> Zfs<R> {
         ])?;
         let changes = crate::adoptcopy::parse_diff(&child_mp, &diff)
             .map_err(|e| ZfsError::Copy(e.to_string()))?;
+        drop(t);
+        let t = crate::timing::span("adopt.copy");
         let snap_dir = child_snap.split_once('@').map_or("", |(_, s)| s);
         let src = child_mp.join(".zfs/snapshot").join(snap_dir);
         crate::adoptcopy::apply(&changes, &src, &dest)
             .map_err(|e| ZfsError::Copy(e.to_string()))?;
+        drop(t);
+        let _t = crate::timing::span("adopt.snapshot");
         self.snapshot(dataset, to.0, to.1)
     }
 

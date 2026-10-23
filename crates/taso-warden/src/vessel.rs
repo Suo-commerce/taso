@@ -568,6 +568,7 @@ impl<P: Pool> Host<P> {
         child: &ReadLog,
         sender: &S,
     ) -> Result<Position, VesselError> {
+        let _total = crate::timing::span("adopt.total");
         if vessel.adoption_pending()? != Some(*promotion) {
             return Err(VesselError::NotASeal(Position {
                 lsn: promotion.seal,
