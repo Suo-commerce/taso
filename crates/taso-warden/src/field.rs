@@ -379,6 +379,8 @@ impl<'v, L: Layers> Session<'v, L> {
                                 provider: r.intent.provider,
                                 request: r.intent.request,
                                 retry: r.intent.retry,
+                                consequence: r.intent.consequence,
+                                authority: r.intent.authority,
                                 unknown: r.state == taso_core::record::OutcomeState::OutcomeUnknown,
                             })
                             .collect(),
@@ -1409,6 +1411,9 @@ mod tests {
                     retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
                         key: b"send bob".to_vec()
                     },
+                    // As declared: the sender needs both to decide how to act.
+                    consequence: taso_core::record::Consequence::Irreversible,
+                    authority: b"user".to_vec(),
                     unknown: false,
                 }]
             }
