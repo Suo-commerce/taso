@@ -53,6 +53,12 @@ pub trait RunVessel: Send + Sync + 'static {
     /// Whether the agent exited ok (`None`: it never ran) and whether the
     /// run ended on a stop.
     fn outcome(out: &Self::Out) -> (Option<bool>, bool);
+    /// Whether a run of `key` has got past its start: its dataset is
+    /// settled here (opened, or reborn), so a fork of it may start
+    /// (parent before child, P3 close-out C6).  By default at once.
+    fn started(&self, _key: &VesselKey) -> bool {
+        true
+    }
 }
 
 impl RunVessel for Node {
@@ -67,6 +73,10 @@ impl RunVessel for Node {
             Ok(r) => (r.agent.as_ref().map(|(ok, _)| *ok), r.stopped),
             Err(_) => (None, false),
         }
+    }
+
+    fn started(&self, key: &VesselKey) -> bool {
+        self.has_started(key)
     }
 }
 
@@ -299,9 +309,23 @@ impl<R: RunVessel> Supervisor<R> {
         }
     }
 
-    /// Start what should run, stop what should not.
+    /// Start what should run, stop what should not.  A fork waits for its
+    /// parent when the parent is wanted here too: until the parent's run
+    /// is past its start (its dataset settled: reborn here if it had to
+    /// be), or has run before.  A fork is reborn only where its parent's
+    /// Seal is (2026-10-23, option c), so the parent comes first.
     fn converge(&mut self, on_event: &mut impl FnMut(Event<R::Out>)) {
         let now = Instant::now();
+        let settled: std::collections::BTreeSet<VesselKey> = self
+            .vessels
+            .iter()
+            .filter(|(k, s)| match &s.state {
+                State::Running { .. } => self.runner.started(k),
+                State::Waiting(_) | State::Done => true,
+                State::Ready => false,
+            })
+            .map(|(k, _)| *k)
+            .collect();
         // Stop runs no longer wanted; forget idle Vessels no longer wanted.
         self.vessels.retain(|key, slot| {
             if self.wanted.contains_key(key) {
@@ -334,6 +358,15 @@ impl<R: RunVessel> Supervisor<R> {
             };
             if !due {
                 continue;
+            }
+            // Parent before child.
+            if let Some(f) = &slot.vc.fork {
+                let parent = *taso_core::record::vessel_id(slot.vc.namespace, f.parent.as_bytes())
+                    .as_bytes();
+                if parent != *key && self.wanted.contains_key(&parent) && !settled.contains(&parent)
+                {
+                    continue;
+                }
             }
             let (runner, stop, run_vc) = (self.runner.clone(), Stop::new(), slot.vc.clone());
             let handle = {
@@ -422,6 +455,10 @@ mod tests {
         runs: Mutex<Vec<RunRecord>>,
         live: Mutex<HashMap<String, u32>>,
         overlap: Mutex<bool>,
+        /// How long a run of a subject takes to get past its start.
+        settle: Mutex<HashMap<String, u64>>,
+        /// Vessels whose run got past its start.
+        started: Mutex<std::collections::BTreeSet<VesselKey>>,
     }
 
     impl Fake {
@@ -458,6 +495,11 @@ mod tests {
                 }
             }
             let start = Instant::now();
+            let settle = self.settle.lock().unwrap().get(&vc.subject).copied();
+            if let Some(ms) = settle {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            self.started.lock().unwrap().insert(*vc.id().as_bytes());
             let act = self
                 .script
                 .lock()
@@ -501,6 +543,9 @@ mod tests {
         }
         fn outcome(out: &Self::Out) -> (Option<bool>, bool) {
             *out
+        }
+        fn started(&self, key: &VesselKey) -> bool {
+            self.started.lock().unwrap().contains(key)
         }
     }
 
@@ -634,6 +679,82 @@ mod tests {
         assert!(
             ev.contains(&E::Exited("b".into(), false, false)),
             "never: a failure is not restarted"
+        );
+    }
+
+    /// A fork of a Vessel in the same set (C6): parent before child.
+    #[test]
+    fn a_fork_starts_only_once_its_parent_is_past_its_start() {
+        let fork_of = |subject: &str, slot, parent: &str| VesselConf {
+            fork: Some(crate::daemon::ForkConf {
+                parent: parent.into(),
+                seal: crate::vessel::SealAt::Last,
+            }),
+            ..vc(subject, slot, Restart::Never)
+        };
+        let f = Fake::with(&[
+            ("p", &[Act::Exit(Some(true))]),
+            ("c", &[Act::Exit(Some(true))]),
+            ("lone", &[Act::Exit(Some(true))]),
+        ]);
+        // The parent's start (a rebirth, say) takes 150 ms.
+        f.settle.lock().unwrap().insert("p".into(), 150);
+        let mut src = Scripted {
+            steps: [Ok(Some(vec![
+                fork_of("c", 2, "p"),
+                vc("p", 1, Restart::Never),
+                // A fork whose parent is not wanted here: does not wait.
+                fork_of("lone", 3, "elsewhere"),
+            ]))]
+            .into(),
+            finite: true,
+        };
+        supervisor(&f).run(&mut src, &Stop::new(), |_| {});
+        let (p, c, lone) = (f.runs_of("p"), f.runs_of("c"), f.runs_of("lone"));
+        assert_eq!((p.len(), c.len(), lone.len()), (1, 1, 1));
+        assert!(
+            c[0].1 >= p[0].1 + Duration::from_millis(150),
+            "the child started {:?} after its parent",
+            c[0].1 - p[0].1
+        );
+        assert!(
+            lone[0].1 < p[0].1 + Duration::from_millis(100),
+            "a fork without its parent here does not wait"
+        );
+    }
+
+    /// A parent that ran before (done, or waiting to restart) has its
+    /// Seal here: its fork does not wait for it to run again.
+    #[test]
+    fn a_fork_of_a_parent_that_ran_before_does_not_wait() {
+        let f = Fake::with(&[
+            ("p", &[Act::Exit(Some(true))]),
+            ("c", &[Act::Exit(Some(true))]),
+        ]);
+        let child = VesselConf {
+            fork: Some(crate::daemon::ForkConf {
+                parent: "p".into(),
+                seal: crate::vessel::SealAt::Last,
+            }),
+            ..vc("c", 2, Restart::Never)
+        };
+        let mut src = Scripted {
+            steps: [
+                Ok(Some(vec![vc("p", 1, Restart::Never)])),
+                Ok(None),
+                Ok(None),
+                Ok(None),
+                Ok(Some(vec![vc("p", 1, Restart::Never), child])),
+            ]
+            .into(),
+            finite: true,
+        };
+        supervisor(&f).run(&mut src, &Stop::new(), |_| {});
+        assert_eq!(f.runs_of("p").len(), 1, "the parent ran once");
+        assert_eq!(
+            f.runs_of("c").len(),
+            1,
+            "the child ran though the parent is done"
         );
     }
 

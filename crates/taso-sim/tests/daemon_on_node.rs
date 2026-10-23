@@ -754,3 +754,146 @@ fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
         );
     }
 }
+
+// ── P3 close-out C6: parent before child; forks are node-bound ─────────
+
+/// A parent and its fork (a config entry) taken over together, on real
+/// ZFS: the supervisor starts the parent first, so the parent is reborn
+/// here before its fork's rebirth needs the parent's Seal; the fork moved
+/// alone is refused, naming the missing Seal, and fences nobody.
+///
+/// 1. node A: the parent runs 2 turns, its fork (from the parent's Seal)
+///    2 turns; both published;
+/// 2. node C, the fork alone, taking it over: refused before anything
+///    changes (A still holds it);
+/// 3. node B, both, taking both over: both reborn and both agents run,
+///    the parent's run started first.
+#[test]
+#[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
+fn a_parent_is_reborn_before_its_fork_and_a_fork_alone_is_refused() {
+    use taso_warden::daemon::{ForkConf, TakeOver};
+    use taso_warden::vessel::SealAt;
+    let base = format!(
+        "{}/c6-{}",
+        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
+        std::process::id()
+    );
+    for ds in [
+        base.clone(),
+        format!("{base}/a"),
+        format!("{base}/b"),
+        format!("{base}/c"),
+    ] {
+        assert!(Command::new("zfs")
+            .args(["create", &ds])
+            .status()
+            .unwrap()
+            .success());
+    }
+    let _c = Cleanup(base.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    rootfs(&tmp.path().join("rootfs"));
+    let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
+    let sim = ["--turns", "2", "--txns", "1", "--rows", "1"];
+    let (parent, child) = ("sim-4", "sim-4-c");
+    // `who`: which of the two entries; `warden`: the node's id;
+    // `take`: take each over from its holder as the coordinator says.
+    let node = |name: &str, warden: u64, who: &[&str], take: bool| {
+        let mut c = config_with(tmp.path(), &base, name, warden, None, parent, &sim);
+        let p = c.vessels[0].clone();
+        let fork = VesselConf {
+            subject: child.into(),
+            uid_slot: 4,
+            fork: Some(ForkConf {
+                parent: parent.into(),
+                seal: SealAt::Last,
+            }),
+            ..p.clone()
+        };
+        let mut list = Vec::new();
+        for (s, vc) in [(parent, p), (child, fork.clone())] {
+            if who.contains(&s) {
+                list.push(vc);
+            }
+        }
+        if take {
+            for vc in &mut list {
+                let o = coord.ownership(vc.id()).unwrap();
+                vc.takeover = Some(TakeOver {
+                    holder: o.holder,
+                    epoch: o.epoch,
+                });
+            }
+        }
+        c.vessels = list;
+        Arc::new(Node::new(c, coord.clone(), Storage::Zfs(Zfs::cli().batched())).unwrap())
+    };
+    let run_all = |n: &Arc<Node>| {
+        let mut source = StaticSource::new(n.config.vessels.clone());
+        let timing = Timing {
+            tick: std::time::Duration::from_millis(20),
+            ..Timing::default()
+        };
+        let mut order = Vec::new();
+        let mut ran: Vec<(String, Result<Report, String>)> = Vec::new();
+        Supervisor::new(n.clone(), Guard::new(n.config.runtime.clone()), timing).run(
+            &mut source,
+            &Stop::new(),
+            |e: Event<Result<Report, DaemonError>>| match e {
+                Event::Started(vc) => order.push(vc.subject),
+                Event::Exited { vc, out, .. } => {
+                    println!("{} ended: {out:?}", vc.subject);
+                    ran.push((vc.subject, out.map_err(|e| e.to_string())));
+                }
+                Event::Refused(r) => panic!("refused: {r:?}"),
+                Event::Panicked { vc, .. } => panic!("{} panicked", vc.subject),
+                _ => {}
+            },
+        );
+        (order, ran)
+    };
+
+    // 1. Node A: both born and run; both published.
+    {
+        let a = node("a", 1, &[parent, child], false);
+        let (order, ran) = run_all(&a);
+        assert_eq!(order, [parent, child], "parent first on A too");
+        for (s, r) in &ran {
+            let r = r.as_ref().unwrap_or_else(|e| panic!("{s}: {e}"));
+            assert!(r.agent.as_ref().is_some_and(|x| x.0), "{s}: {:?}", r.agent);
+        }
+    }
+    let ids = |s: &str| {
+        taso_core::record::vessel_id(
+            taso_core::record::Namespace::from_bytes([7; 16]),
+            s.as_bytes(),
+        )
+    };
+
+    // 2. Node C, the fork alone: refused, A still holds it.
+    {
+        let c = node("c", 3, &[child], true);
+        let e = c.run_vessel(&c.config.vessels[0]).unwrap_err().to_string();
+        println!("C, the fork alone: {e}");
+        assert!(
+            e.contains("a fork is reborn only where its parent's Seal is"),
+            "{e}"
+        );
+        assert_eq!(coord.ownership(ids(child)).unwrap().holder.get(), 1);
+    }
+
+    // 3. Node B, both: the parent is reborn first, then the fork.
+    let b = node("b", 2, &[parent, child], true);
+    let (order, ran) = run_all(&b);
+    assert_eq!(order, [parent, child], "the parent's run started first");
+    for (s, r) in &ran {
+        let r = r.as_ref().unwrap_or_else(|e| panic!("{s}: {e}"));
+        assert_eq!(r.start, Start::Rebirth, "{s}");
+        assert!(r.agent.as_ref().is_some_and(|x| x.0), "{s}: {:?}", r.agent);
+    }
+    for s in [parent, child] {
+        assert_eq!(coord.ownership(ids(s)).unwrap().holder.get(), 2, "{s}");
+    }
+}
