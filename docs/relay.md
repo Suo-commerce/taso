@@ -10,6 +10,21 @@ present.  The sender is a peer of the agent, sitting outside the
 Vessel, reading the Field protocol's `Open` list and reporting back
 through `Outcome`.
 
+## Where the sender connects
+
+Each Vessel has two sockets.  The agent's is mounted into the Vessel;
+the **sender socket** is the Warden's own, at
+`<run_dir>/senders/<vessel-id>.sock` (mode 0600, owned by the Warden),
+and is never mounted into any Vessel.  `Open` and `Outcome` are
+answered only there; the agent's socket refuses them
+(`NotOnThisSocket`), so an agent can never list the outbox or claim
+that its own effect happened.  The agent learns what became of its
+effect with `Result { op }` — pending, held, applied (with the receipt),
+not applied (with the reason), unknown — read-only.  One socket per
+Vessel: its path says whose outbox it is; nothing on the wire names a
+Vessel.  Several senders may connect to one Vessel's socket at once;
+their requests are handled one at a time.
+
 This document is the contract between Taso and any sender.  It replaces
 the `Adapter` trait that was removed in P3 and is normative for anyone
 building a relay.
@@ -27,10 +42,13 @@ building a relay.
      request.
    - `consequence` and `authority`: what it does to the world and what
      permits it, as declared — what a sender needs to decide how to act.
-   - `unknown`: true if this effect was acted on in a previous
-     incarnation whose outcome was lost (the reconciler recorded
-     `OutcomeUnknown`).  The sender must not blindly re-send; the
-     retry policy says what is safe.
+   - `unknown`: true if this effect may have been acted on already:
+     a previous incarnation of the Warden released it and its outcome
+     was lost (the reconciler recorded `OutcomeUnknown`), or an earlier
+     `Open` of this Warden already listed it (a sender that crashed, or
+     the same sender polling again — a sender keeps track of its own
+     in-flight ops).  The sender must not blindly re-send; the retry
+     policy says what is safe.
 
 2. **The durability guarantee.**  Every intent listed by `Open` has been
    shipped to remote storage before it was made visible: a release
@@ -174,10 +192,12 @@ loop:
 ```
 
 The relay runs beside the agent, not inside it: the agent declares
-effects through the Field, the relay reads what was released and acts
-on them.  A relay that is down does not stop the agent or lose its
+effects through its socket, the relay reads what was released on the
+sender socket and acts on them; the agent asks `Result` for the outcome.  A relay that is down does not stop the agent or lose its
 effects; it catches up on restart.  Multiple relays for different
 provider namespaces may run concurrently, each handling its own slice of
 the outbox.
 
-A reference relay is provided in `scripts/p3-relay.py`.
+A reference relay is provided in `scripts/p3-relay.py` (`--role sender`;
+`--role agent` is the stub agent the no-trace gate runs inside the
+Vessel).

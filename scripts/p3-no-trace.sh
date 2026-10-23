@@ -16,14 +16,18 @@
 #      "promote": {"child": "<child-0>"}, SIGKILL after a tiny sleep.
 #   d. Clean start: parent Warden with promote config; finish_promotion
 #      handles crash recovery; the daemon's "already promoted" guard
-#      skips a double promote.  Agent reads Open, writes keys.log.
+#      skips a double promote.  The sender (the relay, --role sender, on
+#      the host) reads Open on the Warden's sender socket, reports, and
+#      writes keys.log; the parent's agent waits for it (C5: an agent can
+#      neither list nor report).
 #   e. Verify: parent's keys.log matches child-0's declared.log; keys
 #      are all-or-none; no duplicates.
 #
 # Egress closed except the Warden socket: the runc container has its
 # own network namespace with no setup, so no outbound connectivity.
-# The relay communicates only through the Field protocol over the
-# per-Vessel Unix socket.
+# The relay's agent role communicates only through the Field protocol
+# over the per-Vessel Unix socket; its sender role runs on the host, on
+# the Warden's sender socket, which is never mounted into a Vessel.
 #
 # Usage (root; needs runc, ZFS, cargo, python3):
 #   TASO_ZFS_DATASET=tasotest/vessel scripts/p3-no-trace.sh
@@ -125,6 +129,8 @@ echo "== coordinator ready"
 NS="7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
 
 # config_parent <subject> <out-file> [promote-child-subject]
+# With a child to promote, the agent waits for the host's sender to be
+# done (/work/sender-done) before it exits.
 config_parent() {
     local subject="$1" out="$2" promote_child="${3:-}"
     python3 - "$subject" "$out" "$promote_child" \
@@ -133,13 +139,15 @@ import json, sys
 subject, out, promote_child = sys.argv[1], sys.argv[2], sys.argv[3]
 sock, base, work, rootfs, ns, landlock = sys.argv[4:10]
 vessel = {"namespace": ns, "subject": subject, "uid_slot": 0}
+args = ["/usr/bin/python3", "/usr/bin/p3-relay.py", "--role", "agent",
+        "--effects", "0", "--turns", "1"]
 if promote_child:
     vessel["promote"] = {"child": promote_child, "seal": "last"}
+    args += ["--wait-for", "/work/sender-done"]
 rt = {
     "rootfs": rootfs,
     "host_uid_base": 200000,
-    "args": ["/usr/bin/python3", "/usr/bin/p3-relay.py",
-             "--effects", "0", "--turns", "1"],
+    "args": args,
     "memory_bytes": 268435456,
     "pids": 64,
 }
@@ -170,7 +178,7 @@ sock, base, work, rootfs, ns, landlock, effects = sys.argv[5:12]
 rt = {
     "rootfs": rootfs,
     "host_uid_base": 200000,
-    "args": ["/usr/bin/python3", "/usr/bin/p3-relay.py",
+    "args": ["/usr/bin/python3", "/usr/bin/p3-relay.py", "--role", "agent",
              "--effects", effects, "--turns", "1"],
     "memory_bytes": 268435456,
     "pids": 64,
@@ -228,7 +236,8 @@ cat <<'EOF' | tee "$OUT/predictions.txt"
 === P3 No-Trace Gate: Predictions ===
 
 P1: released = promoted child's declared keys only.
-    Expect: after promoting child-0, Open returns exactly child-0's
+    Expect: after promoting child-0, the sender's Open (on the Warden's
+    sender socket, outside the Vessel) returns exactly child-0's
     declared effects.  No effect from child-1, child-2, … appears.
     The promoted child's keys.log matches its declared.log exactly.
 
@@ -309,13 +318,36 @@ for k in $(seq 1 "$N"); do
 
     # d. Clean start with promote config: the daemon's already-promoted
     #    guard and finish_promotion handle all crash-recovery cases.
+    #    The sender reads Open on the Warden's sender socket, from the
+    #    host, while the parent's agent waits for it.
     kill_runc
-    run_daemon "$WORK/parent-$k-promote.json" "$OUT/parent-$k-final.out" "$OUT/parent-$k-final.err"
+    parent_mount=$(zfs get -H -o value mountpoint "$parent_ds")
+    rm -f "$parent_mount/sender-done"
+    sender_sock="$WORK/run/senders/${parent_ds##*/v-}.sock"
+    parent_keys_file="$OUT/keys-$k.log"
+    "$WORK/bin/taso-wardend" "$WORK/parent-$k-promote.json" \
+        >"$OUT/parent-$k-final.out" 2>"$OUT/parent-$k-final.err" &
+    PID=$!
+    for _ in $(seq 600); do
+        [ -S "$sender_sock" ] && break
+        kill -0 "$PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [ -S "$sender_sock" ]; then
+        python3 "$RELAY" --role sender --socket "$sender_sock" \
+            --keys-file "$parent_keys_file" 2>"$OUT/sender-$k.err" \
+            || echo "  sender failed: $(tail -3 "$OUT/sender-$k.err")"
+    else
+        echo "  no sender socket at $sender_sock"
+    fi
+    touch "$parent_mount/sender-done"
+    if ! wait "$PID"; then
+        echo "  final start failed:"; tail -20 "$OUT/parent-$k-final.err"
+        exit 1
+    fi
     echo "  final start done"
 
-    # e. Read the parent's keys.log from its dataset.
-    parent_mount=$(zfs get -H -o value mountpoint "$parent_ds")
-    parent_keys_file="$parent_mount/keys.log"
+    # e. Read the keys the sender wrote.
     if [ -f "$parent_keys_file" ]; then
         parent_keys=$(sort "$parent_keys_file")
         parent_count=$(wc -l < "$parent_keys_file")

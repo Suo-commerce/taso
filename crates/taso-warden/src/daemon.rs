@@ -74,7 +74,10 @@
 //! 6. **runc**: a stale container of the same id is deleted (a backstop;
 //!    the startup sweep already removed it), then the agent runs in the
 //!    foreground on its own thread.
-//! 7. **Serve** the socket until the agent exits.  Every Seal is published
+//! 7. **Serve** both sockets until the agent exits: the agent's, and the
+//!    sender's at `<run_dir>/senders/<id>.sock` (the Warden's own, mode
+//!    0600, never mounted into the Vessel: only a sender lists released
+//!    effects and reports outcomes; [`crate::field::Socket`]).  Every Seal is published
 //!    right after it is taken ([`SealPublisher`]): ship the `fs` section
 //!    and the log, advance the shipped anchor.  A failed publish is
 //!    counted and logged; the Seal stands and the next one catches up.
@@ -123,7 +126,7 @@ use crate::chronicle::Layers;
 use crate::chronicle::{Claim, LayerError, Recovery};
 use crate::coordinator::{Coord, CoordError};
 use crate::effects::{Effects, Mode};
-use crate::field::{serve, AfterSeal, Branches, FieldSocket, Session};
+use crate::field::{serve_vessel, AfterSeal, Branches, FieldSocket, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
@@ -395,7 +398,8 @@ pub struct VesselConf {
 /// `slots` that no child of this Vessel has taken yet, so the list is
 /// also the quota: one child per slot, a slot never given twice.  The
 /// child is an entry the Warden makes ([`ForksConf::child`]): named
-/// `<subject>-fork-<slot>`, forked from the Seal asked for, in this
+/// `<subject>-fork-<slot>`, forked from the Seal asked for (refused
+/// until that Seal is shipped: [`Host::shipped_seal`]), in this
 /// Vessel's namespace and runtime, effects always held, never restarted,
 /// and with no forks of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1553,8 +1557,14 @@ impl Branches<StorageLayers> for NodeBranches<'_> {
             ));
         };
         let name = ForksConf::child_name(&self.vc.subject, slot);
+        // Only from a shipped Seal (C3): a child of a Seal only this node
+        // holds could be reborn nowhere once the node is lost.  "last" is
+        // fixed here to the Seal checked.
+        let seal = host
+            .shipped_seal(vessel.id(), at)
+            .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?;
         let child = host
-            .fork_from_log(vessel.id(), at, name.as_bytes())
+            .fork_from_log(vessel.id(), SealAt::At(seal.lsn), name.as_bytes())
             .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?;
         let seal = child
             .lineage()
@@ -1761,18 +1771,35 @@ pub fn claim_run_dir(run_dir: &Path) -> io::Result<RunDirLock> {
         .truncate(false)
         .write(true)
         .open(&path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(RunDirLock { _file: file, path }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!(
-                "{} is held by another taso-wardend (one daemon per run_dir)",
-                path.display()
-            ),
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    // A lock just released can still be held for a moment by a process
+    // another thread is spawning (a child between fork and exec holds a
+    // copy of every open file): retry briefly, as the Chronicle's own
+    // directory lock does, before calling it another daemon's.
+    let start = std::time::Instant::now();
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(RunDirLock { _file: file, path }),
+            Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < RUN_LOCK_WAIT => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is held by another taso-wardend (one daemon per run_dir)",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
     }
 }
+
+/// How long [`claim_run_dir`] retries a held lock before refusing.
+const RUN_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 /// Remove every container in a claimed run directory's runc root
 /// ([`Runc::sweep`]).  Any container that could not be removed is an
@@ -2100,7 +2127,7 @@ impl Node {
         let rt = vc
             .effective(&self.config.runtime, &self.config.quiescence)
             .map_err(DaemonError::Runtime)?;
-        let (mut vessel, start, mut verdict) = self.start(vc)?;
+        let (mut vessel, start, verdict) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
         let birth_turn = match vessel.last_seal() {
@@ -2315,6 +2342,21 @@ impl Node {
         let socket = FieldSocket::bind(dir.join("field.sock")).map_err(io("field socket"))?;
         std::os::unix::fs::chown(socket.path(), Some(uid), Some(uid))
             .map_err(io("field socket owner"))?;
+        // The sender socket (C5): the Warden's own, never mounted into the
+        // Vessel; one per Vessel, so its path says whose.
+        let senders = self.config.run_dir.join("senders");
+        std::fs::create_dir_all(&senders).map_err(io("sender socket dir"))?;
+        std::fs::set_permissions(
+            &senders,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .map_err(io("sender socket dir"))?;
+        let sender = FieldSocket::bind(senders.join(format!("{}.sock", id_hex(id))))
+            .map_err(io("sender socket"))?;
+        self.log(
+            vc,
+            format_args!("sender socket {}", sender.path().display()),
+        );
 
         let spec = VesselSpec {
             id: container_id(id, self.config.warden),
@@ -2388,43 +2430,50 @@ impl Node {
             })
         };
 
+        // Both sockets, every connection on its own thread, every request
+        // handled here, one at a time (C5).
         let mut connections = 0;
-        let mut failures = 0;
         let stop = || exited.load(Ordering::SeqCst);
-        while let Some(mut stream) = socket
-            .accept_until(&stop, Duration::from_millis(20))
-            .map_err(io("accept"))?
-        {
-            connections += 1;
-            let watch = if rt.quiescence.is_empty() {
-                None
-            } else {
-                let dbs: Vec<&str> = rt.quiescence.iter().map(String::as_str).collect();
-                Some(Watch::new(&mount, &dbs).map_err(io("quiescence watch"))?)
-            };
-            let mut branches = NodeBranches { node: self, vc };
-            let mut session = Session::new(&mut vessel, verdict.clone())?
-                .with_effects(&mut effects)
-                .with_after_seal(&mut publisher)
-                .with_branches(&mut branches);
-            if let Some(w) = watch {
-                session = session.with_watch(w);
-            }
-            let before = session.last_sealed_turn();
-            let ended = serve(&mut stream, &mut session);
-            if session.last_sealed_turn() != before {
-                verdict = Verdict::Clean;
-            }
-            let (f, last) = session.after_seal_failures();
-            if f > 0 {
-                failures += f;
+        let watch = if rt.quiescence.is_empty() {
+            None
+        } else {
+            let dbs: Vec<&str> = rt.quiescence.iter().map(String::as_str).collect();
+            Some(Watch::new(&mount, &dbs).map_err(io("quiescence watch"))?)
+        };
+        let mut branches = NodeBranches { node: self, vc };
+        let mut session = Session::new(&mut vessel, verdict)?
+            .with_effects(&mut effects)
+            .with_after_seal(&mut publisher)
+            .with_branches(&mut branches);
+        if let Some(w) = watch {
+            session = session.with_watch(w);
+        }
+        serve_vessel(
+            &mut session,
+            &socket,
+            &sender,
+            &stop,
+            Duration::from_millis(20),
+            &mut |c| {
+                connections += 1;
                 self.log(
                     vc,
-                    format_args!("{f} Seal publishes failed, last: {}", last.unwrap_or("?")),
+                    format_args!("{:?} connection ended: {:?}", c.socket, c.ended),
                 );
-            }
-            self.log(vc, format_args!("connection ended: {ended:?}"));
+            },
+        )
+        .map_err(io("serving the sockets"))?;
+        let (failures, last) = session.after_seal_failures();
+        if failures > 0 {
+            self.log(
+                vc,
+                format_args!(
+                    "{failures} Seal publishes failed, last: {}",
+                    last.unwrap_or("?")
+                ),
+            );
         }
+        drop(session);
         let agent = agent
             .join()
             .map_err(|_| DaemonError::Io("the runc thread panicked".into()))?
@@ -2611,6 +2660,41 @@ mod tests {
         // Another run directory is independent.
         let _other = claim_run_dir(&tmp.path().join("run/other")).unwrap();
         drop(again);
+    }
+
+    /// A run directory released while another thread spawns processes may
+    /// still be held for a moment by a child between fork and exec;
+    /// claiming it again must not be refused for that (found on taso-test
+    /// 2026-10-23: the node tests run in parallel, spawning runc and zfs,
+    /// and a second Node of one test was refused its own run directory).
+    #[test]
+    fn a_run_dir_released_while_processes_spawn_is_claimed_again() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawned = Arc::new(AtomicU64::new(0));
+        let spawner = {
+            let (stop, spawned) = (stop.clone(), spawned.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let (mut claims, mut refused) = (0u64, 0u64);
+        let t = std::time::Instant::now();
+        while spawned.load(Ordering::Relaxed) < 300 && t.elapsed() < Duration::from_secs(10) {
+            match claim_run_dir(tmp.path()) {
+                Ok(lock) => drop(lock),
+                Err(_) => refused += 1,
+            }
+            claims += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+        assert!(spawned.load(Ordering::Relaxed) >= 300);
+        assert_eq!(refused, 0, "{refused} of {claims} claims refused");
     }
 
     #[test]

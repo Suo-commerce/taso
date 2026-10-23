@@ -587,8 +587,9 @@ fn stats_of(node: &Node, subject: &str) -> Value {
 ///    each child continues the parent's turns, its effects are held, and
 ///    its own fork requests are refused (a child has no fork slots);
 /// 2. the parent again, promoting `-fork-4` then `-fork-5`: the first
-///    adopts exactly fork-4's 2 proposals as released effects (Open lists
-///    those 2), the second is refused (one choice per fork point).
+///    adopts exactly fork-4's 2 proposals as released effects (the
+///    agent's Result says pending for each; listing is the sender's), the
+///    second is refused (one choice per fork point).
 #[test]
 #[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
 fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
@@ -744,7 +745,7 @@ fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
             .contains("already promoted"),
         "the sibling is refused: {p}"
     );
-    // Its own 2 released effects (no sender reported on them) and the 2
-    // adopted ones; nothing of fork-5's.
-    assert_eq!(p["open_after_promote"], 4, "{p}");
+    // The agent reads what became of each adopted op (listing is the
+    // sender's, C5): released, no report yet.
+    assert_eq!(p["adopted_states"], json!(["Pending", "Pending"]), "{p}");
 }

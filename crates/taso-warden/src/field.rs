@@ -7,6 +7,14 @@
 //!
 //! # Rules
 //!
+//! - **Two sockets** (C5, review findings 2 and 4): the agent's, mounted
+//!   into the Vessel, and the sender's, the Warden's own
+//!   ([`Socket`]).  Only the sender lists (`Open`) and reports
+//!   (`Outcome`); the agent declares and reads its effect's `Result`.  A
+//!   request on the other socket is refused (`NotOnThisSocket`) and
+//!   records nothing.  [`serve_vessel`] serves both at once, every
+//!   connection on its own thread, every request handled by the one
+//!   thread that owns the session.
 //! - **Hello first.**  Anything before a `Hello` with this crate's
 //!   [`VERSION`], or a second `Hello`, is refused with `BadHello`.
 //! - **Transcript** entries become `Transcript` records, durable (segment
@@ -76,7 +84,7 @@ use std::time::Duration;
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{OpId, Payload, StreamCut, TurnId, Verdict};
 use taso_field::protocol::{
-    recv_request, send_reply, EffectResult, ErrorCode, ForkResult, OpenEffect, Outcome,
+    recv_request, send_reply, EffectResult, ErrorCode, ForkResult, OpState, OpenEffect, Outcome,
     PromoteResult, ProtocolError, Reply, Request, VERSION,
 };
 
@@ -94,6 +102,55 @@ pub trait AfterSeal<L: Layers> {
     /// `seal` was just accepted on `vessel`.  An error is reported, not
     /// fatal: the Seal stands.
     fn after_seal(&mut self, vessel: &mut Vessel<L>, seal: Position) -> Result<(), String>;
+}
+
+/// Which of a Vessel's two sockets a connection came in on (C5): the agent
+/// socket, mounted into the Vessel, or the sender socket, the Warden's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Socket {
+    /// Hello, Effect, Transcript, TurnEnd, Fork, Promote, Result.
+    Agent,
+    /// Hello, Open, Outcome.
+    Sender,
+}
+
+impl Socket {
+    /// True if `req` may come in on this socket.
+    pub fn allows(self, req: &Request) -> bool {
+        match req {
+            Request::Hello { .. } => true,
+            Request::Open | Request::Outcome { .. } => self == Socket::Sender,
+            Request::Effect { .. }
+            | Request::Transcript { .. }
+            | Request::TurnEnd { .. }
+            | Request::Fork { .. }
+            | Request::Promote { .. }
+            | Request::Result { .. } => self == Socket::Agent,
+        }
+    }
+}
+
+/// One connection's own state; everything else is the Vessel's
+/// ([`Session`]).
+#[derive(Debug)]
+pub struct Conn {
+    socket: Socket,
+    greeted: bool,
+}
+
+impl Conn {
+    /// A new connection on `socket`.
+    pub fn new(socket: Socket) -> Self {
+        Self {
+            socket,
+            greeted: false,
+        }
+    }
+
+    /// The socket it came in on.
+    pub fn socket(&self) -> Socket {
+        self.socket
+    }
 }
 
 /// How a session's Fork and Promote requests reach the Warden (the
@@ -115,7 +172,8 @@ pub trait Branches<L: Layers> {
 /// One conversation with a Vessel's harness.
 pub struct Session<'v, L: Layers> {
     vessel: &'v mut Vessel<L>,
-    greeted: bool,
+    /// The connection [`Session::handle`] answers for (an agent's).
+    agent: Conn,
     last_sealed_turn: Option<u64>,
     /// Highest `Transcript` lsn so far (the Seal cut).
     transcript: Lsn,
@@ -157,7 +215,7 @@ impl<'v, L: Layers> Session<'v, L> {
         let last_sealed_turn = summary.seal.map(|s| s.turn.get());
         Ok(Self {
             vessel,
-            greeted: false,
+            agent: Conn::new(Socket::Agent),
             last_sealed_turn,
             transcript,
             ledger,
@@ -242,12 +300,32 @@ impl<'v, L: Layers> Session<'v, L> {
         }
     }
 
-    /// Answer one request.
+    /// Answer one request from the agent's connection.
     pub fn handle(&mut self, req: Request) -> Reply {
+        let mut conn = std::mem::replace(&mut self.agent, Conn::new(Socket::Agent));
+        let reply = self.handle_as(&mut conn, req);
+        self.agent = conn;
+        reply
+    }
+
+    /// Answer one request from `conn`.  A request the connection's socket
+    /// does not allow ([`Socket::allows`]) is refused (`NotOnThisSocket`)
+    /// and records nothing.
+    pub fn handle_as(&mut self, conn: &mut Conn, req: Request) -> Reply {
         self.after_reply();
-        match (self.greeted, req) {
+        if conn.greeted && !conn.socket.allows(&req) {
+            let other = match conn.socket {
+                Socket::Agent => "the Warden's sender socket",
+                Socket::Sender => "the agent's socket",
+            };
+            return error(
+                ErrorCode::NotOnThisSocket,
+                format!("{} belongs on {other}", request_name(&req)),
+            );
+        }
+        match (conn.greeted, req) {
             (false, Request::Hello { version }) if version == VERSION => {
-                self.greeted = true;
+                conn.greeted = true;
                 // The birth Seal is the Warden's, not a harness turn.
                 let last = self.last_sealed_turn.filter(|&t| t != BIRTH_TURN.get());
                 Reply::Hello {
@@ -371,23 +449,25 @@ impl<'v, L: Layers> Session<'v, L> {
                 if let Some(fx) = self.effects.as_deref_mut() {
                     let _ = fx.ship_unlisted(self.vessel);
                 }
-                let Some(fx) = self.effects.as_deref() else {
+                let Some(fx) = self.effects.as_deref_mut() else {
                     return Reply::Open {
                         effects: Vec::new(),
                     };
                 };
-                match fx.released(self.vessel) {
+                match fx.hand_out(self.vessel) {
                     Ok(released) => Reply::Open {
                         effects: released
                             .into_iter()
-                            .map(|r| OpenEffect {
+                            .map(|(r, before)| OpenEffect {
                                 op: r.intent.op.get(),
                                 provider: r.intent.provider,
                                 request: r.intent.request,
                                 retry: r.intent.retry,
                                 consequence: r.intent.consequence,
                                 authority: r.intent.authority,
-                                unknown: r.state == taso_core::record::OutcomeState::OutcomeUnknown,
+                                // Reconciled unknown, or listed before
+                                // (a sender that crashed, the Warden up).
+                                unknown: before,
                             })
                             .collect(),
                     },
@@ -398,6 +478,7 @@ impl<'v, L: Layers> Session<'v, L> {
             (true, Request::Fork { seal }) => Reply::Fork {
                 result: self.fork(seal),
             },
+            (true, Request::Result { op }) => self.result(op),
             (true, Request::Promote { child, seal }) => {
                 let result = self.promote(&child, seal);
                 if let Some(b) = self.branches.as_deref_mut() {
@@ -406,6 +487,42 @@ impl<'v, L: Layers> Session<'v, L> {
                 Reply::Promote { child, result }
             }
         }
+    }
+
+    fn result(&mut self, op: u64) -> Reply {
+        let Some(fx) = self.effects.as_deref() else {
+            return Reply::Result {
+                op,
+                state: OpState::NotFound,
+            };
+        };
+        let state = match fx.result(self.vessel, OpId::new(op)) {
+            Ok(None) => OpState::NotFound,
+            Ok(Some(crate::effects::OpRecord { state, evidence })) => {
+                use taso_core::record::OutcomeState as S;
+                let text = |e: Option<Vec<u8>>| {
+                    e.map(|b| String::from_utf8_lossy(&b).into_owned())
+                        .unwrap_or_default()
+                };
+                match state {
+                    Some(S::DispatchAuthorized) => OpState::Pending,
+                    Some(S::Proposed) => OpState::Held,
+                    Some(S::OutcomeUnknown) => OpState::Unknown,
+                    Some(S::ConfirmedApplied) => OpState::Applied {
+                        receipt: evidence.unwrap_or_default(),
+                    },
+                    Some(S::ConfirmedNotApplied) => OpState::NotApplied {
+                        reason: text(evidence),
+                    },
+                    // An intent never released: nothing could act on it.
+                    Some(S::Prepared) | None => OpState::NotApplied {
+                        reason: "never released".into(),
+                    },
+                }
+            }
+            Err(e) => return vessel_error(e),
+        };
+        Reply::Result { op, state }
     }
 
     fn fork(&mut self, seal: Option<u64>) -> ForkResult {
@@ -549,6 +666,21 @@ fn vessel_error(e: VesselError) -> Reply {
     error(code, e.to_string())
 }
 
+/// A request's name, for refusals.
+fn request_name(req: &Request) -> &'static str {
+    match req {
+        Request::Hello { .. } => "Hello",
+        Request::Effect { .. } => "Effect",
+        Request::Transcript { .. } => "Transcript",
+        Request::TurnEnd { .. } => "TurnEnd",
+        Request::Outcome { .. } => "Outcome",
+        Request::Open => "Open",
+        Request::Fork { .. } => "Fork",
+        Request::Promote { .. } => "Promote",
+        Request::Result { .. } => "Result",
+    }
+}
+
 /// The wire's Seal choice: `None` is the newest.
 fn at(seal: Option<u64>) -> SealAt {
     match seal {
@@ -588,6 +720,156 @@ pub fn serve<S: Read + Write, L: Layers>(stream: &mut S, session: &mut Session<'
     };
     session.after_reply();
     ended
+}
+
+/// What one connection of [`serve_vessel`] came to.
+#[derive(Debug)]
+pub struct ConnEnded {
+    /// Which socket it came in on.
+    pub socket: Socket,
+    /// How it ended.
+    pub ended: Ended,
+}
+
+enum Msg {
+    Request {
+        id: u64,
+        req: Request,
+        reply: std::sync::mpsc::Sender<Reply>,
+    },
+    End {
+        id: u64,
+        ended: Ended,
+    },
+}
+
+/// Serve a Vessel's two sockets (C5) until `stop` says so and the agent's
+/// connections have ended; then the sender's connections are closed.
+///
+/// Each connection has its own thread, which only reads and writes
+/// frames; every request is handled here, by the one thread that owns
+/// `session`, one at a time, so the Vessel's Chronicle keeps one writer.
+/// Each reply is handed to its connection before the after-Seal hook
+/// runs ([`Session::after_reply`]), as in [`serve`].  A malformed body is
+/// answered by its connection's thread and the connection goes on.
+/// `on_end` is told of every connection that ended.
+pub fn serve_vessel<L: Layers>(
+    session: &mut Session<'_, L>,
+    agent: &FieldSocket,
+    sender: &FieldSocket,
+    stop: &dyn Fn() -> bool,
+    tick: Duration,
+    on_end: &mut dyn FnMut(ConnEnded),
+) -> io::Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+    agent.listener.set_nonblocking(true)?;
+    sender.listener.set_nonblocking(true)?;
+    let (tx, rx) = mpsc::channel::<Msg>();
+    std::thread::scope(|scope| -> io::Result<()> {
+        let mut conns: BTreeMap<u64, (Conn, UnixStream)> = BTreeMap::new();
+        let mut next_id = 0u64;
+        let mut closing = false;
+        let mut failed: Option<io::Error> = None;
+        loop {
+            // New connections, unless stopping (or accepting failed).
+            if !stop() && failed.is_none() {
+                for (listener, socket) in [(agent, Socket::Agent), (sender, Socket::Sender)] {
+                    loop {
+                        match listener.listener.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(false)?;
+                                let id = next_id;
+                                next_id += 1;
+                                conns.insert(id, (Conn::new(socket), stream.try_clone()?));
+                                let tx = tx.clone();
+                                scope.spawn(move || connection(id, stream, tx));
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(e) => {
+                                // Every connection's thread must end before
+                                // the scope can: close them all.
+                                for (_, stream) in conns.values() {
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                }
+                                closing = true;
+                                failed = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if !closing && !conns.values().any(|(c, _)| c.socket == Socket::Agent) {
+                // The agent is done: close the senders' connections.
+                closing = true;
+                for (_, stream) in conns.values() {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            if closing && conns.is_empty() {
+                return failed.map_or(Ok(()), Err);
+            }
+            match rx.recv_timeout(tick) {
+                Ok(Msg::Request { id, req, reply }) => {
+                    let Some((conn, _)) = conns.get_mut(&id) else {
+                        continue;
+                    };
+                    let r = session.handle_as(conn, req);
+                    let _ = reply.send(r);
+                    // The reply is on its way: now publish the Seal it
+                    // announced.
+                    session.after_reply();
+                }
+                Ok(Msg::End { id, ended }) => {
+                    if let Some((conn, _)) = conns.remove(&id) {
+                        on_end(ConnEnded {
+                            socket: conn.socket,
+                            ended,
+                        });
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!("tx is held here"),
+            }
+        }
+    })?;
+    session.after_reply();
+    Ok(())
+}
+
+/// One connection's thread: frames in, requests to the owner, replies out.
+fn connection(id: u64, mut stream: UnixStream, tx: std::sync::mpsc::Sender<Msg>) {
+    let ended = loop {
+        let reply = match recv_request(&mut stream) {
+            Ok(None) => break Ended::Closed,
+            Ok(Some(req)) => {
+                let (rtx, rrx) = std::sync::mpsc::channel();
+                if tx
+                    .send(Msg::Request {
+                        id,
+                        req,
+                        reply: rtx,
+                    })
+                    .is_err()
+                {
+                    break Ended::Closed;
+                }
+                match rrx.recv() {
+                    Ok(r) => r,
+                    Err(_) => break Ended::Closed,
+                }
+            }
+            Err(ProtocolError::Malformed { at, why }) => {
+                error(ErrorCode::Malformed, format!("byte {at}: {why}"))
+            }
+            Err(e) => break Ended::Broken(e),
+        };
+        if let Err(e) = send_reply(&mut stream, &reply) {
+            break Ended::Broken(e);
+        }
+    };
+    let _ = tx.send(Msg::End { id, ended });
 }
 
 /// A Vessel's Field socket.
@@ -689,6 +971,14 @@ mod tests {
 
     fn hello() -> Request {
         Request::Hello { version: VERSION }
+    }
+
+    /// A greeted connection on the sender socket.
+    fn sender() -> Conn {
+        Conn {
+            socket: Socket::Sender,
+            greeted: true,
+        }
     }
 
     fn is_error(r: &Reply, code: ErrorCode) -> bool {
@@ -1372,17 +1662,20 @@ mod tests {
             }
         ));
         assert!(matches!(
-            s.handle(Request::Outcome {
-                op: 1,
-                result: Outcome::Unknown
-            }),
+            s.handle_as(
+                &mut sender(),
+                Request::Outcome {
+                    op: 1,
+                    result: Outcome::Unknown
+                }
+            ),
             Reply::Outcome {
                 op: 1,
                 refused: Some(_)
             }
         ));
         assert_eq!(
-            s.handle(Request::Open),
+            s.handle_as(&mut sender(), Request::Open),
             Reply::Open {
                 effects: Vec::new()
             }
@@ -1418,7 +1711,7 @@ mod tests {
             }
         );
         assert_eq!(
-            s.handle(Request::Open),
+            s.handle_as(&mut sender(), Request::Open),
             Reply::Open {
                 effects: vec![OpenEffect {
                     op: 1,
@@ -1436,10 +1729,13 @@ mod tests {
         );
         let tail = s.vessel.tail();
         assert!(matches!(
-            s.handle(Request::Outcome {
-                op: 7,
-                result: Outcome::Unknown
-            }),
+            s.handle_as(
+                &mut sender(),
+                Request::Outcome {
+                    op: 7,
+                    result: Outcome::Unknown
+                }
+            ),
             Reply::Outcome {
                 op: 7,
                 refused: Some(_)
@@ -1447,19 +1743,22 @@ mod tests {
         ));
         assert_eq!(s.vessel.tail(), tail, "a refused report records nothing");
         assert_eq!(
-            s.handle(Request::Outcome {
-                op: 1,
-                result: Outcome::Applied {
-                    receipt: b"ok".to_vec()
+            s.handle_as(
+                &mut sender(),
+                Request::Outcome {
+                    op: 1,
+                    result: Outcome::Applied {
+                        receipt: b"ok".to_vec()
+                    }
                 }
-            }),
+            ),
             Reply::Outcome {
                 op: 1,
                 refused: None
             }
         );
         assert_eq!(
-            s.handle(Request::Open),
+            s.handle_as(&mut sender(), Request::Open),
             Reply::Open {
                 effects: Vec::new()
             }
@@ -1502,16 +1801,19 @@ mod tests {
             }
         );
         assert_eq!(
-            s.handle(Request::Open),
+            s.handle_as(&mut sender(), Request::Open),
             Reply::Open {
                 effects: Vec::new()
             }
         );
         assert!(matches!(
-            s.handle(Request::Outcome {
-                op: 1,
-                result: Outcome::Applied { receipt: vec![] }
-            }),
+            s.handle_as(
+                &mut sender(),
+                Request::Outcome {
+                    op: 1,
+                    result: Outcome::Applied { receipt: vec![] }
+                }
+            ),
             Reply::Outcome {
                 op: 1,
                 refused: Some(_)
@@ -1671,7 +1973,10 @@ mod tests {
             .with_effects(&mut fx)
             .with_branches(&mut b);
         s.handle(hello());
-        assert_eq!(s.handle(Request::Open), Reply::Open { effects: vec![] });
+        assert_eq!(
+            s.handle_as(&mut sender(), Request::Open),
+            Reply::Open { effects: vec![] }
+        );
         let Reply::Promote {
             child,
             result: PromoteResult::Promoted { seal, adopted },
@@ -1683,7 +1988,7 @@ mod tests {
             panic!("c1 not promoted")
         };
         assert_eq!((child.as_str(), seal, adopted.len()), ("c1", c1_seal, 2));
-        let Reply::Open { effects } = s.handle(Request::Open) else {
+        let Reply::Open { effects } = s.handle_as(&mut sender(), Request::Open) else {
             panic!()
         };
         assert_eq!(effects.iter().map(|e| e.op).collect::<Vec<_>>(), adopted);
@@ -1703,10 +2008,19 @@ mod tests {
                 }
             ));
         }
-        let Reply::Open { effects: after } = s.handle(Request::Open) else {
+        let Reply::Open { effects: after } = s.handle_as(&mut sender(), Request::Open) else {
             panic!()
         };
-        assert_eq!(after, effects, "nothing of the sibling's was adopted");
+        let ops = |l: &[OpenEffect]| l.iter().map(|e| e.op).collect::<Vec<_>>();
+        assert_eq!(
+            ops(&after),
+            ops(&effects),
+            "nothing of the sibling's was adopted"
+        );
+        assert!(
+            after.iter().all(|e| e.unknown),
+            "listed before: may have been acted on"
+        );
         // Not a child of this Vessel: refused.
         assert!(matches!(
             s.handle(Request::Promote {
@@ -1805,12 +2119,314 @@ mod tests {
             panic!("not promoted")
         };
         assert_eq!(adopted.len(), 2);
-        assert_eq!(s.handle(Request::Open), Reply::Open { effects: vec![] });
+        assert_eq!(
+            s.handle_as(&mut sender(), Request::Open),
+            Reply::Open { effects: vec![] }
+        );
         up.set(true);
-        let Reply::Open { effects } = s.handle(Request::Open) else {
+        let Reply::Open { effects } = s.handle_as(&mut sender(), Request::Open) else {
             panic!()
         };
         assert_eq!(effects.iter().map(|e| e.op).collect::<Vec<_>>(), adopted);
+    }
+
+    /// Review finding 3: a sender that crashed while the Warden stayed up
+    /// left no `OutcomeUnknown`; the next listing tells whoever reads it
+    /// that the op was handed out before — also on a new connection, the
+    /// engine (not the session) remembers.  A new op is not marked.
+    #[test]
+    fn an_op_listed_before_is_listed_as_unknown() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let unknown = |r: Reply| match r {
+            Reply::Open { effects } => effects
+                .iter()
+                .map(|e| (e.op, e.unknown))
+                .collect::<Vec<_>>(),
+            r => panic!("{r:?}"),
+        };
+        {
+            let mut s = Session::new(&mut v, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx);
+            s.handle(hello());
+            s.handle(declare(1, "mail", b"send bob"));
+            assert_eq!(
+                unknown(s.handle_as(&mut sender(), Request::Open)),
+                [(1, false)]
+            );
+            // The sender polls again, or crashed and a new one reads.
+            assert_eq!(
+                unknown(s.handle_as(&mut sender(), Request::Open)),
+                [(1, true)]
+            );
+        }
+        // A new connection (the sender restarted), the same engine.
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        s.handle(declare(2, "mail", b"send eve"));
+        assert_eq!(
+            unknown(s.handle_as(&mut sender(), Request::Open)),
+            [(1, true), (2, false)],
+            "the old op is marked, the new one is not"
+        );
+    }
+
+    /// Review finding 4 (C5): both sockets are served at once.  The agent
+    /// and a sender are connected together; the agent declares, the sender
+    /// lists and reports, the agent reads the result — all while both
+    /// connections stay open.  Once the agent is gone and `stop` says so,
+    /// the sender's connection is closed and serving returns.
+    #[test]
+    fn the_agent_and_a_sender_are_served_together() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = FieldSocket::bind(dir.path().join("agent.sock")).unwrap();
+        let sender = FieldSocket::bind(dir.path().join("sender.sock")).unwrap();
+        let done = AtomicBool::new(false);
+        let mut ends = Vec::new();
+        std::thread::scope(|scope| {
+            let (a, snd) = (agent.path().to_path_buf(), sender.path().to_path_buf());
+            let done = &done;
+            scope.spawn(move || {
+                let ask = |c: &mut UnixStream, r: Request| {
+                    send_request(c, &r).unwrap();
+                    recv_reply(c).unwrap().unwrap()
+                };
+                let mut ag = UnixStream::connect(&a).unwrap();
+                let mut se = UnixStream::connect(&snd).unwrap();
+                assert!(matches!(ask(&mut ag, hello()), Reply::Hello { .. }));
+                assert!(matches!(ask(&mut se, hello()), Reply::Hello { .. }));
+                assert!(matches!(
+                    ask(&mut ag, declare(1, "mail", b"send bob")),
+                    Reply::Effect {
+                        result: EffectResult::Released { op: 1 },
+                        ..
+                    }
+                ));
+                let Reply::Open { effects } = ask(&mut se, Request::Open) else {
+                    panic!()
+                };
+                assert_eq!(effects.len(), 1);
+                assert!(matches!(
+                    ask(
+                        &mut se,
+                        Request::Outcome {
+                            op: 1,
+                            result: Outcome::Applied {
+                                receipt: b"r1".to_vec()
+                            }
+                        }
+                    ),
+                    Reply::Outcome { refused: None, .. }
+                ));
+                assert_eq!(
+                    ask(&mut ag, Request::Result { op: 1 }),
+                    Reply::Result {
+                        op: 1,
+                        state: OpState::Applied {
+                            receipt: b"r1".to_vec()
+                        }
+                    }
+                );
+                // The agent asks on the sender's behalf: refused.
+                assert!(is_error(
+                    &ask(&mut ag, Request::Open),
+                    ErrorCode::NotOnThisSocket
+                ));
+                drop(ag);
+                done.store(true, Ordering::SeqCst);
+                // The Warden closes the sender's connection.
+                assert!(recv_reply(&mut se).unwrap().is_none());
+            });
+            let mut session = Session::new(&mut v, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx);
+            serve_vessel(
+                &mut session,
+                &agent,
+                &sender,
+                &|| done.load(Ordering::SeqCst),
+                Duration::from_millis(5),
+                &mut |c| ends.push(c.socket),
+            )
+            .unwrap();
+        });
+        ends.sort_by_key(|s| *s == Socket::Sender);
+        assert_eq!(ends, [Socket::Agent, Socket::Sender]);
+    }
+
+    /// Review finding 2: who may write an outcome is a trust boundary.  The
+    /// agent's socket refuses Open and Outcome, the sender's refuses
+    /// everything an agent does; a refusal records nothing.  Both need
+    /// Hello first.
+    #[test]
+    fn each_socket_takes_only_its_own_requests() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        assert!(matches!(
+            s.handle(declare(1, "mail", b"send bob")),
+            Reply::Effect {
+                result: EffectResult::Released { op: 1 },
+                ..
+            }
+        ));
+        let tail = s.vessel.tail();
+        // The agent may neither list nor report.
+        for req in [
+            Request::Open,
+            Request::Outcome {
+                op: 1,
+                result: Outcome::Applied { receipt: vec![] },
+            },
+        ] {
+            assert!(is_error(&s.handle(req), ErrorCode::NotOnThisSocket));
+        }
+        assert_eq!(s.vessel.tail(), tail, "nothing recorded");
+        // The sender: Hello first, then only Open and Outcome.
+        let mut snd = Conn::new(Socket::Sender);
+        assert!(is_error(
+            &s.handle_as(&mut snd, Request::Open),
+            ErrorCode::BadHello
+        ));
+        assert!(matches!(
+            s.handle_as(&mut snd, hello()),
+            Reply::Hello { .. }
+        ));
+        for req in [
+            declare(2, "mail", b"send eve"),
+            Request::Transcript { entry: vec![1] },
+            Request::TurnEnd {
+                turn: 1,
+                quiescent: true,
+            },
+            Request::Fork { seal: None },
+            Request::Promote {
+                child: "c".into(),
+                seal: None,
+            },
+            Request::Result { op: 1 },
+        ] {
+            assert!(
+                is_error(
+                    &s.handle_as(&mut snd, req.clone()),
+                    ErrorCode::NotOnThisSocket
+                ),
+                "{req:?}"
+            );
+        }
+        assert_eq!(s.vessel.tail(), tail, "nothing recorded");
+        assert!(matches!(
+            s.handle_as(&mut snd, Request::Open),
+            Reply::Open { effects } if effects.len() == 1
+        ));
+    }
+
+    /// The agent reads what became of its own effect (C5), never writes
+    /// it: pending until the sender reports, then applied with the receipt
+    /// or not applied with the reason; held in a fork; not found for an op
+    /// that is not its.  Reading marks nothing for the sender.
+    #[test]
+    fn the_agent_reads_its_effects_result() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        s.handle(declare(1, "mail", b"send bob"));
+        s.handle(declare(2, "mail", b"send eve"));
+        let result = |s: &mut Session<'_, _>, op| match s.handle(Request::Result { op }) {
+            Reply::Result { op: o, state } if o == op => state,
+            r => panic!("{r:?}"),
+        };
+        assert_eq!(result(&mut s, 1), OpState::Pending);
+        // Asking marks nothing: the sender's first listing is fresh.
+        let Reply::Open { effects } = s.handle_as(&mut sender(), Request::Open) else {
+            panic!()
+        };
+        assert!(effects.iter().all(|e| !e.unknown));
+        let mut snd = sender();
+        s.handle_as(
+            &mut snd,
+            Request::Outcome {
+                op: 1,
+                result: Outcome::Applied {
+                    receipt: b"msg-1".to_vec(),
+                },
+            },
+        );
+        s.handle_as(
+            &mut snd,
+            Request::Outcome {
+                op: 2,
+                result: Outcome::NotApplied {
+                    reason: "bounced".into(),
+                },
+            },
+        );
+        assert_eq!(
+            result(&mut s, 1),
+            OpState::Applied {
+                receipt: b"msg-1".to_vec()
+            }
+        );
+        assert_eq!(
+            result(&mut s, 2),
+            OpState::NotApplied {
+                reason: "bounced".into()
+            }
+        );
+        assert_eq!(result(&mut s, 99), OpState::NotFound);
+        drop(s);
+
+        // In a fork, a proposal is held.
+        let (mut h, _) = e.host.ensure(ns(1), b"h").unwrap();
+        h.seal_birth().unwrap();
+        let (mut hfx, _) =
+            Effects::open(Mode::Hold, Box::new(crate::effects::AlwaysPublish), &mut h).unwrap();
+        let mut s = Session::new(&mut h, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut hfx);
+        s.handle(hello());
+        s.handle(declare(1, "mail", b"send bob"));
+        assert_eq!(result(&mut s, 1), OpState::Held);
     }
 
     /// Without the Warden's `Branches` (or, for Promote, an engine),

@@ -34,8 +34,22 @@
 //!   the child's held proposals become this Vessel's released intents
 //!   (refused if this Vessel sealed again since the fork, M7).
 //!
-//! Fork and Promote were added to v2 without a version change: a Warden
-//! that does not know them answers `Malformed` and records nothing.
+//! - **Result**: the agent's read-only question about one of its own
+//!   effects: pending, held, applied (with the receipt), not applied (with
+//!   the reason), unknown, or not found.
+//!
+//! Fork, Promote and Result were added to v2 without a version change: a
+//! Warden that does not know them answers `Malformed` and records nothing.
+//!
+//! # Two sockets (P3 close-out C5)
+//!
+//! Each Vessel has two sockets.  The **agent socket** is mounted into the
+//! Vessel: Hello, Effect, Transcript, TurnEnd, Fork, Promote, Result.  The
+//! **sender socket** is the Warden's own and never mounted into the
+//! Vessel: Hello, Open, Outcome.  Only the sender lists what is released
+//! and reports what happened; an agent can never write an outcome.  A
+//! request on the other socket is answered `NotOnThisSocket` and records
+//! nothing.
 //!
 //! v1 (one `Effect` shape, no declaration, `Applied`/`NotApplied`/
 //! `Unknown` results) is not spoken any more: a v1 `Hello` is refused.
@@ -125,6 +139,11 @@ pub enum Request {
         /// The child's Seal lsn; `None`: its newest.
         seal: Option<u64>,
     },
+    /// What became of one of this Vessel's effects (tag 8).  Read-only.
+    Result {
+        /// The op, as the `Effect` reply gave it.
+        op: u64,
+    },
 }
 
 /// What a sender reports.
@@ -208,6 +227,39 @@ pub enum Reply {
         /// What happened.
         result: PromoteResult,
     },
+    /// Answer to `Result` (tag 9).
+    Result {
+        /// The op asked about.
+        op: u64,
+        /// Its state.
+        state: OpState,
+    },
+}
+
+/// What became of an effect, as far as this Vessel's ledger knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpState {
+    /// Released, no report yet (tag 0).
+    Pending,
+    /// A proposal: this Vessel holds; only its parent may adopt it (tag 1).
+    Held,
+    /// The sender reported it happened (tag 2).
+    Applied {
+        /// The provider's receipt, opaque.
+        receipt: Vec<u8>,
+    },
+    /// It did not happen (tag 3): the sender said so, or it was withdrawn
+    /// before anything could act on it.
+    NotApplied {
+        /// Why.
+        reason: String,
+    },
+    /// It may or may not have happened; a sender or an operator settles it
+    /// (tag 4).
+    Unknown,
+    /// No such op in this Vessel's log: never declared here, or settled
+    /// and pruned (tag 5).
+    NotFound,
 }
 
 /// The answer to a fork request.
@@ -303,6 +355,8 @@ pub enum ErrorCode {
     Fenced = 3,
     /// Something failed inside the Warden.
     Internal = 4,
+    /// The request belongs to the other socket (agent or sender).
+    NotOnThisSocket = 5,
 }
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -491,6 +545,9 @@ impl Request {
             Self::Promote { child, seal } => {
                 o.u8(7).str(child).opt_u64(*seal);
             }
+            Self::Result { op } => {
+                o.u8(8).u64(*op);
+            }
         }
         o.0
     }
@@ -533,6 +590,7 @@ impl Request {
                 child: r.string()?,
                 seal: r.opt_u64()?,
             },
+            8 => Self::Result { op: r.u64()? },
             _ => return Err(r.bad_tag("unknown request tag")),
         };
         r.finish()?;
@@ -608,6 +666,17 @@ impl Reply {
                     }
                 };
             }
+            Self::Result { op, state } => {
+                o.u8(9).u64(*op);
+                match state {
+                    OpState::Pending => o.u8(0),
+                    OpState::Held => o.u8(1),
+                    OpState::Applied { receipt } => o.u8(2).bytes(receipt),
+                    OpState::NotApplied { reason } => o.u8(3).str(reason),
+                    OpState::Unknown => o.u8(4),
+                    OpState::NotFound => o.u8(5),
+                };
+            }
         }
         o.0
     }
@@ -644,6 +713,7 @@ impl Reply {
                     2 => ErrorCode::Closed,
                     3 => ErrorCode::Fenced,
                     4 => ErrorCode::Internal,
+                    5 => ErrorCode::NotOnThisSocket,
                     _ => return Err(r.bad_tag("unknown error code")),
                 };
                 Self::Error {
@@ -713,6 +783,22 @@ impl Reply {
                 };
                 Self::Promote { child, result }
             }
+            9 => Self::Result {
+                op: r.u64()?,
+                state: match r.tag()? {
+                    0 => OpState::Pending,
+                    1 => OpState::Held,
+                    2 => OpState::Applied {
+                        receipt: r.bytes()?,
+                    },
+                    3 => OpState::NotApplied {
+                        reason: r.string()?,
+                    },
+                    4 => OpState::Unknown,
+                    5 => OpState::NotFound,
+                    _ => return Err(r.bad_tag("unknown op state tag")),
+                },
+            },
             _ => return Err(r.bad_tag("unknown reply tag")),
         };
         r.finish()?;
@@ -948,6 +1034,7 @@ mod tests {
             proptest::option::of(any::<u64>()).prop_map(|seal| Request::Fork { seal }),
             (text(), proptest::option::of(any::<u64>()))
                 .prop_map(|(child, seal)| Request::Promote { child, seal }),
+            any::<u64>().prop_map(|op| Request::Result { op }),
         ]
     }
 
@@ -986,6 +1073,7 @@ mod tests {
             Just(ErrorCode::Closed),
             Just(ErrorCode::Fenced),
             Just(ErrorCode::Internal),
+            Just(ErrorCode::NotOnThisSocket),
         ];
         prop_oneof![
             (any::<u16>(), proptest::option::of(any::<u64>())).prop_map(
@@ -1017,6 +1105,18 @@ mod tests {
                 ]
             )
                 .prop_map(|(child, result)| Reply::Promote { child, result }),
+            (
+                any::<u64>(),
+                prop_oneof![
+                    Just(OpState::Pending),
+                    Just(OpState::Held),
+                    blob().prop_map(|receipt| OpState::Applied { receipt }),
+                    text().prop_map(|reason| OpState::NotApplied { reason }),
+                    Just(OpState::Unknown),
+                    Just(OpState::NotFound),
+                ]
+            )
+                .prop_map(|(op, state)| Reply::Result { op, state }),
         ]
     }
 

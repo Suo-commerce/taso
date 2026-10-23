@@ -20,9 +20,9 @@
 //! (`NoExternalMutation`, deduplicated by key `t<turn>-<k>`: released,
 //! held or refused, counted); `--promote NAME` (repeatable) asks right
 //! after `Hello` for the child `NAME` to be promoted at its newest Seal,
-//! and then lists `Open`; `--forks N` asks for N forks after the last
-//! turn.  Every answer goes into the stats; a refusal is an answer, not an
-//! error.
+//! and then asks `Result` for each adopted op; `--forks N` asks for N
+//! forks after the last turn.  Every answer goes into the stats; a refusal
+//! is an answer, not an error.
 //!
 //! `--bare` runs the same writes with no Field at all: the baseline the
 //! gate compares against ("p95 write latency ≤ 1.5× bare local NVMe").
@@ -205,14 +205,18 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
             },
         );
     }
-    let open_after_promote = if o.promote.is_empty() {
-        None
-    } else {
-        match field.ask(Request::Open)? {
-            Some(Reply::Open { effects }) => Some(effects.len()),
-            r => return Err(format!("unexpected answer to Open: {r:?}")),
+    // What became of each adopted op, as the agent may ask (C5: listing
+    // is the sender's).
+    let mut adopted_states = Vec::new();
+    for p in &promotions {
+        for op in p["adopted"].as_array().into_iter().flatten() {
+            let op = op.as_u64().expect("op ids are numbers");
+            adopted_states.push(match field.ask(Request::Result { op })? {
+                Some(Reply::Result { state, .. }) => json!(format!("{state:?}")),
+                r => return Err(format!("unexpected answer to Result: {r:?}")),
+            });
         }
-    };
+    }
 
     let db =
         rusqlite::Connection::open(&o.db).map_err(|e| format!("open {}: {e}", o.db.display()))?;
@@ -321,7 +325,7 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
         "turn_end": summary(turn_ends),
         "effects": { "released": released, "held": held, "refused": refused },
         "promotions": promotions,
-        "open_after_promote": open_after_promote,
+        "adopted_states": adopted_states,
         "forks": forks,
     }))
 }
@@ -454,7 +458,7 @@ mod tests {
     #[test]
     fn field_run_promotes_declares_and_forks() {
         use std::os::unix::net::UnixListener;
-        use taso_field::protocol::{recv_request, send_reply, OpenEffect};
+        use taso_field::protocol::{recv_request, send_reply, OpState};
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("f.sock");
         let listener = UnixListener::bind(&sock).unwrap();
@@ -481,19 +485,9 @@ mod tests {
                             reason: "already promoted".into(),
                         },
                     },
-                    Request::Open => Reply::Open {
-                        effects: vec![
-                            OpenEffect {
-                                op: 4,
-                                provider: "sim".into(),
-                                request: vec![],
-                                retry: RetryPolicy::UnsafeToRetry,
-                                consequence: Consequence::NoExternalMutation,
-                                authority: vec![],
-                                unknown: false,
-                            };
-                            2
-                        ],
+                    Request::Result { op } => Reply::Result {
+                        op: *op,
+                        state: OpState::Pending,
                     },
                     Request::Effect { call, .. } => Reply::Effect {
                         call: *call,
@@ -552,7 +546,7 @@ mod tests {
                 {"child": "c2", "refused": "already promoted"},
             ])
         );
-        assert_eq!(st["open_after_promote"], 2);
+        assert_eq!(st["adopted_states"], json!(["Pending", "Pending"]));
         assert_eq!(
             st["effects"],
             json!({"released": 0, "held": 1, "refused": ["quota"]})
@@ -561,13 +555,15 @@ mod tests {
             st["forks"],
             json!([{"child": "p-fork-3", "seal": 12}, {"refused": "no fork slot left"}])
         );
-        // The order: Hello, the promotions and Open, the turn, the forks.
+        // The order: Hello, the promotions and their results, the turn,
+        // the forks.
         let tags: Vec<&str> = seen
             .iter()
             .map(|r| match r {
                 Request::Hello { .. } => "hello",
                 Request::Promote { .. } => "promote",
                 Request::Open => "open",
+                Request::Result { .. } => "result",
                 Request::Effect { .. } => "effect",
                 Request::Transcript { .. } => "transcript",
                 Request::TurnEnd { .. } => "turn",
@@ -581,7 +577,8 @@ mod tests {
                 "hello",
                 "promote",
                 "promote",
-                "open",
+                "result",
+                "result",
                 "effect",
                 "effect",
                 "transcript",
@@ -624,7 +621,8 @@ mod tests {
                     | Request::Outcome { .. }
                     | Request::Open
                     | Request::Fork { .. }
-                    | Request::Promote { .. } => {
+                    | Request::Promote { .. }
+                    | Request::Result { .. } => {
                         unreachable!()
                     }
                 };

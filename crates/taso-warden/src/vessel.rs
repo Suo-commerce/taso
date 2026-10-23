@@ -238,6 +238,15 @@ pub enum VesselError {
         /// This Vessel's last Seal now.
         last: Option<Position>,
     },
+    /// A fork asked for over the Field: the Seal is accepted but not yet
+    /// shipped, so a fork of it could be reborn nowhere if this node were
+    /// lost (the Seal would be lost with it).
+    SealNotShipped {
+        /// The Seal.
+        seal: Position,
+        /// How far the Chronicle is shipped.
+        shipped: Position,
+    },
     /// Promotion: a child was already promoted at this Vessel's last Seal
     /// (one choice per fork point: a second would adopt a sibling's
     /// futures too, or the same ones twice).
@@ -321,6 +330,12 @@ impl fmt::Display for VesselError {
                 Some(l) => write!(f, "cannot promote: this vessel sealed again (lsn {}) since the fork at lsn {}", l.lsn.get(), fork.lsn.get()),
                 None => write!(f, "cannot promote: this vessel has no Seal, the fork names lsn {}", fork.lsn.get()),
             },
+            Self::SealNotShipped { seal, shipped } => write!(
+                f,
+                "the Seal at lsn {} is not shipped yet (shipped up to lsn {}): a fork of it could be reborn nowhere if this node were lost",
+                seal.lsn.get(),
+                shipped.lsn.get()
+            ),
             Self::AlreadyPromoted { child, seal } => write!(
                 f,
                 "cannot promote: {} was already promoted at its Seal lsn {} since this vessel's last Seal",
@@ -632,6 +647,23 @@ impl<P: Pool> Host<P> {
             ledger_pos,
             subject,
         )
+    }
+
+    /// The accepted Seal `at` of `parent`, proven from its local log
+    /// ([`ReadLog::prove`]) and **shipped**: the coordinator's shipped
+    /// anchor is at or past it.  The log is never shipped past a Seal whose
+    /// `fs` section is not (F4), so its files went with it.  What a fork
+    /// asked for over the Field starts from (P3 close-out C3): a child of
+    /// a Seal only this node holds could be reborn nowhere once the node is
+    /// lost.  Resolves "last" to one lsn, so a Seal taken after this check
+    /// is not the one forked.
+    pub fn shipped_seal(&self, parent: ChronicleId, at: SealAt) -> Result<Position, VesselError> {
+        let (seal, _) = self.read_log_of(parent)?.prove(at)?;
+        let shipped = self.coord.shipped(parent).map_err(VesselError::Coord)?;
+        if shipped.lsn < seal.lsn {
+            return Err(VesselError::SealNotShipped { seal, shipped });
+        }
+        Ok(seal)
     }
 
     /// Another Vessel's local log, read without claiming it, with its
@@ -2288,6 +2320,47 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .any(|f| matches!(decode(f), Ok(Payload::Promotion(_)))));
+    }
+
+    /// A fork asked for over the Field starts only from a shipped Seal:
+    /// accepted is not enough, "last" means the newest shipped one only if
+    /// it is shipped, and the answer names the Seal and the anchor.
+    #[test]
+    fn a_seal_is_forkable_over_the_field_only_once_shipped() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut p);
+        // Accepted, not shipped.
+        for at in [SealAt::Last, SealAt::At(s1.lsn)] {
+            assert!(matches!(
+                e.host.shipped_seal(p.id(), at),
+                Err(VesselError::SealNotShipped { seal, shipped })
+                    if seal == s1 && shipped.lsn < s1.lsn
+            ));
+        }
+        // Shipped up to s1: forkable; a newer, unshipped Seal is not.
+        e.host
+            .coord
+            .advance_shipped(e.host.warden, p.id(), p.chronicle().epoch(), s1)
+            .unwrap();
+        assert_eq!(e.host.shipped_seal(p.id(), SealAt::Last).unwrap(), s1);
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let s2 = seal(&mut p);
+        assert!(matches!(
+            e.host.shipped_seal(p.id(), SealAt::Last),
+            Err(VesselError::SealNotShipped { seal, .. }) if seal == s2
+        ));
+        assert_eq!(
+            e.host.shipped_seal(p.id(), SealAt::At(s1.lsn)).unwrap(),
+            s1,
+            "an older shipped Seal stays forkable"
+        );
+        // Not a Seal at all: not proven, as before.
+        assert!(matches!(
+            e.host.shipped_seal(p.id(), SealAt::At(Lsn::new(999))),
+            Err(VesselError::ParentNotProven(_))
+        ));
     }
 
     /// One choice per fork point: once a child is promoted at the parent's

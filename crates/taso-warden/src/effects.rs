@@ -160,6 +160,15 @@ impl From<VesselError> for PromoteError {
     }
 }
 
+/// What the local log says of one op ([`Effects::result`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpRecord {
+    /// Its latest outcome state; `None`: an intent with no outcome yet.
+    pub state: Option<OutcomeState>,
+    /// That outcome's evidence (a receipt, a reason), if any.
+    pub evidence: Option<Vec<u8>>,
+}
+
 /// A released, unsettled effect: what a sender reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Released {
@@ -180,6 +189,10 @@ pub struct Effects {
     /// Released ops recorded but not yet known shipped: not listed until a
     /// ship succeeds.
     unlisted: std::collections::BTreeMap<OpId, Option<taso_core::record::BarrierId>>,
+    /// Ops a listing ([`Effects::hand_out`]) has already given to a
+    /// sender in this engine's life.  Not durable on purpose: after a
+    /// Warden restart reconcile records them `OutcomeUnknown` anyway.
+    handed_out: std::collections::BTreeSet<OpId>,
     pending: Option<PromotionRecord>,
 }
 
@@ -206,6 +219,7 @@ impl Effects {
             ledger,
             released: Default::default(),
             unlisted,
+            handed_out: Default::default(),
             pending: summary.promotion,
         };
         // Listed once a ship covers them (a failure leaves them unlisted
@@ -299,6 +313,81 @@ impl Effects {
                 state: e.state.expect("unsettled has a state"),
             })
             .collect())
+    }
+
+    /// What a sender reads ([`Effects::released`]), each with whether it
+    /// may have been acted on already: `OutcomeUnknown` (reconciled after a
+    /// restart), or handed out by an earlier listing of this engine — a
+    /// sender that crashed while the Warden stayed up (review finding 3).
+    /// Marks every listed op as handed out.
+    pub fn hand_out<L: Layers>(
+        &mut self,
+        vessel: &Vessel<L>,
+    ) -> Result<Vec<(Released, bool)>, VesselError> {
+        let listed = self.released(vessel)?;
+        Ok(listed
+            .into_iter()
+            .map(|r| {
+                let before =
+                    r.state == OutcomeState::OutcomeUnknown || !self.handed_out.insert(r.intent.op);
+                (r, before)
+            })
+            .collect())
+    }
+
+    /// What became of `op`, as this Vessel's local log says: its latest
+    /// outcome state and evidence (`None` state: an intent with no outcome
+    /// yet), or `None` if the op is not in the local log (never declared
+    /// here, or settled and pruned behind a Checkpoint).  Read-only: what
+    /// an agent asks about its own effect (C5), never a listing.
+    pub fn result<L: Layers>(
+        &self,
+        vessel: &Vessel<L>,
+        op: OpId,
+    ) -> Result<Option<OpRecord>, VesselError> {
+        let frames = vessel
+            .chronicle()
+            .frames()
+            .map_err(|e| VesselError::Chronicle(crate::chronicle::ChronicleError::Segment(e)))?;
+        let mut found = None;
+        for f in &frames {
+            if f.envelope.stream != taso_core::envelope::Stream::Effect {
+                continue;
+            }
+            let p = taso_core::record::Payload::decode(&f.payload).map_err(|error| {
+                VesselError::Decode {
+                    lsn: f.envelope.lsn,
+                    error,
+                }
+            })?;
+            match p {
+                taso_core::record::Payload::Intent(i) if i.op == op => {
+                    found = Some(OpRecord {
+                        state: None,
+                        evidence: None,
+                    })
+                }
+                taso_core::record::Payload::Outcome(o) if o.op == op && found.is_some() => {
+                    found = Some(OpRecord {
+                        state: Some(o.state),
+                        evidence: o.evidence,
+                    })
+                }
+                _ => {}
+            }
+        }
+        // A Checkpoint carries the ops still open: one of those whose
+        // intent was pruned is still known, as open.
+        if found.is_none() {
+            let s = summary(vessel)?;
+            if let Some(e) = s.open.get(&op) {
+                found = Some(OpRecord {
+                    state: e.state,
+                    evidence: None,
+                });
+            }
+        }
+        Ok(found)
     }
 
     /// The sender's report on a released effect.  Refused for an op that
