@@ -21,6 +21,8 @@
 #            2 forks over the Field; the Warden makes one child in slot 3
 #            and runs it, the agent's second ask is refused (the quota)
 #   phase 5  the parent again: its agent asks to promote that child, twice
+#   phases 6-8 (M7, C8) the parent forks once more (slot 4), seals one more
+#            turn (it moves), then asks to promote the new child
 #
 # Rows, predictions written before the first run (2026-10-21):
 #   R1 forked     phase 2's log: "Forked from \"parent\" at Seal lsn L",
@@ -63,6 +65,13 @@
 #                  (C5, 2026-10-23: Open is the sender's, an agent asks
 #                  Result; until then this row checked that Open listed 2);
 #                  the Warden exits 0
+#
+# Row added for P3 close-out C8, prediction written before the first run
+# (2026-10-23):
+#   R11 moved      phase 8: the promotion of parent-fork-4 is refused, the
+#                  reason says the parent sealed again since the fork, and
+#                  nothing is adopted (no Result asked, no promotion
+#                  logged as done); every Warden exits 0
 #
 # Usage (root on a node with runc, cargo, python3, ublk and the installed
 # taso-blkd; node-setup.sh vessel-blk):
@@ -443,12 +452,37 @@ elif ! grep -q "parent: promoted \"parent-fork-3\" at Seal lsn [0-9]* on its age
 fi
 row R10 "$r10"
 
+# ── phases 6-8: promotion refused when the parent moved (M7, C8) ───────
+PARENT_F2='{"subject": "parent", "uid_slot": 1, "forks": {"slots": [3, 4]}}'
+EXTRA="--forks 1" config "$WORK/p6.json" 1 "$PARENT_F2"
+rc6=$(wardend phase6 "$WORK/p6.json")
+config "$WORK/p7.json" 1 "$PARENT_F2"
+rc7=$(wardend phase7 "$WORK/p7.json")
+EXTRA="--promote parent-fork-4" config "$WORK/p8.json" 1 "$PARENT_F2"
+rc8=$(wardend phase8 "$WORK/p8.json")
+r11=$(python3 - "$WORK/mnt/$PDS/sim-stats.json" <<'PY'
+import json, sys
+try: p = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as e: print(f"FAIL (sim-stats: {e})"); sys.exit()
+pr = p.get("promotions", [])
+if len(pr) == 1 and pr[0].get("child") == "parent-fork-4" and "sealed again" in pr[0].get("refused", "") and p.get("adopted_states") == []:
+    print("PASS (refused: the parent sealed again; nothing adopted)")
+else:
+    print(f"FAIL (promotions {pr}, adopted states {p.get('adopted_states')})")
+PY
+)
+if [ "$rc6$rc7$rc8" != 000 ]; then r11="FAIL (exits $rc6 $rc7 $rc8; ${r11})"
+elif ! grep -q "parent: forked \"parent-fork-4\" (uid slot 4)" "$OUT/phase6.err"; then r11="FAIL (no fork-4 in phase 6; ${r11})"
+elif ! grep -q "parent: promotion of \"parent-fork-4\" refused: cannot promote: this vessel sealed again" "$OUT/phase8.err"; then r11="FAIL (no refusal logged; ${r11})"
+fi
+row R11 "$r11"
+
 # ── summary ───────────────────────────────────────────────────────────
-ROWS="R1 R2 R3 R4 R5 R6 R7 R8 R9 R10"
+ROWS="R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11"
 fails=0
 for r in $ROWS; do [[ "${ROW[$r]}" == PASS* ]] || fails=$((fails + 1)); done
 {
-    echo "f6-fork-blk $RUN: $((10 - fails))/10 rows passed"
+    echo "f6-fork-blk $RUN: $((11 - fails))/11 rows passed"
     for r in $ROWS; do printf '%-6s %s\n' "$r" "${ROW[$r]}"; done
 } | tee "$OUT/summary.txt"
 echo "== results in $OUT"

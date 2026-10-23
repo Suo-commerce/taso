@@ -83,6 +83,156 @@ mod tests {
         }
     }
 
+    /// M7 (P3 close-out C8): what one promotion costs at 1, 10 and 100
+    /// proposals.  Per size a fresh parent, then `TASO_BENCH_N` (20)
+    /// rounds: the parent seals and publishes a new fork point, a child is
+    /// forked from it and proposes `n` held effects and seals, the parent
+    /// reads the child's log and promotes it (Promotion recorded and
+    /// shipped, adoption recorded and shipped, C2).  Real segment fsyncs,
+    /// coordinator and pack store; the layers are fake (promotion moves no
+    /// files yet: C7).
+    ///
+    /// Predictions, written before the first run (2026-10-23):
+    /// - flat in n: p50 of `promote.total` at 100 within 1.5x of the p50 at
+    ///   1 (one batched adoption write and two ships, whatever n);
+    /// - its parts: two ships (`promote.ship_promotion`,
+    ///   `promote.ship_adoption`) dominate; `effect.adopt` (one write, one
+    ///   fsync, one CAS) is about one effect release; `promote.record` and
+    ///   reading the child's log grow with n but stay small;
+    /// - a promotion costs about two single releases (`effect.total` of
+    ///   `dispatch`).
+    #[test]
+    #[ignore = "benchmark: run alone, in release"]
+    fn promotion_cost() {
+        use crate::vessel::tests::{fake_guid, FakeLayers};
+        use crate::vessel::SealAt;
+        let rounds = n(20);
+        let e = env();
+        let store = tempfile::tempdir().unwrap();
+        let packs = |id| {
+            Packs::new(
+                LocalStore::new(store.path().join("store")),
+                FixedSend(64 << 10),
+                "vessels",
+                id,
+            )
+            .unwrap()
+        };
+        let snap = |v: &Vessel<FakeLayers>, s: Position| Snapshot {
+            dataset: v.dataset().clone(),
+            seal: s.lsn,
+            createtxg: 1,
+            guid: fake_guid(s.lsn),
+            seal_hash: Some(s.hash),
+        };
+        let held = |k: usize| Declared {
+            provider: "pay".into(),
+            request: format!("pay {k}").into_bytes(),
+            footprint: Vec::new(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::ProviderDeduplicated {
+                key: format!("k{k}").into_bytes(),
+            },
+            consequence: Consequence::NoExternalMutation,
+            authority: Vec::new(),
+        };
+        println!("\n=== M7: promotion cost, {rounds} promotions per size ===");
+        println!(
+            "TMPDIR={}",
+            std::env::var("TMPDIR").unwrap_or_else(|_| "(default)".into())
+        );
+        let parts = [
+            "promote.total",
+            "promote.read_log",
+            "promote.record",
+            "promote.ship_promotion",
+            "effect.adopt",
+            "promote.ship_adoption",
+        ];
+        println!(
+            "{:>4}  {}",
+            "n",
+            parts
+                .iter()
+                .map(|p| format!("  {p:>22}"))
+                .collect::<String>()
+        );
+        let mut p50s = Vec::new();
+        for size in [1usize, 10, 100] {
+            let (mut p, _) = e
+                .host
+                .ensure(ns(1), format!("prime-{size}").as_bytes())
+                .unwrap();
+            let s0 = p.seal_birth().unwrap().seal;
+            p.publish_seal(&packs(p.id()), &snap(&p, s0), None).unwrap();
+            let publisher = PackPublisher::new(packs(p.id()), e.host.coord.clone(), e.host.warden);
+            let (mut fx, _) = Effects::open(Mode::Dispatch, Box::new(publisher), &mut p).unwrap();
+            timing::take();
+            timing::enable(true);
+            for r in 0..rounds {
+                p.append(Stream::Fs, Payload::Raw(vec![1; 200])).unwrap();
+                let s = p
+                    .seal(
+                        StreamCut::EMPTY,
+                        Verdict::Clean,
+                        crate::effects::ledger_pos(&p).unwrap(),
+                        TurnId::new(r as u64 + 1),
+                    )
+                    .unwrap()
+                    .seal;
+                p.publish_seal(&packs(p.id()), &snap(&p, s), None).unwrap();
+                let subject = format!("child-{size}-{r}");
+                let cid = {
+                    let mut c = e
+                        .host
+                        .fork_from_log(p.id(), SealAt::Last, subject.as_bytes())
+                        .unwrap();
+                    c.seal_birth().unwrap();
+                    let (mut cfx, _) =
+                        Effects::open(Mode::Hold, Box::new(crate::effects::AlwaysPublish), &mut c)
+                            .unwrap();
+                    for k in 0..size {
+                        assert!(matches!(
+                            cfx.ask(&mut c, &held(k)).unwrap(),
+                            Asked::Held { .. }
+                        ));
+                    }
+                    let pos = crate::effects::ledger_pos(&c).unwrap();
+                    c.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(1))
+                        .unwrap();
+                    c.id()
+                };
+                let t = timing::span("promote.read_log");
+                let log = e.host.read_log_of(cid).unwrap();
+                drop(t);
+                let (_, adopted) = fx.promote(&mut p, &log, SealAt::Last).unwrap();
+                assert_eq!(adopted.len(), size);
+            }
+            timing::enable(false);
+            let spans = timing::take();
+            let q = |name: &str, at: f64| {
+                let mut v = spans.get(name).cloned().unwrap_or_default();
+                v.sort_unstable();
+                timing::quantile(&v, at) as f64 / 1000.0
+            };
+            println!(
+                "{size:>4}  {}",
+                parts
+                    .iter()
+                    .map(|n| format!("  {:>13.3} / {:>6.3}", q(n, 0.5), q(n, 0.95)))
+                    .collect::<String>()
+            );
+            assert_eq!(spans["promote.total"].len(), rounds);
+            p50s.push(q("promote.total", 0.5));
+        }
+        println!("(each cell: p50 / p95 ms)");
+        let ratio = p50s[2] / p50s[0];
+        println!(
+            "prediction 'flat in n' (p50 at 100 within 1.5x of p50 at 1): {ratio:.2}x -> {}",
+            if ratio <= 1.5 { "held" } else { "NOT held" }
+        );
+    }
+
     /// A stream of fixed size; only publishing is measured, not `zfs send`.
     struct FixedSend(usize);
     impl Sender for FixedSend {

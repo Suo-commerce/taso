@@ -437,7 +437,9 @@ impl Effects {
         at: SealAt,
     ) -> Result<(PromotionRecord, Vec<Authorized>), PromoteError> {
         let _total = crate::timing::span("promote.total");
+        let t = crate::timing::span("promote.record");
         let (record, _) = vessel.promote(child, at)?;
+        drop(t);
         self.pending = Some(record);
         let adopted = self.finish_promotion(vessel, child)?;
         Ok((record, adopted))
@@ -464,7 +466,9 @@ impl Effects {
         // The Promotion goes off the node before anything is adopted from
         // it: an adoption only this node knew of could not be reconciled
         // by whoever takes the Vessel over.
+        let t = crate::timing::span("promote.ship_promotion");
         self.ledger.ship(vessel).map_err(PromoteError::NotShipped)?;
+        drop(t);
         let seal = Position {
             lsn: p.seal,
             hash: p.seal_hash,
@@ -495,7 +499,10 @@ impl Effects {
         for a in &adopted {
             self.unlisted.insert(a.op, a.barrier);
         }
-        match self.ship_unlisted(vessel) {
+        let t = crate::timing::span("promote.ship_adoption");
+        let shipped = self.ship_unlisted(vessel);
+        drop(t);
+        match shipped {
             Ok(_) => Ok(adopted),
             Err(error) => Err(PromoteError::AdoptionNotShipped {
                 promotion: p,

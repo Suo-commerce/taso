@@ -2429,6 +2429,78 @@ mod tests {
         assert_eq!(result(&mut s, 1), OpState::Held);
     }
 
+    /// M7 over the Field (C8): a parent that sealed again since the fork
+    /// has moved on; promoting the child is refused, names both Seals,
+    /// and adopts and lists nothing.
+    #[test]
+    fn a_promotion_after_the_parent_moved_is_refused() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.seal_birth().unwrap();
+        let mut b = FakeBranches {
+            host: &e.host,
+            quota: 1,
+            children: Vec::new(),
+            promoted: Vec::new(),
+        };
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut p,
+        )
+        .unwrap();
+        {
+            let mut s = Session::new(&mut p, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx)
+                .with_branches(&mut b);
+            s.handle(hello());
+            assert!(matches!(
+                s.handle(Request::Fork { seal: None }),
+                Reply::Fork {
+                    result: ForkResult::Forked { .. }
+                }
+            ));
+        }
+        let mut children = std::mem::take(&mut b.children);
+        propose(&mut children[0], 2);
+        drop(children);
+
+        let mut s = Session::new(&mut p, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        // The parent moves: one more sealed turn.
+        assert!(matches!(
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                sealed: Some(_),
+                ..
+            }
+        ));
+        let tail = s.vessel.tail();
+        let Reply::Promote {
+            result: PromoteResult::Refused { reason },
+            ..
+        } = s.handle(Request::Promote {
+            child: "c1".into(),
+            seal: None,
+        })
+        else {
+            panic!("promoted after the parent moved")
+        };
+        assert!(reason.contains("sealed again"), "{reason}");
+        assert_eq!(s.vessel.tail(), tail, "nothing recorded");
+        assert_eq!(
+            s.handle_as(&mut sender(), Request::Open),
+            Reply::Open { effects: vec![] }
+        );
+    }
+
     /// Without the Warden's `Branches` (or, for Promote, an engine),
     /// Fork and Promote are refused and nothing is recorded.
     #[test]
