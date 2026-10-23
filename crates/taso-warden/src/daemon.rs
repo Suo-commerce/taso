@@ -99,6 +99,14 @@
 //!
 //! - Successions from a config entry (forks are: [`ForkConf`], and forks
 //!   asked for over the Field: [`ForksConf`]).
+//! - A fork is reborn only where its parent's Seal is (decided
+//!   2026-10-23, option c): on its parent's node, on a node its parent was
+//!   reborn on, or where the parent's Seal is kept as a Template.  The
+//!   supervisor starts a parent listed with its fork first, so a node that
+//!   takes both over rebirths the parent, then the child; anywhere else
+//!   the child's rebirth is refused before anything changes, naming the
+//!   missing Seal.  Fetching the parent's sections to rebirth a fork alone
+//!   (option a) is for when children must outlive their parent's node.
 //! - Children asked for over the Field are run by the Warden that made
 //!   them; a new Warden does not list them again.  What happens to them
 //!   then is the prime agent's call: their datasets, logs and slots stay,
@@ -1922,6 +1930,9 @@ pub struct Node {
     /// daemon runs them next to its source's entries
     /// ([`crate::source::WithRequested`]).
     requested: Requested,
+    /// Vessels whose run got past its start in this Warden's life (their
+    /// datasets settled here): a fork of one may start (C6).
+    started: std::sync::Mutex<std::collections::BTreeSet<[u8; 16]>>,
 }
 
 impl Node {
@@ -1963,7 +1974,17 @@ impl Node {
             run_lock,
             held,
             requested: Requested::new(),
+            started: Default::default(),
         })
+    }
+
+    /// Whether a run of the Vessel `key` got past its start in this
+    /// Warden's life ([`crate::supervisor::RunVessel::started`]).
+    pub fn has_started(&self, key: &[u8; 16]) -> bool {
+        self.started
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(key)
     }
 
     /// The children asked for over the Field (see [`ForksConf`]).
@@ -2074,7 +2095,17 @@ impl Node {
                 (v, verdict)
             }
             Start::Rebirth => {
-                let (v, reborn) = host.rebirth_as(id, &self.packs(id)?, claim)?;
+                let (v, reborn) = host
+                    .rebirth_as(id, &self.packs(id)?, claim)
+                    .map_err(|e| match e {
+                        // Forks are node-bound (2026-10-23, option c).
+                        VesselError::ParentMissing(p) => DaemonError::Refused(format!(
+                            "a fork is reborn only where its parent's Seal is: the Seal at lsn {} of its parent {} is not on this node; rebirth the parent here first (a parent listed with it is started first), or keep its Seal here as a Template",
+                            p.seal.get(),
+                            id_hex(p.chronicle)
+                        )),
+                        e => DaemonError::Vessel(e),
+                    })?;
                 self.log(vc, &reborn);
                 let verdict = verdict_after_rebirth(&reborn);
                 (v, verdict)
@@ -2135,6 +2166,11 @@ impl Node {
             Some(_) => BIRTH_TURN,
         };
         let settled = settle_at(&mut vessel, birth_turn)?;
+        // Its dataset is settled here: a fork of it may start (C6).
+        self.started
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(*id.as_bytes());
         if let Some(b) = settled.birth {
             self.log(
                 vc,
