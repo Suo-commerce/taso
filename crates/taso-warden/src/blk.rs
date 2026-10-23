@@ -584,7 +584,9 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
         dataset: &Dataset,
         base: (Lsn, HashVal),
         to: (Lsn, HashVal),
-        stream: &mut dyn io::Read,
+        child: &Dataset,
+        child_seal: Lsn,
+        sender: &dyn crate::ship::Sender,
     ) -> Result<u64, LayerError> {
         // Out of use first: the branch's blocks change under its ext4.
         {
@@ -628,7 +630,9 @@ impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
         }
         // The fork's increment from `base`, imported as this branch's own
         // Seal layer `to` (the receive checks `base` and binds `to`).
-        Pool::receive(self, dataset, Some(base), to, stream)
+        let from = dataset.seal_snapshot(base.0);
+        let mut stream = sender.send(child, Some(&from), child_seal)?;
+        Pool::receive(self, dataset, Some(base), to, &mut stream)
     }
 
     fn create(&self, dataset: &Dataset) -> Result<DatasetInfo, LayerError> {

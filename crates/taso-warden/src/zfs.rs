@@ -136,6 +136,8 @@ pub enum ZfsError {
         /// What is wrong with it.
         why: &'static str,
     },
+    /// Copying a fork's changes into its parent failed (an adoption).
+    Copy(String),
 }
 
 impl fmt::Display for ZfsError {
@@ -161,6 +163,7 @@ impl fmt::Display for ZfsError {
                 write!(f, "zfs program could not snapshot {name}: errno {errno}")
             }
             Self::Parse { line, why } => write!(f, "cannot parse zfs output {line:?}: {why}"),
+            Self::Copy(e) => write!(f, "adopting a fork's files: {e}"),
         }
     }
 }
@@ -922,28 +925,36 @@ impl<R: Runner> Zfs<R> {
         self.bind(snap, to.1)
     }
 
-    /// Adopt (P3 close-out C7): receive an increment made on *another*
-    /// dataset — a fork's state at its Seal, made from `dataset`'s Seal
-    /// snapshot `base` — as `dataset`'s own Seal snapshot `to`, and bind
-    /// it.  `base` must be `dataset`'s newest snapshot (the M7 condition)
-    /// and bound to its hash; refused before anything changes otherwise.
-    /// The dataset is unmounted first and left unmounted (`-u`); `-F`
-    /// rolls it back to `base` (its newest snapshot) before the receive, so
-    /// nothing written after `base` stands in the way.  If `to` already
-    /// exists, nothing is received and it is bound if needed.
-    pub fn receive_adopted(
+    /// Adopt (P3 close-out C7): make `dataset`, at its Seal snapshot
+    /// `base`, what the fork `child` is at its Seal snapshot `child_seal`,
+    /// and take that as `dataset`'s own Seal snapshot `to`, bound.  ZFS
+    /// cannot receive a clone's increment into its origin (the stream is a
+    /// clone stream), so the fork's changes are copied: `zfs diff
+    /// <dataset>@base <child>@child_seal` lists them, and
+    /// [`crate::adoptcopy::apply`] copies them from the fork's snapshot
+    /// directory.
+    ///
+    /// `base` must be `dataset`'s newest snapshot (the M7 condition) and
+    /// bound to its hash; refused before anything changes otherwise.
+    /// `dataset` is rolled back to `base` first, so nothing written after
+    /// it stands, and a crash mid-copy is undone by doing it all again.
+    /// Both datasets are mounted for it (`zfs diff` needs that) and left
+    /// mounted.  If `to` already exists, nothing is copied and it is bound
+    /// if needed.
+    pub fn adopt_copy(
         &self,
         dataset: &Dataset,
         base: (Lsn, HashVal),
         to: (Lsn, HashVal),
-        stream: &mut dyn Read,
+        child: &Dataset,
+        child_seal: Lsn,
     ) -> Result<Snapshot, ZfsError> {
         if let Some(existing) = self.get(dataset, to.0)? {
             return self.bind(existing, to.1);
         }
-        if self.dataset_info(dataset)?.is_none() {
-            return Err(ZfsError::NotFound(dataset.to_string()));
-        }
+        let info = self
+            .dataset_info(dataset)?
+            .ok_or_else(|| ZfsError::NotFound(dataset.to_string()))?;
         let snaps = self.list(dataset)?;
         let base_name = dataset.seal_snapshot(base.0);
         let found = snaps
@@ -956,31 +967,30 @@ impl<R: Runner> Zfs<R> {
         if snaps.last().map(|s| s.seal) != Some(base.0) {
             return Err(ZfsError::NotLatest(base_name));
         }
-        match self.run(vec!["unmount".to_string(), dataset.to_string()]) {
-            Ok(_) => {}
-            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("not currently mounted") => {}
-            Err(e) => return Err(e),
-        }
-        let target = dataset.seal_snapshot(to.0);
-        let args = vec![
-            "receive".to_string(),
-            "-u".to_string(),
+        let child_info = self
+            .dataset_info(child)?
+            .ok_or_else(|| ZfsError::NotFound(child.to_string()))?;
+        let no_mount = |d: &Dataset| ZfsError::Copy(format!("{d} has no mountpoint"));
+        let dest = info.mountpoint.ok_or_else(|| no_mount(dataset))?;
+        let child_mp = child_info.mountpoint.ok_or_else(|| no_mount(child))?;
+        self.run(vec!["rollback".to_string(), base_name.clone()])?;
+        self.ensure_mounted(dataset)?;
+        self.ensure_mounted(child)?;
+        let child_snap = child.seal_snapshot(child_seal);
+        let diff = self.run(vec![
+            "diff".to_string(),
+            "-H".to_string(),
             "-F".to_string(),
-            target.clone(),
-        ];
-        let out = self.runner.run_input(&args, &mut HoldBack::new(stream))?;
-        if !out.success {
-            return Err(ZfsError::Exit {
-                args,
-                code: out.code,
-                stderr: out.stderr,
-            });
-        }
-        let snap = self.get(dataset, to.0)?.ok_or(ZfsError::Parse {
-            line: target,
-            why: "the adopted stream did not create the expected Seal snapshot",
-        })?;
-        self.bind(snap, to.1)
+            base_name,
+            child_snap.clone(),
+        ])?;
+        let changes = crate::adoptcopy::parse_diff(&child_mp, &diff)
+            .map_err(|e| ZfsError::Copy(e.to_string()))?;
+        let snap_dir = child_snap.split_once('@').map_or("", |(_, s)| s);
+        let src = child_mp.join(".zfs/snapshot").join(snap_dir);
+        crate::adoptcopy::apply(&changes, &src, &dest)
+            .map_err(|e| ZfsError::Copy(e.to_string()))?;
+        self.snapshot(dataset, to.0, to.1)
     }
 
     /// Receive the first stream of a cloned Vessel: incremental from the
@@ -1916,46 +1926,96 @@ mod tests {
         assert_eq!(calls[5], set_args(Lsn::new(7), hash(7)));
     }
 
-    /// C7: a fork's increment is received into the parent under the
-    /// parent's own next Seal name, after unmounting it (a dataset that is
-    /// not mounted is fine), with `-F` (back to the checked base only), and
-    /// bound; a base that is not the newest is refused before anything.
+    /// Adoption copies: the checks, a rollback to the base, both mounted,
+    /// the diff between the parent's base and the fork's Seal, the
+    /// changes copied from the fork's snapshot directory, then the
+    /// parent's own Seal snapshot taken, bound in the same command.  A
+    /// base that is not the newest is refused before anything changes.
     #[test]
-    fn receive_adopted_names_the_parents_seal_and_binds() {
+    fn adopt_copy_diffs_copies_and_takes_the_parents_seal() {
+        let t = tempfile::tempdir().unwrap();
+        let (pmp, cmp) = (t.path().join("p"), t.path().join("c"));
+        let snapdir = cmp.join(".zfs/snapshot/taso-seal-00000000000000000009");
+        std::fs::create_dir_all(&pmp).unwrap();
+        std::fs::create_dir_all(&snapdir).unwrap();
+        std::fs::write(pmp.join("gone"), "x").unwrap();
+        std::fs::write(snapdir.join("new"), "from the fork").unwrap();
+        let child = Dataset::new("tasotest/vessel-c").unwrap();
         let base = seal_line(Lsn::new(3), &hash(3).to_string());
+        let diff = format!("-\tF\t{0}/gone\n+\tF\t{0}/new\nM\t/\t{0}/\n", cmp.display());
         let zfs = Zfs::with_runner(
             Fake::default()
                 .reply(false, "", MISSING) // get @7: not yet
-                .reply(true, &ds_info(), "")
+                .reply(
+                    true,
+                    &info_line("tasotest/vessel", pmp.to_str().unwrap(), "-", "-"),
+                    "",
+                )
                 .reply(true, &base, "") // list: base is last and bound
+                .reply(
+                    true,
+                    &info_line(
+                        "tasotest/vessel-c",
+                        cmp.to_str().unwrap(),
+                        &ds().seal_snapshot(Lsn::new(3)),
+                        &hash(3).to_string(),
+                    ),
+                    "",
+                )
+                .reply(true, "", "") // rollback
                 .reply(
                     false,
                     "",
-                    "cannot unmount 'tasotest/vessel': not currently mounted",
+                    "cannot mount 'tasotest/vessel': filesystem already mounted",
                 )
-                .reply(true, "", "") // receive
-                .reply(true, &seal_line(Lsn::new(7), "-"), "")
-                .reply(true, "", "")
+                .reply(true, "", "") // mount the child
+                .reply(true, &diff, "")
+                .reply(true, "", "") // snapshot
                 .reply(true, &seal_line(Lsn::new(7), &hash(7).to_string()), ""),
         );
         let snap = zfs
-            .receive_adopted(
+            .adopt_copy(
                 &ds(),
                 (Lsn::new(3), hash(3)),
                 (Lsn::new(7), hash(7)),
-                &mut &b"INC"[..],
+                &child,
+                Lsn::new(9),
             )
             .unwrap();
         assert_eq!(snap.seal_hash, Some(hash(7)));
         let calls = zfs.runner.calls.borrow();
-        assert_eq!(calls[3], strs(&["unmount", "tasotest/vessel"]));
         assert_eq!(
             calls[4],
-            strs(&["receive", "-u", "-F", &ds().seal_snapshot(Lsn::new(7))])
+            strs(&["rollback", &ds().seal_snapshot(Lsn::new(3))])
         );
-        assert_eq!(calls[6], set_args(Lsn::new(7), hash(7)));
+        assert_eq!(calls[5], strs(&["mount", "tasotest/vessel"]));
+        assert_eq!(calls[6], strs(&["mount", "tasotest/vessel-c"]));
+        assert_eq!(
+            calls[7],
+            strs(&[
+                "diff",
+                "-H",
+                "-F",
+                &ds().seal_snapshot(Lsn::new(3)),
+                &child.seal_snapshot(Lsn::new(9)),
+            ])
+        );
+        assert_eq!(
+            calls[8],
+            strs(&[
+                "snapshot",
+                "-o",
+                &format!("taso:seal={}", hash(7)),
+                &ds().seal_snapshot(Lsn::new(7)),
+            ])
+        );
+        assert!(!pmp.join("gone").exists());
+        assert_eq!(
+            std::fs::read_to_string(pmp.join("new")).unwrap(),
+            "from the fork"
+        );
 
-        // The base is not the newest: refused, nothing unmounted or received.
+        // The base is not the newest: refused, nothing rolled back or copied.
         let later = format!("{base}\n{}", seal_line(Lsn::new(5), &hash(5).to_string()));
         let zfs = Zfs::with_runner(
             Fake::default()
@@ -1964,11 +2024,12 @@ mod tests {
                 .reply(true, &later, ""),
         );
         assert!(matches!(
-            zfs.receive_adopted(
+            zfs.adopt_copy(
                 &ds(),
                 (Lsn::new(3), hash(3)),
                 (Lsn::new(7), hash(7)),
-                &mut &b"INC"[..],
+                &child,
+                Lsn::new(9),
             ),
             Err(ZfsError::NotLatest(_))
         ));
@@ -1977,7 +2038,7 @@ mod tests {
             .calls
             .borrow()
             .iter()
-            .all(|c| c[0] != "unmount" && c[0] != "receive"));
+            .all(|c| c[0] != "rollback" && c[0] != "diff"));
     }
 
     /// Every refusal happens before `zfs receive`, and the stream is not

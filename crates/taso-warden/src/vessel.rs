@@ -114,18 +114,23 @@ pub trait Pool {
         to: (Lsn, HashVal),
         stream: &mut dyn std::io::Read,
     ) -> Result<u64, LayerError>;
-    /// Adopt a fork's state (P3 close-out C7): receive an increment made
-    /// on the fork's dataset from `dataset`'s newest Seal snapshot `base`
-    /// as `dataset`'s Seal layer `to`, bound to its hash.  The dataset is
-    /// unmounted for it and left unmounted; what was written after `base`
-    /// is discarded.  Calling it again for a layer already there binds it
-    /// and returns.  Returns the layer's guid.
+    /// Adopt a fork's state (P3 close-out C7): make `dataset`, at its
+    /// newest Seal layer `base`, what the fork `child` is at its Seal
+    /// `child_seal` (a fork of `dataset` at `base`), as `dataset`'s Seal
+    /// layer `to`, bound to its hash.  What was written after `base` is
+    /// discarded.  How is the pool's: the block log imports the fork's
+    /// increment from `base` (made with `sender`); ZFS, which cannot
+    /// receive a clone's increment into its origin, copies the fork's
+    /// changes ([`Zfs::adopt_copy`]).  Calling it again for a layer
+    /// already there binds it and returns.  Returns the layer's guid.
     fn adopt(
         &self,
         dataset: &Dataset,
         base: (Lsn, HashVal),
         to: (Lsn, HashVal),
-        stream: &mut dyn std::io::Read,
+        child: &Dataset,
+        child_seal: Lsn,
+        sender: &dyn Sender,
     ) -> Result<u64, LayerError>;
     /// Receive a stream that is incremental from another dataset's Seal
     /// snapshot (`base`, a Template's) into the new clone `dataset`.  As
@@ -179,9 +184,11 @@ impl<R: Runner + Clone> Pool for Zfs<R> {
         dataset: &Dataset,
         base: (Lsn, HashVal),
         to: (Lsn, HashVal),
-        stream: &mut dyn std::io::Read,
+        child: &Dataset,
+        child_seal: Lsn,
+        _sender: &dyn Sender,
     ) -> Result<u64, LayerError> {
-        Ok(Zfs::receive_adopted(self, dataset, base, to, stream)?.guid)
+        Ok(Zfs::adopt_copy(self, dataset, base, to, child, child_seal)?.guid)
     }
 
     fn receive_clone(
@@ -600,16 +607,19 @@ impl<P: Pool> Host<P> {
             ..StreamCut::EMPTY
         };
         let child_ds = self.dataset_for(child.chronicle);
-        let from = vessel.dataset().seal_snapshot(fork.lsn);
-        let mut stream = sender
-            .send(&child_ds, Some(&from), t.lsn)
-            .map_err(|e| VesselError::Pool(LayerError::from(e)))?;
         let dataset = vessel.dataset().clone();
         let pool = &self.pool;
         let sealed =
             vessel.seal_with_layer(cut, Verdict::Clean, summary.effect, turn, |lsn, hash| {
-                pool.adopt(&dataset, (fork.lsn, fork.hash), (lsn, hash), &mut stream)
-                    .map(|_| ())
+                pool.adopt(
+                    &dataset,
+                    (fork.lsn, fork.hash),
+                    (lsn, hash),
+                    &child_ds,
+                    t.lsn,
+                    sender,
+                )
+                .map(|_| ())
             })?;
         Ok(sealed.seal)
     }
@@ -1915,8 +1925,13 @@ pub(crate) mod tests {
             dataset: &Dataset,
             base: (Lsn, HashVal),
             to: (Lsn, HashVal),
-            stream: &mut dyn std::io::Read,
+            child: &Dataset,
+            child_seal: Lsn,
+            sender: &dyn Sender,
         ) -> Result<u64, LayerError> {
+            let from = dataset.seal_snapshot(base.0);
+            let mut stream = sender.send(child, Some(&from), child_seal)?;
+            let stream = &mut stream;
             // The newest layer must be `base` (the M7 condition).
             let newest = self
                 .0
