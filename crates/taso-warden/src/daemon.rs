@@ -96,12 +96,13 @@
 //!
 //! - Successions from a config entry (forks are: [`ForkConf`], and forks
 //!   asked for over the Field: [`ForksConf`]).
-//! - Fork slots for Kubernetes Vessels: the CRD has no `forks` field, so
-//!   their agents' fork requests are refused.
 //! - Children asked for over the Field are run by the Warden that made
-//!   them; a new Warden does not list them again (their datasets, logs
-//!   and slots stay: a promotion still reads them, and their slots are
-//!   not given to another child).
+//!   them; a new Warden does not list them again.  What happens to them
+//!   then is the prime agent's call: their datasets, logs and slots stay,
+//!   so it can still promote one (a promotion reads the log, it does not
+//!   need the child running), or ask for new forks in its remaining
+//!   slots.  A child cut short by the restart stays at its last Seal and
+//!   keeps its slot.
 //!
 //! - A coordinator on another node: `remote` is a Unix socket, so across
 //!   nodes it is forwarded (e.g. `ssh -L local.sock:remote.sock`).

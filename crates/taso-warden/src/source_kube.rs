@@ -67,8 +67,8 @@ use taso_core::model::WardenId;
 use taso_core::record::Namespace;
 
 use crate::daemon::{
-    check_env, check_quiescence, valid_kube_namespace, ForkConf, KubeSourceConf, Restart,
-    RuntimeConf, TakeOver, VesselConf, VesselRuntime,
+    check_env, check_quiescence, valid_kube_namespace, ForkConf, ForksConf, KubeSourceConf,
+    Restart, RuntimeConf, TakeOver, VesselConf, VesselRuntime,
 };
 use crate::kube::{valid_name, Kube, KubeError, Resource};
 use crate::source::{SourceError, VesselKey, VesselSource};
@@ -286,6 +286,7 @@ impl<L: ListVessels> KubeSource<L> {
                 "node",
                 "takeover",
                 "fork",
+                "forks",
                 "rootfs",
                 "args",
                 "env",
@@ -335,6 +336,11 @@ impl<L: ListVessels> KubeSource<L> {
         let fork = match spec.get("fork") {
             None | Some(Value::Null) => None,
             Some(f) => Some(fork(f, subject)?),
+        };
+        // The forks its agent may ask for over the Field (P3 file 11).
+        let forks = match spec.get("forks") {
+            None | Some(Value::Null) => None,
+            Some(f) => Some(Box::new(forks(f, uid_slot)?)),
         };
 
         // D2.
@@ -407,7 +413,7 @@ impl<L: ListVessels> KubeSource<L> {
             fork,
             effects: None,
             promote: None,
-            forks: None,
+            forks,
             namespace: tenant,
             subject: subject.to_string(),
             takeover,
@@ -515,6 +521,35 @@ fn fork(v: &Value, subject: &str) -> Result<ForkConf, String> {
         parent: parent.to_string(),
         seal,
     })
+}
+
+/// `spec.forks`: `{"slots": [<uidSlot>, ...]}`: 1 to 64 distinct slots
+/// from 0 to 65000, none the Vessel's own.  Whether another Vessel holds
+/// one is the guard's to say ([`crate::source::Guard`]).
+fn forks(v: &Value, uid_slot: u32) -> Result<ForksConf, String> {
+    let o = v.as_object().ok_or("spec.forks must be {slots}")?;
+    known_keys(o, "spec.forks", &["slots"])?;
+    let a = o
+        .get("slots")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty() && a.len() <= 64)
+        .ok_or("spec.forks.slots must be 1 to 64 uid slots")?;
+    let mut slots = Vec::new();
+    for x in a {
+        let s = x
+            .as_u64()
+            .filter(|s| *s <= 65_000)
+            .ok_or("spec.forks.slots: each must be an integer from 0 to 65000")?
+            as u32;
+        if s == uid_slot {
+            return Err(format!("spec.forks.slots: {s} is the Vessel's own uidSlot"));
+        }
+        if slots.contains(&s) {
+            return Err(format!("spec.forks.slots: {s} is listed twice"));
+        }
+        slots.push(s);
+    }
+    Ok(ForksConf { slots })
 }
 
 /// `spec.takeover`: `{"holder": <warden>, "epoch": <n>}`, both positive
@@ -855,6 +890,34 @@ mod tests {
         ] {
             let e = one(&f, json!({ "fork": fork.clone() })).unwrap_err();
             assert!(e.contains(says), "{fork}: {e}");
+        }
+    }
+
+    /// `spec.forks` gives the agent's forks their slots (P3 file 11);
+    /// whether another Vessel holds one is the guard's to say.
+    #[test]
+    fn a_forks_resource_gives_its_agent_fork_slots() {
+        let f = fixture();
+        assert_eq!(one(&f, json!({})).unwrap().forks, None);
+        assert_eq!(one(&f, json!({ "forks": null })).unwrap().forks, None);
+        let vc = one(&f, json!({ "forks": { "slots": [7, 3] } })).unwrap();
+        assert_eq!(vc.forks, Some(Box::new(ForksConf { slots: vec![7, 3] })));
+        for (forks, says) in [
+            (json!([7]), "must be {slots}"),
+            (json!({}), "1 to 64 uid slots"),
+            (json!({ "slots": [] }), "1 to 64 uid slots"),
+            (
+                json!({ "slots": (0..65).collect::<Vec<u32>>() }),
+                "1 to 64 uid slots",
+            ),
+            (json!({ "slots": [65_001] }), "0 to 65000"),
+            (json!({ "slots": ["7"] }), "0 to 65000"),
+            (json!({ "slots": [1] }), "the Vessel's own uidSlot"),
+            (json!({ "slots": [7, 7] }), "listed twice"),
+            (json!({ "slots": [7], "max": 1 }), "unknown"),
+        ] {
+            let e = one(&f, json!({ "forks": forks.clone() })).unwrap_err();
+            assert!(e.contains(says), "{forks}: {e}");
         }
     }
 

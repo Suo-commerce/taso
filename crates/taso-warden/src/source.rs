@@ -15,6 +15,10 @@
 //!
 //! - **One entry per Vessel id**, and a slot range that fits above the
 //!   node's `host_uid_base`.
+//! - **A fork slot is its child's** (P3 file 11): a slot an entry gives
+//!   its agent's forks (`forks`) is bound to the one child that may take
+//!   it, from the entry's admission on and for good; another Vessel asking
+//!   for it is refused, and so is an entry whose fork slots another has.
 //! - **No two Vessels share a uid slot** — not at once, and not over time:
 //!   a slot whose range owns files on the node stays reserved for them,
 //!   also after their Vessel is removed.  "Over time" spans Warden
@@ -229,6 +233,22 @@ impl VesselSource for WithRequested<'_> {
     fn is_finite(&self) -> bool {
         self.inner.is_finite() && !self.requested.unreported()
     }
+}
+
+/// `vc`'s fork slots, each with the key of the only child that may take
+/// it ([`crate::daemon::ForksConf::child_name`]).
+fn fork_slots(vc: &VesselConf) -> Vec<(u32, VesselKey)> {
+    vc.forks
+        .iter()
+        .flat_map(|f| &f.slots)
+        .map(|&s| {
+            let name = crate::daemon::ForksConf::child_name(&vc.subject, s);
+            (
+                s,
+                *taso_core::record::vessel_id(vc.namespace, name.as_bytes()).as_bytes(),
+            )
+        })
+        .collect()
 }
 
 /// A Vessel's key: its Chronicle id.
@@ -518,7 +538,47 @@ impl Guard {
                     continue;
                 }
             }
+            // Its fork slots: each only ever its own child's.
+            let forks = fork_slots(vc);
+            let clash = forks.iter().find_map(|&(s, child)| {
+                if s == vc.uid_slot {
+                    return Some(format!("fork slot {s} is its own uid_slot"));
+                }
+                let fits = VesselConf {
+                    uid_slot: s,
+                    ..vc.clone()
+                }
+                .host_uid(&self.runtime)
+                .is_some();
+                if !fits {
+                    return Some(format!(
+                        "fork slot {s} does not fit above host_uid_base {}",
+                        self.runtime.host_uid_base
+                    ));
+                }
+                if self.slots.get(&s).is_some_and(|o| *o != child) {
+                    return Some(format!(
+                        "fork slot {s} is bound to another Vessel on this node"
+                    ));
+                }
+                if let Some(why) = self.blocked_slots.get(&s) {
+                    return Some(format!("fork slot {s} is not given: {why}"));
+                }
+                if slots_now.get(&s).is_some_and(|o| *o != child) {
+                    return Some(format!(
+                        "fork slot {s} is taken by another entry in this set"
+                    ));
+                }
+                None
+            });
+            if let Some(why) = clash {
+                refuse(vc, key, why, &self.running);
+                continue;
+            }
             slots_now.insert(vc.uid_slot, key);
+            for (s, child) in forks {
+                slots_now.insert(s, child);
+            }
             set.insert(key, vc.clone());
         }
 
@@ -527,14 +587,21 @@ impl Guard {
             if r.kept_previous {
                 let prev = self.running[&r.key].clone();
                 slots_now.insert(prev.uid_slot, r.key);
+                for (s, child) in fork_slots(&prev) {
+                    slots_now.insert(s, child);
+                }
                 set.entry(r.key).or_insert(prev);
             }
         }
 
-        // Record what runs now; bindings are kept for good.
+        // Record what runs now; bindings are kept for good (a fork slot is
+        // bound to the child that may take it, made or not).
         for (key, vc) in &set {
             self.slots.entry(vc.uid_slot).or_insert(*key);
             self.bound.entry(*key).or_insert(vc.uid_slot);
+            for (s, child) in fork_slots(vc) {
+                self.slots.entry(s).or_insert(child);
+            }
         }
         self.running = set.clone();
 
@@ -613,6 +680,71 @@ mod tests {
         let set = src.poll(z).unwrap().unwrap();
         assert_eq!(names(&set), vec!["p", "p-fork-5"]);
         assert_eq!(set.iter().find(|v| v.subject == "p").unwrap().uid_slot, 1);
+    }
+
+    fn with_forks(subject: &str, slot: u32, forks: &[u32]) -> VesselConf {
+        VesselConf {
+            forks: Some(Box::new(crate::daemon::ForksConf {
+                slots: forks.to_vec(),
+            })),
+            ..vc(subject, slot)
+        }
+    }
+
+    /// A fork slot is its child's: the child itself is admitted in it,
+    /// nobody else is (in the same set or later, also after the parent is
+    /// gone), and an entry whose fork slots another Vessel holds, or that
+    /// do not fit, is refused.
+    #[test]
+    fn fork_slots_are_their_childs_only() {
+        let mut g = Guard::new(runtime());
+        let child = |s: u32| VesselConf {
+            fork: Some(crate::daemon::ForkConf {
+                parent: "p".into(),
+                seal: crate::vessel::SealAt::Last,
+            }),
+            ..vc(&crate::daemon::ForksConf::child_name("p", s), s)
+        };
+        // The child before or after its parent in key order: both admitted.
+        let a = g.admit(vec![with_forks("p", 1, &[4, 5]), child(4), vc("x", 5)]);
+        assert_eq!(subjects(&a), [("p".into(), 1), ("p-fork-4".into(), 4)]);
+        assert_eq!(reasons(&a), [("x".into(), false)]);
+        assert!(
+            a.refused[0].reason.contains("taken by another entry"),
+            "{a:?}"
+        );
+        // Later, with the parent gone: slot 5 is still its child's.
+        let a = g.admit(vec![vc("x", 5)]);
+        assert!(
+            a.refused[0].reason.contains("bound to another Vessel"),
+            "{a:?}"
+        );
+        let a = g.admit(vec![child(5)]);
+        assert_eq!(subjects(&a), [("p-fork-5".into(), 5)]);
+
+        // An entry whose fork slot another Vessel holds, or that does not fit.
+        let mut g = Guard::new(runtime());
+        g.admit(vec![vc("y", 6)]);
+        for (forks, says) in [
+            (&[7, 6][..], "fork slot 6 is bound to another Vessel"),
+            (&[2][..], "fork slot 2 is its own uid_slot"),
+            (&[70_000][..], "fork slot 70000 does not fit"),
+        ] {
+            let a = g.admit(vec![vc("y", 6), with_forks("q", 2, forks)]);
+            assert_eq!(subjects(&a), [("y".into(), 6)]);
+            assert!(a.refused[0].reason.contains(says), "{forks:?}: {a:?}");
+        }
+        // Two entries naming one fork slot: the smaller Vessel id wins.
+        let mut g = Guard::new(runtime());
+        let (m, n) = (with_forks("m", 1, &[9]), with_forks("n", 2, &[9]));
+        let first = if m.id().as_bytes() < n.id().as_bytes() {
+            "m"
+        } else {
+            "n"
+        };
+        let a = g.admit(vec![m, n]);
+        assert_eq!(a.set.len(), 1);
+        assert_eq!(a.set[0].subject, first);
     }
 
     /// A child asked for before the source ever answered waits for that
