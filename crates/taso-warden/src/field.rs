@@ -189,6 +189,10 @@ pub struct Session<'v, L: Layers> {
     after_seal: Option<&'v mut dyn AfterSeal<L>>,
     /// Forks and promotions, if this Vessel may ask for them.
     branches: Option<&'v mut dyn Branches<L>>,
+    /// A promotion is done and its files are adopted at the next start
+    /// (C7): until then this Vessel takes no Seal (it would move), and the
+    /// agent may only record transcript and read results.
+    adopting: bool,
     /// How many times it failed, and the last reason.
     after_seal_failures: u64,
     last_after_seal_error: Option<String>,
@@ -224,6 +228,7 @@ impl<'v, L: Layers> Session<'v, L> {
             watch: None,
             after_seal: None,
             branches: None,
+            adopting: false,
             after_seal_failures: 0,
             last_after_seal_error: None,
             pending_seal: None,
@@ -321,6 +326,24 @@ impl<'v, L: Layers> Session<'v, L> {
             return error(
                 ErrorCode::NotOnThisSocket,
                 format!("{} belongs on {other}", request_name(&req)),
+            );
+        }
+        if self.adopting
+            && conn.greeted
+            && matches!(
+                req,
+                Request::Effect { .. }
+                    | Request::TurnEnd { .. }
+                    | Request::Fork { .. }
+                    | Request::Promote { .. }
+            )
+        {
+            return error(
+                ErrorCode::Closed,
+                format!(
+                    "{}: this vessel was promoted; it adopts its child's files at its next start, and the Warden starts its agent again on them",
+                    request_name(&req)
+                ),
             );
         }
         match (conn.greeted, req) {
@@ -568,20 +591,26 @@ impl<'v, L: Layers> Session<'v, L> {
             self.ledger = self.vessel.tail().lsn;
         }
         match r {
-            Ok((record, adopted)) => PromoteResult::Promoted {
-                seal: record.seal.get(),
-                adopted: adopted.iter().map(|a| a.op.get()).collect(),
-            },
+            Ok((record, adopted)) => {
+                self.adopting = true;
+                PromoteResult::Promoted {
+                    seal: record.seal.get(),
+                    adopted: adopted.iter().map(|a| a.op.get()).collect(),
+                }
+            }
             // Done; Open lists the adopted ops once a ship succeeds (it
             // retries before each Open).
             Err(crate::effects::PromoteError::AdoptionNotShipped {
                 promotion,
                 adopted,
                 ..
-            }) => PromoteResult::Promoted {
-                seal: promotion.seal.get(),
-                adopted: adopted.iter().map(|a| a.op.get()).collect(),
-            },
+            }) => {
+                self.adopting = true;
+                PromoteResult::Promoted {
+                    seal: promotion.seal.get(),
+                    adopted: adopted.iter().map(|a| a.op.get()).collect(),
+                }
+            }
             Err(crate::effects::PromoteError::Vessel(e)) => refused(e.to_string()),
             Err(crate::effects::PromoteError::NotShipped(e)) => refused(format!(
                 "the Promotion is recorded but the ledger could not be shipped ({e}); nothing is adopted until it is finished at this vessel's next start"
@@ -1995,18 +2024,25 @@ mod tests {
         assert!(effects
             .iter()
             .all(|e| e.request.starts_with(b"child-") && !e.unknown));
-        // The sibling, and c1 again: one choice per fork point.
-        for c in ["c2", "c1"] {
-            assert!(matches!(
-                s.handle(Request::Promote {
-                    child: c.into(),
-                    seal: None
-                }),
-                Reply::Promote {
-                    result: PromoteResult::Refused { .. },
-                    ..
-                }
-            ));
+        // The sibling, c1 again, and a turn: the Vessel is promoted, its
+        // files are adopted at the next start (C7), so nothing more is taken
+        // until then; one choice per fork point holds below that too.
+        for req in [
+            Request::Promote {
+                child: "c2".into(),
+                seal: None,
+            },
+            Request::Promote {
+                child: "c1".into(),
+                seal: None,
+            },
+            Request::TurnEnd {
+                turn: 9,
+                quiescent: true,
+            },
+            Request::Fork { seal: None },
+        ] {
+            assert!(is_error(&s.handle(req), ErrorCode::Closed));
         }
         let Reply::Open { effects: after } = s.handle_as(&mut sender(), Request::Open) else {
             panic!()
@@ -2021,20 +2057,24 @@ mod tests {
             after.iter().all(|e| e.unknown),
             "listed before: may have been acted on"
         );
-        // Not a child of this Vessel: refused.
+        // Results stay readable.
         assert!(matches!(
-            s.handle(Request::Promote {
-                child: "nobody".into(),
-                seal: None
-            }),
-            Reply::Promote {
-                result: PromoteResult::Refused { .. },
+            s.handle(Request::Result { op: adopted[0] }),
+            Reply::Result {
+                state: OpState::Pending,
                 ..
             }
         ));
         drop(s);
-        assert_eq!(b.promoted.len(), 4);
-        assert!(p.last_seal().unwrap().lsn.get() == fork_seal);
+        assert_eq!(b.promoted.len(), 1);
+        assert!(
+            p.last_seal().unwrap().lsn.get() == fork_seal,
+            "no Seal taken"
+        );
+        assert!(
+            p.adoption_pending().unwrap().is_some(),
+            "the files are still to come"
+        );
     }
 
     /// A store that is down from the `from`-th ship on, until `up` is set.

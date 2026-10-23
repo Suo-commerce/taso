@@ -57,12 +57,15 @@
 #                  files (idmapped), continued the parent's turns, its
 #                  effect held (none released), its own 2 asks refused
 #                  ("may not fork"); the Warden exits 0
-#   R10 promote    phase 5: the first promotion adopts exactly the child's
-#                  1 proposal, the second is refused ("already promoted");
-#                  the agent's Result for the adopted op says Pending
-#                  (C5, 2026-10-23: Open is the sender's, an agent asks
-#                  Result; until then this row checked that Open listed 2);
-#                  the Warden exits 0
+#   R10 promote    phase 5: the promotion adopts exactly the child's 1
+#                  proposal and ends the run; the Warden starts the parent
+#                  again and first adopts the child's files as its adoption
+#                  Seal (C7, 2026-10-23, prediction written before the first
+#                  run: the parent resumes after the child's turn T+1, on
+#                  the child's database, 8 rows per turn, so 8(T+2) rows
+#                  after its next turn; its own second-run asks to promote
+#                  are refused, "sealed again"); the Warden exits 0.
+#                  (Before C7 this row checked the adopted op's Result.)
 #
 # Usage (root on a node with runc, cargo, python3, ublk and the installed
 # taso-blkd; node-setup.sh vessel-blk):
@@ -426,20 +429,26 @@ row R9 "$r9"
 # ── phase 5: the promotion asked for over the Field ────────────────────
 EXTRA="--promote parent-fork-3 --promote parent-fork-3" config "$WORK/p5.json" 1 "$PARENT_F"
 rc5=$(wardend phase5 "$WORK/p5.json")
-r10=$(python3 - "$WORK/mnt/$PDS/sim-stats.json" <<'PY'
+r10=$(python3 - "$WORK/mnt/$PDS/sim-stats.json" "$P4_TURN" <<'PY'
 import json, sys
+t = int(sys.argv[2])
 try: p = json.load(open(sys.argv[1]))
 except (OSError, ValueError) as e: print(f"FAIL (sim-stats: {e})"); sys.exit()
-pr, why = p.get("promotions", []), []
-if len(pr) != 2 or pr[0].get("child") != "parent-fork-3" or len(pr[0].get("adopted", [])) != 1:
-    why.append(f"first: {pr[:1]}")
-if len(pr) != 2 or "already promoted" not in pr[1].get("refused", ""): why.append(f"second: {pr[1:]}")
-if p.get("adopted_states") != ["Pending"]: why.append(f"adopted states {p.get('adopted_states')} (want ['Pending'])")
-print("PASS (1 adopted and pending, the second refused)" if not why else "FAIL (" + "; ".join(why) + ")")
+why = []
+# The second run's stats: on the child's files.
+if (p.get("resumed_after"), p.get("turns")) != (t + 1, [t + 2, t + 2]):
+    why.append(f"resumed after {p.get('resumed_after')}, turns {p.get('turns')} (want after {t + 1})")
+if p.get("rows_in_db") != 8 * (t + 2):
+    why.append(f"{p.get('rows_in_db')} rows (want {8 * (t + 2)}: the child's database and one more turn)")
+pr = p.get("promotions", [])
+if not pr or not all("sealed again" in x.get("refused", "") for x in pr):
+    why.append(f"second-run asks: {pr}")
+print(f"PASS (1 adopted; restarted on the child's files: resumed after {t + 1}, {8 * (t + 2)} rows)" if not why else "FAIL (" + "; ".join(why) + ")")
 PY
 )
 if [ "$rc5" != 0 ]; then r10="FAIL (exit $rc5; ${r10})"
 elif ! grep -q "parent: promoted \"parent-fork-3\" at Seal lsn [0-9]* on its agent's request: 1 effect(s) adopted" "$OUT/phase5.err"; then r10="FAIL (no promotion logged; ${r10})"
+elif ! grep -q "parent: adopted the files of [0-9a-f]* at its Seal lsn [0-9]*: the adoption Seal at lsn [0-9]*" "$OUT/phase5.err"; then r10="FAIL (no adoption Seal logged; ${r10})"
 fi
 row R10 "$r10"
 

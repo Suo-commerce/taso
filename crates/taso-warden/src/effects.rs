@@ -52,7 +52,9 @@
 //! Promotion without its adoption (finished on reopen) or the whole
 //! adoption.  The adoption is shipped too before any of it is listed.  A
 //! sibling that was not promoted has no Promotion and no adopted intent:
-//! nothing of it was ever released.
+//! nothing of it was ever released.  The child's files follow as the
+//! parent's next Seal, its adoption Seal ([`crate::vessel::Host::adopt_files`],
+//! C7): the Promotion record is the commit for both.
 //!
 //! # Listing ([`Effects::released`]): only what is off the node
 //!

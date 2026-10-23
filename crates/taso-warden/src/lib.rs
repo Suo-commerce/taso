@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod adoptcopy;
 mod bench;
 pub mod blk;
 pub mod chronicle;

@@ -160,6 +160,21 @@ impl Pool for Storage {
         }
     }
 
+    fn adopt(
+        &self,
+        dataset: &Dataset,
+        base: (Lsn, HashVal),
+        to: (Lsn, HashVal),
+        child: &Dataset,
+        child_seal: Lsn,
+        sender: &dyn crate::ship::Sender,
+    ) -> Result<u64, LayerError> {
+        match self {
+            Self::Zfs(z) => Pool::adopt(z, dataset, base, to, child, child_seal, sender),
+            Self::Blk(p) => p.adopt(dataset, base, to, child, child_seal, sender),
+        }
+    }
+
     fn receive_clone(
         &self,
         dataset: &Dataset,

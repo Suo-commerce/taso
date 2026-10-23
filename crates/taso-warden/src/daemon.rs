@@ -67,6 +67,11 @@
 //! 4. **Effects**: the engine is opened (and reconciles) with the pack
 //!    publisher: no effect is sent before its authorization is shipped.
 //!    Taso never sends; the sender's contract is in `docs/relay.md`.
+//!    A promotion whose files are not adopted yet is finished here too
+//!    (C7): the child's increment from the fork Seal becomes this Vessel's
+//!    adoption Seal before the agent runs ([`Host::adopt_files`]), so the
+//!    agent starts on the child's files and continues its turns.  A
+//!    promotion asked for over the Field ends the run for that.
 //! 5. **Field socket** at `<run_dir>/v-<id>/field.sock`, owned by the
 //!    Vessel's mapped root so the agent can connect.  Each Vessel has its
 //!    own host uid/gid range ([`VesselConf::uid_slot`]); the dataset's
@@ -1522,7 +1527,14 @@ impl AfterSeal<StorageLayers> for SealPublisher {
 struct NodeBranches<'n> {
     node: &'n Node,
     vc: &'n VesselConf,
+    /// Requested once a promotion is done: the run ends, and the files are
+    /// adopted at the next start (C7).
+    promoted: &'n Stop,
 }
+
+/// How long an agent that asked for a promotion has to exit by itself
+/// before its container is killed (C7).
+const PROMOTED_GRACE: Duration = Duration::from_secs(2);
 
 impl Branches<StorageLayers> for NodeBranches<'_> {
     fn fork(
@@ -1600,13 +1612,16 @@ impl Branches<StorageLayers> for NodeBranches<'_> {
 
     fn promoted(&mut self, child: &str, result: &PromoteResult) {
         match result {
-            PromoteResult::Promoted { seal, adopted } => self.node.log(
-                self.vc,
-                format_args!(
-                    "promoted {child:?} at Seal lsn {seal} on its agent's request: {} effect(s) adopted",
-                    adopted.len()
-                ),
-            ),
+            PromoteResult::Promoted { seal, adopted } => {
+                self.node.log(
+                    self.vc,
+                    format_args!(
+                        "promoted {child:?} at Seal lsn {seal} on its agent's request: {} effect(s) adopted; its files at the next start",
+                        adopted.len()
+                    ),
+                );
+                self.promoted.request();
+            }
             PromoteResult::Refused { reason } => self.node.log(
                 self.vc,
                 format_args!("promotion of {child:?} refused: {reason}"),
@@ -2122,7 +2137,32 @@ impl Node {
     /// runs kills its container (right away, also in the middle of a Field
     /// session), and the run ends as on an agent exit, with
     /// [`Report::stopped`] set.
+    ///
+    /// A promotion the agent asks for over the Field ends the run (its
+    /// files are adopted before it runs again, C7 Q1): the Vessel is started
+    /// again at once, within this run and whatever its restart policy, and
+    /// the agent comes back on the child's files.
     pub fn run_vessel_until(&self, vc: &VesselConf, stop: &Stop) -> Result<Report, DaemonError> {
+        loop {
+            let promoted = Stop::new();
+            let report = self.run_once(vc, stop, &promoted)?;
+            if promoted.requested() && !stop.requested() {
+                self.log(
+                    vc,
+                    "promoted on its agent's request: starting it again to adopt the child's files",
+                );
+                continue;
+            }
+            return Ok(report);
+        }
+    }
+
+    fn run_once(
+        &self,
+        vc: &VesselConf,
+        stop: &Stop,
+        promoted: &Stop,
+    ) -> Result<Report, DaemonError> {
         // Before anything touches the coordinator or the dataset.
         let rt = vc
             .effective(&self.config.runtime, &self.config.quiescence)
@@ -2305,7 +2345,45 @@ impl Node {
             }
         }
 
-        // A reborn dataset was received unmounted.
+        // The promoted child's files (C7): the adoption Seal, before the
+        // agent runs, from the child's log on this node (forks are
+        // node-bound), then published at once.
+        if let Some(p) = vessel.adoption_pending()? {
+            let refused = |e: VesselError| {
+                DaemonError::Refused(format!(
+                    "adopting the files of {} promoted at its Seal lsn {}: {e}",
+                    id_hex(p.child),
+                    p.seal.get()
+                ))
+            };
+            let child = self.host().read_log_of(p.child).map_err(refused)?;
+            let seal = self
+                .host()
+                .adopt_files(&mut vessel, &p, &child, &self.storage.sender())
+                .map_err(refused)?;
+            self.log(
+                vc,
+                format_args!(
+                    "adopted the files of {} at its Seal lsn {}: the adoption Seal at lsn {}",
+                    id_hex(p.child),
+                    p.seal.get(),
+                    seal.lsn.get()
+                ),
+            );
+            match publisher.publish(&mut vessel, seal) {
+                Ok(true) => publisher.published += 1,
+                Ok(false) => {}
+                Err(e) => self.log(
+                    vc,
+                    format_args!(
+                        "publishing the adoption Seal (lsn {}) failed: {e}",
+                        seal.lsn.get()
+                    ),
+                ),
+            }
+        }
+
+        // A reborn (or adopting) dataset was received unmounted.
         self.storage
             .ensure_mounted(vessel.dataset())
             .map_err(|e| DaemonError::Io(format!("mount: {e}")))?;
@@ -2415,18 +2493,30 @@ impl Node {
         // doing; the agent's connection then closes and the loop ends as on
         // an exit.  It keeps trying until the agent is gone (a kill can fail
         // while the container is still being created).
+        // A promotion asked for over the Field ends the run too, after a
+        // grace for the agent to exit by itself (C7).
         let stopper = {
-            let (stop, exited, id) = (stop.clone(), exited.clone(), spec.id.clone());
+            let (stop, promoted, exited, id) = (
+                stop.clone(),
+                promoted.clone(),
+                exited.clone(),
+                spec.id.clone(),
+            );
             let runc = Runc::new(RuncCli::new(self.config.run_dir.join("runc")));
             std::thread::spawn(move || {
                 let mut killed = false;
+                let mut since: Option<std::time::Instant> = None;
                 while !exited.load(Ordering::SeqCst) {
-                    if stop.requested() {
+                    if promoted.requested() {
+                        since.get_or_insert_with(std::time::Instant::now);
+                    }
+                    let grace_over = since.is_some_and(|t| t.elapsed() >= PROMOTED_GRACE);
+                    if stop.requested() || grace_over {
                         killed |= runc.kill(&id).is_ok();
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                killed || stop.requested()
+                stop.requested() || (killed && !promoted.requested())
             })
         };
 
@@ -2440,7 +2530,11 @@ impl Node {
             let dbs: Vec<&str> = rt.quiescence.iter().map(String::as_str).collect();
             Some(Watch::new(&mount, &dbs).map_err(io("quiescence watch"))?)
         };
-        let mut branches = NodeBranches { node: self, vc };
+        let mut branches = NodeBranches {
+            node: self,
+            vc,
+            promoted,
+        };
         let mut session = Session::new(&mut vessel, verdict)?
             .with_effects(&mut effects)
             .with_after_seal(&mut publisher)

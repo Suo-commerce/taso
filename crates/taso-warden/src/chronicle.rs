@@ -772,6 +772,39 @@ impl<L: Layers> Chronicle<L> {
         turn: TurnId,
         check: impl FnOnce() -> Result<(), String>,
     ) -> Result<Sealed, ChronicleError> {
+        self.seal_made(cut, verdict, ledger_pos, turn, None, check)
+    }
+
+    /// A Seal whose layer is not a snapshot of the current state but made
+    /// by `make(lsn, hash)`, which must leave the layer for the Seal record
+    /// at `lsn` with hash `hash` (as [`Layers::snapshot`] would): a
+    /// promotion's adoption, the child's state received as this Vessel's
+    /// (P3 close-out C7).  Everything else is a Seal's: layer first, then
+    /// the record; a layer whose record is not accepted is an orphan,
+    /// destroyed now or by the next open.
+    pub fn seal_with_layer(
+        &mut self,
+        cut: StreamCut,
+        verdict: Verdict,
+        ledger_pos: Lsn,
+        turn: TurnId,
+        make: impl FnOnce(Lsn, HashVal) -> Result<(), LayerError>,
+    ) -> Result<Sealed, ChronicleError> {
+        self.seal_made(cut, verdict, ledger_pos, turn, Some(Box::new(make)), || {
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn seal_made(
+        &mut self,
+        cut: StreamCut,
+        verdict: Verdict,
+        ledger_pos: Lsn,
+        turn: TurnId,
+        make: Option<Box<dyn FnOnce(Lsn, HashVal) -> Result<(), LayerError> + '_>>,
+        check: impl FnOnce() -> Result<(), String>,
+    ) -> Result<Sealed, ChronicleError> {
         self.ready()?;
         let _total = crate::timing::span("seal.total");
         let lsn = self.segment.tail().lsn.next();
@@ -788,9 +821,11 @@ impl<L: Layers> Chronicle<L> {
         );
         let hash = rec.envelope.hash;
         let snap = crate::timing::span("seal.snapshot");
-        self.layers
-            .snapshot(lsn, hash)
-            .map_err(ChronicleError::Layer)?;
+        match make {
+            None => self.layers.snapshot(lsn, hash),
+            Some(make) => make(lsn, hash),
+        }
+        .map_err(ChronicleError::Layer)?;
         drop(snap);
         if let Err(why) = check() {
             // Best effort: if this fails, the next recovery destroys the

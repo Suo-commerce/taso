@@ -188,6 +188,14 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
     }
     let mut promotions = Vec::new();
     for child in &o.promote {
+        // Promoted: nothing more is asked (C7: the Warden restarts this
+        // agent on the child's files).
+        if promotions
+            .iter()
+            .any(|p: &serde_json::Value| p.get("adopted").is_some())
+        {
+            break;
+        }
         promotions.push(
             match field.ask(Request::Promote {
                 child: child.clone(),
@@ -232,8 +240,12 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
     let mut turn_ends = Vec::new();
     let (mut sealed, mut not_sealed) = (0u64, 0u64);
     let (mut released, mut held, mut refused) = (0u64, 0u64, Vec::new());
+    // Promoted: the Warden adopts the child's files at the next start and
+    // runs this agent again on them (C7); no turn is taken until then.
+    let promoted = promotions.iter().any(|p| p.get("adopted").is_some());
+    let (turns, fork_asks) = if promoted { (0, 0) } else { (o.turns, o.forks) };
     let start = Instant::now();
-    for turn in first..first + o.turns {
+    for turn in first..first + turns {
         for _ in 0..o.txns {
             let t = Instant::now();
             let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
@@ -298,7 +310,7 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
         }
     }
     let mut forks = Vec::new();
-    for _ in 0..o.forks {
+    for _ in 0..fork_asks {
         forks.push(match field.ask(Request::Fork { seal: None })? {
             None => json!({ "refused": "bare: no Field" }),
             Some(Reply::Fork {
@@ -316,7 +328,8 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
     Ok(json!({
         "bare": o.bare,
         "resumed_after": resumed_after,
-        "turns": [first, first + o.turns - 1],
+        "turns": if turns > 0 { json!([first, first + turns - 1]) } else { json!(null) },
+        "promoted_then_exited": promoted,
         "rows_in_db": rows,
         "sealed": sealed,
         "not_sealed": not_sealed,
@@ -452,9 +465,11 @@ mod tests {
         assert!(st["turn_end"].is_null());
     }
 
-    /// Against a stand-in Warden: promotions right after Hello, then
-    /// Open; effects per turn; forks after the last turn.  Every answer,
-    /// a refusal too, is in the stats.
+    /// Against a stand-in Warden, two runs.  With promotions: right after
+    /// Hello, then each adopted op's Result; one succeeded, so no turn and
+    /// no fork follows (C7: the Warden restarts the agent on the child's
+    /// files).  Without: effects per turn, forks after the last turn.
+    /// Every answer, a refusal too, is in the stats.
     #[test]
     fn field_run_promotes_declares_and_forks() {
         use std::os::unix::net::UnixListener;
@@ -463,67 +478,71 @@ mod tests {
         let sock = dir.path().join("f.sock");
         let listener = UnixListener::bind(&sock).unwrap();
         let warden = std::thread::spawn(move || {
-            let (mut c, _) = listener.accept().unwrap();
-            let mut seen = Vec::new();
+            let mut runs = Vec::new();
             let mut forks = 0;
-            while let Some(req) = recv_request(&mut c).unwrap() {
-                let reply = match &req {
-                    Request::Hello { .. } => Reply::Hello {
-                        version: VERSION,
-                        last_sealed_turn: None,
-                    },
-                    Request::Promote { child, .. } if child == "c1" => Reply::Promote {
-                        child: child.clone(),
-                        result: PromoteResult::Promoted {
-                            seal: 9,
-                            adopted: vec![4, 5],
+            for _ in 0..2 {
+                let (mut c, _) = listener.accept().unwrap();
+                let mut seen = Vec::new();
+                while let Some(req) = recv_request(&mut c).unwrap() {
+                    let reply = match &req {
+                        Request::Hello { .. } => Reply::Hello {
+                            version: VERSION,
+                            last_sealed_turn: None,
                         },
-                    },
-                    Request::Promote { child, .. } => Reply::Promote {
-                        child: child.clone(),
-                        result: PromoteResult::Refused {
-                            reason: "already promoted".into(),
-                        },
-                    },
-                    Request::Result { op } => Reply::Result {
-                        op: *op,
-                        state: OpState::Pending,
-                    },
-                    Request::Effect { call, .. } => Reply::Effect {
-                        call: *call,
-                        result: match call {
-                            0 => EffectResult::Held { op: 1 },
-                            _ => EffectResult::Refused {
-                                reason: "quota".into(),
+                        Request::Promote { child, .. } if child == "c1" => Reply::Promote {
+                            child: child.clone(),
+                            result: PromoteResult::Promoted {
+                                seal: 9,
+                                adopted: vec![4, 5],
                             },
                         },
-                    },
-                    Request::Transcript { .. } => Reply::Recorded { lsn: 1 },
-                    Request::TurnEnd { turn, .. } => Reply::TurnEnd {
-                        turn: *turn,
-                        sealed: Some(*turn),
-                    },
-                    Request::Fork { seal: None } => {
-                        forks += 1;
-                        Reply::Fork {
-                            result: if forks == 1 {
-                                ForkResult::Forked {
-                                    child: "p-fork-3".into(),
-                                    seal: 12,
-                                }
-                            } else {
-                                ForkResult::Refused {
-                                    reason: "no fork slot left".into(),
-                                }
+                        Request::Promote { child, .. } => Reply::Promote {
+                            child: child.clone(),
+                            result: PromoteResult::Refused {
+                                reason: "already promoted".into(),
                             },
+                        },
+                        Request::Result { op } => Reply::Result {
+                            op: *op,
+                            state: OpState::Pending,
+                        },
+                        Request::Effect { call, .. } => Reply::Effect {
+                            call: *call,
+                            result: match call {
+                                0 => EffectResult::Held { op: 1 },
+                                _ => EffectResult::Refused {
+                                    reason: "quota".into(),
+                                },
+                            },
+                        },
+                        Request::Transcript { .. } => Reply::Recorded { lsn: 1 },
+                        Request::TurnEnd { turn, .. } => Reply::TurnEnd {
+                            turn: *turn,
+                            sealed: Some(*turn),
+                        },
+                        Request::Fork { seal: None } => {
+                            forks += 1;
+                            Reply::Fork {
+                                result: if forks == 1 {
+                                    ForkResult::Forked {
+                                        child: "p-fork-3".into(),
+                                        seal: 12,
+                                    }
+                                } else {
+                                    ForkResult::Refused {
+                                        reason: "no fork slot left".into(),
+                                    }
+                                },
+                            }
                         }
-                    }
-                    r => panic!("unexpected {r:?}"),
-                };
-                seen.push(req);
-                send_reply(&mut c, &reply).unwrap();
+                        r => panic!("unexpected {r:?}"),
+                    };
+                    seen.push(req);
+                    send_reply(&mut c, &reply).unwrap();
+                }
+                runs.push(seen);
             }
-            seen
+            runs
         });
         let o = Opts {
             turns: 1,
@@ -534,19 +553,50 @@ mod tests {
             stats: dir.path().join("x"),
             effects: 2,
             forks: 2,
-            promote: vec!["c1".into(), "c2".into()],
+            promote: vec!["c2".into(), "c1".into(), "c3".into()],
             ..Opts::default()
         };
         let st = run(&o, Some(&sock)).unwrap();
-        let seen = warden.join().unwrap();
+        let plain = run(
+            &Opts {
+                promote: Vec::new(),
+                ..o.clone()
+            },
+            Some(&sock),
+        )
+        .unwrap();
+        let runs = warden.join().unwrap();
+        let tag = |r: &Request| match r {
+            Request::Hello { .. } => "hello",
+            Request::Promote { .. } => "promote",
+            Request::Open => "open",
+            Request::Result { .. } => "result",
+            Request::Effect { .. } => "effect",
+            Request::Transcript { .. } => "transcript",
+            Request::TurnEnd { .. } => "turn",
+            Request::Fork { .. } => "fork",
+            Request::Outcome { .. } => "outcome",
+        };
         assert_eq!(
-            st["promotions"],
-            json!([
-                {"child": "c1", "seal": 9, "adopted": [4, 5]},
-                {"child": "c2", "refused": "already promoted"},
-            ])
+            runs[0].iter().map(tag).collect::<Vec<_>>(),
+            ["hello", "promote", "promote", "result", "result"],
+            "promoted (c1): no third promotion, nothing after the results"
         );
-        assert_eq!(st["adopted_states"], json!(["Pending", "Pending"]));
+        assert_eq!(st["promoted_then_exited"], true);
+        assert_eq!(st["turns"], json!(null));
+        let st = {
+            let promoted = st;
+            assert_eq!(
+                promoted["promotions"],
+                json!([
+                    {"child": "c2", "refused": "already promoted"},
+                    {"child": "c1", "seal": 9, "adopted": [4, 5]},
+                ])
+            );
+            assert_eq!(promoted["adopted_states"], json!(["Pending", "Pending"]));
+            plain
+        };
+        let seen = &runs[1];
         assert_eq!(
             st["effects"],
             json!({"released": 0, "held": 1, "refused": ["quota"]})
@@ -555,30 +605,11 @@ mod tests {
             st["forks"],
             json!([{"child": "p-fork-3", "seal": 12}, {"refused": "no fork slot left"}])
         );
-        // The order: Hello, the promotions and their results, the turn,
-        // the forks.
-        let tags: Vec<&str> = seen
-            .iter()
-            .map(|r| match r {
-                Request::Hello { .. } => "hello",
-                Request::Promote { .. } => "promote",
-                Request::Open => "open",
-                Request::Result { .. } => "result",
-                Request::Effect { .. } => "effect",
-                Request::Transcript { .. } => "transcript",
-                Request::TurnEnd { .. } => "turn",
-                Request::Fork { .. } => "fork",
-                Request::Outcome { .. } => "outcome",
-            })
-            .collect();
+        // The order: Hello, the turn, the forks.
         assert_eq!(
-            tags,
+            seen.iter().map(tag).collect::<Vec<_>>(),
             [
                 "hello",
-                "promote",
-                "promote",
-                "result",
-                "result",
                 "effect",
                 "effect",
                 "transcript",
