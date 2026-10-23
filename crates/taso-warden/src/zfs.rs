@@ -1916,6 +1916,70 @@ mod tests {
         assert_eq!(calls[5], set_args(Lsn::new(7), hash(7)));
     }
 
+    /// C7: a fork's increment is received into the parent under the
+    /// parent's own next Seal name, after unmounting it (a dataset that is
+    /// not mounted is fine), with `-F` (back to the checked base only), and
+    /// bound; a base that is not the newest is refused before anything.
+    #[test]
+    fn receive_adopted_names_the_parents_seal_and_binds() {
+        let base = seal_line(Lsn::new(3), &hash(3).to_string());
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(false, "", MISSING) // get @7: not yet
+                .reply(true, &ds_info(), "")
+                .reply(true, &base, "") // list: base is last and bound
+                .reply(
+                    false,
+                    "",
+                    "cannot unmount 'tasotest/vessel': not currently mounted",
+                )
+                .reply(true, "", "") // receive
+                .reply(true, &seal_line(Lsn::new(7), "-"), "")
+                .reply(true, "", "")
+                .reply(true, &seal_line(Lsn::new(7), &hash(7).to_string()), ""),
+        );
+        let snap = zfs
+            .receive_adopted(
+                &ds(),
+                (Lsn::new(3), hash(3)),
+                (Lsn::new(7), hash(7)),
+                &mut &b"INC"[..],
+            )
+            .unwrap();
+        assert_eq!(snap.seal_hash, Some(hash(7)));
+        let calls = zfs.runner.calls.borrow();
+        assert_eq!(calls[3], strs(&["unmount", "tasotest/vessel"]));
+        assert_eq!(
+            calls[4],
+            strs(&["receive", "-u", "-F", &ds().seal_snapshot(Lsn::new(7))])
+        );
+        assert_eq!(calls[6], set_args(Lsn::new(7), hash(7)));
+
+        // The base is not the newest: refused, nothing unmounted or received.
+        let later = format!("{base}\n{}", seal_line(Lsn::new(5), &hash(5).to_string()));
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(false, "", MISSING)
+                .reply(true, &ds_info(), "")
+                .reply(true, &later, ""),
+        );
+        assert!(matches!(
+            zfs.receive_adopted(
+                &ds(),
+                (Lsn::new(3), hash(3)),
+                (Lsn::new(7), hash(7)),
+                &mut &b"INC"[..],
+            ),
+            Err(ZfsError::NotLatest(_))
+        ));
+        assert!(zfs
+            .runner
+            .calls
+            .borrow()
+            .iter()
+            .all(|c| c[0] != "unmount" && c[0] != "receive"));
+    }
+
     /// Every refusal happens before `zfs receive`, and the stream is not
     /// read.
     #[test]
