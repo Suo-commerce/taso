@@ -180,6 +180,10 @@ pub struct Effects {
     /// Released ops recorded but not yet known shipped: not listed until a
     /// ship succeeds.
     unlisted: std::collections::BTreeMap<OpId, Option<taso_core::record::BarrierId>>,
+    /// Ops a listing ([`Effects::hand_out`]) has already given to a
+    /// sender in this engine's life.  Not durable on purpose: after a
+    /// Warden restart reconcile records them `OutcomeUnknown` anyway.
+    handed_out: std::collections::BTreeSet<OpId>,
     pending: Option<PromotionRecord>,
 }
 
@@ -206,6 +210,7 @@ impl Effects {
             ledger,
             released: Default::default(),
             unlisted,
+            handed_out: Default::default(),
             pending: summary.promotion,
         };
         // Listed once a ship covers them (a failure leaves them unlisted
@@ -297,6 +302,26 @@ impl Effects {
             .map(|e| Released {
                 intent: e.intent.clone(),
                 state: e.state.expect("unsettled has a state"),
+            })
+            .collect())
+    }
+
+    /// What a sender reads ([`Effects::released`]), each with whether it
+    /// may have been acted on already: `OutcomeUnknown` (reconciled after a
+    /// restart), or handed out by an earlier listing of this engine — a
+    /// sender that crashed while the Warden stayed up (review finding 3).
+    /// Marks every listed op as handed out.
+    pub fn hand_out<L: Layers>(
+        &mut self,
+        vessel: &Vessel<L>,
+    ) -> Result<Vec<(Released, bool)>, VesselError> {
+        let listed = self.released(vessel)?;
+        Ok(listed
+            .into_iter()
+            .map(|r| {
+                let before =
+                    r.state == OutcomeState::OutcomeUnknown || !self.handed_out.insert(r.intent.op);
+                (r, before)
             })
             .collect())
     }

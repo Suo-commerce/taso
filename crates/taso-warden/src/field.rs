@@ -371,23 +371,25 @@ impl<'v, L: Layers> Session<'v, L> {
                 if let Some(fx) = self.effects.as_deref_mut() {
                     let _ = fx.ship_unlisted(self.vessel);
                 }
-                let Some(fx) = self.effects.as_deref() else {
+                let Some(fx) = self.effects.as_deref_mut() else {
                     return Reply::Open {
                         effects: Vec::new(),
                     };
                 };
-                match fx.released(self.vessel) {
+                match fx.hand_out(self.vessel) {
                     Ok(released) => Reply::Open {
                         effects: released
                             .into_iter()
-                            .map(|r| OpenEffect {
+                            .map(|(r, before)| OpenEffect {
                                 op: r.intent.op.get(),
                                 provider: r.intent.provider,
                                 request: r.intent.request,
                                 retry: r.intent.retry,
                                 consequence: r.intent.consequence,
                                 authority: r.intent.authority,
-                                unknown: r.state == taso_core::record::OutcomeState::OutcomeUnknown,
+                                // Reconciled unknown, or listed before
+                                // (a sender that crashed, the Warden up).
+                                unknown: before,
                             })
                             .collect(),
                     },
@@ -1706,7 +1708,16 @@ mod tests {
         let Reply::Open { effects: after } = s.handle(Request::Open) else {
             panic!()
         };
-        assert_eq!(after, effects, "nothing of the sibling's was adopted");
+        let ops = |l: &[OpenEffect]| l.iter().map(|e| e.op).collect::<Vec<_>>();
+        assert_eq!(
+            ops(&after),
+            ops(&effects),
+            "nothing of the sibling's was adopted"
+        );
+        assert!(
+            after.iter().all(|e| e.unknown),
+            "listed before: may have been acted on"
+        );
         // Not a child of this Vessel: refused.
         assert!(matches!(
             s.handle(Request::Promote {
@@ -1811,6 +1822,51 @@ mod tests {
             panic!()
         };
         assert_eq!(effects.iter().map(|e| e.op).collect::<Vec<_>>(), adopted);
+    }
+
+    /// Review finding 3: a sender that crashed while the Warden stayed up
+    /// left no `OutcomeUnknown`; the next listing tells whoever reads it
+    /// that the op was handed out before — also on a new connection, the
+    /// engine (not the session) remembers.  A new op is not marked.
+    #[test]
+    fn an_op_listed_before_is_listed_as_unknown() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let unknown = |r: Reply| match r {
+            Reply::Open { effects } => effects
+                .iter()
+                .map(|e| (e.op, e.unknown))
+                .collect::<Vec<_>>(),
+            r => panic!("{r:?}"),
+        };
+        {
+            let mut s = Session::new(&mut v, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx);
+            s.handle(hello());
+            s.handle(declare(1, "mail", b"send bob"));
+            assert_eq!(unknown(s.handle(Request::Open)), [(1, false)]);
+            // The sender polls again, or crashed and a new one reads.
+            assert_eq!(unknown(s.handle(Request::Open)), [(1, true)]);
+        }
+        // A new connection (the sender restarted), the same engine.
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        s.handle(declare(2, "mail", b"send eve"));
+        assert_eq!(
+            unknown(s.handle(Request::Open)),
+            [(1, true), (2, false)],
+            "the old op is marked, the new one is not"
+        );
     }
 
     /// Without the Warden's `Branches` (or, for Promote, an engine),

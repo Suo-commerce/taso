@@ -27,10 +27,13 @@ building a relay.
      request.
    - `consequence` and `authority`: what it does to the world and what
      permits it, as declared — what a sender needs to decide how to act.
-   - `unknown`: true if this effect was acted on in a previous
-     incarnation whose outcome was lost (the reconciler recorded
-     `OutcomeUnknown`).  The sender must not blindly re-send; the
-     retry policy says what is safe.
+   - `unknown`: true if this effect may have been acted on already:
+     a previous incarnation of the Warden released it and its outcome
+     was lost (the reconciler recorded `OutcomeUnknown`), or an earlier
+     `Open` of this Warden already listed it (a sender that crashed, or
+     the same sender polling again — a sender keeps track of its own
+     in-flight ops).  The sender must not blindly re-send; the retry
+     policy says what is safe.
 
 2. **The durability guarantee.**  Every intent listed by `Open` has been
    shipped to remote storage before it was made visible: a release
