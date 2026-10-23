@@ -395,7 +395,8 @@ pub struct VesselConf {
 /// `slots` that no child of this Vessel has taken yet, so the list is
 /// also the quota: one child per slot, a slot never given twice.  The
 /// child is an entry the Warden makes ([`ForksConf::child`]): named
-/// `<subject>-fork-<slot>`, forked from the Seal asked for, in this
+/// `<subject>-fork-<slot>`, forked from the Seal asked for (refused
+/// until that Seal is shipped: [`Host::shipped_seal`]), in this
 /// Vessel's namespace and runtime, effects always held, never restarted,
 /// and with no forks of its own.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1553,8 +1554,14 @@ impl Branches<StorageLayers> for NodeBranches<'_> {
             ));
         };
         let name = ForksConf::child_name(&self.vc.subject, slot);
+        // Only from a shipped Seal (C3): a child of a Seal only this node
+        // holds could be reborn nowhere once the node is lost.  "last" is
+        // fixed here to the Seal checked.
+        let seal = host
+            .shipped_seal(vessel.id(), at)
+            .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?;
         let child = host
-            .fork_from_log(vessel.id(), at, name.as_bytes())
+            .fork_from_log(vessel.id(), SealAt::At(seal.lsn), name.as_bytes())
             .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?;
         let seal = child
             .lineage()
