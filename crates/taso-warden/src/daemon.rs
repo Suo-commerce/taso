@@ -1771,18 +1771,35 @@ pub fn claim_run_dir(run_dir: &Path) -> io::Result<RunDirLock> {
         .truncate(false)
         .write(true)
         .open(&path)?;
-    match file.try_lock() {
-        Ok(()) => Ok(RunDirLock { _file: file, path }),
-        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            format!(
-                "{} is held by another taso-wardend (one daemon per run_dir)",
-                path.display()
-            ),
-        )),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    // A lock just released can still be held for a moment by a process
+    // another thread is spawning (a child between fork and exec holds a
+    // copy of every open file): retry briefly, as the Chronicle's own
+    // directory lock does, before calling it another daemon's.
+    let start = std::time::Instant::now();
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(RunDirLock { _file: file, path }),
+            Err(std::fs::TryLockError::WouldBlock) if start.elapsed() < RUN_LOCK_WAIT => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is held by another taso-wardend (one daemon per run_dir)",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
     }
 }
+
+/// How long [`claim_run_dir`] retries a held lock before refusing.
+const RUN_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 /// Remove every container in a claimed run directory's runc root
 /// ([`Runc::sweep`]).  Any container that could not be removed is an
@@ -2643,6 +2660,41 @@ mod tests {
         // Another run directory is independent.
         let _other = claim_run_dir(&tmp.path().join("run/other")).unwrap();
         drop(again);
+    }
+
+    /// A run directory released while another thread spawns processes may
+    /// still be held for a moment by a child between fork and exec;
+    /// claiming it again must not be refused for that (found on taso-test
+    /// 2026-10-23: the node tests run in parallel, spawning runc and zfs,
+    /// and a second Node of one test was refused its own run directory).
+    #[test]
+    fn a_run_dir_released_while_processes_spawn_is_claimed_again() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawned = Arc::new(AtomicU64::new(0));
+        let spawner = {
+            let (stop, spawned) = (stop.clone(), spawned.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                    spawned.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        let (mut claims, mut refused) = (0u64, 0u64);
+        let t = std::time::Instant::now();
+        while spawned.load(Ordering::Relaxed) < 300 && t.elapsed() < Duration::from_secs(10) {
+            match claim_run_dir(tmp.path()) {
+                Ok(lock) => drop(lock),
+                Err(_) => refused += 1,
+            }
+            claims += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+        assert!(spawned.load(Ordering::Relaxed) >= 300);
+        assert_eq!(refused, 0, "{refused} of {claims} claims refused");
     }
 
     #[test]
