@@ -13,6 +13,7 @@ pub mod adoptcopy;
 mod bench;
 pub mod blk;
 pub mod chronicle;
+pub mod classify;
 pub mod coordinator;
 pub mod coordsrv;
 pub mod daemon;

@@ -22,9 +22,11 @@ ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 hmac = "0.12"
 sha2 = "0.10"
 libc = "0.2"
-# Safe `SO_PEERCRED` for the coordinator's peer map (coordsrv.rs); the
+# Safe `SO_PEERCRED` (coordsrv.rs) and the manifest walk (classify.rs); the
 # crate forbids unsafe code.  Already in the tree through tempfile.
-rustix = { version = "1", features = ["net", "time"] }
+rustix = { version = "1", features = ["fs", "net", "process", "time"] }
+# The classification map (spec §8, D28); shared later with taso-policy.
+toml = "0.9"
 
 [dev-dependencies]
 proptest = { workspace = true }
