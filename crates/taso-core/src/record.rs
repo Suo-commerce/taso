@@ -25,6 +25,7 @@
 //! Normative references: v0.4 §§3–7 (Lineage: §3, §4).
 
 use crate::canon::{Canon, Canonical};
+use crate::contract::ContractRecord;
 use crate::envelope::{
     payload_hash, BranchId, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream,
 };
@@ -917,6 +918,11 @@ pub enum Payload {
     Checkpoint(Box<CheckpointRecord>),
     /// A Promotion record: the parent chose a fork at its Seal (tag 10).
     Promotion(PromotionRecord),
+    /// A P4 contract record (tag 11): a Candidate, a verification, a
+    /// verdict, a sanction, a Template, a purge or a genesis step
+    /// ([`crate::contract`]).  Encoded as the tag, then the record's own
+    /// canonical bytes; the record is always the payload's last field.
+    Contract(Box<ContractRecord>),
 }
 
 impl Canonical for Payload {
@@ -964,6 +970,10 @@ impl Canonical for Payload {
             }
             Self::Promotion(r) => {
                 out.tag(10);
+                r.canon(out);
+            }
+            Self::Contract(r) => {
+                out.tag(11);
                 r.canon(out);
             }
         }
@@ -1641,4 +1651,55 @@ mod tests {
             "vessel_id derivation changed",
         );
     }
+
+    // ── P4 contract payloads (tag 11) ───────────────────────────────
+
+    fn contract_payloads() -> Vec<Payload> {
+        use crate::contract::{ContractRecord, ReclaimOutcome};
+        vec![
+            Payload::Contract(Box::new(ContractRecord::ReclaimClaimed {
+                object_key: HashVal::from_bytes([0xE0; 32]),
+            })),
+            Payload::Contract(Box::new(ContractRecord::ReclaimComplete {
+                object_key: HashVal::from_bytes([0xE0; 32]),
+                outcome: ReclaimOutcome::Absent,
+            })),
+            Payload::Contract(Box::new(ContractRecord::SanctionCompleted {
+                template_id: ChronicleId::from_bytes([0x7E; 16]),
+            })),
+        ]
+    }
+
+    #[test]
+    fn contract_payloads_round_trip_strictly() {
+        for p in contract_payloads() {
+            let b = p.canon_bytes();
+            assert_eq!(b[0], 11, "tag 11");
+            assert_eq!(Payload::decode(&b).unwrap(), p);
+            let mut trailing = b.clone();
+            trailing.push(0);
+            assert!(Payload::decode(&trailing).is_err(), "trailing bytes");
+            assert!(Payload::decode(&b[..b.len() - 1]).is_err(), "truncated");
+            assert!(make_record(p).verify());
+        }
+        assert!(Payload::decode(&[11]).is_err(), "an empty contract record");
+        assert!(Payload::decode(&[12]).is_err(), "tag 12 is not a payload");
+    }
+
+    /// Additive: every earlier pin is unchanged (the other pin tests), and
+    /// these pin contract payloads inside a Chronicle record.
+    #[test]
+    fn contract_payload_hashes_are_pinned() {
+        let got: Vec<String> = contract_payloads()
+            .into_iter()
+            .map(|p| make_record(p).envelope.hash.to_string())
+            .collect();
+        assert_eq!(got, PINS_CONTRACT);
+    }
+
+    const PINS_CONTRACT: [&str; 3] = [
+        "aa28dd78f22460398ad7e73dedf7ae6bf08ef3a98759b4fe6c96598e77a35d2a",
+        "761c04378b93bcdc86bff19701bd204e44b6e07d7d89d930cbf3575d0bfdfdab",
+        "e54dff3e751d20933a39c1b90dab35432577a23e2620b6f7d9485e5fb493f9dd",
+    ];
 }

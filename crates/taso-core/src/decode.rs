@@ -16,6 +16,7 @@
 
 use std::fmt;
 
+use crate::contract::ContractRecord;
 use crate::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use crate::record::{
     Authority, BarrierId, CheckpointRecord, CheckpointSeal, Consequence, Dispatch, FsShippedRecord,
@@ -502,6 +503,13 @@ impl<'a> Reader<'a> {
             (_, 8) => Payload::FsShipped(self.fs_shipped()?),
             (_, 9) => Payload::Checkpoint(Box::new(self.checkpoint()?)),
             (_, 10) => Payload::Promotion(self.promotion()?),
+            // The contract record is the rest of the payload; it has its
+            // own strict decoder (offsets in its errors are from its
+            // first byte).
+            (_, 11) => {
+                let rest = self.take(self.remaining() as u64)?;
+                Payload::Contract(Box::new(ContractRecord::decode(rest)?))
+            }
             (at, tag) => {
                 return Err(DecodeError::BadTag {
                     at,
@@ -894,11 +902,11 @@ mod tests {
     #[test]
     fn unknown_payload_tag() {
         assert_eq!(
-            Payload::decode(&[11]),
+            Payload::decode(&[12]),
             Err(DecodeError::BadTag {
                 at: 0,
                 what: "payload",
-                tag: 11
+                tag: 12
             })
         );
         assert_eq!(

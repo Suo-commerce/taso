@@ -389,7 +389,7 @@ impl fmt::Display for VesselError {
             Self::CrossNamespace => write!(f, "succession across namespaces was not allowed"),
             Self::EmptyAuthority => write!(f, "succession needs an actor and a reason"),
             Self::SelfSuccession => write!(f, "a vessel cannot succeed itself"),
-            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap, FsShipped, Checkpoint and Promotion records are reserved"),
+            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap, FsShipped, Checkpoint, Promotion and contract records are reserved"),
             Self::NotThisSeal(why) => write!(f, "not a Seal of this vessel: {why}"),
             Self::NothingShipped(id) => write!(f, "nothing of vessel {} is shipped and anchored", hex(id)),
             Self::ParentMissing(p) => write!(
@@ -1337,6 +1337,7 @@ impl<L: Layers> Vessel<L> {
                 | Payload::FsShipped(_)
                 | Payload::Checkpoint(_)
                 | Payload::Promotion(_)
+                | Payload::Contract(_)
         ) {
             return Err(VesselError::ReservedPayload);
         }
@@ -1359,6 +1360,7 @@ impl<L: Layers> Vessel<L> {
                     | Payload::FsShipped(_)
                     | Payload::Checkpoint(_)
                     | Payload::Promotion(_)
+                    | Payload::Contract(_)
             )
         }) {
             return Err(VesselError::ReservedPayload);
@@ -2368,6 +2370,21 @@ pub(crate) mod tests {
             ),
             Err(VesselError::ReservedPayload)
         ));
+        // P4 contract records come only from the Warden's own paths.
+        let contract = Payload::Contract(Box::new(
+            taso_core::contract::ContractRecord::ReclaimClaimed {
+                object_key: HashVal::GENESIS,
+            },
+        ));
+        assert!(matches!(
+            v.append(Stream::Ctl, contract.clone()),
+            Err(VesselError::ReservedPayload)
+        ));
+        assert!(matches!(
+            v.append_batch(vec![(Stream::Fs, raw(2)), (Stream::Ctl, contract)]),
+            Err(VesselError::ReservedPayload)
+        ));
+        assert_eq!(v.tail(), tail, "nothing of a refused batch is written");
     }
 
     // ── promotion (P3) ──────────────────────────────────────────────

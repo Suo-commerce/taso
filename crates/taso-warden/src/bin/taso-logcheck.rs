@@ -107,6 +107,11 @@ fn describe(v: &mut Value, payload: Option<Payload>) {
         Some(Payload::Succession(_)) => "succession",
         Some(Payload::FsShipped(_)) => "fs_shipped",
         Some(Payload::Checkpoint(_)) => "checkpoint",
+        Some(Payload::Contract(r)) => {
+            o.insert("logical_id".into(), json!(r.logical_id().to_string()));
+            o.insert("digest".into(), json!(r.digest().to_string()));
+            "contract"
+        }
         Some(Payload::Promotion(p)) => {
             let child: String = p
                 .child
