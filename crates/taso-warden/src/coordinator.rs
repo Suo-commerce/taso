@@ -7,7 +7,7 @@
 //! - [`Ownership`] `{ epoch, holder, sealed_prefix }`, and
 //! - the anchored [`ChronicleHead`] `{ lsn, hash, epoch }`.
 //!
-//! P4 adds the coordinator log of contract records (P4 spec rev. 10 §1),
+//! P4 adds the coordinator log of contract records (P4 spec rev. 11 §1),
 //! journalled in the same database ([`crate::coordjournal`]; see "The
 //! coordinator log" on [`Coordinator`]), and the bytes of `Effect` records
 //! with an append, from which it derives open obligations (D33).

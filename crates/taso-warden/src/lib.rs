@@ -17,6 +17,7 @@ pub mod classify;
 pub mod coordinator;
 pub mod coordjournal;
 pub mod coordsrv;
+pub mod coordstore;
 pub mod daemon;
 pub mod effects;
 pub mod field;

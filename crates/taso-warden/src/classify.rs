@@ -1,4 +1,4 @@
-//! Classification and manifests (P4 spec rev. 10 §8; D26–D32).
+//! Classification and manifests (P4 spec rev. 11 §8; D26–D32).
 //!
 //! A **classification map** gives every path of a tree a class
 //! ([`PathClass`]): an ordered list of globs, read from TOML (D28), where
@@ -18,8 +18,8 @@
 //! entry unsupported, so under SELinux every entry would be; the Warden
 //! refuses to start there (file 3b).
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 10, BLAKE3
-//! `e24580cb475ae2724e9c679363f995ffcc88abf72751370aa493f5c1eb8d9bdc`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 11, BLAKE3
+//! `b064c5083fa3d4f8abd853c0e165e40fcbf88f611622cdb0da7bfc455997f73e`.
 
 use std::ffi::CStr;
 use std::fmt;
