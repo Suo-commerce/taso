@@ -582,5 +582,228 @@ mod tests {
             );
             assert_eq!(spans["publish.total"].len(), count);
         }
+
+        /// M7 with files (P3 close-out C8 part 2): what adopting a promoted
+        /// fork's files costs on ZFS ([`Host::adopt_files`], C7: rollback,
+        /// `zfs diff`, copy, snapshot), by the parent's size (`base` files
+        /// of 4 KiB) and the fork's changes (`changed` new files of 64 KiB
+        /// and one rewritten base file).  Per pair a fresh parent, then
+        /// `TASO_BENCH_N` (10) rounds: the parent seals and publishes a fork
+        /// point, a fork writes its files, proposes one held effect and
+        /// seals, the parent promotes it (effects, as `promotion_cost`) and
+        /// adopts its files, and publishes the adoption Seal (`zfs send -i`
+        /// into the pack store).  The fork's dataset is destroyed after
+        /// each round (not timed).
+        ///
+        /// Predictions, written before the first run (2026-10-23):
+        /// - flat in the parent's size: for each `changed`, the p50 of
+        ///   `adopt.total` at base 10000 within 1.5x of base 100 (`zfs
+        ///   diff` and the copy touch only what the fork changed);
+        /// - a fixed cost of about ten `zfs` commands (checks, rollback,
+        ///   two mounts, diff, snapshot): `adopt.total` p50 under 100 ms at
+        ///   one changed file;
+        /// - linear in the changes: at 1000 changed files (64 MiB)
+        ///   `adopt.copy` is the largest part of `adopt.total`;
+        /// - `adopt.publish` grows with the bytes changed, as any Seal's.
+        #[test]
+        #[ignore = "benchmark on a ZFS pool: set TASO_ZFS_DATASET; run alone, in release"]
+        fn adoption_on_zfs() {
+            use crate::vessel::SealAt;
+            let rounds = n(10);
+            let Ok(base_ds) = std::env::var("TASO_ZFS_DATASET") else {
+                println!("\n=== M7 adoption on ZFS: skipped, TASO_ZFS_DATASET is not set ===");
+                return;
+            };
+            let root = format!("{base_ds}/m7-{}", std::process::id());
+            let zfs = Zfs::<Cli>::cli();
+            Zfs::create(&zfs, &Dataset::new(&root).unwrap()).unwrap();
+            struct Cleanup(String);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = Command::new("zfs")
+                        .args(["destroy", "-R", &self.0])
+                        .status();
+                }
+            }
+            let _c = Cleanup(root.clone());
+            let tmp = tempfile::tempdir().unwrap();
+            let host = Host {
+                coord: Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap()),
+                pool: Clone::clone(&zfs),
+                root: Dataset::new(&root).unwrap(),
+                state_dir: tmp.path().join("state"),
+                warden: WardenId::new(1),
+            };
+            let packs = |id| {
+                Packs::new(
+                    LocalStore::new(tmp.path().join("store")),
+                    ZfsSend::default(),
+                    "vessels",
+                    id,
+                )
+                .unwrap()
+            };
+            let mount = |ds: &Dataset| {
+                zfs.ensure_mounted(ds).unwrap();
+                zfs.dataset_info(ds).unwrap().unwrap().mountpoint.unwrap()
+            };
+            let held = Declared {
+                provider: "pay".into(),
+                request: b"pay".to_vec(),
+                footprint: Vec::new(),
+                dispatch: Dispatch::Immediate,
+                retry: RetryPolicy::ProviderDeduplicated { key: b"k".to_vec() },
+                consequence: Consequence::NoExternalMutation,
+                authority: Vec::new(),
+            };
+            println!("\n=== M7: adoption on ZFS, {rounds} promotions per pair, dataset {root} ===");
+            println!(
+                "TMPDIR={}",
+                std::env::var("TMPDIR").unwrap_or_else(|_| "(default)".into())
+            );
+            let parts = [
+                "adopt.total",
+                "adopt.checks",
+                "adopt.rollback",
+                "adopt.mount",
+                "adopt.diff",
+                "adopt.copy",
+                "adopt.snapshot",
+                "adopt.publish",
+                "promote.total",
+            ];
+            println!(
+                "{:>6} {:>6} {}",
+                "base",
+                "chgd",
+                parts
+                    .iter()
+                    .map(|p| format!(" {p:>17}"))
+                    .collect::<String>()
+            );
+            let mut p50 = BTreeMap::new();
+            for base in [100usize, 10_000] {
+                for changed in [1usize, 100, 1000] {
+                    let (mut p, _) = host
+                        .ensure(ns(1), format!("m7-{base}-{changed}").as_bytes())
+                        .unwrap();
+                    let pm = mount(p.dataset());
+                    for i in 0..base {
+                        let d = pm.join(format!("b{}", i / 100));
+                        std::fs::create_dir_all(&d).unwrap();
+                        std::fs::write(d.join(format!("f{i}")), vec![i as u8; 4 << 10]).unwrap();
+                    }
+                    let s0 = p.seal_birth().unwrap().seal;
+                    let snap0 = zfs.get(p.dataset(), s0.lsn).unwrap().unwrap();
+                    p.publish_seal(&packs(p.id()), &snap0, None).unwrap();
+                    let publisher =
+                        PackPublisher::new(packs(p.id()), host.coord.clone(), host.warden);
+                    let (mut fx, _) =
+                        Effects::open(Mode::Dispatch, Box::new(publisher), &mut p).unwrap();
+                    timing::take();
+                    timing::enable(true);
+                    for r in 0..rounds {
+                        p.append(Stream::Fs, Payload::Raw(vec![1; 200])).unwrap();
+                        let s = p
+                            .seal(
+                                StreamCut::EMPTY,
+                                Verdict::Clean,
+                                crate::effects::ledger_pos(&p).unwrap(),
+                                TurnId::new(r as u64 + 1),
+                            )
+                            .unwrap()
+                            .seal;
+                        let snap = zfs.get(p.dataset(), s.lsn).unwrap().unwrap();
+                        p.publish_seal(&packs(p.id()), &snap, None).unwrap();
+                        let (cid, cds) = {
+                            let mut c = host
+                                .fork_from_log(
+                                    p.id(),
+                                    SealAt::Last,
+                                    format!("fork-{base}-{changed}-{r}").as_bytes(),
+                                )
+                                .unwrap();
+                            c.seal_birth().unwrap();
+                            let cm = mount(c.dataset());
+                            let d = cm.join(format!("r{r}"));
+                            std::fs::create_dir_all(&d).unwrap();
+                            for k in 0..changed {
+                                std::fs::write(d.join(format!("n{k}")), vec![k as u8; 64 << 10])
+                                    .unwrap();
+                            }
+                            std::fs::write(cm.join("b0/f0"), format!("round {r}")).unwrap();
+                            let (mut cfx, _) = Effects::open(
+                                Mode::Hold,
+                                Box::new(crate::effects::AlwaysPublish),
+                                &mut c,
+                            )
+                            .unwrap();
+                            assert!(matches!(
+                                cfx.ask(&mut c, &held).unwrap(),
+                                Asked::Held { .. }
+                            ));
+                            let pos = crate::effects::ledger_pos(&c).unwrap();
+                            c.append(Stream::Fs, Payload::Raw(vec![1; 200])).unwrap();
+                            c.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(1))
+                                .unwrap();
+                            (c.id(), c.dataset().clone())
+                        };
+                        let log = host.read_log_of(cid).unwrap();
+                        fx.promote(&mut p, &log, SealAt::Last).unwrap();
+                        let promotion = p.adoption_pending().unwrap().expect("pending");
+                        let a = host
+                            .adopt_files(&mut p, &promotion, &log, &ZfsSend::default())
+                            .unwrap();
+                        let t = timing::span("adopt.publish");
+                        let snap = zfs.get(p.dataset(), a.lsn).unwrap().unwrap();
+                        p.publish_seal(&packs(p.id()), &snap, None).unwrap();
+                        drop(t);
+                        assert_eq!(
+                            std::fs::read_to_string(pm.join("b0/f0")).unwrap(),
+                            format!("round {r}")
+                        );
+                        assert!(pm.join(format!("r{r}/n{}", changed - 1)).exists());
+                        timing::enable(false);
+                        let _ = Command::new("zfs")
+                            .args(["destroy", "-r", cds.as_str()])
+                            .status();
+                        timing::enable(true);
+                    }
+                    timing::enable(false);
+                    let spans = timing::take();
+                    let q = |name: &str, at: f64| {
+                        let mut v = spans.get(name).cloned().unwrap_or_default();
+                        v.sort_unstable();
+                        timing::quantile(&v, at) as f64 / 1000.0
+                    };
+                    println!(
+                        "{base:>6} {changed:>6} {}",
+                        parts
+                            .iter()
+                            .map(|n| format!(" {:>8.1} / {:>6.1}", q(n, 0.5), q(n, 0.95)))
+                            .collect::<String>()
+                    );
+                    assert_eq!(spans["adopt.total"].len(), rounds);
+                    p50.insert(
+                        (base, changed),
+                        (q("adopt.total", 0.5), q("adopt.copy", 0.5)),
+                    );
+                }
+            }
+            println!("(each cell: p50 / p95 ms)");
+            for changed in [1usize, 100, 1000] {
+                let ratio = p50[&(10_000, changed)].0 / p50[&(100, changed)].0;
+                println!(
+                    "prediction 'flat in the parent's size' at {changed} changed: {ratio:.2}x -> {}",
+                    if ratio <= 1.5 { "held" } else { "NOT held" }
+                );
+            }
+            let fixed = p50[&(100, 1)].0;
+            println!(
+                "prediction 'fixed cost under 100 ms' (1 changed, base 100): {fixed:.1} ms -> {}",
+                if fixed < 100.0 { "held" } else { "NOT held" }
+            );
+            println!("prediction 'copy is the largest part at 1000 changed': see the table");
+        }
     }
 }

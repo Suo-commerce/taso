@@ -784,6 +784,53 @@ impl<R: Runner> Zfs<R> {
         }
     }
 
+    /// Where `dataset` is mounted (as [`DatasetInfo::mountpoint`]) and its
+    /// `written`: bytes written since its newest snapshot.  `None` if it
+    /// does not exist.
+    fn mount_and_written(
+        &self,
+        dataset: &Dataset,
+    ) -> Result<Option<(Option<PathBuf>, u64)>, ZfsError> {
+        let args: Vec<String> = [
+            "list",
+            "-H",
+            "-p",
+            "-t",
+            "filesystem",
+            "-o",
+            "name,mountpoint,written",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([dataset.to_string()])
+        .collect();
+        let stdout = match self.run(args) {
+            Ok(o) => o,
+            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("does not exist") => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+        let line = stdout.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let bad = |why| ZfsError::Parse {
+            line: line.to_string(),
+            why,
+        };
+        let [name, mount, written] = line.split('\t').collect::<Vec<_>>()[..] else {
+            return Err(bad("expected name, mountpoint and written"));
+        };
+        if name != dataset.as_str() {
+            return Err(bad("not the requested dataset"));
+        }
+        let written = written
+            .parse()
+            .map_err(|_| bad("written is not a number"))?;
+        Ok(Some((
+            mount.starts_with('/').then(|| PathBuf::from(mount)),
+            written,
+        )))
+    }
+
     /// The filesystems directly under `root` (not `root` itself, nor
     /// deeper ones).
     pub fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, ZfsError> {
@@ -937,7 +984,9 @@ impl<R: Runner> Zfs<R> {
     /// `base` must be `dataset`'s newest snapshot (the M7 condition) and
     /// bound to its hash; refused before anything changes otherwise.
     /// `dataset` is rolled back to `base` first, so nothing written after
-    /// it stands, and a crash mid-copy is undone by doing it all again.
+    /// it stands, and a crash mid-copy is undone by doing it all again;
+    /// if its `written` is 0 (nothing since `base`) there is nothing to
+    /// roll back and the rollback is skipped.
     /// Both datasets are mounted for it (`zfs diff` needs that) and left
     /// mounted.  If `to` already exists, nothing is copied and it is bound
     /// if needed.
@@ -949,11 +998,12 @@ impl<R: Runner> Zfs<R> {
         child: &Dataset,
         child_seal: Lsn,
     ) -> Result<Snapshot, ZfsError> {
+        let checks = crate::timing::span("adopt.checks");
         if let Some(existing) = self.get(dataset, to.0)? {
             return self.bind(existing, to.1);
         }
-        let info = self
-            .dataset_info(dataset)?
+        let (mountpoint, written) = self
+            .mount_and_written(dataset)?
             .ok_or_else(|| ZfsError::NotFound(dataset.to_string()))?;
         let snaps = self.list(dataset)?;
         let base_name = dataset.seal_snapshot(base.0);
@@ -971,12 +1021,23 @@ impl<R: Runner> Zfs<R> {
             .dataset_info(child)?
             .ok_or_else(|| ZfsError::NotFound(child.to_string()))?;
         let no_mount = |d: &Dataset| ZfsError::Copy(format!("{d} has no mountpoint"));
-        let dest = info.mountpoint.ok_or_else(|| no_mount(dataset))?;
+        let dest = mountpoint.ok_or_else(|| no_mount(dataset))?;
         let child_mp = child_info.mountpoint.ok_or_else(|| no_mount(child))?;
-        self.run(vec!["rollback".to_string(), base_name.clone()])?;
+        drop(checks);
+        // `written` counts what was written since the newest snapshot,
+        // `base`: nothing means the dataset is `base` and the rollback (an
+        // unmount and a mount, costing with every cached file: M7,
+        // 2026-10-23) is skipped.
+        if written != 0 {
+            let _t = crate::timing::span("adopt.rollback");
+            self.run(vec!["rollback".to_string(), base_name.clone()])?;
+        }
+        let t = crate::timing::span("adopt.mount");
         self.ensure_mounted(dataset)?;
         self.ensure_mounted(child)?;
+        drop(t);
         let child_snap = child.seal_snapshot(child_seal);
+        let t = crate::timing::span("adopt.diff");
         let diff = self.run(vec![
             "diff".to_string(),
             "-H".to_string(),
@@ -986,10 +1047,14 @@ impl<R: Runner> Zfs<R> {
         ])?;
         let changes = crate::adoptcopy::parse_diff(&child_mp, &diff)
             .map_err(|e| ZfsError::Copy(e.to_string()))?;
+        drop(t);
+        let t = crate::timing::span("adopt.copy");
         let snap_dir = child_snap.split_once('@').map_or("", |(_, s)| s);
         let src = child_mp.join(".zfs/snapshot").join(snap_dir);
         crate::adoptcopy::apply(&changes, &src, &dest)
             .map_err(|e| ZfsError::Copy(e.to_string()))?;
+        drop(t);
+        let _t = crate::timing::span("adopt.snapshot");
         self.snapshot(dataset, to.0, to.1)
     }
 
@@ -1948,7 +2013,7 @@ mod tests {
                 .reply(false, "", MISSING) // get @7: not yet
                 .reply(
                     true,
-                    &info_line("tasotest/vessel", pmp.to_str().unwrap(), "-", "-"),
+                    &format!("tasotest/vessel\t{}\t4096\n", pmp.display()),
                     "",
                 )
                 .reply(true, &base, "") // list: base is last and bound
@@ -2020,7 +2085,7 @@ mod tests {
         let zfs = Zfs::with_runner(
             Fake::default()
                 .reply(false, "", MISSING)
-                .reply(true, &ds_info(), "")
+                .reply(true, "tasotest/vessel\t/tasotest/vessel\t0\n", "")
                 .reply(true, &later, ""),
         );
         assert!(matches!(
@@ -2039,6 +2104,61 @@ mod tests {
             .borrow()
             .iter()
             .all(|c| c[0] != "rollback" && c[0] != "diff"));
+    }
+
+    /// Nothing written since the base (`written` 0): the dataset is the
+    /// base, and the rollback, an unmount and a mount, is skipped.
+    #[test]
+    fn adopt_copy_skips_the_rollback_when_nothing_was_written() {
+        let t = tempfile::tempdir().unwrap();
+        let (pmp, cmp) = (t.path().join("p"), t.path().join("c"));
+        std::fs::create_dir_all(&pmp).unwrap();
+        std::fs::create_dir_all(cmp.join(".zfs/snapshot/taso-seal-00000000000000000009")).unwrap();
+        let child = Dataset::new("tasotest/vessel-c").unwrap();
+        let base = seal_line(Lsn::new(3), &hash(3).to_string());
+        let zfs = Zfs::with_runner(
+            Fake::default()
+                .reply(false, "", MISSING)
+                .reply(
+                    true,
+                    &format!("tasotest/vessel\t{}\t0\n", pmp.display()),
+                    "",
+                )
+                .reply(true, &base, "")
+                .reply(
+                    true,
+                    &info_line("tasotest/vessel-c", cmp.to_str().unwrap(), "-", "-"),
+                    "",
+                )
+                .reply(true, "", "") // mount
+                .reply(true, "", "") // mount the child
+                .reply(true, "", "") // diff: no changes
+                .reply(true, "", "") // snapshot
+                .reply(true, &seal_line(Lsn::new(7), &hash(7).to_string()), ""),
+        );
+        zfs.adopt_copy(
+            &ds(),
+            (Lsn::new(3), hash(3)),
+            (Lsn::new(7), hash(7)),
+            &child,
+            Lsn::new(9),
+        )
+        .unwrap();
+        let calls = zfs.runner.calls.borrow();
+        assert!(calls.iter().all(|c| c[0] != "rollback"), "{calls:?}");
+        assert_eq!(
+            calls[1],
+            strs(&[
+                "list",
+                "-H",
+                "-p",
+                "-t",
+                "filesystem",
+                "-o",
+                "name,mountpoint,written",
+                "tasotest/vessel"
+            ])
+        );
     }
 
     /// Every refusal happens before `zfs receive`, and the stream is not
