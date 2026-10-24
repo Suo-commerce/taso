@@ -2711,12 +2711,13 @@ pub(crate) mod tests {
             fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
                 self.inner.append(w, e)
             }
-            fn append_batch(
+            fn append_batch_with(
                 &self,
                 w: WardenId,
                 es: &[Envelope],
+                fx: &[Vec<u8>],
             ) -> Result<ChronicleHead, CoordError> {
-                self.inner.append_batch(w, es)
+                self.inner.append_batch_with(w, es, fx)
             }
             fn transfer_if(
                 &self,

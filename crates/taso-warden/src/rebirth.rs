@@ -738,12 +738,13 @@ mod tests {
         ) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
             self.inner.append(w, e)
         }
-        fn append_batch(
+        fn append_batch_with(
             &self,
             w: WardenId,
             es: &[taso_core::envelope::Envelope],
+            fx: &[Vec<u8>],
         ) -> Result<taso_core::envelope::ChronicleHead, crate::coordinator::CoordError> {
-            self.inner.append_batch(w, es)
+            self.inner.append_batch_with(w, es, fx)
         }
         fn transfer_if(
             &self,

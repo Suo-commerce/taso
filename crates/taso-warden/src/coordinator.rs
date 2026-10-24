@@ -7,6 +7,11 @@
 //! - [`Ownership`] `{ epoch, holder, sealed_prefix }`, and
 //! - the anchored [`ChronicleHead`] `{ lsn, hash, epoch }`.
 //!
+//! P4 adds the coordinator log of contract records (P4 spec rev. 10 §1),
+//! journalled in the same database ([`crate::coordjournal`]; see "The
+//! coordinator log" on [`Coordinator`]), and the bytes of `Effect` records
+//! with an append, from which it derives open obligations (D33).
+//!
 //! Record bodies are not here.  They live with the Warden (a local
 //! segment, later shipped to Garage).  The coordinator only decides which
 //! head is accepted.  The Warden's order is: write the record locally and
@@ -46,12 +51,21 @@
 
 use std::fmt;
 use std::path::Path;
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
-use taso_core::envelope::{ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn};
+use taso_core::contract::{Inventory, InventoryItem};
+use taso_core::coordlog::{
+    self, Answer, ChronicleView, ClaimAuthority, ClaimError, CoordLog, Head, ObjectId, StoreView,
+    SubmissionStatus, Submitted,
+};
+use taso_core::envelope::{
+    payload_hash, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream,
+};
 use taso_core::model::{Ownership, WardenId};
+use taso_core::record::{OutcomeState, Payload};
 
+use crate::coordjournal::{self, Done, Entry, JournalError, Op};
 use crate::segment::Position;
 
 // ── Storage layout ──────────────────────────────────────────────────
@@ -179,6 +193,53 @@ pub enum CoordError {
     /// The coordinator could not be reached, or the connection broke before
     /// an answer arrived.  The request may or may not have been applied.
     Unavailable(std::io::Error),
+    /// An `Effect` record's bytes are missing, extra, do not match its
+    /// envelope's `payload_hash`, or do not decode (P4 spec D33).  Nothing
+    /// was appended.
+    EffectPayload {
+        /// The envelope's lsn (0: bytes with no `Effect` envelope left).
+        lsn: Lsn,
+        /// What was wrong.
+        fault: EffectFault,
+    },
+    /// `claim_chronicle` or `takeover_target` was refused by the
+    /// coordinator log (P4 spec §5.3, §7, D21).  Nothing changed.
+    Claim(ClaimError),
+    /// The coordinator log's journal does not decode or does not replay to
+    /// the answers it recorded.
+    Journal(JournalError),
+}
+
+/// What was wrong with an `Effect` record's bytes ([`CoordError::EffectPayload`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectFault {
+    /// An `Effect` envelope came without its bytes (code 0).
+    Missing,
+    /// More bytes than `Effect` envelopes (code 1).
+    Extra,
+    /// The bytes do not hash to the envelope's `payload_hash` (code 2).
+    Mismatch,
+    /// The bytes are not a payload (code 3).
+    Undecodable,
+}
+
+impl EffectFault {
+    /// Its wire code.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// From a wire code.
+    pub fn from_code(c: u8) -> Option<Self> {
+        [
+            Self::Missing,
+            Self::Extra,
+            Self::Mismatch,
+            Self::Undecodable,
+        ]
+        .get(usize::from(c))
+        .copied()
+    }
 }
 
 impl CoordError {
@@ -193,7 +254,9 @@ impl CoordError {
     /// until it is classified.
     pub fn outcome_unknown(&self) -> bool {
         match self {
-            Self::Corrupt { .. } | Self::Storage(_) | Self::Unavailable(_) => true,
+            Self::Corrupt { .. } | Self::Storage(_) | Self::Unavailable(_) | Self::Journal(_) => {
+                true
+            }
             Self::UnknownChronicle(_)
             | Self::AlreadyRegistered(_)
             | Self::BadHash { .. }
@@ -206,7 +269,9 @@ impl CoordError {
             | Self::ShippedConflict { .. }
             | Self::NotYou { .. }
             | Self::UnknownPeer { .. }
-            | Self::OwnershipChanged { .. } => false,
+            | Self::OwnershipChanged { .. }
+            | Self::EffectPayload { .. }
+            | Self::Claim(_) => false,
         }
     }
 }
@@ -275,6 +340,19 @@ impl fmt::Display for CoordError {
             ),
             Self::UnknownPeer { uid } => write!(f, "peer uid {uid} is not a known warden"),
             Self::Unavailable(e) => write!(f, "coordinator unavailable: {e}"),
+            Self::EffectPayload { lsn, fault } => write!(
+                f,
+                "effect record at lsn {}: bytes {}",
+                lsn.get(),
+                match fault {
+                    EffectFault::Missing => "missing",
+                    EffectFault::Extra => "with no effect record",
+                    EffectFault::Mismatch => "do not match its payload hash",
+                    EffectFault::Undecodable => "do not decode",
+                }
+            ),
+            Self::Claim(e) => write!(f, "claim refused: {e:?}"),
+            Self::Journal(e) => write!(f, "{e}"),
         }
     }
 }
@@ -313,11 +391,26 @@ pub trait Coord: Send + Sync {
     /// CAS append of consecutive records of one Chronicle, all or none, in
     /// one durable transaction: each must pass [`Coord::append`]'s checks
     /// against the head the one before it leaves.  On success returns the
-    /// new anchored head.
+    /// new anchored head.  No `Effect` record may be in it (its bytes are
+    /// required: [`Coord::append_batch_with`]).
     fn append_batch(
         &self,
         warden: WardenId,
         envelopes: &[Envelope],
+    ) -> Result<ChronicleHead, CoordError> {
+        self.append_batch_with(warden, envelopes, &[])
+    }
+
+    /// [`Coord::append_batch`], with the payload bytes of every `Effect`
+    /// envelope in it, in order (P4 spec D33).  The coordinator checks each
+    /// against its envelope's `payload_hash` and derives the Chronicle's
+    /// open obligations from them (§1.5); bytes missing, extra, mismatched
+    /// or undecodable refuse the whole batch ([`CoordError::EffectPayload`]).
+    fn append_batch_with(
+        &self,
+        warden: WardenId,
+        envelopes: &[Envelope],
+        effects: &[Vec<u8>],
     ) -> Result<ChronicleHead, CoordError>;
 
     /// Atomic ownership transfer, conditional on the ownership being
@@ -470,6 +563,20 @@ fn be_u64(b: &[u8]) -> u64 {
 // ── Coordinator ─────────────────────────────────────────────────────
 
 type Rows<'t> = Table<'t, [u8; 16], &'static [u8]>;
+type Journal<'t> = Table<'t, u64, &'static [u8]>;
+
+/// The coordinator log's journal (P4 spec §1.1; [`crate::coordjournal`]):
+/// key = sequence number from 1, value = one [`Entry`].
+const JOURNAL: TableDefinition<u64, &[u8]> = TableDefinition::new("taso.coordinator.journal");
+
+/// The tables one group transaction writes.
+struct Tables<'t> {
+    rows: Rows<'t>,
+    journal: Journal<'t>,
+    /// A journal entry was written: the group must commit, whatever the
+    /// request that wrote it answered (the in-memory log has it).
+    journalled: bool,
+}
 
 /// The durable single-node coordinator (v1.0 §3: "single-node `redb`,
 /// fsync").
@@ -483,22 +590,110 @@ type Rows<'t> = Table<'t, [u8; 16], &'static [u8]>;
 /// writes nothing unless it is accepted, so grouping changes no answer:
 /// only how many fsyncs a busy node pays (the p64 Seal finding,
 /// 2026-10-16).
+///
+/// # The coordinator log (P4)
+///
+/// The P4 coordinator log ([`CoordLog`]) lives in memory and is made
+/// durable by its journal ([`crate::coordjournal`]), written in the same
+/// transactions as the ownership rows: every operation that changes it is
+/// journalled with the store answers it read and its own answer, and
+/// opening the coordinator replays the journal and checks every answer.
+/// Its operations, and its queries, run as requests in the same queue, so
+/// they see exactly the committed order and an answer is given only once
+/// its transaction committed.  A transaction that fails, or a request that
+/// fails with an unknown outcome, discards the in-memory log; the next
+/// request rebuilds it from the journal.
+///
+/// The log's epoch of a Chronicle is the ownership epoch: registering
+/// claims it, every transfer fences it, in the same transaction.  A
+/// Chronicle registered before the log existed is brought in on first use
+/// ([`Op::Sync`]); if it already had records, it gets an obligation that
+/// never closes ([`crate::coordjournal::LEGACY_OBLIGATION`]), since its
+/// effects were never seen (fail closed).
 pub struct Coordinator {
     db: Database,
     queue: Mutex<Queue>,
+    shared: Arc<Shared>,
     /// Transactions led so far (tests check that writes were grouped).
     #[cfg(test)]
     groups: std::sync::atomic::AtomicUsize,
 }
 
+/// What the coordinator log needs, shared with the requests that run it.
+struct Shared {
+    /// The log, or `None` when it must be rebuilt from the journal.
+    log: Mutex<Option<CoordLog>>,
+    config: LogConfig,
+}
+
+/// The coordinator log's configuration.
+#[derive(Clone)]
+pub struct LogConfig {
+    /// What the coordinator reads from the store (P4 spec §0.4, §1.2 step
+    /// 5).  It never takes a Warden's word for these.
+    pub store: Arc<dyn StoreView + Send + Sync>,
+    /// Timing (spec §11.1), in seconds.
+    pub timing: coordlog::Config,
+    /// The coordinator's clock: seconds since the Unix epoch.
+    pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl Default for LogConfig {
+    /// No store (nothing is readable: every accept is `NotReadable`),
+    /// `announce.ttl` 10 min, `store.deleted_quarantine` 7 d, the system
+    /// clock.
+    fn default() -> Self {
+        Self {
+            store: Arc::new(NoStore),
+            timing: coordlog::Config {
+                announce_ttl: 600,
+                deleted_quarantine: 7 * 24 * 3600,
+            },
+            clock: Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            }),
+        }
+    }
+}
+
+/// A store with nothing in it.
+struct NoStore;
+
+impl StoreView for NoStore {
+    fn carries(&self, _: ChronicleId, _: &str, _: HashVal) -> bool {
+        false
+    }
+    fn exists(&self, _: &ObjectId) -> bool {
+        false
+    }
+    fn inventory(&self, _: HashVal) -> Option<Inventory> {
+        None
+    }
+    fn fs_packs(&self, _: ChronicleId) -> Vec<InventoryItem> {
+        Vec::new()
+    }
+    fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<ObjectId> {
+        Vec::new()
+    }
+    fn verify_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Option<HashVal> {
+        None
+    }
+}
+
 /// What a request does once its transaction has committed (`None`) or
 /// failed to: send its answer.
-type Done = Box<dyn FnOnce(Option<&CoordError>) + Send>;
+type Deliver = Box<dyn FnOnce(Option<&CoordError>) + Send>;
 
-/// A queued write request: run against the group's table (or told why
-/// there is none); returns whether it wrote, and how to answer.
-type Job =
-    Box<dyn for<'a, 't> FnOnce(Result<&'a mut Rows<'t>, &'a CoordError>) -> (bool, Done) + Send>;
+/// A queued request: run against the group's tables (or told why there
+/// are none); returns whether it wrote, whether it failed with an unknown
+/// outcome (which aborts the whole group), and how to answer.
+type Job = Box<
+    dyn for<'a, 't> FnOnce(Result<&'a mut Tables<'t>, &'a CoordError>) -> (bool, bool, Deliver)
+        + Send,
+>;
 
 #[derive(Default)]
 struct Queue {
@@ -508,17 +703,29 @@ struct Queue {
 
 impl Coordinator {
     /// Open the coordinator at `path`, creating the file if it does not
-    /// exist.
+    /// exist, with the default [`LogConfig`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CoordError> {
+        Self::open_with(path, LogConfig::default())
+    }
+
+    /// Open the coordinator at `path` with `config`; the coordinator log
+    /// is replayed from its journal, and every journalled answer checked.
+    pub fn open_with(path: impl AsRef<Path>, config: LogConfig) -> Result<Self, CoordError> {
         let db = Database::create(path).map_err(storage)?;
         let coord = Self {
             db,
             queue: Mutex::default(),
+            shared: Arc::new(Shared {
+                log: Mutex::new(None),
+                config,
+            }),
             #[cfg(test)]
             groups: std::sync::atomic::AtomicUsize::new(0),
         };
-        // Make sure the table exists so reads never see "no such table".
+        // Make sure the tables exist so reads never see "no such table".
         coord.write(|_| Ok(()))?;
+        // Replay now: a journal that does not replay is found at open.
+        coord.read_log(|_| ())?;
         Ok(coord)
     }
 
@@ -531,23 +738,35 @@ impl Coordinator {
     /// whose outcome is unknown.
     fn write<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&mut Rows<'_>) -> Result<T, CoordError> + Send + 'static,
+        f: impl FnOnce(&mut Tables<'_>) -> Result<T, CoordError> + Send + 'static,
+    ) -> Result<T, CoordError> {
+        self.queued(f, true)
+    }
+
+    /// As [`Coordinator::write`] for a request that writes nothing (a
+    /// query of the coordinator log): it sees the queue's order and is
+    /// answered only once the requests before it committed.
+    fn queued<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Tables<'_>) -> Result<T, CoordError> + Send + 'static,
+        writes: bool,
     ) -> Result<T, CoordError> {
         let (tx, rx) = mpsc::channel::<Result<T, CoordError>>();
-        let job: Job = Box::new(move |rows| {
-            let out = match rows {
-                Ok(rows) => f(rows),
+        let job: Job = Box::new(move |tables| {
+            let out = match tables {
+                Ok(tables) => f(tables),
                 Err(e) => Err(group_failed(e)),
             };
-            let wrote = out.is_ok();
-            let done: Done = Box::new(move |commit| {
+            let wrote = writes && out.is_ok();
+            let poison = out.as_ref().is_err_and(CoordError::outcome_unknown);
+            let deliver: Deliver = Box::new(move |commit| {
                 let answer = match (out, commit) {
                     (Ok(_), Some(e)) => Err(group_failed(e)),
                     (out, _) => out,
                 };
                 let _ = tx.send(answer);
             });
-            (wrote, done)
+            (wrote, poison, deliver)
         });
         let lead = {
             let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -569,17 +788,19 @@ impl Coordinator {
         // If a request panics, give up leading and drop what is queued:
         // dropped requests answer their callers with an error, and the
         // next caller leads.  Without this every later write would wait.
-        struct Abdicate<'a>(&'a Mutex<Queue>);
+        // The in-memory log may be half-changed: discard it.
+        struct Abdicate<'a>(&'a Mutex<Queue>, &'a Shared);
         impl Drop for Abdicate<'_> {
             fn drop(&mut self) {
                 if std::thread::panicking() {
                     let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
                     q.jobs.clear();
                     q.leading = false;
+                    *self.1.log.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
             }
         }
-        let _abdicate = Abdicate(&self.queue);
+        let _abdicate = Abdicate(&self.queue, &self.shared);
         loop {
             let jobs = {
                 let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -594,12 +815,20 @@ impl Coordinator {
     }
 
     /// One transaction for `jobs`, in order; commit if any wrote, else
-    /// abort; then answer each.
+    /// abort; then answer each.  A request that failed with an unknown
+    /// outcome aborts the whole group: its partial writes are never
+    /// committed by another request's commit.
     fn commit_group(&self, jobs: Vec<Job>) {
         let _t = crate::timing::span("coord.group");
         #[cfg(test)]
         self.groups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let fail_all = |jobs: Vec<Job>, e: CoordError| {
+            for job in jobs {
+                let (_, _, deliver) = job(Err(&e));
+                deliver(Some(&e));
+            }
+        };
         let begun = self.db.begin_write().map_err(storage).and_then(|mut txn| {
             // Immediate is redb's default; stated so it cannot drift.
             txn.set_durability(Durability::Immediate).map_err(storage)?;
@@ -607,41 +836,49 @@ impl Coordinator {
         });
         let txn = match begun {
             Ok(t) => t,
-            Err(e) => {
-                for job in jobs {
-                    let (_, done) = job(Err(&e));
-                    done(Some(&e));
-                }
-                return;
-            }
+            Err(e) => return fail_all(jobs, e),
         };
-        let mut dones = Vec::with_capacity(jobs.len());
+        let mut delivers = Vec::with_capacity(jobs.len());
         let mut any = false;
+        let mut poisoned = false;
         {
-            let mut rows = match txn.open_table(CHRONICLES).map_err(storage) {
-                Ok(rows) => rows,
-                Err(e) => {
-                    for job in jobs {
-                        let (_, done) = job(Err(&e));
-                        done(Some(&e));
-                    }
-                    return;
-                }
+            let opened = txn.open_table(CHRONICLES).and_then(|rows| {
+                let journal = txn.open_table(JOURNAL)?;
+                Ok(Tables {
+                    rows,
+                    journal,
+                    journalled: false,
+                })
+            });
+            let mut tables = match opened.map_err(storage) {
+                Ok(t) => t,
+                Err(e) => return fail_all(jobs, e),
             };
             for job in jobs {
-                let (wrote, done) = job(Ok(&mut rows));
+                let (wrote, poison, deliver) = job(Ok(&mut tables));
                 any |= wrote;
-                dones.push(done);
+                poisoned |= poison;
+                delivers.push(deliver);
             }
+            any |= tables.journalled;
         }
-        let ended = if any {
+        let ended = if poisoned {
+            let _ = txn.abort();
+            Err(CoordError::Unavailable(std::io::Error::other(
+                "a request in the group failed with an unknown outcome",
+            )))
+        } else if any {
             txn.commit().map_err(storage)
         } else {
             txn.abort().map_err(storage)
         };
         let failed = ended.err();
-        for done in dones {
-            done(failed.as_ref());
+        if failed.is_some() {
+            // What the log holds in memory was not committed.
+            *self.shared.log.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        for deliver in delivers {
+            deliver(failed.as_ref());
         }
     }
 
@@ -654,6 +891,384 @@ impl Coordinator {
             .ok_or(CoordError::UnknownChronicle(chronicle))?;
         State::decode(chronicle, guard.value())
     }
+
+    /// Read the coordinator log, in the queue's order.
+    fn read_log<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&CoordLog) -> T + Send + 'static,
+    ) -> Result<T, CoordError> {
+        let shared = self.shared.clone();
+        self.queued(
+            move |t| {
+                let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(f(loaded(&mut g, &shared, &t.journal)?))
+            },
+            false,
+        )
+    }
+
+    // ── The coordinator log (P4 spec §1) ────────────────────────────
+
+    /// `claim_chronicle { id, authority }` (§1.6, §5.3, §7): a new
+    /// Chronicle id, held by `holder` at epoch 1 — an ownership row and
+    /// the log's claim, in one transaction.  Refused if the id is known
+    /// ([`CoordError::AlreadyRegistered`]) or the authority does not name
+    /// it ([`CoordError::Claim`]).
+    pub fn claim_chronicle(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+    ) -> Result<Epoch, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            if load(&t.rows, id)?.is_some() {
+                return Err(CoordError::AlreadyRegistered(id));
+            }
+            let done = journal_if(&shared, t, Op::Claim { id, authority }, |d| {
+                matches!(d, Done::Claim(Ok(_)))
+            })?;
+            let epoch = match done {
+                Done::Claim(Ok(e)) => e,
+                Done::Claim(Err(e)) => return Err(CoordError::Claim(e)),
+                _ => unreachable!("a claim answers a claim"),
+            };
+            let genesis = ChronicleHead {
+                lsn: Lsn::new(0),
+                hash: HashVal::GENESIS,
+                epoch,
+            };
+            store(
+                &mut t.rows,
+                id,
+                &State {
+                    holder,
+                    epoch,
+                    sealed_prefix: genesis,
+                    head: genesis,
+                    shipped: Position::GENESIS,
+                },
+            )?;
+            Ok(epoch)
+        })
+    }
+
+    /// `takeover_target { id, authority, current_epoch }` (§5.3, D21):
+    /// verified by the log, conditional on `current_epoch`; the ownership
+    /// moves to `holder` at the next epoch, fencing the old owner, in the
+    /// same transaction.  Returns the epoch and the target's head in the
+    /// log.
+    pub fn takeover_target(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+        current_epoch: Epoch,
+    ) -> Result<(Epoch, Head), CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            let mut state = load(&t.rows, id)?.ok_or(CoordError::UnknownChronicle(id))?;
+            sync(&shared, t, id, &state)?;
+            let op = Op::Takeover {
+                id,
+                authority,
+                current_epoch,
+            };
+            let (epoch, head) =
+                match journal_if(&shared, t, op, |d| matches!(d, Done::Takeover(Ok(_))))? {
+                    Done::Takeover(Ok(v)) => v,
+                    Done::Takeover(Err(e)) => return Err(CoordError::Claim(e)),
+                    _ => unreachable!("a takeover answers a takeover"),
+                };
+            if epoch != state.epoch.next() {
+                *shared.log.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                return Err(CoordError::Corrupt {
+                    chronicle: id,
+                    reason: "the log's epoch is not the ownership epoch",
+                });
+            }
+            state.sealed_prefix = state.head;
+            state.epoch = epoch;
+            state.holder = holder;
+            state.head.epoch = epoch;
+            store(&mut t.rows, id, &state)?;
+            Ok((epoch, head))
+        })
+    }
+
+    /// `announce` (§1.2).  `Err` is the log's refusal.
+    pub fn announce(
+        &self,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        logical: HashVal,
+        digest: HashVal,
+    ) -> Result<Result<(), Answer>, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            sync_if_known(&shared, t, chronicle)?;
+            let now = (shared.config.clock)();
+            let op = Op::Announce {
+                chronicle,
+                epoch,
+                submission,
+                logical,
+                digest,
+                now,
+            };
+            match journal(&shared, t, op)? {
+                Done::Announce(r) => Ok(r),
+                _ => unreachable!("an announce answers an announce"),
+            }
+        })
+    }
+
+    /// `accept` (§1.2): `record` is what `pack` carries; the log checks the
+    /// store agrees (step 5), then the row's predicate and effects.
+    pub fn accept(
+        &self,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        expected_head: Head,
+        pack: String,
+        record: Submitted,
+    ) -> Result<Answer, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            sync_if_known(&shared, t, chronicle)?;
+            let now = (shared.config.clock)();
+            let op = Op::Accept {
+                chronicle,
+                epoch,
+                submission,
+                expected_head,
+                pack,
+                record,
+                now,
+            };
+            match journal(&shared, t, op)? {
+                Done::Answer(a) => Ok(a),
+                _ => unreachable!("an accept answers"),
+            }
+        })
+    }
+
+    /// `cancel` (§1.2): idempotent.
+    pub fn cancel(
+        &self,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+    ) -> Result<Answer, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            sync_if_known(&shared, t, chronicle)?;
+            let op = Op::Cancel {
+                chronicle,
+                epoch,
+                submission,
+            };
+            match journal(&shared, t, op)? {
+                Done::Answer(a) => Ok(a),
+                _ => unreachable!("a cancel answers"),
+            }
+        })
+    }
+
+    /// `set_retention_pin` (§1.6): an operator's call; a pinned Chronicle
+    /// cannot retire.
+    pub fn set_retention_pin(
+        &self,
+        chronicle: ChronicleId,
+        pinned: bool,
+    ) -> Result<(), CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            let state = load(&t.rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+            sync(&shared, t, chronicle, &state)?;
+            journal(&shared, t, Op::Pin { chronicle, pinned })?;
+            Ok(())
+        })
+    }
+
+    /// `query { submission }` (§1.3).
+    pub fn query_submission(
+        &self,
+        chronicle: ChronicleId,
+        submission: HashVal,
+    ) -> Result<SubmissionStatus, CoordError> {
+        self.read_log(move |log| log.query_submission(chronicle, submission))
+    }
+
+    /// `query { logical }` (§1.3): the accepted record and its position.
+    pub fn query_logical(&self, logical: HashVal) -> Result<Option<(u64, Submitted)>, CoordError> {
+        self.read_log(move |log| log.query_logical(logical).map(|(p, s)| (p, s.clone())))
+    }
+
+    /// `query { chronicle }` (§1.3).
+    pub fn query_chronicle(
+        &self,
+        chronicle: ChronicleId,
+    ) -> Result<Option<ChronicleView>, CoordError> {
+        self.read_log(move |log| log.query_chronicle(chronicle))
+    }
+
+    /// The Chronicle's open obligations as the log derives them (§1.5).
+    pub fn obligations(&self, chronicle: ChronicleId) -> Result<Vec<u64>, CoordError> {
+        self.read_log(move |log| log.obligations(chronicle))
+    }
+}
+
+/// The log, rebuilt from `journal` if it was discarded.
+fn loaded<'g>(
+    g: &'g mut Option<CoordLog>,
+    shared: &Shared,
+    journal: &impl ReadableTable<u64, &'static [u8]>,
+) -> Result<&'g mut CoordLog, CoordError> {
+    if g.is_none() {
+        let mut log = CoordLog::new(shared.config.timing);
+        for row in journal.range::<u64>(..).map_err(storage)? {
+            let (_, v) = row.map_err(storage)?;
+            let entry = Entry::decode(v.value()).map_err(CoordError::Journal)?;
+            coordjournal::replay(&mut log, &entry).map_err(CoordError::Journal)?;
+        }
+        *g = Some(log);
+    }
+    Ok(g.as_mut().expect("just loaded"))
+}
+
+/// Run `op` on the log and journal it.
+fn journal(shared: &Shared, t: &mut Tables<'_>, op: Op) -> Result<Done, CoordError> {
+    journal_if(shared, t, op, |_| true)
+}
+
+/// Run `op` on the log; journal it if `keep` says so.  An operation not
+/// kept must not have changed the log (a refused claim or takeover).
+fn journal_if(
+    shared: &Shared,
+    t: &mut Tables<'_>,
+    op: Op,
+    keep: impl FnOnce(&Done) -> bool,
+) -> Result<Done, CoordError> {
+    let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+    let log = loaded(&mut g, shared, &t.journal)?;
+    let (done, entry) = coordjournal::run(log, op, &*shared.config.store);
+    if keep(&done) {
+        let seq = match t.journal.last().map_err(storage)? {
+            Some((k, _)) => k.value() + 1,
+            None => 1,
+        };
+        if let Err(e) = t.journal.insert(seq, entry.bytes().as_slice()) {
+            *g = None;
+            return Err(storage(e));
+        }
+        t.journalled = true;
+    }
+    Ok(done)
+}
+
+/// Bring the log's epoch for `chronicle` to the ownership row's
+/// ([`Op::Sync`]); journalled only if it changes anything.
+fn sync(
+    shared: &Shared,
+    t: &mut Tables<'_>,
+    chronicle: ChronicleId,
+    state: &State,
+) -> Result<(), CoordError> {
+    let known = {
+        let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+        loaded(&mut g, shared, &t.journal)?
+            .query_chronicle(chronicle)
+            .map(|v| v.epoch)
+    };
+    if known == Some(state.epoch) {
+        return Ok(());
+    }
+    let op = Op::Sync {
+        chronicle,
+        epoch: state.epoch,
+        legacy: known.is_none() && state.head.lsn.get() > 0,
+    };
+    match journal(shared, t, op)? {
+        Done::Sync(Ok(_)) => Ok(()),
+        _ => {
+            *shared.log.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            Err(CoordError::Corrupt {
+                chronicle,
+                reason: "the log's epoch is past the ownership epoch",
+            })
+        }
+    }
+}
+
+/// [`sync`] if `chronicle` has an ownership row; otherwise the log answers
+/// for an unknown Chronicle itself.
+fn sync_if_known(
+    shared: &Shared,
+    t: &mut Tables<'_>,
+    chronicle: ChronicleId,
+) -> Result<(), CoordError> {
+    match load(&t.rows, chronicle)? {
+        Some(state) => sync(shared, t, chronicle, &state),
+        None => Ok(()),
+    }
+}
+
+/// The obligation changes an accepted batch makes (§1.5, D34): an intent
+/// with a barrier opens one; a terminal outcome closes it.
+fn obligation_changes(
+    envelopes: &[Envelope],
+    effects: &[Vec<u8>],
+) -> Result<Vec<(u64, bool)>, CoordError> {
+    let mut bytes = effects.iter();
+    let mut changes = Vec::new();
+    for e in envelopes {
+        if e.stream != Stream::Effect {
+            continue;
+        }
+        let Some(b) = bytes.next() else {
+            return Err(CoordError::EffectPayload {
+                lsn: e.lsn,
+                fault: EffectFault::Missing,
+            });
+        };
+        if payload_hash(b) != e.payload_hash {
+            return Err(CoordError::EffectPayload {
+                lsn: e.lsn,
+                fault: EffectFault::Mismatch,
+            });
+        }
+        match Payload::decode(b) {
+            Ok(Payload::Intent(i)) if i.barrier.is_some() => changes.push((i.op.get(), true)),
+            Ok(Payload::Outcome(o))
+                if matches!(
+                    o.state,
+                    OutcomeState::ConfirmedApplied
+                        | OutcomeState::ConfirmedNotApplied
+                        | OutcomeState::AcceptedUnknown
+                        | OutcomeState::Proposed
+                ) =>
+            {
+                changes.push((o.op.get(), false))
+            }
+            Ok(_) => {}
+            Err(_) => {
+                return Err(CoordError::EffectPayload {
+                    lsn: e.lsn,
+                    fault: EffectFault::Undecodable,
+                })
+            }
+        }
+    }
+    if bytes.next().is_some() {
+        return Err(CoordError::EffectPayload {
+            lsn: Lsn::new(0),
+            fault: EffectFault::Extra,
+        });
+    }
+    Ok(changes)
 }
 
 /// The redb coordinator.  Each write is checked on its own and committed
@@ -670,8 +1285,9 @@ impl Coord for Coordinator {
         chronicle: ChronicleId,
         holder: WardenId,
     ) -> Result<ChronicleHead, CoordError> {
-        self.write(move |rows| {
-            if load(rows, chronicle)?.is_some() {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            if load(&t.rows, chronicle)?.is_some() {
                 return Err(CoordError::AlreadyRegistered(chronicle));
             }
             let genesis = ChronicleHead {
@@ -686,7 +1302,10 @@ impl Coord for Coordinator {
                 head: genesis,
                 shipped: Position::GENESIS,
             };
-            store(rows, chronicle, &state)?;
+            store(&mut t.rows, chronicle, &state)?;
+            // The log claims it in the same transaction (P4): its epoch is
+            // this one.
+            sync(&shared, t, chronicle, &state)?;
             Ok(genesis)
         })
     }
@@ -707,23 +1326,31 @@ impl Coord for Coordinator {
     /// The coordinator re-validates ownership on every append; there is no
     /// separate heartbeat (v0.4 §8.7).
     fn append(&self, warden: WardenId, envelope: &Envelope) -> Result<ChronicleHead, CoordError> {
-        self.append_batch(warden, std::slice::from_ref(envelope))
+        self.append_batch_with(warden, std::slice::from_ref(envelope), &[])
     }
 
-    fn append_batch(
+    /// The CAS checks of [`Coord::append`] for each envelope, in order;
+    /// then, for an accepted batch, the obligation changes its `Effect`
+    /// records make (P4 spec §1.5, D33), journalled in the same
+    /// transaction.  The bytes are checked before anything else: a batch
+    /// whose bytes are wrong is refused whole.
+    fn append_batch_with(
         &self,
         warden: WardenId,
         envelopes: &[Envelope],
+        effects: &[Vec<u8>],
     ) -> Result<ChronicleHead, CoordError> {
         let chronicle = envelopes
             .first()
             .ok_or(CoordError::BadBatch { lsn: Lsn::new(0) })?
             .chronicle;
+        let changes = obligation_changes(envelopes, effects)?;
         // Owned: the request may run on the thread leading the group.
         let envelopes = envelopes.to_vec();
-        self.write(move |rows| {
+        let shared = self.shared.clone();
+        self.write(move |t| {
             let mut state =
-                load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+                load(&t.rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             // Checked against a running head; stored once, or not at all
             // (an error drops the transaction).
             for envelope in &envelopes {
@@ -764,7 +1391,23 @@ impl Coord for Coordinator {
                     epoch: state.epoch,
                 };
             }
-            store(rows, chronicle, &state)?;
+            if !changes.is_empty() {
+                // `legacy` is judged on the head before this batch.
+                let before = load(&t.rows, chronicle)?.expect("loaded above");
+                sync(&shared, t, chronicle, &before)?;
+                for (op, open) in changes {
+                    journal(
+                        &shared,
+                        t,
+                        Op::Obligation {
+                            chronicle,
+                            op,
+                            open,
+                        },
+                    )?;
+                }
+            }
+            store(&mut t.rows, chronicle, &state)?;
             Ok(state.head)
         })
     }
@@ -784,34 +1427,26 @@ impl Coord for Coordinator {
         new_holder: WardenId,
         expected: (WardenId, Epoch),
     ) -> Result<Epoch, CoordError> {
-        self.write(move |rows| {
+        let shared = self.shared.clone();
+        self.write(move |t| {
             let mut state =
-                load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+                load(&t.rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             if (state.holder, state.epoch) != expected {
                 return Err(CoordError::OwnershipChanged {
                     holder: state.holder,
                     epoch: state.epoch,
                 });
             }
-            state.sealed_prefix = state.head;
-            state.epoch = state.epoch.next();
-            state.holder = new_holder;
-            state.head.epoch = state.epoch;
-            store(rows, chronicle, &state)?;
-            Ok(state.epoch)
+            fenced(&shared, t, chronicle, &mut state, new_holder)
         })
     }
 
     fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
-        self.write(move |rows| {
+        let shared = self.shared.clone();
+        self.write(move |t| {
             let mut state =
-                load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
-            state.sealed_prefix = state.head;
-            state.epoch = state.epoch.next();
-            state.holder = new_holder;
-            state.head.epoch = state.epoch;
-            store(rows, chronicle, &state)?;
-            Ok(state.epoch)
+                load(&t.rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+            fenced(&shared, t, chronicle, &mut state, new_holder)
         })
     }
 
@@ -834,9 +1469,9 @@ impl Coord for Coordinator {
         epoch: Epoch,
         to: Position,
     ) -> Result<Position, CoordError> {
-        self.write(move |rows| {
+        self.write(move |t| {
             let mut state =
-                load(rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
+                load(&t.rows, chronicle)?.ok_or(CoordError::UnknownChronicle(chronicle))?;
             if warden != state.holder {
                 return Err(CoordError::NotHolder {
                     warden,
@@ -862,7 +1497,7 @@ impl Coord for Coordinator {
             }
             if to.lsn > state.shipped.lsn {
                 state.shipped = to;
-                store(rows, chronicle, &state)?;
+                store(&mut t.rows, chronicle, &state)?;
             }
             Ok(state.shipped)
         })
@@ -878,6 +1513,27 @@ impl Coord for Coordinator {
 /// kept).
 fn group_failed(e: &CoordError) -> CoordError {
     CoordError::Unavailable(std::io::Error::other(format!("group commit failed: {e}")))
+}
+
+/// The transfer of `state` to `holder` at the next epoch (v0.4 §8.2), and
+/// the log's fence to the same epoch, in one transaction.
+fn fenced(
+    shared: &Shared,
+    t: &mut Tables<'_>,
+    chronicle: ChronicleId,
+    state: &mut State,
+    holder: WardenId,
+) -> Result<Epoch, CoordError> {
+    // The log first knows the Chronicle at its current epoch (legacy is
+    // judged on the head as it is), then follows it to the next.
+    sync(shared, t, chronicle, state)?;
+    state.sealed_prefix = state.head;
+    state.epoch = state.epoch.next();
+    state.holder = holder;
+    state.head.epoch = state.epoch;
+    sync(shared, t, chronicle, state)?;
+    store(&mut t.rows, chronicle, state)?;
+    Ok(state.epoch)
 }
 
 fn load(rows: &Rows<'_>, chronicle: ChronicleId) -> Result<Option<State>, CoordError> {
@@ -1355,8 +2011,9 @@ mod tests {
         let (_d, _p, coord) = fresh();
         coord.register(chron(1), A).unwrap();
         coord
-            .write(|rows| {
-                rows.insert(*chron(1).as_bytes(), [0u8; 3].as_slice())
+            .write(|t| {
+                t.rows
+                    .insert(*chron(1).as_bytes(), [0u8; 3].as_slice())
                     .map_err(storage)?;
                 Ok(())
             })
@@ -1978,5 +2635,544 @@ pub(crate) mod conformance {
             prop_assert_eq!(pos(model.shipped()), co.shipped(c).unwrap());
         }
         Ok(())
+    }
+}
+
+// ── The coordinator log (P4, file 1d-1) ─────────────────────────────
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use taso_core::canon::Canonical;
+    use taso_core::contract::{
+        genesis_id, submission_id, Consistency, ContractRecord, GenesisStarted, Peer,
+        TRANSFORM_VERSION,
+    };
+    use taso_core::coordlog::{Final, Transient};
+    use taso_core::envelope::BranchId;
+    use taso_core::record::{
+        Authority, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord, Record, RetryPolicy,
+    };
+
+    use crate::coordjournal::LEGACY_OBLIGATION;
+
+    const A: WardenId = WardenId::new(1);
+    const B: WardenId = WardenId::new(2);
+
+    fn h(n: u8) -> HashVal {
+        HashVal::from_bytes([n; 32])
+    }
+
+    fn chron(n: u8) -> ChronicleId {
+        ChronicleId::from_bytes([n; 16])
+    }
+
+    /// A store whose contents the test sets.
+    type Carried = BTreeSet<([u8; 16], String, [u8; 32])>;
+
+    #[derive(Default)]
+    struct Fake {
+        objects: Mutex<BTreeSet<ObjectId>>,
+        carried: Mutex<Carried>,
+    }
+
+    impl Fake {
+        fn put(&self, o: ObjectId) {
+            self.objects.lock().unwrap().insert(o);
+        }
+        fn ship(&self, c: ChronicleId, pack: &str, r: &Submitted) {
+            self.carried.lock().unwrap().insert((
+                *c.as_bytes(),
+                pack.to_string(),
+                *r.digest().as_bytes(),
+            ));
+        }
+    }
+
+    impl StoreView for Fake {
+        fn carries(&self, c: ChronicleId, name: &str, digest: HashVal) -> bool {
+            self.carried.lock().unwrap().contains(&(
+                *c.as_bytes(),
+                name.to_string(),
+                *digest.as_bytes(),
+            ))
+        }
+        fn exists(&self, o: &ObjectId) -> bool {
+            self.objects.lock().unwrap().contains(o)
+        }
+        fn inventory(&self, _: HashVal) -> Option<Inventory> {
+            None
+        }
+        fn fs_packs(&self, _: ChronicleId) -> Vec<InventoryItem> {
+            Vec::new()
+        }
+        fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<ObjectId> {
+            Vec::new()
+        }
+        fn verify_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Option<HashVal> {
+            None
+        }
+    }
+
+    fn config(store: Arc<Fake>, now: u64) -> LogConfig {
+        LogConfig {
+            store,
+            clock: Arc::new(move || now),
+            ..LogConfig::default()
+        }
+    }
+
+    fn open(path: &Path, store: Arc<Fake>) -> Coordinator {
+        Coordinator::open_with(path, config(store, 1_000)).unwrap()
+    }
+
+    fn genesis() -> GenesisStarted {
+        GenesisStarted {
+            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo"),
+            source_key: h(0x20),
+            consistency: Consistency::Immutable,
+            classmap_key: h(0x21),
+            transform_version: TRANSFORM_VERSION,
+            hook_waiver: None,
+            authority: Authority {
+                actor: "jarmo".into(),
+                reason: "T(0)".into(),
+            },
+            peer: Peer { uid: 0, pid: 1 },
+        }
+    }
+
+    /// Announce, ship and accept `r` under `epoch` as attempt `n`.
+    fn submit(
+        coord: &Coordinator,
+        store: &Fake,
+        c: ChronicleId,
+        epoch: Epoch,
+        n: u64,
+        r: Submitted,
+    ) -> Answer {
+        let s = submission_id(r.logical_id(), r.digest(), epoch, n);
+        if let Err(a) = coord
+            .announce(c, epoch, s, r.logical_id(), r.digest())
+            .unwrap()
+        {
+            return a;
+        }
+        let pack = format!("pack-{n}");
+        store.ship(c, &pack, &r);
+        let head = coord.query_chronicle(c).unwrap().unwrap().head;
+        coord.accept(c, epoch, s, head, pack, r).unwrap()
+    }
+
+    fn journal_len(coord: &Coordinator) -> u64 {
+        let txn = coord.db.begin_read().unwrap();
+        let t = txn.open_table(JOURNAL).unwrap();
+        t.range::<u64>(..).unwrap().count() as u64
+    }
+
+    /// A genesis claimed and started: the log's state after it, as the
+    /// queries answer.
+    fn started(coord: &Coordinator, store: &Fake) -> (ChronicleId, Submitted) {
+        let g = genesis();
+        let t0 = g.genesis_id;
+        store.put(ObjectId::content(h(0x20)));
+        store.put(ObjectId::content(h(0x21)));
+        assert_eq!(
+            coord
+                .claim_chronicle(t0, A, ClaimAuthority::Genesis)
+                .unwrap(),
+            Epoch::FIRST
+        );
+        let r = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(g)));
+        assert!(matches!(
+            submit(coord, store, t0, Epoch::FIRST, 1, r.clone()),
+            Answer::Accepted { log_pos: 1, .. }
+        ));
+        (t0, r)
+    }
+
+    #[test]
+    fn the_log_survives_a_restart_from_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let coord = open(&path, store.clone());
+        let (t0, r) = started(&coord, &store);
+        // A second submission, cancelled; a pin.
+        let late = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 2);
+        assert_eq!(
+            coord.cancel(t0, Epoch::FIRST, late).unwrap(),
+            Answer::FinalRefused(Final::Cancelled)
+        );
+        coord.set_retention_pin(t0, true).unwrap();
+        let view = coord.query_chronicle(t0).unwrap().unwrap();
+        assert_eq!(view.holds.len(), 2, "source and classmap held");
+        let logical = coord.query_logical(r.logical_id()).unwrap();
+        assert_eq!(logical, Some((1, r.clone())));
+        drop(coord);
+
+        // Reopened with a store that holds nothing: the state is the
+        // journal's, read from the recorded answers, not from the store.
+        let coord = open(&path, Arc::new(Fake::default()));
+        assert_eq!(coord.query_chronicle(t0).unwrap(), Some(view));
+        assert_eq!(coord.query_logical(r.logical_id()).unwrap(), logical);
+        assert_eq!(
+            coord.query_submission(t0, late).unwrap(),
+            SubmissionStatus::FinalRefused(Final::Cancelled)
+        );
+        // And it goes on: the same record again is AlreadyAccepted.
+        assert!(matches!(
+            submit(&coord, &store, t0, Epoch::FIRST, 3, r),
+            Answer::AlreadyAccepted { log_pos: 1, .. }
+        ));
+    }
+
+    /// Rewrite the journal entry `seq` with `f`.
+    fn tamper(path: &Path, seq: u64, f: impl FnOnce(&mut Entry)) {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut t = txn.open_table(JOURNAL).unwrap();
+            let mut e = Entry::decode(t.get(seq).unwrap().unwrap().value()).unwrap();
+            f(&mut e);
+            t.insert(seq, e.bytes().as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_journal_that_does_not_replay_is_refused_at_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let coord = open(&path, store.clone());
+        started(&coord, &store);
+        let n = journal_len(&coord);
+        drop(coord);
+        // The accept is the last entry; its answer, then a store answer.
+        let copy = dir.path().join("copy.redb");
+        std::fs::copy(&path, &copy).unwrap();
+        tamper(&path, n, |e| e.done = Done::Unit.bytes());
+        assert!(matches!(
+            Coordinator::open_with(&path, config(store.clone(), 1_000)),
+            Err(CoordError::Journal(_))
+        ));
+        tamper(&copy, n, |e| {
+            let last = e.calls.len() - 1;
+            e.calls[last] ^= 1;
+        });
+        assert!(matches!(
+            Coordinator::open_with(&copy, config(store, 1_000)),
+            Err(CoordError::Journal(_))
+        ));
+    }
+
+    #[test]
+    fn the_log_epoch_is_the_ownership_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let coord = open(&path, store.clone());
+        let c = chron(1);
+        coord.register(c, A).unwrap();
+        assert_eq!(
+            coord.query_chronicle(c).unwrap().unwrap().epoch,
+            Epoch::FIRST
+        );
+        let s = h(9);
+        coord
+            .announce(c, Epoch::FIRST, s, h(10), h(11))
+            .unwrap()
+            .unwrap();
+        // A transfer fences the log in the same transaction: the pending
+        // submission of the old epoch expires, the old epoch is stale.
+        assert_eq!(coord.transfer(c, B).unwrap(), Epoch::new(2));
+        assert_eq!(
+            coord.query_chronicle(c).unwrap().unwrap().epoch,
+            Epoch::new(2)
+        );
+        assert_eq!(
+            coord.query_submission(c, s).unwrap(),
+            SubmissionStatus::FinalRefused(Final::Expired)
+        );
+        assert_eq!(
+            coord
+                .announce(c, Epoch::FIRST, h(12), h(10), h(11))
+                .unwrap(),
+            Err(Answer::FinalRefused(Final::StaleEpoch))
+        );
+        coord.transfer_if(c, A, (B, Epoch::new(2))).unwrap();
+        drop(coord);
+        let coord = open(&path, store);
+        assert_eq!(coord.ownership(c).unwrap().epoch, Epoch::new(3));
+        assert_eq!(
+            coord.query_chronicle(c).unwrap().unwrap().epoch,
+            Epoch::new(3)
+        );
+    }
+
+    #[test]
+    fn claims_and_takeovers_are_the_logs_and_a_refusal_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Fake::default());
+        let coord = open(&dir.path().join("c.redb"), store.clone());
+        let (t0, _) = started(&coord, &store);
+        let n = journal_len(&coord);
+        // An authority that names nothing.
+        assert!(matches!(
+            coord.claim_chronicle(chron(7), A, ClaimAuthority::Sanction { commit: h(1) }),
+            Err(CoordError::Claim(ClaimError::BadAuthority))
+        ));
+        assert!(matches!(
+            coord.ownership(chron(7)),
+            Err(CoordError::UnknownChronicle(_))
+        ));
+        assert!(matches!(
+            coord.claim_chronicle(t0, B, ClaimAuthority::Genesis),
+            Err(CoordError::AlreadyRegistered(_))
+        ));
+        // A takeover by the accepted GenesisStarted, conditional on the
+        // epoch read.
+        assert!(matches!(
+            coord.takeover_target(t0, B, ClaimAuthority::GenesisStarted, Epoch::new(5)),
+            Err(CoordError::Claim(ClaimError::EpochMoved { epoch })) if epoch == Epoch::FIRST
+        ));
+        assert_eq!(journal_len(&coord), n, "refusals journal nothing");
+        let (e, head) = coord
+            .takeover_target(t0, B, ClaimAuthority::GenesisStarted, Epoch::FIRST)
+            .unwrap();
+        assert_eq!(e, Epoch::new(2));
+        assert_eq!(head.pos, 1);
+        let o = coord.ownership(t0).unwrap();
+        assert_eq!((o.holder, o.epoch), (B, Epoch::new(2)));
+        // The old owner's submissions are stale.
+        assert_eq!(
+            coord.announce(t0, Epoch::FIRST, h(3), h(4), h(5)).unwrap(),
+            Err(Answer::FinalRefused(Final::StaleEpoch))
+        );
+    }
+
+    // ── Effect bytes and obligations (D33, D34) ─────────────────────
+
+    fn intent(op: u64, consequence: Consequence) -> Payload {
+        let barrier = (consequence != Consequence::NoExternalMutation)
+            .then(|| taso_core::record::BarrierId::new(op));
+        Payload::Intent(IntentRecord {
+            op: OpId::new(op),
+            provider: "mail".into(),
+            request: b"send".to_vec(),
+            footprint: Vec::new(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::UnsafeToRetry,
+            consequence,
+            authority: Vec::new(),
+            barrier,
+        })
+    }
+
+    fn outcome(op: u64, state: OutcomeState) -> Payload {
+        Payload::Outcome(OutcomeRecord {
+            op: OpId::new(op),
+            state,
+            evidence: None,
+        })
+    }
+
+    /// The next records of `c` after its head, with the `Effect` ones'
+    /// bytes.
+    fn next(
+        coord: &Coordinator,
+        c: ChronicleId,
+        recs: Vec<(Stream, Payload)>,
+    ) -> (Vec<Envelope>, Vec<Vec<u8>>) {
+        let head = coord.head(c).unwrap();
+        let mut prev = (head.lsn, head.hash);
+        let mut envs = Vec::new();
+        let mut fx = Vec::new();
+        for (stream, p) in recs {
+            if stream == Stream::Effect {
+                fx.push(p.canon_bytes());
+            }
+            let r = Record::new(
+                c,
+                BranchId::TRUNK,
+                head.epoch,
+                stream,
+                prev.0.next(),
+                prev.1,
+                p,
+            );
+            prev = (r.envelope.lsn, r.envelope.hash);
+            envs.push(r.envelope);
+        }
+        (envs, fx)
+    }
+
+    #[test]
+    fn effect_bytes_are_checked_before_anything_is_appended() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = open(&dir.path().join("c.redb"), Arc::new(Fake::default()));
+        let c = chron(1);
+        coord.register(c, A).unwrap();
+        let fault = |r: Result<ChronicleHead, CoordError>| match r {
+            Err(CoordError::EffectPayload { fault, .. }) => fault,
+            other => panic!("not refused: {other:?}"),
+        };
+        let (e, fx) = next(
+            &coord,
+            c,
+            vec![(Stream::Effect, intent(1, Consequence::Irreversible))],
+        );
+        assert_eq!(fault(coord.append(A, &e[0])), EffectFault::Missing);
+        assert_eq!(
+            fault(coord.append_batch_with(
+                A,
+                &e,
+                &[outcome(1, OutcomeState::Prepared).canon_bytes()]
+            )),
+            EffectFault::Mismatch
+        );
+        assert_eq!(
+            fault(coord.append_batch_with(A, &e, &[fx[0].clone(), fx[0].clone()])),
+            EffectFault::Extra
+        );
+        let (fs, _) = next(&coord, c, vec![(Stream::Fs, Payload::Raw(vec![1]))]);
+        assert_eq!(
+            fault(coord.append_batch_with(A, &fs, &[fx[0].clone()])),
+            EffectFault::Extra
+        );
+        // Bytes that hash right but are no payload.
+        let junk = vec![0xff, 0xee];
+        let head = coord.head(c).unwrap();
+        let bad = Envelope::new(
+            c,
+            BranchId::TRUNK,
+            head.epoch,
+            Stream::Effect,
+            head.lsn.next(),
+            head.hash,
+            payload_hash(&junk),
+        );
+        assert_eq!(
+            fault(coord.append_batch_with(A, &[bad], &[junk])),
+            EffectFault::Undecodable
+        );
+        assert_eq!(coord.head(c).unwrap().lsn, Lsn::new(0), "nothing appended");
+        coord.append_batch_with(A, &e, &fx).unwrap();
+        assert_eq!(coord.obligations(c).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn obligations_follow_the_effect_records_and_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let coord = open(&path, store.clone());
+        let c = chron(1);
+        coord.register(c, A).unwrap();
+        let step = |recs: Vec<(Stream, Payload)>| {
+            let (e, fx) = next(&coord, c, recs);
+            coord.append_batch_with(A, &e, &fx).unwrap();
+            coord.obligations(c).unwrap()
+        };
+        // An intent and its release in one batch, as the ledger writes.
+        assert_eq!(
+            step(vec![
+                (Stream::Effect, intent(1, Consequence::Irreversible)),
+                (Stream::Effect, outcome(1, OutcomeState::DispatchAuthorized)),
+            ]),
+            vec![1],
+            "released and not reported is open (D34)"
+        );
+        assert_eq!(
+            step(vec![(
+                Stream::Effect,
+                intent(2, Consequence::NoExternalMutation)
+            )]),
+            vec![1],
+            "no barrier, no obligation"
+        );
+        assert_eq!(
+            step(vec![
+                (Stream::Fs, Payload::Raw(vec![7])),
+                (Stream::Effect, outcome(1, OutcomeState::OutcomeUnknown)),
+            ]),
+            vec![1]
+        );
+        assert_eq!(
+            step(vec![(Stream::Effect, intent(3, Consequence::Irreversible))]),
+            vec![1, 3]
+        );
+        assert_eq!(
+            step(vec![(
+                Stream::Effect,
+                outcome(1, OutcomeState::AcceptedUnknown)
+            )]),
+            vec![3]
+        );
+        drop(coord);
+        let coord = open(&path, store);
+        assert_eq!(coord.obligations(c).unwrap(), vec![3]);
+        let (e, fx) = next(
+            &coord,
+            c,
+            vec![(
+                Stream::Effect,
+                outcome(3, OutcomeState::ConfirmedNotApplied),
+            )],
+        );
+        coord.append_batch_with(A, &e, &fx).unwrap();
+        assert!(coord.obligations(c).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_chronicle_older_than_the_log_gets_an_obligation_that_never_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let coord = open(&path, store.clone());
+        coord.register(chron(1), A).unwrap();
+        coord.register(chron(2), A).unwrap();
+        let (e, _) = next(&coord, chron(1), vec![(Stream::Fs, Payload::Raw(vec![1]))]);
+        coord.append(A, &e[0]).unwrap();
+        drop(coord);
+        // As a database from before the log: no journal.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.delete_table(JOURNAL).unwrap();
+            txn.commit().unwrap();
+        }
+        let coord = open(&path, store);
+        // Brought in on first use; one with records is never sanctionable.
+        coord
+            .announce(chron(1), Epoch::FIRST, h(1), h(2), h(3))
+            .unwrap()
+            .unwrap();
+        coord
+            .announce(chron(2), Epoch::FIRST, h(1), h(2), h(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            coord.obligations(chron(1)).unwrap(),
+            vec![LEGACY_OBLIGATION]
+        );
+        assert!(coord.obligations(chron(2)).unwrap().is_empty());
+        // An accept under a stale announce still answers by the rules.
+        assert_eq!(
+            coord
+                .accept(
+                    chron(2),
+                    Epoch::FIRST,
+                    h(1),
+                    Head::EMPTY,
+                    "p".into(),
+                    Submitted::Contract(ContractRecord::GenesisStarted(Box::new(genesis()))),
+                )
+                .unwrap(),
+            Answer::FinalRefused(Final::NotAnnounced)
+        );
+        let _ = Transient::NotReadable;
     }
 }

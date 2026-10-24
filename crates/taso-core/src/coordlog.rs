@@ -801,6 +801,14 @@ impl CoordLog {
         })
     }
 
+    /// The open obligations of `chronicle` (§1.5), ascending by op id.
+    pub fn obligations(&self, chronicle: ChronicleId) -> Vec<u64> {
+        self.chrons
+            .get(chronicle.as_bytes())
+            .map(|ch| ch.obligations.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Every holder of `object`.
     pub fn holders(&self, object: &ObjectId) -> Vec<ChronicleId> {
         let mut v: Vec<C16> = self

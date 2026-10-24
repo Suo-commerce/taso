@@ -41,6 +41,8 @@
 //!   7 shipped    chronicle (16)
 //!   8 append_batch  warden (8) · count (4) · count × envelope (137)
 //!   9 transfer_if  chronicle (16) · new_holder (8) · expected holder (8) · expected epoch (8)
+//!  10 append_effects  warden (8) · count (4) · count × envelope (137)
+//!                  · effects (4) · effects × (length (4) · bytes)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
@@ -58,7 +60,11 @@
 //! 11 (`NotYou`: claimed (8) · peer (8)) and 12 (`UnknownPeer`: uid (4))
 //! were added with the peer map, below; operation 9 and refusal 13
 //! (`OwnershipChanged`: holder (8) · epoch (8)) with the conditional
-//! transfer (fencing review F1).
+//! transfer (fencing review F1).  Operation 10 and refusals 14
+//! (`EffectPayload`: lsn (8) · fault (1)) and 15 (`Claim`: kind (1) ·
+//! epoch (8) for kinds 0 and 3) with P4's effect bytes (spec D33): an
+//! append batch with `Effect` records carries their payload bytes, and
+//! one without any is still sent as operation 8.
 //!
 //! A malformed request gets status 3 and the server closes the connection,
 //! since it can no longer trust the framing.  The version byte lets a
@@ -117,8 +123,9 @@ use taso_core::envelope::{
 use taso_core::frame::{read_frame, write_frame, FrameError};
 use taso_core::model::{Ownership, WardenId};
 
-use crate::coordinator::{Coord, CoordError};
+use crate::coordinator::{Coord, CoordError, EffectFault};
 use crate::segment::Position;
+use taso_core::coordlog::ClaimError;
 
 const WIRE_V1: u8 = 1;
 
@@ -131,6 +138,7 @@ const OP_ADVANCE_SHIPPED: u8 = 6;
 const OP_SHIPPED: u8 = 7;
 const OP_APPEND_BATCH: u8 = 8;
 const OP_TRANSFER_IF: u8 = 9;
+const OP_APPEND_EFFECTS: u8 = 10;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -153,6 +161,8 @@ const R_BAD_BATCH: u8 = 10;
 const R_NOT_YOU: u8 = 11;
 const R_UNKNOWN_PEER: u8 = 12;
 const R_OWNERSHIP_CHANGED: u8 = 13;
+const R_EFFECT_PAYLOAD: u8 = 14;
+const R_CLAIM: u8 = 15;
 
 /// How often the accept loop checks whether it should stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
@@ -175,6 +185,8 @@ enum Request {
     AppendBatch {
         warden: WardenId,
         envelopes: Vec<Envelope>,
+        /// The `Effect` records' bytes (P4 spec D33); empty: operation 8.
+        effects: Vec<Vec<u8>>,
     },
     Transfer {
         chronicle: ChronicleId,
@@ -368,12 +380,25 @@ impl Request {
             Self::Append { warden, envelope } => {
                 o.u8(OP_APPEND).u64(warden.get()).envelope(envelope)
             }
-            Self::AppendBatch { warden, envelopes } => {
-                o.u8(OP_APPEND_BATCH)
-                    .u64(warden.get())
-                    .u32(envelopes.len() as u32);
+            Self::AppendBatch {
+                warden,
+                envelopes,
+                effects,
+            } => {
+                let op = if effects.is_empty() {
+                    OP_APPEND_BATCH
+                } else {
+                    OP_APPEND_EFFECTS
+                };
+                o.u8(op).u64(warden.get()).u32(envelopes.len() as u32);
                 for e in envelopes {
                     o.envelope(e);
+                }
+                if !effects.is_empty() {
+                    o.u32(effects.len() as u32);
+                    for b in effects {
+                        o.u32(b.len() as u32).bytes(b);
+                    }
                 }
                 &mut o
             }
@@ -417,7 +442,8 @@ impl Request {
         if i.u8()? != WIRE_V1 {
             return Err(Malformed("unknown protocol version"));
         }
-        let req = match i.u8()? {
+        let op = i.u8()?;
+        let req = match op {
             OP_REGISTER => Self::Register {
                 chronicle: i.chronicle()?,
                 holder: i.warden()?,
@@ -426,14 +452,29 @@ impl Request {
                 warden: i.warden()?,
                 envelope: i.envelope()?,
             },
-            OP_APPEND_BATCH => {
+            OP_APPEND_BATCH | OP_APPEND_EFFECTS => {
                 let warden = i.warden()?;
                 let count = i.u32()?;
                 if count > MAX_BATCH {
                     return Err(Malformed("batch too large"));
                 }
                 let envelopes = (0..count).map(|_| i.envelope()).collect::<Result<_, _>>()?;
-                Self::AppendBatch { warden, envelopes }
+                let mut effects = Vec::new();
+                if op == OP_APPEND_EFFECTS {
+                    let n = i.u32()?;
+                    if n == 0 || n > count {
+                        return Err(Malformed("effect count"));
+                    }
+                    for _ in 0..n {
+                        let len = i.u32()? as usize;
+                        effects.push(i.take(len)?.to_vec());
+                    }
+                }
+                Self::AppendBatch {
+                    warden,
+                    envelopes,
+                    effects,
+                }
             }
             OP_TRANSFER => Self::Transfer {
                 chronicle: i.chronicle()?,
@@ -597,9 +638,19 @@ fn encode_refusal(e: &CoordError) -> Option<Vec<u8>> {
         CoordError::OwnershipChanged { holder, epoch } => {
             o.u8(R_OWNERSHIP_CHANGED).u64(holder.get()).u64(epoch.get())
         }
-        CoordError::Corrupt { .. } | CoordError::Storage(_) | CoordError::Unavailable(_) => {
-            return None
+        CoordError::EffectPayload { lsn, fault } => {
+            o.u8(R_EFFECT_PAYLOAD).u64(lsn.get()).u8(fault.code())
         }
+        CoordError::Claim(c) => match c {
+            ClaimError::AlreadyClaimed { epoch } => o.u8(R_CLAIM).u8(0).u64(epoch.get()),
+            ClaimError::BadAuthority => o.u8(R_CLAIM).u8(1),
+            ClaimError::Unknown => o.u8(R_CLAIM).u8(2),
+            ClaimError::EpochMoved { epoch } => o.u8(R_CLAIM).u8(3).u64(epoch.get()),
+        },
+        CoordError::Corrupt { .. }
+        | CoordError::Storage(_)
+        | CoordError::Unavailable(_)
+        | CoordError::Journal(_) => return None,
     };
     Some(o.0)
 }
@@ -646,6 +697,21 @@ fn decode_refusal(i: &mut In<'_>) -> Result<CoordError, Malformed> {
             holder: i.warden()?,
             epoch: Epoch::new(i.u64()?),
         },
+        R_EFFECT_PAYLOAD => CoordError::EffectPayload {
+            lsn: Lsn::new(i.u64()?),
+            fault: EffectFault::from_code(i.u8()?).ok_or(Malformed("unknown effect fault"))?,
+        },
+        R_CLAIM => CoordError::Claim(match i.u8()? {
+            0 => ClaimError::AlreadyClaimed {
+                epoch: Epoch::new(i.u64()?),
+            },
+            1 => ClaimError::BadAuthority,
+            2 => ClaimError::Unknown,
+            3 => ClaimError::EpochMoved {
+                epoch: Epoch::new(i.u64()?),
+            },
+            _ => return Err(Malformed("unknown claim refusal")),
+        }),
         _ => return Err(Malformed("unknown refusal")),
     })
 }
@@ -659,9 +725,13 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
             coord.register(chronicle, holder).map(Reply::Head)
         }
         Request::Append { warden, envelope } => coord.append(warden, &envelope).map(Reply::Head),
-        Request::AppendBatch { warden, envelopes } => {
-            coord.append_batch(warden, &envelopes).map(Reply::Head)
-        }
+        Request::AppendBatch {
+            warden,
+            envelopes,
+            effects,
+        } => coord
+            .append_batch_with(warden, &envelopes, &effects)
+            .map(Reply::Head),
         Request::Transfer {
             chronicle,
             new_holder,
@@ -1079,19 +1149,27 @@ impl Coord for RemoteCoord {
         }
     }
 
-    fn append_batch(
+    fn append_batch_with(
         &self,
         warden: WardenId,
         envelopes: &[Envelope],
+        effects: &[Vec<u8>],
     ) -> Result<ChronicleHead, CoordError> {
         if envelopes.len() > MAX_BATCH as usize {
             return Err(CoordError::BadBatch {
                 lsn: envelopes[MAX_BATCH as usize].lsn,
             });
         }
+        if effects.len() > envelopes.len() {
+            return Err(CoordError::EffectPayload {
+                lsn: Lsn::new(0),
+                fault: EffectFault::Extra,
+            });
+        }
         match self.call(Request::AppendBatch {
             warden,
             envelopes: envelopes.to_vec(),
+            effects: effects.to_vec(),
         })? {
             Reply::Head(h) => Ok(h),
             Reply::Err(e) => Err(e),
@@ -1316,6 +1394,18 @@ mod tests {
                 holder: B,
                 epoch: Epoch::new(2),
             },
+            CoordError::EffectPayload {
+                lsn: Lsn::new(4),
+                fault: EffectFault::Undecodable,
+            },
+            CoordError::Claim(ClaimError::AlreadyClaimed {
+                epoch: Epoch::new(3),
+            }),
+            CoordError::Claim(ClaimError::BadAuthority),
+            CoordError::Claim(ClaimError::Unknown),
+            CoordError::Claim(ClaimError::EpochMoved {
+                epoch: Epoch::new(5),
+            }),
         ];
         for e in refusals {
             let body = Reply::Err(e).encode();
@@ -1331,6 +1421,7 @@ mod tests {
             },
             CoordError::Storage(redb::Error::Corrupted("x".into())),
             CoordError::Unavailable(io::Error::other("x")),
+            CoordError::Journal(crate::coordjournal::JournalError("x")),
         ];
         for e in failures {
             let body = Reply::Err(e).encode();
@@ -1340,6 +1431,45 @@ mod tests {
             };
             assert!(back.outcome_unknown(), "{back:?}");
         }
+    }
+
+    /// P4 spec D33: an append with `Effect` records carries their bytes
+    /// over the socket (operation 10), and the served coordinator derives
+    /// the obligations from them; a missing one is refused field for field.
+    #[test]
+    fn effect_bytes_cross_the_socket() {
+        use taso_core::record::{Consequence, Dispatch, IntentRecord, OpId, RetryPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let coord = Arc::new(Coordinator::open(dir.path().join("c.redb")).unwrap());
+        let served: Arc<dyn Coord> = coord.clone();
+        let server = Server::spawn(dir.path().join("c.sock"), served).unwrap();
+        let c = RemoteCoord::with_timeout(dir.path().join("c.sock"), Duration::from_secs(5));
+        let g = c.register(chron(1), A).unwrap();
+        let w = WardenModel::resume(A, chron(1), Epoch::FIRST, g, Lsn::new(1));
+        let p = Payload::Intent(IntentRecord {
+            op: OpId::new(4),
+            provider: "mail".into(),
+            request: vec![1; 100],
+            footprint: vec![],
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::UnsafeToRetry,
+            consequence: Consequence::Irreversible,
+            authority: vec![],
+            barrier: Some(taso_core::record::BarrierId::new(1)),
+        });
+        let rec = w.build_record(Stream::Effect, p.clone());
+        assert!(matches!(
+            c.append(A, &rec.envelope),
+            Err(CoordError::EffectPayload {
+                fault: EffectFault::Missing,
+                ..
+            })
+        ));
+        use taso_core::canon::Canonical;
+        c.append_batch_with(A, &[rec.envelope], &[p.canon_bytes()])
+            .unwrap();
+        assert_eq!(coord.obligations(chron(1)).unwrap(), vec![4]);
+        server.stop();
     }
 
     #[test]
@@ -1384,10 +1514,17 @@ mod tests {
             Request::AppendBatch {
                 warden: A,
                 envelopes: vec![record(&w, 1), record(&w, 1)],
+                effects: vec![],
+            },
+            Request::AppendBatch {
+                warden: A,
+                envelopes: vec![record(&w, 1), record(&w, 1)],
+                effects: vec![vec![1, 2, 3], vec![]],
             },
             Request::AppendBatch {
                 warden: A,
                 envelopes: vec![],
+                effects: vec![],
             },
         ];
         for r in reqs.clone() {
@@ -1536,6 +1673,7 @@ mod tests {
                 Request::AppendBatch {
                     warden: B,
                     envelopes: vec![],
+                    effects: vec![],
                 },
                 Some(B),
             ),
@@ -1777,8 +1915,13 @@ mod tests {
         fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
             self.inner.append(w, e)
         }
-        fn append_batch(&self, w: WardenId, e: &[Envelope]) -> Result<ChronicleHead, CoordError> {
-            self.inner.append_batch(w, e)
+        fn append_batch_with(
+            &self,
+            w: WardenId,
+            e: &[Envelope],
+            fx: &[Vec<u8>],
+        ) -> Result<ChronicleHead, CoordError> {
+            self.inner.append_batch_with(w, e, fx)
         }
         fn transfer_if(
             &self,

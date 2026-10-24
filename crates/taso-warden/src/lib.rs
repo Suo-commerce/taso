@@ -15,6 +15,7 @@ pub mod blk;
 pub mod chronicle;
 pub mod classify;
 pub mod coordinator;
+pub mod coordjournal;
 pub mod coordsrv;
 pub mod daemon;
 pub mod effects;

@@ -1100,11 +1100,20 @@ impl<L: Layers> Chronicle<L> {
             .collect();
         self.segment.append_batch(&frames)?;
         let envelopes: Vec<Envelope> = recs.iter().map(|r| r.envelope).collect();
+        // The coordinator derives obligations from the Effect records'
+        // bytes (P4 spec D33): they go with the CAS.
+        let effects: Vec<Vec<u8>> = recs
+            .iter()
+            .zip(&payloads)
+            .filter(|(r, _)| r.envelope.stream == Stream::Effect)
+            .map(|(_, p)| p.clone())
+            .collect();
         let cas = crate::timing::span("append.cas");
-        let accepted = if envelopes.len() == 1 {
+        let accepted = if envelopes.len() == 1 && effects.is_empty() {
             self.coord.append(self.warden, &envelopes[0])
         } else {
-            self.coord.append_batch(self.warden, &envelopes)
+            self.coord
+                .append_batch_with(self.warden, &envelopes, &effects)
         };
         drop(cas);
         match accepted {
@@ -2926,12 +2935,13 @@ mod tests {
             }
             r
         }
-        fn append_batch(
+        fn append_batch_with(
             &self,
             w: WardenId,
             es: &[taso_core::envelope::Envelope],
+            fx: &[Vec<u8>],
         ) -> Result<ChronicleHead, CoordError> {
-            let r = self.inner.append_batch(w, es);
+            let r = self.inner.append_batch_with(w, es, fx);
             if self
                 .lose_next
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
