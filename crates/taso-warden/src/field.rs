@@ -531,6 +531,7 @@ impl<'v, L: Layers> Session<'v, L> {
                     Some(S::DispatchAuthorized) => OpState::Pending,
                     Some(S::Proposed) => OpState::Held,
                     Some(S::OutcomeUnknown) => OpState::Unknown,
+                    Some(S::AcceptedUnknown) => OpState::AcceptedUnknown,
                     Some(S::ConfirmedApplied) => OpState::Applied {
                         receipt: evidence.unwrap_or_default(),
                     },

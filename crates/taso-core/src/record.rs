@@ -344,6 +344,11 @@ pub enum OutcomeState {
     /// the parent re-recording it as its own intent under a
     /// [`PromotionRecord`].
     Proposed = 5,
+    /// An operator closed the effect without knowing whether it was
+    /// applied (P4 spec D34): terminal, recorded only by operator
+    /// resolution with an actor and a reason.  Says nothing about what
+    /// happened; never re-issued, probed or reported again.
+    AcceptedUnknown = 6,
 }
 
 impl Canonical for OutcomeState {
@@ -1216,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn outcome_state_six_distinct() {
+    fn outcome_states_distinct() {
         let states = [
             OutcomeState::Prepared,
             OutcomeState::DispatchAuthorized,
@@ -1224,8 +1229,10 @@ mod tests {
             OutcomeState::ConfirmedApplied,
             OutcomeState::ConfirmedNotApplied,
             OutcomeState::Proposed,
+            OutcomeState::AcceptedUnknown,
         ];
         let enc: Vec<Vec<u8>> = states.iter().map(|s| s.canon_bytes()).collect();
+        assert_eq!(OutcomeState::AcceptedUnknown.canon_bytes(), vec![6]);
         for i in 0..enc.len() {
             for j in (i + 1)..enc.len() {
                 assert_ne!(enc[i], enc[j]);

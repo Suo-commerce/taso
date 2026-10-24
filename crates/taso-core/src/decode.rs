@@ -342,6 +342,7 @@ impl<'a> Reader<'a> {
             (_, 3) => OutcomeState::ConfirmedApplied,
             (_, 4) => OutcomeState::ConfirmedNotApplied,
             (_, 5) => OutcomeState::Proposed,
+            (_, 6) => OutcomeState::AcceptedUnknown,
             (at, tag) => {
                 return Err(DecodeError::BadTag {
                     at,
@@ -674,6 +675,7 @@ mod tests {
             Just(OutcomeState::ConfirmedApplied),
             Just(OutcomeState::ConfirmedNotApplied),
             Just(OutcomeState::Proposed),
+            Just(OutcomeState::AcceptedUnknown),
         ];
         (any::<u64>(), state, proptest::option::of(blob())).prop_map(|(op, state, evidence)| {
             Payload::Outcome(OutcomeRecord {
@@ -1057,26 +1059,35 @@ mod tests {
         );
     }
 
-    /// `Proposed` (state tag 5) decodes; the next tag does not, and the
-    /// refusal names the type so a reader of an older binary sees
-    /// "outcome state 6", not a generic failure.
+    /// `Proposed` (state tag 5) and `AcceptedUnknown` (state tag 6, P4
+    /// spec D34) decode; the next tag does not, and the refusal names the
+    /// type so a reader of an older binary sees "outcome state 7", not a
+    /// generic failure.
     #[test]
-    fn proposed_decodes_and_the_next_state_tag_is_refused() {
-        let p = Payload::Outcome(OutcomeRecord {
+    fn proposed_and_accepted_unknown_decode_and_the_next_state_tag_is_refused() {
+        for state in [OutcomeState::Proposed, OutcomeState::AcceptedUnknown] {
+            let p = Payload::Outcome(OutcomeRecord {
+                op: OpId::new(3),
+                state,
+                evidence: None,
+            });
+            assert_eq!(Payload::decode(&p.canon_bytes()), Ok(p));
+        }
+        let mut bytes = Payload::Outcome(OutcomeRecord {
             op: OpId::new(3),
-            state: OutcomeState::Proposed,
+            state: OutcomeState::AcceptedUnknown,
             evidence: None,
-        });
-        let mut bytes = p.canon_bytes();
-        assert_eq!(Payload::decode(&bytes), Ok(p));
+        })
+        .canon_bytes();
         // Outcome: tag, op 8 -> state tag at 9.
-        bytes[9] = 6;
+        assert_eq!(bytes[9], 6);
+        bytes[9] = 7;
         assert_eq!(
             Payload::decode(&bytes),
             Err(DecodeError::BadTag {
                 at: 9,
                 what: "outcome state",
-                tag: 6
+                tag: 7
             })
         );
     }

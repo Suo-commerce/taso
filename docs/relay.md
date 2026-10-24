@@ -82,7 +82,10 @@ For every effect it acts on, the sender reports one of:
   Taso records `ConfirmedNotApplied`.
 - **Unknown**: no answer, or an ambiguous one.  Taso records
   `OutcomeUnknown` — the effect is still open until the sender or an
-  operator resolves it.
+  operator resolves it.  An operator may resolve it as applied, as not
+  applied, or as `AcceptedUnknown` (nobody knows; closed with an actor
+  and a reason, P4 spec D34).  Once resolved, the effect is no longer
+  listed to the sender, and a later report for it is refused.
 
 The sender reports through `Request::Outcome { op, result }`.
 A report for an unknown `op` is refused and nothing is recorded.

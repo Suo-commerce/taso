@@ -2,10 +2,10 @@
 //! purge, genesis and reclamation, with every identity and hash they
 //! carry.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 9 (file 0), frozen
+//! Normative reference: `Taso_spec_p4_contracts` rev. 10 (file 0), frozen
 //! 2026-10-24, BLAKE3
-//! `9c3a984fc45d213b024a4b93a1cb519c4f176c0a3366db7a3f81484029892dc5`.
-//! Section numbers below (§) are rev. 9's.
+//! `e24580cb475ae2724e9c679363f995ffcc88abf72751370aa493f5c1eb8d9bdc`.
+//! Section numbers below (§) are rev. 10's.
 //!
 //! This module is pure data: the records, their canonical encoding (the
 //! same rules as [`crate::canon`]), their strict decoding, and the

@@ -80,7 +80,9 @@ impl Default for Summary {
 fn terminal(s: OutcomeState) -> bool {
     matches!(
         s,
-        OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied
+        OutcomeState::ConfirmedApplied
+            | OutcomeState::ConfirmedNotApplied
+            | OutcomeState::AcceptedUnknown
     )
 }
 
@@ -242,7 +244,7 @@ mod tests {
             Just(Step::Transcript),
             Just(Step::Fs),
             (0u8..6).prop_map(Step::Intent),
-            (0u8..6, 0u8..6).prop_map(|(op, s)| Step::Outcome(op, s)),
+            (0u8..6, 0u8..7).prop_map(|(op, s)| Step::Outcome(op, s)),
             (1u64..1000).prop_map(Step::Seal),
             Just(Step::Shipped),
             (0u8..4).prop_map(Step::Promotion),
@@ -257,6 +259,7 @@ mod tests {
             OutcomeState::ConfirmedApplied,
             OutcomeState::ConfirmedNotApplied,
             OutcomeState::Proposed,
+            OutcomeState::AcceptedUnknown,
         ][usize::from(n)]
     }
 

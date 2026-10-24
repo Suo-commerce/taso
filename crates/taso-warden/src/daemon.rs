@@ -24,7 +24,7 @@
 //! # Starting
 //!
 //! First, [`Node::new`] refuses a host with SELinux enabled
-//! ([`refuse_selinux`], P4 spec rev. 9 D32): SELinux labels every file
+//! ([`refuse_selinux`], P4 spec rev. 10 D32): SELinux labels every file
 //! with an xattr, in permissive mode too, and a manifest refuses every
 //! entry that has one, so nothing on such a host could become a Template.
 //! Supported hosts are Linux without SELinux (Ubuntu, Debian).
@@ -1790,7 +1790,7 @@ impl RunDirLock {
 /// is enabled, enforcing or permissive (relative to the sysfs root).
 pub const SELINUX_ENFORCE: &str = "fs/selinux/enforce";
 
-/// Refuse to start on a host with SELinux enabled (P4 spec rev. 9 D32).
+/// Refuse to start on a host with SELinux enabled (P4 spec rev. 10 D32).
 /// `sys` is the sysfs root, `/sys` on a real host.  A host whose sysfs
 /// cannot be read is refused too: not knowing is not "no SELinux".
 pub fn refuse_selinux(sys: &Path) -> io::Result<()> {

@@ -434,7 +434,9 @@ struct OpTrack<'a> {
 const fn is_terminal(s: OutcomeState) -> bool {
     matches!(
         s,
-        OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied
+        OutcomeState::ConfirmedApplied
+            | OutcomeState::ConfirmedNotApplied
+            | OutcomeState::AcceptedUnknown
     )
 }
 
@@ -511,11 +513,14 @@ fn check_ledger(
             continue;
         }
         match terminal.map(|(_, st)| st) {
-            Some(OutcomeState::ConfirmedApplied) => obligations.push(Obligation {
-                op,
-                barrier,
-                kind: ObligationKind::Suppress,
-            }),
+            // An operator's AcceptedUnknown may have happened: never
+            // repeat it, exactly as if applied (P4 spec D34).
+            Some(OutcomeState::ConfirmedApplied | OutcomeState::AcceptedUnknown) => obligations
+                .push(Obligation {
+                    op,
+                    barrier,
+                    kind: ObligationKind::Suppress,
+                }),
             Some(_) => {} // ConfirmedNotApplied: nothing happened.
             None => reasons.push(Reason::MissingOutcome(op)),
         }
@@ -995,6 +1000,26 @@ mod tests {
         assert_eq!(
             sim.nav(s),
             Navigation::Inconsistent(vec![Mode::UnaccountedBarrier(Some(OpId::new(9)))]),
+        );
+    }
+
+    /// P4 spec D34: an effect an operator closed as `AcceptedUnknown`
+    /// after S may have happened, so resuming at S must never repeat it:
+    /// suppressed, exactly as if applied.
+    #[test]
+    fn accepted_unknown_after_seal_is_suppressed() {
+        let mut sim = Sim::new();
+        let s = sim.seal();
+        sim.append(
+            Stream::Effect,
+            intent(9, Consequence::Irreversible, Some(1)),
+        );
+        sim.append(Stream::Effect, outcome(9, OutcomeState::DispatchAuthorized));
+        sim.append(Stream::Effect, outcome(9, OutcomeState::OutcomeUnknown));
+        sim.append(Stream::Effect, outcome(9, OutcomeState::AcceptedUnknown));
+        assert_eq!(
+            sim.nav(s),
+            Navigation::Consistent(vec![suppress(OpId::new(9), 1)])
         );
     }
 

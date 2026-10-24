@@ -191,6 +191,29 @@ pub enum Answer {
     Unknown,
 }
 
+/// An operator's answer for an open effect ([`Ledger::resolve`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// It happened: `ConfirmedApplied`.
+    Applied,
+    /// It did not happen: `ConfirmedNotApplied`.
+    NotApplied,
+    /// Nobody knows, and the operator closes it anyway:
+    /// `AcceptedUnknown` (P4 spec D34).  Never re-issued or probed.
+    AcceptedUnknown,
+}
+
+impl Resolution {
+    /// The outcome state it records.
+    pub fn state(self) -> OutcomeState {
+        match self {
+            Self::Applied => OutcomeState::ConfirmedApplied,
+            Self::NotApplied => OutcomeState::ConfirmedNotApplied,
+            Self::AcceptedUnknown => OutcomeState::AcceptedUnknown,
+        }
+    }
+}
+
 /// Why an operator resolution was refused.
 #[derive(Debug)]
 pub enum ResolveError {
@@ -483,14 +506,15 @@ impl Ledger {
         Ok(false)
     }
 
-    /// Operator resolution of an open effect: record what really happened.
-    /// Refused without an actor and a reason, or for an effect that is not
-    /// open.
+    /// Operator resolution of an open effect: record what really happened,
+    /// or that nobody knows ([`Resolution::AcceptedUnknown`]).  Each closes
+    /// the obligation and restores effect authority.  Refused without an
+    /// actor and a reason, or for an effect that is not open.
     pub fn resolve<L: Layers>(
         &mut self,
         vessel: &mut Vessel<L>,
         op: OpId,
-        applied: bool,
+        resolution: Resolution,
         authority: Authority,
     ) -> Result<(), ResolveError> {
         if authority.actor.trim().is_empty() || authority.reason.trim().is_empty() {
@@ -499,15 +523,10 @@ impl Ledger {
         if !self.open.contains(&op) {
             return Err(ResolveError::NotOpen(op));
         }
-        let state = if applied {
-            OutcomeState::ConfirmedApplied
-        } else {
-            OutcomeState::ConfirmedNotApplied
-        };
         vessel
             .append(
                 Stream::Effect,
-                outcome(op, state, Some(authority.canon_bytes())),
+                outcome(op, resolution.state(), Some(authority.canon_bytes())),
             )
             .map_err(ResolveError::Vessel)?;
         self.open.remove(&op);
@@ -564,7 +583,11 @@ impl Ledger {
             let state = latest.get(&op).copied();
             if matches!(
                 state,
-                Some(OutcomeState::ConfirmedApplied | OutcomeState::ConfirmedNotApplied)
+                Some(
+                    OutcomeState::ConfirmedApplied
+                        | OutcomeState::ConfirmedNotApplied
+                        | OutcomeState::AcceptedUnknown
+                )
             ) {
                 continue;
             }
@@ -877,19 +900,74 @@ mod tests {
             reason: "x".into(),
         };
         assert!(matches!(
-            l.resolve(&mut v, a.op, true, empty),
+            l.resolve(&mut v, a.op, Resolution::Applied, empty),
             Err(ResolveError::EmptyAuthority)
         ));
         assert!(matches!(
-            l.resolve(&mut v, OpId::new(9), true, auth()),
+            l.resolve(&mut v, OpId::new(9), Resolution::Applied, auth()),
             Err(ResolveError::NotOpen(_))
         ));
-        l.resolve(&mut v, a.op, false, auth()).unwrap();
+        l.resolve(&mut v, a.op, Resolution::NotApplied, auth())
+            .unwrap();
         assert!(l.authorized());
         assert_eq!(
             outcomes(&v).last(),
             Some(&(1, OutcomeState::ConfirmedNotApplied))
         );
+    }
+
+    /// P4 spec D34: an operator who does not know closes the effect as
+    /// `AcceptedUnknown`, with a name and a reason.  It restores authority,
+    /// and no later reopen visits, re-issues or probes it.
+    #[test]
+    fn an_operator_may_close_an_unknown_effect_as_accepted_unknown() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut l, _) = open(&mut v);
+        let a = l
+            .release(&mut v, &declared("wire money", Consequence::Irreversible))
+            .unwrap();
+        drop((l, v));
+        let mut v = vessel(&e);
+        let (mut l, r) = open(&mut v);
+        assert_eq!(r.open, vec![a.op]);
+        assert!(!l.authorized());
+
+        let empty = Authority {
+            actor: "ops".into(),
+            reason: "".into(),
+        };
+        assert!(matches!(
+            l.resolve(&mut v, a.op, Resolution::AcceptedUnknown, empty),
+            Err(ResolveError::EmptyAuthority)
+        ));
+        l.resolve(&mut v, a.op, Resolution::AcceptedUnknown, auth())
+            .unwrap();
+        assert!(l.authorized(), "authority restored");
+        assert_eq!(
+            outcomes(&v),
+            vec![
+                (1, OutcomeState::DispatchAuthorized),
+                (1, OutcomeState::OutcomeUnknown),
+                (1, OutcomeState::AcceptedUnknown)
+            ]
+        );
+        let Some(Payload::Outcome(last)) = records(&v).pop() else {
+            panic!("an outcome last");
+        };
+        assert_eq!(last.evidence, Some(auth().canon_bytes()), "who and why");
+        assert!(matches!(
+            l.resolve(&mut v, a.op, Resolution::Applied, auth()),
+            Err(ResolveError::NotOpen(_))
+        ));
+
+        // A reopen settles nothing and records nothing for it.
+        drop((l, v));
+        let mut v = vessel(&e);
+        let (l, r) = Ledger::open(Box::new(AlwaysPublish), &mut v, no_settle).unwrap();
+        assert_eq!(r, Reconciled::default());
+        assert!(l.authorized());
+        assert_eq!(outcomes(&v).len(), 3);
     }
 
     #[test]

@@ -342,10 +342,13 @@ impl AdapterModel {
 
             match state {
                 // Terminal — nothing to do.  A held proposal is terminal
-                // here too: only its parent may release it (P3).
+                // here too: only its parent may release it (P3); so is an
+                // operator's AcceptedUnknown: never re-issued or probed
+                // (P4 spec D34).
                 Some(OutcomeState::ConfirmedApplied)
                 | Some(OutcomeState::ConfirmedNotApplied)
-                | Some(OutcomeState::Proposed) => {}
+                | Some(OutcomeState::Proposed)
+                | Some(OutcomeState::AcceptedUnknown) => {}
 
                 // No outcome: dispatch was never authorized.
                 None | Some(OutcomeState::Prepared) => {

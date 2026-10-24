@@ -77,7 +77,7 @@ use crate::ledger::{Answer, Authorized, Declared, Ledger};
 use crate::segment::Position;
 use crate::vessel::{ReadLog, SealAt, Vessel, VesselError};
 
-pub use crate::ledger::{Publish, PublishError, Reconciled, ResolveError};
+pub use crate::ledger::{Publish, PublishError, Reconciled, Resolution, ResolveError};
 
 #[cfg(test)]
 pub(crate) use crate::ledger::AlwaysPublish;
@@ -420,10 +420,10 @@ impl Effects {
         &mut self,
         vessel: &mut Vessel<L>,
         op: OpId,
-        applied: bool,
+        resolution: Resolution,
         authority: Authority,
     ) -> Result<(), ResolveError> {
-        self.ledger.resolve(vessel, op, applied, authority)?;
+        self.ledger.resolve(vessel, op, resolution, authority)?;
         self.released.remove(&op);
         self.unlisted.remove(&op);
         Ok(())
@@ -766,7 +766,8 @@ mod tests {
         fx.ask(&mut v, &pay("pay 3")).unwrap();
         fx.report(&mut v, OpId::new(2), &Answer::Unknown).unwrap();
         assert!(!fx.authorized());
-        fx.resolve(&mut v, OpId::new(2), true, auth()).unwrap();
+        fx.resolve(&mut v, OpId::new(2), Resolution::Applied, auth())
+            .unwrap();
         assert!(fx.authorized());
         assert!(fx.released(&v).unwrap().is_empty());
     }
@@ -827,6 +828,37 @@ mod tests {
             fx.ask(&mut v, &pay("pay 2")).unwrap(),
             Asked::Released { op: OpId::new(2) }
         );
+    }
+
+    /// P4 spec D34: an unknown effect closed by an operator as
+    /// `AcceptedUnknown` is no longer listed to the sender, a late report
+    /// for it is refused, and a reopen neither lists nor settles it.
+    #[test]
+    fn accepted_unknown_is_closed_for_the_sender_and_for_reopen() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut v);
+        fx.ask(&mut v, &pay("pay 1")).unwrap();
+        fx.report(&mut v, OpId::new(1), &Answer::Unknown).unwrap();
+        assert!(!fx.authorized());
+        fx.resolve(&mut v, OpId::new(1), Resolution::AcceptedUnknown, auth())
+            .unwrap();
+        assert!(fx.authorized());
+        assert!(fx.released(&v).unwrap().is_empty());
+        assert!(matches!(
+            fx.report(&mut v, OpId::new(1), &Answer::Unknown),
+            Err(ReportError::NotReleased(_))
+        ));
+        assert_eq!(
+            fx.result(&v, OpId::new(1)).unwrap().map(|r| r.state),
+            Some(Some(OutcomeState::AcceptedUnknown))
+        );
+        drop((fx, v));
+        let mut v = vessel(&e);
+        let (fx, r) = open_dispatch(&mut v);
+        assert_eq!(r, Reconciled::default());
+        assert!(fx.authorized());
+        assert!(fx.released(&v).unwrap().is_empty());
     }
 
     #[test]

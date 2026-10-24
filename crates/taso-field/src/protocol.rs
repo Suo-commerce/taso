@@ -260,6 +260,10 @@ pub enum OpState {
     /// No such op in this Vessel's log: never declared here, or settled
     /// and pruned (tag 5).
     NotFound,
+    /// It may or may not have happened, and an operator closed it without
+    /// knowing (tag 6): nothing will report it again, and it is never
+    /// repeated.
+    AcceptedUnknown,
 }
 
 /// The answer to a fork request.
@@ -675,6 +679,7 @@ impl Reply {
                     OpState::NotApplied { reason } => o.u8(3).str(reason),
                     OpState::Unknown => o.u8(4),
                     OpState::NotFound => o.u8(5),
+                    OpState::AcceptedUnknown => o.u8(6),
                 };
             }
         }
@@ -796,6 +801,7 @@ impl Reply {
                     },
                     4 => OpState::Unknown,
                     5 => OpState::NotFound,
+                    6 => OpState::AcceptedUnknown,
                     _ => return Err(r.bad_tag("unknown op state tag")),
                 },
             },
@@ -1114,6 +1120,7 @@ mod tests {
                     text().prop_map(|reason| OpState::NotApplied { reason }),
                     Just(OpState::Unknown),
                     Just(OpState::NotFound),
+                    Just(OpState::AcceptedUnknown),
                 ]
             )
                 .prop_map(|(op, state)| Reply::Result { op, state }),
