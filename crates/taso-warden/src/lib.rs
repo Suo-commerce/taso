@@ -22,6 +22,7 @@ pub mod coordstore;
 pub mod daemon;
 pub mod effects;
 pub mod field;
+pub mod genesis;
 pub mod kube;
 pub mod ledger;
 pub mod navigate;
