@@ -110,6 +110,9 @@ pub enum ZfsError {
     },
     /// A snapshot for this Seal, or a dataset, already exists.
     AlreadyExists(String),
+    /// A dataset of this name exists, but not the one meant: its guid is
+    /// another.  Nothing was done to it.
+    Replaced(String),
     /// The Seal snapshot to clone from or roll back to does not exist.
     NotFound(String),
     /// The snapshot exists but is not bound to the Seal the caller named
@@ -153,6 +156,7 @@ impl fmt::Display for ZfsError {
                 stderr.trim(),
             ),
             Self::AlreadyExists(name) => write!(f, "{name} already exists"),
+            Self::Replaced(what) => write!(f, "{what}"),
             Self::NotFound(name) => write!(f, "{name} does not exist"),
             Self::SealMismatch(name) => {
                 write!(f, "{name} is not bound to the requested Seal")
@@ -1186,6 +1190,37 @@ impl<R: Runner> Zfs<R> {
         self.run(vec!["destroy".to_string(), snapshot.name()])
             .map(|_| ())
     }
+
+    /// The filesystem's `guid`, `None` if it does not exist.
+    pub fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, ZfsError> {
+        let args = strs_of(&["get", "-H", "-p", "-o", "value", "guid", dataset.as_str()]);
+        match self.run(args) {
+            Ok(out) => {
+                let v = out.trim();
+                v.parse().map(Some).map_err(|_| ZfsError::Parse {
+                    line: v.to_string(),
+                    why: "guid is not a number",
+                })
+            }
+            Err(ZfsError::Exit { stderr, .. }) if stderr.contains("does not exist") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Destroy the filesystem `dataset` and its snapshots
+    /// (`zfs destroy -r`), only if its guid is still `guid`.  `Ok(false)`
+    /// if it does not exist; ZFS refuses if a clone depends on a snapshot.
+    pub fn destroy_dataset(&self, dataset: &Dataset, guid: u64) -> Result<bool, ZfsError> {
+        match self.guid(dataset)? {
+            None => Ok(false),
+            Some(g) if g != guid => Err(ZfsError::Replaced(format!(
+                "{dataset} has guid {g}, not {guid}; not destroying it"
+            ))),
+            Some(_) => self
+                .run(strs_of(&["destroy", "-r", dataset.as_str()]))
+                .map(|_| true),
+        }
+    }
 }
 
 /// `zfs list` arguments for one snapshot, or for every snapshot of a
@@ -1578,6 +1613,44 @@ mod tests {
         assert_eq!(
             zfs.runner.calls.borrow()[0],
             strs(&["destroy", "tasotest/vessel@taso-seal-00000000000000000004"]),
+        );
+    }
+
+    // ── P4 file 4b-0: guid and destroying a dataset ────────────────
+
+    #[test]
+    fn guid_reads_the_property_and_absent_is_none() {
+        let zfs = Zfs::with_runner(Fake::default().reply(true, "1234567890123\n", "").reply(
+            false,
+            "",
+            "cannot open 'tasotest/vessel': dataset does not exist",
+        ));
+        assert_eq!(zfs.guid(&ds()).unwrap(), Some(1234567890123));
+        assert_eq!(zfs.guid(&ds()).unwrap(), None);
+        assert_eq!(
+            zfs.runner.calls.borrow()[0],
+            strs(&["get", "-H", "-p", "-o", "value", "guid", "tasotest/vessel"])
+        );
+    }
+
+    #[test]
+    fn destroy_dataset_checks_the_guid_first() {
+        // Another guid: refused, and no destroy is run.
+        let zfs = Zfs::with_runner(Fake::default().reply(true, "77\n", ""));
+        assert!(matches!(
+            zfs.destroy_dataset(&ds(), 76),
+            Err(ZfsError::Replaced(_))
+        ));
+        assert_eq!(zfs.runner.calls.borrow().len(), 1);
+        // Absent: nothing to do.
+        let zfs = Zfs::with_runner(Fake::default().reply(false, "", "dataset does not exist"));
+        assert!(!zfs.destroy_dataset(&ds(), 77).unwrap());
+        // Its own guid: destroyed with its snapshots.
+        let zfs = Zfs::with_runner(Fake::default().reply(true, "77\n", "").reply(true, "", ""));
+        assert!(zfs.destroy_dataset(&ds(), 77).unwrap());
+        assert_eq!(
+            zfs.runner.calls.borrow()[1],
+            strs(&["destroy", "-r", "tasotest/vessel"])
         );
     }
 
@@ -2587,6 +2660,33 @@ mod tests {
                     .args(["destroy", "-R", self.ds.as_str()])
                     .status();
             }
+        }
+
+        /// P4 4b-0: a Seal's files are read through its snapshot
+        /// directory, unchanged by later writes; a dataset is destroyed by
+        /// its guid only.
+        #[test]
+        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
+        fn seal_view_and_destroy_on_zfs() {
+            use crate::vessel::Pool;
+            let s = Scratch::new("sealview");
+            let zfs = Zfs::cli();
+            std::fs::write(s.mountpoint.join("a"), b"sealed").unwrap();
+            zfs.snapshot(&s.ds, Lsn::new(3), hash(3)).unwrap();
+            std::fs::write(s.mountpoint.join("a"), b"after the Seal").unwrap();
+            assert!(Pool::seal_view(&zfs, &s.ds, Lsn::new(9)).is_err());
+            let view = Pool::seal_view(&zfs, &s.ds, Lsn::new(3)).unwrap();
+            assert_eq!(std::fs::read(view.path().join("a")).unwrap(), b"sealed");
+            assert!(
+                std::fs::write(view.path().join("b"), b"x").is_err(),
+                "a snapshot is read-only"
+            );
+            drop(view);
+            let g = Pool::guid(&zfs, &s.ds).unwrap().unwrap();
+            assert!(Pool::destroy(&zfs, &s.ds, g + 1).is_err());
+            assert!(Pool::destroy(&zfs, &s.ds, g).unwrap());
+            assert_eq!(Pool::guid(&zfs, &s.ds).unwrap(), None);
+            assert!(!Pool::destroy(&zfs, &s.ds, g).unwrap());
         }
 
         /// What `zfs rollback` does on this ZFS, checked rather than

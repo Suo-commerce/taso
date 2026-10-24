@@ -142,6 +142,56 @@ pub trait Pool {
         to: (Lsn, HashVal),
         stream: &mut dyn std::io::Read,
     ) -> Result<u64, LayerError>;
+    /// The files of `dataset`'s Seal layer `lsn`, read-only, for as long
+    /// as the view lives (P4 spec rev. 12 §7, D39, D40: genesis reads a
+    /// Vessel's Seal and its own sealed output this way).  ZFS: the
+    /// snapshot's directory; the block log: a throwaway branch of the Seal
+    /// mounted read-only, gone when the view is dropped.
+    fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError>;
+    /// An identity of `dataset` that a later dataset of the same name does
+    /// not share (ZFS: its `guid`; the block log: its branch's id).  `None`
+    /// if there is no such dataset.
+    fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError>;
+    /// Destroy `dataset` and its own Seal layers, only if it is still the
+    /// dataset with `guid` (§7 step 7: a scratch is deleted by guid).
+    /// `Ok(false)` if there is no such dataset; refused if it has another
+    /// guid, or if a clone stands on one of its layers.
+    fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError>;
+}
+
+/// A read-only view of a Seal's files ([`Pool::seal_view`]); what it
+/// borrowed is given back when it is dropped.
+pub struct SealView {
+    path: std::path::PathBuf,
+    release: Option<Box<dyn FnOnce()>>,
+}
+
+impl SealView {
+    /// A view of the files at `path`; `release` runs when it is dropped.
+    pub fn new(path: std::path::PathBuf, release: Option<Box<dyn FnOnce()>>) -> Self {
+        Self { path, release }
+    }
+
+    /// Where the files are.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for SealView {
+    fn drop(&mut self) {
+        if let Some(r) = self.release.take() {
+            r();
+        }
+    }
+}
+
+impl std::fmt::Debug for SealView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealView")
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 impl<R: Runner + Clone> Pool for Zfs<R> {
@@ -199,6 +249,31 @@ impl<R: Runner + Clone> Pool for Zfs<R> {
         stream: &mut dyn std::io::Read,
     ) -> Result<u64, LayerError> {
         Ok(Zfs::receive_clone(self, dataset, base, to, stream)?.guid)
+    }
+
+    /// The snapshot's own directory (`.zfs/snapshot/<name>`): ZFS
+    /// snapshots are read-only, so there is nothing to give back.
+    fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
+        if self.get(dataset, lsn)?.is_none() {
+            return Err(format!("no Seal layer {}", dataset.seal_snapshot(lsn)).into());
+        }
+        self.ensure_mounted(dataset)?;
+        let mp = self
+            .dataset_info(dataset)?
+            .and_then(|i| i.mountpoint)
+            .ok_or_else(|| format!("{dataset} has no mountpoint"))?;
+        Ok(SealView::new(
+            mp.join(".zfs/snapshot").join(crate::zfs::snap_name(lsn)),
+            None,
+        ))
+    }
+
+    fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
+        Ok(Zfs::guid(self, dataset)?)
+    }
+
+    fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
+        Ok(Zfs::destroy_dataset(self, dataset, guid)?)
     }
 }
 
@@ -1988,6 +2063,26 @@ pub(crate) mod tests {
                 },
             );
             Ok(fake_guid(to.0))
+        }
+        fn seal_view(&self, _: &Dataset, _: Lsn) -> Result<SealView, LayerError> {
+            Err("the fake pool holds no files".into())
+        }
+        fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
+            Ok(self
+                .0
+                .borrow()
+                .contains_key(dataset.as_str())
+                .then(|| fake_guid(Lsn::new(dataset.as_str().len() as u64))))
+        }
+        fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
+            match Pool::guid(self, dataset)? {
+                None => Ok(false),
+                Some(g) if g != guid => Err("another guid".into()),
+                Some(_) => {
+                    self.remove(dataset.as_str());
+                    Ok(true)
+                }
+            }
         }
     }
 

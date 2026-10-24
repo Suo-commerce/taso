@@ -352,3 +352,54 @@ fn rebirth_on_a_second_node_from_shipped_packs() {
         (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash))
     );
 }
+
+/// P4 file 4b-0: a Seal's files read through a read-only view (a
+/// throwaway branch, gone with the view), unchanged by later writes; a
+/// dataset destroyed by its guid with every layer it made.
+#[test]
+#[ignore = "needs root, ublk and a running taso-blkd; run scripts/blk-warden-test.sh"]
+fn seal_views_and_destroy_on_real_devices() {
+    use taso_core::envelope::HashVal;
+    let (socket, mounts) = setup();
+    let _unmount = Unmount(mounts.clone());
+    let state = tempfile::tempdir().unwrap();
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let pool = BlkPool::new(&socket, &mounts, state.path().join("spool"));
+    let ds = Dataset::new(&format!("blk/view-{run}")).unwrap();
+    let mp = pool.create(&ds).unwrap().mountpoint.unwrap();
+    std::fs::write(mp.join("a"), b"sealed").unwrap();
+    let h = HashVal::from_bytes([3; 32]);
+    pool.layers(&ds).snapshot(Lsn::new(3), h).unwrap();
+    std::fs::write(mp.join("a"), b"after the Seal").unwrap();
+
+    let view = pool.seal_view(&ds, Lsn::new(3)).unwrap();
+    assert_eq!(std::fs::read(view.path().join("a")).unwrap(), b"sealed");
+    assert!(
+        mount_options(view.path()).split(',').any(|o| o == "ro"),
+        "mounted read-only: {}",
+        mount_options(view.path())
+    );
+    assert!(std::fs::write(view.path().join("b"), b"x").is_err());
+    let g = pool.guid(&ds).unwrap().unwrap();
+    assert!(
+        Pool::destroy(&pool, &ds, g).is_err(),
+        "the view stands on its Seal"
+    );
+    let at = view.path().to_path_buf();
+    drop(view);
+    assert!(
+        !std::fs::read_to_string("/proc/self/mountinfo")
+            .unwrap()
+            .contains(&at.to_string_lossy().to_string()),
+        "the view is unmounted"
+    );
+    assert_eq!(std::fs::read(mp.join("a")).unwrap(), b"after the Seal");
+
+    assert!(Pool::destroy(&pool, &ds, g + 1).is_err());
+    assert!(Pool::destroy(&pool, &ds, g).unwrap());
+    assert_eq!(pool.info(&ds).unwrap(), None);
+    assert!(!Pool::destroy(&pool, &ds, g).unwrap());
+}

@@ -61,7 +61,7 @@ use taso_core::envelope::{HashVal, Lsn};
 
 use crate::chronicle::{LayerError, Layers};
 use crate::ship::{ByteStream, Sender};
-use crate::vessel::Pool;
+use crate::vessel::{Pool, SealView};
 use crate::zfs::{CloneBase, Dataset, DatasetInfo, Snapshot, SNAP_PREFIX};
 
 // ── tags ────────────────────────────────────────────────────────────
@@ -236,6 +236,8 @@ pub trait Mounts {
     fn mkfs(&self, dev: &Path) -> io::Result<()>;
     /// Mount `dev` on the directory `dir` (created if missing).
     fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()>;
+    /// Mount `dev` read-only on the directory `dir` (created if missing).
+    fn mount_ro(&self, dev: &Path, dir: &Path) -> io::Result<()>;
     /// The device mounted on exactly `dir`, if something is.
     fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>>;
     /// Unmount the file system mounted on `dir`.
@@ -281,6 +283,10 @@ impl Mounts for System {
             .args(["-o", "discard"])
             .arg(dev)
             .arg(dir))
+    }
+    fn mount_ro(&self, dev: &Path, dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        run(Command::new("mount").args(["-o", "ro"]).arg(dev).arg(dir))
     }
     fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
         Ok(mount_source(
@@ -506,6 +512,35 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     }
 }
 
+/// Unmount `mp` if branch `b`'s device is mounted there, detach `b`, and
+/// drop it.
+fn take_down<D: Blkd, M: Mounts + ?Sized>(
+    d: &mut D,
+    m: &M,
+    b: LayerId,
+    mp: &Path,
+) -> Result<(), LayerError> {
+    let info = d.info(b)?;
+    match (info.dev.as_ref(), m.source(mp)?) {
+        (Some(dev), Some(src)) if &src == dev => m.umount(mp)?,
+        (_, Some(src)) => {
+            return Err(format!(
+                "{} is mounted from {}, not from branch {b}'s device",
+                mp.display(),
+                src.display()
+            )
+            .into())
+        }
+        (_, None) => {}
+    }
+    if info.dev.is_some() {
+        d.detach(b)?;
+    }
+    d.drop_layer(b)?;
+    d.flush()?;
+    Ok(())
+}
+
 /// Give branch `b` a device if it has none and mount it on `mp` if nothing
 /// is mounted there; refuse if something else is.  Returns the device.
 fn mount_branch<D: Blkd, M: Mounts>(
@@ -576,8 +611,114 @@ fn seal_at<D: Blkd>(
         .find_map(|(l, t)| untag(&t).filter(|(n, _)| *n == lsn).map(|(_, h)| (l, h))))
 }
 
-impl<D: Blkd, M: Mounts> Pool for BlkPool<D, M> {
+impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     type Layers = BlkLayers<D, M>;
+
+    /// A throwaway branch of the Seal, given a device and mounted
+    /// read-only under `<mount root>/.views/`; dropping the view unmounts
+    /// it, detaches it and drops the branch.  A view left behind by a
+    /// crash (same name) is taken down first.
+    fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
+        let name = format!("{}.view-{}", dataset.as_str(), lsn.get());
+        let dir = self.mount_root.join(".views").join(&name);
+        let mut d = self.blkd.lock().unwrap();
+        let b = d
+            .find(dataset.as_str())?
+            .ok_or_else(|| format!("no dataset {dataset}"))?;
+        let (layer, _) = seal_at(&mut *d, b, lsn)?
+            .ok_or_else(|| format!("no Seal layer {}", dataset.seal_snapshot(lsn)))?;
+        if let Some(stale) = d.find(&name)? {
+            take_down(&mut *d, &*self.mounts, stale, &dir)?;
+        }
+        let v = d.branch(layer, &name)?;
+        let made = (|| -> Result<(), LayerError> {
+            d.flush()?;
+            let dev = d.attach(v)?;
+            self.mounts.mount_ro(&dev, &dir)?;
+            Ok(())
+        })();
+        if let Err(e) = made {
+            let _ = take_down(&mut *d, &*self.mounts, v, &dir);
+            return Err(e);
+        }
+        drop(d);
+        let (blkd, mounts, at) = (self.blkd.clone(), self.mounts.clone(), dir.clone());
+        Ok(SealView::new(
+            dir,
+            Some(Box::new(move || {
+                let mut d = blkd.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = take_down(&mut *d, &*mounts, v, &at) {
+                    eprintln!("taso: leaving a Seal view behind at {}: {e}", at.display());
+                }
+            })),
+        ))
+    }
+
+    fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        Ok(d.find(dataset.as_str())?.map(|b| b.get()))
+    }
+
+    /// Unmount, detach, drop the branch, then its own Seals (newest first)
+    /// and, for a dataset born from the void, its root Seal.  The block
+    /// log refuses to drop a layer something stands on (a clone).
+    fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let Some(b) = d.find(dataset.as_str())? else {
+            return Ok(false);
+        };
+        if b.get() != guid {
+            return Err(format!(
+                "{dataset} is branch {}, not {guid}; not destroying it",
+                b.get()
+            )
+            .into());
+        }
+        // Its own Seals, newest first, then what it was born on.
+        let mut own = Vec::new();
+        let mut cur = d.info(b)?.parent;
+        let mut root = None;
+        while let Some(l) = cur {
+            let i = d.info(l)?;
+            if i.origin == Some(b) {
+                own.push(l);
+                cur = i.parent;
+                continue;
+            }
+            if i.parent.is_none() && i.origin.is_none() {
+                root = Some(l); // a void birth's own root Seal
+            }
+            break;
+        }
+        // Refuse before touching anything if another branch (a clone, an
+        // open Seal view) stands on one of its layers.
+        let mut mine: Vec<LayerId> = own.clone();
+        mine.extend(root);
+        for (name, x) in d.names()? {
+            if x == b {
+                continue;
+            }
+            let mut cur = d.info(x)?.parent;
+            while let Some(l) = cur {
+                if mine.contains(&l) {
+                    return Err(format!(
+                        "{name} stands on {dataset}'s layer {l}; not destroying it"
+                    )
+                    .into());
+                }
+                cur = d.info(l)?.parent;
+            }
+        }
+        take_down(&mut *d, &*self.mounts, b, &self.mountpoint(dataset))?;
+        for l in own {
+            d.drop_layer(l)?;
+        }
+        if let Some(r) = root {
+            d.drop_layer(r)?;
+        }
+        d.flush()?;
+        Ok(true)
+    }
 
     fn adopt(
         &self,
@@ -1228,6 +1369,15 @@ mod tests {
                 .insert(dir.to_path_buf(), dev.to_path_buf());
             Ok(())
         }
+        fn mount_ro(&self, dev: &Path, dir: &Path) -> io::Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("mount-ro {} {}", dev.display(), dir.display()));
+            self.table
+                .borrow_mut()
+                .insert(dir.to_path_buf(), dev.to_path_buf());
+            Ok(())
+        }
         fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
             Ok(self.table.borrow().get(dir).cloned())
         }
@@ -1484,6 +1634,119 @@ mod tests {
         Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
         assert!(l.destroy(Lsn::new(2)).is_err(), "the clone stands on it");
         assert_eq!(l.list().unwrap().len(), 2);
+    }
+
+    // ── P4 file 4b-0: Seal views and destroying a dataset ───────────
+
+    #[test]
+    fn a_seal_view_is_a_read_only_throwaway_branch_gone_when_dropped() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.layers(&a).snapshot(Lsn::new(3), h(3)).unwrap();
+        assert!(p.seal_view(&a, Lsn::new(9)).is_err(), "no such Seal");
+        calls(&p);
+        let view = p.seal_view(&a, Lsn::new(3)).unwrap();
+        assert_eq!(view.path(), Path::new("/mnt/taso/.views/tank/v-a.view-3"));
+        let (vb, dev) = {
+            let mut d = p.blkd.lock().unwrap();
+            let vb = d
+                .find("tank/v-a.view-3")
+                .unwrap()
+                .expect("the view's branch");
+            (vb, d.info(vb).unwrap().dev.unwrap())
+        };
+        assert_eq!(
+            calls(&p),
+            [format!(
+                "mount-ro {} /mnt/taso/.views/tank/v-a.view-3",
+                dev.display()
+            )]
+        );
+        // While the view is open the dataset cannot be destroyed.
+        let g = p.guid(&a).unwrap().unwrap();
+        assert!(
+            Pool::destroy(&p, &a, g).is_err(),
+            "the view stands on its Seal"
+        );
+        drop(view);
+        assert_eq!(calls(&p), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
+        let mut d = p.blkd.lock().unwrap();
+        assert_eq!(
+            d.find("tank/v-a.view-3").unwrap(),
+            None,
+            "the branch is dropped"
+        );
+        assert!(d.info(vb).is_err());
+    }
+
+    #[test]
+    fn a_view_left_by_a_crash_is_taken_down_first() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.layers(&a).snapshot(Lsn::new(3), h(3)).unwrap();
+        std::mem::forget(p.seal_view(&a, Lsn::new(3)).unwrap());
+        calls(&p);
+        let view = p.seal_view(&a, Lsn::new(3)).unwrap();
+        let c = calls(&p);
+        assert_eq!(c[0], "umount /mnt/taso/.views/tank/v-a.view-3", "{c:?}");
+        assert!(c[1].starts_with("mount-ro "));
+        drop(view);
+    }
+
+    #[test]
+    fn destroy_takes_a_dataset_and_its_own_layers_by_guid() {
+        let p = pool();
+        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        assert_eq!(p.guid(&a).unwrap(), None);
+        assert!(!Pool::destroy(&p, &a, 1).unwrap(), "nothing to destroy");
+        p.create(&a).unwrap();
+        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        p.layers(&a).snapshot(Lsn::new(4), h(4)).unwrap();
+        let g = p.guid(&a).unwrap().unwrap();
+        // A clone on one of its layers: refused, nothing touched.
+        Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
+        calls(&p);
+        assert!(Pool::destroy(&p, &a, g).is_err());
+        assert!(calls(&p).is_empty(), "nothing unmounted");
+        assert_eq!(p.layers(&a).list().unwrap().len(), 2);
+        // The clone goes first (it has no layers of its own), then a.
+        let gc = p.guid(&c).unwrap().unwrap();
+        assert!(Pool::destroy(&p, &c, gc).unwrap());
+        assert_eq!(p.layers(&a).list().unwrap().len(), 2, "a's layers stay");
+        assert!(
+            Pool::destroy(&p, &a, g + 1).is_err(),
+            "another guid: refused"
+        );
+        let layers: Vec<LayerId> = {
+            let mut d = p.blkd.lock().unwrap();
+            let b = d.find("tank/v-a").unwrap().unwrap();
+            let mut v = Vec::new();
+            let mut cur = d.info(b).unwrap().parent;
+            while let Some(l) = cur {
+                v.push(l);
+                cur = d.info(l).unwrap().parent;
+            }
+            v
+        };
+        assert_eq!(layers.len(), 3, "two Seals and the root");
+        assert!(Pool::destroy(&p, &a, g).unwrap());
+        {
+            let mut d = p.blkd.lock().unwrap();
+            for l in &layers {
+                assert!(d.info(*l).is_err(), "layer {l} is dropped");
+            }
+        }
+        assert_eq!(p.info(&a).unwrap(), None);
+        assert!(calls(&p).contains(&"umount /mnt/taso/tank/v-a".to_string()));
+        // Every layer it made is gone: only the store's own state is left.
+        let mut d = p.blkd.lock().unwrap();
+        assert!(d.names().unwrap().is_empty());
+        drop(d);
+        // A new dataset of the same name has another guid.
+        p.create(&a).unwrap();
+        assert_ne!(p.guid(&a).unwrap(), Some(g));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use taso_core::envelope::{HashVal, Lsn};
 use crate::blk::{BlkLayers, BlkPool, BlkSend};
 use crate::chronicle::{LayerError, Layers, ZfsLayers};
 use crate::ship::{ByteStream, Sender, ZfsSend};
-use crate::vessel::Pool;
+use crate::vessel::{Pool, SealView};
 use crate::zfs::{Cli, CloneBase, Dataset, DatasetInfo, Snapshot, Zfs};
 
 /// A node's storage.
@@ -185,6 +185,27 @@ impl Pool for Storage {
         match self {
             Self::Zfs(z) => Pool::receive_clone(z, dataset, base, to, stream),
             Self::Blk(p) => p.receive_clone(dataset, base, to, stream),
+        }
+    }
+
+    fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
+        match self {
+            Self::Zfs(z) => Pool::seal_view(z, dataset, lsn),
+            Self::Blk(p) => p.seal_view(dataset, lsn),
+        }
+    }
+
+    fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
+        match self {
+            Self::Zfs(z) => Pool::guid(z, dataset),
+            Self::Blk(p) => p.guid(dataset),
+        }
+    }
+
+    fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
+        match self {
+            Self::Zfs(z) => Pool::destroy(z, dataset, guid),
+            Self::Blk(p) => Pool::destroy(p, dataset, guid),
         }
     }
 }
