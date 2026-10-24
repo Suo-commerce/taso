@@ -68,7 +68,7 @@
 //!          little-endian inside, as the coordinator journals them
 //! ```
 //!
-//! Operations 11–19 are the P4 coordinator log (spec rev. 11 §1.2, §1.3,
+//! Operations 11–19 are the P4 coordinator log (spec rev. 12 §1.2, §1.3,
 //! §5.3).  Their answers are blobs: `takeover_target` epoch (8) · head;
 //! `announce` tag 0, or tag 1 · answer; `accept` and `cancel` an answer;
 //! `query_submission` a status; `query_logical` tag 0, or tag 1 · log

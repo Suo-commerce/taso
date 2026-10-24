@@ -2,10 +2,10 @@
 //! purge, genesis and reclamation, with every identity and hash they
 //! carry.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 11 (file 0), frozen
+//! Normative reference: `Taso_spec_p4_contracts` rev. 12 (file 0), frozen
 //! 2026-10-24, BLAKE3
-//! `b064c5083fa3d4f8abd853c0e165e40fcbf88f611622cdb0da7bfc455997f73e`.
-//! Section numbers below (§) are rev. 11's.
+//! `37c75f30580bf3edd79674be38702d7893af413813bbfe6d4585231e9477144a`.
+//! Section numbers below (§) are rev. 12's.
 //!
 //! This module is pure data: the records, their canonical encoding (the
 //! same rules as [`crate::canon`]), their strict decoding, and the
@@ -1431,12 +1431,15 @@ pub struct GenesisRefused {
     pub genesis_id: ChronicleId,
     /// Why.
     pub reason: WalkRefusal,
+    /// The input manifest, if the walk ran: for diagnosis (§8, D41).
+    pub input_manifest_key: Option<HashVal>,
 }
 
 impl Canonical for GenesisRefused {
     fn canon(&self, out: &mut Canon) {
         self.genesis_id.canon(out);
         self.reason.canon(out);
+        out.option(self.input_manifest_key.as_ref());
     }
 }
 
@@ -2623,6 +2626,7 @@ impl<'a> Reader<'a> {
             (_, 16) => ContractRecord::GenesisRefused(GenesisRefused {
                 genesis_id: self.chronicle()?,
                 reason: self.walk_refusal()?,
+                input_manifest_key: self.option(Self::hash)?,
             }),
             (_, 17) => ContractRecord::ReclaimClaimed {
                 object_key: self.hash()?,
@@ -2938,6 +2942,7 @@ mod tests {
             ContractRecord::GenesisRefused(GenesisRefused {
                 genesis_id: genesis().genesis_id,
                 reason: WalkRefusal::HookNotWaived,
+                input_manifest_key: Some(h(0xD7)),
             }),
             ContractRecord::ReclaimClaimed {
                 object_key: h(0xE0),
@@ -3263,7 +3268,7 @@ mod tests {
         "8373fc4772c5b11de462534112f85d96ce00feee95bff3201e6775fc3317199f",
         "717041ba8ca2cf3b31e182daad281330e750fce94fc95a8f4b2f2875d9e41172",
         "82c11cad087ed0120e35e321b57cbc2c2c267b4f73b225d462ba82fdba83d540",
-        "4502cf30e826d40531e67207983c00e5dd82f7663f9fda28a0983953524f8684",
+        "8d72712c39d3fe9683075fea0a4c47b51684631c5db7f5ad1b1fede5529210ef",
         "4d820c377642a1bcbcd67bf235dcfa8ad964b5cd4a45017a22f970376e44ea41",
         "7bc1209031258d3bdb68e1f7ad43245b8fc10bfe4c28d3135489bb12047bc6a5",
         "9de7174a6d7d5362a88b620704dbeff81314ae846ad53bc5373b663caae60133",
@@ -3591,6 +3596,7 @@ mod tests {
                 6 => ContractRecord::GenesisRefused(GenesisRefused {
                     genesis_id: c,
                     reason: WalkRefusal::ALL[w],
+                    input_manifest_key: (w % 2 == 0).then_some(a),
                 }),
                 7 => ContractRecord::ReclaimClaimed { object_key: a },
                 8 => ContractRecord::NominationRefused(NominationRefused {

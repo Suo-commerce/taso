@@ -148,7 +148,7 @@ const LOG_DOMAIN: &str = "taso.pack.log.v1";
 /// Derive-key domain of an inventory item's `log_digest`: the frames of a
 /// pack as stored (`[payload len · envelope · payload]` each), without the
 /// header, so a pack and its log-only replacement share it (P4 spec
-/// rev. 11 §6.2).
+/// rev. 12 §6.2).
 pub const FRAMES_DOMAIN: &str = "taso.pack.frames.v1";
 const PACK_DOMAIN: &str = "taso.pack.v1";
 
@@ -322,7 +322,7 @@ pub enum PackError {
     /// The request contradicts the local segment or what is shipped.
     Refused(String),
     /// A purge found neither an inventoried pack nor its replacement
-    /// (P4 spec rev. 11 §6.4: the item is lost, never fabricated).
+    /// (P4 spec rev. 12 §6.4: the item is lost, never fabricated).
     Lost {
         /// The original pack's name.
         name: String,
@@ -1563,7 +1563,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     }
 
     /// [`Packs::chain`] of a Chronicle part of whose `fs` sections were
-    /// purged (P4 spec rev. 11 §6.5).  `purged` are the Seals of the
+    /// purged (P4 spec rev. 12 §6.5).  `purged` are the Seals of the
     /// sections in the inventory of an accepted `PurgeCommitted` whose
     /// `ReplacementInstalled` is accepted; the caller reads them from the
     /// coordinator.  Such a section is excused: its pack may be gone, it
@@ -1815,7 +1815,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     }
 }
 
-// ── Purge (P4 spec rev. 11 §6) ───────────────────────────────────────
+// ── Purge (P4 spec rev. 12 §6) ───────────────────────────────────────
 //
 // A purged `fs` pack `<end>-<base>-<to>` is replaced by the log pack of
 // the same frames, `<end>-<base>-0` (D25): no fs bytes, so every writer
@@ -1908,7 +1908,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
 
     /// The header and verified log of the pack `name` (its `fs` section is
     /// not read): `None` if there is no such pack.  What the coordinator
-    /// reads to check a pack (P4 spec rev. 11 D36, §1.2 step 5).
+    /// reads to check a pack (P4 spec rev. 12 D36, §1.2 step 5).
     pub fn read_pack_log(&self, name: &str) -> Result<Option<(PackHeader, Vec<Frame>)>, PackError> {
         let (key, n) = self.key_of(name)?;
         if !self.store.exists(&key)? {
@@ -1918,7 +1918,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         Ok(Some((h, frames)))
     }
 
-    /// The inventory item for the pack `name` (P4 spec rev. 11 §6.2): its
+    /// The inventory item for the pack `name` (P4 spec rev. 12 §6.2): its
     /// name and trailer digest, the `fs` section it holds, the digest and
     /// range of its frames, and the form its replacement takes.  Reads the
     /// whole pack, `fs` stream included, to check the trailer: purges are
@@ -1977,7 +1977,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     /// The replacement's name, or why there cannot be one.
     fn replacement_of(&self, item: &InventoryItem) -> Result<String, PackError> {
         if item.form == ReplacementForm::Tombstone {
-            // P4 spec rev. 11 §6.4: no writer produces an fs pack without
+            // P4 spec rev. 12 §6.4: no writer produces an fs pack without
             // frames (a Seal pack always carries the Seal record), so the
             // tombstone form is not built.  Refused, never faked.
             return Err(PackError::Refused(format!(
@@ -4336,7 +4336,7 @@ mod tests {
         }
     }
 
-    // ── purge (P4 spec rev. 11 §6) ───────────────────────────────────
+    // ── purge (P4 spec rev. 12 §6) ───────────────────────────────────
 
     /// A log with Seals 6 and 9 shipped and named, and the log shipped to
     /// its tail; the name of Seal 6's fs pack.

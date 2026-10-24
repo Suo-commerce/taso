@@ -1,4 +1,4 @@
-//! What the coordinator reads from the store (P4 spec rev. 11 §0.4, §1.2
+//! What the coordinator reads from the store (P4 spec rev. 12 §0.4, §1.2
 //! step 5, §2.1; D35, D36; file 1d-2).
 //!
 //! [`CoordStore`] is the coordinator log's [`StoreView`] over an object
@@ -23,8 +23,8 @@
 //! A store error answers "no" (not readable, not there): the coordinator
 //! refuses rather than guesses, and the caller may submit again.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 11, BLAKE3
-//! `b064c5083fa3d4f8abd853c0e165e40fcbf88f611622cdb0da7bfc455997f73e`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 12, BLAKE3
+//! `37c75f30580bf3edd79674be38702d7893af413813bbfe6d4585231e9477144a`.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
