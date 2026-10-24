@@ -2,10 +2,11 @@
 //! purge, genesis and reclamation, with every identity and hash they
 //! carry.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 12 (file 0), frozen
+//! Normative reference: `Taso_spec_p4_contracts` rev. 15 (file 0), frozen
 //! 2026-10-24, BLAKE3
-//! `37c75f30580bf3edd79674be38702d7893af413813bbfe6d4585231e9477144a`.
-//! Section numbers below (§) are rev. 12's.
+//! `0ba877a0a48af8e26a3bc0ae68ac3f6b542db701f8701239fffa7b787a5e9912`
+//! (`TemplateNamed` and `TemplateRef`, D49 and D50, from file 5a; the rest
+//! unchanged since rev. 12).  Section numbers below (§) are rev. 15's.
 //!
 //! This module is pure data: the records, their canonical encoding (the
 //! same rules as [`crate::canon`]), their strict decoding, and the
@@ -1543,6 +1544,105 @@ impl Canonical for GenesisCleanedUp {
     }
 }
 
+/// An operator names a ready Template (§5.5, D49): `name@version` is bound
+/// to `template_id` once and for good.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateNamed {
+    /// The name ([`valid_template_name`]).
+    pub name: String,
+    /// Its version: 1, 2, 3, … in the order they are accepted.
+    pub version: u32,
+    /// The Template it names.
+    pub template_id: ChronicleId,
+    /// Who named it, and why.
+    pub authority: Authority,
+}
+
+impl Canonical for TemplateNamed {
+    fn canon(&self, out: &mut Canon) {
+        out.str(&self.name).u32(self.version);
+        self.template_id.canon(out);
+        self.authority.canon(out);
+    }
+}
+
+/// The longest Template name (§5.5).
+pub const MAX_TEMPLATE_NAME: usize = 64;
+
+/// Whether `name` is a Template name (§5.5): 1–64 bytes of `a`–`z`,
+/// `0`–`9`, `.`, `_`, `-`, starting with a letter or a digit.
+pub fn valid_template_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= MAX_TEMPLATE_NAME
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'_' | b'-')
+        })
+}
+
+/// Which Template a Vessel's config asks for (§5.5, D50): an exact one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TemplateRef {
+    /// `<name>@<version>`, resolved through its `TemplateNamed`.
+    Named {
+        /// The name.
+        name: String,
+        /// The version, from 1.
+        version: u32,
+    },
+    /// `<template_id>`, 32 lowercase hex digits.
+    Id(ChronicleId),
+}
+
+impl TemplateRef {
+    /// Read a config's `"template"`.  A bare name is refused: a config
+    /// never changes meaning when a name gets a new version (D50).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        if let Some((name, v)) = s.split_once('@') {
+            if !valid_template_name(name) {
+                return Err(format!("{s:?}: {name:?} is not a Template name"));
+            }
+            let version =
+                (!v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()) && !v.starts_with('0'))
+                    .then(|| v.parse::<u32>().ok())
+                    .flatten()
+                    .ok_or_else(|| format!("{s:?}: the version is a number from 1"))?;
+            return Ok(Self::Named {
+                name: name.to_string(),
+                version,
+            });
+        }
+        let hex = |c: u8| c.is_ascii_digit() || (b'a'..=b'f').contains(&c);
+        if s.len() == 32 && s.bytes().all(hex) {
+            let mut b = [0u8; 16];
+            for (i, byte) in b.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("hex checked");
+            }
+            return Ok(Self::Id(ChronicleId::from_bytes(b)));
+        }
+        if valid_template_name(s) {
+            return Err(format!(
+                "{s:?}: name an exact version, {s}@<version>, or a template id (D50)"
+            ));
+        }
+        Err(format!(
+            "{s:?}: neither <name>@<version> nor a 32-hex template id"
+        ))
+    }
+
+    /// The logical id that resolves it, for a name.
+    pub fn logical_id(&self) -> Option<HashVal> {
+        match self {
+            Self::Named { name, version } => Some(logical_id(&LogicalKey::TemplateName(
+                name.clone(),
+                *version,
+            ))),
+            Self::Id(_) => None,
+        }
+    }
+}
+
 /// The exclusion set as a bitmask, one bit per [`PathClass`] tag: a
 /// fixed-size stand-in for the set inside a [`LogicalKey`].
 pub fn exclude_mask(exclude: &BTreeSet<PathClass>) -> u8 {
@@ -1607,6 +1707,8 @@ pub enum ContractRecord {
     NominationRefused(NominationRefused),
     /// Tag 20 (D23).
     GenesisCleanedUp(GenesisCleanedUp),
+    /// Tag 21 (D49).
+    TemplateNamed(TemplateNamed),
 }
 
 impl ContractRecord {
@@ -1636,6 +1738,7 @@ impl ContractRecord {
                 LogicalKey::NominationRefused(n.chronicle, n.seal.hash, exclude_mask(&n.exclude))
             }
             Self::GenesisCleanedUp(g) => LogicalKey::GenesisCleaned(g.genesis_id),
+            Self::TemplateNamed(t) => LogicalKey::TemplateName(t.name.clone(), t.version),
         }
     }
 
@@ -1749,6 +1852,10 @@ impl Canonical for ContractRecord {
                 out.tag(20);
                 r.canon(out);
             }
+            Self::TemplateNamed(r) => {
+                out.tag(21);
+                r.canon(out);
+            }
         }
     }
 }
@@ -1758,7 +1865,7 @@ impl Canonical for ContractRecord {
 /// One row of the §1.2 table.  The row is part of the key, so two rows
 /// never share a logical id even when their raw fields are equal
 /// (`GenesisStarted` and a genesis `TemplateReady` both name `genesis_id`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalKey {
     /// `Candidate`: `candidate_id` (tag 0).
     Candidate(HashVal),
@@ -1803,6 +1910,8 @@ pub enum LogicalKey {
     NominationRefused(ChronicleId, HashVal, u8),
     /// `GenesisCleanedUp`: `genesis_id ‖ "cleaned"` (tag 19; D23).
     GenesisCleaned(ChronicleId),
+    /// `TemplateNamed`: `name ‖ version` (tag 20; D49).
+    TemplateName(String, u32),
 }
 
 impl Canonical for LogicalKey {
@@ -1892,6 +2001,9 @@ impl Canonical for LogicalKey {
             Self::GenesisCleaned(c) => {
                 out.tag(19);
                 c.canon(out);
+            }
+            Self::TemplateName(name, version) => {
+                out.tag(20).str(name).u32(*version);
             }
         }
     }
@@ -2647,6 +2759,12 @@ impl<'a> Reader<'a> {
                 genesis_id: self.chronicle()?,
                 scratch_guid: self.option(Self::u64)?,
             }),
+            (_, 21) => ContractRecord::TemplateNamed(TemplateNamed {
+                name: self.string()?,
+                version: self.u32()?,
+                template_id: self.chronicle()?,
+                authority: self.authority()?,
+            }),
             (at, t) => return Self::bad(at, "contract record", t),
         })
     }
@@ -2959,7 +3077,17 @@ mod tests {
                 genesis_id: genesis().genesis_id,
                 scratch_guid: Some(0xC1EA),
             }),
+            ContractRecord::TemplateNamed(named()),
         ]
+    }
+
+    fn named() -> TemplateNamed {
+        TemplateNamed {
+            name: "acme-base".into(),
+            version: 3,
+            template_id: genesis().genesis_id,
+            authority: auth(),
+        }
     }
 
     fn nomination_refused(reason: NominationRefusal) -> NominationRefused {
@@ -2976,6 +3104,65 @@ mod tests {
     }
 
     // ── round trips and strictness ──────────────────────────────────
+
+    #[test]
+    fn template_names_and_references() {
+        for ok in ["a", "acme-base", "t0", "0day", "a.b_c-d", &"x".repeat(64)] {
+            assert!(valid_template_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "-a",
+            ".a",
+            "_a",
+            "Acme",
+            "a b",
+            "a@1",
+            "a/b",
+            "ä",
+            &"x".repeat(65),
+        ] {
+            assert!(!valid_template_name(bad), "{bad:?}");
+        }
+        assert_eq!(
+            TemplateRef::parse("acme-base@3"),
+            Ok(TemplateRef::Named {
+                name: "acme-base".into(),
+                version: 3
+            })
+        );
+        let id = "00112233445566778899aabbccddeeff";
+        assert!(matches!(TemplateRef::parse(id), Ok(TemplateRef::Id(_))));
+        let bare = TemplateRef::parse("acme-base").unwrap_err();
+        assert!(bare.contains("exact version"), "{bare}");
+        for bad in [
+            "acme-base@",
+            "acme-base@0",
+            "acme-base@03",
+            "acme-base@x",
+            "acme-base@1@2",
+            "@1",
+            "Acme@1",
+            "acme-base@4294967296",
+            "00112233445566778899AABBCCDDEEFF",
+            "",
+        ] {
+            assert!(TemplateRef::parse(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            TemplateRef::parse("acme-base@3").unwrap().logical_id(),
+            Some(ContractRecord::TemplateNamed(named()).logical_id())
+        );
+        // The row is in the key: another version, another name, another id.
+        assert_ne!(
+            logical_id(&LogicalKey::TemplateName("acme-base".into(), 4)),
+            ContractRecord::TemplateNamed(named()).logical_id()
+        );
+        assert_ne!(
+            logical_id(&LogicalKey::TemplateName("acme-bas".into(), 3)),
+            ContractRecord::TemplateNamed(named()).logical_id()
+        );
+    }
 
     #[test]
     fn every_record_round_trips_and_tags_are_in_order() {
@@ -3000,7 +3187,7 @@ mod tests {
             Err(DecodeError::Truncated { .. })
         ));
         assert!(matches!(
-            ContractRecord::decode(&[21]),
+            ContractRecord::decode(&[22]),
             Err(DecodeError::BadTag { .. })
         ));
     }
@@ -3248,11 +3435,12 @@ mod tests {
             hold_id(7, h(6), cid(1)).to_string(),
             claim_id(7, h(6)).to_string(),
             logical_id(&LogicalKey::Birth(cid(1))).to_string(),
+            logical_id(&LogicalKey::TemplateName("acme-base".into(), 3)).to_string(),
         ];
         assert_eq!(got, PINS_DERIVED);
     }
 
-    const PINS_RECORDS: [&str; 21] = [
+    const PINS_RECORDS: [&str; 22] = [
         "4c679c6a0022ae188b75236abe543c1fdad404ad556c55f8efecfa1f842053e6",
         "220b967695a40c425c53a626ffed0635d40528a852489b0ad66772c87e6b0e18",
         "7449db856743d73ce30398c37ba97b2295e43b6715875f8f55fe0f859ae15bfe",
@@ -3274,8 +3462,9 @@ mod tests {
         "7bc1209031258d3bdb68e1f7ad43245b8fc10bfe4c28d3135489bb12047bc6a5",
         "9de7174a6d7d5362a88b620704dbeff81314ae846ad53bc5373b663caae60133",
         "81568db9b33f001502c0cf7993a2c50cb65ca6df2a1e58c1669a91a802187a7f",
+        "95d6743ed38bd728132cccc0a8d38ba1ce439ad9d8bd288a85896ecb9d0dee06",
     ];
-    const PINS_DERIVED: [&str; 11] = [
+    const PINS_DERIVED: [&str; 12] = [
         "f6091f83116ec7fcb319e5f951fe6b5c709360d89baa30307925bd36d6a59e05",
         "56ca8a77730eeb5a08131010723d9fd944c83afebcc8590d741761932b5b9d14",
         "fc1e0a251a4a8fb312d6f57acc628772976d614377604f0c58b1eee9f041a6a2",
@@ -3287,6 +3476,7 @@ mod tests {
         "12203a1c3d5eae0ffbfb4d23b7169b421e5449a4109d6f1cc682a22342fe3a26",
         "9faafa3b90f351a8a5f09e29101835caf9be58e1371ac1fc7c23a661b59afac0",
         "ca48e4f67689a85d431715b63a5e113e1beddd76e68cc20153b4bb7b46f8665a",
+        "5186a5ddb051af1a5cd2e410c9cd31fb2783300f048881f4efc06a62abbe0a07",
     ];
 
     // ── property tests ──────────────────────────────────────────────
@@ -3558,7 +3748,7 @@ mod tests {
             text(),
             (0usize..8),
         )
-            .prop_map(|(c, a, b, n, m, r, s, w)| match n % 11 {
+            .prop_map(|(c, a, b, n, m, r, s, w)| match n % 12 {
                 0 => ContractRecord::Refused(Refused {
                     request_id: a,
                     candidate_id: b,
@@ -3617,6 +3807,15 @@ mod tests {
                 9 => ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
                     genesis_id: c,
                     scratch_guid: (m % 2 == 0).then_some(n),
+                }),
+                10 => ContractRecord::TemplateNamed(TemplateNamed {
+                    name: s.clone(),
+                    version: m as u32,
+                    template_id: c,
+                    authority: Authority {
+                        actor: s.clone(),
+                        reason: s,
+                    },
                 }),
                 _ => ContractRecord::ReclaimComplete {
                     object_key: a,

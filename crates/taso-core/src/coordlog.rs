@@ -11,8 +11,9 @@
 //! state is a function of the accepted records, so it can be rebuilt by
 //! replaying them.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 13, BLAKE3
-//! `31d3e97f2c9a6b8ab7efcf3442457ae65f73985b89836b96ed3ba04bcb2864df`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 15, BLAKE3
+//! `0ba877a0a48af8e26a3bc0ae68ac3f6b542db701f8701239fffa7b787a5e9912`
+//! (the TemplateName row, D49, from file 5a).
 //!
 //! # What the coordinator knows about packs
 //!
@@ -26,8 +27,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
-    hold_id, replacement_name, BornFrom, Candidate, CloseKind, ContractRecord, Decision, Inventory,
-    InventoryItem, LogicalKey, VerificationFinished, VerificationStarted, RECORD_DOMAIN,
+    hold_id, replacement_name, valid_template_name, BornFrom, Candidate, CloseKind, ContractRecord,
+    Decision, Inventory, InventoryItem, LogicalKey, VerificationFinished, VerificationStarted,
+    RECORD_DOMAIN,
 };
 use crate::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use crate::record::{LineageRecord, Origin, Payload};
@@ -382,6 +384,8 @@ pub struct CoordLog {
     templates: BTreeMap<C16, u64>,
     genesis: BTreeMap<C16, u64>,
     purges: BTreeMap<C16, PurgeState>,
+    /// The greatest accepted version of every Template name (D49).
+    names: BTreeMap<String, u32>,
 }
 
 /// What a record does once accepted, computed before anything changes.
@@ -417,6 +421,7 @@ enum Change {
     PurgeStart(C16, H32, Vec<InventoryItem>),
     PurgeProgress(C16, String, Progress),
     PurgeEnd(C16),
+    NameBound(String, u32),
 }
 
 type Plan = Result<Effects, Final>;
@@ -448,6 +453,7 @@ impl CoordLog {
             templates: BTreeMap::new(),
             genesis: BTreeMap::new(),
             purges: BTreeMap::new(),
+            names: BTreeMap::new(),
         }
     }
 
@@ -1362,6 +1368,26 @@ impl CoordLog {
                 need(!store.exists(&o), "not deleted")?;
                 fx.resolve_claims.push(o);
             }
+            // D49: any Chronicle with a current epoch may submit it; the row
+            // admits only a ready Template and the next version of the name.
+            ContractRecord::TemplateNamed(t) => {
+                need(valid_template_name(&t.name), "not a Template name")?;
+                need(
+                    self.templates.contains_key(t.template_id.as_bytes()),
+                    "no ready Template",
+                )?;
+                need(
+                    !t.authority.actor.trim().is_empty() && !t.authority.reason.trim().is_empty(),
+                    "authority without an actor and a reason",
+                )?;
+                let next = match self.names.get(&t.name) {
+                    None => Some(1),
+                    Some(v) => v.checked_add(1),
+                };
+                need(next == Some(t.version), "not the next version of the name")?;
+                fx.changes
+                    .push(Change::NameBound(t.name.clone(), t.version));
+            }
         }
         let _ = pack;
         Ok(fx)
@@ -1522,6 +1548,9 @@ impl CoordLog {
                 }
                 Change::GenesisStart(g) => {
                     self.genesis.insert(g, pos);
+                }
+                Change::NameBound(name, version) => {
+                    self.names.insert(name, version);
                 }
                 Change::PurgeStart(c, key, items) => {
                     self.purges.insert(
@@ -2498,6 +2527,99 @@ mod tests {
         };
         let t0 = genesis_t0(&mut w);
         w.ok(t0, cleaned(t0));
+    }
+
+    /// D49: an operator names ready Templates `name@version`, versions in
+    /// order, once and for good; any Template, several names; nothing
+    /// else is named.
+    #[test]
+    fn templates_are_named_in_order_once_and_for_good() {
+        use crate::contract::TemplateNamed;
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let t0 = genesis_t0(&mut w);
+        // A second, unrelated Template (another actor: another genesis).
+        let other = Authority {
+            actor: "operator-2".into(),
+            reason: "second root".into(),
+        };
+        let t1 = genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, &other.actor);
+        w.log.claim_chronicle(t1, ClaimAuthority::Genesis).unwrap();
+        w.ok(
+            t1,
+            ContractRecord::GenesisStarted(Box::new(GenesisStarted {
+                genesis_id: t1,
+                authority: other.clone(),
+                ..genesis_started(t1)
+            })),
+        );
+        let ContractRecord::TemplateReady(mut r1) = genesis_ready(t1) else {
+            unreachable!()
+        };
+        r1.template_id = t1;
+        r1.born_from = BornFrom::Genesis { genesis_id: t1 };
+        w.ok(t1, ContractRecord::TemplateReady(r1));
+        // A Chronicle that is not a Template (not ready, never named).
+        let v = cid(0x0A);
+        w.log.claim_chronicle(v, ClaimAuthority::Vessel).unwrap();
+        // The operator's naming Chronicle.
+        let op = cid(0x0B);
+        w.log.claim_chronicle(op, ClaimAuthority::Vessel).unwrap();
+        let named = |name: &str, version: u32, t: ChronicleId| {
+            ContractRecord::TemplateNamed(TemplateNamed {
+                name: name.into(),
+                version,
+                template_id: t,
+                authority: auth(),
+            })
+        };
+        let pred = |f: Final| matches!(f, Final::Predicate(_));
+
+        // Versions start at 1 and go up by one.
+        assert!(pred(w.refused(op, named("acme-base", 2, t0))));
+        w.ok(op, named("acme-base", 1, t0));
+        assert!(pred(w.refused(op, named("acme-base", 3, t1))));
+        // A later version need not descend from the earlier one.
+        w.ok(op, named("acme-base", 2, t1));
+        // Bound once and for good: the same binding again is the same
+        // record; another Template under it is a Conflict.
+        assert!(matches!(
+            w.submit(op, Submitted::Contract(named("acme-base", 2, t1))),
+            Answer::AlreadyAccepted { .. }
+        ));
+        assert_eq!(w.refused(op, named("acme-base", 2, t0)), Final::Conflict);
+        // One Template, several names.
+        w.ok(op, named("t0", 1, t0));
+        // Only a ready Template, a valid name, an actor and a reason.
+        assert!(pred(w.refused(op, named("not-ready", 1, v))));
+        assert!(pred(w.refused(op, named("Acme", 1, t0))));
+        assert!(pred(w.refused(op, named("a@b", 1, t0))));
+        let mut blank = TemplateNamed {
+            name: "blank".into(),
+            version: 1,
+            template_id: t0,
+            authority: auth(),
+        };
+        blank.authority.reason = " ".into();
+        assert!(pred(w.refused(op, ContractRecord::TemplateNamed(blank))));
+        // Resolved by logical id: name@version → the Template.
+        let resolve = |log: &CoordLog, n: &str, v: u32| match log.query_logical(
+            crate::contract::logical_id(&LogicalKey::TemplateName(n.into(), v)),
+        ) {
+            Some((_, Submitted::Contract(ContractRecord::TemplateNamed(t)))) => Some(t.template_id),
+            _ => None,
+        };
+        assert_eq!(resolve(w.log, "acme-base", 1), Some(t0));
+        assert_eq!(resolve(w.log, "acme-base", 2), Some(t1));
+        assert_eq!(resolve(w.log, "acme-base", 3), None);
+        assert_eq!(resolve(w.log, "t0", 1), Some(t0));
+        // Naming holds nothing and moves no Template's state.
+        assert!(w.log.query_chronicle(op).unwrap().holds.is_empty());
     }
 
     /// An accepted genesis survives its node: takeover by its
