@@ -206,6 +206,36 @@ pub enum StoreConf {
 }
 
 impl StoreConf {
+    /// The `"store"` field of `v`: a directory, or `{"s3": {endpoint,
+    /// bucket, access_key_id, secret_key_file, region?, ca_file?}}`.  The
+    /// Warden's config and `taso-coordd --store-config` read it the same
+    /// way.
+    pub fn parse_in(v: &Value) -> Result<Self, ConfigError> {
+        Ok(match field(v, "store")? {
+            Value::String(_) => StoreConf::Local(abs_path(v, "store")?),
+            Value::Object(o) if o.contains_key("s3") => {
+                let s = &o["s3"];
+                StoreConf::S3 {
+                    endpoint: string(s, "endpoint")?,
+                    region: s
+                        .get("region")
+                        .and_then(Value::as_str)
+                        .unwrap_or("garage")
+                        .to_string(),
+                    bucket: string(s, "bucket")?,
+                    access_key_id: string(s, "access_key_id")?,
+                    secret_key_file: abs_path(s, "secret_key_file")?,
+                    ca_file: if s.get("ca_file").is_some() {
+                        Some(abs_path(s, "ca_file")?)
+                    } else {
+                        None
+                    },
+                }
+            }
+            _ => return Err(bad("\"store\" must be a directory or {\"s3\": {...}}")),
+        })
+    }
+
     /// Open the store.
     pub fn open(&self) -> std::io::Result<SharedStore> {
         Ok(match self {
@@ -1286,29 +1316,7 @@ impl Config {
             state_dir: abs_path(&v, "state_dir")?,
             batched_snapshots: bool_or(&v, "batched_snapshots", true)?,
             storage: storage_conf(&v)?,
-            store: match field(&v, "store")? {
-                Value::String(_) => StoreConf::Local(abs_path(&v, "store")?),
-                Value::Object(o) if o.contains_key("s3") => {
-                    let s = &o["s3"];
-                    StoreConf::S3 {
-                        endpoint: string(s, "endpoint")?,
-                        region: s
-                            .get("region")
-                            .and_then(Value::as_str)
-                            .unwrap_or("garage")
-                            .to_string(),
-                        bucket: string(s, "bucket")?,
-                        access_key_id: string(s, "access_key_id")?,
-                        secret_key_file: abs_path(s, "secret_key_file")?,
-                        ca_file: if s.get("ca_file").is_some() {
-                            Some(abs_path(s, "ca_file")?)
-                        } else {
-                            None
-                        },
-                    }
-                }
-                _ => return Err(bad("\"store\" must be a directory or {\"s3\": {...}}")),
-            },
+            store: StoreConf::parse_in(&v)?,
             prefix: v
                 .get("prefix")
                 .and_then(Value::as_str)

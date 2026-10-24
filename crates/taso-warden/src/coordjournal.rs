@@ -158,14 +158,14 @@ pub fn apply(log: &mut CoordLog, op: &Op, store: &dyn StoreView) -> Done {
             epoch,
             legacy,
         } => {
-            if log.query_chronicle(*chronicle).is_none() {
+            if log.epoch(*chronicle).is_none() {
                 log.claim_chronicle(*chronicle, ClaimAuthority::Vessel)
                     .expect("not known, so claimable");
                 if *legacy {
                     log.note_obligation(*chronicle, LEGACY_OBLIGATION, true);
                 }
             }
-            let mut now = log.query_chronicle(*chronicle).expect("known").epoch;
+            let mut now = log.epoch(*chronicle).expect("known");
             while now < *epoch {
                 now = log.fence(*chronicle).expect("known");
             }

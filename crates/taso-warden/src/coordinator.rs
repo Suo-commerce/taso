@@ -1103,9 +1103,7 @@ fn sync(
 ) -> Result<(), CoordError> {
     let known = {
         let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
-        loaded(&mut g, shared, &t.journal)?
-            .query_chronicle(chronicle)
-            .map(|v| v.epoch)
+        loaded(&mut g, shared, &t.journal)?.epoch(chronicle)
     };
     if known == Some(state.epoch) {
         return Ok(());

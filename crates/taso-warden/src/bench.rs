@@ -806,4 +806,227 @@ mod tests {
             println!("prediction 'copy is the largest part at 1000 changed': see the table");
         }
     }
+    // ── P4: the coordinator log (file 1d-4) ─────────────────────────
+
+    /// The coordinator log's costs (P4 spec D33, §0.4): an append carrying
+    /// an effect record's bytes against a plain append of the same size,
+    /// and a contract record's announce and accept (one pack read through
+    /// [`crate::coordstore::CoordStore`]); then the journal's replay at
+    /// open.  Real redb with fsync, in-process (no socket); packs over
+    /// [`LocalStore`].  `TASO_BENCH_N` rounds (500).
+    ///
+    /// Predictions, written before the first run (2026-10-24):
+    /// 1. effect append within +10% of a plain append at p50 (the same
+    ///    fsync dominates; the journal row and the decode share it) — over
+    ///    +10% is a defect to fix (D33);
+    /// 2. announce about one plain append (within ±20% at p50);
+    /// 3. accept a plain append + 5–30% at p50 (one small pack read);
+    /// 4. replay linear, ≤ 0.1 ms per journal entry.
+    #[test]
+    #[ignore = "benchmark: run alone, in release"]
+    fn coordinator_log() {
+        use std::collections::BTreeSet;
+        use std::sync::Arc;
+        use taso_core::canon::Canonical;
+        use taso_core::contract::{
+            submission_id, ContractRecord, NominationRefusal, NominationRefused, SealRef,
+        };
+        use taso_core::coordlog::{Answer, Head, Submitted};
+        use taso_core::envelope::{BranchId, ChronicleId, Epoch, HashVal};
+        use taso_core::model::WardenId;
+        use taso_core::record::{IntentRecord, OpId, OutcomeRecord, OutcomeState, Record};
+
+        use crate::coordinator::{Coord, Coordinator, LogConfig};
+        use crate::coordstore::CoordStore;
+        use crate::segment::Segment;
+
+        struct NoSend;
+        impl Sender for NoSend {
+            fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> io::Result<ByteStream> {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+        }
+
+        let rounds = n(500);
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<LocalStore> = Arc::new(LocalStore::new(dir.path().join("bucket")));
+        let config = || LogConfig {
+            store: Arc::new(CoordStore::new(store.clone(), "vessels")),
+            ..LogConfig::default()
+        };
+        let db = dir.path().join("coord.redb");
+        let coord = Coordinator::open_with(&db, config()).unwrap();
+        let a = WardenId::new(1);
+        let c = ChronicleId::from_bytes([0x4d; 16]);
+        let g = coord.register(c, a).unwrap();
+        let mut seg = Segment::create(dir.path().join("seg"), c, Position::GENESIS).unwrap();
+        let packs = Packs::new(store.clone(), NoSend, "vessels", c).unwrap();
+        let mut tail = Position {
+            lsn: g.lsn,
+            hash: g.hash,
+        };
+        let next = |seg: &mut Segment, tail: &mut Position, stream: Stream, p: Payload| {
+            let r = Record::new(
+                c,
+                BranchId::TRUNK,
+                Epoch::FIRST,
+                stream,
+                tail.lsn.next(),
+                tail.hash,
+                p,
+            );
+            seg.append(&r.envelope, &r.payload.canon_bytes()).unwrap();
+            *tail = Position {
+                lsn: r.envelope.lsn,
+                hash: r.envelope.hash,
+            };
+            r
+        };
+        let us = |t: Instant| t.elapsed().as_micros() as u64;
+        let (mut plain, mut effect, mut announce, mut accept) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut head = Head::EMPTY;
+        let started = Instant::now();
+        for i in 0..rounds as u64 {
+            let intent = Payload::Intent(IntentRecord {
+                op: OpId::new(i + 1),
+                provider: "mail".into(),
+                request: vec![7; 200],
+                footprint: Vec::new(),
+                dispatch: Dispatch::Immediate,
+                retry: RetryPolicy::UnsafeToRetry,
+                consequence: Consequence::Irreversible,
+                authority: Vec::new(),
+                barrier: Some(taso_core::record::BarrierId::new(i + 1)),
+            });
+            let size = intent.canon_bytes().len();
+            // 1. A plain append of the same size.
+            let r = next(
+                &mut seg,
+                &mut tail,
+                Stream::Fs,
+                Payload::Raw(vec![1; size - 9]),
+            );
+            let t = Instant::now();
+            coord.append(a, &r.envelope).unwrap();
+            plain.push(us(t));
+            // 2. The effect record, with its bytes.
+            let r = next(&mut seg, &mut tail, Stream::Effect, intent);
+            let bytes = r.payload.canon_bytes();
+            let t = Instant::now();
+            coord.append_batch_with(a, &[r.envelope], &[bytes]).unwrap();
+            effect.push(us(t));
+            let o = next(
+                &mut seg,
+                &mut tail,
+                Stream::Effect,
+                Payload::Outcome(OutcomeRecord {
+                    op: OpId::new(i + 1),
+                    state: OutcomeState::ConfirmedApplied,
+                    evidence: None,
+                }),
+            );
+            coord
+                .append_batch_with(a, &[o.envelope], &[o.payload.canon_bytes()])
+                .unwrap();
+            // 3. A contract record: appended, shipped in its own pack,
+            // announced, accepted.
+            let rec = ContractRecord::NominationRefused(NominationRefused {
+                chronicle: c,
+                seal: SealRef {
+                    lsn: Lsn::new(i + 1),
+                    hash: HashVal::from_bytes(*blake3::hash(&i.to_le_bytes()).as_bytes()),
+                },
+                exclude: BTreeSet::new(),
+                reason: NominationRefusal::SealNotAccepted,
+                input_manifest_key: None,
+            });
+            let r = next(
+                &mut seg,
+                &mut tail,
+                Stream::Ctl,
+                Payload::Contract(Box::new(rec.clone())),
+            );
+            coord.append(a, &r.envelope).unwrap();
+            let shipped = packs.ship_log(&[&seg], tail).unwrap().unwrap();
+            let name = format!(
+                "{:020}-{:020}-{:020}",
+                shipped.end.lsn.get(),
+                shipped.base.lsn.get(),
+                0
+            );
+            let sub = Submitted::Contract(rec);
+            let s = submission_id(sub.logical_id(), sub.digest(), Epoch::FIRST, i);
+            let t = Instant::now();
+            coord
+                .announce(a, c, Epoch::FIRST, s, sub.logical_id(), sub.digest())
+                .unwrap()
+                .unwrap();
+            announce.push(us(t));
+            let digest = sub.digest();
+            let t = Instant::now();
+            let got = coord
+                .accept(a, c, Epoch::FIRST, s, head, name, sub)
+                .unwrap();
+            accept.push(us(t));
+            let Answer::Accepted { log_pos, .. } = got else {
+                panic!("not accepted: {got:?}");
+            };
+            head = Head {
+                pos: log_pos,
+                digest,
+            };
+        }
+        let wall = started.elapsed().as_secs_f64();
+        assert!(coord.obligations(c).unwrap().is_empty());
+        drop(coord);
+        // 4. Replay at open.
+        let t = Instant::now();
+        let coord = Coordinator::open_with(&db, config()).unwrap();
+        let replay_ms = t.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(coord.query_chronicle(c).unwrap().unwrap().head, head);
+
+        let line = |name: &str, v: &mut Vec<u64>| {
+            v.sort_unstable();
+            println!(
+                "  {name:<18} p50 {:>8.3} ms   p95 {:>8.3} ms   (n={})",
+                timing::quantile(v, 0.5) as f64 / 1000.0,
+                timing::quantile(v, 0.95) as f64 / 1000.0,
+                v.len()
+            );
+            timing::quantile(v, 0.5) as f64
+        };
+        println!("\n=== coordinator log (P4 1d-4) ===");
+        println!(
+            "TMPDIR={}",
+            std::env::var("TMPDIR").unwrap_or_else(|_| "(default)".into())
+        );
+        let block = (rounds / 5).max(1);
+        for (name, v) in [
+            ("plain append", &plain),
+            ("effect append", &effect),
+            ("announce", &announce),
+            ("accept", &accept),
+        ] {
+            print!("{}", growth(name, v, block));
+        }
+        let p = line("plain append", &mut plain);
+        let e = line("effect append", &mut effect);
+        let an = line("announce", &mut announce);
+        let ac = line("accept", &mut accept);
+        // Journal entries: one per announce, accept, two obligation changes
+        // per round, and the register's sync.
+        let entries = rounds * 4 + 1;
+        println!(
+            "  effect / plain {:+.1}%   announce / plain {:+.1}%   accept / plain {:+.1}%",
+            (e / p - 1.0) * 100.0,
+            (an / p - 1.0) * 100.0,
+            (ac / p - 1.0) * 100.0
+        );
+        println!(
+            "  replay at open: {replay_ms:.1} ms for {entries} journal entries ({:.4} ms each)",
+            replay_ms / entries as f64
+        );
+        println!("  wall {wall:.1} s");
+    }
 }

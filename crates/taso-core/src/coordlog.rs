@@ -801,6 +801,12 @@ impl CoordLog {
         })
     }
 
+    /// The current epoch of `chronicle`, if the log knows it (what
+    /// [`CoordLog::query_chronicle`] answers, without building the view).
+    pub fn epoch(&self, chronicle: ChronicleId) -> Option<Epoch> {
+        self.chrons.get(chronicle.as_bytes()).map(|ch| ch.epoch)
+    }
+
     /// The open obligations of `chronicle` (§1.5), ascending by op id.
     pub fn obligations(&self, chronicle: ChronicleId) -> Vec<u64> {
         self.chrons
