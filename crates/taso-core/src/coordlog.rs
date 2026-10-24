@@ -1,4 +1,4 @@
-//! The coordinator log of P4 contract records (spec rev. 6 §1; D11–D13,
+//! The coordinator log of P4 contract records (spec rev. 7 §1; D11–D13,
 //! D16, D19).
 //!
 //! One durable, ordered log of accepted records is the registry, the holds,
@@ -11,8 +11,8 @@
 //! state is a function of the accepted records, so it can be rebuilt by
 //! replaying them.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 6, BLAKE3
-//! `568928c4768e1605a0ba6d5661f4dbc5f6ca091b4fbe90ad8cbfe6605506113c`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 7, BLAKE3
+//! `836ca7d2469700c62285d3b629dddbd852581f7bc7914fb91cf375f4992d5c01`.
 //!
 //! # What the coordinator knows about packs
 //!
