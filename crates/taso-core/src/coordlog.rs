@@ -1,4 +1,4 @@
-//! The coordinator log of P4 contract records (spec rev. 12 §1; D11–D13,
+//! The coordinator log of P4 contract records (spec rev. 13 §1; D11–D13,
 //! D16, D19).
 //!
 //! One durable, ordered log of accepted records is the registry, the holds,
@@ -11,8 +11,8 @@
 //! state is a function of the accepted records, so it can be rebuilt by
 //! replaying them.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 12, BLAKE3
-//! `37c75f30580bf3edd79674be38702d7893af413813bbfe6d4585231e9477144a`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 13, BLAKE3
+//! `31d3e97f2c9a6b8ab7efcf3442457ae65f73985b89836b96ed3ba04bcb2864df`.
 //!
 //! # What the coordinator knows about packs
 //!
@@ -505,15 +505,22 @@ impl CoordLog {
         authority: ClaimAuthority,
         current_epoch: Epoch,
     ) -> Result<(Epoch, Head), ClaimError> {
+        let ch = self.chrons.get(id.as_bytes());
         let ok = match authority {
             ClaimAuthority::Sanction { commit } => self.commit_names(commit, id),
             ClaimAuthority::GenesisStarted => self.genesis.contains_key(id.as_bytes()),
-            ClaimAuthority::Vessel | ClaimAuthority::Genesis => false,
+            // D42: an operator may take over a genesis that was claimed and
+            // has nothing accepted, so a node lost between its claim and
+            // its GenesisStarted never strands the genesis id.
+            ClaimAuthority::Genesis => ch.is_some_and(|ch| {
+                matches!(ch.claimed_by, ClaimAuthority::Genesis) && ch.head == Head::EMPTY
+            }),
+            ClaimAuthority::Vessel => false,
         };
         if !ok {
             return Err(ClaimError::BadAuthority);
         }
-        let ch = self.chrons.get(id.as_bytes()).ok_or(ClaimError::Unknown)?;
+        let ch = ch.ok_or(ClaimError::Unknown)?;
         if ch.epoch != current_epoch {
             return Err(ClaimError::EpochMoved { epoch: ch.epoch });
         }
@@ -1332,7 +1339,15 @@ impl CoordLog {
             }
             ContractRecord::GenesisCleanedUp(g) => {
                 need(g.genesis_id == chronicle, "not this Chronicle's record")?;
-                need(self.templates.contains_key(&c), "no TemplateReady")?;
+                // D45: after TemplateReady, or after a refusal once a
+                // scratch existed, so every scratch deletion is logged.
+                need(
+                    self.templates.contains_key(&c)
+                        || self
+                            .entry(&LogicalKey::GenesisRefused(g.genesis_id))
+                            .is_some(),
+                    "neither TemplateReady nor GenesisRefused",
+                )?;
             }
             ContractRecord::ReclaimClaimed { object_key } => {
                 let o = ObjectId::content(*object_key);
@@ -1559,10 +1574,10 @@ mod tests {
     use crate::contract::{
         attempt_id, candidate_id, facts_hash, genesis_id, object_key, output_digest, request_id,
         result_digest, template_id, CandidateClosed, ClassCounts, Consistency, Facts, FrameRange,
-        GenesisStarted, ItemLost, NominatedBy, ObjectKind, OpKind, Outcome, PackRef, Peer,
-        PurgeCommitted, PurgeComplete, ReplacementForm, ReplacementInstalled, SanctionCommitted,
-        SealRef, TemplateReady, VerdictRequest, VerdictSubmitted, VerifierRequirement,
-        TRANSFORM_VERSION,
+        GenesisCleanedUp, GenesisRefused, GenesisStarted, ItemLost, NominatedBy, ObjectKind,
+        OpKind, Outcome, PackRef, Peer, PurgeCommitted, PurgeComplete, ReplacementForm,
+        ReplacementInstalled, SanctionCommitted, SealRef, TemplateReady, VerdictRequest,
+        VerdictSubmitted, VerifierRequirement, WalkRefusal, TRANSFORM_VERSION,
     };
     use crate::record::{Authority, Namespace, ParentSeal};
     use std::cell::RefCell;
@@ -2361,6 +2376,128 @@ mod tests {
                 items_lost: 1,
             }),
         );
+    }
+
+    fn genesis_started(t0: ChronicleId) -> GenesisStarted {
+        GenesisStarted {
+            genesis_id: t0,
+            source_key: h(0x20),
+            consistency: Consistency::Immutable,
+            classmap_key: h(0x21),
+            transform_version: TRANSFORM_VERSION,
+            hook_waiver: None,
+            authority: auth(),
+            peer: peer(),
+        }
+    }
+
+    /// D42: a genesis whose node is lost after its claim, before its
+    /// GenesisStarted, is taken over by an operator; once anything is
+    /// accepted, only GenesisStarted is the authority.
+    #[test]
+    fn a_genesis_claimed_but_not_started_is_taken_over() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let t0 = genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo");
+        for k in [0x20, 0x21] {
+            store.put(ObjectId::content(h(k)));
+        }
+        let e1 = w.log.claim_chronicle(t0, ClaimAuthority::Genesis).unwrap();
+        // Nothing accepted, GenesisStarted is no authority yet.
+        assert_eq!(
+            w.log
+                .takeover_target(t0, ClaimAuthority::GenesisStarted, e1),
+            Err(ClaimError::BadAuthority)
+        );
+        assert_eq!(
+            w.log.takeover_target(t0, ClaimAuthority::Vessel, e1),
+            Err(ClaimError::BadAuthority)
+        );
+        let (e2, head) = w
+            .log
+            .takeover_target(t0, ClaimAuthority::Genesis, e1)
+            .unwrap();
+        assert_eq!(head, Head::EMPTY);
+        assert_eq!(
+            w.log.takeover_target(t0, ClaimAuthority::Genesis, e1),
+            Err(ClaimError::EpochMoved { epoch: e2 }),
+            "conditional on the epoch"
+        );
+        // The old holder's late GenesisStarted is refused; the new one's
+        // is accepted.
+        let r = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(genesis_started(
+            t0,
+        ))));
+        assert_eq!(
+            w.submit_as(t0, e1, 0, r.clone()),
+            Answer::FinalRefused(Final::StaleEpoch)
+        );
+        assert!(matches!(w.submit_as(t0, e2, 1, r), Answer::Accepted { .. }));
+        // Started: the operator's authority is no longer enough.
+        assert_eq!(
+            w.log.takeover_target(t0, ClaimAuthority::Genesis, e2),
+            Err(ClaimError::BadAuthority)
+        );
+        // A Vessel's claim is never a genesis's.
+        let v = cid(0x0B);
+        let ev = w.log.claim_chronicle(v, ClaimAuthority::Vessel).unwrap();
+        assert_eq!(
+            w.log.takeover_target(v, ClaimAuthority::Genesis, ev),
+            Err(ClaimError::BadAuthority)
+        );
+    }
+
+    /// D45: GenesisCleanedUp follows TemplateReady or GenesisRefused, and
+    /// nothing else.
+    #[test]
+    fn genesis_cleanup_follows_ready_or_refusal() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        for k in [0x20, 0x21, 0x22] {
+            store.put(ObjectId::content(h(k)));
+        }
+        let cleaned = |t0| {
+            ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
+                genesis_id: t0,
+                scratch_guid: Some(77),
+            })
+        };
+        // Refused after materialisation.
+        let t1 = genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo");
+        w.log.claim_chronicle(t1, ClaimAuthority::Genesis).unwrap();
+        w.ok(
+            t1,
+            ContractRecord::GenesisStarted(Box::new(genesis_started(t1))),
+        );
+        assert!(matches!(w.refused(t1, cleaned(t1)), Final::Predicate(_)));
+        w.ok(
+            t1,
+            ContractRecord::GenesisRefused(GenesisRefused {
+                genesis_id: t1,
+                reason: WalkRefusal::MaterialisationMismatch,
+                input_manifest_key: Some(h(0x22)),
+            }),
+        );
+        w.ok(t1, cleaned(t1));
+        // Ready (the same inputs: a fresh log).
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 200,
+        };
+        let t0 = genesis_t0(&mut w);
+        w.ok(t0, cleaned(t0));
     }
 
     /// An accepted genesis survives its node: takeover by its

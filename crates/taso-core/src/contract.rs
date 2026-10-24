@@ -1531,7 +1531,8 @@ impl Canonical for NominationRefused {
 pub struct GenesisCleanedUp {
     /// The operation.
     pub genesis_id: ChronicleId,
-    /// The scratch dataset's guid, if one was made (`--best-effort`).
+    /// The scratch dataset's guid; `None` if no scratch exists any more
+    /// (its node was lost; spec rev. 13 §7 step 7).
     pub scratch_guid: Option<u64>,
 }
 
