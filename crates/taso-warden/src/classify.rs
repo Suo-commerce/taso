@@ -18,8 +18,9 @@
 //! entry unsupported, so under SELinux every entry would be; the Warden
 //! refuses to start there (file 3b).
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 12, BLAKE3
-//! `37c75f30580bf3edd79674be38702d7893af413813bbfe6d4585231e9477144a`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 15, BLAKE3
+//! `0ba877a0a48af8e26a3bc0ae68ac3f6b542db701f8701239fffa7b787a5e9912`
+//! (D51, the date range, from file 5-0; the rest unchanged since rev. 12).
 
 use std::ffi::CStr;
 use std::fmt;
@@ -275,8 +276,9 @@ pub enum Content {
     Target(Vec<u8>),
 }
 
-/// A modification time as the kernel stores it (D30): any date, before
-/// 1970 or after 2262, exactly.
+/// A modification time as the kernel stores it (D30): a date before
+/// 1970 or after 2262, exactly.  The walk lists one outside the range every
+/// supported storage holds as unsupported ([`mtime_supported`], D51).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Mtime {
     /// Seconds since the epoch; negative before 1970.
@@ -335,10 +337,13 @@ pub enum Unsupported {
     /// Owned outside the tree's slot range: something outside the Vessel
     /// wrote it (tag 10, D29).
     OwnerOutOfRange,
+    /// Its `mtime` is outside the range every supported storage holds
+    /// ([`MIN_MTIME_SECS`] ..= [`MAX_MTIME_SECS`]; tag 11, D51).
+    DateOutOfRange,
 }
 
 impl Unsupported {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::HardLink,
         Self::Device,
         Self::Socket,
@@ -350,7 +355,24 @@ impl Unsupported {
         Self::ReservedMismatch,
         Self::DanglingByExclusion,
         Self::OwnerOutOfRange,
+        Self::DateOutOfRange,
     ];
+}
+
+/// The earliest `mtime` every supported storage holds (D51): ext4's,
+/// 1901-12-13 20:45:52 UTC.
+pub const MIN_MTIME_SECS: i64 = -(1 << 31);
+
+/// The latest second of an `mtime` every supported storage holds (D51):
+/// ext4's, a signed 32-bit second plus two epoch bits, 2446-05-10 22:38:55
+/// UTC.  Any nanoseconds within it are held.
+pub const MAX_MTIME_SECS: i64 = (1 << 31) - 1 + 3 * (1 << 32);
+
+/// Whether every supported storage holds an `mtime` with these seconds
+/// (D51: outside, the entry is unsupported, as Postgres refuses an
+/// out-of-range timestamp at input; never clamped).
+pub fn mtime_supported(secs: i64) -> bool {
+    (MIN_MTIME_SECS..=MAX_MTIME_SECS).contains(&secs)
 }
 
 /// Why a walk stopped early (spec §8, limits).
@@ -893,6 +915,9 @@ impl Walker<'_> {
             secs: st.st_mtime as i64,
             nsec: st.st_mtime_nsec as u32,
         };
+        if !mtime_supported(mtime.secs) {
+            return self.unsupported(path, Unsupported::DateOutOfRange);
+        }
         let class = self.map.classify(&path);
         let mut e = Entry {
             path: path.clone(),
@@ -1184,7 +1209,18 @@ class = "Hook"
     }
 
     fn tree() -> tempfile::TempDir {
-        let d = tempfile::tempdir().unwrap();
+        fill(tempfile::tempdir().unwrap())
+    }
+
+    /// [`tree`] under `dir` if it is a writable directory, else as [`tree`].
+    fn tree_in(dir: &Path) -> tempfile::TempDir {
+        match tempfile::tempdir_in(dir) {
+            Ok(d) => fill(d),
+            Err(_) => tree(),
+        }
+    }
+
+    fn fill(d: tempfile::TempDir) -> tempfile::TempDir {
         let p = d.path();
         fs::create_dir_all(p.join("src/inner")).unwrap();
         fs::write(p.join("src/main.rs"), b"fn main() {}").unwrap();
@@ -1361,9 +1397,9 @@ class = "Hook"
                 .set_times(fs::FileTimes::new().set_modified(t))
                 .unwrap();
         };
-        // 1960-01-01 and 2300-01-01 (D30: never refused).  The manifest
-        // carries what the filesystem stores; ext4 stores both exactly (its
-        // own limit is the year 2446), other filesystems may clamp.
+        // 1960-01-01 and 2300-01-01: before 1970 and after 2262, both inside
+        // the range every storage holds (D30, D51).  The manifest carries
+        // what the filesystem stores; ext4 stores both exactly.
         set("Cargo.toml", UNIX_EPOCH - Duration::from_secs(315_619_200));
         set("src/main.rs", UNIX_EPOCH + Duration::new(10_413_792_000, 5));
         let m = walk_it(d.path());
@@ -1390,6 +1426,81 @@ class = "Hook"
         let mut bad = m.clone();
         bad.entries[0].mtime.nsec = 1_000_000_000;
         assert!(Manifest::decode(&bad.bytes()).is_err());
+    }
+
+    #[test]
+    fn the_supported_range_is_ext4s() {
+        // 1901-12-13 20:45:52 and 2446-05-10 22:38:55 UTC.
+        assert_eq!(MIN_MTIME_SECS, -2_147_483_648);
+        assert_eq!(MAX_MTIME_SECS, 15_032_385_535);
+        assert!(mtime_supported(MIN_MTIME_SECS) && mtime_supported(MAX_MTIME_SECS));
+        assert!(!mtime_supported(MIN_MTIME_SECS - 1) && !mtime_supported(MAX_MTIME_SECS + 1));
+        assert!(mtime_supported(0) && !mtime_supported(i64::MIN) && !mtime_supported(i64::MAX));
+    }
+
+    /// D51: an entry whose stored `mtime` is outside the range is
+    /// unsupported `DateOutOfRange`; inside, it is described.  What a test
+    /// host's filesystem stores past ext4's range varies (it may clamp), so
+    /// each verdict is checked against the date as stored.
+    #[test]
+    fn a_date_outside_the_range_is_unsupported() {
+        use std::time::UNIX_EPOCH;
+        // On tmpfs where there is one (it keeps any date), else wherever
+        // temporary files go (ext4 clamps; the verdicts are still checked).
+        let d = tree_in(Path::new("/dev/shm"));
+        let set = |name: &str, secs: i64| {
+            let t = if secs < 0 {
+                UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+            } else {
+                UNIX_EPOCH + Duration::from_secs(secs as u64)
+            };
+            fs::File::options()
+                .write(true)
+                .open(d.path().join(name))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        };
+        let stored = |p: &str| {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(d.path().join(p)).unwrap().mtime()
+        };
+        let files = [
+            ("Cargo.toml", MIN_MTIME_SECS),
+            ("src/main.rs", MAX_MTIME_SECS),
+            ("src/inner/lib.rs", MIN_MTIME_SECS - 1),
+            ("build/x.o", MAX_MTIME_SECS + 1),
+        ];
+        for (f, secs) in files {
+            set(f, secs);
+        }
+        let m = walk_it(d.path());
+        let mut out_of_range = 0;
+        for (f, _) in files {
+            let listed = m
+                .unsupported
+                .iter()
+                .any(|(p, u)| p == f.as_bytes() && *u == Unsupported::DateOutOfRange);
+            let described = m.entries.iter().any(|e| e.path == f.as_bytes());
+            if mtime_supported(stored(f)) {
+                assert!(described && !listed, "{f}: stored {}", stored(f));
+            } else {
+                assert!(listed && !described, "{f}: stored {}", stored(f));
+                out_of_range += 1;
+            }
+        }
+        eprintln!(
+            "dates past the range stored as such in {}: {out_of_range} of 2",
+            d.path().display()
+        );
+        if d.path().starts_with("/dev/shm") {
+            // tmpfs stores 64-bit seconds: the refusal itself is exercised.
+            assert_eq!(out_of_range, 2, "tmpfs keeps dates past ext4's range");
+        }
+        // The edges themselves are held by any filesystem that holds ext4's.
+        assert!(mtime_supported(stored("Cargo.toml")) && mtime_supported(stored("src/main.rs")));
+        // The tag survives a round trip.
+        assert_eq!(Manifest::decode(&m.bytes()).unwrap(), m);
     }
 
     #[test]
