@@ -27,8 +27,8 @@ use std::fmt;
 use taso_core::canon::{Canon, Canonical};
 use taso_core::contract::{ContractRecord, Inventory, InventoryItem};
 use taso_core::coordlog::{
-    Answer, ClaimAuthority, ClaimError, CoordLog, Final, Head, ObjectId, StoreView, Submitted,
-    Transient,
+    Answer, ChronicleView, ClaimAuthority, ClaimError, CoordLog, Final, Head, ObjectId, StoreView,
+    SubmissionStatus, Submitted, Transient,
 };
 use taso_core::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use taso_core::record::Payload;
@@ -536,7 +536,7 @@ impl StoreView for Replayer<'_> {
 
 // ── Encodings ───────────────────────────────────────────────────────
 
-fn put_object(o: &mut Canon, obj: &ObjectId) {
+pub(crate) fn put_object(o: &mut Canon, obj: &ObjectId) {
     match obj {
         ObjectId::Content(h) => {
             o.tag(0).fixed(h);
@@ -547,7 +547,7 @@ fn put_object(o: &mut Canon, obj: &ObjectId) {
     }
 }
 
-fn get_object(r: &mut Rd<'_>) -> Result<ObjectId, JournalError> {
+pub(crate) fn get_object(r: &mut Rd<'_>) -> Result<ObjectId, JournalError> {
     match r.u8()? {
         0 => Ok(ObjectId::Content(r.fixed()?)),
         1 => {
@@ -558,7 +558,7 @@ fn get_object(r: &mut Rd<'_>) -> Result<ObjectId, JournalError> {
     }
 }
 
-fn put_authority(o: &mut Canon, a: &ClaimAuthority) {
+pub(crate) fn put_authority(o: &mut Canon, a: &ClaimAuthority) {
     match a {
         ClaimAuthority::Vessel => o.tag(0),
         ClaimAuthority::Genesis => o.tag(1),
@@ -567,7 +567,7 @@ fn put_authority(o: &mut Canon, a: &ClaimAuthority) {
     };
 }
 
-fn get_authority(r: &mut Rd<'_>) -> Result<ClaimAuthority, JournalError> {
+pub(crate) fn get_authority(r: &mut Rd<'_>) -> Result<ClaimAuthority, JournalError> {
     Ok(match r.u8()? {
         0 => ClaimAuthority::Vessel,
         1 => ClaimAuthority::Genesis,
@@ -579,18 +579,18 @@ fn get_authority(r: &mut Rd<'_>) -> Result<ClaimAuthority, JournalError> {
     })
 }
 
-fn put_head(o: &mut Canon, h: &Head) {
+pub(crate) fn put_head(o: &mut Canon, h: &Head) {
     o.u64(h.pos).fixed(h.digest.as_bytes());
 }
 
-fn get_head(r: &mut Rd<'_>) -> Result<Head, JournalError> {
+pub(crate) fn get_head(r: &mut Rd<'_>) -> Result<Head, JournalError> {
     Ok(Head {
         pos: r.u64()?,
         digest: HashVal::from_bytes(r.fixed()?),
     })
 }
 
-fn put_submitted(o: &mut Canon, s: &Submitted) {
+pub(crate) fn put_submitted(o: &mut Canon, s: &Submitted) {
     match s {
         Submitted::Contract(rec) => {
             o.tag(0).bytes(&rec.canon_bytes());
@@ -603,7 +603,7 @@ fn put_submitted(o: &mut Canon, s: &Submitted) {
     }
 }
 
-fn get_submitted(r: &mut Rd<'_>) -> Result<Submitted, JournalError> {
+pub(crate) fn get_submitted(r: &mut Rd<'_>) -> Result<Submitted, JournalError> {
     match r.u8()? {
         0 => ContractRecord::decode(&r.bytes()?)
             .map(Submitted::Contract)
@@ -755,7 +755,7 @@ fn get_op(r: &mut Rd<'_>) -> Result<Op, JournalError> {
     })
 }
 
-fn put_transient(o: &mut Canon, t: &Transient) {
+pub(crate) fn put_transient(o: &mut Canon, t: &Transient) {
     match t {
         Transient::HeadMoved { head } => {
             o.tag(0);
@@ -770,7 +770,7 @@ fn put_transient(o: &mut Canon, t: &Transient) {
     }
 }
 
-fn put_final(o: &mut Canon, f: &Final) {
+pub(crate) fn put_final(o: &mut Canon, f: &Final) {
     match f {
         Final::Conflict => {
             o.tag(0);
@@ -805,7 +805,7 @@ fn put_final(o: &mut Canon, f: &Final) {
     }
 }
 
-fn put_answer(o: &mut Canon, a: &Answer) {
+pub(crate) fn put_answer(o: &mut Canon, a: &Answer) {
     match a {
         Answer::Accepted {
             log_pos,
@@ -900,18 +900,148 @@ impl Done {
     }
 }
 
+// ── Decoding answers (the coordinator's wire, `coordsrv`) ──────────
+
+/// A rule name read back from the wire, as the `&'static str`
+/// [`Final::Predicate`] holds: each distinct name is kept once.  The
+/// coordinator's rule names are a fixed set; a name longer than 128 bytes
+/// is refused.
+pub(crate) fn intern(name: &str) -> Result<&'static str, JournalError> {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
+    if name.len() > 128 {
+        return Err(JournalError("rule name too long"));
+    }
+    let mut set = NAMES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = set.get(name) {
+        return Ok(n);
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    set.insert(leaked);
+    Ok(leaked)
+}
+
+pub(crate) fn get_transient(r: &mut Rd<'_>) -> Result<Transient, JournalError> {
+    Ok(match r.u8()? {
+        0 => Transient::HeadMoved { head: get_head(r)? },
+        1 => Transient::NotReadable,
+        2 => Transient::Pending {
+            submission: HashVal::from_bytes(r.fixed()?),
+        },
+        _ => return Err(JournalError("bad transient tag")),
+    })
+}
+
+pub(crate) fn get_final(r: &mut Rd<'_>) -> Result<Final, JournalError> {
+    Ok(match r.u8()? {
+        0 => Final::Conflict,
+        1 => Final::StaleEpoch,
+        2 => Final::NotAnnounced,
+        3 => Final::Predicate(intern(&r.string()?)?),
+        4 => Final::Claimed(get_object(r)?),
+        5 => Final::Quarantined(get_object(r)?),
+        6 => Final::NoSuchObject(get_object(r)?),
+        7 => Final::Cancelled,
+        8 => Final::Expired,
+        _ => return Err(JournalError("bad final tag")),
+    })
+}
+
+pub(crate) fn get_answer(r: &mut Rd<'_>) -> Result<Answer, JournalError> {
+    Ok(match r.u8()? {
+        0 => Answer::Accepted {
+            log_pos: r.u64()?,
+            logical_id: HashVal::from_bytes(r.fixed()?),
+        },
+        1 => Answer::AlreadyAccepted {
+            log_pos: r.u64()?,
+            record_digest: HashVal::from_bytes(r.fixed()?),
+        },
+        2 => Answer::Refused(get_transient(r)?),
+        3 => Answer::FinalRefused(get_final(r)?),
+        _ => return Err(JournalError("bad answer tag")),
+    })
+}
+
+pub(crate) fn put_status(o: &mut Canon, s: &SubmissionStatus) {
+    match s {
+        SubmissionStatus::Accepted(p) => {
+            o.tag(0).u64(*p);
+        }
+        SubmissionStatus::AbsentAtRead => {
+            o.tag(1);
+        }
+        SubmissionStatus::FinalRefused(f) => {
+            o.tag(2);
+            put_final(o, f);
+        }
+    }
+}
+
+pub(crate) fn get_status(r: &mut Rd<'_>) -> Result<SubmissionStatus, JournalError> {
+    Ok(match r.u8()? {
+        0 => SubmissionStatus::Accepted(r.u64()?),
+        1 => SubmissionStatus::AbsentAtRead,
+        2 => SubmissionStatus::FinalRefused(get_final(r)?),
+        _ => return Err(JournalError("bad status tag")),
+    })
+}
+
+pub(crate) fn put_view(o: &mut Canon, v: &ChronicleView) {
+    o.u64(v.epoch.get());
+    put_head(o, &v.head);
+    o.bool(v.retired);
+    match &v.pending {
+        None => o.tag(0),
+        Some(s) => o.tag(1).fixed(s.as_bytes()),
+    };
+    o.u64(v.accepted.len() as u64);
+    for p in &v.accepted {
+        o.u64(*p);
+    }
+    o.u64(v.holds.len() as u64);
+    for h in &v.holds {
+        put_object(o, h);
+    }
+}
+
+pub(crate) fn get_view(r: &mut Rd<'_>) -> Result<ChronicleView, JournalError> {
+    Ok(ChronicleView {
+        epoch: Epoch::new(r.u64()?),
+        head: get_head(r)?,
+        retired: r.bool()?,
+        pending: match r.u8()? {
+            0 => None,
+            1 => Some(HashVal::from_bytes(r.fixed()?)),
+            _ => return Err(JournalError("bad option tag")),
+        },
+        accepted: {
+            let n = r.count()?;
+            (0..n).map(|_| r.u64()).collect::<Result<_, _>>()?
+        },
+        holds: {
+            let n = r.count()?;
+            (0..n).map(|_| get_object(r)).collect::<Result<_, _>>()?
+        },
+    })
+}
+
 // ── Reading ─────────────────────────────────────────────────────────
 
-struct Rd<'a> {
+pub(crate) struct Rd<'a> {
     b: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Rd<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
-    fn take(&mut self, n: u64) -> Result<&'a [u8], JournalError> {
+    pub(crate) fn take(&mut self, n: u64) -> Result<&'a [u8], JournalError> {
         if n > (self.b.len() - self.pos) as u64 {
             return Err(JournalError("truncated"));
         }
@@ -919,38 +1049,38 @@ impl<'a> Rd<'a> {
         self.pos += n as usize;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8, JournalError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, JournalError> {
         Ok(self.take(1)?[0])
     }
-    fn bool(&mut self) -> Result<bool, JournalError> {
+    pub(crate) fn bool(&mut self) -> Result<bool, JournalError> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
             _ => Err(JournalError("bad bool")),
         }
     }
-    fn u64(&mut self) -> Result<u64, JournalError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, JournalError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8")))
     }
-    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], JournalError> {
+    pub(crate) fn fixed<const N: usize>(&mut self) -> Result<[u8; N], JournalError> {
         Ok(self.take(N as u64)?.try_into().expect("N"))
     }
-    fn bytes(&mut self) -> Result<Vec<u8>, JournalError> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, JournalError> {
         let n = self.u64()?;
         Ok(self.take(n)?.to_vec())
     }
-    fn string(&mut self) -> Result<String, JournalError> {
+    pub(crate) fn string(&mut self) -> Result<String, JournalError> {
         String::from_utf8(self.bytes()?).map_err(|_| JournalError("not UTF-8"))
     }
     /// A count no larger than the bytes left (every item is ≥ 1 byte).
-    fn count(&mut self) -> Result<u64, JournalError> {
+    pub(crate) fn count(&mut self) -> Result<u64, JournalError> {
         let n = self.u64()?;
         if n > (self.b.len() - self.pos) as u64 {
             return Err(JournalError("truncated"));
         }
         Ok(n)
     }
-    fn finish(&self) -> Result<(), JournalError> {
+    pub(crate) fn finish(&self) -> Result<(), JournalError> {
         if self.pos == self.b.len() {
             Ok(())
         } else {

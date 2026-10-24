@@ -457,6 +457,125 @@ pub trait Coord: Send + Sync {
 
     /// How far the Chronicle is known to be shipped (genesis if never).
     fn shipped(&self, chronicle: ChronicleId) -> Result<Position, CoordError>;
+
+    // ── The coordinator log (P4 spec §1) ────────────────────────────
+    //
+    // A coordinator without one (a test double) answers every call with
+    // an error whose outcome is unknown.
+
+    /// `claim_chronicle { id, authority }` (§1.6, §5.3, §7): a new
+    /// Chronicle id, held by `holder` at epoch 1.
+    fn claim_chronicle(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+    ) -> Result<Epoch, CoordError> {
+        let _ = (id, holder, authority);
+        Err(no_log())
+    }
+
+    /// `takeover_target { id, authority, current_epoch }` (§5.3, D21):
+    /// the ownership moves to `holder` at the next epoch.  Returns the
+    /// epoch and the target's head in the log.
+    fn takeover_target(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+        current_epoch: Epoch,
+    ) -> Result<(Epoch, Head), CoordError> {
+        let _ = (id, holder, authority, current_epoch);
+        Err(no_log())
+    }
+
+    /// `announce` (§1.2), by `chronicle`'s holder.  `Err` inside is the
+    /// log's refusal.
+    fn announce(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        logical: HashVal,
+        digest: HashVal,
+    ) -> Result<Result<(), Answer>, CoordError> {
+        let _ = (warden, chronicle, epoch, submission, logical, digest);
+        Err(no_log())
+    }
+
+    /// `accept` (§1.2), by `chronicle`'s holder: `record` is what `pack`
+    /// carries.
+    #[allow(clippy::too_many_arguments)]
+    fn accept(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        expected_head: Head,
+        pack: String,
+        record: Submitted,
+    ) -> Result<Answer, CoordError> {
+        let _ = (
+            warden,
+            chronicle,
+            epoch,
+            submission,
+            expected_head,
+            pack,
+            record,
+        );
+        Err(no_log())
+    }
+
+    /// `cancel` (§1.2), by `chronicle`'s holder: idempotent.
+    fn cancel(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+    ) -> Result<Answer, CoordError> {
+        let _ = (warden, chronicle, epoch, submission);
+        Err(no_log())
+    }
+
+    /// `query { submission }` (§1.3).
+    fn query_submission(
+        &self,
+        chronicle: ChronicleId,
+        submission: HashVal,
+    ) -> Result<SubmissionStatus, CoordError> {
+        let _ = (chronicle, submission);
+        Err(no_log())
+    }
+
+    /// `query { logical }` (§1.3): the accepted record and its position.
+    fn query_logical(&self, logical: HashVal) -> Result<Option<(u64, Submitted)>, CoordError> {
+        let _ = logical;
+        Err(no_log())
+    }
+
+    /// `query { chronicle }` (§1.3).
+    fn query_chronicle(&self, chronicle: ChronicleId) -> Result<Option<ChronicleView>, CoordError> {
+        let _ = chronicle;
+        Err(no_log())
+    }
+
+    /// The Chronicle's open obligations as the log derives them (§1.5).
+    fn obligations(&self, chronicle: ChronicleId) -> Result<Vec<u64>, CoordError> {
+        let _ = chronicle;
+        Err(no_log())
+    }
+}
+
+/// The answer of a coordinator with no coordinator log.
+fn no_log() -> CoordError {
+    CoordError::Unavailable(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this coordinator has no coordinator log",
+    ))
 }
 
 /// Wrap any `redb` error.
@@ -907,175 +1026,7 @@ impl Coordinator {
         )
     }
 
-    // ── The coordinator log (P4 spec §1) ────────────────────────────
-
-    /// `claim_chronicle { id, authority }` (§1.6, §5.3, §7): a new
-    /// Chronicle id, held by `holder` at epoch 1 — an ownership row and
-    /// the log's claim, in one transaction.  Refused if the id is known
-    /// ([`CoordError::AlreadyRegistered`]) or the authority does not name
-    /// it ([`CoordError::Claim`]).
-    pub fn claim_chronicle(
-        &self,
-        id: ChronicleId,
-        holder: WardenId,
-        authority: ClaimAuthority,
-    ) -> Result<Epoch, CoordError> {
-        let shared = self.shared.clone();
-        self.write(move |t| {
-            if load(&t.rows, id)?.is_some() {
-                return Err(CoordError::AlreadyRegistered(id));
-            }
-            let done = journal_if(&shared, t, Op::Claim { id, authority }, |d| {
-                matches!(d, Done::Claim(Ok(_)))
-            })?;
-            let epoch = match done {
-                Done::Claim(Ok(e)) => e,
-                Done::Claim(Err(e)) => return Err(CoordError::Claim(e)),
-                _ => unreachable!("a claim answers a claim"),
-            };
-            let genesis = ChronicleHead {
-                lsn: Lsn::new(0),
-                hash: HashVal::GENESIS,
-                epoch,
-            };
-            store(
-                &mut t.rows,
-                id,
-                &State {
-                    holder,
-                    epoch,
-                    sealed_prefix: genesis,
-                    head: genesis,
-                    shipped: Position::GENESIS,
-                },
-            )?;
-            Ok(epoch)
-        })
-    }
-
-    /// `takeover_target { id, authority, current_epoch }` (§5.3, D21):
-    /// verified by the log, conditional on `current_epoch`; the ownership
-    /// moves to `holder` at the next epoch, fencing the old owner, in the
-    /// same transaction.  Returns the epoch and the target's head in the
-    /// log.
-    pub fn takeover_target(
-        &self,
-        id: ChronicleId,
-        holder: WardenId,
-        authority: ClaimAuthority,
-        current_epoch: Epoch,
-    ) -> Result<(Epoch, Head), CoordError> {
-        let shared = self.shared.clone();
-        self.write(move |t| {
-            let mut state = load(&t.rows, id)?.ok_or(CoordError::UnknownChronicle(id))?;
-            sync(&shared, t, id, &state)?;
-            let op = Op::Takeover {
-                id,
-                authority,
-                current_epoch,
-            };
-            let (epoch, head) =
-                match journal_if(&shared, t, op, |d| matches!(d, Done::Takeover(Ok(_))))? {
-                    Done::Takeover(Ok(v)) => v,
-                    Done::Takeover(Err(e)) => return Err(CoordError::Claim(e)),
-                    _ => unreachable!("a takeover answers a takeover"),
-                };
-            if epoch != state.epoch.next() {
-                *shared.log.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                return Err(CoordError::Corrupt {
-                    chronicle: id,
-                    reason: "the log's epoch is not the ownership epoch",
-                });
-            }
-            state.sealed_prefix = state.head;
-            state.epoch = epoch;
-            state.holder = holder;
-            state.head.epoch = epoch;
-            store(&mut t.rows, id, &state)?;
-            Ok((epoch, head))
-        })
-    }
-
-    /// `announce` (§1.2).  `Err` is the log's refusal.
-    pub fn announce(
-        &self,
-        chronicle: ChronicleId,
-        epoch: Epoch,
-        submission: HashVal,
-        logical: HashVal,
-        digest: HashVal,
-    ) -> Result<Result<(), Answer>, CoordError> {
-        let shared = self.shared.clone();
-        self.write(move |t| {
-            sync_if_known(&shared, t, chronicle)?;
-            let now = (shared.config.clock)();
-            let op = Op::Announce {
-                chronicle,
-                epoch,
-                submission,
-                logical,
-                digest,
-                now,
-            };
-            match journal(&shared, t, op)? {
-                Done::Announce(r) => Ok(r),
-                _ => unreachable!("an announce answers an announce"),
-            }
-        })
-    }
-
-    /// `accept` (§1.2): `record` is what `pack` carries; the log checks the
-    /// store agrees (step 5), then the row's predicate and effects.
-    pub fn accept(
-        &self,
-        chronicle: ChronicleId,
-        epoch: Epoch,
-        submission: HashVal,
-        expected_head: Head,
-        pack: String,
-        record: Submitted,
-    ) -> Result<Answer, CoordError> {
-        let shared = self.shared.clone();
-        self.write(move |t| {
-            sync_if_known(&shared, t, chronicle)?;
-            let now = (shared.config.clock)();
-            let op = Op::Accept {
-                chronicle,
-                epoch,
-                submission,
-                expected_head,
-                pack,
-                record,
-                now,
-            };
-            match journal(&shared, t, op)? {
-                Done::Answer(a) => Ok(a),
-                _ => unreachable!("an accept answers"),
-            }
-        })
-    }
-
-    /// `cancel` (§1.2): idempotent.
-    pub fn cancel(
-        &self,
-        chronicle: ChronicleId,
-        epoch: Epoch,
-        submission: HashVal,
-    ) -> Result<Answer, CoordError> {
-        let shared = self.shared.clone();
-        self.write(move |t| {
-            sync_if_known(&shared, t, chronicle)?;
-            let op = Op::Cancel {
-                chronicle,
-                epoch,
-                submission,
-            };
-            match journal(&shared, t, op)? {
-                Done::Answer(a) => Ok(a),
-                _ => unreachable!("a cancel answers"),
-            }
-        })
-    }
+    // ── The coordinator log: operator calls (P4 spec §1.6) ──────────
 
     /// `set_retention_pin` (§1.6): an operator's call; a pinned Chronicle
     /// cannot retire.
@@ -1091,33 +1042,6 @@ impl Coordinator {
             journal(&shared, t, Op::Pin { chronicle, pinned })?;
             Ok(())
         })
-    }
-
-    /// `query { submission }` (§1.3).
-    pub fn query_submission(
-        &self,
-        chronicle: ChronicleId,
-        submission: HashVal,
-    ) -> Result<SubmissionStatus, CoordError> {
-        self.read_log(move |log| log.query_submission(chronicle, submission))
-    }
-
-    /// `query { logical }` (§1.3): the accepted record and its position.
-    pub fn query_logical(&self, logical: HashVal) -> Result<Option<(u64, Submitted)>, CoordError> {
-        self.read_log(move |log| log.query_logical(logical).map(|(p, s)| (p, s.clone())))
-    }
-
-    /// `query { chronicle }` (§1.3).
-    pub fn query_chronicle(
-        &self,
-        chronicle: ChronicleId,
-    ) -> Result<Option<ChronicleView>, CoordError> {
-        self.read_log(move |log| log.query_chronicle(chronicle))
-    }
-
-    /// The Chronicle's open obligations as the log derives them (§1.5).
-    pub fn obligations(&self, chronicle: ChronicleId) -> Result<Vec<u64>, CoordError> {
-        self.read_log(move |log| log.obligations(chronicle))
     }
 }
 
@@ -1203,14 +1127,21 @@ fn sync(
     }
 }
 
-/// [`sync`] if `chronicle` has an ownership row; otherwise the log answers
-/// for an unknown Chronicle itself.
-fn sync_if_known(
+/// Refuse `warden` if it is not `chronicle`'s holder, then [`sync`]: the
+/// current epoch is its holder's (P4 spec §1.6, §1.8; as for an append).
+/// A Chronicle with no ownership row is left to the log, which answers
+/// for an unknown Chronicle itself (`StaleEpoch`).
+fn holder_synced(
     shared: &Shared,
     t: &mut Tables<'_>,
+    warden: WardenId,
     chronicle: ChronicleId,
 ) -> Result<(), CoordError> {
     match load(&t.rows, chronicle)? {
+        Some(state) if state.holder != warden => Err(CoordError::NotHolder {
+            warden,
+            holder: state.holder,
+        }),
         Some(state) => sync(shared, t, chronicle, &state),
         None => Ok(()),
     }
@@ -1505,6 +1436,203 @@ impl Coord for Coordinator {
 
     fn shipped(&self, chronicle: ChronicleId) -> Result<Position, CoordError> {
         Ok(self.read(chronicle)?.shipped)
+    }
+
+    // ── The coordinator log (P4 spec §1) ────────────────────────────
+
+    /// `claim_chronicle { id, authority }` (§1.6, §5.3, §7): a new
+    /// Chronicle id, held by `holder` at epoch 1 — an ownership row and
+    /// the log's claim, in one transaction.  Refused if the id is known
+    /// ([`CoordError::AlreadyRegistered`]) or the authority does not name
+    /// it ([`CoordError::Claim`]).
+    fn claim_chronicle(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+    ) -> Result<Epoch, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            if load(&t.rows, id)?.is_some() {
+                return Err(CoordError::AlreadyRegistered(id));
+            }
+            let done = journal_if(&shared, t, Op::Claim { id, authority }, |d| {
+                matches!(d, Done::Claim(Ok(_)))
+            })?;
+            let epoch = match done {
+                Done::Claim(Ok(e)) => e,
+                Done::Claim(Err(e)) => return Err(CoordError::Claim(e)),
+                _ => unreachable!("a claim answers a claim"),
+            };
+            let genesis = ChronicleHead {
+                lsn: Lsn::new(0),
+                hash: HashVal::GENESIS,
+                epoch,
+            };
+            store(
+                &mut t.rows,
+                id,
+                &State {
+                    holder,
+                    epoch,
+                    sealed_prefix: genesis,
+                    head: genesis,
+                    shipped: Position::GENESIS,
+                },
+            )?;
+            Ok(epoch)
+        })
+    }
+
+    /// `takeover_target { id, authority, current_epoch }` (§5.3, D21):
+    /// verified by the log, conditional on `current_epoch`; the ownership
+    /// moves to `holder` at the next epoch, fencing the old owner, in the
+    /// same transaction.  Returns the epoch and the target's head in the
+    /// log.
+    fn takeover_target(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+        current_epoch: Epoch,
+    ) -> Result<(Epoch, Head), CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            let mut state = load(&t.rows, id)?.ok_or(CoordError::UnknownChronicle(id))?;
+            sync(&shared, t, id, &state)?;
+            let op = Op::Takeover {
+                id,
+                authority,
+                current_epoch,
+            };
+            let (epoch, head) =
+                match journal_if(&shared, t, op, |d| matches!(d, Done::Takeover(Ok(_))))? {
+                    Done::Takeover(Ok(v)) => v,
+                    Done::Takeover(Err(e)) => return Err(CoordError::Claim(e)),
+                    _ => unreachable!("a takeover answers a takeover"),
+                };
+            if epoch != state.epoch.next() {
+                *shared.log.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                return Err(CoordError::Corrupt {
+                    chronicle: id,
+                    reason: "the log's epoch is not the ownership epoch",
+                });
+            }
+            state.sealed_prefix = state.head;
+            state.epoch = epoch;
+            state.holder = holder;
+            state.head.epoch = epoch;
+            store(&mut t.rows, id, &state)?;
+            Ok((epoch, head))
+        })
+    }
+
+    /// `announce` (§1.2).  `Err` is the log's refusal.
+    fn announce(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        logical: HashVal,
+        digest: HashVal,
+    ) -> Result<Result<(), Answer>, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            holder_synced(&shared, t, warden, chronicle)?;
+            let now = (shared.config.clock)();
+            let op = Op::Announce {
+                chronicle,
+                epoch,
+                submission,
+                logical,
+                digest,
+                now,
+            };
+            match journal(&shared, t, op)? {
+                Done::Announce(r) => Ok(r),
+                _ => unreachable!("an announce answers an announce"),
+            }
+        })
+    }
+
+    /// `accept` (§1.2): `record` is what `pack` carries; the log checks the
+    /// store agrees (step 5), then the row's predicate and effects.
+    fn accept(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        expected_head: Head,
+        pack: String,
+        record: Submitted,
+    ) -> Result<Answer, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            holder_synced(&shared, t, warden, chronicle)?;
+            let now = (shared.config.clock)();
+            let op = Op::Accept {
+                chronicle,
+                epoch,
+                submission,
+                expected_head,
+                pack,
+                record,
+                now,
+            };
+            match journal(&shared, t, op)? {
+                Done::Answer(a) => Ok(a),
+                _ => unreachable!("an accept answers"),
+            }
+        })
+    }
+
+    /// `cancel` (§1.2): idempotent.
+    fn cancel(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+    ) -> Result<Answer, CoordError> {
+        let shared = self.shared.clone();
+        self.write(move |t| {
+            holder_synced(&shared, t, warden, chronicle)?;
+            let op = Op::Cancel {
+                chronicle,
+                epoch,
+                submission,
+            };
+            match journal(&shared, t, op)? {
+                Done::Answer(a) => Ok(a),
+                _ => unreachable!("a cancel answers"),
+            }
+        })
+    }
+
+    /// `query { submission }` (§1.3).
+    fn query_submission(
+        &self,
+        chronicle: ChronicleId,
+        submission: HashVal,
+    ) -> Result<SubmissionStatus, CoordError> {
+        self.read_log(move |log| log.query_submission(chronicle, submission))
+    }
+
+    /// `query { logical }` (§1.3): the accepted record and its position.
+    fn query_logical(&self, logical: HashVal) -> Result<Option<(u64, Submitted)>, CoordError> {
+        self.read_log(move |log| log.query_logical(logical).map(|(p, s)| (p, s.clone())))
+    }
+
+    /// `query { chronicle }` (§1.3).
+    fn query_chronicle(&self, chronicle: ChronicleId) -> Result<Option<ChronicleView>, CoordError> {
+        self.read_log(move |log| log.query_chronicle(chronicle))
+    }
+
+    /// The Chronicle's open obligations as the log derives them (§1.5).
+    fn obligations(&self, chronicle: ChronicleId) -> Result<Vec<u64>, CoordError> {
+        self.read_log(move |log| log.obligations(chronicle))
     }
 }
 
@@ -2754,7 +2882,7 @@ mod log_tests {
     ) -> Answer {
         let s = submission_id(r.logical_id(), r.digest(), epoch, n);
         if let Err(a) = coord
-            .announce(c, epoch, s, r.logical_id(), r.digest())
+            .announce(A, c, epoch, s, r.logical_id(), r.digest())
             .unwrap()
         {
             return a;
@@ -2762,7 +2890,7 @@ mod log_tests {
         let pack = format!("pack-{n}");
         store.ship(c, &pack, &r);
         let head = coord.query_chronicle(c).unwrap().unwrap().head;
-        coord.accept(c, epoch, s, head, pack, r).unwrap()
+        coord.accept(A, c, epoch, s, head, pack, r).unwrap()
     }
 
     fn journal_len(coord: &Coordinator) -> u64 {
@@ -2802,7 +2930,7 @@ mod log_tests {
         // A second submission, cancelled; a pin.
         let late = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 2);
         assert_eq!(
-            coord.cancel(t0, Epoch::FIRST, late).unwrap(),
+            coord.cancel(A, t0, Epoch::FIRST, late).unwrap(),
             Answer::FinalRefused(Final::Cancelled)
         );
         coord.set_retention_pin(t0, true).unwrap();
@@ -2882,7 +3010,7 @@ mod log_tests {
         );
         let s = h(9);
         coord
-            .announce(c, Epoch::FIRST, s, h(10), h(11))
+            .announce(A, c, Epoch::FIRST, s, h(10), h(11))
             .unwrap()
             .unwrap();
         // A transfer fences the log in the same transaction: the pending
@@ -2898,7 +3026,7 @@ mod log_tests {
         );
         assert_eq!(
             coord
-                .announce(c, Epoch::FIRST, h(12), h(10), h(11))
+                .announce(B, c, Epoch::FIRST, h(12), h(10), h(11))
                 .unwrap(),
             Err(Answer::FinalRefused(Final::StaleEpoch))
         );
@@ -2948,7 +3076,9 @@ mod log_tests {
         assert_eq!((o.holder, o.epoch), (B, Epoch::new(2)));
         // The old owner's submissions are stale.
         assert_eq!(
-            coord.announce(t0, Epoch::FIRST, h(3), h(4), h(5)).unwrap(),
+            coord
+                .announce(B, t0, Epoch::FIRST, h(3), h(4), h(5))
+                .unwrap(),
             Err(Answer::FinalRefused(Final::StaleEpoch))
         );
     }
@@ -3147,11 +3277,11 @@ mod log_tests {
         let coord = open(&path, store);
         // Brought in on first use; one with records is never sanctionable.
         coord
-            .announce(chron(1), Epoch::FIRST, h(1), h(2), h(3))
+            .announce(A, chron(1), Epoch::FIRST, h(1), h(2), h(3))
             .unwrap()
             .unwrap();
         coord
-            .announce(chron(2), Epoch::FIRST, h(1), h(2), h(3))
+            .announce(A, chron(2), Epoch::FIRST, h(1), h(2), h(3))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3163,6 +3293,7 @@ mod log_tests {
         assert_eq!(
             coord
                 .accept(
+                    A,
                     chron(2),
                     Epoch::FIRST,
                     h(1),

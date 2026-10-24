@@ -43,17 +43,41 @@
 //!   9 transfer_if  chronicle (16) · new_holder (8) · expected holder (8) · expected epoch (8)
 //!  10 append_effects  warden (8) · count (4) · count × envelope (137)
 //!                  · effects (4) · effects × (length (4) · bytes)
+//!  11 claim_chronicle   holder (8) · id (16) · blob(authority)
+//!  12 takeover_target   holder (8) · id (16) · current epoch (8) · blob(authority)
+//!  13 announce   warden (8) · chronicle (16) · epoch (8) · submission (32)
+//!                · logical (32) · digest (32)
+//!  14 accept     warden (8) · chronicle (16) · epoch (8) · submission (32)
+//!                · blob(expected head · pack name · record)
+//!  15 cancel     warden (8) · chronicle (16) · epoch (8) · submission (32)
+//!  16 query_submission  chronicle (16) · submission (32)
+//!  17 query_logical     logical (32)
+//!  18 query_chronicle   chronicle (16)
+//!  19 obligations       chronicle (16)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
-//!                | position (40)
+//!                | position (40) | blob (operations 12–19)
 //!   1 refused    reason (1) · fields          (every refusal of CoordError)
 //!   2 failed     utf-8 message                (outcome unknown on the server)
 //!   3 bad        utf-8 message                (malformed request; nothing done)
 //!
 //! head     lsn (8) · hash (32) · epoch (8)
 //! position lsn (8) · hash (32)
+//! blob     length (4) · bytes in the canonical encoding (P4 spec §9),
+//!          little-endian inside, as the coordinator journals them
 //! ```
+//!
+//! Operations 11–19 are the P4 coordinator log (spec rev. 11 §1.2, §1.3,
+//! §5.3).  Their answers are blobs: `takeover_target` epoch (8) · head;
+//! `announce` tag 0, or tag 1 · answer; `accept` and `cancel` an answer;
+//! `query_submission` a status; `query_logical` tag 0, or tag 1 · log
+//! position (8) · record; `query_chronicle` tag 0, or tag 1 · view;
+//! `obligations` count (8) · op ids (8 each).  `announce`, `accept` and
+//! `cancel` name the Warden, which must be the Chronicle's holder (its
+//! epoch is the holder's), so a peer map binds them like an append; the
+//! queries are open to any mapped peer.  `set_retention_pin` is an
+//! operator's call and is not on the wire.
 //!
 //! Operations 6, 7 and 8 were added to version 1 before any server ran
 //! outside a test.  A batch holds at most 4096 envelopes.  Refusal reasons
@@ -124,8 +148,15 @@ use taso_core::frame::{read_frame, write_frame, FrameError};
 use taso_core::model::{Ownership, WardenId};
 
 use crate::coordinator::{Coord, CoordError, EffectFault};
+use crate::coordjournal::{
+    get_answer, get_authority, get_head, get_status, get_submitted, get_view, put_answer,
+    put_authority, put_head, put_status, put_submitted, put_view, JournalError, Rd,
+};
 use crate::segment::Position;
-use taso_core::coordlog::ClaimError;
+use taso_core::canon::Canon;
+use taso_core::coordlog::{
+    Answer, ChronicleView, ClaimAuthority, ClaimError, Head, SubmissionStatus, Submitted,
+};
 
 const WIRE_V1: u8 = 1;
 
@@ -139,6 +170,15 @@ const OP_SHIPPED: u8 = 7;
 const OP_APPEND_BATCH: u8 = 8;
 const OP_TRANSFER_IF: u8 = 9;
 const OP_APPEND_EFFECTS: u8 = 10;
+const OP_CLAIM_CHRONICLE: u8 = 11;
+const OP_TAKEOVER_TARGET: u8 = 12;
+const OP_ANNOUNCE: u8 = 13;
+const OP_ACCEPT: u8 = 14;
+const OP_CANCEL: u8 = 15;
+const OP_QUERY_SUBMISSION: u8 = 16;
+const OP_QUERY_LOGICAL: u8 = 17;
+const OP_QUERY_CHRONICLE: u8 = 18;
+const OP_OBLIGATIONS: u8 = 19;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -172,6 +212,9 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ── Messages ────────────────────────────────────────────────────────
 
+// One request at a time, never held in bulk: the size of `Accept` costs
+// nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Request {
     Register {
@@ -212,6 +255,53 @@ enum Request {
     Shipped {
         chronicle: ChronicleId,
     },
+    ClaimChronicle {
+        holder: WardenId,
+        id: ChronicleId,
+        authority: ClaimAuthority,
+    },
+    TakeoverTarget {
+        holder: WardenId,
+        id: ChronicleId,
+        current_epoch: Epoch,
+        authority: ClaimAuthority,
+    },
+    Announce {
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        logical: HashVal,
+        digest: HashVal,
+    },
+    Accept {
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        expected_head: Head,
+        pack: String,
+        record: Submitted,
+    },
+    Cancel {
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+    },
+    QuerySubmission {
+        chronicle: ChronicleId,
+        submission: HashVal,
+    },
+    QueryLogical {
+        logical: HashVal,
+    },
+    QueryChronicle {
+        chronicle: ChronicleId,
+    },
+    Obligations {
+        chronicle: ChronicleId,
+    },
 }
 
 #[derive(Debug)]
@@ -220,6 +310,8 @@ enum Reply {
     Epoch(Epoch),
     Ownership(Ownership),
     Position(Position),
+    /// A coordinator log answer, in the canonical encoding.
+    Blob(Vec<u8>),
     /// A refusal, or a server-side failure (always `outcome_unknown`).
     Err(CoordError),
     /// The server could not parse the request.
@@ -264,6 +356,9 @@ impl Out {
     }
     fn pos(&mut self, p: &Position) -> &mut Self {
         self.u64(p.lsn.get()).bytes(p.hash.as_bytes())
+    }
+    fn blob(&mut self, b: &[u8]) -> &mut Self {
+        self.u32(b.len() as u32).bytes(b)
     }
     fn envelope(&mut self, e: &Envelope) -> &mut Self {
         self.bytes(e.chronicle.as_bytes())
@@ -359,6 +454,10 @@ impl<'a> In<'a> {
         self.b = &[];
         s
     }
+    fn blob(&mut self) -> Result<&'a [u8], Malformed> {
+        let n = self.u32()? as usize;
+        self.take(n)
+    }
     fn end(&self) -> Result<(), Malformed> {
         if self.b.is_empty() {
             Ok(())
@@ -433,6 +532,90 @@ impl Request {
                 .u64(epoch.get())
                 .pos(to),
             Self::Shipped { chronicle } => o.u8(OP_SHIPPED).bytes(chronicle.as_bytes()),
+            Self::ClaimChronicle {
+                holder,
+                id,
+                authority,
+            } => {
+                let mut a = Canon::new();
+                put_authority(&mut a, authority);
+                o.u8(OP_CLAIM_CHRONICLE)
+                    .u64(holder.get())
+                    .bytes(id.as_bytes())
+                    .blob(a.as_bytes())
+            }
+            Self::TakeoverTarget {
+                holder,
+                id,
+                current_epoch,
+                authority,
+            } => {
+                let mut a = Canon::new();
+                put_authority(&mut a, authority);
+                o.u8(OP_TAKEOVER_TARGET)
+                    .u64(holder.get())
+                    .bytes(id.as_bytes())
+                    .u64(current_epoch.get())
+                    .blob(a.as_bytes())
+            }
+            Self::Announce {
+                warden,
+                chronicle,
+                epoch,
+                submission,
+                logical,
+                digest,
+            } => o
+                .u8(OP_ANNOUNCE)
+                .u64(warden.get())
+                .bytes(chronicle.as_bytes())
+                .u64(epoch.get())
+                .bytes(submission.as_bytes())
+                .bytes(logical.as_bytes())
+                .bytes(digest.as_bytes()),
+            Self::Accept {
+                warden,
+                chronicle,
+                epoch,
+                submission,
+                expected_head,
+                pack,
+                record,
+            } => {
+                let mut b = Canon::new();
+                put_head(&mut b, expected_head);
+                b.str(pack);
+                put_submitted(&mut b, record);
+                o.u8(OP_ACCEPT)
+                    .u64(warden.get())
+                    .bytes(chronicle.as_bytes())
+                    .u64(epoch.get())
+                    .bytes(submission.as_bytes())
+                    .blob(b.as_bytes())
+            }
+            Self::Cancel {
+                warden,
+                chronicle,
+                epoch,
+                submission,
+            } => o
+                .u8(OP_CANCEL)
+                .u64(warden.get())
+                .bytes(chronicle.as_bytes())
+                .u64(epoch.get())
+                .bytes(submission.as_bytes()),
+            Self::QuerySubmission {
+                chronicle,
+                submission,
+            } => o
+                .u8(OP_QUERY_SUBMISSION)
+                .bytes(chronicle.as_bytes())
+                .bytes(submission.as_bytes()),
+            Self::QueryLogical { logical } => o.u8(OP_QUERY_LOGICAL).bytes(logical.as_bytes()),
+            Self::QueryChronicle { chronicle } => {
+                o.u8(OP_QUERY_CHRONICLE).bytes(chronicle.as_bytes())
+            }
+            Self::Obligations { chronicle } => o.u8(OP_OBLIGATIONS).bytes(chronicle.as_bytes()),
         };
         o.0
     }
@@ -500,6 +683,60 @@ impl Request {
             OP_SHIPPED => Self::Shipped {
                 chronicle: i.chronicle()?,
             },
+            OP_CLAIM_CHRONICLE => Self::ClaimChronicle {
+                holder: i.warden()?,
+                id: i.chronicle()?,
+                authority: canonical(i.blob()?, get_authority)?,
+            },
+            OP_TAKEOVER_TARGET => Self::TakeoverTarget {
+                holder: i.warden()?,
+                id: i.chronicle()?,
+                current_epoch: Epoch::new(i.u64()?),
+                authority: canonical(i.blob()?, get_authority)?,
+            },
+            OP_ANNOUNCE => Self::Announce {
+                warden: i.warden()?,
+                chronicle: i.chronicle()?,
+                epoch: Epoch::new(i.u64()?),
+                submission: i.hash()?,
+                logical: i.hash()?,
+                digest: i.hash()?,
+            },
+            OP_ACCEPT => {
+                let warden = i.warden()?;
+                let chronicle = i.chronicle()?;
+                let epoch = Epoch::new(i.u64()?);
+                let submission = i.hash()?;
+                let (expected_head, pack, record) = canonical(i.blob()?, |r| {
+                    Ok((get_head(r)?, r.string()?, get_submitted(r)?))
+                })?;
+                Self::Accept {
+                    warden,
+                    chronicle,
+                    epoch,
+                    submission,
+                    expected_head,
+                    pack,
+                    record,
+                }
+            }
+            OP_CANCEL => Self::Cancel {
+                warden: i.warden()?,
+                chronicle: i.chronicle()?,
+                epoch: Epoch::new(i.u64()?),
+                submission: i.hash()?,
+            },
+            OP_QUERY_SUBMISSION => Self::QuerySubmission {
+                chronicle: i.chronicle()?,
+                submission: i.hash()?,
+            },
+            OP_QUERY_LOGICAL => Self::QueryLogical { logical: i.hash()? },
+            OP_QUERY_CHRONICLE => Self::QueryChronicle {
+                chronicle: i.chronicle()?,
+            },
+            OP_OBLIGATIONS => Self::Obligations {
+                chronicle: i.chronicle()?,
+            },
             _ => return Err(Malformed("unknown operation")),
         };
         i.end()?;
@@ -517,7 +754,19 @@ impl Request {
                 Some(*new_holder)
             }
             Self::AdvanceShipped { warden, .. } => Some(*warden),
-            Self::Ownership { .. } | Self::Head { .. } | Self::Shipped { .. } => None,
+            Self::ClaimChronicle { holder, .. } | Self::TakeoverTarget { holder, .. } => {
+                Some(*holder)
+            }
+            Self::Announce { warden, .. }
+            | Self::Accept { warden, .. }
+            | Self::Cancel { warden, .. } => Some(*warden),
+            Self::Ownership { .. }
+            | Self::Head { .. }
+            | Self::Shipped { .. }
+            | Self::QuerySubmission { .. }
+            | Self::QueryLogical { .. }
+            | Self::QueryChronicle { .. }
+            | Self::Obligations { .. } => None,
         }
     }
 
@@ -528,9 +777,19 @@ impl Request {
             | Self::Append { .. }
             | Self::AppendBatch { .. }
             | Self::Head { .. } => OkKind::Head,
-            Self::Transfer { .. } | Self::TransferIf { .. } => OkKind::Epoch,
+            Self::Transfer { .. } | Self::TransferIf { .. } | Self::ClaimChronicle { .. } => {
+                OkKind::Epoch
+            }
             Self::Ownership { .. } => OkKind::Ownership,
             Self::AdvanceShipped { .. } | Self::Shipped { .. } => OkKind::Position,
+            Self::TakeoverTarget { .. }
+            | Self::Announce { .. }
+            | Self::Accept { .. }
+            | Self::Cancel { .. }
+            | Self::QuerySubmission { .. }
+            | Self::QueryLogical { .. }
+            | Self::QueryChronicle { .. }
+            | Self::Obligations { .. } => OkKind::Blob,
         }
     }
 }
@@ -541,6 +800,18 @@ enum OkKind {
     Epoch,
     Ownership,
     Position,
+    Blob,
+}
+
+/// Decode a whole canonical blob with `f`; nothing may follow.
+fn canonical<T>(
+    b: &[u8],
+    f: impl FnOnce(&mut Rd<'_>) -> Result<T, JournalError>,
+) -> Result<T, Malformed> {
+    let mut r = Rd::new(b);
+    let v = f(&mut r).map_err(|e| Malformed(e.0))?;
+    r.finish().map_err(|e| Malformed(e.0))?;
+    Ok(v)
 }
 
 impl Reply {
@@ -561,6 +832,9 @@ impl Reply {
             }
             Self::Position(p) => {
                 o.u8(ST_OK).pos(p);
+            }
+            Self::Blob(b) => {
+                o.u8(ST_OK).blob(b);
             }
             Self::Err(e) => match encode_refusal(e) {
                 Some(body) => {
@@ -589,6 +863,7 @@ impl Reply {
                     sealed_prefix: i.head()?,
                 }),
                 OkKind::Position => Self::Position(i.pos()?),
+                OkKind::Blob => Self::Blob(i.blob()?.to_vec()),
             },
             ST_REFUSED => Self::Err(decode_refusal(&mut i)?),
             ST_FAILED => Self::Err(CoordError::Unavailable(io::Error::other(format!(
@@ -754,6 +1029,117 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
             .advance_shipped(warden, chronicle, epoch, to)
             .map(Reply::Position),
         Request::Shipped { chronicle } => coord.shipped(chronicle).map(Reply::Position),
+        Request::ClaimChronicle {
+            holder,
+            id,
+            authority,
+        } => coord
+            .claim_chronicle(id, holder, authority)
+            .map(Reply::Epoch),
+        Request::TakeoverTarget {
+            holder,
+            id,
+            current_epoch,
+            authority,
+        } => coord
+            .takeover_target(id, holder, authority, current_epoch)
+            .map(|(e, h)| {
+                let mut c = Canon::new();
+                c.u64(e.get());
+                put_head(&mut c, &h);
+                Reply::Blob(c.into_bytes())
+            }),
+        Request::Announce {
+            warden,
+            chronicle,
+            epoch,
+            submission,
+            logical,
+            digest,
+        } => coord
+            .announce(warden, chronicle, epoch, submission, logical, digest)
+            .map(|r| {
+                let mut c = Canon::new();
+                match r {
+                    Ok(()) => {
+                        c.tag(0);
+                    }
+                    Err(a) => {
+                        c.tag(1);
+                        put_answer(&mut c, &a);
+                    }
+                }
+                Reply::Blob(c.into_bytes())
+            }),
+        Request::Accept {
+            warden,
+            chronicle,
+            epoch,
+            submission,
+            expected_head,
+            pack,
+            record,
+        } => coord
+            .accept(
+                warden,
+                chronicle,
+                epoch,
+                submission,
+                expected_head,
+                pack,
+                record,
+            )
+            .map(|a| answer_blob(&a)),
+        Request::Cancel {
+            warden,
+            chronicle,
+            epoch,
+            submission,
+        } => coord
+            .cancel(warden, chronicle, epoch, submission)
+            .map(|a| answer_blob(&a)),
+        Request::QuerySubmission {
+            chronicle,
+            submission,
+        } => coord.query_submission(chronicle, submission).map(|st| {
+            let mut c = Canon::new();
+            put_status(&mut c, &st);
+            Reply::Blob(c.into_bytes())
+        }),
+        Request::QueryLogical { logical } => coord.query_logical(logical).map(|q| {
+            let mut c = Canon::new();
+            match q {
+                None => {
+                    c.tag(0);
+                }
+                Some((pos, rec)) => {
+                    c.tag(1).u64(pos);
+                    put_submitted(&mut c, &rec);
+                }
+            }
+            Reply::Blob(c.into_bytes())
+        }),
+        Request::QueryChronicle { chronicle } => coord.query_chronicle(chronicle).map(|v| {
+            let mut c = Canon::new();
+            match v {
+                None => {
+                    c.tag(0);
+                }
+                Some(v) => {
+                    c.tag(1);
+                    put_view(&mut c, &v);
+                }
+            }
+            Reply::Blob(c.into_bytes())
+        }),
+        Request::Obligations { chronicle } => coord.obligations(chronicle).map(|ops| {
+            let mut c = Canon::new();
+            c.u64(ops.len() as u64);
+            for op in ops {
+                c.u64(op);
+            }
+            Reply::Blob(c.into_bytes())
+        }),
     };
     r.unwrap_or_else(Reply::Err)
 }
@@ -1118,6 +1504,26 @@ fn unavailable(e: FrameError) -> CoordError {
     }
 }
 
+fn answer_blob(a: &Answer) -> Reply {
+    let mut c = Canon::new();
+    put_answer(&mut c, a);
+    Reply::Blob(c.into_bytes())
+}
+
+/// A blob answer, decoded with `f`; a blob that does not decode is a
+/// broken reply (outcome unknown).
+fn blob_reply<T>(
+    r: Reply,
+    f: impl FnOnce(&mut Rd<'_>) -> Result<T, JournalError>,
+) -> Result<T, CoordError> {
+    match r {
+        Reply::Blob(b) => canonical(&b, f)
+            .map_err(|m| CoordError::Unavailable(io::Error::new(io::ErrorKind::InvalidData, m.0))),
+        Reply::Err(e) => Err(e),
+        r => Err(unexpected(r)),
+    }
+}
+
 fn unexpected(r: Reply) -> CoordError {
     CoordError::Unavailable(io::Error::new(
         io::ErrorKind::InvalidData,
@@ -1246,6 +1652,141 @@ impl Coord for RemoteCoord {
             Reply::Err(e) => Err(e),
             r => Err(unexpected(r)),
         }
+    }
+
+    // ── The coordinator log (operations 11–19) ──────────────────────
+
+    fn claim_chronicle(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+    ) -> Result<Epoch, CoordError> {
+        match self.call(Request::ClaimChronicle {
+            holder,
+            id,
+            authority,
+        })? {
+            Reply::Epoch(e) => Ok(e),
+            Reply::Err(e) => Err(e),
+            r => Err(unexpected(r)),
+        }
+    }
+
+    fn takeover_target(
+        &self,
+        id: ChronicleId,
+        holder: WardenId,
+        authority: ClaimAuthority,
+        current_epoch: Epoch,
+    ) -> Result<(Epoch, Head), CoordError> {
+        let r = self.call(Request::TakeoverTarget {
+            holder,
+            id,
+            current_epoch,
+            authority,
+        })?;
+        blob_reply(r, |r| Ok((Epoch::new(r.u64()?), get_head(r)?)))
+    }
+
+    fn announce(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        logical: HashVal,
+        digest: HashVal,
+    ) -> Result<Result<(), Answer>, CoordError> {
+        let r = self.call(Request::Announce {
+            warden,
+            chronicle,
+            epoch,
+            submission,
+            logical,
+            digest,
+        })?;
+        blob_reply(r, |r| match r.u8()? {
+            0 => Ok(Ok(())),
+            1 => Ok(Err(get_answer(r)?)),
+            _ => Err(JournalError("bad announce tag")),
+        })
+    }
+
+    fn accept(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        expected_head: Head,
+        pack: String,
+        record: Submitted,
+    ) -> Result<Answer, CoordError> {
+        let r = self.call(Request::Accept {
+            warden,
+            chronicle,
+            epoch,
+            submission,
+            expected_head,
+            pack,
+            record,
+        })?;
+        blob_reply(r, get_answer)
+    }
+
+    fn cancel(
+        &self,
+        warden: WardenId,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+    ) -> Result<Answer, CoordError> {
+        let r = self.call(Request::Cancel {
+            warden,
+            chronicle,
+            epoch,
+            submission,
+        })?;
+        blob_reply(r, get_answer)
+    }
+
+    fn query_submission(
+        &self,
+        chronicle: ChronicleId,
+        submission: HashVal,
+    ) -> Result<SubmissionStatus, CoordError> {
+        let r = self.call(Request::QuerySubmission {
+            chronicle,
+            submission,
+        })?;
+        blob_reply(r, get_status)
+    }
+
+    fn query_logical(&self, logical: HashVal) -> Result<Option<(u64, Submitted)>, CoordError> {
+        let r = self.call(Request::QueryLogical { logical })?;
+        blob_reply(r, |r| match r.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some((r.u64()?, get_submitted(r)?))),
+            _ => Err(JournalError("bad option tag")),
+        })
+    }
+
+    fn query_chronicle(&self, chronicle: ChronicleId) -> Result<Option<ChronicleView>, CoordError> {
+        let r = self.call(Request::QueryChronicle { chronicle })?;
+        blob_reply(r, |r| match r.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(get_view(r)?)),
+            _ => Err(JournalError("bad option tag")),
+        })
+    }
+
+    fn obligations(&self, chronicle: ChronicleId) -> Result<Vec<u64>, CoordError> {
+        let r = self.call(Request::Obligations { chronicle })?;
+        blob_reply(r, |r| {
+            let n = r.count()?;
+            (0..n).map(|_| r.u64()).collect()
+        })
     }
 }
 
@@ -1527,6 +2068,10 @@ mod tests {
                 effects: vec![],
             },
         ];
+        let reqs: Vec<Request> = reqs
+            .into_iter()
+            .chain(log_requests().into_iter().map(|(r, _)| r))
+            .collect();
         for r in reqs.clone() {
             let b = r.encode();
             assert_eq!(Request::decode(&b), Ok(r.clone()));
@@ -1720,9 +2265,340 @@ mod tests {
                 None,
             ),
         ];
-        for (req, want) in cases {
+        for (req, want) in cases.into_iter().chain(log_requests()) {
             assert_eq!(req.claimed(), want, "{req:?}");
         }
+    }
+
+    // ── the coordinator log (operations 11–19) ──────────────────────
+
+    fn genesis_record() -> Submitted {
+        use taso_core::contract::{
+            genesis_id, Consistency, ContractRecord, GenesisStarted, Peer as CPeer,
+            TRANSFORM_VERSION,
+        };
+        let h = |n: u8| HashVal::from_bytes([n; 32]);
+        Submitted::Contract(ContractRecord::GenesisStarted(Box::new(GenesisStarted {
+            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo"),
+            source_key: h(0x20),
+            consistency: Consistency::Immutable,
+            classmap_key: h(0x21),
+            transform_version: TRANSFORM_VERSION,
+            hook_waiver: None,
+            authority: taso_core::record::Authority {
+                actor: "jarmo".into(),
+                reason: "T(0)".into(),
+            },
+            peer: CPeer { uid: 0, pid: 1 },
+        })))
+    }
+
+    /// One of every coordinator log request, and whom it acts as.
+    fn log_requests() -> Vec<(Request, Option<WardenId>)> {
+        let h = |n: u8| HashVal::from_bytes([n; 32]);
+        vec![
+            (
+                Request::ClaimChronicle {
+                    holder: A,
+                    id: chron(5),
+                    authority: ClaimAuthority::Sanction { commit: h(1) },
+                },
+                Some(A),
+            ),
+            (
+                Request::TakeoverTarget {
+                    holder: B,
+                    id: chron(5),
+                    current_epoch: Epoch::new(3),
+                    authority: ClaimAuthority::GenesisStarted,
+                },
+                Some(B),
+            ),
+            (
+                Request::Announce {
+                    warden: A,
+                    chronicle: chron(1),
+                    epoch: Epoch::FIRST,
+                    submission: h(2),
+                    logical: h(3),
+                    digest: h(4),
+                },
+                Some(A),
+            ),
+            (
+                Request::Accept {
+                    warden: B,
+                    chronicle: chron(1),
+                    epoch: Epoch::FIRST,
+                    submission: h(2),
+                    expected_head: Head {
+                        pos: 7,
+                        digest: h(5),
+                    },
+                    pack: "p".into(),
+                    record: genesis_record(),
+                },
+                Some(B),
+            ),
+            (
+                Request::Cancel {
+                    warden: A,
+                    chronicle: chron(1),
+                    epoch: Epoch::FIRST,
+                    submission: h(2),
+                },
+                Some(A),
+            ),
+            (
+                Request::QuerySubmission {
+                    chronicle: chron(1),
+                    submission: h(2),
+                },
+                None,
+            ),
+            (Request::QueryLogical { logical: h(3) }, None),
+            (
+                Request::QueryChronicle {
+                    chronicle: chron(1),
+                },
+                None,
+            ),
+            (
+                Request::Obligations {
+                    chronicle: chron(1),
+                },
+                None,
+            ),
+        ]
+    }
+
+    /// A store that has everything: every accept is readable.
+    struct Everything;
+    impl taso_core::coordlog::StoreView for Everything {
+        fn carries(&self, _: ChronicleId, _: &str, _: HashVal) -> bool {
+            true
+        }
+        fn exists(&self, _: &taso_core::coordlog::ObjectId) -> bool {
+            true
+        }
+        fn inventory(&self, _: HashVal) -> Option<taso_core::contract::Inventory> {
+            None
+        }
+        fn fs_packs(&self, _: ChronicleId) -> Vec<taso_core::contract::InventoryItem> {
+            Vec::new()
+        }
+        fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<taso_core::coordlog::ObjectId> {
+            Vec::new()
+        }
+        fn verify_replacement(
+            &self,
+            _: ChronicleId,
+            _: &taso_core::contract::InventoryItem,
+        ) -> Option<HashVal> {
+            None
+        }
+    }
+
+    /// Every coordinator log operation through the socket answers what the
+    /// coordinator answers, field for field: a genesis claimed, started,
+    /// queried, a second submission cancelled, a refusal with its rule's
+    /// name, a takeover, and the old holder refused.
+    #[test]
+    fn the_coordinator_log_crosses_the_socket() {
+        use crate::coordinator::LogConfig;
+        use taso_core::contract::submission_id;
+        use taso_core::coordlog::Final;
+        let dir = tempfile::tempdir().unwrap();
+        let config = LogConfig {
+            store: Arc::new(Everything),
+            ..LogConfig::default()
+        };
+        let coord = Arc::new(Coordinator::open_with(dir.path().join("c.redb"), config).unwrap());
+        let served: Arc<dyn Coord> = coord.clone();
+        let server = Server::spawn(dir.path().join("c.sock"), served).unwrap();
+        let c = RemoteCoord::with_timeout(dir.path().join("c.sock"), Duration::from_secs(5));
+
+        let r = genesis_record();
+        let Submitted::Contract(ref rec) = r else {
+            unreachable!()
+        };
+        let taso_core::contract::ContractRecord::GenesisStarted(g) = rec else {
+            unreachable!()
+        };
+        let t0 = g.genesis_id;
+        assert!(matches!(
+            c.claim_chronicle(
+                t0,
+                A,
+                ClaimAuthority::Sanction {
+                    commit: HashVal::GENESIS
+                }
+            ),
+            Err(CoordError::Claim(ClaimError::BadAuthority))
+        ));
+        assert_eq!(
+            c.claim_chronicle(t0, A, ClaimAuthority::Genesis).unwrap(),
+            Epoch::FIRST
+        );
+        let s = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 1);
+        c.announce(A, t0, Epoch::FIRST, s, r.logical_id(), r.digest())
+            .unwrap()
+            .unwrap();
+        let head = c.query_chronicle(t0).unwrap().unwrap().head;
+        let accepted = c
+            .accept(A, t0, Epoch::FIRST, s, head, "p".into(), r.clone())
+            .unwrap();
+        assert!(matches!(accepted, Answer::Accepted { log_pos: 1, .. }));
+        assert_eq!(
+            c.query_logical(r.logical_id()).unwrap(),
+            Some((1, r.clone()))
+        );
+        assert_eq!(
+            c.query_submission(t0, s).unwrap(),
+            SubmissionStatus::Accepted(1)
+        );
+        let view = c.query_chronicle(t0).unwrap();
+        assert_eq!(view, coord.query_chronicle(t0).unwrap(), "the same view");
+        assert_eq!(view.unwrap().holds.len(), 2);
+        assert_eq!(c.obligations(t0).unwrap(), Vec::<u64>::new());
+        let late = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 2);
+        assert_eq!(
+            c.cancel(A, t0, Epoch::FIRST, late).unwrap(),
+            Answer::FinalRefused(Final::Cancelled)
+        );
+        // A record of another Chronicle: refused by its rule, by name.
+        let other = chron(9);
+        c.register(other, A).unwrap();
+        let s2 = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 3);
+        assert_eq!(
+            c.announce(A, other, Epoch::FIRST, s2, r.logical_id(), r.digest())
+                .unwrap(),
+            Ok(())
+        );
+        let refused = c
+            .accept(
+                A,
+                other,
+                Epoch::FIRST,
+                s2,
+                taso_core::coordlog::Head::EMPTY,
+                "p".into(),
+                r.clone(),
+            )
+            .unwrap();
+        assert!(
+            matches!(&refused, Answer::AlreadyAccepted { log_pos: 1, .. }),
+            "the logical id is taken: {refused:?}"
+        );
+        // Another genesis on a Vessel's Chronicle: refused by its rule, and
+        // the rule's name crosses the socket.
+        let mut g2 = (**g).clone();
+        g2.source_key = HashVal::from_bytes([0x30; 32]);
+        g2.genesis_id = taso_core::contract::genesis_id(
+            g2.source_key,
+            g2.classmap_key,
+            g2.transform_version,
+            None,
+            "jarmo",
+        );
+        let r2 = Submitted::Contract(taso_core::contract::ContractRecord::GenesisStarted(
+            Box::new(g2),
+        ));
+        let s3 = submission_id(r2.logical_id(), r2.digest(), Epoch::FIRST, 4);
+        c.announce(A, other, Epoch::FIRST, s3, r2.logical_id(), r2.digest())
+            .unwrap()
+            .unwrap();
+        let got = c
+            .accept(
+                A,
+                other,
+                Epoch::FIRST,
+                s3,
+                taso_core::coordlog::Head::EMPTY,
+                "p".into(),
+                r2,
+            )
+            .unwrap();
+        assert_eq!(
+            got,
+            Answer::FinalRefused(Final::Predicate("not this Chronicle's record"))
+        );
+        // Takeover by the accepted GenesisStarted; the old holder is
+        // refused by name.
+        let (e, h) = c
+            .takeover_target(t0, B, ClaimAuthority::GenesisStarted, Epoch::FIRST)
+            .unwrap();
+        assert_eq!((e, h.pos), (Epoch::new(2), 1));
+        assert!(matches!(
+            c.announce(A, t0, e, s, r.logical_id(), r.digest()),
+            Err(CoordError::NotHolder { warden, holder }) if warden == A && holder == B
+        ));
+        assert_eq!(
+            c.announce(B, t0, Epoch::FIRST, s, r.logical_id(), r.digest())
+                .unwrap(),
+            Err(Answer::FinalRefused(Final::StaleEpoch))
+        );
+        server.stop();
+    }
+
+    /// A coordinator without a log (a test double) answers the log's
+    /// operations with an outcome-unknown error, through the socket too.
+    #[test]
+    fn a_coordinator_without_a_log_says_so() {
+        struct Plain(Coordinator);
+        impl Coord for Plain {
+            fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+                self.0.register(c, h)
+            }
+            fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
+                self.0.append(w, e)
+            }
+            fn append_batch_with(
+                &self,
+                w: WardenId,
+                e: &[Envelope],
+                fx: &[Vec<u8>],
+            ) -> Result<ChronicleHead, CoordError> {
+                self.0.append_batch_with(w, e, fx)
+            }
+            fn transfer_if(
+                &self,
+                c: ChronicleId,
+                h: WardenId,
+                e: (WardenId, Epoch),
+            ) -> Result<Epoch, CoordError> {
+                self.0.transfer_if(c, h, e)
+            }
+            fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+                self.0.transfer(c, h)
+            }
+            fn ownership(&self, c: ChronicleId) -> Result<Ownership, CoordError> {
+                self.0.ownership(c)
+            }
+            fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
+                self.0.head(c)
+            }
+            fn advance_shipped(
+                &self,
+                w: WardenId,
+                c: ChronicleId,
+                e: Epoch,
+                to: Position,
+            ) -> Result<Position, CoordError> {
+                self.0.advance_shipped(w, c, e, to)
+            }
+            fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+                self.0.shipped(c)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let plain: Arc<dyn Coord> =
+            Arc::new(Plain(Coordinator::open(dir.path().join("c.redb")).unwrap()));
+        let server = Server::spawn(dir.path().join("c.sock"), plain).unwrap();
+        let c = RemoteCoord::with_timeout(dir.path().join("c.sock"), Duration::from_secs(5));
+        let e = c.obligations(chron(1)).unwrap_err();
+        assert!(e.outcome_unknown(), "{e:?}");
+        server.stop();
     }
 
     /// A mapped peer may act only as its own Warden: every request naming
