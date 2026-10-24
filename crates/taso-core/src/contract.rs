@@ -2,12 +2,10 @@
 //! purge, genesis and reclamation, with every identity and hash they
 //! carry.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 5 (file 0), frozen
+//! Normative reference: `Taso_spec_p4_contracts` rev. 6 (file 0), frozen
 //! 2026-10-24, BLAKE3
-//! `7119554fb2719dc8caf6b51f4351530eccbcfaa563e71c1e654dd7c185c2c823`,
-//! with the rev. 4 clauses it incorporates by reference (BLAKE3
-//! `e199e5d3f34d52f4fb2f4a0ed8d8bf0c2430b1824856be6648433238528156fa`).
-//! Section numbers below (§) are rev. 5's.
+//! `568928c4768e1605a0ba6d5661f4dbc5f6ca091b4fbe90ad8cbfe6605506113c`.
+//! Section numbers below (§) are rev. 6's.
 //!
 //! This module is pure data: the records, their canonical encoding (the
 //! same rules as [`crate::canon`]), their strict decoding, and the
@@ -30,8 +28,7 @@
 //!
 //! Not here (later files): the manifest and classification map (file 3),
 //! the `Payload` tag that carries a [`ContractRecord`] in a Chronicle
-//! (file 1b), `NominationRefused` and `GenesisCleanedUp` (their logical
-//! ids are not defined by rev. 5; amendment A1 is proposed).
+//! (file 1b).
 //!
 //! # Hashing
 //!
@@ -75,8 +72,6 @@ pub const VRESULT_DOMAIN: &str = "taso.vresult.v1";
 pub const TEMPLATE_DOMAIN: &str = "taso.template.v1";
 /// Domain of [`genesis_id`].
 pub const GENESIS_DOMAIN: &str = "taso.genesis.v1";
-/// Domain of [`discovery_name`].
-pub const PURGE_DOMAIN: &str = "taso.purge.v1";
 /// Domain of [`request_id`].
 pub const REQUEST_DOMAIN: &str = "taso.request.v1";
 
@@ -801,11 +796,31 @@ impl Canonical for FrameRange {
     }
 }
 
+/// A Chronicle pack in the store (D25): where it is and what it
+/// is.  Packs keep their positional names (`<end>-<base>-<fs to>`, 20
+/// digits each); `digest` is the pack's trailer digest (derive-key
+/// `taso.pack.v1` over everything before the trailer), its content
+/// identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PackRef {
+    /// The pack's name under the Chronicle's `pack/` prefix.
+    pub name: String,
+    /// Its trailer digest.
+    pub digest: HashVal,
+}
+
+impl Canonical for PackRef {
+    fn canon(&self, out: &mut Canon) {
+        out.str(&self.name);
+        self.digest.canon(out);
+    }
+}
+
 /// One inventoried pack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InventoryItem {
-    /// The original pack's object key.
-    pub pack_key: HashVal,
+    /// The original pack.
+    pub pack: PackRef,
     /// The fs sections it holds, named by their Seal's lsn, ascending.
     pub sections: Vec<Lsn>,
     /// The digest its replacement's frames must hash to.
@@ -818,7 +833,7 @@ pub struct InventoryItem {
 
 impl Canonical for InventoryItem {
     fn canon(&self, out: &mut Canon) {
-        self.pack_key.canon(out);
+        self.pack.canon(out);
         out.seq(self.sections.iter());
         self.log_digest.canon(out);
         self.frames.canon(out);
@@ -826,7 +841,7 @@ impl Canonical for InventoryItem {
     }
 }
 
-/// A purge inventory: an immutable object, items ascending by `pack_key`
+/// A purge inventory: an immutable object, items ascending by pack name
 /// with no duplicates.  Its key is the `inventory_digest` (§6.2, §9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inventory {
@@ -849,24 +864,24 @@ impl fmt::Display for OrderError {
 impl std::error::Error for OrderError {}
 
 impl Inventory {
-    /// Build an inventory: items are sorted by `pack_key`; each item's
-    /// sections are sorted.  Duplicate pack keys or sections are refused.
+    /// Build an inventory: items are sorted by pack name; each item's
+    /// sections are sorted.  Duplicate pack names or sections are refused.
     pub fn new(mut items: Vec<InventoryItem>) -> Result<Self, OrderError> {
-        items.sort_by(|a, b| a.pack_key.as_bytes().cmp(b.pack_key.as_bytes()));
+        items.sort_by(|a, b| a.pack.name.cmp(&b.pack.name));
         for it in &mut items {
             it.sections.sort();
             if !strictly_ascending(&it.sections) {
                 return Err(OrderError::NotStrictlyAscending);
             }
         }
-        let keys: Vec<[u8; 32]> = items.iter().map(|i| *i.pack_key.as_bytes()).collect();
+        let keys: Vec<&str> = items.iter().map(|i| i.pack.name.as_str()).collect();
         if !strictly_ascending(&keys) {
             return Err(OrderError::NotStrictlyAscending);
         }
         Ok(Self { items })
     }
 
-    /// The items, ascending by `pack_key`.
+    /// The items, ascending by pack name.
     pub fn items(&self) -> &[InventoryItem] {
         &self.items
     }
@@ -1284,35 +1299,36 @@ pub struct ReplacementInstalled {
     /// The Vessel.
     pub chronicle: ChronicleId,
     /// The original.
-    pub pack_key: HashVal,
-    /// The replacement's object key (hash of its bytes).
+    pub pack: PackRef,
+    /// The replacement's content digest (its trailer digest), verified by
+    /// the coordinator against the inventory item.
     pub replacement_key: HashVal,
-    /// [`discovery_name`]`(pack_key, inventory_digest)`.
-    pub discovery_name: String,
+    /// [`replacement_name`] of the original: `<end>-<base>-0`.
+    pub replacement_name: String,
 }
 
 impl Canonical for ReplacementInstalled {
     fn canon(&self, out: &mut Canon) {
         self.chronicle.canon(out);
-        self.pack_key.canon(out);
+        self.pack.canon(out);
         self.replacement_key.canon(out);
-        out.str(&self.discovery_name);
+        out.str(&self.replacement_name);
     }
 }
 
 /// An inventoried pack is lost: no original, no replacement (§6.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemLost {
     /// The Vessel.
     pub chronicle: ChronicleId,
     /// The lost original.
-    pub pack_key: HashVal,
+    pub pack: PackRef,
 }
 
 impl Canonical for ItemLost {
     fn canon(&self, out: &mut Canon) {
         self.chronicle.canon(out);
-        self.pack_key.canon(out);
+        self.pack.canon(out);
     }
 }
 
@@ -1424,6 +1440,111 @@ impl Canonical for GenesisRefused {
     }
 }
 
+/// Why a nomination made no Candidate (§3.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NominationRefusal {
+    /// The walk or the materialisation refused the tree (tag 0).
+    Walk(WalkRefusal),
+    /// The Seal is not accepted (tag 1).
+    SealNotAccepted,
+    /// The Seal is not this Vessel's (tag 2).
+    NotThisVessel,
+    /// `exclude` is not a subset of `sanction.allowed_exclude` (tag 3).
+    BadExclude,
+    /// A Candidate with this id is already accepted (tag 4).
+    Duplicate,
+    /// The same id belongs to a closed Candidate (tag 5).
+    Closed,
+    /// A supersession that changes nothing (tag 6).
+    NoChange,
+    /// A store quota is exhausted (tag 7).
+    Quota {
+        /// The config key.
+        key: String,
+    },
+}
+
+impl Canonical for NominationRefusal {
+    fn canon(&self, out: &mut Canon) {
+        match self {
+            Self::Walk(w) => {
+                out.tag(0);
+                w.canon(out);
+            }
+            Self::SealNotAccepted => {
+                out.tag(1);
+            }
+            Self::NotThisVessel => {
+                out.tag(2);
+            }
+            Self::BadExclude => {
+                out.tag(3);
+            }
+            Self::Duplicate => {
+                out.tag(4);
+            }
+            Self::Closed => {
+                out.tag(5);
+            }
+            Self::NoChange => {
+                out.tag(6);
+            }
+            Self::Quota { key } => {
+                out.tag(7).str(key);
+            }
+        }
+    }
+}
+
+/// A nomination was refused (§3.1; logical id by D23).  For
+/// diagnosis: it holds nothing and is not a Candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NominationRefused {
+    /// The Vessel.
+    pub chronicle: ChronicleId,
+    /// The Seal put forward.
+    pub seal: SealRef,
+    /// The exclusion asked for.
+    pub exclude: BTreeSet<PathClass>,
+    /// Why.
+    pub reason: NominationRefusal,
+    /// The walk's manifest, if the walk ran.
+    pub input_manifest_key: Option<HashVal>,
+}
+
+impl Canonical for NominationRefused {
+    fn canon(&self, out: &mut Canon) {
+        self.chronicle.canon(out);
+        self.seal.canon(out);
+        out.set(self.exclude.iter());
+        self.reason.canon(out);
+        out.option(self.input_manifest_key.as_ref());
+    }
+}
+
+/// A genesis operation's scratch was removed after its `TemplateReady`
+/// (§7 step 7; logical id by D23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenesisCleanedUp {
+    /// The operation.
+    pub genesis_id: ChronicleId,
+    /// The scratch dataset's guid, if one was made (`--best-effort`).
+    pub scratch_guid: Option<u64>,
+}
+
+impl Canonical for GenesisCleanedUp {
+    fn canon(&self, out: &mut Canon) {
+        self.genesis_id.canon(out);
+        out.option(self.scratch_guid.as_ref());
+    }
+}
+
+/// The exclusion set as a bitmask, one bit per [`PathClass`] tag: a
+/// fixed-size stand-in for the set inside a [`LogicalKey`].
+pub fn exclude_mask(exclude: &BTreeSet<PathClass>) -> u8 {
+    exclude.iter().fold(0u8, |m, c| m | (1 << (*c as u8)))
+}
+
 // ── The record enum ─────────────────────────────────────────────────
 
 /// A P4 contract record.  Tags are fixed; a new kind is a new tag.
@@ -1478,6 +1599,10 @@ pub enum ContractRecord {
         /// How it ended.
         outcome: ReclaimOutcome,
     },
+    /// Tag 19 (D23).
+    NominationRefused(NominationRefused),
+    /// Tag 20 (D23).
+    GenesisCleanedUp(GenesisCleanedUp),
 }
 
 impl ContractRecord {
@@ -1495,14 +1620,18 @@ impl ContractRecord {
             Self::SanctionCompleted { template_id } => LogicalKey::SanctionCompleted(*template_id),
             Self::PurgeDeferred(p) => LogicalKey::PurgeDefer(p.chronicle, p.checked_at),
             Self::PurgeCommitted(p) => LogicalKey::Purge(p.chronicle),
-            Self::ReplacementInstalled(r) => LogicalKey::Replacement(r.chronicle, r.pack_key),
-            Self::ItemLost(i) => LogicalKey::ItemLost(i.chronicle, i.pack_key),
+            Self::ReplacementInstalled(r) => LogicalKey::Replacement(r.chronicle, r.pack.digest),
+            Self::ItemLost(i) => LogicalKey::ItemLost(i.chronicle, i.pack.digest),
             Self::PurgeComplete(p) => LogicalKey::PurgeEnd(p.chronicle),
             Self::PurgeDamaged(p) => LogicalKey::PurgeEnd(p.chronicle),
             Self::GenesisStarted(g) => LogicalKey::Genesis(g.genesis_id),
             Self::GenesisRefused(g) => LogicalKey::GenesisRefused(g.genesis_id),
             Self::ReclaimClaimed { object_key } => LogicalKey::Reclaim(*object_key),
             Self::ReclaimComplete { object_key, .. } => LogicalKey::ReclaimDone(*object_key),
+            Self::NominationRefused(n) => {
+                LogicalKey::NominationRefused(n.chronicle, n.seal.hash, exclude_mask(&n.exclude))
+            }
+            Self::GenesisCleanedUp(g) => LogicalKey::GenesisCleaned(g.genesis_id),
         }
     }
 
@@ -1608,6 +1737,14 @@ impl Canonical for ContractRecord {
                 object_key.canon(out);
                 outcome.canon(out);
             }
+            Self::NominationRefused(r) => {
+                out.tag(19);
+                r.canon(out);
+            }
+            Self::GenesisCleanedUp(r) => {
+                out.tag(20);
+                r.canon(out);
+            }
         }
     }
 }
@@ -1639,9 +1776,11 @@ pub enum LogicalKey {
     PurgeDefer(ChronicleId, Lsn),
     /// `PurgeCommitted`: `chronicle ‖ "purge"` (tag 9).
     Purge(ChronicleId),
-    /// `ReplacementInstalled`: `chronicle ‖ pack_key` (tag 10).
+    /// `ReplacementInstalled`: `chronicle ‖ pack` (tag 10); the pack by
+    /// its trailer digest (D25).
     Replacement(ChronicleId, HashVal),
-    /// `ItemLost`: `chronicle ‖ pack_key ‖ "lost"` (tag 11).
+    /// `ItemLost`: `chronicle ‖ pack ‖ "lost"` (tag 11); the pack by its
+    /// trailer digest (D25).
     ItemLost(ChronicleId, HashVal),
     /// `PurgeComplete`, `PurgeDamaged`: `chronicle ‖ "purge-end"` (tag 12).
     PurgeEnd(ChronicleId),
@@ -1655,6 +1794,11 @@ pub enum LogicalKey {
     ReclaimDone(HashVal),
     /// `Birth` (a fork's Lineage record): `chronicle ‖ "birth"` (tag 17).
     Birth(ChronicleId),
+    /// `NominationRefused`: `chronicle ‖ seal ‖ exclude ‖ "refused"`
+    /// (tag 18; D23).  `exclude` as [`exclude_mask`].
+    NominationRefused(ChronicleId, HashVal, u8),
+    /// `GenesisCleanedUp`: `genesis_id ‖ "cleaned"` (tag 19; D23).
+    GenesisCleaned(ChronicleId),
 }
 
 impl Canonical for LogicalKey {
@@ -1733,6 +1877,16 @@ impl Canonical for LogicalKey {
             }
             Self::Birth(c) => {
                 out.tag(17);
+                c.canon(out);
+            }
+            Self::NominationRefused(c, h, m) => {
+                out.tag(18);
+                c.canon(out);
+                h.canon(out);
+                out.u8(*m);
+            }
+            Self::GenesisCleaned(c) => {
+                out.tag(19);
                 c.canon(out);
             }
         }
@@ -1897,13 +2051,24 @@ pub fn genesis_id(
     derive16(GENESIS_DOMAIN, &c)
 }
 
-/// The name a replacement pack is listed under (§6.2): `purged-` and the
-/// hex of `blake3("taso.purge.v1" ‖ pack_key ‖ inventory_digest)`.
-pub fn discovery_name(pack_key: HashVal, inventory_digest: HashVal) -> String {
-    let mut c = Canon::new();
-    pack_key.canon(&mut c);
-    inventory_digest.canon(&mut c);
-    format!("purged-{}", derive(PURGE_DOMAIN, &c))
+/// The name of a pack's log-only replacement (D25): the pack
+/// `<end>-<base>-<fs to>` is replaced by `<end>-<base>-0`, the log pack of
+/// the same frames.  It holds no fs bytes, so every writer produces the
+/// same object under it.  `None` if `name` is not a pack name, or names a
+/// pack without an fs section (nothing to replace).
+pub fn replacement_name(name: &str) -> Option<String> {
+    const DIGITS: usize = 20;
+    let parts: Vec<&str> = name.split('-').collect();
+    let [end, base, to] = parts[..] else {
+        return None;
+    };
+    let num = |x: &str| {
+        (x.len() == DIGITS && x.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| x.parse::<u64>().ok())
+            .flatten()
+    };
+    let (_, _, to) = (num(end)?, num(base)?, num(to)?);
+    (to != 0).then(|| format!("{end}-{base}-{:0DIGITS$}", 0))
 }
 
 /// A request's id (§3.7, §9): the peer's uid, the operation, and the
@@ -2281,9 +2446,32 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn nomination_refusal(&mut self) -> R<NominationRefusal> {
+        match self.tag()? {
+            (_, 0) => Ok(NominationRefusal::Walk(self.walk_refusal()?)),
+            (_, 1) => Ok(NominationRefusal::SealNotAccepted),
+            (_, 2) => Ok(NominationRefusal::NotThisVessel),
+            (_, 3) => Ok(NominationRefusal::BadExclude),
+            (_, 4) => Ok(NominationRefusal::Duplicate),
+            (_, 5) => Ok(NominationRefusal::Closed),
+            (_, 6) => Ok(NominationRefusal::NoChange),
+            (_, 7) => Ok(NominationRefusal::Quota {
+                key: self.string()?,
+            }),
+            (at, t) => Self::bad(at, "nomination refusal", t),
+        }
+    }
+
+    fn pack_ref(&mut self) -> R<PackRef> {
+        Ok(PackRef {
+            name: self.string()?,
+            digest: self.hash()?,
+        })
+    }
+
     fn inventory_item(&mut self) -> R<InventoryItem> {
         Ok(InventoryItem {
-            pack_key: self.hash()?,
+            pack: self.pack_ref()?,
             sections: self.ascending("section order", Self::lsn, |l| *l)?,
             log_digest: self.hash()?,
             frames: FrameRange {
@@ -2296,7 +2484,7 @@ impl<'a> Reader<'a> {
 
     fn inventory(&mut self) -> R<Inventory> {
         let items = self.ascending("inventory order", Self::inventory_item, |i| {
-            *i.pack_key.as_bytes()
+            i.pack.name.clone()
         })?;
         Ok(Inventory { items })
     }
@@ -2402,13 +2590,13 @@ impl<'a> Reader<'a> {
             }),
             (_, 11) => ContractRecord::ReplacementInstalled(ReplacementInstalled {
                 chronicle: self.chronicle()?,
-                pack_key: self.hash()?,
+                pack: self.pack_ref()?,
                 replacement_key: self.hash()?,
-                discovery_name: self.string()?,
+                replacement_name: self.string()?,
             }),
             (_, 12) => ContractRecord::ItemLost(ItemLost {
                 chronicle: self.chronicle()?,
-                pack_key: self.hash()?,
+                pack: self.pack_ref()?,
             }),
             (_, 13) => ContractRecord::PurgeComplete(PurgeComplete {
                 chronicle: self.chronicle()?,
@@ -2443,6 +2631,17 @@ impl<'a> Reader<'a> {
                 object_key: self.hash()?,
                 outcome: self.reclaim_outcome()?,
             },
+            (_, 19) => ContractRecord::NominationRefused(NominationRefused {
+                chronicle: self.chronicle()?,
+                seal: self.seal_ref()?,
+                exclude: self.class_set()?,
+                reason: self.nomination_refusal()?,
+                input_manifest_key: self.option(Self::hash)?,
+            }),
+            (_, 20) => ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
+                genesis_id: self.chronicle()?,
+                scratch_guid: self.option(Self::u64)?,
+            }),
             (at, t) => return Self::bad(at, "contract record", t),
         })
     }
@@ -2622,10 +2821,19 @@ mod tests {
             peer: peer(),
         }
     }
+    fn pname(end: u64, base: u64, to: u64) -> String {
+        format!("{end:020}-{base:020}-{to:020}")
+    }
+    fn pack(end: u64, base: u64, to: u64, d: u8) -> PackRef {
+        PackRef {
+            name: pname(end, base, to),
+            digest: h(d),
+        }
+    }
     fn inventory() -> Inventory {
         Inventory::new(vec![
             InventoryItem {
-                pack_key: h(0x91),
+                pack: pack(14, 9, 12, 0x91),
                 sections: vec![Lsn::new(12)],
                 log_digest: h(0xA1),
                 frames: FrameRange {
@@ -2635,7 +2843,7 @@ mod tests {
                 form: ReplacementForm::LogOnly,
             },
             InventoryItem {
-                pack_key: h(0x90),
+                pack: pack(8, 4, 8, 0x90),
                 sections: vec![Lsn::new(8), Lsn::new(4)],
                 log_digest: h(0xA0),
                 frames: FrameRange {
@@ -2657,7 +2865,7 @@ mod tests {
     /// One record of every kind, in tag order.
     fn every_record() -> Vec<ContractRecord> {
         let inv = inventory();
-        let pack = inv.items()[0].pack_key;
+        let pack = inv.items()[0].pack.clone();
         vec![
             ContractRecord::Candidate(Box::new(candidate())),
             ContractRecord::VerificationStarted(started()),
@@ -2706,13 +2914,13 @@ mod tests {
             }),
             ContractRecord::ReplacementInstalled(ReplacementInstalled {
                 chronicle: cid(1),
-                pack_key: pack,
+                pack: pack.clone(),
                 replacement_key: h(0xB0),
-                discovery_name: discovery_name(pack, inv.key()),
+                replacement_name: replacement_name(&pack.name).unwrap(),
             }),
             ContractRecord::ItemLost(ItemLost {
                 chronicle: cid(1),
-                pack_key: pack,
+                pack,
             }),
             ContractRecord::PurgeComplete(PurgeComplete {
                 chronicle: cid(1),
@@ -2738,7 +2946,27 @@ mod tests {
                 object_key: h(0xE0),
                 outcome: ReclaimOutcome::Deleted,
             },
+            ContractRecord::NominationRefused(nomination_refused(NominationRefusal::Walk(
+                WalkRefusal::UnknownPaths,
+            ))),
+            ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
+                genesis_id: genesis().genesis_id,
+                scratch_guid: Some(0xC1EA),
+            }),
         ]
+    }
+
+    fn nomination_refused(reason: NominationRefusal) -> NominationRefused {
+        NominationRefused {
+            chronicle: cid(1),
+            seal: SealRef {
+                lsn: Lsn::new(20),
+                hash: h(2),
+            },
+            exclude: scratch(),
+            reason,
+            input_manifest_key: Some(h(4)),
+        }
     }
 
     // ── round trips and strictness ──────────────────────────────────
@@ -2766,7 +2994,7 @@ mod tests {
             Err(DecodeError::Truncated { .. })
         ));
         assert!(matches!(
-            ContractRecord::decode(&[19]),
+            ContractRecord::decode(&[21]),
             Err(DecodeError::BadTag { .. })
         ));
     }
@@ -2792,7 +3020,7 @@ mod tests {
     #[test]
     fn inventory_is_sorted_and_rejects_duplicates() {
         let inv = inventory();
-        assert_eq!(inv.items()[0].pack_key, h(0x90));
+        assert_eq!(inv.items()[0].pack.name, pname(8, 4, 8), "sorted by name");
         assert_eq!(inv.items()[0].sections, vec![Lsn::new(4), Lsn::new(8)]);
         assert_eq!(Inventory::decode(&inv.bytes()).unwrap(), inv);
         let dup = inv.items()[0].clone();
@@ -2943,10 +3171,36 @@ mod tests {
     }
 
     #[test]
-    fn discovery_name_is_prefixed_hex() {
-        let n = discovery_name(h(1), h(2));
-        assert!(n.starts_with("purged-"));
-        assert_eq!(n.len(), "purged-".len() + 64);
+    fn a_pack_is_replaced_by_the_log_pack_of_the_same_frames() {
+        assert_eq!(
+            replacement_name(&pname(14, 9, 12)).as_deref(),
+            Some(pname(14, 9, 0).as_str())
+        );
+        assert_eq!(
+            replacement_name(&pname(14, 9, 0)),
+            None,
+            "no fs: nothing to replace"
+        );
+        assert_eq!(replacement_name("purged-abc"), None);
+        assert_eq!(replacement_name("14-9-12"), None, "names are 20 digits");
+        assert_eq!(replacement_name(&format!("{}-x", pname(14, 9, 12))), None);
+    }
+
+    #[test]
+    fn a_seal_and_exclusion_have_one_refusal_logical_id() {
+        let a = ContractRecord::NominationRefused(nomination_refused(NominationRefusal::Duplicate));
+        let b = ContractRecord::NominationRefused(nomination_refused(NominationRefusal::Quota {
+            key: "store.max_pending_artifacts".into(),
+        }));
+        assert_eq!(a.logical_id(), b.logical_id());
+        assert_ne!(a.digest(), b.digest());
+        let mut other = nomination_refused(NominationRefusal::Duplicate);
+        other.exclude.insert(PathClass::Artifact);
+        assert_ne!(
+            ContractRecord::NominationRefused(other).logical_id(),
+            a.logical_id()
+        );
+        assert_eq!(exclude_mask(&scratch()), 1 << 4);
     }
 
     // ── pins ────────────────────────────────────────────────────────
@@ -2992,7 +3246,7 @@ mod tests {
         assert_eq!(got, PINS_DERIVED);
     }
 
-    const PINS_RECORDS: [&str; 19] = [
+    const PINS_RECORDS: [&str; 21] = [
         "4c679c6a0022ae188b75236abe543c1fdad404ad556c55f8efecfa1f842053e6",
         "220b967695a40c425c53a626ffed0635d40528a852489b0ad66772c87e6b0e18",
         "7449db856743d73ce30398c37ba97b2295e43b6715875f8f55fe0f859ae15bfe",
@@ -3003,15 +3257,17 @@ mod tests {
         "6c947a3f7fb84f260a8b963fb82a4e93156882ae40d8561a91b55aedce2c5000",
         "305f9805d49234b85987ab9ce76c4fc44737dcc51af3f62c35e1680484ffdf0d",
         "f1677cdd630eca1c9421e343bb41c2c515fe0b163ec38bf2bf7e20e0362ada4f",
-        "86646ce06e188f02deab2e67270159f44bfebdebda0e3c728636de3218da49f4",
-        "41256a378b35dea4d417de891697bcc281d07cc4fd18c99d606bd11aa060d6e3",
-        "83f05df266892d1b4497abc09a27939d5fcfc94e53ba7fa5a4cde4850a38f702",
-        "ba0af16b5941953f4a85f20fdb0111dd9ea9a2c9a60dbea0b7daefe70647f731",
-        "7fae070e01fcdbae8bcbfd51a2f4f890f98904998ea54c9accce2ec922ff8d98",
+        "4604b817eb6188722cb619d15e728d7e3899e455e6e8d5360d4b1543ca72e206",
+        "3483b8e7bac5cbc38f44edb841fff258423c22cb21ffd7b80844e4258e1a3154",
+        "05d07e61d8e2f2456ef75d171d9835f8b736aa9abd81ecdaa7b0606d6a859129",
+        "8373fc4772c5b11de462534112f85d96ce00feee95bff3201e6775fc3317199f",
+        "717041ba8ca2cf3b31e182daad281330e750fce94fc95a8f4b2f2875d9e41172",
         "82c11cad087ed0120e35e321b57cbc2c2c267b4f73b225d462ba82fdba83d540",
         "4502cf30e826d40531e67207983c00e5dd82f7663f9fda28a0983953524f8684",
         "4d820c377642a1bcbcd67bf235dcfa8ad964b5cd4a45017a22f970376e44ea41",
         "7bc1209031258d3bdb68e1f7ad43245b8fc10bfe4c28d3135489bb12047bc6a5",
+        "9de7174a6d7d5362a88b620704dbeff81314ae846ad53bc5373b663caae60133",
+        "81568db9b33f001502c0cf7993a2c50cb65ca6df2a1e58c1669a91a802187a7f",
     ];
     const PINS_DERIVED: [&str; 11] = [
         "f6091f83116ec7fcb319e5f951fe6b5c709360d89baa30307925bd36d6a59e05",
@@ -3021,7 +3277,7 @@ mod tests {
         "3a76a6820afbe5c58197069fcaf53cb25604b2c85a40f488795d6f6ce1f22792",
         "f0a9612b06bf5e01a5bc8e4e05bea81a00000000000000000000000000000000",
         "bbd324b6f8aeca6e03c85a430b49b9e800000000000000000000000000000000",
-        "627abf6a0c9e363f510293c3933b97d01e9048ba897fecc974aa0c4b8494250f",
+        "1698eb7a470a00825a38b7183edca3d6764faf4e7971fdeab4b8e51cda042779",
         "12203a1c3d5eae0ffbfb4d23b7169b421e5449a4109d6f1cc682a22342fe3a26",
         "9faafa3b90f351a8a5f09e29101835caf9be58e1371ac1fc7c23a661b59afac0",
         "ca48e4f67689a85d431715b63a5e113e1beddd76e68cc20153b4bb7b46f8665a",
@@ -3296,7 +3552,7 @@ mod tests {
             text(),
             (0usize..8),
         )
-            .prop_map(|(c, a, b, n, m, r, s, w)| match n % 9 {
+            .prop_map(|(c, a, b, n, m, r, s, w)| match n % 11 {
                 0 => ContractRecord::Refused(Refused {
                     request_id: a,
                     candidate_id: b,
@@ -3309,13 +3565,16 @@ mod tests {
                 1 => ContractRecord::SanctionCompleted { template_id: c },
                 2 => ContractRecord::ReplacementInstalled(ReplacementInstalled {
                     chronicle: c,
-                    pack_key: a,
+                    pack: PackRef {
+                        name: s.clone(),
+                        digest: a,
+                    },
                     replacement_key: b,
-                    discovery_name: s,
+                    replacement_name: s,
                 }),
                 3 => ContractRecord::ItemLost(ItemLost {
                     chronicle: c,
-                    pack_key: a,
+                    pack: PackRef { name: s, digest: a },
                 }),
                 4 => ContractRecord::PurgeComplete(PurgeComplete {
                     chronicle: c,
@@ -3334,6 +3593,24 @@ mod tests {
                     reason: WalkRefusal::ALL[w],
                 }),
                 7 => ContractRecord::ReclaimClaimed { object_key: a },
+                8 => ContractRecord::NominationRefused(NominationRefused {
+                    chronicle: c,
+                    seal: SealRef {
+                        lsn: Lsn::new(m),
+                        hash: a,
+                    },
+                    exclude: [PathClass::ALL[w]].into_iter().collect(),
+                    reason: if m % 2 == 0 {
+                        NominationRefusal::Walk(WalkRefusal::ALL[w])
+                    } else {
+                        NominationRefusal::Quota { key: s }
+                    },
+                    input_manifest_key: (n % 2 == 0).then_some(b),
+                }),
+                9 => ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
+                    genesis_id: c,
+                    scratch_guid: (m % 2 == 0).then_some(n),
+                }),
                 _ => ContractRecord::ReclaimComplete {
                     object_key: a,
                     outcome: if m % 2 == 0 {
