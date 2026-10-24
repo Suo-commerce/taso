@@ -123,6 +123,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read};
 
+use std::collections::BTreeSet;
+
+use taso_core::contract::{replacement_name, FrameRange, InventoryItem, PackRef, ReplacementForm};
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use taso_core::record::{
     FsShippedRecord, GapRecord, Origin, ParentSeal, Payload, StreamBase, FS_STREAM_DOMAIN,
@@ -142,6 +145,11 @@ use crate::zfs::Snapshot;
 const MAGIC: [u8; 8] = *b"TASOPAK\0";
 const VERSION: u8 = 1;
 const LOG_DOMAIN: &str = "taso.pack.log.v1";
+/// Derive-key domain of an inventory item's `log_digest`: the frames of a
+/// pack as stored (`[payload len · envelope · payload]` each), without the
+/// header, so a pack and its log-only replacement share it (P4 spec
+/// rev. 6 §6.2).
+pub const FRAMES_DOMAIN: &str = "taso.pack.frames.v1";
 const PACK_DOMAIN: &str = "taso.pack.v1";
 
 /// Size of a pack header.
@@ -245,8 +253,12 @@ pub struct Chain {
     pub end: Position,
     /// The `fs` sections up to `end` that an `FsShipped` record in the
     /// chain names, in Seal order, forming one chain; none whose Seal is
-    /// lost.
+    /// lost.  A purged section is never here: its bytes are gone.
     pub seals: Vec<ShippedFs>,
+    /// The Seals whose `fs` sections were purged (given to
+    /// [`Packs::chain_after_purge`]), in order.  Their `FsShipped` records
+    /// are still in `frames`.
+    pub purged: Vec<Lsn>,
 }
 
 /// Why packing or reading packs failed.
@@ -309,6 +321,12 @@ pub enum PackError {
     },
     /// The request contradicts the local segment or what is shipped.
     Refused(String),
+    /// A purge found neither an inventoried pack nor its replacement
+    /// (P4 spec rev. 6 §6.4: the item is lost, never fabricated).
+    Lost {
+        /// The original pack's name.
+        name: String,
+    },
 }
 
 impl fmt::Display for PackError {
@@ -358,6 +376,9 @@ impl fmt::Display for PackError {
                 )
             }
             Self::Refused(why) => write!(f, "refused: {why}"),
+            Self::Lost { name } => {
+                write!(f, "pack {name} and its replacement are both gone")
+            }
         }
     }
 }
@@ -1532,6 +1553,30 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
     /// Verify and merge every pack (see the module docs).  With `anchor`,
     /// the chain must also contain that position, and ends there.
     pub fn chain(&self, anchor: Option<Position>) -> Result<Chain, PackError> {
+        self.chain_with(anchor, &BTreeSet::new())
+    }
+
+    /// [`Packs::chain`] of a Chronicle part of whose `fs` sections were
+    /// purged (P4 spec rev. 6 §6.5).  `purged` are the Seals of the
+    /// sections in the inventory of an accepted `PurgeCommitted` whose
+    /// `ReplacementInstalled` is accepted; the caller reads them from the
+    /// coordinator.  Such a section is excused: its pack may be gone, it
+    /// is never returned in [`Chain::seals`], and its Seal record and
+    /// `FsShipped` record must still be in the chain.  Anything else is
+    /// checked exactly as by [`Packs::chain`].
+    pub fn chain_after_purge(
+        &self,
+        anchor: Option<Position>,
+        purged: &BTreeSet<Lsn>,
+    ) -> Result<Chain, PackError> {
+        self.chain_with(anchor, purged)
+    }
+
+    fn chain_with(
+        &self,
+        anchor: Option<Position>,
+        purged: &BTreeSet<Lsn>,
+    ) -> Result<Chain, PackError> {
         let mut by_lsn: BTreeMap<Lsn, Frame> = BTreeMap::new();
         let mut fs_by_to: BTreeMap<Lsn, FsRef> = BTreeMap::new();
         let mut bases = Vec::new();
@@ -1652,8 +1697,25 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         // first starts from what the lineage says, every later one from the
         // one before.
         let mut seals = Vec::new();
+        let mut purged_out = Vec::new();
         let mut prev: Option<Position> = None;
         for r in named.values() {
+            if purged.contains(&r.seal) {
+                let seal = Position {
+                    lsn: r.seal,
+                    hash: r.seal_hash,
+                };
+                let is_seal = !is_lost(&lost, seal.lsn)
+                    && by_lsn.get(&seal.lsn).is_some_and(|f| {
+                        f.envelope.hash == seal.hash && f.envelope.stream == Stream::Ctl
+                    });
+                if !is_seal {
+                    return Err(PackError::FsAheadOfLog { to: seal.lsn });
+                }
+                prev = Some(seal);
+                purged_out.push(r.seal);
+                continue;
+            }
             let fs = fs_by_to
                 .get(&r.seal)
                 .filter(|fs| names(r, fs))
@@ -1709,7 +1771,18 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             .into_values()
             .filter(|f| f.envelope.lsn <= end.lsn && !is_lost(&lost, f.envelope.lsn))
             .collect();
-        Ok(Chain { frames, end, seals })
+        if let Some(s) = purged.iter().find(|s| !named.contains_key(s)) {
+            return Err(PackError::Refused(format!(
+                "Seal {} is given as purged, but no FsShipped record in the chain names it",
+                s.get()
+            )));
+        }
+        Ok(Chain {
+            frames,
+            end,
+            seals,
+            purged: purged_out,
+        })
     }
 
     /// The `fs` stream of a named section (from [`Packs::chain`]), read
@@ -1733,6 +1806,215 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             count: 0,
             expect: (shipped.bytes, shipped.digest),
         })))
+    }
+}
+
+// ── Purge (P4 spec rev. 6 §6) ───────────────────────────────────────
+//
+// A purged `fs` pack `<end>-<base>-<to>` is replaced by the log pack of
+// the same frames, `<end>-<base>-0` (D25): no fs bytes, so every writer
+// produces the same object, and today's reader takes it as any log pack.
+// What a purge may do and when is the coordinator's (a claim, then
+// `ReplacementInstalled` accepted before the original is deleted); these
+// are the store-side steps it calls, each safe to repeat.
+
+impl<S: ObjectStore, X: Sender> Packs<S, X> {
+    fn key_of(&self, name: &str) -> Result<(String, Name), PackError> {
+        let n = parse_name(name).ok_or_else(|| PackError::BadKey(name.into()))?;
+        Ok((format!("{}/{name}", self.dir), n))
+    }
+
+    /// The rest of a pack after its log: skip the `fs` chunks, then check
+    /// the trailer and that nothing follows.  Returns the trailer digest.
+    fn read_to_trailer(
+        &self,
+        key: &str,
+        mut pin: PackIn,
+        has_fs: bool,
+    ) -> Result<HashVal, PackError> {
+        let corrupt = |why: String| PackError::Corrupt {
+            key: key.into(),
+            why,
+        };
+        if has_fs {
+            loop {
+                let len = pin
+                    .take(4)
+                    .map_err(|e| corrupt(format!("truncated fs: {e}")))?;
+                let len = u32::from_be_bytes(len[..].try_into().expect("4 bytes"));
+                if len == 0 {
+                    break;
+                }
+                if len > MAX_FS_CHUNK {
+                    return Err(corrupt(format!("fs chunk of {len} bytes")));
+                }
+                pin.take(len as usize)
+                    .map_err(|e| corrupt(format!("truncated fs: {e}")))?;
+            }
+        }
+        let mut t = [0u8; 40];
+        pin.r
+            .read_exact(&mut t)
+            .map_err(|e| corrupt(format!("no trailer: {e}")))?;
+        let digest = pin.hasher.finalize();
+        if u64::from_be_bytes(t[..8].try_into().expect("8 bytes")) != pin.total
+            || t[8..] != digest.as_bytes()[..]
+        {
+            return Err(corrupt("the pack does not match its trailer".into()));
+        }
+        let mut extra = [0u8; 1];
+        if pin.r.read(&mut extra)? != 0 {
+            return Err(corrupt("bytes after the trailer".into()));
+        }
+        Ok(HashVal::from_bytes(*digest.as_bytes()))
+    }
+
+    /// Read a whole pack and check its trailer: header, frames, trailer
+    /// digest.  `None` if no such object.
+    fn read_whole(
+        &self,
+        name: &str,
+    ) -> Result<Option<(PackHeader, Vec<Frame>, HashVal)>, PackError> {
+        let (key, n) = self.key_of(name)?;
+        if !self.store.exists(&key)? {
+            return Ok(None);
+        }
+        let (h, frames, pin) = self.read_log(&key, n)?;
+        let digest = self.read_to_trailer(&key, pin, h.fs.is_some())?;
+        Ok(Some((h, frames, digest)))
+    }
+
+    /// The inventory item for the pack `name` (P4 spec rev. 6 §6.2): its
+    /// name and trailer digest, the `fs` section it holds, the digest and
+    /// range of its frames, and the form its replacement takes.  Reads the
+    /// whole pack, `fs` stream included, to check the trailer: purges are
+    /// rare.  Refused for a pack without an `fs` section (nothing to
+    /// purge); [`PackError::Lost`] if there is no such pack.
+    pub fn inventory_item(&self, name: &str) -> Result<InventoryItem, PackError> {
+        let (h, frames, digest) = self
+            .read_whole(name)?
+            .ok_or_else(|| PackError::Lost { name: name.into() })?;
+        let fs =
+            h.fs.ok_or_else(|| PackError::Refused(format!("pack {name} holds no fs section")))?;
+        Ok(InventoryItem {
+            pack: PackRef {
+                name: name.into(),
+                digest,
+            },
+            sections: vec![fs.to.lsn],
+            log_digest: frames_digest(&frames),
+            frames: frame_range(&h),
+            form: if frames.is_empty() {
+                ReplacementForm::Tombstone
+            } else {
+                ReplacementForm::LogOnly
+            },
+        })
+    }
+
+    /// The trailer digest of `item`'s replacement if it is in the store
+    /// and matches the item: a log-only pack under `<end>-<base>-0`, this
+    /// Chronicle's, with exactly the item's frames (range and
+    /// [`FRAMES_DOMAIN`] digest) and a valid trailer.  `None` if it is not
+    /// in the store; an error if it is there and does not match.  This is
+    /// the check the coordinator makes before accepting
+    /// `ReplacementInstalled` (§1.2, Replacement row).
+    pub fn verify_replacement(&self, item: &InventoryItem) -> Result<Option<HashVal>, PackError> {
+        let name = self.replacement_of(item)?;
+        let Some((h, frames, digest)) = self.read_whole(&name)? else {
+            return Ok(None);
+        };
+        let wrong = |why: &str| PackError::Corrupt {
+            key: name.clone(),
+            why: format!("does not match the inventory: {why}"),
+        };
+        if h.fs.is_some() {
+            return Err(wrong("it has an fs section"));
+        }
+        if frame_range(&h) != item.frames {
+            return Err(wrong("frame range"));
+        }
+        if frames_digest(&frames) != item.log_digest {
+            return Err(wrong("frames digest"));
+        }
+        Ok(Some(digest))
+    }
+
+    /// The replacement's name, or why there cannot be one.
+    fn replacement_of(&self, item: &InventoryItem) -> Result<String, PackError> {
+        if item.form == ReplacementForm::Tombstone {
+            // P4 spec rev. 6 §6.4: no writer produces an fs pack without
+            // frames (a Seal pack always carries the Seal record), so the
+            // tombstone form is not built.  Refused, never faked.
+            return Err(PackError::Refused(format!(
+                "pack {} needs a tombstone, which this store does not build",
+                item.pack.name
+            )));
+        }
+        replacement_name(&item.pack.name).ok_or_else(|| PackError::BadKey(item.pack.name.clone()))
+    }
+
+    /// Put `item`'s replacement, built from the original's frames, and
+    /// verify it; return its trailer digest (`replacement_key`).  If a
+    /// replacement is already there it is verified and nothing is put, so
+    /// a retry after a crash is a no-op; a log-only pack is the same
+    /// bytes whoever builds it.  [`PackError::Lost`] if neither the
+    /// original nor the replacement is in the store.
+    pub fn install_replacement(&self, item: &InventoryItem) -> Result<HashVal, PackError> {
+        if let Some(d) = self.verify_replacement(item)? {
+            return Ok(d);
+        }
+        let (h, frames, _) = self
+            .read_whole(&item.pack.name)?
+            .ok_or_else(|| PackError::Lost {
+                name: item.pack.name.clone(),
+            })?;
+        if frame_range(&h) != item.frames || frames_digest(&frames) != item.log_digest {
+            return Err(PackError::Refused(format!(
+                "pack {} does not hold the frames its inventory item names",
+                item.pack.name
+            )));
+        }
+        self.put_pack(PackHeader { fs: None, ..h }, &frames, None)?;
+        self.verify_replacement(item)?.ok_or_else(|| {
+            PackError::Refused(format!(
+                "the replacement of {} is not readable after its put",
+                item.pack.name
+            ))
+        })
+    }
+
+    /// Delete `item`'s original pack, only once its replacement is in the
+    /// store and verifies to `replacement_key` (the key the accepted
+    /// `ReplacementInstalled` names).  `Ok(false)` if it was already gone.
+    pub fn delete_original(
+        &self,
+        item: &InventoryItem,
+        replacement_key: HashVal,
+    ) -> Result<bool, PackError> {
+        if self.verify_replacement(item)? != Some(replacement_key) {
+            return Err(PackError::Refused(format!(
+                "pack {} is not deleted: its replacement is not in the store as installed",
+                item.pack.name
+            )));
+        }
+        let (key, _) = self.key_of(&item.pack.name)?;
+        Ok(self.store.delete(&key)?)
+    }
+}
+
+/// [`FRAMES_DOMAIN`] digest of frames as a pack stores them.
+pub fn frames_digest(frames: &[Frame]) -> HashVal {
+    let mut b = Vec::new();
+    encode_frames(frames, &mut b);
+    HashVal::from_bytes(blake3::derive_key(FRAMES_DOMAIN, &b))
+}
+
+/// The frames a pack holds: `base+1 ..= end` (`first == last + 1` if none).
+fn frame_range(h: &PackHeader) -> FrameRange {
+    FrameRange {
+        first: h.base.lsn.next(),
+        last: h.end.lsn,
     }
 }
 
@@ -2092,6 +2374,9 @@ mod tests {
         fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
             self.lists.fetch_add(1, Ordering::Relaxed);
             self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> io::Result<bool> {
+            self.inner.delete(key)
         }
     }
 
@@ -4015,5 +4300,206 @@ mod tests {
             );
             println!("packs: {:?}", packs.store.list(&packs.dir).unwrap());
         }
+    }
+
+    // ── purge (P4 spec rev. 6 §6) ───────────────────────────────────
+
+    /// A log with Seals 6 and 9 shipped and named, and the log shipped to
+    /// its tail; the name of Seal 6's fs pack.
+    fn purge_env() -> (Env, Log, String) {
+        let e = env();
+        let mut log = Log::new();
+        log.fill(6, &[6]);
+        log.publish(&e, 6, 100, None).unwrap();
+        log.fill(9, &[6, 9]);
+        log.publish(&e, 9, 101, None).unwrap();
+        log.fill(11, &[6, 9]);
+        e.packs.ship_log(&log.segs(), log.at(11)).unwrap();
+        let name = e
+            .keys()
+            .into_iter()
+            .map(|k| k.rsplit('/').next().unwrap().to_string())
+            .find(|n| n.ends_with(&format!("-{:020}", 6)))
+            .expect("Seal 6's pack");
+        (e, log, name)
+    }
+
+    fn six() -> BTreeSet<Lsn> {
+        [Lsn::new(6)].into_iter().collect()
+    }
+
+    #[test]
+    fn a_purged_fs_pack_is_replaced_by_the_log_pack_of_its_frames() {
+        let (e, _log, name) = purge_env();
+        let before = e.packs.chain(None).unwrap();
+        let item = e.packs.inventory_item(&name).unwrap();
+        assert_eq!(item.sections, vec![Lsn::new(6)]);
+        assert_eq!(item.form, ReplacementForm::LogOnly);
+        assert_eq!(item.frames.first, Lsn::new(1));
+        assert_eq!(item.frames.last, Lsn::new(6));
+
+        let r = e.packs.install_replacement(&item).unwrap();
+        let rname = replacement_name(&name).unwrap();
+        assert!(
+            e.keys().iter().any(|k| k.ends_with(&rname)),
+            "put under <end>-<base>-0"
+        );
+        assert_eq!(e.packs.verify_replacement(&item).unwrap(), Some(r));
+        assert_eq!(
+            e.packs.install_replacement(&item).unwrap(),
+            r,
+            "a retry is a no-op"
+        );
+
+        // Both present (a crash before the delete): either read works.
+        assert_eq!(e.packs.chain(None).unwrap().frames, before.frames);
+        let c = e.packs.chain_after_purge(None, &six()).unwrap();
+        assert_eq!(c.purged, vec![Lsn::new(6)]);
+        assert_eq!(
+            c.seals
+                .iter()
+                .map(|s| s.fs.to.lsn.get())
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+
+        assert!(e.packs.delete_original(&item, r).unwrap());
+        assert!(
+            !e.packs.delete_original(&item, r).unwrap(),
+            "a retry is a no-op"
+        );
+        assert!(!e.keys().iter().any(|k| k.ends_with(&name)));
+
+        // Without the purge the chain is incomplete, with it whole.
+        assert!(
+            matches!(e.packs.chain(None), Err(PackError::FsMissing { seal }) if seal == Lsn::new(6))
+        );
+        let c = e.packs.chain_after_purge(None, &six()).unwrap();
+        assert_eq!(c.frames, before.frames, "the log is untouched");
+        assert_eq!(c.end, before.end);
+        assert_eq!(c.purged, vec![Lsn::new(6)]);
+        assert_eq!(c.seals.len(), 1);
+        assert_eq!(
+            c.seals[0], before.seals[1],
+            "Seal 9 still chains from Seal 6"
+        );
+        // Seal 9's stream is still readable and verified.
+        let mut v = Vec::new();
+        e.packs
+            .open_fs(&c.seals[0])
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut v)
+            .unwrap();
+        assert!(!v.is_empty());
+    }
+
+    #[test]
+    fn an_original_is_deleted_only_after_its_replacement_verifies() {
+        let (e, _log, name) = purge_env();
+        let item = e.packs.inventory_item(&name).unwrap();
+        // No replacement yet.
+        assert!(matches!(
+            e.packs.delete_original(&item, HashVal::from_bytes([7; 32])),
+            Err(PackError::Refused(_))
+        ));
+        let r = e.packs.install_replacement(&item).unwrap();
+        // The wrong replacement key.
+        assert!(matches!(
+            e.packs.delete_original(&item, HashVal::from_bytes([7; 32])),
+            Err(PackError::Refused(_))
+        ));
+        // A replacement tampered with after its install.
+        let rkey = format!("{}/{}", e.packs.dir, replacement_name(&name).unwrap());
+        let mut bytes = std::fs::read(e.path(&rkey)).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(e.path(&rkey), &bytes).unwrap();
+        assert!(matches!(
+            e.packs.verify_replacement(&item),
+            Err(PackError::Corrupt { .. })
+        ));
+        assert!(e.packs.delete_original(&item, r).is_err());
+        assert!(
+            e.keys().iter().any(|k| k.ends_with(&name)),
+            "the original stays"
+        );
+    }
+
+    #[test]
+    fn an_item_that_does_not_match_its_pack_is_refused() {
+        let (e, _log, name) = purge_env();
+        let mut item = e.packs.inventory_item(&name).unwrap();
+        item.log_digest = HashVal::from_bytes([1; 32]);
+        assert!(matches!(
+            e.packs.install_replacement(&item),
+            Err(PackError::Refused(_))
+        ));
+        let mut item = e.packs.inventory_item(&name).unwrap();
+        item.frames.last = Lsn::new(5);
+        assert!(matches!(
+            e.packs.install_replacement(&item),
+            Err(PackError::Refused(_))
+        ));
+        assert!(e
+            .keys()
+            .iter()
+            .all(|k| !k.ends_with(&replacement_name(&name).unwrap())));
+    }
+
+    #[test]
+    fn a_pack_and_its_replacement_both_gone_is_lost() {
+        let (e, _log, name) = purge_env();
+        let item = e.packs.inventory_item(&name).unwrap();
+        let key = format!("{}/{name}", e.packs.dir);
+        assert!(e.packs.store.delete(&key).unwrap());
+        assert!(matches!(
+            e.packs.install_replacement(&item),
+            Err(PackError::Lost { .. })
+        ));
+        assert!(matches!(
+            e.packs.inventory_item(&name),
+            Err(PackError::Lost { .. })
+        ));
+        assert_eq!(e.packs.verify_replacement(&item).unwrap(), None);
+    }
+
+    #[test]
+    fn only_fs_packs_and_named_seals_are_purged() {
+        let (e, log, name) = purge_env();
+        // The log pack shipped after Seal 9 holds no fs section.
+        let log_pack = e
+            .keys()
+            .into_iter()
+            .map(|k| k.rsplit('/').next().unwrap().to_string())
+            .find(|n| n.ends_with(&format!("-{:020}", 0)))
+            .unwrap();
+        assert!(matches!(
+            e.packs.inventory_item(&log_pack),
+            Err(PackError::Refused(_))
+        ));
+        assert!(matches!(
+            e.packs.inventory_item("not-a-pack"),
+            Err(PackError::BadKey(_))
+        ));
+        // A purged Seal must be one an FsShipped record names.
+        let five: BTreeSet<Lsn> = [Lsn::new(5)].into_iter().collect();
+        assert!(matches!(
+            e.packs.chain_after_purge(None, &five),
+            Err(PackError::Refused(_))
+        ));
+        // A missing section that no purge excuses still fails.
+        let item = e.packs.inventory_item(&name).unwrap();
+        let r = e.packs.install_replacement(&item).unwrap();
+        e.packs.delete_original(&item, r).unwrap();
+        assert!(matches!(
+            e.packs.chain(Some(log.at(11))),
+            Err(PackError::FsMissing { seal }) if seal == Lsn::new(6)
+        ));
+        let nine: BTreeSet<Lsn> = [Lsn::new(9)].into_iter().collect();
+        assert!(matches!(
+            e.packs.chain_after_purge(None, &nine),
+            Err(PackError::FsMissing { seal }) if seal == Lsn::new(6)
+        ));
     }
 }
