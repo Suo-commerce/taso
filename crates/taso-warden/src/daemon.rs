@@ -23,7 +23,13 @@
 //!
 //! # Starting
 //!
-//! Before any Vessel, [`Node::new`] claims the run directory
+//! First, [`Node::new`] refuses a host with SELinux enabled
+//! ([`refuse_selinux`], P4 spec rev. 9 D32): SELinux labels every file
+//! with an xattr, in permissive mode too, and a manifest refuses every
+//! entry that has one, so nothing on such a host could become a Template.
+//! Supported hosts are Linux without SELinux (Ubuntu, Debian).
+//!
+//! Then, before any Vessel, it claims the run directory
 //! ([`claim_run_dir`]: one daemon per `run_dir`, held until it exits) and
 //! then sweeps its runc root ([`sweep_stale`]).  Holding the lock proves
 //! that every container in that root was left by a dead incarnation of
@@ -1780,6 +1786,47 @@ impl RunDirLock {
     }
 }
 
+/// Where the kernel shows SELinux: this file exists exactly when SELinux
+/// is enabled, enforcing or permissive (relative to the sysfs root).
+pub const SELINUX_ENFORCE: &str = "fs/selinux/enforce";
+
+/// Refuse to start on a host with SELinux enabled (P4 spec rev. 9 D32).
+/// `sys` is the sysfs root, `/sys` on a real host.  A host whose sysfs
+/// cannot be read is refused too: not knowing is not "no SELinux".
+pub fn refuse_selinux(sys: &Path) -> io::Result<()> {
+    let enforce = sys.join(SELINUX_ENFORCE);
+    match std::fs::symlink_metadata(&enforce) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "SELinux is enabled ({} exists): unsupported host; Taso runs on Linux \
+                 without SELinux (e.g. Ubuntu, Debian), because SELinux labels every \
+                 file and a manifest refuses labelled entries (P4 spec D32)",
+                enforce.display()
+            ),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Absent: no SELinux, provided sysfs itself is there.
+            std::fs::metadata(sys.join("fs")).map(|_| ()).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "cannot tell whether SELinux is enabled ({}: {e})",
+                        sys.display()
+                    ),
+                )
+            })
+        }
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!(
+                "cannot tell whether SELinux is enabled ({}: {e})",
+                enforce.display()
+            ),
+        )),
+    }
+}
+
 /// Claim `run_dir` for this daemon: create it, then take an exclusive
 /// `flock` on [`RUN_LOCK`] without waiting.  Two daemons on one run
 /// directory would share a runc root and sweep each other's agents, so a
@@ -1951,13 +1998,15 @@ pub struct Node {
 }
 
 impl Node {
-    /// A node: claims the run directory, sweeps containers a dead
+    /// A node: refuses a host with SELinux ([`refuse_selinux`]), claims
+    /// the run directory, sweeps containers a dead
     /// incarnation left in its runc root (see "Starting" in the module
     /// docs), then opens the store.  Each error says which step failed.
     pub fn new(config: Config, coord: Arc<dyn Coord>, storage: Storage) -> std::io::Result<Self> {
         let ctx = |what: &'static str| {
             move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"))
         };
+        refuse_selinux(Path::new("/sys")).map_err(ctx("checking the host"))?;
         let run_lock = claim_run_dir(&config.run_dir).map_err(ctx("claiming the run directory"))?;
         let swept = sweep_stale(&Runc::new(RuncCli::new(config.run_dir.join("runc"))))
             .map_err(ctx("sweeping stale containers"))?;
@@ -2767,6 +2816,33 @@ mod tests {
             last_seal: Some(p(3))
         }
         .behind());
+    }
+
+    // ── Starting: the host (D32) ────────────────────────────────────
+
+    #[test]
+    fn a_host_with_selinux_is_refused() {
+        let sys = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(sys.path().join("fs")).unwrap();
+        refuse_selinux(sys.path()).expect("no SELinux: starts");
+        std::fs::create_dir_all(sys.path().join("fs/selinux")).unwrap();
+        refuse_selinux(sys.path()).expect("selinuxfs directory alone: not enabled");
+        std::fs::write(sys.path().join(SELINUX_ENFORCE), b"0").unwrap();
+        let e = refuse_selinux(sys.path()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported, "permissive (0) too");
+        assert!(e.to_string().contains("SELinux is enabled"), "{e}");
+        let gone = sys.path().join("nothing");
+        assert!(
+            refuse_selinux(&gone).is_err(),
+            "no sysfs: cannot tell, refused"
+        );
+    }
+
+    #[test]
+    fn this_host_passes_the_selinux_check() {
+        // The tests run on a supported host (taso-test, CI); if this
+        // fails, every Node::new test fails for the same reason.
+        refuse_selinux(Path::new("/sys")).unwrap();
     }
 
     // ── Starting: run directory and sweep ───────────────────────────
