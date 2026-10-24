@@ -41,6 +41,22 @@ pub trait ObjectStore {
     /// keys that start with `prefix/`), at any depth, in byte order.
     /// Objects still being written are not listed.
     fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
+    /// Remove the object under `key`.  `Ok(true)` if it was there and is
+    /// gone, `Ok(false)` if there was nothing to remove: a retry after a
+    /// crash is a no-op (P4 spec §6.4).  Durable when it returns.
+    ///
+    /// The store does not log or check who deletes: a caller deletes only
+    /// a key it holds the coordinator's claim on, and the claim and its
+    /// resolution are the record of what was deleted (P4 spec §2.4).
+    ///
+    /// A store that cannot delete answers [`io::ErrorKind::Unsupported`].
+    fn delete(&self, key: &str) -> io::Result<bool> {
+        let _ = key;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this object store cannot delete",
+        ))
+    }
 }
 
 /// A store shared by a node's Vessels (any [`ObjectStore`]).
@@ -58,6 +74,9 @@ impl<T: ObjectStore + ?Sized> ObjectStore for std::sync::Arc<T> {
     }
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
         (**self).list(prefix)
+    }
+    fn delete(&self, key: &str) -> io::Result<bool> {
+        (**self).delete(key)
     }
 }
 
@@ -173,6 +192,21 @@ impl ObjectStore for LocalStore {
         }
         keys.sort();
         Ok(keys)
+    }
+
+    /// Unlink the file, then fsync its directory so the removal survives a
+    /// crash.  Empty directories are left: [`LocalStore::list`] does not
+    /// list them, and a later put reuses them.
+    fn delete(&self, key: &str) -> io::Result<bool> {
+        let path = self.path(key)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        let dir = path.parent().expect("a key has a file name");
+        File::open(dir)?.sync_all()?;
+        Ok(true)
     }
 }
 
@@ -363,5 +397,77 @@ mod tests {
         }
         assert!(store.put("v/a/2", &mut Dies).is_err());
         assert_eq!(store.list("v/a").unwrap(), vec!["v/a/1"]);
+    }
+
+    #[test]
+    fn delete_removes_once_and_is_then_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("v/a/1", &mut &b"x"[..]).unwrap();
+        store.put("v/a/2", &mut &b"y"[..]).unwrap();
+        assert!(store.delete("v/a/1").unwrap(), "it was there");
+        assert!(!store.exists("v/a/1").unwrap());
+        assert!(store.get("v/a/1").unwrap().is_none());
+        assert_eq!(store.list("v/a").unwrap(), vec!["v/a/2"], "the other stays");
+        assert!(!store.delete("v/a/1").unwrap(), "a retry is a no-op");
+        assert!(!store.delete("v/never").unwrap());
+        // A deleted key can be put again (a replacement, or a re-put).
+        store.put("v/a/1", &mut &b"z"[..]).unwrap();
+        assert!(store.exists("v/a/1").unwrap());
+    }
+
+    #[test]
+    fn delete_refuses_invalid_keys_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("v/a/1", &mut &b"x"[..]).unwrap();
+        for bad in ["", "../v/a/1", "v/../v/a/1", "/v/a/1"] {
+            assert_eq!(
+                store.delete(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{bad:?}"
+            );
+        }
+        // A prefix is not an object: deleting it removes nothing.
+        assert!(store.delete("v/a").is_err());
+        assert_eq!(store.list("v").unwrap(), vec!["v/a/1"]);
+    }
+
+    #[test]
+    fn delete_works_on_pack_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        let pack =
+            "vessels/ab12/pack/00000000000000000014-00000000000000000009-00000000000000000012";
+        let log =
+            "vessels/ab12/pack/00000000000000000014-00000000000000000009-00000000000000000000";
+        store.put(pack, &mut &b"fs pack"[..]).unwrap();
+        store.put(log, &mut &b"log pack"[..]).unwrap();
+        assert!(store.delete(pack).unwrap());
+        assert_eq!(store.list("vessels/ab12/pack").unwrap(), vec![log]);
+    }
+
+    #[test]
+    fn a_store_without_delete_says_so() {
+        struct NoDelete;
+        impl ObjectStore for NoDelete {
+            fn put(&self, _: &str, _: &mut dyn Read) -> io::Result<u64> {
+                Ok(0)
+            }
+            fn get(&self, _: &str) -> io::Result<Option<ByteStream>> {
+                Ok(None)
+            }
+            fn exists(&self, _: &str) -> io::Result<bool> {
+                Ok(false)
+            }
+            fn list(&self, _: &str) -> io::Result<Vec<String>> {
+                Ok(vec![])
+            }
+        }
+        let shared: SharedStore = std::sync::Arc::new(NoDelete);
+        assert_eq!(
+            shared.delete("a").unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 }
