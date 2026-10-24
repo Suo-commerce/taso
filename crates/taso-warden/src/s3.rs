@@ -333,6 +333,29 @@ impl ObjectStore for S3Store {
         keys.sort();
         Ok(keys)
     }
+
+    /// HEAD, then DELETE.  S3 answers a DELETE of a missing key with 204
+    /// like any other, so the HEAD is what tells "removed" from "nothing
+    /// to remove".  The two requests are not atomic, but nothing else
+    /// writes a key while its deleter holds the coordinator's claim
+    /// (P4 spec §2.4).
+    ///
+    /// On a bucket with versioning enabled, DELETE adds a delete marker and
+    /// the bytes stay as a noncurrent version: that is the hosting
+    /// platform's retention, not Taso's (P4 spec §0.4).
+    fn delete(&self, key: &str) -> io::Result<bool> {
+        if !self.exists(key)? {
+            return Ok(false);
+        }
+        let what = format!("delete {key}");
+        let req = self.request("DELETE", &self.path(key), &[], EMPTY_SHA256, &[]);
+        let resp = self.send(&what, req, ())?;
+        if resp.status() == http::StatusCode::NOT_FOUND {
+            return Ok(false); // gone between the HEAD and the DELETE
+        }
+        success(&what, resp)?;
+        Ok(true)
+    }
 }
 
 // ── ListObjectsV2 ───────────────────────────────────────────────────
@@ -816,6 +839,12 @@ class H(http.server.BaseHTTPRequestHandler):
             return self.reply(200, (xml + "</ListBucketResult>").encode())
         if k not in objs: return self.error(404, "NoSuchKey")
         self.reply(200, objs[k], "application/octet-stream")
+    def do_DELETE(self):
+        b, k, _ = self.key()
+        if not self.signed(): return self.error(403, "AccessDenied")
+        if k.startswith("deny/"): return self.error(403, "AccessDenied")
+        objs.pop(k, None)
+        self.reply(204)
     def log_message(self, *a): pass
 "#,
         );
@@ -854,6 +883,15 @@ class H(http.server.BaseHTTPRequestHandler):
             e.to_string().contains("HTTP 403 AccessDenied"),
             "the store's code is reported: {e}"
         );
+        assert!(store.delete("d/a").unwrap(), "it was there");
+        assert!(!store.exists("d/a").unwrap());
+        assert!(!store.delete("d/a").unwrap(), "a retry is a no-op");
+        assert_eq!(
+            store.list("d").unwrap(),
+            vec!["d/c".to_string(), "d/sub/b".into()],
+            "the others stay"
+        );
+        assert!(store.delete("../x").is_err(), "invalid keys are refused");
         drop(srv);
         assert_eq!(
             store.exists("d/a").unwrap_err().kind(),
@@ -926,6 +964,19 @@ class H(http.server.BaseHTTPRequestHandler):
         let e = wrong.put(&k("c"), &mut &b"x"[..]).unwrap_err();
         println!("a wrong secret: {e}");
         assert!(!store.exists(&k("c")).unwrap());
+        assert!(
+            wrong.delete(&k("a")).is_err(),
+            "a wrong secret deletes nothing"
+        );
+        assert!(store.exists(&k("a")).unwrap());
+        assert!(store.delete(&k("a")).unwrap());
+        assert!(!store.exists(&k("a")).unwrap());
+        assert!(!store.delete(&k("a")).unwrap(), "a retry is a no-op");
+        // Leave the bucket as found.
+        for key in store.list(&dir).unwrap() {
+            assert!(store.delete(&key).unwrap());
+        }
+        assert_eq!(store.list(&dir).unwrap(), Vec::<String>::new());
     }
 
     /// Whether the tools the local-server tests need are here.
