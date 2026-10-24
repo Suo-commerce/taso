@@ -1,4 +1,4 @@
-//! Classification and manifests (P4 spec rev. 8 §8; D26–D28).
+//! Classification and manifests (P4 spec rev. 9 §8; D26–D32).
 //!
 //! A **classification map** gives every path of a tree a class
 //! ([`PathClass`]): an ordered list of globs, read from TOML (D28), where
@@ -14,8 +14,12 @@
 //! directory's file descriptor with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`
 //! (`openat2`), and link targets are read with `readlinkat`.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 8, BLAKE3
-//! `9e651d6cd1c886b436d0165326de9dfe54087604411929fa680a30056e0a8888`.
+//! Supported hosts are Linux without SELinux (D32): any xattr makes an
+//! entry unsupported, so under SELinux every entry would be; the Warden
+//! refuses to start there (file 3b).
+//!
+//! Normative reference: `Taso_spec_p4_contracts` rev. 9, BLAKE3
+//! `9c3a984fc45d213b024a4b93a1cb519c4f176c0a3366db7a3f81484029892dc5`.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -271,6 +275,16 @@ pub enum Content {
     Target(Vec<u8>),
 }
 
+/// A modification time as the kernel stores it (D30): any date, before
+/// 1970 or after 2262, exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Mtime {
+    /// Seconds since the epoch; negative before 1970.
+    pub secs: i64,
+    /// Nanoseconds, below 10⁹.
+    pub nsec: u32,
+}
+
 /// One manifest entry (spec §8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -288,8 +302,8 @@ pub struct Entry {
     pub uid_slot: u32,
     /// Owner gid relative to the Vessel's slot base.
     pub gid_slot: u32,
-    /// Modification time, nanoseconds since the epoch.
-    pub mtime_ns: u64,
+    /// Modification time (D30).
+    pub mtime: Mtime,
     /// Its class.
     pub class: PathClass,
 }
@@ -318,9 +332,9 @@ pub enum Unsupported {
     ReservedMismatch,
     /// A kept symlink whose target the transform drops (tag 9; file 6).
     DanglingByExclusion,
-    /// PENDING spec rev. 9: owned outside the Vessel's uid/gid range, or
-    /// an mtime before 1970 (tag 10).
-    OutOfRange,
+    /// Owned outside the tree's slot range: something outside the Vessel
+    /// wrote it (tag 10, D29).
+    OwnerOutOfRange,
 }
 
 impl Unsupported {
@@ -335,7 +349,7 @@ impl Unsupported {
         Self::PathTooLong,
         Self::ReservedMismatch,
         Self::DanglingByExclusion,
-        Self::OutOfRange,
+        Self::OwnerOutOfRange,
     ];
 }
 
@@ -369,9 +383,10 @@ impl Incomplete {
 pub struct Manifest {
     /// The map it was classified with.
     pub classmap_key: HashVal,
-    /// Entries directly under the root.
+    /// Every name directly under the root, reserved and unsupported
+    /// ones included.
     pub root_entries: u64,
-    /// The sum of the files' sizes.
+    /// The sum of the described files' sizes.
     pub total_bytes: u64,
     /// `None` if the walk finished; else why it stopped.
     pub incomplete: Option<Incomplete>,
@@ -444,7 +459,8 @@ impl Manifest {
                 .u32(e.mode)
                 .u32(e.uid_slot)
                 .u32(e.gid_slot)
-                .u64(e.mtime_ns)
+                .u64(e.mtime.secs as u64)
+                .u32(e.mtime.nsec)
                 .tag(e.class as u8);
         }
         c.u64(self.unsupported.len() as u64);
@@ -504,7 +520,14 @@ impl Manifest {
                 mode: r.u32()?,
                 uid_slot: r.u32()?,
                 gid_slot: r.u32()?,
-                mtime_ns: r.u64()?,
+                mtime: {
+                    let secs = r.u64()? as i64;
+                    let nsec = r.u32()?;
+                    if nsec >= 1_000_000_000 {
+                        return Err(bad("nsec out of range"));
+                    }
+                    Mtime { secs, nsec }
+                },
                 class: *CLASSES
                     .get(r.u8()? as usize)
                     .ok_or_else(|| bad("bad class"))?,
@@ -644,15 +667,19 @@ impl Reserved {
     }
 }
 
-/// The Vessel's uid and gid range: `base .. base + width`.
+/// The width of a slot range (spec §8, D29).
+pub const SLOT_WIDTH: u32 = 65536;
+
+/// The slot range the tree is stored in on disk (D29): `base ..
+/// base + SLOT_WIDTH`.  For a Vessel whose files sit in its parent's
+/// range (an idmapped work mount), that is the parent's range, not the
+/// Vessel's host range.
 #[derive(Clone, Copy, Debug)]
 pub struct Owner {
     /// First uid of the range.
     pub uid_base: u32,
     /// First gid of the range.
     pub gid_base: u32,
-    /// Its width.
-    pub width: u32,
 }
 
 /// The header [`Manifest::bytes`] writes for a complete walk: version,
@@ -855,18 +882,17 @@ impl Walker<'_> {
                 return;
             }
         }
-        let in_range = |v: u32, base: u32| v.checked_sub(base).filter(|s| *s < self.owner.width);
+        let in_range = |v: u32, base: u32| v.checked_sub(base).filter(|s| *s < SLOT_WIDTH);
         let (Some(uid_slot), Some(gid_slot)) = (
             in_range(uid, self.owner.uid_base),
             in_range(gid, self.owner.gid_base),
         ) else {
-            return self.unsupported(path, Unsupported::OutOfRange);
+            return self.unsupported(path, Unsupported::OwnerOutOfRange);
         };
-        let (secs, nsec) = (st.st_mtime as i64, st.st_mtime_nsec as i64);
-        if secs < 0 {
-            return self.unsupported(path, Unsupported::OutOfRange);
-        }
-        let mtime_ns = secs as u64 * 1_000_000_000 + nsec as u64;
+        let mtime = Mtime {
+            secs: st.st_mtime as i64,
+            nsec: st.st_mtime_nsec as u32,
+        };
         let class = self.map.classify(&path);
         let mut e = Entry {
             path: path.clone(),
@@ -876,7 +902,7 @@ impl Walker<'_> {
             mode,
             uid_slot,
             gid_slot,
-            mtime_ns,
+            mtime,
             class,
         };
         match ft {
@@ -1007,6 +1033,7 @@ impl Walker<'_> {
             + 4
             + 4
             + 8
+            + 4
             + 1;
         if !self.room(cost) {
             return false;
@@ -1147,13 +1174,12 @@ class = "Hook"
     // ── walks ───────────────────────────────────────────────────────
 
     fn me() -> Owner {
-        // SAFETY-free: the test runs as whoever it runs as.
+        // The test's own ids as slot 0.
         let uid = rustix::process::getuid().as_raw();
         let gid = rustix::process::getgid().as_raw();
         Owner {
             uid_base: uid,
             gid_base: gid,
-            width: 65536,
         }
     }
 
@@ -1324,6 +1350,49 @@ class = "Hook"
     }
 
     #[test]
+    fn any_date_is_described_exactly() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let d = tree();
+        let set = |name: &str, t: SystemTime| {
+            fs::File::options()
+                .write(true)
+                .open(d.path().join(name))
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        };
+        // 1960-01-01 and 2300-01-01 (D30: never refused).  The manifest
+        // carries what the filesystem stores; ext4 stores both exactly (its
+        // own limit is the year 2446), other filesystems may clamp.
+        set("Cargo.toml", UNIX_EPOCH - Duration::from_secs(315_619_200));
+        set("src/main.rs", UNIX_EPOCH + Duration::new(10_413_792_000, 5));
+        let m = walk_it(d.path());
+        assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
+        let get = |p: &[u8]| m.entries.iter().find(|e| e.path == p).unwrap().mtime;
+        let stored = |p: &str| {
+            use std::os::unix::fs::MetadataExt;
+            let md = fs::metadata(d.path().join(p)).unwrap();
+            Mtime {
+                secs: md.mtime(),
+                nsec: md.mtime_nsec() as u32,
+            }
+        };
+        assert_eq!(get(b"Cargo.toml"), stored("Cargo.toml"));
+        assert_eq!(get(b"src/main.rs"), stored("src/main.rs"));
+        assert!(get(b"Cargo.toml").secs < 0, "before 1970 is described");
+        eprintln!(
+            "dates as stored here: {:?} {:?}",
+            get(b"Cargo.toml"),
+            get(b"src/main.rs")
+        );
+        assert_eq!(Manifest::decode(&m.bytes()).unwrap(), m);
+        // A decoded nsec of 10⁹ or more is refused.
+        let mut bad = m.clone();
+        bad.entries[0].mtime.nsec = 1_000_000_000;
+        assert!(Manifest::decode(&bad.bytes()).is_err());
+    }
+
+    #[test]
     fn ownership_outside_the_range_is_unsupported() {
         let d = tree();
         let o = me();
@@ -1336,7 +1405,7 @@ class = "Hook"
         assert!(m
             .unsupported
             .iter()
-            .all(|(_, u)| *u == Unsupported::OutOfRange));
+            .all(|(_, u)| *u == Unsupported::OwnerOutOfRange));
     }
 
     #[test]
