@@ -1,4 +1,4 @@
-//! Template genesis (P4 spec rev. 13 §7; D17, D38–D46; file 4b).
+//! Template genesis (P4 spec rev. 14 §7; D17, D38–D48; file 4b).
 //!
 //! A genesis makes a Template from a tree nobody verified: a Vessel's Seal,
 //! or a host directory under `--best-effort`.  It runs on a node, with that
@@ -68,8 +68,25 @@
 //! died.  The command (file 4c) exits when `TASO_FAILPOINT` names the
 //! point.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 13, BLAKE3
-//! `31d3e97f2c9a6b8ab7efcf3442457ae65f73985b89836b96ed3ba04bcb2864df`.
+//! # Resume by id (D48)
+//!
+//! [`Genesis::resume`] finishes a genesis from its id alone, once its
+//! `GenesisStarted` is accepted: the source key, the map's key, the waiver
+//! and the authority come from that record, the source artifact and the
+//! map from the store, so the source need not exist any more.  Before
+//! `GenesisStarted` is accepted the log does not name the source, and the
+//! answer is [`GenesisError::NothingToResume`].  Every later record carries
+//! the accepted `GenesisStarted`'s authority, whoever runs it.
+//!
+//! # Lsn 1 (D47)
+//!
+//! The first accepted record is `GenesisStarted`.  A holder lost after
+//! appending its `GenesisStarted` and before shipping it takes lsn 1 with
+//! it; the next holder continues after a Gap record and its own
+//! `GenesisStarted` is the first accepted one.
+//!
+//! Normative reference: `Taso_spec_p4_contracts` rev. 14, BLAKE3
+//! `0d964e34a75a6c46cd3fcac21c752f863b1a6b431f325e1600e6a00cf1d30ba5`.
 
 use std::fmt;
 use std::fs::File;
@@ -244,6 +261,9 @@ pub enum GenesisError {
     Inconsistent(String),
     /// A failpoint stopped the run.
     Failpoint(&'static str),
+    /// `--resume` of a genesis whose `GenesisStarted` is not accepted: the
+    /// log does not name its source (D48).
+    NothingToResume(ChronicleId),
 }
 
 impl fmt::Display for GenesisError {
@@ -273,6 +293,11 @@ impl fmt::Display for GenesisError {
             }
             Self::Inconsistent(why) => write!(f, "inconsistent: {why}"),
             Self::Failpoint(p) => write!(f, "failpoint {p}"),
+            Self::NothingToResume(id) => write!(
+                f,
+                "nothing to resume: no GenesisStarted is accepted for {}; run it with its source",
+                hex(id.as_bytes())
+            ),
         }
     }
 }
@@ -346,6 +371,17 @@ struct Exported {
     consistency: Consistency,
 }
 
+/// What the steps after the export start from: a run's request, or an
+/// accepted `GenesisStarted` (D48).
+struct Inputs {
+    exported: Exported,
+    hook_waiver: Option<String>,
+    authority: Authority,
+    peer: Peer,
+    /// The map, if this run read it; else it is read from the store.
+    map: Option<Classmap>,
+}
+
 impl<P: Pool> Genesis<P> {
     /// The scratch dataset of `id` (§7 step 4).
     pub fn scratch(&self, id: ChronicleId) -> Result<Dataset, GenesisError> {
@@ -371,12 +407,53 @@ impl<P: Pool> Genesis<P> {
             req.hook_waiver.as_deref(),
             &req.authority.actor,
         );
+        let source_key = exported.source_key;
+        let inputs = Inputs {
+            exported,
+            hook_waiver: req.hook_waiver.clone(),
+            authority: req.authority.clone(),
+            peer: req.peer,
+            map: Some(map),
+        };
         let mut notes = Vec::new();
-        let outcome = self.resume(gid, req, &exported, &map, &mut notes)?;
-        let (outcome, cleaned) = outcome;
+        let (outcome, cleaned) = self.finish(gid, &inputs, &mut notes)?;
         Ok(Report {
             genesis_id: gid,
-            source_key: exported.source_key,
+            source_key,
+            outcome,
+            cleaned,
+            notes,
+        })
+    }
+
+    /// Resume the genesis `gid` from the log and the store alone (D48): its
+    /// `GenesisStarted` must be accepted.
+    pub fn resume(&self, gid: ChronicleId) -> Result<Report, GenesisError> {
+        let Some((_, Submitted::Contract(ContractRecord::GenesisStarted(g)))) = self
+            .coord
+            .query_logical(logical_id(&LogicalKey::Genesis(gid)))?
+        else {
+            return Err(GenesisError::NothingToResume(gid));
+        };
+        let inputs = Inputs {
+            exported: Exported {
+                source_key: g.source_key,
+                classmap_key: g.classmap_key,
+                consistency: g.consistency,
+            },
+            hook_waiver: g.hook_waiver.clone(),
+            authority: g.authority.clone(),
+            peer: g.peer,
+            map: None,
+        };
+        let mut notes = vec![format!(
+            "resumed by id; the genesis was started by {:?} ({:?})",
+            g.authority.actor, g.authority.reason
+        )];
+        let (outcome, cleaned) = self.finish(gid, &inputs, &mut notes)?;
+        Ok(Report {
+            genesis_id: gid,
+            source_key: g.source_key,
             outcome,
             cleaned,
             notes,
@@ -512,14 +589,13 @@ impl<P: Pool> Genesis<P> {
 
     /// Every step after the export, from what the log has accepted.
     /// Returns the outcome and whether the cleanup is accepted.
-    fn resume(
+    fn finish(
         &self,
         gid: ChronicleId,
-        req: &Request,
-        exported: &Exported,
-        map: &Classmap,
+        inputs: &Inputs,
         notes: &mut Vec<String>,
     ) -> Result<(Outcome, bool), GenesisError> {
+        let exported = &inputs.exported;
         let accepted = |key: LogicalKey| -> Result<Option<ContractRecord>, GenesisError> {
             Ok(match self.coord.query_logical(logical_id(&key))? {
                 Some((_, Submitted::Contract(r))) => Some(r),
@@ -561,35 +637,53 @@ impl<P: Pool> Genesis<P> {
 
         if decided.is_none() {
             // 3. GenesisStarted.
-            if started.is_none() {
-                let g = GenesisStarted {
-                    genesis_id: gid,
-                    source_key: exported.source_key,
-                    consistency: exported.consistency,
-                    classmap_key: exported.classmap_key,
-                    transform_version: TRANSFORM_VERSION,
-                    hook_waiver: req.hook_waiver.clone(),
-                    authority: req.authority.clone(),
-                    peer: req.peer,
-                };
-                let got = run.submit(
-                    ContractRecord::GenesisStarted(Box::new(g)),
-                    Some("genesis.before_started_accept"),
-                )?;
-                if let ContractRecord::GenesisStarted(a) = &got {
-                    if a.source_key != exported.source_key
-                        || a.classmap_key != exported.classmap_key
-                    {
-                        return Err(GenesisError::Inconsistent(
-                            "the accepted GenesisStarted names another source or map".into(),
-                        ));
-                    }
+            let started = match started {
+                Some(ContractRecord::GenesisStarted(g)) => *g,
+                Some(_) => unreachable!("the Genesis row holds GenesisStarted"),
+                None => {
+                    let g = GenesisStarted {
+                        genesis_id: gid,
+                        source_key: exported.source_key,
+                        consistency: exported.consistency,
+                        classmap_key: exported.classmap_key,
+                        transform_version: TRANSFORM_VERSION,
+                        hook_waiver: inputs.hook_waiver.clone(),
+                        authority: inputs.authority.clone(),
+                        peer: inputs.peer,
+                    };
+                    let got = run.submit(
+                        ContractRecord::GenesisStarted(Box::new(g)),
+                        Some("genesis.before_started_accept"),
+                    )?;
+                    let ContractRecord::GenesisStarted(a) = got else {
+                        unreachable!("the Genesis row holds GenesisStarted")
+                    };
+                    (self.failpoint)("genesis.after_started_accept")?;
+                    *a
                 }
-                (self.failpoint)("genesis.after_started_accept")?;
+            };
+            if started.source_key != exported.source_key
+                || started.classmap_key != exported.classmap_key
+            {
+                return Err(GenesisError::Inconsistent(
+                    "the accepted GenesisStarted names another source or map".into(),
+                ));
+            }
+            if started.authority != inputs.authority {
+                notes.push(format!(
+                    "the genesis was started with reason {:?}; its records carry that one",
+                    started.authority.reason
+                ));
             }
             // 4.–7.
-            let outcome =
-                self.judge_and_publish(&mut run, gid, req, exported, map, &scratch, notes)?;
+            let outcome = self.judge_and_publish(
+                &mut run,
+                gid,
+                &started,
+                inputs.map.as_ref(),
+                &scratch,
+                notes,
+            )?;
             if let Outcome::Refused { reason, .. } = &outcome {
                 if *reason != WalkRefusal::MaterialisationMismatch {
                     return Ok((outcome, false));
@@ -688,28 +782,50 @@ impl<P: Pool> Genesis<P> {
         Packs::new(self.store.clone(), NoSend, &self.prefix, gid).map_err(GenesisError::Store)
     }
 
-    /// Steps 4–7: judge, materialise, export, publish.
-    #[allow(clippy::too_many_arguments)]
+    /// The map `GenesisStarted` names, from the store (D48).
+    fn stored_map(&self, key: HashVal) -> Result<Classmap, GenesisError> {
+        let mut bytes = Vec::new();
+        self.get_content(ObjectKind::Classmap, key)?
+            .read_to_end(&mut bytes)
+            .map_err(GenesisError::Store)?;
+        let map = Classmap::parse(&bytes).map_err(GenesisError::Classmap)?;
+        if map.key() != key {
+            return Err(GenesisError::Integrity(
+                object_key_path(&self.prefix, ObjectKind::Classmap, key).expect("a content kind"),
+            ));
+        }
+        Ok(map)
+    }
+
+    /// Steps 4–7: judge, materialise, export, publish, from the accepted
+    /// `GenesisStarted` `g`.
     fn judge_and_publish(
         &self,
         run: &mut Run<'_, P>,
         gid: ChronicleId,
-        req: &Request,
-        exported: &Exported,
-        map: &Classmap,
+        g: &GenesisStarted,
+        map: Option<&Classmap>,
         scratch: &Dataset,
         notes: &mut Vec<String>,
     ) -> Result<Outcome, GenesisError> {
         // 4. Judge, from the source artifact in the store.
         let input = {
-            let mut r = self.get_content(ObjectKind::Artifact, exported.source_key)?;
+            let mut r = self.get_content(ObjectKind::Artifact, g.source_key)?;
             artifact::read_manifest(&mut r)?
         };
         let input_key = input.key();
         self.put_content(ObjectKind::Manifest, input_key, &mut &input.bytes()[..])?;
-        if let Some(reason) = judge(&input, req.hook_waiver.is_some()) {
+        if let Some(reason) = judge(&input, g.hook_waiver.is_some()) {
             return self.refuse(run, gid, reason, input_key);
         }
+        let stored;
+        let map = match map {
+            Some(m) => m,
+            None => {
+                stored = self.stored_map(g.classmap_key)?;
+                &stored
+            }
+        };
 
         // 5. Materialise.  Nothing is excluded: the output manifest is the
         //    input manifest, the same object.
@@ -728,7 +844,7 @@ impl<P: Pool> Genesis<P> {
             .mountpoint
             .ok_or_else(|| GenesisError::NoMountpoint(scratch.clone()))?;
         {
-            let mut r = self.get_content(ObjectKind::Artifact, exported.source_key)?;
+            let mut r = self.get_content(ObjectKind::Artifact, g.source_key)?;
             artifact::restore(
                 &mut r,
                 &mount,
@@ -737,7 +853,7 @@ impl<P: Pool> Genesis<P> {
                     gid_base: 0,
                 },
                 &self.reserved,
-                Some(exported.source_key),
+                Some(g.source_key),
             )?;
         }
         let seal = Lsn::new(1);
@@ -778,9 +894,9 @@ impl<P: Pool> Genesis<P> {
             born_from: BornFrom::Genesis { genesis_id: gid },
             layer,
             output_manifest_key: output_key,
-            classmap_key: exported.classmap_key,
+            classmap_key: g.classmap_key,
             vconf_key: None,
-            authority: req.authority.clone(),
+            authority: g.authority.clone(),
         };
         let got = run.submit(
             ContractRecord::TemplateReady(Box::new(t.clone())),
@@ -2192,11 +2308,10 @@ class = "Scratch"
         assert_eq!(aside.len(), 1, "kept, not deleted");
     }
 
-    /// Spec rev. 13 §7 step 3 says the genesis Chronicle's lsn 1 carries
-    /// `GenesisStarted`.  A node lost after appending its `GenesisStarted`
-    /// (accepted by the append CAS) and before shipping it takes lsn 1
-    /// with it: the next holder continues after a Gap, and the accepted
-    /// `GenesisStarted` is at lsn 3.  Raised for a spec decision.
+    /// D47: a node lost after appending its `GenesisStarted` (accepted by
+    /// the append CAS) and before shipping it takes lsn 1 with it: the next
+    /// holder continues after a Gap, and the accepted `GenesisStarted`, the
+    /// first accepted record, is at lsn 3.
     #[test]
     fn a_genesis_started_lost_before_it_was_shipped_leaves_a_gap_at_lsn_1() {
         let want = reference();
@@ -2422,5 +2537,121 @@ class = "Scratch"
         let b = c.node(2);
         let r = b.run(&dir_request(&c)).unwrap();
         finished(&c, &b, &r, want);
+    }
+
+    // ── Resume by id (D48) ──────────────────────────────────────────
+
+    #[test]
+    fn a_genesis_resumes_by_id_after_its_node_and_its_source_are_gone() {
+        let want = reference();
+        for fp in [
+            "genesis.after_started_accept",
+            "genesis.after_materialise",
+            "genesis.after_artifact_put",
+            "genesis.before_ready_accept",
+            "genesis.after_ready_accept",
+            "genesis.before_cleanup",
+        ] {
+            let c = Cluster::new();
+            good_tree(&c.src(), 0);
+            let mut a = c.node(1);
+            a.failpoint = fail_at(fp);
+            assert!(a.run(&dir_request(&c)).is_err(), "{fp}");
+            drop(a);
+            c.lose(1);
+            std::fs::remove_dir_all(c.src()).unwrap();
+            let b = c.node(2);
+            let r = b.resume(want.0).unwrap_or_else(|e| panic!("{fp}: {e}"));
+            finished(&c, &b, &r, want);
+            assert_eq!(r.source_key, want.1, "{fp}");
+            assert!(
+                r.notes[0].starts_with("resumed by id"),
+                "{fp}: {:?}",
+                r.notes
+            );
+            // Every record carries the authority GenesisStarted was
+            // accepted with.
+            let Some(ContractRecord::TemplateReady(t)) = accepted(&c, LogicalKey::Template(want.0))
+            else {
+                panic!()
+            };
+            assert_eq!(t.authority, dir_request(&c).authority, "{fp}");
+        }
+    }
+
+    #[test]
+    fn a_refused_genesis_is_cleaned_up_by_id() {
+        let c = Cluster::new();
+        good_tree(&c.src(), 0);
+        let mut a = c.node(1);
+        a.pool.mangle = true;
+        a.failpoint = fail_at("genesis.before_cleanup");
+        assert!(a.run(&dir_request(&c)).is_err());
+        let Some((_, Submitted::Contract(ContractRecord::GenesisRefused(r)))) = c
+            .coord
+            .query_logical(logical_id(&LogicalKey::GenesisRefused(reference().0)))
+            .unwrap()
+        else {
+            panic!("refused")
+        };
+        drop(a);
+        c.lose(1);
+        std::fs::remove_dir_all(c.src()).unwrap();
+        let b = c.node(2);
+        let rep = b.resume(r.genesis_id).unwrap();
+        assert_eq!(refused(&rep), WalkRefusal::MaterialisationMismatch);
+        assert!(rep.cleaned);
+        assert_eq!(
+            records(&c, r.genesis_id),
+            ["GenesisStarted", "GenesisRefused", "GenesisCleanedUp"]
+        );
+    }
+
+    #[test]
+    fn resume_by_id_needs_an_accepted_genesis_started() {
+        let want = reference();
+        let c = Cluster::new();
+        good_tree(&c.src(), 0);
+        // Nothing at all, then claimed and announced but not accepted.
+        assert!(matches!(
+            c.node(2).resume(want.0),
+            Err(GenesisError::NothingToResume(id)) if id == want.0
+        ));
+        let mut a = c.node(1);
+        a.failpoint = fail_at("genesis.before_started_accept");
+        assert!(a.run(&dir_request(&c)).is_err());
+        assert!(matches!(
+            c.node(2).resume(want.0),
+            Err(GenesisError::NothingToResume(_))
+        ));
+        // With its source, it finishes.
+        let b = c.node(2);
+        let r = b.run(&dir_request(&c)).unwrap();
+        finished(&c, &b, &r, want);
+    }
+
+    #[test]
+    fn later_records_carry_the_authority_genesis_started_was_accepted_with() {
+        let c = Cluster::new();
+        good_tree(&c.src(), 0);
+        let mut g = c.node(1);
+        g.failpoint = fail_at("genesis.after_started_accept");
+        assert!(g.run(&dir_request(&c)).is_err());
+        g.failpoint = no_failpoints();
+        let mut req = dir_request(&c);
+        req.authority.reason = "a different reason".into();
+        let r = g.run(&req).unwrap();
+        let (tid, _) = ready(&r);
+        let Some(ContractRecord::TemplateReady(t)) = accepted(&c, LogicalKey::Template(tid)) else {
+            panic!()
+        };
+        assert_eq!(t.authority.reason, "T(0)");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("its records carry that one")),
+            "{:?}",
+            r.notes
+        );
     }
 }
