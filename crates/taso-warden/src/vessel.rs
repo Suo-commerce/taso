@@ -408,6 +408,14 @@ pub enum VesselError {
     TemplateMismatch,
     /// A deliberate stop at a named failpoint (tests).
     Failpoint(&'static str),
+    /// A Template-born Vessel's layer is not on this node with the
+    /// binding its Lineage names (P4 §5.6): received first, or refused.
+    TemplateLayerMissing {
+        /// The Template.
+        template_id: ChronicleId,
+        /// The layer its Lineage names.
+        layer_key: HashVal,
+    },
     /// Rebirth: a received snapshot is not the one the Seal was taken from.
     WrongSnapshot {
         /// The Seal.
@@ -489,6 +497,11 @@ impl fmt::Display for VesselError {
             Self::BirthMismatch => f.write_str("another Birth is accepted for this vessel than its Lineage"),
             Self::TemplateMismatch => f.write_str("the vessel exists, born from another Template, layer or name than asked"),
             Self::Failpoint(at) => write!(f, "stopped at failpoint {at}"),
+            Self::TemplateLayerMissing { template_id, layer_key } => write!(
+                f,
+                "the layer {layer_key} of Template {} is not on this node",
+                hex(template_id)
+            ),
             Self::WrongSnapshot { seal, expected, got } => {
                 write!(f, "Seal {} was received with guid {got}, not {expected}", seal.get())
             }

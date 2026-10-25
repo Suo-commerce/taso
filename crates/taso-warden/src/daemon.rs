@@ -2419,8 +2419,31 @@ impl Node {
                 (v, verdict)
             }
             Start::Rebirth => {
+                // A Template-born Vessel: its layer received here first
+                // (§5.6), the one settled for this node's storage kind.
+                let layer = |t: ChronicleId, key: taso_core::envelope::HashVal| {
+                    let layers = self.layers.as_ref().ok_or_else(|| {
+                        VesselError::LocalState(
+                            "a Template-born Vessel is reborn over its layer: runtime.template_slot is not set".into(),
+                        )
+                    })?;
+                    let l = layers.ensure(t).map_err(|e| {
+                        VesselError::LocalState(format!("the layer of Template {}: {e}", id_hex(t)))
+                    })?;
+                    for n in &l.notes {
+                        self.log(vc, n);
+                    }
+                    if l.layer_key != key {
+                        return Err(VesselError::LocalState(format!(
+                            "its Lineage names layer {key} of Template {}, but this node's storage kind has layer {}: a Vessel is not reborn across storage kinds",
+                            id_hex(t),
+                            l.layer_key
+                        )));
+                    }
+                    Ok(())
+                };
                 let (v, reborn) = host
-                    .rebirth_as(id, &self.packs(id)?, claim)
+                    .rebirth_with(id, &self.packs(id)?, claim, &layer)
                     .map_err(|e| match e {
                         // Forks are node-bound (2026-10-23, option c).
                         VesselError::ParentMissing(p) => DaemonError::Refused(format!(

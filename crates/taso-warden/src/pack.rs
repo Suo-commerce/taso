@@ -793,6 +793,34 @@ impl Read for Digesting {
     }
 }
 
+/// The Seal a Vessel's dataset is a clone of, as its first `fs` section's
+/// base names it: a fork's or successor's parent Seal; for a Template-born
+/// Vessel its layer's Seal at lsn 1 of the Template, bound to `layer_key`
+/// (P4 spec rev. 18 §5.6, D56); `None` for one born from the void.
+pub fn origin_seal(origin: &Origin) -> Option<(ChronicleId, Position)> {
+    match origin {
+        Origin::Void => None,
+        Origin::Fork { parent } | Origin::Succession { parent, .. } => Some((
+            parent.chronicle,
+            Position {
+                lsn: parent.seal,
+                hash: parent.seal_hash,
+            },
+        )),
+        Origin::Template {
+            template_id,
+            layer_key,
+            ..
+        } => Some((
+            *template_id,
+            Position {
+                lsn: crate::template::LAYER_LSN,
+                hash: *layer_key,
+            },
+        )),
+    }
+}
+
 /// The record's form of an `fs` base.
 fn stream_base(b: FsBase) -> StreamBase {
     match b {
@@ -1463,7 +1491,7 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                         _ => None,
                     })
                     .ok_or(PackError::NoLineage)?;
-                match (lineage.origin.parent(), origin) {
+                match (origin_seal(&lineage.origin), origin) {
                     (None, None) => (FsBase::Full, None),
                     (None, Some(_)) => {
                         return Err(PackError::Refused(
@@ -1475,20 +1503,17 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                             "a child Vessel's first Seal needs its origin snapshot".into(),
                         ))
                     }
-                    (Some(parent), Some(o)) => {
-                        if o.seal != parent.seal || o.seal_hash != Some(parent.seal_hash) {
+                    (Some((chronicle, parent)), Some(o)) => {
+                        if o.seal != parent.lsn || o.seal_hash != Some(parent.hash) {
                             return Err(PackError::Refused(format!(
                                 "{} is not the lineage's parent Seal (lsn {})",
                                 o.name(),
-                                parent.seal.get()
+                                parent.lsn.get()
                             )));
                         }
                         let base = FsBase::Origin {
-                            chronicle: parent.chronicle,
-                            seal: Position {
-                                lsn: parent.seal,
-                                hash: parent.seal_hash,
-                            },
+                            chronicle,
+                            seal: parent,
                             guid: o.guid,
                         };
                         (base, Some(o.name()))
@@ -1744,21 +1769,14 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
                             _ => None,
                         })
                         .ok_or(PackError::NoLineage)?;
-                    match (lineage.origin, base) {
-                        (Origin::Void, FsBase::Full) => true,
+                    match (origin_seal(&lineage.origin), base) {
+                        (None, FsBase::Full) => true,
                         (
-                            Origin::Fork { parent } | Origin::Succession { parent, .. },
+                            Some(want),
                             FsBase::Origin {
                                 chronicle, seal, ..
                             },
-                        ) => {
-                            chronicle == parent.chronicle
-                                && seal
-                                    == Position {
-                                        lsn: parent.seal,
-                                        hash: parent.seal_hash,
-                                    }
-                        }
+                        ) => (chronicle, seal) == want,
                         _ => false,
                     }
                 }

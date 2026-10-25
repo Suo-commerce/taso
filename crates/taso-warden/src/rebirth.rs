@@ -49,7 +49,7 @@
 
 use std::fmt;
 
-use taso_core::envelope::{ChronicleId, Epoch, Lsn};
+use taso_core::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use taso_core::record::{LineageRecord, Origin, ParentSeal, Payload};
 
 use crate::chronicle::{restore_log, Chronicle, ChronicleError, Claim, Layers};
@@ -133,12 +133,30 @@ impl<P: Pool> Host<P> {
         packs: &Packs<S, X>,
         claim: Claim,
     ) -> Result<(Vessel<P::Layers>, Reborn), VesselError> {
+        self.rebirth_with(id, packs, claim, &|_, _| Ok(()))
+    }
+
+    /// [`Host::rebirth_as`] for a Vessel that may be Template-born (P4
+    /// spec rev. 18 §5.6): `layer(template_id, layer_key)` receives the
+    /// Template's settled layer on this node, checked, before anything
+    /// else ([`crate::template::TemplateLayers::ensure`]), and refuses a
+    /// `layer_key` that is not the one settled for this node's storage
+    /// kind.  The Vessel's sections are then received as increments on
+    /// that layer (D56).  Without it ([`Host::rebirth_as`]) a
+    /// Template-born Vessel is reborn only where its layer already is.
+    pub fn rebirth_with<S: ObjectStore, X: Sender>(
+        &self,
+        id: ChronicleId,
+        packs: &Packs<S, X>,
+        claim: Claim,
+        layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
+    ) -> Result<(Vessel<P::Layers>, Reborn), VesselError> {
         // 1. Verify before fencing (fencing review F5): what was shipped
         //    and anchored, the chain, the lineage, this node's state and
         //    the parents it needs.  A rebirth that cannot succeed then
         //    fences nobody and the Vessel keeps running where it is.
         let dataset = self.dataset_for(id);
-        let (anchor, chain, lineage) = self.verify(id, packs, &dataset)?;
+        let (anchor, chain, lineage) = self.verify(id, packs, &dataset, layer)?;
 
         // 2. Fence, on the claim: from here on the anchor cannot move
         //    under us, and a stale decision changes nothing.
@@ -156,12 +174,11 @@ impl<P: Pool> Host<P> {
         let (anchor, chain, lineage) = if anchored_now == anchor {
             (anchor, chain, lineage)
         } else {
-            self.verify(id, packs, &dataset)?
+            self.verify(id, packs, &dataset, layer)?
         };
 
         // 4. The dataset.
         let here = self.seals_here(&dataset)?;
-        let parent_ds = |p: &ParentSeal| self.dataset_for(p.chronicle);
         let mut received = Vec::new();
         for s in &chain.seals {
             let to = (s.fs.to.lsn, s.fs.to.hash);
@@ -181,19 +198,13 @@ impl<P: Pool> Host<P> {
                     self.pool
                         .receive(&dataset, Some((prev.lsn, prev.hash)), to, &mut stream)
                 }
-                FsBase::Origin {
-                    chronicle,
-                    seal,
-                    guid,
-                } => {
-                    let parent = ParentSeal {
-                        chronicle,
-                        seal: seal.lsn,
-                        seal_hash: seal.hash,
-                    };
-                    self.parent_present(&parent)?;
+                // The chain checked that this is the Lineage's origin Seal.
+                FsBase::Origin { seal, guid, .. } => {
+                    let (origin_ds, _) = self.origin_present(&lineage)?.ok_or_else(|| {
+                        VesselError::NotAVessel("an origin base for a Vessel born from the void")
+                    })?;
                     let base = CloneBase {
-                        dataset: parent_ds(&parent),
+                        dataset: origin_ds,
                         seal: seal.lsn,
                         hash: seal.hash,
                         guid,
@@ -252,6 +263,7 @@ impl<P: Pool> Host<P> {
         id: ChronicleId,
         packs: &Packs<S, X>,
         dataset: &crate::zfs::Dataset,
+        layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
     ) -> Result<(Position, Chain, LineageRecord), VesselError> {
         let anchor = self.coord.shipped(id).map_err(VesselError::Coord)?;
         if anchor.lsn == Lsn::new(0) {
@@ -278,28 +290,28 @@ impl<P: Pool> Host<P> {
                 stray.0.get()
             )));
         }
-        for s in &chain.seals {
-            if let FsBase::Origin {
-                chronicle, seal, ..
-            } = s.fs.base
-            {
-                self.parent_present(&ParentSeal {
-                    chronicle,
-                    seal: seal.lsn,
-                    seal_hash: seal.hash,
-                })?;
-            }
+        // A Template-born Vessel: its layer first, received and checked
+        // here (§5.6), whatever else it needs.
+        if let Origin::Template {
+            template_id,
+            layer_key,
+            ..
+        } = lineage.origin
+        {
+            layer(template_id, layer_key)?;
         }
-        if chain.seals.is_empty()
+        let from_origin = chain
+            .seals
+            .first()
+            .is_some_and(|s| matches!(s.fs.base, FsBase::Origin { .. }));
+        let born_here = chain.seals.is_empty()
             && self
                 .pool
                 .info(dataset)
                 .map_err(VesselError::Pool)?
-                .is_none()
-        {
-            if let Origin::Fork { parent } | Origin::Succession { parent, .. } = lineage.origin {
-                self.parent_present(&parent)?;
-            }
+                .is_none();
+        if from_origin || born_here {
+            self.origin_present(&lineage)?;
         }
         Ok((anchor, chain, lineage))
     }
@@ -333,6 +345,41 @@ impl<P: Pool> Host<P> {
         }
     }
 
+    /// The dataset and Seal the Vessel's dataset is a clone of, by its
+    /// Lineage ([`crate::pack::origin_seal`]), which must be on this node
+    /// with its binding: a parent's Seal snapshot, or a Template's layer
+    /// at lsn 1 bound to its `layer_key`.  `None` for a Vessel born from
+    /// the void.
+    fn origin_present(
+        &self,
+        lineage: &LineageRecord,
+    ) -> Result<Option<(crate::zfs::Dataset, Position)>, VesselError> {
+        let Some((chronicle, seal)) = crate::pack::origin_seal(&lineage.origin) else {
+            return Ok(None);
+        };
+        if let Origin::Template {
+            template_id,
+            layer_key,
+            ..
+        } = lineage.origin
+        {
+            let ds = self.layer_dataset(template_id);
+            if !self.seals_here(&ds)?.contains(&(seal.lsn, seal.hash)) {
+                return Err(VesselError::TemplateLayerMissing {
+                    template_id,
+                    layer_key,
+                });
+            }
+            return Ok(Some((ds, seal)));
+        }
+        self.parent_present(&ParentSeal {
+            chronicle,
+            seal: seal.lsn,
+            seal_hash: seal.hash,
+        })?;
+        Ok(Some((self.dataset_for(chronicle), seal)))
+    }
+
     /// No section shipped: the dataset is what the Vessel was born as.
     fn as_born(
         &self,
@@ -347,25 +394,13 @@ impl<P: Pool> Host<P> {
         {
             return Ok(()); // made by an interrupted rebirth; the open checks it
         }
-        match lineage.origin {
-            Origin::Void => self.pool.create(dataset).map(|_| ()),
-            Origin::Fork { parent } | Origin::Succession { parent, .. } => {
-                self.parent_present(&parent)?;
-                self.pool
-                    .clone(
-                        &self.dataset_for(parent.chronicle),
-                        parent.seal,
-                        parent.seal_hash,
-                        dataset,
-                    )
-                    .map(|_| ())
-            }
-            // Its layer must be received on this node first (P4 spec rev. 16
-            // §5.6); until file 5g does that, refused, nothing changed.
-            Origin::Template { .. } => Err(
-                "rebirth of a Template-born Vessel needs its Template's layer on this node (P4 file 5g)"
-                    .into(),
-            ),
+        match self.origin_present(lineage)? {
+            None => self.pool.create(dataset).map(|_| ()),
+            // A clone of the parent's Seal, or of the Template's layer.
+            Some((origin_ds, seal)) => self
+                .pool
+                .clone(&origin_ds, seal.lsn, seal.hash, dataset)
+                .map(|_| ()),
         }
         .map_err(VesselError::Pool)
     }
@@ -602,6 +637,180 @@ mod tests {
             Some(b.dataset_for(t.id()).seal_snapshot(ts.lsn))
         );
         assert_eq!(info.parent, Some(ts.hash));
+    }
+
+    // ── Template-born Vessels (P4 file 5g, spec rev. 18 §5.6, D56) ──
+
+    const LAYER_KEY: HashVal = HashVal::from_bytes([0x1A; 32]);
+    const T: ChronicleId = ChronicleId::from_bytes([0x77; 16]);
+
+    /// A Vessel born on `a` from T's layer, stopped before its Birth is
+    /// accepted (the test coordinator has no Template); its Lineage is
+    /// shipped and anchored.
+    fn template_born(
+        n: &Nodes,
+        a: &Host<FakePool>,
+        subject: &[u8],
+    ) -> Vessel<<FakePool as Pool>::Layers> {
+        a.pool.put_snapshot(
+            a.layer_dataset(T).as_str(),
+            crate::template::LAYER_LSN,
+            LAYER_KEY,
+        );
+        let birth = crate::vessel::TemplateBirth {
+            template_id: T,
+            layer_key: LAYER_KEY,
+            asked: None,
+        };
+        let id = taso_core::record::vessel_id(ns(1), subject);
+        let stop = |p: &'static str| {
+            if p == "birth.before_accept" {
+                Err(VesselError::Failpoint(p))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            a.born_from_template(ns(1), subject, &birth, &n.packs(id), &stop),
+            Err(VesselError::Failpoint(_))
+        ));
+        a.open(id).unwrap().0
+    }
+
+    /// The layer's snapshot, as the daemon finds it for a first Seal.
+    fn layer_snap(h: &Host<FakePool>) -> Snapshot {
+        Snapshot {
+            dataset: h.layer_dataset(T),
+            seal: crate::template::LAYER_LSN,
+            createtxg: 1,
+            guid: fake_guid(crate::template::LAYER_LSN),
+            seal_hash: Some(LAYER_KEY),
+        }
+    }
+
+    /// Its first Seal ships as an increment on the layer (D56); on another
+    /// node the layer is received first, then the sections on it.
+    #[test]
+    fn a_template_born_vessel_is_reborn_over_its_layer() {
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let mut v = template_born(&n, &a, b"tb");
+        let s1 = turn(&mut v, 1);
+        let pa = n.packs(v.id());
+        // Without the layer's snapshot the first Seal is refused, and with
+        // a snapshot of another binding too.
+        assert!(v.publish_seal(&pa, &snap(&v, s1), None).is_err());
+        let mut wrong = layer_snap(&a);
+        wrong.seal_hash = Some(HashVal::from_bytes([0x5A; 32]));
+        assert!(v.publish_seal(&pa, &snap(&v, s1), Some(&wrong)).is_err());
+        v.publish_seal(&pa, &snap(&v, s1), Some(&layer_snap(&a)))
+            .unwrap();
+        let s2 = turn(&mut v, 2);
+        v.publish_seal(&pa, &snap(&v, s2), None).unwrap();
+        let chain = pa.chain(None).unwrap();
+        assert_eq!(
+            chain.seals[0].fs.base,
+            FsBase::Origin {
+                chronicle: T,
+                seal: Position {
+                    lsn: crate::template::LAYER_LSN,
+                    hash: LAYER_KEY
+                },
+                guid: fake_guid(crate::template::LAYER_LSN),
+            }
+        );
+
+        // Node B has no layer and nothing receives one: refused, nobody
+        // fenced.
+        let before = n.coord.ownership(v.id()).unwrap();
+        assert!(matches!(
+            b.rebirth(v.id(), &n.packs(v.id())),
+            Err(VesselError::TemplateLayerMissing { template_id, layer_key })
+                if template_id == T && layer_key == LAYER_KEY
+        ));
+        // A layer that is not the settled one (another kind's): refused
+        // by the receive step, nobody fenced.
+        let refuse = |_: ChronicleId, _: HashVal| Err(VesselError::TemplateMismatch);
+        assert!(matches!(
+            b.rebirth_with(
+                v.id(),
+                &n.packs(v.id()),
+                Claim::TakeOver {
+                    from: before.holder,
+                    epoch: before.epoch
+                },
+                &refuse
+            ),
+            Err(VesselError::TemplateMismatch)
+        ));
+        let after = n.coord.ownership(v.id()).unwrap();
+        assert_eq!((after.holder, after.epoch), (before.holder, before.epoch));
+
+        // The receive step brings the layer; then the sections on it.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let receive = |t: ChronicleId, key: HashVal| {
+            asked.borrow_mut().push((t, key));
+            b.pool
+                .put_snapshot(b.layer_dataset(t).as_str(), crate::template::LAYER_LSN, key);
+            Ok(())
+        };
+        let claim = Claim::TakeOver {
+            from: before.holder,
+            epoch: before.epoch,
+        };
+        let (w, r) = b
+            .rebirth_with(v.id(), &n.packs(v.id()), claim, &receive)
+            .unwrap();
+        assert_eq!(asked.into_inner(), vec![(T, LAYER_KEY)]);
+        assert_eq!(r.received, vec![s1.lsn, s2.lsn]);
+        let ds = b.dataset_for(v.id());
+        let info = b.pool.info(&ds).unwrap().unwrap();
+        assert_eq!(
+            info.origin,
+            Some(b.layer_dataset(T).seal_snapshot(crate::template::LAYER_LSN))
+        );
+        assert_eq!(info.parent, Some(LAYER_KEY));
+        assert_eq!(
+            b.pool.received_of(ds.as_str()),
+            vec![
+                said(
+                    &ds,
+                    Some(&a.layer_dataset(T).seal_snapshot(crate::template::LAYER_LSN)),
+                    s1.lsn
+                ),
+                said(&ds, Some(&ds.seal_snapshot(s1.lsn)), s2.lsn)
+            ]
+        );
+        assert_eq!(w.lineage(), v.lineage());
+        assert_eq!(w.last_seal(), Some(s2));
+    }
+
+    /// A Template-born Vessel that shipped no Seal is reborn as a clone of
+    /// its layer.
+    #[test]
+    fn a_template_born_vessel_without_a_seal_is_reborn_as_a_clone_of_its_layer() {
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let v = template_born(&n, &a, b"tb");
+        assert_eq!(
+            n.coord.shipped(v.id()).unwrap().lsn,
+            Lsn::new(1),
+            "the Lineage"
+        );
+        b.pool.put_snapshot(
+            b.layer_dataset(T).as_str(),
+            crate::template::LAYER_LSN,
+            LAYER_KEY,
+        );
+        let (w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
+        assert_eq!((r.received.len(), r.dataset_at), (0, None));
+        let info = b.pool.info(w.dataset()).unwrap().unwrap();
+        assert_eq!(
+            info.origin,
+            Some(b.layer_dataset(T).seal_snapshot(crate::template::LAYER_LSN))
+        );
+        assert_eq!(info.parent, Some(LAYER_KEY));
+        assert!(b.pool.received_of(w.dataset().as_str()).is_empty());
     }
 
     /// A fork that shipped no Seal is reborn as a clone of its Template.
