@@ -574,12 +574,21 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
         let wall = Duration::from_secs(vconf.limits.wall_seconds);
         let result = if (self.failpoint)("verify.mid_run") {
             // The Warden "dies" while the verifier runs: it is killed (as
-            // the next start's sweep would) and no result is given.
+            // the next start's sweep would) and no result is given.  No
+            // terminal: a `runc run` that inherits one is stopped by job
+            // control when it touches it, and its wait never returns
+            // (taso-test, 2026-10-25).  The container is killed, then
+            // `runc run` itself, so the wait returns even when the kill
+            // found no container yet.
             let mut c = cmd;
+            c.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             let child = c.spawn();
             std::thread::sleep(Duration::from_millis(500));
             kill(0);
             if let Ok(mut ch) = child {
+                let _ = ch.kill();
                 let _ = ch.wait();
             }
             let _ = runc(&["delete", "--force", &id]);
