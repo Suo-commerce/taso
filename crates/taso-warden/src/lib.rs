@@ -40,6 +40,7 @@ pub mod status_kube;
 pub mod storage;
 pub mod summary;
 pub mod supervisor;
+pub mod template;
 pub mod timing;
 pub mod vessel;
 pub mod zfs;

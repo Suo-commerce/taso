@@ -1,0 +1,1781 @@
+//! A Template's layer on a node (P4 spec rev. 17 §5.6; D52, D53, D55;
+//! file 5e).
+//!
+//! A Vessel born from a Template is a clone of the Template's **layer**:
+//! the dataset `<root>/t-<template_id hex>`, whose Seal layer at lsn 1 is
+//! bound to `layer_key`.  Its later Seals ship as increments on that layer,
+//! so every node of a storage kind must hold the very same layer: one
+//! storage stream, the `layer` object `layer_key`, accepted once per
+//! Template and storage kind by `LayerShipped` (D52).
+//!
+//! [`TemplateLayers::ensure`] makes the layer present and checked on this
+//! node, in an order that a retry of the same call finishes from any
+//! crash:
+//!
+//! 1. **Accepted?**  If a `LayerShipped` for the Template and this storage
+//!    kind is accepted, the layer is **settled**: receive it (step 3) and
+//!    stop.
+//! 2. **Build** (no `LayerShipped` yet).  A `LayerShipped` this node
+//!    prepared earlier and never had accepted, or a layer it received and
+//!    checked but never shipped, is reused if its object is in the store.
+//!    Otherwise: the Template's artifact is restored into a
+//!    fresh `<root>/tb-<hex>` at the Template range (D53), its top
+//!    directory and a `lost+found` the filesystem made are given to the
+//!    range (an artifact has no entry for its root), the tree is walked and
+//!    checked equal to the output manifest, and sealed at lsn 1 with the
+//!    build hash; its full stream is put as the `layer` object; the build
+//!    dataset is destroyed by guid.  The builder then receives its own
+//!    object (step 3), which gives it the layer's guid, and only then
+//!    submits `LayerShipped` from its **Warden Chronicle** (D55).  If
+//!    another node's layer was accepted first (`Conflict`), this node's
+//!    received layer is destroyed by guid and the accepted one received.
+//! 3. **Receive and check** (every node, the builder included).  A layer
+//!    already bound to `layer_key` is used as it is once this node has
+//!    checked it (a marker in `<state_dir>/layers/`); one bound otherwise
+//!    is destroyed by guid.  The object is received as the Seal at lsn 1,
+//!    bound to `layer_key`, verified against its key as it is read (a
+//!    stream that fails as it is read leaves nothing); its guid must be
+//!    the accepted one; its top directory must be owned by the Template
+//!    range; its tree is walked and checked equal to the output manifest.
+//!    Only then is it marked checked.
+//!
+//! A layer is bound to `layer_key` only by receiving the object with that
+//! key, so no other bytes can stand where a Vessel's increments expect
+//! these.
+//!
+//! # The Warden Chronicle (D55)
+//!
+//! Each Warden has one Chronicle of its own, id `"taso.warden.v1" ‖
+//! warden_id` ([`warden_chronicle`]), claimed with authority `Vessel` and
+//! reopened by it after a restart; it has no Lineage and carries
+//! `LayerShipped`.  Its local log lives in `<state_dir>/warden/<id hex>`,
+//! rebuilt from its packs if this node lost it.  A Warden that finds it
+//! held by another Warden stops.
+//!
+//! The submit path (logical lookup, append once, ship, announce, accept)
+//! is the one of [`crate::genesis`], kept here as its own copy for now;
+//! the two are to be joined when P4 is simplified.
+//!
+//! # Failpoints (§10.2)
+//!
+//! `layer.after_build_put`, `layer.before_shipped_accept`,
+//! `layer.after_shipped_accept`, `layer.after_receive`.
+//!
+//! Normative reference: `Taso_spec_p4_contracts` rev. 17, BLAKE3
+//! `097a3eb0375596aa60927260b971deeaf350b70c08067234ad2e656cb88ae369`.
+
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use taso_core::canon::Canon;
+use taso_core::contract::{
+    logical_id, submission_id, ContractRecord, LayerShipped, LogicalKey, ObjectKind, StorageKind,
+    TemplateReady,
+};
+use taso_core::coordlog::{Answer, ClaimAuthority, ClaimError, Final, Head, Submitted, Transient};
+use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
+use taso_core::model::WardenId;
+use taso_core::record::Payload;
+
+use crate::artifact::{self, ArtifactError};
+use crate::chronicle::{restore_log, Chronicle, ChronicleError, LayerError, Layers};
+use crate::classify::{self, Classmap, Limits, Manifest, MapError, Owner, Reserved};
+use crate::coordinator::{Coord, CoordError};
+use crate::coordstore::object_key_path;
+use crate::pack::{name_bounds, PackError, Packs};
+use crate::ship::{ByteStream, Sender, SharedStore};
+use crate::vessel::Pool;
+use crate::zfs::Dataset;
+
+/// The lsn of a Template's layer Seal on every node.
+pub const LAYER_LSN: Lsn = Lsn::new(1);
+
+/// Domain of the build's provisional Seal hash (§9).
+pub const BUILD_DOMAIN: &str = "taso.template.layer.build.v1";
+
+/// Domain of a Warden Chronicle's id (D55).
+pub const WARDEN_DOMAIN: &str = "taso.warden.v1";
+
+/// How often a `NotReadable` accept is retried.
+const NOT_READABLE_TRIES: u32 = 5;
+
+/// How many times a record is resubmitted after `HeadMoved`.
+const HEAD_MOVED_TRIES: u64 = 3;
+
+/// A Warden's own Chronicle (D55): the first 16 bytes of
+/// `"taso.warden.v1" ‖ warden_id`.
+pub fn warden_chronicle(warden: WardenId) -> ChronicleId {
+    let mut c = Canon::new();
+    c.u64(warden.get());
+    let h = blake3::derive_key(WARDEN_DOMAIN, c.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h[..16]);
+    ChronicleId::from_bytes(id)
+}
+
+/// The build's provisional Seal hash.
+pub fn build_hash(template: ChronicleId) -> HashVal {
+    HashVal::from_bytes(blake3::derive_key(BUILD_DOMAIN, template.as_bytes()))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ── Errors ──────────────────────────────────────────────────────────
+
+/// Why a layer could not be made present.  Each leaves something a retry
+/// of the same call finishes.
+#[derive(Debug)]
+pub enum TemplateError {
+    /// No `TemplateReady` is accepted for this id.
+    NotATemplate(ChronicleId),
+    /// The store failed.
+    Store(io::Error),
+    /// An object in the store does not hash to its key (§0.4).
+    Integrity(String),
+    /// The pool failed.
+    Pool(LayerError),
+    /// A new dataset has no mountpoint.
+    NoMountpoint(Dataset),
+    /// The classification map in the store is refused.
+    Classmap(MapError),
+    /// Walking a tree failed.
+    Walk(io::Error),
+    /// Restoring the artifact failed.
+    Artifact(ArtifactError),
+    /// The layer is not what it must be: its walk, its guid or its owner
+    /// differs.  It was destroyed, unless it was already bound to the
+    /// accepted key (then it is left, for an operator).
+    Mismatch(String),
+    /// The coordinator failed or refused.
+    Coord(CoordError),
+    /// The Warden Chronicle's local log failed.
+    Chronicle(ChronicleError),
+    /// The packs failed.
+    Pack(PackError),
+    /// This Warden's own Chronicle is held by another Warden: two nodes
+    /// with one id.
+    WardenHeldElsewhere {
+        /// Who holds it.
+        holder: WardenId,
+    },
+    /// A submission can never be accepted.
+    Refused(Final),
+    /// A submission stayed transiently refused past the retries.
+    NotAccepted(Transient),
+    /// What the log holds does not agree with what this node did.
+    Inconsistent(String),
+    /// A failpoint stopped the call.
+    Failpoint(&'static str),
+}
+
+impl fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotATemplate(t) => write!(f, "{} is not a ready Template", hex(t.as_bytes())),
+            Self::Store(e) => write!(f, "store: {e}"),
+            Self::Integrity(p) => write!(f, "store integrity: {p} does not hash to its key"),
+            Self::Pool(e) => write!(f, "pool: {e}"),
+            Self::NoMountpoint(d) => write!(f, "{d} has no mountpoint"),
+            Self::Classmap(e) => write!(f, "{e}"),
+            Self::Walk(e) => write!(f, "walk: {e}"),
+            Self::Artifact(e) => write!(f, "artifact: {e}"),
+            Self::Mismatch(why) => write!(f, "layer mismatch: {why}"),
+            Self::Coord(e) => write!(f, "coordinator: {e}"),
+            Self::Chronicle(e) => write!(f, "warden chronicle: {e}"),
+            Self::Pack(e) => write!(f, "packs: {e}"),
+            Self::WardenHeldElsewhere { holder } => write!(
+                f,
+                "this Warden's own Chronicle is held by warden {}: two nodes with one id",
+                holder.get()
+            ),
+            Self::Refused(r) => write!(f, "LayerShipped refused: {r:?}"),
+            Self::NotAccepted(t) => write!(f, "LayerShipped not accepted: {t:?}"),
+            Self::Inconsistent(why) => write!(f, "inconsistent: {why}"),
+            Self::Failpoint(p) => write!(f, "failpoint {p}"),
+        }
+    }
+}
+
+impl std::error::Error for TemplateError {}
+
+impl From<CoordError> for TemplateError {
+    fn from(e: CoordError) -> Self {
+        Self::Coord(e)
+    }
+}
+
+impl From<ChronicleError> for TemplateError {
+    fn from(e: ChronicleError) -> Self {
+        Self::Chronicle(e)
+    }
+}
+
+impl From<PackError> for TemplateError {
+    fn from(e: PackError) -> Self {
+        Self::Pack(e)
+    }
+}
+
+impl From<ArtifactError> for TemplateError {
+    fn from(e: ArtifactError) -> Self {
+        Self::Artifact(e)
+    }
+}
+
+/// Called at each failpoint; an `Err` stops the call there.
+pub type Failpoint = Box<dyn Fn(&'static str) -> Result<(), TemplateError> + Send + Sync>;
+
+/// No failpoint stops anything.
+pub fn no_failpoints() -> Failpoint {
+    Box::new(|_| Ok(()))
+}
+
+// ── The layer ───────────────────────────────────────────────────────
+
+/// A Template's layer, present and checked on this node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layer {
+    /// The Template.
+    pub template_id: ChronicleId,
+    /// `<root>/t-<template_id hex>`: Vessels clone its Seal at
+    /// [`LAYER_LSN`], bound to `layer_key`.
+    pub dataset: Dataset,
+    /// The `layer` object, and the layer Seal's binding.
+    pub layer_key: HashVal,
+    /// The layer Seal's guid.
+    pub guid: u64,
+    /// For the operator: a build, a leftover destroyed, another node's
+    /// layer taken.
+    pub notes: Vec<String>,
+}
+
+/// What a node needs to make Template layers present (from its Warden
+/// config).
+pub struct TemplateLayers<P: Pool, X: Sender> {
+    /// The node's storage.
+    pub pool: P,
+    /// Makes a Seal's full stream.
+    pub sender: X,
+    /// Which storage `pool` is.
+    pub storage: StorageKind,
+    /// The store.
+    pub store: SharedStore,
+    /// Key prefix in the store.
+    pub prefix: String,
+    /// The coordinator.
+    pub coord: Arc<dyn Coord>,
+    /// This Warden.
+    pub warden: WardenId,
+    /// The Warden's state directory.
+    pub state_dir: PathBuf,
+    /// The parent dataset of Vessels and layers.
+    pub root: Dataset,
+    /// The Template range's base: `host_uid_base + template_slot · 65536`
+    /// (D53), the same on every node of the cluster.
+    pub template_base: u32,
+    /// `manifest.*`.
+    pub limits: Limits,
+    /// `fs.reserved`.
+    pub reserved: Vec<Reserved>,
+    /// The failpoint hook.
+    pub failpoint: Failpoint,
+    /// One `ensure` at a time on this node (the Warden Chronicle and the
+    /// datasets are this node's).
+    pub lock: Mutex<()>,
+}
+
+/// What the Template's own records say its layer must be.
+struct Definition {
+    ready: TemplateReady,
+    map: Classmap,
+    manifest: Manifest,
+}
+
+impl<P: Pool, X: Sender> TemplateLayers<P, X> {
+    /// `<root>/t-<template_id hex>`.
+    pub fn layer_dataset(&self, t: ChronicleId) -> Result<Dataset, TemplateError> {
+        Dataset::new(&format!("{}/t-{}", self.root, hex(t.as_bytes())))
+            .map_err(|e| TemplateError::Pool(Box::new(e)))
+    }
+
+    /// `<root>/tb-<template_id hex>`.
+    pub fn build_dataset(&self, t: ChronicleId) -> Result<Dataset, TemplateError> {
+        Dataset::new(&format!("{}/tb-{}", self.root, hex(t.as_bytes())))
+            .map_err(|e| TemplateError::Pool(Box::new(e)))
+    }
+
+    fn marker(&self, key: HashVal) -> PathBuf {
+        self.state_dir.join("layers").join(hex(key.as_bytes()))
+    }
+
+    /// Make the layer of Template `t` present and checked on this node.
+    pub fn ensure(&self, t: ChronicleId) -> Result<Layer, TemplateError> {
+        let _one = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let def = self.definition(t)?;
+        let ds = self.layer_dataset(t)?;
+        let mut notes = Vec::new();
+        // At most twice round: a lost race leaves the accepted layer.
+        for _ in 0..3 {
+            if let Some(l) = self.accepted(t)? {
+                let guid =
+                    self.receive_checked(&ds, l.layer_key, Some(l.guid), &def, &mut notes)?;
+                return Ok(Layer {
+                    template_id: t,
+                    dataset: ds,
+                    layer_key: l.layer_key,
+                    guid,
+                    notes,
+                });
+            }
+            let mut warden = self.open_warden(&mut notes)?;
+            let logical = logical_id(&LogicalKey::Layer(t, self.storage));
+            let mine = match (warden.prepared(logical)?, self.built_here(&ds)?) {
+                (Some(ContractRecord::LayerShipped(p)), _) if self.has_object(p.layer_key)? => {
+                    notes.push(format!(
+                        "reusing the layer {} this node prepared earlier",
+                        hex(p.layer_key.as_bytes())
+                    ));
+                    let guid =
+                        self.receive_checked(&ds, p.layer_key, Some(p.guid), &def, &mut notes)?;
+                    LayerShipped { guid, ..p }
+                }
+                (_, Some((key, guid))) => {
+                    notes.push(format!(
+                        "reusing the layer {} this node built and checked earlier",
+                        hex(key.as_bytes())
+                    ));
+                    LayerShipped {
+                        template_id: t,
+                        storage: self.storage,
+                        layer_key: key,
+                        guid,
+                    }
+                }
+                _ => {
+                    let key = self.build(t, &def, &mut notes)?;
+                    let guid = self.receive_checked(&ds, key, None, &def, &mut notes)?;
+                    notes.push(format!("built the layer {}", hex(key.as_bytes())));
+                    LayerShipped {
+                        template_id: t,
+                        storage: self.storage,
+                        layer_key: key,
+                        guid,
+                    }
+                }
+            };
+            (self.failpoint)("layer.before_shipped_accept")?;
+            let got = warden.submit(ContractRecord::LayerShipped(mine))?;
+            (self.failpoint)("layer.after_shipped_accept")?;
+            let ContractRecord::LayerShipped(got) = got else {
+                return Err(TemplateError::Inconsistent(
+                    "the Layer row holds LayerShipped".into(),
+                ));
+            };
+            if got == mine {
+                return Ok(Layer {
+                    template_id: t,
+                    dataset: ds,
+                    layer_key: got.layer_key,
+                    guid: got.guid,
+                    notes,
+                });
+            }
+            // Another node's layer was accepted first: ours is destroyed
+            // when the accepted one is received (next round).
+            notes.push(format!(
+                "another node's layer {} was shipped first; this node's {} is an orphan candidate",
+                hex(got.layer_key.as_bytes()),
+                hex(mine.layer_key.as_bytes())
+            ));
+        }
+        Err(TemplateError::Inconsistent(
+            "no LayerShipped settled after a lost race".into(),
+        ))
+    }
+
+    // ── What the log says ───────────────────────────────────────────
+
+    fn accepted_record(&self, key: LogicalKey) -> Result<Option<ContractRecord>, TemplateError> {
+        Ok(match self.coord.query_logical(logical_id(&key))? {
+            Some((_, Submitted::Contract(r))) => Some(r),
+            Some(_) => {
+                return Err(TemplateError::Inconsistent(
+                    "a Birth under a Template logical id".into(),
+                ))
+            }
+            None => None,
+        })
+    }
+
+    fn accepted(&self, t: ChronicleId) -> Result<Option<LayerShipped>, TemplateError> {
+        match self.accepted_record(LogicalKey::Layer(t, self.storage))? {
+            Some(ContractRecord::LayerShipped(l)) => Ok(Some(l)),
+            Some(_) => Err(TemplateError::Inconsistent(
+                "the Layer row holds LayerShipped".into(),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// The Template's definition, its map and output manifest from the
+    /// store, each checked against its key.
+    fn definition(&self, t: ChronicleId) -> Result<Definition, TemplateError> {
+        let ready = match self.accepted_record(LogicalKey::Template(t))? {
+            Some(ContractRecord::TemplateReady(r)) => *r,
+            _ => return Err(TemplateError::NotATemplate(t)),
+        };
+        let bytes = self.read_content(ObjectKind::Classmap, ready.classmap_key)?;
+        let map = Classmap::parse(&bytes).map_err(TemplateError::Classmap)?;
+        let bytes = self.read_content(ObjectKind::Manifest, ready.output_manifest_key)?;
+        let manifest = Manifest::decode(&bytes).map_err(TemplateError::Classmap)?;
+        if manifest.key() != ready.output_manifest_key {
+            return Err(TemplateError::Integrity(
+                self.path(ObjectKind::Manifest, ready.output_manifest_key),
+            ));
+        }
+        Ok(Definition {
+            ready,
+            map,
+            manifest,
+        })
+    }
+
+    // ── The store ───────────────────────────────────────────────────
+
+    fn path(&self, kind: ObjectKind, key: HashVal) -> String {
+        object_key_path(&self.prefix, kind, key).expect("a content kind")
+    }
+
+    fn get(&self, kind: ObjectKind, key: HashVal) -> Result<ByteStream, TemplateError> {
+        let path = self.path(kind, key);
+        self.store
+            .get(&path)
+            .map_err(TemplateError::Store)?
+            .ok_or_else(|| {
+                TemplateError::Store(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{path} is not in the store"),
+                ))
+            })
+    }
+
+    /// A small content object, read whole and checked against its key.
+    fn read_content(&self, kind: ObjectKind, key: HashVal) -> Result<Vec<u8>, TemplateError> {
+        let mut b = Vec::new();
+        self.get(kind, key)?
+            .read_to_end(&mut b)
+            .map_err(TemplateError::Store)?;
+        if taso_core::contract::object_key(kind, &b) != key {
+            return Err(TemplateError::Integrity(self.path(kind, key)));
+        }
+        Ok(b)
+    }
+
+    /// A layer this node received and checked earlier whose object is in
+    /// the store (a build interrupted before it shipped): its key and guid.
+    fn built_here(&self, ds: &Dataset) -> Result<Option<(HashVal, u64)>, TemplateError> {
+        if self.pool.info(ds).map_err(TemplateError::Pool)?.is_none() {
+            return Ok(None);
+        }
+        let bound = self.pool.layers(ds).list().map_err(TemplateError::Pool)?;
+        let [(lsn, key)] = bound[..] else {
+            return Ok(None);
+        };
+        if lsn != LAYER_LSN || !self.has_object(key)? {
+            return Ok(None);
+        }
+        let Ok(g) = self
+            .pool
+            .receive(ds, None, (LAYER_LSN, key), &mut io::empty())
+        else {
+            return Ok(None);
+        };
+        let checked = std::fs::read_to_string(self.marker(key)).ok() == Some(g.to_string());
+        Ok(checked.then_some((key, g)))
+    }
+
+    fn has_object(&self, key: HashVal) -> Result<bool, TemplateError> {
+        self.store
+            .exists(&self.path(ObjectKind::Layer, key))
+            .map_err(TemplateError::Store)
+    }
+
+    /// Put a content object from a file (§0.4): an existing key is read
+    /// back and verified instead.
+    fn put_layer(&self, key: HashVal, file: &Path) -> Result<(), TemplateError> {
+        let path = self.path(ObjectKind::Layer, key);
+        if let Some(mut r) = self.store.get(&path).map_err(TemplateError::Store)? {
+            let mut h = blake3::Hasher::new_derive_key(ObjectKind::Layer.prefix());
+            io::copy(&mut r, &mut h).map_err(TemplateError::Store)?;
+            if h.finalize().as_bytes() != key.as_bytes() {
+                return Err(TemplateError::Integrity(path));
+            }
+            return Ok(());
+        }
+        let mut f = File::open(file).map_err(TemplateError::Store)?;
+        self.store
+            .put(&path, &mut f)
+            .map_err(TemplateError::Store)?;
+        Ok(())
+    }
+
+    // ── Build ───────────────────────────────────────────────────────
+
+    /// Restore, check, seal, send, put, destroy the build: the new layer
+    /// object's key.
+    fn build(
+        &self,
+        t: ChronicleId,
+        def: &Definition,
+        notes: &mut Vec<String>,
+    ) -> Result<HashVal, TemplateError> {
+        let bd = self.build_dataset(t)?;
+        if let Some(g) = self.pool.guid(&bd).map_err(TemplateError::Pool)? {
+            self.pool.destroy(&bd, g).map_err(TemplateError::Pool)?;
+            notes.push(format!(
+                "destroyed the build {bd} (guid {g}) an interrupted run left"
+            ));
+        }
+        let info = self.pool.create(&bd).map_err(TemplateError::Pool)?;
+        let mount = info
+            .mountpoint
+            .ok_or_else(|| TemplateError::NoMountpoint(bd.clone()))?;
+        let owner = Owner {
+            uid_base: self.template_base,
+            gid_base: self.template_base,
+        };
+        {
+            let mut r = self.get(ObjectKind::Artifact, def.ready.layer)?;
+            artifact::restore(&mut r, &mount, owner, &self.reserved, Some(def.ready.layer))?;
+        }
+        own_top(&mount, self.template_base).map_err(TemplateError::Walk)?;
+        let walked = classify::walk(&mount, &def.map, owner, &self.limits, &self.reserved)
+            .map_err(TemplateError::Walk)?;
+        if !same_entries(&walked, &def.manifest) {
+            let g = self.pool.guid(&bd).map_err(TemplateError::Pool)?;
+            if let Some(g) = g {
+                self.pool.destroy(&bd, g).map_err(TemplateError::Pool)?;
+            }
+            return Err(TemplateError::Mismatch(format!(
+                "the restored build {bd} does not walk to the Template's output manifest"
+            )));
+        }
+        self.pool
+            .layers(&bd)
+            .snapshot(LAYER_LSN, build_hash(t))
+            .map_err(TemplateError::Pool)?;
+        // The full stream, to a temporary file: its key, then the put.
+        let tmp_dir = self.state_dir.join("layers").join("tmp");
+        std::fs::create_dir_all(&tmp_dir).map_err(TemplateError::Store)?;
+        let tmp = tmp_dir.join(format!("{}-{}.part", hex(t.as_bytes()), std::process::id()));
+        let key = (|| -> Result<HashVal, TemplateError> {
+            let mut stream = self
+                .sender
+                .send(&bd, None, LAYER_LSN)
+                .map_err(TemplateError::Store)?;
+            let mut f = File::create(&tmp).map_err(TemplateError::Store)?;
+            let mut h = blake3::Hasher::new_derive_key(ObjectKind::Layer.prefix());
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                let n = stream.read(&mut buf).map_err(TemplateError::Store)?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+                f.write_all(&buf[..n]).map_err(TemplateError::Store)?;
+            }
+            f.sync_all().map_err(TemplateError::Store)?;
+            let key = HashVal::from_bytes(*h.finalize().as_bytes());
+            self.put_layer(key, &tmp)?;
+            Ok(key)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        let key = key?;
+        (self.failpoint)("layer.after_build_put")?;
+        if let Some(g) = self.pool.guid(&bd).map_err(TemplateError::Pool)? {
+            self.pool.destroy(&bd, g).map_err(TemplateError::Pool)?;
+        }
+        Ok(key)
+    }
+
+    // ── Receive and check ───────────────────────────────────────────
+
+    /// The layer bound to `key`, present and checked: its guid.  `want`
+    /// is the accepted guid, if one is accepted.
+    fn receive_checked(
+        &self,
+        ds: &Dataset,
+        key: HashVal,
+        want: Option<u64>,
+        def: &Definition,
+        notes: &mut Vec<String>,
+    ) -> Result<u64, TemplateError> {
+        let marker = self.marker(key);
+        if self.pool.info(ds).map_err(TemplateError::Pool)?.is_some() {
+            // Bound to this key already?  `receive` of a Seal that is
+            // there binds and returns without reading.
+            match self
+                .pool
+                .receive(ds, None, (LAYER_LSN, key), &mut io::empty())
+            {
+                Ok(g) => {
+                    if want.is_some_and(|w| w != g) {
+                        return Err(TemplateError::Mismatch(format!(
+                            "{ds} is bound to the accepted layer with guid {g}, not {}; left for an operator",
+                            want.unwrap_or_default()
+                        )));
+                    }
+                    if std::fs::read_to_string(&marker).ok().as_deref() == Some(&g.to_string()) {
+                        return Ok(g);
+                    }
+                    notes.push(format!("checking {ds}, received but not yet checked"));
+                    self.check_or_destroy(ds, def)?;
+                    self.mark(&marker, g)?;
+                    return Ok(g);
+                }
+                Err(_) => {
+                    let g = self.pool.guid(ds).map_err(TemplateError::Pool)?;
+                    if let Some(g) = g {
+                        self.pool.destroy(ds, g).map_err(TemplateError::Pool)?;
+                        notes.push(format!(
+                            "destroyed {ds} (guid {g}): bound to another layer than {}",
+                            hex(key.as_bytes())
+                        ));
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&marker);
+        let mut r = Verifying {
+            inner: self.get(ObjectKind::Layer, key)?,
+            hasher: blake3::Hasher::new_derive_key(ObjectKind::Layer.prefix()),
+            key,
+            done: false,
+        };
+        let g = self
+            .pool
+            .receive(ds, None, (LAYER_LSN, key), &mut r)
+            .map_err(|e| {
+                if r.done && r.failed() {
+                    TemplateError::Integrity(self.path(ObjectKind::Layer, key))
+                } else {
+                    TemplateError::Pool(e)
+                }
+            })?;
+        (self.failpoint)("layer.after_receive")?;
+        if want.is_some_and(|w| w != g) {
+            self.destroy(ds)?;
+            return Err(TemplateError::Mismatch(format!(
+                "the received layer's guid is {g}, the accepted one {}",
+                want.unwrap_or_default()
+            )));
+        }
+        self.check_or_destroy(ds, def)?;
+        self.mark(&marker, g)?;
+        Ok(g)
+    }
+
+    fn mark(&self, marker: &Path, guid: u64) -> Result<(), TemplateError> {
+        if let Some(d) = marker.parent() {
+            std::fs::create_dir_all(d).map_err(TemplateError::Store)?;
+        }
+        std::fs::write(marker, guid.to_string()).map_err(TemplateError::Store)
+    }
+
+    fn destroy(&self, ds: &Dataset) -> Result<(), TemplateError> {
+        if let Some(g) = self.pool.guid(ds).map_err(TemplateError::Pool)? {
+            self.pool.destroy(ds, g).map_err(TemplateError::Pool)?;
+        }
+        Ok(())
+    }
+
+    /// The received layer's top directory is the Template range's and its
+    /// tree walks to the output manifest; else it is destroyed.
+    fn check_or_destroy(&self, ds: &Dataset, def: &Definition) -> Result<(), TemplateError> {
+        let checked = (|| -> Result<(), TemplateError> {
+            use std::os::unix::fs::MetadataExt;
+            let view = self
+                .pool
+                .seal_view(ds, LAYER_LSN)
+                .map_err(TemplateError::Pool)?;
+            let m = std::fs::symlink_metadata(view.path()).map_err(TemplateError::Walk)?;
+            if (m.uid(), m.gid()) != (self.template_base, self.template_base) {
+                return Err(TemplateError::Mismatch(format!(
+                    "{ds}'s top directory is owned by {}:{}, not this node's Template range {} \
+                     (host_uid_base and template_slot must be the same on every node)",
+                    m.uid(),
+                    m.gid(),
+                    self.template_base
+                )));
+            }
+            let owner = Owner {
+                uid_base: self.template_base,
+                gid_base: self.template_base,
+            };
+            let walked = classify::walk(view.path(), &def.map, owner, &self.limits, &self.reserved)
+                .map_err(TemplateError::Walk)?;
+            if !same_entries(&walked, &def.manifest) {
+                return Err(TemplateError::Mismatch(format!(
+                    "{ds} does not walk to the Template's output manifest"
+                )));
+            }
+            Ok(())
+        })();
+        if checked.is_err() {
+            self.destroy(ds)?;
+        }
+        checked
+    }
+
+    // ── The Warden Chronicle ────────────────────────────────────────
+
+    fn open_warden(&self, notes: &mut Vec<String>) -> Result<Warden<'_, P, X>, TemplateError> {
+        let id = warden_chronicle(self.warden);
+        match self
+            .coord
+            .claim_chronicle(id, self.warden, ClaimAuthority::Vessel)
+        {
+            Ok(_) => {}
+            Err(CoordError::AlreadyRegistered(_))
+            | Err(CoordError::Claim(ClaimError::AlreadyClaimed { .. })) => {
+                let own = self.coord.ownership(id)?;
+                if own.holder != self.warden {
+                    return Err(TemplateError::WardenHeldElsewhere { holder: own.holder });
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let packs = Packs::new(self.store.clone(), NoSend, &self.prefix, id)
+            .map_err(TemplateError::Store)?;
+        let dir = self.state_dir.join("warden").join(hex(id.as_bytes()));
+        if !dir.exists() {
+            let anchor = self.coord.shipped(id)?;
+            let frames = if anchor.lsn > Lsn::new(0) {
+                packs.chain(Some(anchor))?.frames
+            } else {
+                Vec::new()
+            };
+            if let Some(p) = dir.parent() {
+                std::fs::create_dir_all(p).map_err(TemplateError::Store)?;
+            }
+            restore_log(&dir, id, &frames)?;
+            if !frames.is_empty() {
+                notes.push("rebuilt this Warden's Chronicle from its packs".into());
+            }
+        }
+        let (chronicle, _) =
+            Chronicle::open_after_gap(&dir, self.coord.clone(), id, self.warden, NoLayers)?;
+        Ok(Warden {
+            t: self,
+            chronicle,
+            packs,
+            attempt: 0,
+        })
+    }
+}
+
+/// §4.1.7: the walk equals the manifest entry for entry.
+fn same_entries(walked: &Manifest, want: &Manifest) -> bool {
+    walked.complete() && walked.unsupported.is_empty() && walked.entries == want.entries
+}
+
+/// What the manifest does not describe is given to the range, as the
+/// runtime prepares a Vessel's dataset: the top directory (owner, mode
+/// 0750; an artifact has no entry for its root) and a `lost+found` the
+/// filesystem made `0:0` (file 4d).  The receive check requires the top
+/// directory to be the range's.
+fn own_top(dir: &Path, base: u32) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    std::os::unix::fs::chown(dir, Some(base), Some(base))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
+    let p = dir.join("lost+found");
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_dir() && m.uid() == 0 && m.gid() == 0 => {
+            std::os::unix::fs::lchown(&p, Some(base), Some(base))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// A layer object as it is read, checked against its key at its end: a
+/// mismatch fails the read, so the receive leaves nothing.
+struct Verifying {
+    inner: ByteStream,
+    hasher: blake3::Hasher,
+    key: HashVal,
+    done: bool,
+}
+
+impl Verifying {
+    fn failed(&self) -> bool {
+        self.hasher.finalize().as_bytes() != self.key.as_bytes()
+    }
+}
+
+impl Read for Verifying {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            self.done = true;
+            if self.failed() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the layer object does not hash to its key",
+                ));
+            }
+            return Ok(0);
+        }
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+// ── Submitting from the Warden Chronicle ────────────────────────────
+
+struct Warden<'a, P: Pool, X: Sender> {
+    t: &'a TemplateLayers<P, X>,
+    chronicle: Chronicle<NoLayers>,
+    packs: Packs<SharedStore, NoSend>,
+    attempt: u64,
+}
+
+impl<P: Pool, X: Sender> Warden<'_, P, X> {
+    /// A record with this logical id already in the local log.
+    fn prepared(&self, logical: HashVal) -> Result<Option<ContractRecord>, TemplateError> {
+        for f in self.chronicle.frames().map_err(ChronicleError::from)? {
+            if f.envelope.stream != Stream::Ctl {
+                continue;
+            }
+            if let Ok(Payload::Contract(r)) = Payload::decode(&f.payload) {
+                if r.logical_id() == logical {
+                    return Ok(Some(*r));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn lsn_of(&self, digest: HashVal) -> Result<Lsn, TemplateError> {
+        for f in self.chronicle.frames().map_err(ChronicleError::from)? {
+            if let Ok(Payload::Contract(r)) = Payload::decode(&f.payload) {
+                if r.digest() == digest {
+                    return Ok(f.envelope.lsn);
+                }
+            }
+        }
+        Err(TemplateError::Inconsistent(
+            "a prepared record is not in the local log".into(),
+        ))
+    }
+
+    fn accepted(&self, logical: HashVal) -> Result<Option<ContractRecord>, TemplateError> {
+        Ok(match self.t.coord.query_logical(logical)? {
+            Some((_, Submitted::Contract(r))) => Some(r),
+            Some(_) => {
+                return Err(TemplateError::Inconsistent(
+                    "a Birth under a layer id".into(),
+                ))
+            }
+            None => None,
+        })
+    }
+
+    /// Submit `rec` (logical lookup, append once, ship, announce, accept):
+    /// the record accepted for its logical id, this one or another.
+    fn submit(&mut self, rec: ContractRecord) -> Result<ContractRecord, TemplateError> {
+        let logical = rec.logical_id();
+        if let Some(r) = self.accepted(logical)? {
+            return Ok(r);
+        }
+        let rec = match self.prepared(logical)? {
+            Some(p) if p == rec => p,
+            Some(p) => {
+                return Err(TemplateError::Inconsistent(format!(
+                    "the Warden Chronicle already holds another {p:?} for this layer"
+                )))
+            }
+            None => {
+                self.chronicle
+                    .append(Stream::Ctl, Payload::Contract(Box::new(rec.clone())))?;
+                rec
+            }
+        };
+        let digest = rec.digest();
+        let lsn = self.lsn_of(digest)?;
+        let tail = self.chronicle.tail();
+        self.packs.ship_log(&self.chronicle.segments(), tail)?;
+        self.t.coord.advance_shipped(
+            self.t.warden,
+            self.chronicle.id(),
+            self.chronicle.epoch(),
+            tail,
+        )?;
+        let pack = self
+            .packs
+            .pack_names()?
+            .into_iter()
+            .find(|n| {
+                name_bounds(n)
+                    .is_some_and(|(end, base, fs)| fs.is_none() && base < lsn && lsn <= end)
+            })
+            .ok_or_else(|| {
+                TemplateError::Inconsistent(format!("no shipped pack carries lsn {}", lsn.get()))
+            })?;
+        let (id, epoch) = (self.chronicle.id(), self.chronicle.epoch());
+        let coord = &self.t.coord;
+        for _ in 0..HEAD_MOVED_TRIES {
+            let sub = submission_id(logical, digest, epoch, self.attempt);
+            self.attempt += 1;
+            if let Err(a) = coord.announce(self.t.warden, id, epoch, sub, logical, digest)? {
+                return self.final_answer(logical, a);
+            }
+            let mut tries = 0;
+            loop {
+                let head = coord.query_chronicle(id)?.map_or(Head::EMPTY, |v| v.head);
+                let a = coord.accept(
+                    self.t.warden,
+                    id,
+                    epoch,
+                    sub,
+                    head,
+                    pack.clone(),
+                    Submitted::Contract(rec.clone()),
+                )?;
+                match a {
+                    Answer::Accepted { .. } | Answer::AlreadyAccepted { .. } => {
+                        return self.accepted(logical)?.ok_or_else(|| {
+                            TemplateError::Inconsistent("accepted, but not in the log".into())
+                        });
+                    }
+                    Answer::Refused(Transient::NotReadable) if tries + 1 < NOT_READABLE_TRIES => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(200 << tries));
+                    }
+                    Answer::Refused(Transient::HeadMoved { .. }) => {
+                        coord.cancel(self.t.warden, id, epoch, sub)?;
+                        break;
+                    }
+                    Answer::Refused(last) => {
+                        let _ = coord.cancel(self.t.warden, id, epoch, sub);
+                        return Err(TemplateError::NotAccepted(last));
+                    }
+                    Answer::FinalRefused(_) => return self.final_answer(logical, a),
+                }
+            }
+        }
+        Err(TemplateError::NotAccepted(Transient::HeadMoved {
+            head: coord.query_chronicle(id)?.map_or(Head::EMPTY, |v| v.head),
+        }))
+    }
+
+    fn final_answer(&self, logical: HashVal, a: Answer) -> Result<ContractRecord, TemplateError> {
+        match a {
+            Answer::FinalRefused(Final::Conflict)
+            | Answer::Accepted { .. }
+            | Answer::AlreadyAccepted { .. } => self.accepted(logical)?.ok_or_else(|| {
+                TemplateError::Inconsistent(
+                    "answered accepted or Conflict, nothing accepted".into(),
+                )
+            }),
+            Answer::FinalRefused(r) => Err(TemplateError::Refused(r)),
+            Answer::Refused(t) => Err(TemplateError::NotAccepted(t)),
+        }
+    }
+}
+
+/// The Warden Chronicle has no Seals.
+struct NoLayers;
+
+impl Layers for NoLayers {
+    fn snapshot(&mut self, lsn: Lsn, _: HashVal) -> Result<(), LayerError> {
+        Err(format!("a Warden Chronicle has no Seal layers (lsn {})", lsn.get()).into())
+    }
+    fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
+        Ok(Vec::new())
+    }
+    fn destroy(&mut self, _: Lsn) -> Result<(), LayerError> {
+        Ok(())
+    }
+}
+
+/// The Warden Chronicle ships logs only.
+struct NoSend;
+
+impl Sender for NoSend {
+    fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> io::Result<ByteStream> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a Warden Chronicle ships no fs stream",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, SystemTime};
+
+    use taso_core::contract::Peer;
+    use taso_core::coordlog::ObjectId;
+    use taso_core::record::Authority;
+
+    use crate::coordinator::{Coordinator, LogConfig};
+    use crate::coordstore::CoordStore;
+    use crate::genesis::{self, Genesis, Outcome, Request, Source};
+    use crate::ship::{LocalStore, ObjectStore};
+    use crate::vessel::SealView;
+    use crate::zfs::{CloneBase, DatasetInfo};
+
+    const PREFIX: &str = "taso";
+    const BASE: u32 = 200_000;
+    const SLOT: u32 = 65_536;
+    /// Slot 9 of every node is the Template range in these tests.
+    const TBASE: u32 = BASE + 9 * SLOT;
+
+    // ── A directory-backed pool that sends and receives ─────────────
+    //
+    // A dataset is a directory; a Seal layer a `cp -a` copy with its hash
+    // beside it; a stream a `tar` of a Seal's copy (owners and times
+    // kept); a received Seal's guid derived from its binding, as the block
+    // log's.
+
+    #[derive(Default)]
+    struct DirState {
+        guids: BTreeMap<String, u64>,
+        next: u64,
+        destroyed: Vec<String>,
+        created: Vec<String>,
+    }
+
+    #[derive(Clone)]
+    struct DirPool {
+        root: PathBuf,
+        state: Arc<Mutex<DirState>>,
+    }
+
+    impl DirPool {
+        fn data(&self, d: &Dataset) -> PathBuf {
+            self.root.join("data").join(d.as_str())
+        }
+        fn snaps(&self, d: &Dataset) -> PathBuf {
+            self.root.join("snap").join(d.as_str())
+        }
+        fn new_dataset(&self, d: &Dataset) -> Result<PathBuf, LayerError> {
+            let p = self.data(d);
+            if p.exists() {
+                return Err(format!("{d} exists").into());
+            }
+            std::fs::create_dir_all(&p)?;
+            let mut s = self.state.lock().unwrap();
+            s.next += 1;
+            let g = 1000 + s.next;
+            s.guids.insert(d.as_str().into(), g);
+            s.created.push(d.as_str().into());
+            Ok(p)
+        }
+    }
+
+    struct DirLayers {
+        data: PathBuf,
+        snaps: PathBuf,
+    }
+
+    fn copy_tree(from: &Path, to: &Path) -> Result<(), LayerError> {
+        let ok = Command::new("cp")
+            .arg("-a")
+            .arg(from)
+            .arg(to)
+            .status()?
+            .success();
+        if ok {
+            Ok(())
+        } else {
+            Err("cp -a failed".into())
+        }
+    }
+
+    impl Layers for DirLayers {
+        fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+            std::fs::create_dir_all(&self.snaps)?;
+            let to = self.snaps.join(lsn.get().to_string());
+            if to.exists() {
+                return Err("layer exists".into());
+            }
+            copy_tree(&self.data, &to)?;
+            std::fs::write(to.with_extension("hash"), hash.as_bytes())?;
+            Ok(())
+        }
+        fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
+            let mut out = Vec::new();
+            let Ok(rd) = std::fs::read_dir(&self.snaps) else {
+                return Ok(out);
+            };
+            for e in rd {
+                let p = e?.path();
+                if p.extension().is_some() {
+                    continue;
+                }
+                let lsn: u64 = p.file_name().unwrap().to_str().unwrap().parse()?;
+                let h: [u8; 32] = std::fs::read(p.with_extension("hash"))?
+                    .try_into()
+                    .map_err(|_| "bad hash")?;
+                out.push((Lsn::new(lsn), HashVal::from_bytes(h)));
+            }
+            out.sort_by_key(|(l, _)| *l);
+            Ok(out)
+        }
+        fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
+            let p = self.snaps.join(lsn.get().to_string());
+            let _ = std::fs::remove_dir_all(&p);
+            let _ = std::fs::remove_file(p.with_extension("hash"));
+            Ok(())
+        }
+    }
+
+    fn unsupported<T>() -> Result<T, LayerError> {
+        Err("not in the test pool".into())
+    }
+
+    impl Pool for DirPool {
+        type Layers = DirLayers;
+        fn create(&self, d: &Dataset) -> Result<DatasetInfo, LayerError> {
+            let p = self.new_dataset(d)?;
+            Ok(DatasetInfo {
+                dataset: d.clone(),
+                mountpoint: Some(p),
+                origin: None,
+                parent: None,
+            })
+        }
+        fn clone(
+            &self,
+            _: &Dataset,
+            _: Lsn,
+            _: HashVal,
+            _: &Dataset,
+        ) -> Result<DatasetInfo, LayerError> {
+            unsupported()
+        }
+        fn info(&self, d: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
+            let p = self.data(d);
+            Ok(p.exists().then(|| DatasetInfo {
+                dataset: d.clone(),
+                mountpoint: Some(p),
+                origin: None,
+                parent: None,
+            }))
+        }
+        fn layers(&self, d: &Dataset) -> DirLayers {
+            DirLayers {
+                data: self.data(d),
+                snaps: self.snaps(d),
+            }
+        }
+        fn receive(
+            &self,
+            d: &Dataset,
+            from: Option<(Lsn, HashVal)>,
+            to: (Lsn, HashVal),
+            stream: &mut dyn Read,
+        ) -> Result<u64, LayerError> {
+            assert!(from.is_none(), "the test pool receives full streams only");
+            if self.data(d).exists() {
+                let bound = self.layers(d).list()?.into_iter().find(|(l, _)| *l == to.0);
+                return match bound {
+                    Some((_, h)) if h == to.1 => Ok(crate::blk::guid(to.0, to.1)),
+                    Some(_) => Err("bound to another record".into()),
+                    None => Err(format!("{d} exists without its Seal").into()),
+                };
+            }
+            // Read the whole stream first: a stream that fails as it is
+            // read leaves nothing.
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes)?;
+            let p = self.new_dataset(d)?;
+            let mut child = Command::new("tar")
+                .args(["-x", "-p", "--numeric-owner", "-f", "-", "-C"])
+                .arg(&p)
+                .stdin(Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(&bytes)?;
+            if !child.wait()?.success() {
+                return Err("tar -x failed".into());
+            }
+            self.layers(d).snapshot(to.0, to.1)?;
+            Ok(crate::blk::guid(to.0, to.1))
+        }
+        fn adopt(
+            &self,
+            _: &Dataset,
+            _: (Lsn, HashVal),
+            _: (Lsn, HashVal),
+            _: &Dataset,
+            _: Lsn,
+            _: &dyn Sender,
+        ) -> Result<u64, LayerError> {
+            unsupported()
+        }
+        fn receive_clone(
+            &self,
+            _: &Dataset,
+            _: &CloneBase,
+            _: (Lsn, HashVal),
+            _: &mut dyn Read,
+        ) -> Result<u64, LayerError> {
+            unsupported()
+        }
+        fn seal_view(&self, d: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
+            let p = self.snaps(d).join(lsn.get().to_string());
+            if !p.exists() {
+                return Err(format!("no layer {d}@{}", lsn.get()).into());
+            }
+            Ok(SealView::new(p, None))
+        }
+        fn guid(&self, d: &Dataset) -> Result<Option<u64>, LayerError> {
+            Ok(self.state.lock().unwrap().guids.get(d.as_str()).copied())
+        }
+        fn destroy(&self, d: &Dataset, guid: u64) -> Result<bool, LayerError> {
+            let mut s = self.state.lock().unwrap();
+            match s.guids.get(d.as_str()) {
+                None => return Ok(false),
+                Some(&g) if g != guid => return Err(format!("{d} is {g}, not {guid}").into()),
+                Some(_) => {}
+            }
+            s.guids.remove(d.as_str());
+            s.destroyed.push(d.as_str().into());
+            std::fs::remove_dir_all(self.data(d))?;
+            let _ = std::fs::remove_dir_all(self.snaps(d));
+            Ok(true)
+        }
+    }
+
+    /// A Seal's full stream: `tar` of its copy, sorted by name.
+    /// The pool's root, and a label written into every stream's tar volume
+    /// header (ignored on extract): each node's builds differ by it, as two
+    /// real builds' streams do (ZFS guids and txgs; ext4 allocation).
+    struct DirSend(PathBuf, String);
+
+    impl Sender for DirSend {
+        fn send(&self, d: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream> {
+            assert!(from.is_none());
+            let dir = self
+                .0
+                .join("snap")
+                .join(d.as_str())
+                .join(to.get().to_string());
+            let out = Command::new("tar")
+                .args(["-c", "--sort=name", "--numeric-owner", "-V"])
+                .arg(&self.1)
+                .args(["-f", "-", "-C"])
+                .arg(&dir)
+                .arg(".")
+                .output()?;
+            if !out.status.success() {
+                return Err(io::Error::other("tar -c failed"));
+            }
+            Ok(Box::new(Cursor::new(out.stdout)))
+        }
+    }
+
+    // ── A cluster with one Template ─────────────────────────────────
+
+    struct Cluster {
+        dir: tempfile::TempDir,
+        store: SharedStore,
+        coord: Arc<Coordinator>,
+        t0: ChronicleId,
+    }
+
+    const MAP: &str = "version = 1\n[[rule]]\nglob = \"**\"\nclass = \"Source\"\n";
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    impl Cluster {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("store")).unwrap();
+            let store: SharedStore = Arc::new(LocalStore::new(dir.path().join("store")));
+            let coord = Arc::new(
+                Coordinator::open_with(
+                    dir.path().join("coord.redb"),
+                    LogConfig {
+                        store: Arc::new(CoordStore::new(store.clone(), PREFIX)),
+                        ..LogConfig::default()
+                    },
+                )
+                .unwrap(),
+            );
+            // T(0), by a genesis from a small host tree on node 0.
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(src.join("app")).unwrap();
+            for (f, body) in [("app/main.py", "print(1)\n"), ("README", "t0\n")] {
+                std::fs::write(src.join(f), body).unwrap();
+                std::fs::set_permissions(src.join(f), std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                File::options()
+                    .write(true)
+                    .open(src.join(f))
+                    .unwrap()
+                    .set_modified(at(1_700_000_000))
+                    .unwrap();
+            }
+            for d in [src.join("app"), src.clone()] {
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+                File::open(&d)
+                    .unwrap()
+                    .set_modified(at(1_600_000_000))
+                    .unwrap();
+            }
+            let n0 = dir.path().join("node0");
+            let g = Genesis {
+                pool: DirPool {
+                    root: n0.join("pool"),
+                    state: Arc::default(),
+                },
+                store: store.clone(),
+                prefix: PREFIX.into(),
+                coord: coord.clone(),
+                warden: WardenId::new(100),
+                state_dir: n0.join("state"),
+                root: Dataset::new("tank/taso").unwrap(),
+                host_uid_base: BASE,
+                limits: Limits::default(),
+                reserved: Reserved::defaults(),
+                failpoint: genesis::no_failpoints(),
+            };
+            let r = g
+                .run(&Request {
+                    source: Source::Dir(src),
+                    classmap: MAP.as_bytes().to_vec(),
+                    authority: Authority {
+                        actor: "jarmo".into(),
+                        reason: "T(0)".into(),
+                    },
+                    hook_waiver: None,
+                    best_effort: true,
+                    peer: Peer { uid: 0, pid: 1 },
+                })
+                .unwrap();
+            let Outcome::Ready { template_id, .. } = r.outcome else {
+                panic!("{:?}", r.outcome)
+            };
+            Self {
+                dir,
+                store,
+                coord,
+                t0: template_id,
+            }
+        }
+
+        fn node(&self, n: u64, storage: StorageKind) -> TemplateLayers<DirPool, DirSend> {
+            let at = self.dir.path().join(format!("node{n}"));
+            TemplateLayers {
+                pool: DirPool {
+                    root: at.join("pool"),
+                    state: Arc::default(),
+                },
+                sender: DirSend(at.join("pool"), format!("node{n}")),
+                storage,
+                store: self.store.clone(),
+                prefix: PREFIX.into(),
+                coord: self.coord.clone(),
+                warden: WardenId::new(n),
+                state_dir: at.join("state"),
+                root: Dataset::new("tank/taso").unwrap(),
+                template_base: TBASE,
+                limits: Limits::default(),
+                reserved: Reserved::defaults(),
+                failpoint: no_failpoints(),
+                lock: Mutex::new(()),
+            }
+        }
+
+        fn lose(&self, n: u64) {
+            std::fs::remove_dir_all(self.dir.path().join(format!("node{n}"))).unwrap();
+        }
+
+        fn shipped(&self, storage: StorageKind) -> Option<LayerShipped> {
+            match self
+                .coord
+                .query_logical(logical_id(&LogicalKey::Layer(self.t0, storage)))
+                .unwrap()
+            {
+                Some((_, Submitted::Contract(ContractRecord::LayerShipped(l)))) => Some(l),
+                None => None,
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    fn fail_at(name: &'static str) -> Failpoint {
+        Box::new(move |p| {
+            if p == name {
+                Err(TemplateError::Failpoint(p))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// The layer on `node` is the accepted one, checked, its files owned by
+    /// the Template range.
+    fn present(c: &Cluster, node: &TemplateLayers<DirPool, DirSend>, l: &Layer) {
+        use std::os::unix::fs::MetadataExt;
+        let s = c.shipped(node.storage).expect("a LayerShipped is accepted");
+        assert_eq!((l.layer_key, l.guid), (s.layer_key, s.guid));
+        assert_eq!(l.dataset, node.layer_dataset(c.t0).unwrap());
+        let bound = node.pool.layers(&l.dataset).list().unwrap();
+        assert_eq!(bound, vec![(LAYER_LSN, s.layer_key)]);
+        let view = node.pool.seal_view(&l.dataset, LAYER_LSN).unwrap();
+        let m = std::fs::metadata(view.path().join("app/main.py")).unwrap();
+        assert_eq!((m.uid(), m.gid()), (TBASE, TBASE));
+        assert!(node.marker(s.layer_key).exists(), "marked checked");
+        assert!(
+            node.pool
+                .info(&node.build_dataset(c.t0).unwrap())
+                .unwrap()
+                .is_none(),
+            "no build left"
+        );
+    }
+
+    // ── Tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_first_node_builds_and_every_node_receives_the_same_layer() {
+        let c = Cluster::new();
+        let n1 = c.node(1, StorageKind::Blk);
+        let l1 = n1.ensure(c.t0).unwrap();
+        present(&c, &n1, &l1);
+        assert!(
+            l1.notes.iter().any(|n| n.starts_with("built the layer")),
+            "{:?}",
+            l1.notes
+        );
+        // Held by the Template.
+        assert!(c
+            .coord
+            .query_chronicle(c.t0)
+            .unwrap()
+            .unwrap()
+            .holds
+            .contains(&ObjectId::content(l1.layer_key)));
+        // Shipped from node 1's own Chronicle.
+        let wc = c
+            .coord
+            .query_chronicle(warden_chronicle(WardenId::new(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(wc.accepted.len(), 1);
+
+        // Node 2 builds nothing: it receives the same stream.
+        let n2 = c.node(2, StorageKind::Blk);
+        let l2 = n2.ensure(c.t0).unwrap();
+        present(&c, &n2, &l2);
+        assert_eq!((l2.layer_key, l2.guid), (l1.layer_key, l1.guid));
+        assert!(l2.notes.is_empty(), "{:?}", l2.notes);
+        assert!(!n2
+            .pool
+            .state
+            .lock()
+            .unwrap()
+            .created
+            .iter()
+            .any(|d| d.contains("/tb-")));
+
+        // Again on node 2: present and checked, nothing done.
+        let again = n2.ensure(c.t0).unwrap();
+        assert_eq!(again, l2);
+        assert_eq!(n2.pool.state.lock().unwrap().created.len(), 1);
+
+        // The other storage kind has its own LayerShipped.  (The test
+        // pool's streams are alike for both kinds, so here it is the same
+        // object; real storages' streams differ.)
+        let z = c.node(3, StorageKind::Zfs).ensure(c.t0).unwrap();
+        assert_eq!(c.shipped(StorageKind::Zfs).unwrap().layer_key, z.layer_key);
+        let wc3 = c
+            .coord
+            .query_chronicle(warden_chronicle(WardenId::new(3)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(wc3.accepted.len(), 1, "node 3 shipped the ZFS layer");
+    }
+
+    #[test]
+    fn not_a_template_is_refused() {
+        let c = Cluster::new();
+        let n1 = c.node(1, StorageKind::Blk);
+        let v = ChronicleId::from_bytes([0x0A; 16]);
+        assert!(matches!(n1.ensure(v), Err(TemplateError::NotATemplate(t)) if t == v));
+    }
+
+    #[test]
+    fn a_layer_received_but_not_checked_is_checked_and_a_bad_one_destroyed() {
+        let c = Cluster::new();
+        c.node(1, StorageKind::Blk).ensure(c.t0).unwrap();
+        // Node 2 stops right after its receive.
+        let mut n2 = c.node(2, StorageKind::Blk);
+        n2.failpoint = fail_at("layer.after_receive");
+        assert!(matches!(n2.ensure(c.t0), Err(TemplateError::Failpoint(_))));
+        n2.failpoint = no_failpoints();
+        let l = n2.ensure(c.t0).unwrap();
+        assert!(
+            l.notes.iter().any(|n| n.contains("not yet checked")),
+            "{:?}",
+            l.notes
+        );
+        present(&c, &n2, &l);
+        // A layer tampered with after its receive fails its check and is
+        // destroyed; the next call receives it afresh.
+        std::fs::remove_file(n2.marker(l.layer_key)).unwrap();
+        let view = n2.pool.seal_view(&l.dataset, LAYER_LSN).unwrap();
+        std::fs::write(view.path().join("README"), "tampered\n").unwrap();
+        assert!(matches!(n2.ensure(c.t0), Err(TemplateError::Mismatch(_))));
+        assert!(n2.pool.info(&l.dataset).unwrap().is_none(), "destroyed");
+        let l = n2.ensure(c.t0).unwrap();
+        present(&c, &n2, &l);
+    }
+
+    #[test]
+    fn every_failpoint_resumes_with_one_layer_shipped() {
+        for fp in [
+            "layer.after_build_put",
+            "layer.before_shipped_accept",
+            "layer.after_shipped_accept",
+            "layer.after_receive",
+        ] {
+            let c = Cluster::new();
+            let mut n1 = c.node(1, StorageKind::Blk);
+            n1.failpoint = fail_at(fp);
+            assert!(
+                matches!(n1.ensure(c.t0), Err(TemplateError::Failpoint(p)) if p == fp),
+                "{fp}"
+            );
+            n1.failpoint = no_failpoints();
+            let l = n1.ensure(c.t0).unwrap_or_else(|e| panic!("{fp}: {e}"));
+            present(&c, &n1, &l);
+            let wc = c
+                .coord
+                .query_chronicle(warden_chronicle(WardenId::new(1)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(wc.accepted.len(), 1, "{fp}: one LayerShipped");
+            // A layer built and checked but not shipped is reused, not
+            // rebuilt.
+            if fp == "layer.before_shipped_accept" {
+                assert!(
+                    l.notes.iter().any(|n| n.contains("checked earlier")),
+                    "{fp}: {:?}",
+                    l.notes
+                );
+                let builds = n1
+                    .pool
+                    .state
+                    .lock()
+                    .unwrap()
+                    .created
+                    .iter()
+                    .filter(|d| d.contains("/tb-"))
+                    .count();
+                assert_eq!(builds, 1, "{fp}: built once");
+            }
+            // The same failpoints on a node lost there: another node
+            // finishes, from the store and the log.
+            let c = Cluster::new();
+            let mut n1 = c.node(1, StorageKind::Blk);
+            n1.failpoint = fail_at(fp);
+            assert!(n1.ensure(c.t0).is_err());
+            drop(n1);
+            c.lose(1);
+            let n2 = c.node(2, StorageKind::Blk);
+            let l = n2
+                .ensure(c.t0)
+                .unwrap_or_else(|e| panic!("{fp} on node 2: {e}"));
+            present(&c, &n2, &l);
+        }
+    }
+
+    #[test]
+    fn two_builders_race_and_the_loser_takes_the_accepted_layer() {
+        let c = Arc::new(Cluster::new());
+        // Node 1 builds and receives its own layer; just before it ships,
+        // node 2 builds and ships its own (a different stream).
+        let mut n1 = c.node(1, StorageKind::Blk);
+        let c2 = c.clone();
+        n1.failpoint = Box::new(move |p| {
+            if p == "layer.before_shipped_accept" && c2.shipped(StorageKind::Blk).is_none() {
+                c2.node(2, StorageKind::Blk)
+                    .ensure(c2.t0)
+                    .map_err(|e| TemplateError::Inconsistent(e.to_string()))?;
+            }
+            Ok(())
+        });
+        let l1 = n1.ensure(c.t0).unwrap();
+        let won = c.shipped(StorageKind::Blk).unwrap();
+        // Node 1's submission answered Conflict: it took node 2's layer,
+        // destroying its own, and said so.
+        assert_eq!(l1.layer_key, won.layer_key);
+        assert!(
+            l1.notes.iter().any(|n| n.contains("was shipped first")),
+            "{:?}",
+            l1.notes
+        );
+        assert!(
+            l1.notes
+                .iter()
+                .any(|n| n.contains("bound to another layer")),
+            "{:?}",
+            l1.notes
+        );
+        present(&c, &n1, &l1);
+        let accepted = |w: u64| {
+            c.coord
+                .query_chronicle(warden_chronicle(WardenId::new(w)))
+                .unwrap()
+                .unwrap()
+                .accepted
+                .len()
+        };
+        assert_eq!(
+            (accepted(1), accepted(2)),
+            (0, 1),
+            "one LayerShipped, node 2's"
+        );
+        // Node 1's own object is an orphan candidate: held by nothing.
+        let mine = l1
+            .notes
+            .iter()
+            .find_map(|n| n.split("this node's ").nth(1))
+            .and_then(|r| r.split(' ').next())
+            .unwrap()
+            .to_string();
+        assert_ne!(mine, hex(won.layer_key.as_bytes()));
+    }
+
+    #[test]
+    fn a_lost_race_with_a_different_stream_destroys_the_losers_layer() {
+        let c = Cluster::new();
+        // Node 1 built, received and checked its own layer, then stopped
+        // before shipping it.
+        let mut n1 = c.node(1, StorageKind::Blk);
+        n1.failpoint = fail_at("layer.before_shipped_accept");
+        assert!(n1.ensure(c.t0).is_err());
+        let mine = n1.layer_dataset(c.t0).unwrap();
+        let my_key = n1.pool.layers(&mine).list().unwrap()[0].1;
+        // Node 2 ships its own, a different stream.
+        let won = c.node(2, StorageKind::Blk).ensure(c.t0).unwrap();
+        assert_ne!(won.layer_key, my_key);
+        // Node 1 again: the accepted layer is settled; its own is destroyed
+        // by guid and the accepted one received.
+        n1.failpoint = no_failpoints();
+        let l = n1.ensure(c.t0).unwrap();
+        assert_eq!(l.layer_key, won.layer_key);
+        assert!(
+            l.notes.iter().any(|n| n.contains("bound to another layer")),
+            "{:?}",
+            l.notes
+        );
+        present(&c, &n1, &l);
+    }
+
+    #[test]
+    fn a_tampered_layer_object_is_never_received() {
+        let c = Cluster::new();
+        let l1 = c.node(1, StorageKind::Blk).ensure(c.t0).unwrap();
+        let path = object_key_path(PREFIX, ObjectKind::Layer, l1.layer_key).unwrap();
+        let mut bytes = Vec::new();
+        c.store
+            .get(&path)
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        c.store.put(&path, &mut &bytes[..]).unwrap();
+        let n2 = c.node(2, StorageKind::Blk);
+        assert!(matches!(n2.ensure(c.t0), Err(TemplateError::Integrity(p)) if p == path));
+        assert!(
+            n2.pool
+                .info(&n2.layer_dataset(c.t0).unwrap())
+                .unwrap()
+                .is_none(),
+            "nothing left"
+        );
+    }
+
+    #[test]
+    fn a_node_with_another_template_range_refuses_the_layer() {
+        let c = Cluster::new();
+        c.node(1, StorageKind::Blk).ensure(c.t0).unwrap();
+        let mut n2 = c.node(2, StorageKind::Blk);
+        n2.template_base = TBASE + SLOT;
+        let e = n2.ensure(c.t0).unwrap_err();
+        assert!(
+            matches!(&e, TemplateError::Mismatch(w) if w.contains("Template range")),
+            "{e}"
+        );
+        assert!(
+            n2.pool
+                .info(&n2.layer_dataset(c.t0).unwrap())
+                .unwrap()
+                .is_none(),
+            "destroyed"
+        );
+    }
+
+    #[test]
+    fn the_warden_chronicle_survives_its_node_and_is_one_wardens() {
+        let c = Cluster::new();
+        let mut n1 = c.node(1, StorageKind::Blk);
+        n1.failpoint = fail_at("layer.after_shipped_accept");
+        assert!(n1.ensure(c.t0).is_err());
+        drop(n1);
+        c.lose(1);
+        // Node 1 again, on a fresh disk: its Chronicle is rebuilt from the
+        // packs; the accepted layer is received.
+        let n1 = c.node(1, StorageKind::Blk);
+        let l = n1.ensure(c.t0).unwrap();
+        present(&c, &n1, &l);
+        // Another Warden holding warden 5's Chronicle stops warden 5.
+        c.coord
+            .claim_chronicle(
+                warden_chronicle(WardenId::new(5)),
+                WardenId::new(6),
+                ClaimAuthority::Vessel,
+            )
+            .unwrap();
+        let n5 = c.node(5, StorageKind::Zfs);
+        assert!(matches!(
+            n5.ensure(c.t0),
+            Err(TemplateError::WardenHeldElsewhere { holder }) if holder == WardenId::new(6)
+        ));
+    }
+
+    #[test]
+    fn warden_chronicle_ids_are_pinned_and_distinct() {
+        assert_ne!(
+            warden_chronicle(WardenId::new(1)),
+            warden_chronicle(WardenId::new(2))
+        );
+        let mut b = [0u8; 32];
+        b[..16].copy_from_slice(warden_chronicle(WardenId::new(1)).as_bytes());
+        assert_eq!(
+            HashVal::from_bytes(b).to_string(),
+            "cccc13deaa40ef3ac092018c1391102800000000000000000000000000000000"
+        );
+    }
+}
