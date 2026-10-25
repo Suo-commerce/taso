@@ -576,6 +576,7 @@ mod tests {
             Request::TurnEnd { .. } => "turn",
             Request::Fork { .. } => "fork",
             Request::Outcome { .. } => "outcome",
+            Request::Nominate { .. } => "nominate",
         };
         assert_eq!(
             runs[0].iter().map(tag).collect::<Vec<_>>(),
@@ -653,7 +654,8 @@ mod tests {
                     | Request::Open
                     | Request::Fork { .. }
                     | Request::Promote { .. }
-                    | Request::Result { .. } => {
+                    | Request::Result { .. }
+                    | Request::Nominate { .. } => {
                         unreachable!()
                     }
                 };

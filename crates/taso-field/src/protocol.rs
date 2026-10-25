@@ -144,6 +144,14 @@ pub enum Request {
         /// The op, as the `Effect` reply gave it.
         op: u64,
     },
+    /// Put one of this Vessel's accepted Seals forward as a Candidate
+    /// (tag 9; P4 §3.1): a request, never an authority.
+    Nominate {
+        /// The Seal's lsn; `None`: the newest.
+        seal: Option<u64>,
+        /// The classes to drop (`"Scratch"`, …), each at most once.
+        exclude: Vec<String>,
+    },
 }
 
 /// What a sender reports.
@@ -234,6 +242,41 @@ pub enum Reply {
         /// Its state.
         state: OpState,
     },
+    /// Answer to `Nominate` (tag 10).
+    Nominate {
+        /// What happened.
+        result: NominateResult,
+    },
+}
+
+/// The answer to a nomination (P4 spec §3.1, D60, D61).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NominateResult {
+    /// The Candidate is accepted: its `candidate_id`, 64 hex digits
+    /// (tag 0).
+    Nominated {
+        /// The Candidate.
+        candidate: String,
+    },
+    /// Submitted; whether it was accepted is not known yet (tag 1).  Ask
+    /// again: the same request answers from the log.
+    Pending {
+        /// The Candidate it would be.
+        candidate: String,
+    },
+    /// Refused, for good for this Seal and exclusion (tag 2).
+    Refused {
+        /// Why.
+        reason: String,
+    },
+    /// Nothing decided and nothing recorded: ask again later (tag 3).
+    Retry {
+        /// Why.
+        why: String,
+    },
+    /// This Vessel has no verifier configured, or its node does not
+    /// nominate: it cannot nominate (tag 4).
+    NoVerifier,
 }
 
 /// What became of an effect, as far as this Vessel's ledger knows.
@@ -552,6 +595,12 @@ impl Request {
             Self::Result { op } => {
                 o.u8(8).u64(*op);
             }
+            Self::Nominate { seal, exclude } => {
+                o.u8(9).opt_u64(*seal).u64(exclude.len() as u64);
+                for c in exclude {
+                    o.str(c);
+                }
+            }
         }
         o.0
     }
@@ -595,6 +644,19 @@ impl Request {
                 seal: r.opt_u64()?,
             },
             8 => Self::Result { op: r.u64()? },
+            9 => {
+                let seal = r.opt_u64()?;
+                let n = r.u64()?;
+                // Every class is at least its 8-byte length.
+                if n > (r.b.len() - r.pos) as u64 / 8 {
+                    return Err(r.err(r.pos, "truncated"));
+                }
+                let mut exclude = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    exclude.push(r.string()?);
+                }
+                Self::Nominate { seal, exclude }
+            }
             _ => return Err(r.bad_tag("unknown request tag")),
         };
         r.finish()?;
@@ -680,6 +742,16 @@ impl Reply {
                     OpState::Unknown => o.u8(4),
                     OpState::NotFound => o.u8(5),
                     OpState::AcceptedUnknown => o.u8(6),
+                };
+            }
+            Self::Nominate { result } => {
+                o.u8(10);
+                match result {
+                    NominateResult::Nominated { candidate } => o.u8(0).str(candidate),
+                    NominateResult::Pending { candidate } => o.u8(1).str(candidate),
+                    NominateResult::Refused { reason } => o.u8(2).str(reason),
+                    NominateResult::Retry { why } => o.u8(3).str(why),
+                    NominateResult::NoVerifier => o.u8(4),
                 };
             }
         }
@@ -803,6 +875,22 @@ impl Reply {
                     5 => OpState::NotFound,
                     6 => OpState::AcceptedUnknown,
                     _ => return Err(r.bad_tag("unknown op state tag")),
+                },
+            },
+            10 => Self::Nominate {
+                result: match r.tag()? {
+                    0 => NominateResult::Nominated {
+                        candidate: r.string()?,
+                    },
+                    1 => NominateResult::Pending {
+                        candidate: r.string()?,
+                    },
+                    2 => NominateResult::Refused {
+                        reason: r.string()?,
+                    },
+                    3 => NominateResult::Retry { why: r.string()? },
+                    4 => NominateResult::NoVerifier,
+                    _ => return Err(r.bad_tag("unknown nominate result tag")),
                 },
             },
             _ => return Err(r.bad_tag("unknown reply tag")),
@@ -1041,6 +1129,11 @@ mod tests {
             (text(), proptest::option::of(any::<u64>()))
                 .prop_map(|(child, seal)| Request::Promote { child, seal }),
             any::<u64>().prop_map(|op| Request::Result { op }),
+            (
+                proptest::option::of(any::<u64>()),
+                proptest::collection::vec(text(), 0..3)
+            )
+                .prop_map(|(seal, exclude)| Request::Nominate { seal, exclude }),
         ]
     }
 
@@ -1124,6 +1217,14 @@ mod tests {
                 ]
             )
                 .prop_map(|(op, state)| Reply::Result { op, state }),
+            prop_oneof![
+                text().prop_map(|candidate| NominateResult::Nominated { candidate }),
+                text().prop_map(|candidate| NominateResult::Pending { candidate }),
+                text().prop_map(|reason| NominateResult::Refused { reason }),
+                text().prop_map(|why| NominateResult::Retry { why }),
+                Just(NominateResult::NoVerifier),
+            ]
+            .prop_map(|result| Reply::Nominate { result }),
         ]
     }
 
@@ -1256,6 +1357,29 @@ mod tests {
 
     /// A `Promote` reply refuses a count larger than the body could hold
     /// before allocating.
+    /// P4 file 6b: the nomination request, pinned, and a count that
+    /// cannot fit refused before allocating.
+    #[test]
+    fn the_nominate_request_is_pinned() {
+        let req = Request::Nominate {
+            seal: Some(7),
+            exclude: vec!["Scratch".into()],
+        };
+        let mut want = vec![9u8, 1];
+        want.extend_from_slice(&7u64.to_le_bytes());
+        want.extend_from_slice(&1u64.to_le_bytes());
+        want.extend_from_slice(&7u64.to_le_bytes());
+        want.extend_from_slice(b"Scratch");
+        assert_eq!(req.encode(), want);
+        let mut bad = vec![9u8, 0];
+        bad.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Request::decode(&bad).is_err());
+        let rep = Reply::Nominate {
+            result: NominateResult::NoVerifier,
+        };
+        assert_eq!(rep.encode(), vec![10, 4]);
+    }
+
     #[test]
     fn a_promote_reply_with_an_impossible_count_is_refused() {
         let mut b = vec![8u8];
@@ -1357,7 +1481,7 @@ mod tests {
     #[test]
     fn strict_refusals_name_the_offset() {
         assert!(matches!(
-            Request::decode(&[9]),
+            Request::decode(&[10]),
             Err(ProtocolError::Malformed {
                 at: 0,
                 why: "unknown request tag"

@@ -84,8 +84,8 @@ use std::time::Duration;
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{OpId, Payload, StreamCut, TurnId, Verdict};
 use taso_field::protocol::{
-    recv_request, send_reply, EffectResult, ErrorCode, ForkResult, OpState, OpenEffect, Outcome,
-    PromoteResult, ProtocolError, Reply, Request, VERSION,
+    recv_request, send_reply, EffectResult, ErrorCode, ForkResult, NominateResult, OpState,
+    OpenEffect, Outcome, PromoteResult, ProtocolError, Reply, Request, VERSION,
 };
 
 use crate::chronicle::{ChronicleError, Layers};
@@ -125,7 +125,8 @@ impl Socket {
             | Request::TurnEnd { .. }
             | Request::Fork { .. }
             | Request::Promote { .. }
-            | Request::Result { .. } => self == Socket::Agent,
+            | Request::Result { .. }
+            | Request::Nominate { .. } => self == Socket::Agent,
         }
     }
 }
@@ -169,6 +170,19 @@ pub trait Branches<L: Layers> {
     fn promoted(&mut self, _child: &str, _result: &PromoteResult) {}
 }
 
+/// How a session's `Nominate` requests reach the Warden (P4 file 6b;
+/// the daemon: [`crate::daemon`]).  A request, never an authority.
+pub trait Nominations<L: Layers> {
+    /// Nominate `vessel`'s Seal `seal` (`None`: the newest) with the
+    /// classes `exclude` dropped (spec §3.1).
+    fn nominate(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        seal: Option<u64>,
+        exclude: &[String],
+    ) -> NominateResult;
+}
+
 /// One conversation with a Vessel's harness.
 pub struct Session<'v, L: Layers> {
     vessel: &'v mut Vessel<L>,
@@ -189,6 +203,8 @@ pub struct Session<'v, L: Layers> {
     after_seal: Option<&'v mut dyn AfterSeal<L>>,
     /// Forks and promotions, if this Vessel may ask for them.
     branches: Option<&'v mut dyn Branches<L>>,
+    /// Nominations, if this Vessel may ask for them.
+    nominations: Option<&'v mut dyn Nominations<L>>,
     /// A promotion is done and its files are adopted at the next start
     /// (C7): until then this Vessel takes no Seal (it would move), and the
     /// agent may only record transcript and read results.
@@ -228,6 +244,7 @@ impl<'v, L: Layers> Session<'v, L> {
             watch: None,
             after_seal: None,
             branches: None,
+            nominations: None,
             adopting: false,
             after_seal_failures: 0,
             last_after_seal_error: None,
@@ -251,6 +268,12 @@ impl<'v, L: Layers> Session<'v, L> {
     /// Run `hook` after each Seal.
     pub fn with_after_seal(mut self, hook: &'v mut dyn AfterSeal<L>) -> Self {
         self.after_seal = Some(hook);
+        self
+    }
+
+    /// Hand Nominate requests to `n`.
+    pub fn with_nominations(mut self, n: &'v mut dyn Nominations<L>) -> Self {
+        self.nominations = Some(n);
         self
     }
 
@@ -502,6 +525,9 @@ impl<'v, L: Layers> Session<'v, L> {
                 result: self.fork(seal),
             },
             (true, Request::Result { op }) => self.result(op),
+            (true, Request::Nominate { seal, exclude }) => Reply::Nominate {
+                result: self.nominate(seal, &exclude),
+            },
             (true, Request::Promote { child, seal }) => {
                 let result = self.promote(&child, seal);
                 if let Some(b) = self.branches.as_deref_mut() {
@@ -547,6 +573,21 @@ impl<'v, L: Layers> Session<'v, L> {
             Err(e) => return vessel_error(e),
         };
         Reply::Result { op, state }
+    }
+
+    fn nominate(&mut self, seal: Option<u64>, exclude: &[String]) -> NominateResult {
+        if self.nominations.is_none() {
+            return NominateResult::NoVerifier;
+        }
+        // Only a shipped Seal is nominated (D60): one whose publish failed
+        // gets one more try first (as before a fork, F4b).
+        if let Some(seal) = self.unpublished {
+            self.run_hook(seal);
+        }
+        let Some(n) = self.nominations.as_deref_mut() else {
+            unreachable!("checked above")
+        };
+        n.nominate(self.vessel, seal, exclude)
     }
 
     fn fork(&mut self, seal: Option<u64>) -> ForkResult {
@@ -708,6 +749,7 @@ fn request_name(req: &Request) -> &'static str {
         Request::Fork { .. } => "Fork",
         Request::Promote { .. } => "Promote",
         Request::Result { .. } => "Result",
+        Request::Nominate { .. } => "Nominate",
     }
 }
 
@@ -2543,6 +2585,65 @@ mod tests {
     }
 
     /// Without the Warden's `Branches` (or, for Promote, an engine),
+    /// P4 file 6b: a `Nominate` reaches the Warden's nominations as asked
+    /// and its answer goes back; without nominations it is `NoVerifier`;
+    /// it belongs on the agent's socket only.
+    #[test]
+    fn nominations_are_asked_for_over_the_field() {
+        struct Echo(Vec<(Option<u64>, Vec<String>)>);
+        impl Nominations<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers> for Echo {
+            fn nominate(
+                &mut self,
+                _: &mut Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>,
+                seal: Option<u64>,
+                exclude: &[String],
+            ) -> NominateResult {
+                self.0.push((seal, exclude.to_vec()));
+                NominateResult::Retry {
+                    why: "asked".into(),
+                }
+            }
+        }
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let ask = || Request::Nominate {
+            seal: Some(2),
+            exclude: vec!["Scratch".into()],
+        };
+        {
+            let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+            s.handle(hello());
+            assert_eq!(
+                s.handle(ask()),
+                Reply::Nominate {
+                    result: NominateResult::NoVerifier
+                }
+            );
+        }
+        let mut echo = Echo(Vec::new());
+        {
+            let mut s = Session::new(&mut v, Verdict::Clean)
+                .unwrap()
+                .with_nominations(&mut echo);
+            s.handle(hello());
+            assert_eq!(
+                s.handle(ask()),
+                Reply::Nominate {
+                    result: NominateResult::Retry {
+                        why: "asked".into()
+                    }
+                }
+            );
+            let mut conn = sender();
+            assert!(is_error(
+                &s.handle_as(&mut conn, ask()),
+                ErrorCode::NotOnThisSocket
+            ));
+        }
+        assert_eq!(echo.0, vec![(Some(2), vec!["Scratch".to_string()])]);
+    }
+
     /// Fork and Promote are refused and nothing is recorded.
     #[test]
     fn forks_and_promotions_without_branches_are_refused() {
