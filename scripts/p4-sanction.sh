@@ -513,9 +513,13 @@ vconf v9 'while :; do echo xxxxxxxx; done' 'output_bound = 100
 WANT_ATTEMPT=([v0]="Exit { code: 0 }" [v1]="Exit { code: 1 }" [v2]="Exit { code: 2 }" [v3]="Timeout"
     [v4]="Exit { code: 0 }" [v5]="LaunchFailed" [v6]="Exit { code: 4 }" [v8]="Exit { code: 5 }" [v9]="OutputLimit")
 say "2. v0..v9 born from T(0) on node 1, two turns each, each agent nominates dropping Scratch (predict: exit 0 each; 'Born from Template' T(0); v7 refused 'Walk(UnknownPaths)'; every other one attempted as listed)"
+# Each Vessel's uid_slot: 1..8, then 10 and 11. Slot 9 is the Template
+# range ($TSLOT), which the Warden refuses for any Vessel (D53).
+SLOTS=(1 2 3 4 5 6 7 8 10 11)
+for sl in "${SLOTS[@]}" 15; do [[ $sl != "$TSLOT" ]] || die "uid_slot $sl is the Template range"; done
 for i in 0 1 2 3 4 5 6 7 8 9; do
     v=v$i
-    config 1 "$W/$v.json" "$(born "$v" $((i + 1)) "$T0" "$(gsim 2 "${DB[$v]:-/work/state.db}" Scratch)")"
+    config 1 "$W/$v.json" "$(born "$v" "${SLOTS[$i]}" "$T0" "$(gsim 2 "${DB[$v]:-/work/state.db}" Scratch)")"
     wardend "2-$v" 1 "$W/$v.json"
     expect "$v: exit 0" is "$RC" 0
     expect "$v: born from T(0)" is "$(count "2-$v.err" "\] $v: Born from Template $T0")" 1
