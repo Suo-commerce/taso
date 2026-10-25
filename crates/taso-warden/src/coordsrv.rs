@@ -1899,13 +1899,13 @@ impl Coord for RemoteCoord {
     fn purge_blocker(
         &self,
         chronicle: ChronicleId,
-    ) -> Result<Option<taso_core::contract::DeferReason>, CoordError> {
+    ) -> Result<Option<taso_core::contract::PurgeBlocker>, CoordError> {
         let r = self.call(Request::PurgeBlocker { chronicle })?;
         blob_reply(r, |r| match r.u8()? {
             0 => Ok(None),
             1 => {
                 let b = r.bytes()?;
-                taso_core::contract::DeferReason::decode(&b)
+                taso_core::contract::PurgeBlocker::decode(&b)
                     .map(Some)
                     .map_err(|_| JournalError("bad defer reason"))
             }
@@ -2590,7 +2590,7 @@ mod tests {
         coord.set_retention_pin(t0, true).unwrap();
         assert_eq!(
             c.purge_blocker(t0).unwrap(),
-            Some(taso_core::contract::DeferReason::RetentionPin)
+            Some(taso_core::contract::PurgeBlocker::RetentionPin)
         );
         coord.set_retention_pin(t0, false).unwrap();
         assert_eq!(

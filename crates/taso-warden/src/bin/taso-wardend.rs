@@ -208,6 +208,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // An interrupted verifier is run again at the Warden's own start
+    // (P4 §3.4, D88), beside the Vessels' runs.
+    let relaunch = {
+        let node = node.clone();
+        std::thread::spawn(move || node.relaunch_pass())
+    };
     // Purge at TTL (P4 §6.7, D81): a pass at start, then every
     // `purge.recheck_seconds`.
     let ttl_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -273,6 +279,7 @@ fn main() -> ExitCode {
         }
     };
 
+    let _ = relaunch.join();
     decider.stop();
     if let Some(t) = ttl {
         ttl_stop.store(true, std::sync::atomic::Ordering::SeqCst);

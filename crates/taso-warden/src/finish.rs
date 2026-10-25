@@ -1,5 +1,6 @@
 //! Finishing a sanction: the Template born from an accepted
-//! `SanctionCommitted` (P4 spec rev. 23 §5.3 steps 5–6, D21, D79; file 9a).
+//! `SanctionCommitted` (P4 spec rev. 30 §5.3 steps 5–6, D21, D79, D87, D90;
+//! files 9a, 15).
 //!
 //! [`Finisher::finish`], from the accepted commit, in order:
 //!
@@ -15,8 +16,18 @@
 //!    is compared, never assumed: the same `born_from` and `layer`
 //!    continue; anything else is [`FinishError::Inconsistent`], the
 //!    operator's `SanctionInconsistent`, and the source stays committed.
+//!    This is a check against a defect, not a state (D87): `template_id`
+//!    is derived from the commit, so a correct Warden never finds the two
+//!    different.
 //! 4. **`SanctionCompleted { template_id }`** in the source, through the
 //!    Vessel's own log.
+//!
+//! **A fenced finisher** (D87): when the coordinator refuses one of the
+//! finish's submissions `StaleEpoch` (another Warden took over the target
+//! or the source), the Warden asks for the Template's `TemplateReady`.
+//! Accepted: another Warden finished the sanction, and [`Finished`] says
+//! so (`elsewhere`), with no error.  Not accepted: the refusal is the
+//! error, and the next holder's open finishes it.
 //!
 //! [`Finisher::unfinished`] is the restart rule (step 6): every accepted
 //! commit in a Vessel's local log without an accepted `SanctionCompleted`.
@@ -24,8 +35,8 @@
 //! The target's local log lives in `<state_dir>/template/<template_id
 //! hex>` (D79); a node without it rebuilds it from the shipped packs.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 23, BLAKE3
-//! `d9e1c19a62cb3b3a736a2856898abb9467fae96283c61a08ee1d557ec57abddb`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 30, BLAKE3
+//! `b5f59255657885a8c056c1e758e76699f1a36485a2e2327ca21d47c6ead1ccd8`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -35,7 +46,7 @@ use std::time::Duration;
 use taso_core::contract::{
     logical_id, BornFrom, ContractRecord, LogicalKey, SanctionCommitted, TemplateReady,
 };
-use taso_core::coordlog::{ClaimAuthority, ClaimError, Submitted};
+use taso_core::coordlog::{ClaimAuthority, ClaimError, Final, Submitted};
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::Payload;
@@ -104,6 +115,32 @@ impl fmt::Display for FinishError {
 
 impl std::error::Error for FinishError {}
 
+impl FinishError {
+    /// The coordinator refused this Warden's epoch: another Warden holds
+    /// the target or the source now (D87).  The fence reaches a finish as
+    /// `StaleEpoch` at accept, as `NotHolder` or `EpochMismatch` when the
+    /// shipped anchor is advanced before the announce, or when the
+    /// Vessel's own log refuses the append (the Warden's epoch check).
+    pub fn is_stale_epoch(&self) -> bool {
+        let fenced = |e: &CoordError| {
+            matches!(
+                e,
+                CoordError::NotHolder { .. } | CoordError::EpochMismatch { .. }
+            )
+        };
+        match self {
+            Self::Submit(SubmitError::Refused(Final::StaleEpoch)) => true,
+            Self::Submit(SubmitError::Coord(e))
+            | Self::Coord(e)
+            | Self::Chronicle(ChronicleError::Refused(e))
+            | Self::Submit(SubmitError::Chronicle(ChronicleError::Refused(e)))
+            | Self::Vessel(VesselError::Coord(e))
+            | Self::Vessel(VesselError::Chronicle(ChronicleError::Refused(e))) => fenced(e),
+            _ => false,
+        }
+    }
+}
+
 impl From<CoordError> for FinishError {
     fn from(e: CoordError) -> Self {
         Self::Coord(e)
@@ -141,6 +178,8 @@ pub struct Finished {
     /// What a reader of the log should know (a takeover, an earlier
     /// run's record).
     pub notes: Vec<String>,
+    /// Another Warden finished it; this one was fenced (D87).
+    pub elsewhere: bool,
 }
 
 /// Finishes sanctions on this Warden.
@@ -224,8 +263,33 @@ impl Finisher {
         Ok(out)
     }
 
-    /// Finish `commit`, an accepted commit of `vessel` (§5.3 step 5).
+    /// Finish `commit`, an accepted commit of `vessel` (§5.3 step 5).  A
+    /// finish fenced by another Warden that has published the Template
+    /// answers `Finished { elsewhere: true }` (D87).
     pub fn finish<L: Layers, X: Sender>(
+        &self,
+        vessel: &mut Vessel<L>,
+        packs: &Packs<SharedStore, X>,
+        commit: &SanctionCommitted,
+    ) -> Result<Finished, FinishError> {
+        match self.finish_here(vessel, packs, commit) {
+            Err(e) if e.is_stale_epoch() => {
+                match self.accepted(LogicalKey::Template(commit.template_id))? {
+                    Some(ContractRecord::TemplateReady(_)) => Ok(Finished {
+                        template_id: commit.template_id,
+                        notes: vec![format!(
+                            "this Warden was fenced ({e}); another Warden finished the sanction"
+                        )],
+                        elsewhere: true,
+                    }),
+                    _ => Err(e),
+                }
+            }
+            r => r,
+        }
+    }
+
+    fn finish_here<L: Layers, X: Sender>(
         &self,
         vessel: &mut Vessel<L>,
         packs: &Packs<SharedStore, X>,
@@ -294,6 +358,7 @@ impl Finisher {
         Ok(Finished {
             template_id: tid,
             notes,
+            elsewhere: false,
         })
     }
 

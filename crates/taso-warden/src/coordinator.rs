@@ -584,11 +584,11 @@ pub trait Coord: Send + Sync {
     }
 
     /// What keeps the Chronicle from being purged now (§6.3 step 2's
-    /// pre-check), as a `PurgeDeferred` reason; `None` if nothing does.
+    /// pre-check), as a blocker (D85); `None` if nothing does.
     fn purge_blocker(
         &self,
         chronicle: ChronicleId,
-    ) -> Result<Option<taso_core::contract::DeferReason>, CoordError> {
+    ) -> Result<Option<taso_core::contract::PurgeBlocker>, CoordError> {
         let _ = chronicle;
         Err(no_log())
     }
@@ -1672,7 +1672,7 @@ impl Coord for Coordinator {
     fn purge_blocker(
         &self,
         chronicle: ChronicleId,
-    ) -> Result<Option<taso_core::contract::DeferReason>, CoordError> {
+    ) -> Result<Option<taso_core::contract::PurgeBlocker>, CoordError> {
         self.read_log(move |log| log.purge_blocker(chronicle))
     }
 

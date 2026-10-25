@@ -1,17 +1,18 @@
-//! Purging a Vessel (P4 spec rev. 25 §6.3, §6.4, §6.7, D81; file 11).
+//! Purging a Vessel (P4 spec rev. 30 §6.3, §6.4, §6.7, D81, D85; files 11, 15).
 //!
 //! [`Purger::purge`] runs §6.3 on a Vessel the caller has opened here (the
 //! open is the fence: a new epoch; open attempts are closed by the open,
 //! D69), in order:
 //!
-//! 2. **Pre-check**: what the coordinator says keeps it from being purged
-//!    is accepted as `PurgeDeferred { checked_at: <the log's tail>, reason }`.
-//!    Else the inventory (the coordinator's projection) and the local state
-//!    (the dataset's guid and its layers) are put as content objects.
-//! 3. **Commit** `PurgeCommitted`.  A `Predicate` refusal at accept is final
-//!    for that submission: what blocks it now is accepted as
-//!    `PurgeDeferred` (§10.2 row 11), and a later purge is a new
-//!    submission.
+//! 2. **Pre-check**: the Warden asks the coordinator what blocks the
+//!    purge (`purge_blocker`).  Something does: the Warden records nothing
+//!    and answers [`Purged::Blocked`] (D85; the caller logs it).  Else the
+//!    Warden puts the inventory (the coordinator's projection) and the
+//!    local state (the dataset's guid and its layers) as content objects.
+//! 3. **Commit** `PurgeCommitted`.  When the coordinator refuses it at
+//!    accept (`Predicate`), that submission is final: the Warden asks what
+//!    blocks it now and answers it, recording nothing (§10.2 row 11); a
+//!    later purge is a new submission.
 //! 4. **Finish** every item by the matrix (§6.4): the replacement put and
 //!    its `ReplacementInstalled` accepted before the original is deleted;
 //!    an item with neither is `ItemLost`, never fabricated.
@@ -27,8 +28,8 @@
 //! Running it again continues from what is accepted: a committed purge is
 //! finished, an ended one answered.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 25, BLAKE3
-//! `2a969bc87edeface4953a9f02e9d1538368fed9ced0ffbe4be52c80c7c9abf16`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 30, BLAKE3
+//! `b5f59255657885a8c056c1e758e76699f1a36485a2e2327ca21d47c6ead1ccd8`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -36,9 +37,9 @@ use std::io::Read;
 use std::sync::Arc;
 
 use taso_core::contract::{
-    logical_id, ContractRecord, Cutoff, DeferReason, Inventory, InventoryItem, ItemLost,
-    LocalState, LogicalKey, ObjectKind, PurgeCommitted, PurgeComplete, PurgeDamaged, PurgeDeferred,
-    ReplacementInstalled, SealRef,
+    logical_id, ContractRecord, Cutoff, Inventory, InventoryItem, ItemLost, LocalState, LogicalKey,
+    ObjectKind, PurgeBlocker, PurgeCommitted, PurgeComplete, PurgeDamaged, ReplacementInstalled,
+    SealRef,
 };
 use taso_core::coordlog::{Final, Submitted};
 use taso_core::envelope::{HashVal, Lsn, Stream};
@@ -72,10 +73,10 @@ pub const FAILPOINTS: [&str; 10] = [
 /// How a purge ended (this run, or an earlier one).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Purged {
-    /// Something keeps it: `PurgeDeferred` is accepted.
-    Deferred(DeferReason),
-    /// The commit was refused for a reason no deferral names (the
-    /// coordinator's rule): Live; nothing more recorded.
+    /// The coordinator names what blocks it; nothing recorded (D85).
+    Blocked(PurgeBlocker),
+    /// The coordinator refused the commit for a reason `purge_blocker`
+    /// does not name (its rule): Live; nothing more recorded.
     Refused(&'static str),
     /// `PurgeComplete` is accepted.
     Complete {
@@ -162,7 +163,7 @@ pub struct Purger {
 
 enum Commit {
     Committed(PurgeCommitted),
-    Deferred(DeferReason),
+    Blocked(PurgeBlocker),
     Refused(&'static str),
 }
 
@@ -283,7 +284,7 @@ impl Purger {
             Some(other) => return Err(PurgeError::Inconsistent(format!("{other:?}"))),
             None => match self.commit(pool, vessel, packs)? {
                 Commit::Committed(p) => p,
-                Commit::Deferred(r) => return Ok(Purged::Deferred(r)),
+                Commit::Blocked(r) => return Ok(Purged::Blocked(r)),
                 Commit::Refused(rule) => return Ok(Purged::Refused(rule)),
             },
         };
@@ -395,8 +396,8 @@ impl Purger {
         packs: &Packs<SharedStore, X>,
     ) -> Result<Commit, PurgeError> {
         let id = vessel.id();
-        if let Some(reason) = self.coord.purge_blocker(id)? {
-            return self.defer(vessel, packs, reason);
+        if let Some(blocker) = self.coord.purge_blocker(id)? {
+            return Ok(Commit::Blocked(blocker));
         }
         let inv = Inventory::new(self.coord.purge_projection(id)?)
             .map_err(|e| PurgeError::Inconsistent(format!("the projection: {e:?}")))?;
@@ -419,29 +420,12 @@ impl Purger {
             Ok(other) => Err(PurgeError::Inconsistent(format!("{other:?}"))),
             // Final for this submission (§6.3 step 3): what blocks it now.
             Err(Final::Predicate(rule)) => match self.coord.purge_blocker(id)? {
-                Some(reason) => self.defer(vessel, packs, reason),
+                Some(blocker) => Ok(Commit::Blocked(blocker)),
                 None => Ok(Commit::Refused(rule)),
             },
             Err(f) => Err(PurgeError::Inconsistent(format!(
                 "PurgeCommitted refused: {f:?}"
             ))),
-        }
-    }
-
-    fn defer<L: Layers, X: Sender>(
-        &self,
-        vessel: &mut Vessel<L>,
-        packs: &Packs<SharedStore, X>,
-        reason: DeferReason,
-    ) -> Result<Commit, PurgeError> {
-        let rec = ContractRecord::PurgeDeferred(PurgeDeferred {
-            chronicle: vessel.id(),
-            checked_at: vessel.tail().lsn,
-            reason,
-        });
-        match self.must(vessel, packs, rec)? {
-            ContractRecord::PurgeDeferred(d) => Ok(Commit::Deferred(d.reason)),
-            other => Err(PurgeError::Inconsistent(format!("{other:?}"))),
         }
     }
 

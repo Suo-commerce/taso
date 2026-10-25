@@ -1,13 +1,15 @@
-//! Verification attempts: their records and their runs (P4 spec rev. 20
-//! §3.4; D66, D68–D70; file 7b).
+//! Verification attempts: their records and their runs (P4 spec rev. 30
+//! §3.4; D66, D68–D70, D88, D90; files 7b, 15).
 //!
 //! **Records** ([`Attempts`]), on the Vessel's session thread, through
 //! the Vessel's own log: [`Attempts::start`] appends and accepts
 //! `VerificationStarted` (`started_at` = the tail) before anything runs;
 //! [`Attempts::finish`] appends and accepts `VerificationFinished`;
 //! [`Attempts::interrupt_open`] closes every open attempt `Interrupted`
-//! at an open (D69); [`Attempts::unattempted`] lists the open Candidates
-//! that never had an attempt (D68).
+//! at an open (D69); [`Attempts::to_attempt`] lists the open Candidates
+//! the Warden launches an attempt for: those that never had one (D68),
+//! and those whose attempts all ended `Interrupted`, fewer than
+//! [`MAX_INTERRUPTED`] of them (D88).
 //!
 //! **A run** ([`AttemptRun::run`]), on its own thread: the vconf (D64),
 //! the verifier Template's layer as the read-only root (D65), the
@@ -18,8 +20,8 @@
 //! [`destroy_candidate`] removes the `/candidate` dataset once the
 //! attempt's `VerificationFinished` is accepted (D66).
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 20, BLAKE3
-//! `77cb877ff0c826ac48f8302b2f468192cfe6e7f46923f19fb6c0bcde79d4c475`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 30, BLAKE3
+//! `b5f59255657885a8c056c1e758e76699f1a36485a2e2327ca21d47c6ead1ccd8`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -59,6 +61,10 @@ pub const FAILPOINTS: [&str; 3] = [
     "verify.mid_run",
     "verify.before_finished_accept",
 ];
+
+/// After this many interrupted attempts of a Candidate the Warden stops
+/// running its verifier again (D88): it waits for a verdict and its TTL.
+pub const MAX_INTERRUPTED: u32 = 3;
 
 /// The `/candidate` Seal's lsn in its dataset.
 const CANDIDATE_LSN: Lsn = Lsn::new(1);
@@ -234,28 +240,64 @@ impl Attempts {
         Ok(out)
     }
 
-    /// The open Candidates of `vessel` (accepted, not closed) that have no
-    /// accepted attempt (D68).
-    pub fn unattempted<L: Layers>(
+    /// The open Candidates of `vessel` (accepted, not closed) the Warden
+    /// launches an attempt for: no accepted attempt (D68), or every
+    /// accepted attempt finished `Interrupted` and fewer than
+    /// [`MAX_INTERRUPTED`] of them (D88).  An attempt that is still open,
+    /// or that ended otherwise (a result about the files), keeps the
+    /// Candidate out.
+    pub fn to_attempt<L: Layers>(
         &self,
         vessel: &Vessel<L>,
     ) -> Result<Vec<Candidate>, AttemptError> {
-        let frames = frames(vessel)?;
-        let mut tried: BTreeSet<[u8; 32]> = BTreeSet::new();
-        for st in self.started(vessel)? {
-            if self.accepted(LogicalKey::Attempt(st.attempt_id))? {
-                tried.insert(*st.candidate_id.as_bytes());
+        self.to_attempt_in(&frames(vessel)?, false)
+    }
+
+    /// [`Attempts::to_attempt`] over a Vessel's local log read without
+    /// opening it.  With `open_as_interrupted`, an attempt still open
+    /// counts as interrupted: the open that settles it (D69) closes it so
+    /// (the Warden's own start, D88).
+    pub fn to_attempt_in(
+        &self,
+        frames: &[Frame],
+        open_as_interrupted: bool,
+    ) -> Result<Vec<Candidate>, AttemptError> {
+        // Per Candidate: the interrupted attempts, or None once one is
+        // open or ended otherwise.
+        let mut tried: std::collections::BTreeMap<[u8; 32], Option<u32>> = Default::default();
+        for st in started_in(frames) {
+            if !self.accepted(LogicalKey::Attempt(st.attempt_id))? {
+                continue;
             }
+            let interrupted = match self
+                .coord
+                .query_logical(logical_id(&LogicalKey::AttemptFinished(st.attempt_id)))?
+            {
+                Some((_, Submitted::Contract(ContractRecord::VerificationFinished(f)))) => {
+                    f.outcome == Outcome::Interrupted
+                }
+                None => open_as_interrupted,
+                _ => false,
+            };
+            let e = tried.entry(*st.candidate_id.as_bytes()).or_insert(Some(0));
+            *e = match (*e, interrupted) {
+                (Some(n), true) => Some(n + 1),
+                _ => None,
+            };
         }
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        for r in contracts(&frames) {
+        for r in contracts(frames) {
             let ContractRecord::Candidate(c) = r else {
                 continue;
             };
-            if !seen.insert(*c.candidate_id.as_bytes()) || tried.contains(c.candidate_id.as_bytes())
-            {
+            if !seen.insert(*c.candidate_id.as_bytes()) {
                 continue;
+            }
+            match tried.get(c.candidate_id.as_bytes()) {
+                None => {}
+                Some(Some(n)) if *n < MAX_INTERRUPTED => {}
+                Some(_) => continue,
             }
             // The accepted one (a retry may have appended another copy).
             let Some((_, Submitted::Contract(ContractRecord::Candidate(acc)))) = self
@@ -275,18 +317,7 @@ impl Attempts {
         &self,
         vessel: &Vessel<L>,
     ) -> Result<Vec<VerificationStarted>, AttemptError> {
-        let frames = frames(vessel)?;
-        let mut seen = BTreeSet::new();
-        Ok(contracts(&frames)
-            .filter_map(|r| match r {
-                ContractRecord::VerificationStarted(st)
-                    if seen.insert(*st.attempt_id.as_bytes()) =>
-                {
-                    Some(st)
-                }
-                _ => None,
-            })
-            .collect())
+        Ok(started_in(&frames(vessel)?))
     }
 
     fn accepted(&self, key: LogicalKey) -> Result<bool, AttemptError> {
@@ -348,6 +379,19 @@ fn frames<L: Layers>(vessel: &Vessel<L>) -> Result<Vec<Frame>, AttemptError> {
         .chronicle()
         .frames()
         .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?)
+}
+
+/// Every `VerificationStarted` in `frames`, once each.
+fn started_in(frames: &[Frame]) -> Vec<VerificationStarted> {
+    let mut seen = BTreeSet::new();
+    contracts(frames)
+        .filter_map(|r| match r {
+            ContractRecord::VerificationStarted(st) if seen.insert(*st.attempt_id.as_bytes()) => {
+                Some(st)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn contracts(frames: &[Frame]) -> impl Iterator<Item = ContractRecord> + '_ {

@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
     hold_id, replacement_name, valid_template_name, BornFrom, Candidate, CloseKind, ContractRecord,
-    Decision, DeferReason, Inventory, InventoryItem, LogicalKey, StorageKind, VerificationFinished,
-    VerificationStarted, RECORD_DOMAIN,
+    Decision, Inventory, InventoryItem, LogicalKey, PurgeBlocker, StorageKind,
+    VerificationFinished, VerificationStarted, RECORD_DOMAIN,
 };
 use crate::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use crate::record::{LineageRecord, Origin, Payload};
@@ -869,16 +869,16 @@ impl CoordLog {
     }
 
     /// What keeps `chronicle` from being purged now (§6.3 step 2, the
-    /// pre-check of the Purge row's predicate), as a `PurgeDeferred`
-    /// reason; `None` if nothing does.  In the predicate's order:
+    /// pre-check of the Purge row's predicate), as a blocker (D85);
+    /// `None` if nothing does.  In the predicate's order:
     /// an open obligation, a liveness dependency (a fork on it; an open
     /// sanction), an open attempt, a retention pin.  The inventory is
     /// the caller's to build ([`CoordLog::purge_projection`]).
-    pub fn purge_blocker(&self, chronicle: ChronicleId) -> Option<DeferReason> {
+    pub fn purge_blocker(&self, chronicle: ChronicleId) -> Option<PurgeBlocker> {
         let c = *chronicle.as_bytes();
         let me = self.chrons.get(&c)?;
         if !me.obligations.is_empty() {
-            return Some(DeferReason::OpenObligation);
+            return Some(PurgeBlocker::OpenObligation);
         }
         let mut holders: Vec<C16> = Vec::new();
         for (holder, on, kind) in &self.live {
@@ -887,7 +887,7 @@ impl CoordLog {
             }
             match kind {
                 Live::OpenSanction { candidate } => {
-                    return Some(DeferReason::OpenSanction {
+                    return Some(PurgeBlocker::OpenSanction {
                         candidate_id: HashVal::from_bytes(*candidate),
                     })
                 }
@@ -897,7 +897,7 @@ impl CoordLog {
         if !holders.is_empty() {
             holders.sort();
             holders.dedup();
-            return Some(DeferReason::LivenessDependency {
+            return Some(PurgeBlocker::LivenessDependency {
                 holders: holders.into_iter().map(ChronicleId::from_bytes).collect(),
                 unknown: Vec::new(),
             });
@@ -905,10 +905,10 @@ impl CoordLog {
         if self.attempts.values().any(|a| {
             a.finished.is_none() && self.cands[a.started.candidate_id.as_bytes()].chronicle == c
         }) {
-            return Some(DeferReason::OpenAttempt);
+            return Some(PurgeBlocker::OpenAttempt);
         }
         if me.pinned {
-            return Some(DeferReason::RetentionPin);
+            return Some(PurgeBlocker::RetentionPin);
         }
         None
     }
@@ -1239,10 +1239,6 @@ impl CoordLog {
                     matches!(t.born_from, BornFrom::Sanction { source, .. } if source == chronicle),
                     "not this Chronicle's sanction",
                 )?;
-            }
-            ContractRecord::PurgeDeferred(p) => {
-                need(p.chronicle == chronicle, "not this Chronicle's record")?;
-                need(!me.retired, "retired")?;
             }
             ContractRecord::PurgeCommitted(p) => {
                 need(p.chronicle == chronicle, "not this Chronicle's record")?;
@@ -2318,13 +2314,7 @@ mod tests {
             SubmissionStatus::AbsentAtRead
         );
         // Conflicting work is blocked by the pending guard.
-        let other = Submitted::Contract(ContractRecord::PurgeDeferred(
-            crate::contract::PurgeDeferred {
-                chronicle: f.v,
-                checked_at: Lsn::new(1),
-                reason: crate::contract::DeferReason::RetentionPin,
-            },
-        ));
+        let other = Submitted::Contract(ContractRecord::SanctionCompleted { template_id: f.v });
         assert!(matches!(
             w.log.announce(
                 f.v,

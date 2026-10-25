@@ -622,9 +622,12 @@ impl Canonical for BornFrom {
     }
 }
 
-/// Why a purge was deferred (§6.2).
+/// What blocks a purge now, as the coordinator's `purge_blocker` names
+/// it (§6.2, D85).  Not a record: the Warden logs it and records
+/// nothing.  Tags 5 and 6 are reserved (they were the store and the
+/// coordinator unavailable, never written).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeferReason {
+pub enum PurgeBlocker {
     /// An obligation is open (tag 0).
     OpenObligation,
     /// Chronicles that need this one live (tag 1).  Both lists ascending,
@@ -644,13 +647,9 @@ pub enum DeferReason {
     RetentionPin,
     /// A verification attempt is open (tag 4).
     OpenAttempt,
-    /// The store did not answer (tag 5).
-    StoreUnavailable,
-    /// The coordinator did not answer (tag 6).
-    CoordinatorUnavailable,
 }
 
-impl DeferReason {
+impl PurgeBlocker {
     /// Its canonical bytes.
     pub fn bytes(&self) -> Vec<u8> {
         let mut c = Canon::new();
@@ -661,13 +660,13 @@ impl DeferReason {
     /// Strict decoding: the bytes must be exactly one reason.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader::new(bytes);
-        let v = r.defer_reason()?;
+        let v = r.purge_blocker()?;
         r.finish()?;
         Ok(v)
     }
 }
 
-impl Canonical for DeferReason {
+impl Canonical for PurgeBlocker {
     fn canon(&self, out: &mut Canon) {
         match self {
             Self::OpenObligation => {
@@ -687,12 +686,6 @@ impl Canonical for DeferReason {
             }
             Self::OpenAttempt => {
                 out.tag(4);
-            }
-            Self::StoreUnavailable => {
-                out.tag(5);
-            }
-            Self::CoordinatorUnavailable => {
-                out.tag(6);
             }
         }
     }
@@ -1273,25 +1266,6 @@ impl Canonical for TemplateReady {
     }
 }
 
-/// A Purge deferred at its TTL (§6.2).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PurgeDeferred {
-    /// The Vessel.
-    pub chronicle: ChronicleId,
-    /// The position the check read.
-    pub checked_at: Lsn,
-    /// Why.
-    pub reason: DeferReason,
-}
-
-impl Canonical for PurgeDeferred {
-    fn canon(&self, out: &mut Canon) {
-        self.chronicle.canon(out);
-        self.checked_at.canon(out);
-        self.reason.canon(out);
-    }
-}
-
 /// A purge is committed: retire, release, close, claim (D20).
 /// Constant-size: the inventory and the local state are objects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1742,8 +1716,7 @@ pub enum ContractRecord {
         /// The Template.
         template_id: ChronicleId,
     },
-    /// Tag 9.
-    PurgeDeferred(PurgeDeferred),
+    // Tag 9 is reserved: it was `PurgeDeferred` (D85).
     /// Tag 10.
     PurgeCommitted(PurgeCommitted),
     /// Tag 11.
@@ -1793,7 +1766,6 @@ impl ContractRecord {
             Self::SanctionCommitted(s) => LogicalKey::Sanction(s.candidate_id),
             Self::TemplateReady(t) => LogicalKey::Template(t.template_id),
             Self::SanctionCompleted { template_id } => LogicalKey::SanctionCompleted(*template_id),
-            Self::PurgeDeferred(p) => LogicalKey::PurgeDefer(p.chronicle, p.checked_at),
             Self::PurgeCommitted(p) => LogicalKey::Purge(p.chronicle),
             Self::ReplacementInstalled(r) => LogicalKey::Replacement(r.chronicle, r.pack.digest),
             Self::ItemLost(i) => LogicalKey::ItemLost(i.chronicle, i.pack.digest),
@@ -1869,10 +1841,6 @@ impl Canonical for ContractRecord {
             Self::SanctionCompleted { template_id } => {
                 out.tag(8);
                 template_id.canon(out);
-            }
-            Self::PurgeDeferred(r) => {
-                out.tag(9);
-                r.canon(out);
             }
             Self::PurgeCommitted(r) => {
                 out.tag(10);
@@ -1957,8 +1925,7 @@ pub enum LogicalKey {
     Template(ChronicleId),
     /// `SanctionCompleted`: `template_id ‖ "completed"` (tag 7).
     SanctionCompleted(ChronicleId),
-    /// `PurgeDeferred`: `chronicle ‖ "defer" ‖ checked_at_lsn` (tag 8).
-    PurgeDefer(ChronicleId, Lsn),
+    // Tag 8 is reserved: it was `PurgeDeferred`'s (D85).
     /// `PurgeCommitted`: `chronicle ‖ "purge"` (tag 9).
     Purge(ChronicleId),
     /// `ReplacementInstalled`: `chronicle ‖ pack` (tag 10); the pack by
@@ -2024,11 +1991,6 @@ impl Canonical for LogicalKey {
             Self::SanctionCompleted(c) => {
                 out.tag(7);
                 c.canon(out);
-            }
-            Self::PurgeDefer(c, l) => {
-                out.tag(8);
-                c.canon(out);
-                l.canon(out);
             }
             Self::Purge(c) => {
                 out.tag(9);
@@ -2594,21 +2556,19 @@ impl<'a> Reader<'a> {
         self.ascending("chronicle list order", Self::chronicle, |c| *c.as_bytes())
     }
 
-    pub(crate) fn defer_reason(&mut self) -> R<DeferReason> {
+    pub(crate) fn purge_blocker(&mut self) -> R<PurgeBlocker> {
         match self.tag()? {
-            (_, 0) => Ok(DeferReason::OpenObligation),
-            (_, 1) => Ok(DeferReason::LivenessDependency {
+            (_, 0) => Ok(PurgeBlocker::OpenObligation),
+            (_, 1) => Ok(PurgeBlocker::LivenessDependency {
                 holders: self.chronicle_list()?,
                 unknown: self.chronicle_list()?,
             }),
-            (_, 2) => Ok(DeferReason::OpenSanction {
+            (_, 2) => Ok(PurgeBlocker::OpenSanction {
                 candidate_id: self.hash()?,
             }),
-            (_, 3) => Ok(DeferReason::RetentionPin),
-            (_, 4) => Ok(DeferReason::OpenAttempt),
-            (_, 5) => Ok(DeferReason::StoreUnavailable),
-            (_, 6) => Ok(DeferReason::CoordinatorUnavailable),
-            (at, t) => Self::bad(at, "defer reason", t),
+            (_, 3) => Ok(PurgeBlocker::RetentionPin),
+            (_, 4) => Ok(PurgeBlocker::OpenAttempt),
+            (at, t) => Self::bad(at, "purge blocker", t),
         }
     }
 
@@ -2779,11 +2739,6 @@ impl<'a> Reader<'a> {
             (_, 8) => ContractRecord::SanctionCompleted {
                 template_id: self.chronicle()?,
             },
-            (_, 9) => ContractRecord::PurgeDeferred(PurgeDeferred {
-                chronicle: self.chronicle()?,
-                checked_at: self.lsn()?,
-                reason: self.defer_reason()?,
-            }),
             (_, 10) => ContractRecord::PurgeCommitted(PurgeCommitted {
                 chronicle: self.chronicle()?,
                 cutoff: Cutoff {
@@ -3114,14 +3069,6 @@ pub(crate) mod tests {
             ContractRecord::SanctionCompleted {
                 template_id: committed().template_id,
             },
-            ContractRecord::PurgeDeferred(PurgeDeferred {
-                chronicle: cid(1),
-                checked_at: Lsn::new(40),
-                reason: DeferReason::LivenessDependency {
-                    holders: vec![cid(2), cid(3)],
-                    unknown: vec![cid(9)],
-                },
-            }),
             ContractRecord::PurgeCommitted(PurgeCommitted {
                 chronicle: cid(1),
                 cutoff: Cutoff {
@@ -3273,7 +3220,9 @@ pub(crate) mod tests {
     fn every_record_round_trips_and_tags_are_in_order() {
         for (i, r) in every_record().into_iter().enumerate() {
             let b = r.canon_bytes();
-            assert_eq!(b[0] as usize, i, "tag of {r:?}");
+            // Tag 9 is reserved (the former PurgeDeferred, D85).
+            let tag = if i < 9 { i } else { i + 1 };
+            assert_eq!(b[0] as usize, tag, "tag of {r:?}");
             assert_eq!(ContractRecord::decode(&b).unwrap(), r);
         }
     }
@@ -3398,12 +3347,13 @@ pub(crate) mod tests {
         let ids: Vec<HashVal> = rs.iter().map(ContractRecord::logical_id).collect();
         // VerdictSubmitted (3) and Refused (4) name the same request.
         assert_eq!(ids[3], ids[4]);
-        // PurgeComplete (13) and PurgeDamaged (14) name the same purge.
-        assert_eq!(ids[13], ids[14]);
+        // PurgeComplete (tag 13) and PurgeDamaged (tag 14) name the same
+        // purge; tag 9 is reserved, so they are at 12 and 13.
+        assert_eq!(ids[12], ids[13]);
         // Every other pair differs.
         for i in 0..ids.len() {
             for j in i + 1..ids.len() {
-                if (i, j) == (3, 4) || (i, j) == (13, 14) {
+                if (i, j) == (3, 4) || (i, j) == (12, 13) {
                     continue;
                 }
                 assert_ne!(ids[i], ids[j], "rows {i} and {j}");
@@ -3547,7 +3497,8 @@ pub(crate) mod tests {
         assert_eq!(got, PINS_DERIVED);
     }
 
-    const PINS_RECORDS: [&str; 23] = [
+    // Tag 9 (the former PurgeDeferred, D85) has no pin: it is reserved.
+    const PINS_RECORDS: [&str; 22] = [
         "4c679c6a0022ae188b75236abe543c1fdad404ad556c55f8efecfa1f842053e6",
         "220b967695a40c425c53a626ffed0635d40528a852489b0ad66772c87e6b0e18",
         "7449db856743d73ce30398c37ba97b2295e43b6715875f8f55fe0f859ae15bfe",
@@ -3557,7 +3508,6 @@ pub(crate) mod tests {
         "e9fdb86f83c1dbd9ff1b92a912c3daf0902986b0d6def0f83d37ab3789463691",
         "6c947a3f7fb84f260a8b963fb82a4e93156882ae40d8561a91b55aedce2c5000",
         "305f9805d49234b85987ab9ce76c4fc44737dcc51af3f62c35e1680484ffdf0d",
-        "f1677cdd630eca1c9421e343bb41c2c515fe0b163ec38bf2bf7e20e0362ada4f",
         "4604b817eb6188722cb619d15e728d7e3899e455e6e8d5360d4b1543ca72e206",
         "3483b8e7bac5cbc38f44edb841fff258423c22cb21ffd7b80844e4258e1a3154",
         "05d07e61d8e2f2456ef75d171d9835f8b736aa9abd81ecdaa7b0606d6a859129",
@@ -3798,28 +3748,6 @@ pub(crate) mod tests {
                     authority: au,
                 }))
             });
-        let deferred = (
-            chron(),
-            any::<u64>(),
-            prop_oneof![
-                Just(DeferReason::OpenObligation),
-                (chronicles(), chronicles()).prop_map(|(holders, unknown)| {
-                    DeferReason::LivenessDependency { holders, unknown }
-                }),
-                hash().prop_map(|candidate_id| DeferReason::OpenSanction { candidate_id }),
-                Just(DeferReason::RetentionPin),
-                Just(DeferReason::OpenAttempt),
-                Just(DeferReason::StoreUnavailable),
-                Just(DeferReason::CoordinatorUnavailable),
-            ],
-        )
-            .prop_map(|(chronicle, c, reason)| {
-                ContractRecord::PurgeDeferred(PurgeDeferred {
-                    chronicle,
-                    checked_at: Lsn::new(c),
-                    reason,
-                })
-            });
         let genesis = (
             chron(),
             hash(),
@@ -3998,9 +3926,35 @@ pub(crate) mod tests {
                 })
             });
         prop_oneof![
-            candidate, started, finished, verdict, close, committed, ready, deferred, purge,
-            genesis, small
+            candidate, started, finished, verdict, close, committed, ready, purge, genesis, small
         ]
+    }
+
+    /// D85: a purge blocker is a query's answer, not a record.  Its five
+    /// kinds round-trip; tags 5 and 6 are reserved; the record tag 9
+    /// (the former `PurgeDeferred`) is refused.
+    #[test]
+    fn purge_blockers_and_the_reserved_tags() {
+        for b in [
+            PurgeBlocker::OpenObligation,
+            PurgeBlocker::LivenessDependency {
+                holders: vec![cid(2), cid(3)],
+                unknown: vec![cid(9)],
+            },
+            PurgeBlocker::OpenSanction { candidate_id: h(7) },
+            PurgeBlocker::RetentionPin,
+            PurgeBlocker::OpenAttempt,
+        ] {
+            assert_eq!(PurgeBlocker::decode(&b.bytes()).unwrap(), b);
+        }
+        assert!(PurgeBlocker::decode(&[5]).is_err());
+        assert!(PurgeBlocker::decode(&[6]).is_err());
+        let mut c = Canon::new();
+        c.tag(9);
+        cid(1).canon(&mut c);
+        Lsn::new(40).canon(&mut c);
+        PurgeBlocker::RetentionPin.canon(&mut c);
+        assert!(ContractRecord::decode(&c.into_bytes()).is_err());
     }
 
     proptest! {

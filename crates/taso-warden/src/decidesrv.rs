@@ -331,7 +331,9 @@ mod tests {
         }
         fn verdict(&self, r: &VerdictRequest, peer: Peer) -> Result<VerdictAnswer, String> {
             lock(&self.seen).push((r.clone(), peer));
-            Ok(VerdictAnswer::NotCommitted(Refusal::OpenAttempt))
+            Ok(VerdictAnswer::Retry(taso_core::decider::RetryReason::Rule(
+                Refusal::OpenAttempt,
+            )))
         }
     }
 
@@ -397,7 +399,9 @@ mod tests {
             })
             .unwrap(),
             Reply::Verdict {
-                answer: VerdictAnswer::NotCommitted(Refusal::OpenAttempt)
+                answer: VerdictAnswer::Retry(taso_core::decider::RetryReason::Rule(
+                    Refusal::OpenAttempt
+                ))
             }
         );
         let seen = lock(&fake.seen).clone();

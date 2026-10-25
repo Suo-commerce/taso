@@ -10,7 +10,7 @@
 //! and sends that verdict: `authority = { actor: <policy actor>, reason:
 //! "rule <name>" | "default" }`, `policy_digest` = the policy file's
 //! BLAKE3.  The same facts and policy make the same request, so a
-//! Candidate still pending at the next pass (a `Hold`, a `NotCommitted`)
+//! Candidate still pending at the next pass (a `Hold`, a `Retry`)
 //! is answered from the log, not recorded again.  Without `--once` it
 //! passes every `--interval-secs` (default 10) until killed; a pass that
 //! cannot reach the socket is logged and the next one tries again.
@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use taso_core::contract::Decision;
-use taso_core::decider::{Reply, Request, VerdictAnswer};
+use taso_core::decider::{Reply, Request, RetryReason, VerdictAnswer};
 use taso_core::record::Authority;
 use taso_warden::daemon::Config;
 use taso_warden::decidesrv::DeciderClient;
@@ -76,12 +76,15 @@ fn answer_fields(v: &mut Value, a: &VerdictAnswer) {
         VerdictAnswer::Held => ("Held", None),
         VerdictAnswer::ClosedNever => ("ClosedNever", None),
         VerdictAnswer::Refused(r) => ("Refused", Some(("rule_refused", format!("{r:?}")))),
-        VerdictAnswer::NotCommitted(r) => {
-            ("NotCommitted", Some(("rule_refused", format!("{r:?}"))))
+        VerdictAnswer::Retry(r) => {
+            let (reason, extra) = match r {
+                RetryReason::NotHere(w) => ("NotHere", ("why", w.clone())),
+                RetryReason::Pending(w) => ("Pending", ("why", w.clone())),
+                RetryReason::Rule(rule) => ("Rule", ("rule_refused", format!("{rule:?}"))),
+            };
+            v["reason"] = json!(reason);
+            ("Retry", Some(extra))
         }
-        VerdictAnswer::NotClosed(r) => ("NotClosed", Some(("rule_refused", format!("{r:?}")))),
-        VerdictAnswer::Pending(w) => ("Pending", Some(("why", w.clone()))),
-        VerdictAnswer::NotHere(w) => ("NotHere", Some(("why", w.clone()))),
     };
     v["answer"] = json!(word);
     if let Some((k, x)) = extra {

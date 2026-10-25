@@ -8,7 +8,7 @@ use serde_json::Value;
 use taso_core::contract::{
     request_id, Decision, OpKind, Peer, Refusal, VerdictRequest, VerifierRequirement,
 };
-use taso_core::decider::{PendingItem, Request, VerdictAnswer};
+use taso_core::decider::{PendingItem, Request, RetryReason, VerdictAnswer};
 use taso_core::envelope::{ChronicleId, HashVal};
 use taso_core::record::Authority;
 use taso_warden::decidesrv::{Decide, DeciderConf, DeciderServer};
@@ -28,7 +28,7 @@ impl Decide for Fake {
         self.seen.lock().unwrap().push((r.clone(), peer));
         Ok(match r.decision {
             Decision::Hold => VerdictAnswer::Held,
-            _ => VerdictAnswer::NotCommitted(Refusal::LaterAttemptFailed),
+            _ => VerdictAnswer::Retry(RetryReason::Rule(Refusal::LaterAttemptFailed)),
         })
     }
 }
@@ -121,8 +121,13 @@ fn pending_verdict_like_and_resend() {
         ],
     );
     assert_eq!(
-        (rc, v3["answer"].as_str(), v3["rule"].as_str()),
-        (0, Some("NotCommitted"), Some("LaterAttemptFailed"))
+        (
+            rc,
+            v3["answer"].as_str(),
+            v3["reason"].as_str(),
+            v3["rule"].as_str()
+        ),
+        (0, Some("Retry"), Some("Rule"), Some("LaterAttemptFailed"))
     );
     let seen = fake.seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 3);

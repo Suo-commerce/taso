@@ -28,7 +28,7 @@
 //! {"pending": [{"candidate_id": "…", "chronicle": "…", "facts_hash": "…",
 //!   "attempts": [{"attempt_id": "…", "outcome": "Exit { code: 0 }", "result_digest": "…"}]}]}
 //! {"answer": "Committed", "template_id": "…", "request_id": "…", "request": "…"}
-//! {"answer": "NotCommitted", "rule": "OpenAttempt", "request_id": "…", "request": "…"}
+//! {"answer": "Retry", "reason": "Rule", "rule": "OpenAttempt", "request_id": "…", "request": "…"}
 //! {"error": "…"}                       (a verdict's also has "request_id" and "request")
 //! ```
 //!
@@ -44,7 +44,7 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 use taso_core::contract::{request_id, Decision, OpKind, VerdictRequest};
-use taso_core::decider::{PendingItem, Reply, Request, VerdictAnswer};
+use taso_core::decider::{PendingItem, Reply, Request, RetryReason, VerdictAnswer};
 use taso_core::envelope::HashVal;
 use taso_core::record::Authority;
 use taso_warden::daemon::Config;
@@ -106,14 +106,15 @@ fn answer_json(a: &VerdictAnswer, r: &VerdictRequest) -> Value {
         VerdictAnswer::Held => json!({"answer": "Held"}),
         VerdictAnswer::ClosedNever => json!({"answer": "ClosedNever"}),
         VerdictAnswer::Refused(rule) => json!({"answer": "Refused", "rule": format!("{rule:?}")}),
-        VerdictAnswer::NotCommitted(rule) => {
-            json!({"answer": "NotCommitted", "rule": format!("{rule:?}")})
+        VerdictAnswer::Retry(RetryReason::NotHere(why)) => {
+            json!({"answer": "Retry", "reason": "NotHere", "why": why})
         }
-        VerdictAnswer::NotClosed(rule) => {
-            json!({"answer": "NotClosed", "rule": format!("{rule:?}")})
+        VerdictAnswer::Retry(RetryReason::Pending(why)) => {
+            json!({"answer": "Retry", "reason": "Pending", "why": why})
         }
-        VerdictAnswer::Pending(why) => json!({"answer": "Pending", "why": why}),
-        VerdictAnswer::NotHere(why) => json!({"answer": "NotHere", "why": why}),
+        VerdictAnswer::Retry(RetryReason::Rule(rule)) => {
+            json!({"answer": "Retry", "reason": "Rule", "rule": format!("{rule:?}")})
+        }
     };
     v["request_id"] = json!(r.request_id.to_string());
     v["request"] = json!(hex(&Request::Verdict {

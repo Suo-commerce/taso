@@ -167,7 +167,7 @@ use taso_core::contract::{
     VerdictRequest,
 };
 use taso_core::coordlog::Submitted;
-use taso_core::decider::{PendingItem, VerdictAnswer};
+use taso_core::decider::{PendingItem, RetryReason, VerdictAnswer};
 use taso_core::model::WardenId;
 use taso_core::record::{Origin, TemplateAsked};
 use taso_field::protocol::{NominateResult, PromoteResult};
@@ -1986,9 +1986,9 @@ impl crate::decidesrv::Decide for NodeDecider {
         {
             Some((_, Submitted::Contract(ContractRecord::Candidate(c)))) => c.chronicle,
             _ => {
-                return Ok(VerdictAnswer::NotHere(format!(
+                return Ok(VerdictAnswer::Retry(RetryReason::NotHere(format!(
                     "no Candidate {cid} is accepted"
-                )))
+                ))))
             }
         };
         let job = |tx| Job::Verdict(Box::new(req.clone()), peer, tx);
@@ -1999,27 +1999,27 @@ impl crate::decidesrv::Decide for NodeDecider {
                     Ok(()) => rx
                         .recv()
                         .map_err(|_| "the verdict was not answered".to_string())?,
-                    Err((why, _)) => Ok(VerdictAnswer::NotHere(why)),
+                    Err((why, _)) => Ok(VerdictAnswer::Retry(RetryReason::NotHere(why))),
                 }
             }
             Err(Some(tx)) => match Node::ask_session(&tx, job) {
                 Ok(r) => r,
                 // Taken but not answered in time: it may still be
                 // recorded, so the same request is to be sent again.
-                Err(why) if why == "timeout" => Ok(VerdictAnswer::Pending(format!(
+                Err(why) if why == "timeout" => Ok(VerdictAnswer::Retry(RetryReason::Pending(format!(
                     "the session of Vessel {} has not answered within {}s: send the same request again",
                     id_hex(id),
                     SESSION_WAIT.as_secs()
-                ))),
-                Err(why) => Ok(VerdictAnswer::NotHere(format!(
+                )))),
+                Err(why) => Ok(VerdictAnswer::Retry(RetryReason::NotHere(format!(
                     "Vessel {}: {why}",
                     id_hex(id)
-                ))),
+                )))),
             },
-            Err(None) => Ok(VerdictAnswer::NotHere(format!(
+            Err(None) => Ok(VerdictAnswer::Retry(RetryReason::NotHere(format!(
                 "Vessel {} is being opened or closed on this node: ask again",
                 id_hex(id)
-            ))),
+            )))),
         }
     }
 }
@@ -2035,7 +2035,8 @@ struct Done {
 struct Verifications<'s, 'e> {
     scope: &'s std::thread::Scope<'s, 'e>,
     node: &'e Node,
-    vc: &'e VesselConf,
+    /// The Vessel, as the Warden's log names it.
+    label: String,
     tx: std::sync::mpsc::Sender<Done>,
     rx: std::sync::mpsc::Receiver<Done>,
     /// The Candidates whose attempt runs now.
@@ -2048,18 +2049,26 @@ struct Verifications<'s, 'e> {
 }
 
 impl<'s, 'e> Verifications<'s, 'e> {
-    fn new(scope: &'s std::thread::Scope<'s, 'e>, node: &'e Node, vc: &'e VesselConf) -> Self {
+    fn new(scope: &'s std::thread::Scope<'s, 'e>, node: &'e Node, label: String) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
             scope,
             node,
-            vc,
+            label,
             tx,
             rx,
             running: Default::default(),
             want: true,
             looked: None,
         }
+    }
+
+    fn log(&self, msg: impl fmt::Display) {
+        eprintln!(
+            "taso-wardend[{}] {}: {msg}",
+            self.node.config.warden.get(),
+            self.label
+        );
     }
 
     fn want(&mut self) {
@@ -2086,18 +2095,17 @@ impl<'s, 'e> Verifications<'s, 'e> {
         self.looked = Some(std::time::Instant::now());
         self.want = false;
         let at = self.node.attempts();
-        let todo = match at.unattempted(vessel) {
+        let todo = match at.to_attempt(vessel) {
             Ok(t) => t,
             Err(e) => {
-                self.node
-                    .log(self.vc, format_args!("listing Candidates to verify: {e}"));
+                self.log(format_args!("listing Candidates to verify: {e}"));
                 return;
             }
         };
         let packs = match self.node.packs(vessel.id()) {
             Ok(p) => p,
             Err(e) => {
-                self.node.log(self.vc, format_args!("packs: {e}"));
+                self.log(format_args!("packs: {e}"));
                 return;
             }
         };
@@ -2113,23 +2121,17 @@ impl<'s, 'e> Verifications<'s, 'e> {
                 Ok(st) => st,
                 Err(e) => {
                     self.node.release_verifier_slot();
-                    self.node.log(
-                        self.vc,
-                        format_args!(
-                            "Candidate {}: its attempt was not started: {e}",
-                            cand.candidate_id
-                        ),
-                    );
+                    self.log(format_args!(
+                        "Candidate {}: its attempt was not started: {e}",
+                        cand.candidate_id
+                    ));
                     continue;
                 }
             };
-            self.node.log(
-                self.vc,
-                format_args!(
-                    "attempt {} of Candidate {}: started",
-                    st.attempt_id, cand.candidate_id
-                ),
-            );
+            self.log(format_args!(
+                "attempt {} of Candidate {}: started",
+                st.attempt_id, cand.candidate_id
+            ));
             self.running.insert(*cand.candidate_id.as_bytes());
             let (node, tx) = (self.node, self.tx.clone());
             self.scope.spawn(move || {
@@ -2173,9 +2175,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
         self.want();
         let id = d.started.attempt_id;
         match d.result {
-            Err(crate::attempt::Stopped(p)) => self.node.log(
-                self.vc,
-                format_args!(
+            Err(crate::attempt::Stopped(p)) => self.log(format_args!(
                     "attempt {id}: stopped at failpoint {p}; it stays open until the next start closes it"
                 ),
             ),
@@ -2192,9 +2192,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
                     });
                 match finished {
                     Ok(_) => {
-                        self.node.log(
-                            self.vc,
-                            format_args!(
+                        self.log(format_args!(
                                 "attempt {id}: finished {outcome:?}, {} bytes of output",
                                 output.len()
                             ),
@@ -2204,13 +2202,10 @@ impl<'s, 'e> Verifications<'s, 'e> {
                             &self.node.config.root,
                             id,
                         ) {
-                            self.node
-                                .log(self.vc, format_args!("attempt {id}: its /candidate dataset: {e}"));
+                            self.log(format_args!("attempt {id}: its /candidate dataset: {e}"));
                         }
                     }
-                    Err(e) => self.node.log(
-                        self.vc,
-                        format_args!(
+                    Err(e) => self.log(format_args!(
                             "attempt {id}: ended {outcome:?} but its record was not accepted: {e}; the next start closes it"
                         ),
                     ),
@@ -3096,11 +3091,19 @@ impl Node {
                     for n in &done.notes {
                         log(format!("sanction of Candidate {}: {n}", s.candidate_id));
                     }
-                    log(format!(
-                        "sanction of Candidate {}: Template {} ready, sanction completed",
-                        s.candidate_id,
-                        id_hex(s.template_id)
-                    ));
+                    if done.elsewhere {
+                        log(format!(
+                            "sanction of Candidate {}: Template {} ready, finished by another Warden (D87)",
+                            s.candidate_id,
+                            id_hex(s.template_id)
+                        ));
+                    } else {
+                        log(format!(
+                            "sanction of Candidate {}: Template {} ready, sanction completed",
+                            s.candidate_id,
+                            id_hex(s.template_id)
+                        ));
+                    }
                 }
                 Err(e) => log(format!(
                     "sanction of Candidate {}: Template {} not finished: {e}",
@@ -3228,9 +3231,80 @@ impl Node {
                 }
             };
             match self.purger().purge(&self.storage, &mut vessel, &packs) {
+                Ok(crate::purge::Purged::Blocked(b)) => log(format!(
+                    "purge: blocked by {b:?}; nothing recorded; checked again at the next pass"
+                )),
                 Ok(out) => log(format!("purge: {out:?}")),
                 Err(e) => log(format!("purge: stopped: {e}")),
             }
+        }
+    }
+
+    /// At the Warden's own start (D88, D90): every Vessel whose local log
+    /// is here, which this Warden holds and which is not running, and
+    /// which has an open Candidate to attempt (never attempted, or every
+    /// attempt interrupted, fewer than three), is opened here as for a
+    /// verdict (a new epoch; open attempts closed `Interrupted`, D69), its
+    /// verifier run and its attempt finished, and closed again.  A running
+    /// Vessel's own session runs it.  Nothing waits for the agent or the
+    /// TTL.
+    pub fn relaunch_pass(&self) {
+        let at = self.attempts();
+        for id in self.local_vessels() {
+            // Its name in this Warden's log: the config's subject, if any.
+            let label = self
+                .config
+                .vessels
+                .iter()
+                .find(|vc| vc.id() == id)
+                .map_or_else(|| id_hex(id), |vc| vc.subject.clone());
+            let log =
+                |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
+            if self.mine_here(id).is_err() {
+                continue;
+            }
+            match self.coord.query_chronicle(id) {
+                Ok(Some(v)) if !v.retired => {}
+                _ => continue,
+            }
+            let frames = match crate::chronicle::read_log(&self.host().dir_for(id)) {
+                Ok(f) => f,
+                Err(e) => {
+                    log(format!("verifier: reading its log: {e}"));
+                    continue;
+                }
+            };
+            match at.to_attempt_in(&frames, true) {
+                Ok(t) if !t.is_empty() => {}
+                Ok(_) => continue,
+                Err(e) => {
+                    log(format!("verifier: listing Candidates to verify: {e}"));
+                    continue;
+                }
+            }
+            let _slot = match self.hold_for_decider(*id.as_bytes()) {
+                Ok(s) => s,
+                Err(Some(_)) => continue, // running: its session runs it
+                Err(None) => continue,    // busy: its next start runs it
+            };
+            let (mut vessel, _) = match self.host().open(id) {
+                Ok(v) => v,
+                Err(e) => {
+                    log(format!("verifier: opening it: {e}"));
+                    continue;
+                }
+            };
+            log("opened here to run its verifier again (D88)".into());
+            if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
+                log(format!("verifier: {e}"));
+                continue;
+            }
+            self.finish_sanctions(&mut vessel, &log);
+            std::thread::scope(|scope| {
+                let mut v = Verifications::new(scope, self, label.clone());
+                v.launch(&mut vessel);
+                v.drain(&mut vessel);
+            });
         }
     }
 
@@ -3255,30 +3329,20 @@ impl Node {
         }
         let frames = crate::chronicle::read_log(&self.host().dir_for(id))
             .map_err(|e| format!("reading its log: {e}"))?;
-        let mut deferred = false;
         for f in &frames {
             if let Ok(taso_core::record::Payload::Contract(r)) =
                 taso_core::record::Payload::decode(&f.payload)
             {
-                match *r {
-                    // A sanctioned Vessel is kept (D81).
-                    ContractRecord::SanctionCommitted(s)
-                        if accepted(LogicalKey::Sanction(s.candidate_id))? =>
-                    {
-                        return Ok(None)
+                // A sanctioned Vessel is kept (D81).
+                if let ContractRecord::SanctionCommitted(s) = *r {
+                    if accepted(LogicalKey::Sanction(s.candidate_id))? {
+                        return Ok(None);
                     }
-                    ContractRecord::PurgeDeferred(d)
-                        if accepted(LogicalKey::PurgeDefer(id, d.checked_at))? =>
-                    {
-                        deferred = true
-                    }
-                    _ => {}
                 }
             }
         }
-        if deferred {
-            return Ok(Some("deferred before: checking again".into()));
-        }
+        // A blocked Vessel is checked again at every pass from its TTL
+        // start: nothing is recorded while it is blocked (D85).
         let start = self
             .ttl_start(id)
             .map_err(|e| format!("its TTL start: {e}"))?;
@@ -4207,7 +4271,8 @@ impl Node {
         // (D68); their records go through the session's thread.
         let (failures, last) =
             std::thread::scope(|scope| -> Result<(u64, Option<String>), DaemonError> {
-                let verif = std::cell::RefCell::new(Verifications::new(scope, self, vc));
+                let verif =
+                    std::cell::RefCell::new(Verifications::new(scope, self, vc.subject.clone()));
                 let mut branches = NodeBranches {
                     node: self,
                     vc,

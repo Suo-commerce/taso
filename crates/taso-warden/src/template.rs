@@ -2240,7 +2240,7 @@ mod tests {
         let c = Cluster::new();
         let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
         let at = attempts(&c);
-        assert_eq!(at.unattempted(&v).unwrap(), vec![cand.clone()]);
+        assert_eq!(at.to_attempt(&v).unwrap(), vec![cand.clone()]);
         let st = at.start(&mut v, &packs, &cand).unwrap();
         assert_eq!(st.started_at, Lsn::new(v.tail().lsn.get() - 1));
         let holds = c.coord.query_chronicle(v.id()).unwrap().unwrap().holds;
@@ -2254,7 +2254,7 @@ mod tests {
         };
         assert!(holds.contains(&ObjectId::content(layer)));
         assert_eq!(at.open(&v).unwrap(), vec![st]);
-        assert!(at.unattempted(&v).unwrap().is_empty());
+        assert!(at.to_attempt(&v).unwrap().is_empty());
         // One attempt at a time.
         assert!(matches!(
             at.start(&mut v, &packs, &cand),
@@ -2273,11 +2273,41 @@ mod tests {
         assert!(at.open(&v).unwrap().is_empty());
         assert_eq!(at.finished(&v).unwrap(), vec![st]);
         // A finished Candidate is not attempted again by itself.
-        assert!(at.unattempted(&v).unwrap().is_empty());
+        assert!(at.to_attempt(&v).unwrap().is_empty());
+    }
+
+    /// D88: a Candidate whose attempts all ended `Interrupted` is attempted
+    /// again, fewer than three times; one that ended otherwise is not.
+    #[test]
+    fn an_interrupted_attempt_is_run_again_up_to_three_times() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let at = attempts(&c);
+        for n in 1..=crate::attempt::MAX_INTERRUPTED {
+            let st = at.start(&mut v, &packs, &cand).unwrap();
+            assert!(at.to_attempt(&v).unwrap().is_empty(), "open: {n}");
+            at.finish(&mut v, &packs, &st, VOutcome::Interrupted, Vec::new())
+                .unwrap();
+            let want = if n < crate::attempt::MAX_INTERRUPTED {
+                vec![cand.clone()]
+            } else {
+                vec![]
+            };
+            assert_eq!(at.to_attempt(&v).unwrap(), want, "after {n} interrupted");
+        }
+        // A result about the files ends it: no rerun.
+        let (_h, mut v, packs, cand) = nominated(&c, b"b", c.t0, VCONF);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        at.finish(&mut v, &packs, &st, VOutcome::Interrupted, Vec::new())
+            .unwrap();
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        at.finish(&mut v, &packs, &st, VOutcome::Exit { code: 1 }, Vec::new())
+            .unwrap();
+        assert!(at.to_attempt(&v).unwrap().is_empty());
     }
 
     #[test]
-    fn a_start_stopped_before_its_accept_leaves_the_candidate_unattempted() {
+    fn a_start_stopped_before_its_accept_leaves_the_candidate_to_attempt() {
         let c = Cluster::new();
         let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
         let mut at = attempts(&c);
@@ -2287,10 +2317,10 @@ mod tests {
             Err(AttemptError::Failpoint("verify.before_started_accept"))
         ));
         at.failpoint = attempt::no_failpoints();
-        assert_eq!(at.unattempted(&v).unwrap(), vec![cand.clone()]);
+        assert_eq!(at.to_attempt(&v).unwrap(), vec![cand.clone()]);
         assert!(at.open(&v).unwrap().is_empty());
         at.start(&mut v, &packs, &cand).unwrap();
-        assert!(at.unattempted(&v).unwrap().is_empty());
+        assert!(at.to_attempt(&v).unwrap().is_empty());
     }
 
     #[test]
@@ -2467,7 +2497,7 @@ mod tests {
 
     // ── Verdicts (P4 file 8a) ───────────────────────────────────────
 
-    use crate::verdict::{self, VerdictAnswer, VerdictError, Verdicts};
+    use crate::verdict::{self, RetryReason, VerdictAnswer, VerdictError, Verdicts};
     use taso_core::contract::{
         template_id as template_id_of, Decision, Refusal, VerdictRequest, VerificationFinished,
     };
@@ -2739,7 +2769,7 @@ mod tests {
         let sanction = request(&cand, &f1, Decision::Sanction);
         assert!(matches!(
             vd.handle(&mut v, &packs, &sanction, PEER).unwrap(),
-            VerdictAnswer::NotCommitted(Refusal::OpenAttempt)
+            VerdictAnswer::Retry(RetryReason::Rule(Refusal::OpenAttempt))
         ));
         let never = request(
             &cand,
@@ -2750,7 +2780,7 @@ mod tests {
         );
         assert_eq!(
             vd.handle(&mut v, &packs, &never, PEER).unwrap(),
-            VerdictAnswer::NotClosed(Refusal::OpenAttempt)
+            VerdictAnswer::Retry(RetryReason::Rule(Refusal::OpenAttempt))
         );
         // The later attempt fails: the same request, sent again, is
         // answered from its recorded VerdictSubmitted.
@@ -2759,7 +2789,7 @@ mod tests {
         let tail = v.tail().lsn;
         assert!(matches!(
             vd.handle(&mut v, &packs, &sanction, PEER).unwrap(),
-            VerdictAnswer::NotCommitted(Refusal::LaterAttemptFailed)
+            VerdictAnswer::Retry(RetryReason::Rule(Refusal::LaterAttemptFailed))
         ));
         assert_eq!(v.tail().lsn, tail, "nothing more recorded");
         // The Never, retried, now closes.
@@ -2768,10 +2798,10 @@ mod tests {
             VerdictAnswer::ClosedNever
         );
         assert!(sanction_of(&c, cand.candidate_id).is_none());
-        // The recorded Sanction, sent again after the close.
+        // The recorded Sanction, sent again after the close: final (D86).
         assert!(matches!(
             vd.handle(&mut v, &packs, &sanction, PEER).unwrap(),
-            VerdictAnswer::NotCommitted(Refusal::Closed)
+            VerdictAnswer::Refused(Refusal::Closed)
         ));
     }
 
@@ -2988,10 +3018,49 @@ mod tests {
             .is_err());
     }
 
+    /// D87: Warden 1, fenced, carries on its finish after Warden 2 has
+    /// published the Template; it learns that another Warden finished it
+    /// and stops with no error.
+    #[test]
+    fn a_fenced_finisher_learns_that_another_warden_finished() {
+        let c = Cluster::new();
+        let (h, mut v1, packs, s) = committed(&c, b"a");
+        let mut f1 = finisher(&c, 1);
+        f1.failpoint = Arc::new(|q| q == "sanction.after_target_put");
+        assert!(matches!(
+            f1.finish(&mut v1, &packs, &s),
+            Err(FinishError::Failpoint("sanction.after_target_put"))
+        ));
+        let h2 = Host {
+            coord: c.coord.clone(),
+            pool: crate::vessel::tests::FakePool::default(),
+            root: h.root.clone(),
+            state_dir: c.dir.path().join("vstate-node2"),
+            warden: WardenId::new(2),
+        };
+        let (mut v2, _) = h2.rebirth(v1.id(), &packs).unwrap();
+        // Warden 2 publishes the Template and stops before completing.
+        let mut f2 = finisher(&c, 2);
+        f2.failpoint = Arc::new(|q| q == "sanction.before_completed_accept");
+        assert!(matches!(
+            f2.finish(&mut v2, &packs, &s),
+            Err(FinishError::Failpoint("sanction.before_completed_accept"))
+        ));
+        assert!(ready_of(&c, s.template_id).is_some());
+        // Warden 1 carries on: fenced on the source, it is told.
+        let done = finisher(&c, 1).finish(&mut v1, &packs, &s).unwrap();
+        assert!(done.elsewhere, "{:?}", done.notes);
+        assert!(!completed(&c, s.template_id));
+        // Warden 2's next open completes it.
+        let done = finisher(&c, 2).finish(&mut v2, &packs, &s).unwrap();
+        assert!(!done.elsewhere);
+        assert!(completed(&c, s.template_id));
+    }
+
     // ── Purge (P4 file 11) ──────────────────────────────────────────
 
     use crate::purge::{PurgeError, Purged, Purger};
-    use taso_core::contract::DeferReason;
+    use taso_core::contract::PurgeBlocker;
 
     fn purger(c: &Cluster) -> Purger {
         Purger {
@@ -3059,16 +3128,31 @@ mod tests {
     }
 
     #[test]
-    fn what_keeps_a_vessel_is_recorded_as_a_deferral() {
+    fn what_blocks_a_purge_is_answered_and_nothing_recorded() {
         let c = Cluster::new();
         let (h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
         let p = purger(&c);
         let at = attempts(&c);
         // An open attempt.
         let st = at.start(&mut v, &packs, &cand).unwrap();
+        let tail = v.tail().lsn;
         assert_eq!(
             p.purge(&h.pool, &mut v, &packs).unwrap(),
-            Purged::Deferred(DeferReason::OpenAttempt)
+            Purged::Blocked(PurgeBlocker::OpenAttempt)
+        );
+        // D85: the Warden records nothing while a purge is blocked; explain
+        // asks the coordinator what blocks it now.
+        assert_eq!(v.tail().lsn, tail);
+        let e = crate::explain::explain(
+            c.coord.as_ref(),
+            &c.store,
+            PREFIX,
+            crate::explain::Subject::Chronicle(v.id()),
+        )
+        .unwrap();
+        assert_eq!(
+            e.explain["purge"]["blocked_now"],
+            serde_json::json!("OpenAttempt")
         );
         let f = at
             .finish(&mut v, &packs, &st, VOutcome::Exit { code: 0 }, Vec::new())
@@ -3077,7 +3161,7 @@ mod tests {
         c.coord.set_retention_pin(v.id(), true).unwrap();
         assert_eq!(
             p.purge(&h.pool, &mut v, &packs).unwrap(),
-            Purged::Deferred(DeferReason::RetentionPin)
+            Purged::Blocked(PurgeBlocker::RetentionPin)
         );
         c.coord.set_retention_pin(v.id(), false).unwrap();
         // A committed sanction not finished.
@@ -3088,7 +3172,7 @@ mod tests {
         ));
         assert_eq!(
             p.purge(&h.pool, &mut v, &packs).unwrap(),
-            Purged::Deferred(DeferReason::OpenSanction {
+            Purged::Blocked(PurgeBlocker::OpenSanction {
                 candidate_id: cand.candidate_id
             })
         );

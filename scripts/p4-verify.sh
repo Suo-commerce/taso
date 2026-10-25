@@ -491,7 +491,7 @@ wardend 9a-again 1 "$W/fa-again.json"
 expect "the next start: started" is "$(attempt_lines 9a-again fa | grep -c ': started$')" 1
 expect "the next start: finished Exit { code: 0 }" is "$(finished 9a-again fa)" "Exit { code: 0 }"
 
-say "9b. verify.mid_run (predict: stopped, the attempt stays open; the next start closes it 'interrupted', destroys its /candidate and does not attempt again)"
+say "9b. verify.mid_run (predict: stopped, the attempt stays open; the next start closes it 'interrupted', destroys its /candidate, and runs the verifier again (D88): started, finished 'Exit { code: 0 }')"
 vconf fb 'exec /bin/sleep 5'
 config 1 "$W/fb.json" "$(vessel fb 11 "$(sim "$TURNS" Scratch)")"
 wardend 9b-stop 1 "$W/fb.json" TASO_FAILPOINT=verify.mid_run
@@ -500,9 +500,10 @@ config 1 "$W/fb-again.json" "$(vessel fb 11 "$(sim 1)")"
 wardend 9b-again 1 "$W/fb-again.json"
 expect "the next start: interrupted" is "$(attempt_lines 9b-again fb | grep -c 'interrupted (it was open at this start)$')" 1
 expect "its /candidate destroyed" is "$(attempt_lines 9b-again fb | grep -c 'destroyed its /candidate dataset')" 1
-expect "not attempted again" is "$(attempt_lines 9b-again fb | grep -c ': started$')" 0
+expect "attempted again (D88)" is "$(attempt_lines 9b-again fb | grep -c ': started$')" 1
+expect "the new attempt: finished Exit { code: 0 }" is "$(finished 9b-again fb)" "Exit { code: 0 }"
 
-say "9c. verify.before_finished_accept (predict: the result not accepted; the next start closes it 'interrupted' and destroys its /candidate)"
+say "9c. verify.before_finished_accept (predict: the result not accepted; the next start closes it 'interrupted', destroys its /candidate, and runs the verifier again (D88): started, finished 'Exit { code: 0 }')"
 vconf fc 'exit 0'
 config 1 "$W/fc.json" "$(vessel fc 12 "$(sim "$TURNS" Scratch)")"
 wardend 9c-stop 1 "$W/fc.json" TASO_FAILPOINT=verify.before_finished_accept
@@ -511,6 +512,8 @@ config 1 "$W/fc-again.json" "$(vessel fc 12 "$(sim 1)")"
 wardend 9c-again 1 "$W/fc-again.json"
 expect "the next start: interrupted" is "$(attempt_lines 9c-again fc | grep -c 'interrupted (it was open at this start)$')" 1
 expect "its /candidate destroyed" is "$(attempt_lines 9c-again fc | grep -c 'destroyed its /candidate dataset')" 1
+expect "attempted again (D88)" is "$(attempt_lines 9c-again fc | grep -c ': started$')" 1
+expect "the new attempt: finished Exit { code: 0 }" is "$(finished 9c-again fc)" "Exit { code: 0 }"
 
 # ── 10. Nothing left ────────────────────────────────────────────────
 

@@ -1,4 +1,4 @@
-//! `taso ctl explain` (P4 spec rev. 27 §5.8, D83; file 12): every decision
+//! `taso ctl explain` (P4 spec rev. 30 §5.8, D83, D85; files 12, 15): every decision
 //! about a Vessel, a Candidate or a Template, rebuilt from the
 //! coordinator log's accepted records alone, and checked.
 //!
@@ -10,7 +10,7 @@
 //! Template, and whether that Template is ready and the sanction
 //! completed; never, and why; closed by the purge; still open, and what
 //! a sanction still waits for: `pending_reason`).  For a Vessel also its
-//! purge (deferrals, the commit, the items, the end); for a Template its
+//! purge (what blocks it now, the commit, the items, the end); for a Template its
 //! definition and where it was born (a sanction's trail, or a genesis,
 //! which has no Candidate, no attempt and no track record).
 //!
@@ -28,8 +28,8 @@
 //! A record or object changed after it was accepted fails a check; the
 //! explanation is still given, and says which.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 27, BLAKE3
-//! `7793e63dbab800e98051061cc0ee4f6f42faae8d7cd3ee8c754c2be9c62e3fad`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 30, BLAKE3
+//! `b5f59255657885a8c056c1e758e76699f1a36485a2e2327ca21d47c6ead1ccd8`.
 
 use std::collections::BTreeMap;
 
@@ -312,7 +312,7 @@ fn vessel(cx: &mut Ctx<'_>, id: ChronicleId) -> Result<Value, String> {
     let mut trails: BTreeMap<[u8; 32], Trail> = BTreeMap::new();
     let mut order: Vec<[u8; 32]> = Vec::new();
     let mut started: BTreeMap<[u8; 32], VerificationStarted> = BTreeMap::new();
-    let mut purge = json!({"deferred": [], "replaced": 0, "lost": 0});
+    let mut purge = json!({"replaced": 0, "lost": 0});
     let mut retired = false;
     let trail = |cid: HashVal, order: &mut Vec<[u8; 32]>| -> [u8; 32] {
         let k = *cid.as_bytes();
@@ -464,11 +464,6 @@ fn vessel(cx: &mut Ctx<'_>, id: ChronicleId) -> Result<Value, String> {
                 let k = trail(s.candidate_id, &mut order);
                 trails.entry(k).or_default().committed = Some((s.template_id, s.verdict));
             }
-            ContractRecord::PurgeDeferred(d) => {
-                purge["deferred"].as_array_mut().expect("an array").push(
-                    json!({"checked_at": d.checked_at.get(), "reason": format!("{:?}", d.reason)}),
-                );
-            }
             ContractRecord::PurgeCommitted(p) => {
                 retired = true;
                 cx.content(
@@ -536,6 +531,14 @@ fn vessel(cx: &mut Ctx<'_>, id: ChronicleId) -> Result<Value, String> {
     let birth = entries
         .iter()
         .any(|e| matches!(e.record, Submitted::Birth { .. }));
+    // What blocks its purge now (D85: no deferral is recorded).
+    if !retired {
+        purge["blocked_now"] = match cx.coord.purge_blocker(id) {
+            Ok(Some(b)) => json!(format!("{b:?}")),
+            Ok(None) => Value::Null,
+            Err(e) => return Err(format!("coordinator: {e}")),
+        };
+    }
     Ok(json!({
         "vessel": hex(id.as_bytes()),
         "records": entries.len(),

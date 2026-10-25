@@ -1,5 +1,5 @@
 //! Verdicts: a caller's decision on a Candidate, recorded and acted on
-//! (P4 spec rev. 22 §5.1, §5.3 steps 1–4; D73, D75–D78; file 8a).
+//! (P4 spec rev. 30 §5.1, §5.3 steps 1–4; D73, D75–D78, D86; files 8a, 15).
 //!
 //! [`Verdicts::handle`] runs §5.3's steps through the Vessel's own log:
 //!
@@ -8,19 +8,21 @@
 //!    (its `Refused` again, or the steps after its `VerdictSubmitted`);
 //!    otherwise the request's binding is checked and one of `Refused`
 //!    (the permanent refusals, D75) or `VerdictSubmitted` is accepted.
-//! 2. **Hold** answers; **Never** closes the Candidate (`NotClosed` while
-//!    an attempt is open).
-//! 3. **Pre-check** of a Sanction: what can still change is answered
-//!    `NotCommitted` (D75); a Candidate closed since is `NotCommitted
-//!    { Closed }`, and a coordinator refusal at step 4 is `NotCommitted
-//!    { Conflict }`, its reason logged (D78).
+//! 2. **Hold**: the Warden answers.  **Never**: the Warden closes the
+//!    Candidate, or answers `Retry { Rule { OpenAttempt } }` while an
+//!    attempt is open.
+//! 3. **Pre-check** of a Sanction: what can still change, the Warden
+//!    answers `Retry { Rule { rule } }` (D75, D86).  A Candidate closed
+//!    since (by another verdict) is `Refused { Closed }`, final; a
+//!    coordinator refusal at step 4 is `Retry { Rule { Conflict } }`, its
+//!    reason logged (D78).
 //! 4. **Commit**: `SanctionCommitted` with `template_id` (§9) and
 //!    `parent_template` (D76).
 //!
 //! [`pending`] is what a caller is shown (D73).
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 22, BLAKE3
-//! `f3a54561505ebef478c43426273d79c789ec60dc74d0ff9c74ae0455720bde46`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 30, BLAKE3
+//! `b5f59255657885a8c056c1e758e76699f1a36485a2e2327ca21d47c6ead1ccd8`.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -36,7 +38,7 @@ use taso_core::envelope::{HashVal, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::{Origin, Payload};
 
-pub use taso_core::decider::{PendingItem, VerdictAnswer};
+pub use taso_core::decider::{PendingItem, RetryReason, VerdictAnswer};
 
 use crate::attempt::Failpoint;
 use crate::chronicle::{ChronicleError, Layers};
@@ -155,7 +157,9 @@ impl Verdicts {
                         return Ok(VerdictAnswer::Refused(r.rule))
                     }
                     Recorded::Accepted(_) => {}
-                    Recorded::Unknown(why) => return Ok(VerdictAnswer::Pending(why)),
+                    Recorded::Unknown(why) => {
+                        return Ok(VerdictAnswer::Retry(RetryReason::Pending(why)))
+                    }
                 }
                 if (self.failpoint)("verdict.after_submitted") {
                     return Err(VerdictError::Failpoint("verdict.after_submitted"));
@@ -178,11 +182,13 @@ impl Verdicts {
                         CloseKind::Never { verdict: v, .. } if v == verdict => {
                             VerdictAnswer::ClosedNever
                         }
-                        _ => VerdictAnswer::NotClosed(Refusal::Closed),
+                        _ => VerdictAnswer::Refused(Refusal::Closed),
                     });
                 }
                 if self.open_attempt(vessel, cid)? {
-                    return Ok(VerdictAnswer::NotClosed(Refusal::OpenAttempt));
+                    return Ok(VerdictAnswer::Retry(RetryReason::Rule(
+                        Refusal::OpenAttempt,
+                    )));
                 }
                 let rec = ContractRecord::CandidateClosed(CandidateClosed {
                     candidate_id: cid,
@@ -196,8 +202,8 @@ impl Verdicts {
                         how: CloseKind::Never { verdict: v, .. },
                         ..
                     })) if v == verdict => VerdictAnswer::ClosedNever,
-                    Recorded::Accepted(_) => VerdictAnswer::NotClosed(Refusal::Closed),
-                    Recorded::Unknown(why) => VerdictAnswer::Pending(why),
+                    Recorded::Accepted(_) => VerdictAnswer::Refused(Refusal::Closed),
+                    Recorded::Unknown(why) => VerdictAnswer::Retry(RetryReason::Pending(why)),
                 })
             }
             Decision::Sanction => {
@@ -210,7 +216,11 @@ impl Verdicts {
                         "taso-warden: verdict {}: not committed: {why}",
                         req.request_id
                     );
-                    return Ok(VerdictAnswer::NotCommitted(rule));
+                    // Closed since: final; anything else can still change.
+                    return Ok(match rule {
+                        Refusal::Closed => VerdictAnswer::Refused(Refusal::Closed),
+                        rule => VerdictAnswer::Retry(RetryReason::Rule(rule)),
+                    });
                 }
                 // 4. Commit.
                 let parent_template = match vessel.lineage().origin {
@@ -240,7 +250,9 @@ impl Verdicts {
                         "the sanction's logical id holds {other:?}"
                     )))
                     .into()),
-                    Ok(Recorded::Unknown(why)) => Ok(VerdictAnswer::Pending(why)),
+                    Ok(Recorded::Unknown(why)) => {
+                        Ok(VerdictAnswer::Retry(RetryReason::Pending(why)))
+                    }
                     // The coordinator is authoritative: final for this
                     // submission only (§5.3 step 4).
                     Err(VerdictError::Submit(SubmitError::Refused(f))) => {
@@ -248,7 +260,7 @@ impl Verdicts {
                             "taso-warden: verdict {}: the coordinator refused the commit: {f:?}",
                             req.request_id
                         );
-                        Ok(VerdictAnswer::NotCommitted(Refusal::Conflict))
+                        Ok(VerdictAnswer::Retry(RetryReason::Rule(Refusal::Conflict)))
                     }
                     Err(e) => Err(e),
                 }

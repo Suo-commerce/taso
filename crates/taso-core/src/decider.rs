@@ -1,4 +1,4 @@
-//! The decider socket's messages (P4 spec rev. 22 §5.1, D72, D73, D77, D78).
+//! The decider socket's messages (P4 spec rev. 30 §5.1, D72, D73, D77, D78, D86).
 //!
 //! Framed as the Field's (`crate::frame`). A body is a tag and its fields
 //! in the canonical encoding (§9); decoding is strict: unknown tags,
@@ -12,10 +12,10 @@
 //! | `Verdict { request }` | 2 | `Verdict { answer }` | 2 |
 //! | | | `Error { message }` | 3 |
 //!
-//! Answers (D77): `Committed { template_id }` 0, `Held` 1, `ClosedNever`
-//! 2, `Refused { rule }` 3, `NotCommitted { rule }` 4, `NotClosed { rule }`
-//! 5, `Pending { why }` 6, `NotHere { why }` 7. A rule is the `Refusal`
-//! tag of §5.1.
+//! Answers (D77, D86): `Committed { template_id }` 0, `Held` 1,
+//! `ClosedNever` 2, `Refused { rule }` 3, `Retry { reason }` 4.  A Retry's
+//! reason: `NotHere { why }` 0, `Pending { why }` 1, `Rule { rule }` 2.  A
+//! rule is the `Refusal` tag of §5.1.
 
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
@@ -37,7 +37,40 @@ pub struct PendingItem {
     pub attempts: Vec<(VerificationStarted, VerificationFinished)>,
 }
 
-/// The answer to a verdict (D77).
+/// Why the Warden answers [`VerdictAnswer::Retry`] (D86): for a person
+/// reading it.  The caller does the same for each: it sends the same
+/// request again later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetryReason {
+    /// The Warden did not handle it here (D74): nothing recorded
+    /// (tag 0).  Ask again, or ask the Vessel's Warden.
+    NotHere(String),
+    /// An accept's outcome is unknown, or a running session did not take
+    /// it in time; it may be recorded (tag 1).
+    Pending(String),
+    /// Recorded, not done: a rule that can still change (steps 2–3), or
+    /// the coordinator refused this commit (step 4) (tag 2).
+    Rule(Refusal),
+}
+
+impl Canonical for RetryReason {
+    fn canon(&self, out: &mut Canon) {
+        match self {
+            Self::NotHere(why) => {
+                out.tag(0).str(why);
+            }
+            Self::Pending(why) => {
+                out.tag(1).str(why);
+            }
+            Self::Rule(r) => {
+                out.tag(2);
+                r.canon(out);
+            }
+        }
+    }
+}
+
+/// The answer to a verdict (D77, D86).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerdictAnswer {
     /// A `SanctionCommitted` is accepted for the Candidate.
@@ -49,17 +82,11 @@ pub enum VerdictAnswer {
     Held,
     /// The Candidate is closed by this `Never`.
     ClosedNever,
-    /// An accepted `Refused`, for good.
+    /// For good: an accepted `Refused`, or `Closed` when another verdict
+    /// closed the Candidate after this one was recorded (D86).
     Refused(Refusal),
-    /// Recorded, not committed: something that can still change (step 3),
-    /// or the coordinator refused this commit (step 4).
-    NotCommitted(Refusal),
-    /// Recorded, not closed (step 2).
-    NotClosed(Refusal),
-    /// An accept's outcome is unknown: send the same request again.
-    Pending(String),
-    /// Not handled on this Warden (D74): nothing recorded.
-    NotHere(String),
+    /// Send the same request again later (D86).
+    Retry(RetryReason),
 }
 
 /// A request to the decider socket.
@@ -165,19 +192,9 @@ impl Canonical for VerdictAnswer {
                 out.tag(3);
                 r.canon(out);
             }
-            Self::NotCommitted(r) => {
+            Self::Retry(r) => {
                 out.tag(4);
                 r.canon(out);
-            }
-            Self::NotClosed(r) => {
-                out.tag(5);
-                r.canon(out);
-            }
-            Self::Pending(why) => {
-                out.tag(6).str(why);
-            }
-            Self::NotHere(why) => {
-                out.tag(7).str(why);
             }
         }
     }
@@ -274,10 +291,12 @@ fn answer(r: &mut Reader<'_>) -> Result<VerdictAnswer, DecodeError> {
         (_, 1) => VerdictAnswer::Held,
         (_, 2) => VerdictAnswer::ClosedNever,
         (_, 3) => VerdictAnswer::Refused(r.refusal()?),
-        (_, 4) => VerdictAnswer::NotCommitted(r.refusal()?),
-        (_, 5) => VerdictAnswer::NotClosed(r.refusal()?),
-        (_, 6) => VerdictAnswer::Pending(r.string()?),
-        (_, 7) => VerdictAnswer::NotHere(r.string()?),
+        (_, 4) => VerdictAnswer::Retry(match r.tag()? {
+            (_, 0) => RetryReason::NotHere(r.string()?),
+            (_, 1) => RetryReason::Pending(r.string()?),
+            (_, 2) => RetryReason::Rule(r.refusal()?),
+            (at, t) => return Reader::bad(at, "retry reason", t),
+        }),
         (at, t) => return Reader::bad(at, "verdict answer", t),
     })
 }
@@ -308,10 +327,10 @@ mod tests {
             VerdictAnswer::Held,
             VerdictAnswer::ClosedNever,
             VerdictAnswer::Refused(Refusal::StaleFacts),
-            VerdictAnswer::NotCommitted(Refusal::LaterAttemptFailed),
-            VerdictAnswer::NotClosed(Refusal::OpenAttempt),
-            VerdictAnswer::Pending("unknown".into()),
-            VerdictAnswer::NotHere("held elsewhere".into()),
+            VerdictAnswer::Retry(RetryReason::NotHere("held elsewhere".into())),
+            VerdictAnswer::Retry(RetryReason::Pending("unknown".into())),
+            VerdictAnswer::Retry(RetryReason::Rule(Refusal::LaterAttemptFailed)),
+            VerdictAnswer::Retry(RetryReason::Rule(Refusal::OpenAttempt)),
         ] {
             v.push(Reply::Verdict { answer });
         }
@@ -357,7 +376,9 @@ mod tests {
             Reply::decode(&[4]),
             Err(DecodeError::BadTag { .. })
         ));
-        assert!(Reply::decode(&[2, 8]).is_err(), "no answer tag 8");
-        assert!(Reply::decode(&[2, 4, 12]).is_err(), "no refusal tag 12");
+        assert!(Reply::decode(&[2, 5]).is_err(), "no answer tag 5 (D86)");
+        assert!(Reply::decode(&[2, 3, 12]).is_err(), "no refusal tag 12");
+        assert!(Reply::decode(&[2, 4, 3]).is_err(), "no retry reason tag 3");
+        assert!(Reply::decode(&[2, 4, 2, 12]).is_err(), "no refusal tag 12");
     }
 }
