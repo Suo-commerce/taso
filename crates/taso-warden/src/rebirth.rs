@@ -360,6 +360,12 @@ impl<P: Pool> Host<P> {
                     )
                     .map(|_| ())
             }
+            // Its layer must be received on this node first (P4 spec rev. 16
+            // §5.6); until file 5g does that, refused, nothing changed.
+            Origin::Template { .. } => Err(
+                "rebirth of a Template-born Vessel needs its Template's layer on this node (P4 file 5g)"
+                    .into(),
+            ),
         }
         .map_err(VesselError::Pool)
     }

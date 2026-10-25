@@ -559,13 +559,45 @@ pub enum Origin {
         /// Who authorised it, and why.
         authority: Authority,
     },
+    /// Born from a Template (tag 3; P4 spec rev. 16 §5.6, D54): a clone of
+    /// the Template's layer on this storage kind.  It inherits files,
+    /// never effects (`ledger_pos` is 0), and never goes back into the
+    /// Template.
+    Template {
+        /// The Template.
+        template_id: ChronicleId,
+        /// The layer object it was cloned from (`taso.layer.v1`), which is
+        /// also the layer Seal's binding hash on every node (D52).
+        layer_key: HashVal,
+        /// The `name@version` its config named, if it named one: a label,
+        /// checked by the coordinator at birth (D50).
+        asked: Option<TemplateAsked>,
+    },
+}
+
+/// The `name@version` a Template-born Vessel was asked by (P4 spec
+/// rev. 16 §5.5, D50).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateAsked {
+    /// The Template name.
+    pub name: String,
+    /// Its version, from 1.
+    pub version: u32,
+}
+
+impl Canonical for TemplateAsked {
+    fn canon(&self, out: &mut Canon) {
+        out.str(&self.name).u32(self.version);
+    }
 }
 
 impl Origin {
-    /// The parent Seal, unless born from the void.
+    /// The parent Seal, for a fork or a succession.  A Template is not a
+    /// parent Seal: its layer is not a Seal record of any Chronicle
+    /// ([`Origin::Template`]).
     pub fn parent(&self) -> Option<&ParentSeal> {
         match self {
-            Self::Void => None,
+            Self::Void | Self::Template { .. } => None,
             Self::Fork { parent } | Self::Succession { parent, .. } => Some(parent),
         }
     }
@@ -585,6 +617,16 @@ impl Canonical for Origin {
                 out.tag(2);
                 parent.canon(out);
                 authority.canon(out);
+            }
+            Self::Template {
+                template_id,
+                layer_key,
+                asked,
+            } => {
+                out.tag(3);
+                template_id.canon(out);
+                layer_key.canon(out);
+                out.option(asked.as_ref());
             }
         }
     }
@@ -1708,5 +1750,60 @@ mod tests {
         "aa28dd78f22460398ad7e73dedf7ae6bf08ef3a98759b4fe6c96598e77a35d2a",
         "761c04378b93bcdc86bff19701bd204e44b6e07d7d89d930cbf3575d0bfdfdab",
         "e54dff3e751d20933a39c1b90dab35432577a23e2620b6f7d9485e5fb493f9dd",
+    ];
+
+    /// A Template-born Vessel's Lineage (origin tag 3; P4 spec rev. 16
+    /// D54), asked by name and by id.  Additive: every earlier pin is
+    /// unchanged.
+    fn template_lineages() -> Vec<Payload> {
+        [
+            Some(TemplateAsked {
+                name: "acme-base".into(),
+                version: 3,
+            }),
+            None,
+        ]
+        .into_iter()
+        .map(|asked| {
+            Payload::Lineage(LineageRecord {
+                origin: Origin::Template {
+                    template_id: ChronicleId::from_bytes([0x7E; 16]),
+                    layer_key: HashVal::from_bytes([0x1A; 32]),
+                    asked,
+                },
+                namespace: Namespace::from_bytes([1; 16]),
+                ledger_pos: Lsn::new(0),
+            })
+        })
+        .collect()
+    }
+
+    #[test]
+    fn template_origin_round_trips_and_is_pinned() {
+        let got: Vec<String> = template_lineages()
+            .into_iter()
+            .map(|p| {
+                assert_eq!(Payload::decode(&p.canon_bytes()).unwrap(), p);
+                make_record(p).envelope.hash.to_string()
+            })
+            .collect();
+        assert_eq!(got, PINS_TEMPLATE_ORIGIN);
+        // No parent Seal: a Template is not a Seal record.
+        for p in template_lineages() {
+            let Payload::Lineage(l) = p else {
+                unreachable!()
+            };
+            assert!(l.origin.parent().is_none());
+        }
+        // An origin tag past 3 is refused.
+        let mut b = template_lineages()[1].canon_bytes();
+        let at = 1; // payload tag, then the origin tag
+        b[at] = 4;
+        assert!(Payload::decode(&b).is_err());
+    }
+
+    const PINS_TEMPLATE_ORIGIN: [&str; 2] = [
+        "03ceba5ce527f5c08f4e0c2e8a4188257cd4ea550872195df465fa75f4067480",
+        "4cc600f1261d931488275ce49dc96e11cfef5400cc94195b199ffe7339bfc97b",
     ];
 }

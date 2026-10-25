@@ -22,7 +22,8 @@ use crate::record::{
     Authority, BarrierId, CheckpointRecord, CheckpointSeal, Consequence, Dispatch, FsShippedRecord,
     GapRecord, GroupId, GroupRecord, IntentRecord, LayerRef, LineageRecord, Member, Namespace,
     OpId, OpenEffect, Origin, OutcomeRecord, OutcomeState, ParentSeal, Payload, PromotionRecord,
-    RetryPolicy, SealRecord, StreamBase, StreamCut, SuccessionRecord, TaintKind, TurnId, Verdict,
+    RetryPolicy, SealRecord, StreamBase, StreamCut, SuccessionRecord, TaintKind, TemplateAsked,
+    TurnId, Verdict,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -113,6 +114,10 @@ impl<'a> Reader<'a> {
         let mut a = [0u8; 8];
         a.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(a))
+    }
+
+    fn u32(&mut self) -> R<u32> {
+        Ok(u32::from_le_bytes(self.fixed::<4>()?))
     }
 
     fn fixed<const N: usize>(&mut self) -> R<[u8; N]> {
@@ -416,6 +421,16 @@ impl<'a> Reader<'a> {
                 parent: self.parent_seal()?,
                 authority: self.authority()?,
             },
+            (_, 3) => Origin::Template {
+                template_id: self.chronicle()?,
+                layer_key: self.hash()?,
+                asked: self.option(|r| {
+                    Ok(TemplateAsked {
+                        name: r.string()?,
+                        version: r.u32()?,
+                    })
+                })?,
+            },
             (at, tag) => {
                 return Err(DecodeError::BadTag {
                     at,
@@ -701,6 +716,16 @@ mod tests {
             parent_seal().prop_map(|parent| Origin::Fork { parent }),
             (parent_seal(), authority())
                 .prop_map(|(parent, authority)| Origin::Succession { parent, authority }),
+            (
+                any::<[u8; 16]>(),
+                hash(),
+                proptest::option::of((text(), any::<u32>()))
+            )
+                .prop_map(|(t, layer_key, asked)| Origin::Template {
+                    template_id: ChronicleId::from_bytes(t),
+                    layer_key,
+                    asked: asked.map(|(name, version)| TemplateAsked { name, version }),
+                }),
         ];
         (origin, any::<[u8; 16]>(), lsn()).prop_map(|(origin, ns, ledger_pos)| {
             Payload::Lineage(LineageRecord {

@@ -94,12 +94,14 @@ pub enum Mode {
 
 impl Mode {
     /// The default by origin (D4): a fork holds, a Vessel born from the
-    /// void or by succession dispatches.  A config entry may override
-    /// it; an agent never can.
+    /// void, by succession or from a Template dispatches (a Template-born
+    /// Vessel is a new start, not a sub-agent: no parent can promote its
+    /// proposals, P4 spec rev. 16 D54).  A config entry may override it;
+    /// an agent never can.
     pub fn of(origin: &Origin) -> Self {
         match origin {
             Origin::Fork { .. } => Mode::Hold,
-            Origin::Void | Origin::Succession { .. } => Mode::Dispatch,
+            Origin::Void | Origin::Succession { .. } | Origin::Template { .. } => Mode::Dispatch,
         }
     }
 }

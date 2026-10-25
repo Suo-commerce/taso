@@ -228,6 +228,9 @@ impl CoordStore {
                 Origin::Fork { parent } | Origin::Succession { parent, .. } => {
                     self.closure(parent.chronicle, parent.seal, depth + 1, out)
                 }
+                // A Template-born Vessel's closure ends at its layer object
+                // (P4 spec rev. 16 §2.1, D54).
+                Origin::Template { layer_key, .. } => out.push(ObjectId::content(layer_key)),
             },
             Some(_) => {}
             None => unreadable(out),
