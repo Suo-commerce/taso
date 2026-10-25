@@ -26,6 +26,7 @@ pub mod genesis;
 pub mod kube;
 pub mod ledger;
 pub mod navigate;
+pub mod nominate;
 pub mod pack;
 pub mod quiesce;
 pub mod rebirth;

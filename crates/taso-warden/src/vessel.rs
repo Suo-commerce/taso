@@ -1615,6 +1615,24 @@ impl<L: Layers> Vessel<L> {
         Ok(self.chronicle.append(stream, payload)?)
     }
 
+    /// Append a contract record this Warden submits for the Vessel (a
+    /// `Candidate`, a `NominationRefused`, …; P4 file 6): reserved for the
+    /// Warden, never an agent's.
+    pub(crate) fn append_contract(
+        &mut self,
+        record: taso_core::contract::ContractRecord,
+    ) -> Result<ChronicleHead, VesselError> {
+        self.writable()?;
+        Ok(self
+            .chronicle
+            .append(Stream::Ctl, Payload::Contract(Box::new(record)))?)
+    }
+
+    /// The coordinator-log submission counter of this epoch (§9).
+    pub(crate) fn attempt_mut(&mut self) -> &mut u64 {
+        &mut self.attempt
+    }
+
     /// Append records together: one write, one fsync, one CAS; all or
     /// none.  The same records are refused as by [`Vessel::append`].
     pub fn append_batch(

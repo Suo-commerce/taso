@@ -61,6 +61,8 @@ pub enum SubmitError {
     NotAccepted(Transient),
     /// The log's answers do not agree with each other.
     Inconsistent(&'static str),
+    /// A deliberate stop at a named failpoint (tests).
+    Stopped(&'static str),
 }
 
 impl fmt::Display for SubmitError {
@@ -73,6 +75,7 @@ impl fmt::Display for SubmitError {
             Self::Refused(r) => write!(f, "refused: {r:?}"),
             Self::NotAccepted(t) => write!(f, "not accepted: {t:?}"),
             Self::Inconsistent(why) => write!(f, "inconsistent: {why}"),
+            Self::Stopped(at) => write!(f, "stopped at failpoint {at}"),
         }
     }
 }
@@ -191,6 +194,21 @@ pub fn accept<L: Layers>(
     pack: String,
     attempt: &mut u64,
 ) -> Result<Submitted, SubmitError> {
+    accept_with(coord, warden, chronicle, record, pack, attempt, &|| Ok(()))
+}
+
+/// [`accept`], calling `after_announce` once the first submission is
+/// announced and before it is accepted (a failpoint, file 6).
+pub fn accept_with<L: Layers>(
+    coord: &dyn Coord,
+    warden: WardenId,
+    chronicle: &Chronicle<L>,
+    record: Submitted,
+    pack: String,
+    attempt: &mut u64,
+    after_announce: &dyn Fn() -> Result<(), SubmitError>,
+) -> Result<Submitted, SubmitError> {
+    let mut announced = false;
     let logical = record.logical_id();
     let digest = record.digest();
     let (id, epoch) = (chronicle.id(), chronicle.epoch());
@@ -199,6 +217,10 @@ pub fn accept<L: Layers>(
         *attempt += 1;
         if let Err(a) = coord.announce(warden, id, epoch, sub, logical, digest)? {
             return final_answer(coord, logical, a);
+        }
+        if !announced {
+            announced = true;
+            after_announce()?;
         }
         let mut tries = 0;
         loop {
