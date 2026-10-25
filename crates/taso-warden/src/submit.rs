@@ -17,8 +17,10 @@
 //! The submission counter (`attempt_no`, §9) lives with the caller, one
 //! per epoch.
 //!
-//! [`crate::genesis`] and [`crate::template`] carry their own copies of
-//! this path; they are to be joined to this one when P4 is simplified.
+//! It is the Warden's one submit path (D89, file 16): every Chronicle's
+//! records go through it, the Vessels', a genesis Chronicle's
+//! ([`crate::genesis`]) and the Warden Chronicle's ([`crate::template`]).
+//! Those two keep only their append-once step and their error types.
 //!
 //! Normative reference: `Taso_spec_p4_contracts` rev. 17, BLAKE3
 //! `097a3eb0375596aa60927260b971deeaf350b70c08067234ad2e656cb88ae369`.

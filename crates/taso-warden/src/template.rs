@@ -52,9 +52,8 @@
 //! rebuilt from its packs if this node lost it.  A Warden that finds it
 //! held by another Warden stops.
 //!
-//! The submit path (logical lookup, append once, ship, announce, accept)
-//! is the one of [`crate::genesis`], kept here as its own copy for now;
-//! the two are to be joined when P4 is simplified.
+//! A record goes logical lookup, append once, then the Warden's one
+//! submit path ([`crate::submit`], D89): ship, announce, accept.
 //!
 //! # Failpoints (§10.2)
 //!
@@ -72,10 +71,9 @@ use std::sync::{Arc, Mutex};
 
 use taso_core::canon::Canon;
 use taso_core::contract::{
-    logical_id, submission_id, ContractRecord, LayerShipped, LogicalKey, ObjectKind, StorageKind,
-    TemplateReady,
+    logical_id, ContractRecord, LayerShipped, LogicalKey, ObjectKind, StorageKind, TemplateReady,
 };
-use taso_core::coordlog::{Answer, ClaimAuthority, ClaimError, Final, Head, Submitted, Transient};
+use taso_core::coordlog::{ClaimAuthority, ClaimError, Final, Submitted, Transient};
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::Payload;
@@ -85,8 +83,9 @@ use crate::chronicle::{restore_log, Chronicle, ChronicleError, LayerError, Layer
 use crate::classify::{self, Classmap, Limits, Manifest, MapError, Owner, Reserved};
 use crate::coordinator::{Coord, CoordError};
 use crate::coordstore::object_key_path;
-use crate::pack::{name_bounds, PackError, Packs};
+use crate::pack::{PackError, Packs};
 use crate::ship::{ByteStream, Sender, SharedStore};
+use crate::submit::{self, SubmitError};
 use crate::vessel::Pool;
 use crate::zfs::Dataset;
 
@@ -98,12 +97,6 @@ pub const BUILD_DOMAIN: &str = "taso.template.layer.build.v1";
 
 /// Domain of a Warden Chronicle's id (D55).
 pub const WARDEN_DOMAIN: &str = "taso.warden.v1";
-
-/// How often a `NotReadable` accept is retried.
-const NOT_READABLE_TRIES: u32 = 5;
-
-/// How many times a record is resubmitted after `HeadMoved`.
-const HEAD_MOVED_TRIES: u64 = 3;
 
 /// A Warden's own Chronicle (D55): the first 16 bytes of
 /// `"taso.warden.v1" ‖ warden_id`.
@@ -202,6 +195,23 @@ impl fmt::Display for TemplateError {
 }
 
 impl std::error::Error for TemplateError {}
+
+impl From<SubmitError> for TemplateError {
+    fn from(e: SubmitError) -> Self {
+        match e {
+            SubmitError::Coord(e) => Self::Coord(e),
+            SubmitError::Chronicle(e) => Self::Chronicle(e),
+            SubmitError::Pack(e) => Self::Pack(e),
+            SubmitError::NotInLog => {
+                Self::Inconsistent("a prepared record is not in the local log".into())
+            }
+            SubmitError::Refused(r) => Self::Refused(r),
+            SubmitError::NotAccepted(t) => Self::NotAccepted(t),
+            SubmitError::Inconsistent(why) => Self::Inconsistent(why.into()),
+            SubmitError::Stopped(p) => Self::Failpoint(p),
+        }
+    }
+}
 
 impl From<CoordError> for TemplateError {
     fn from(e: CoordError) -> Self {
@@ -862,19 +872,6 @@ impl<P: Pool, X: Sender> Warden<'_, P, X> {
         Ok(None)
     }
 
-    fn lsn_of(&self, digest: HashVal) -> Result<Lsn, TemplateError> {
-        for f in self.chronicle.frames().map_err(ChronicleError::from)? {
-            if let Ok(Payload::Contract(r)) = Payload::decode(&f.payload) {
-                if r.digest() == digest {
-                    return Ok(f.envelope.lsn);
-                }
-            }
-        }
-        Err(TemplateError::Inconsistent(
-            "a prepared record is not in the local log".into(),
-        ))
-    }
-
     fn accepted(&self, logical: HashVal) -> Result<Option<ContractRecord>, TemplateError> {
         Ok(match self.t.coord.query_logical(logical)? {
             Some((_, Submitted::Contract(r))) => Some(r),
@@ -887,8 +884,9 @@ impl<P: Pool, X: Sender> Warden<'_, P, X> {
         })
     }
 
-    /// Submit `rec` (logical lookup, append once, ship, announce, accept):
-    /// the record accepted for its logical id, this one or another.
+    /// Submit `rec` (logical lookup, append once, then the Warden's one
+    /// submit path, [`crate::submit`], D89): the record accepted for its
+    /// logical id, this one or another.
     fn submit(&mut self, rec: ContractRecord) -> Result<ContractRecord, TemplateError> {
         let logical = rec.logical_id();
         if let Some(r) = self.accepted(logical)? {
@@ -907,85 +905,21 @@ impl<P: Pool, X: Sender> Warden<'_, P, X> {
                 rec
             }
         };
-        let digest = rec.digest();
-        let lsn = self.lsn_of(digest)?;
-        let tail = self.chronicle.tail();
-        self.packs.ship_log(&self.chronicle.segments(), tail)?;
-        self.t.coord.advance_shipped(
+        let rec = Submitted::Contract(rec);
+        let coord = self.t.coord.as_ref();
+        let pack = submit::put(coord, self.t.warden, &self.chronicle, &self.packs, &rec)?;
+        match submit::accept(
+            coord,
             self.t.warden,
-            self.chronicle.id(),
-            self.chronicle.epoch(),
-            tail,
-        )?;
-        let pack = self
-            .packs
-            .pack_names()?
-            .into_iter()
-            .find(|n| {
-                name_bounds(n)
-                    .is_some_and(|(end, base, fs)| fs.is_none() && base < lsn && lsn <= end)
-            })
-            .ok_or_else(|| {
-                TemplateError::Inconsistent(format!("no shipped pack carries lsn {}", lsn.get()))
-            })?;
-        let (id, epoch) = (self.chronicle.id(), self.chronicle.epoch());
-        let coord = &self.t.coord;
-        for _ in 0..HEAD_MOVED_TRIES {
-            let sub = submission_id(logical, digest, epoch, self.attempt);
-            self.attempt += 1;
-            if let Err(a) = coord.announce(self.t.warden, id, epoch, sub, logical, digest)? {
-                return self.final_answer(logical, a);
-            }
-            let mut tries = 0;
-            loop {
-                let head = coord.query_chronicle(id)?.map_or(Head::EMPTY, |v| v.head);
-                let a = coord.accept(
-                    self.t.warden,
-                    id,
-                    epoch,
-                    sub,
-                    head,
-                    pack.clone(),
-                    Submitted::Contract(rec.clone()),
-                )?;
-                match a {
-                    Answer::Accepted { .. } | Answer::AlreadyAccepted { .. } => {
-                        return self.accepted(logical)?.ok_or_else(|| {
-                            TemplateError::Inconsistent("accepted, but not in the log".into())
-                        });
-                    }
-                    Answer::Refused(Transient::NotReadable) if tries + 1 < NOT_READABLE_TRIES => {
-                        tries += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(200 << tries));
-                    }
-                    Answer::Refused(Transient::HeadMoved { .. }) => {
-                        coord.cancel(self.t.warden, id, epoch, sub)?;
-                        break;
-                    }
-                    Answer::Refused(last) => {
-                        let _ = coord.cancel(self.t.warden, id, epoch, sub);
-                        return Err(TemplateError::NotAccepted(last));
-                    }
-                    Answer::FinalRefused(_) => return self.final_answer(logical, a),
-                }
-            }
-        }
-        Err(TemplateError::NotAccepted(Transient::HeadMoved {
-            head: coord.query_chronicle(id)?.map_or(Head::EMPTY, |v| v.head),
-        }))
-    }
-
-    fn final_answer(&self, logical: HashVal, a: Answer) -> Result<ContractRecord, TemplateError> {
-        match a {
-            Answer::FinalRefused(Final::Conflict)
-            | Answer::Accepted { .. }
-            | Answer::AlreadyAccepted { .. } => self.accepted(logical)?.ok_or_else(|| {
-                TemplateError::Inconsistent(
-                    "answered accepted or Conflict, nothing accepted".into(),
-                )
-            }),
-            Answer::FinalRefused(r) => Err(TemplateError::Refused(r)),
-            Answer::Refused(t) => Err(TemplateError::NotAccepted(t)),
+            &self.chronicle,
+            rec,
+            pack,
+            &mut self.attempt,
+        )? {
+            Submitted::Contract(r) => Ok(r),
+            _ => Err(TemplateError::Inconsistent(
+                "a Birth under a layer id".into(),
+            )),
         }
     }
 }

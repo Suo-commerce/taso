@@ -53,11 +53,12 @@
 //! Every record goes the same way ([`Run::submit`]): the logical id is
 //! asked first (accepted → done, whatever the digest); the record is
 //! appended to the local log once (a frame with the same logical id from
-//! an earlier run is reused, so the earlier run's `peer` stands); the log
-//! is shipped and the anchor advanced; then announce and accept with the
-//! head `query { chronicle }` reports.  `HeadMoved` cancels and resubmits;
-//! `NotReadable` retries the same submission; `Conflict` reads the accepted
-//! record and returns it for the caller to compare.
+//! an earlier run is reused, so the earlier run's `peer` stands); then
+//! the Warden's one submit path ([`crate::submit`], D89) ships it,
+//! advances the anchor, announces and accepts with the head `query {
+//! chronicle }` reports.  `HeadMoved` cancels and resubmits; `NotReadable`
+//! retries the same submission; `Conflict` reads the accepted record and
+//! returns it for the caller to compare.
 //!
 //! # Failpoints (§10.2)
 //!
@@ -95,11 +96,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use taso_core::contract::{
-    genesis_id, logical_id, submission_id, BornFrom, Consistency, ContractRecord, GenesisCleanedUp,
+    genesis_id, logical_id, BornFrom, Consistency, ContractRecord, GenesisCleanedUp,
     GenesisRefused, GenesisStarted, LogicalKey, ObjectKind, PathClass, Peer, TemplateReady,
     WalkRefusal, TRANSFORM_VERSION,
 };
-use taso_core::coordlog::{Answer, ClaimAuthority, ClaimError, Final, Head, Submitted, Transient};
+use taso_core::coordlog::{ClaimAuthority, ClaimError, Final, Submitted, Transient};
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::{Authority, Payload};
@@ -109,9 +110,10 @@ use crate::chronicle::{restore_log, Chronicle, ChronicleError, LayerError, Layer
 use crate::classify::{self, Classmap, Limits, Manifest, MapError, Owner, Reserved, Unsupported};
 use crate::coordinator::{Coord, CoordError};
 use crate::coordstore::object_key_path;
-use crate::pack::{name_bounds, PackError, Packs};
+use crate::pack::{PackError, Packs};
 use crate::segment::Position;
 use crate::ship::{ByteStream, Sender, SharedStore};
+use crate::submit::{self, SubmitError};
 use crate::vessel::Pool;
 use crate::zfs::Dataset;
 
@@ -121,16 +123,6 @@ pub const SCRATCH_DOMAIN: &str = "taso.genesis.scratch.v1";
 /// The width of a uid slot (D44: a Seal's base is a whole slot above
 /// `host_uid_base`).
 const SLOT: u32 = classify::SLOT_WIDTH;
-
-/// How often a `NotReadable` accept is retried before the run gives up
-/// (the pack was put before the accept, so it is normally readable at
-/// once; a store that lags gets a few tries).
-const NOT_READABLE_TRIES: u32 = 5;
-
-/// How many times a record is resubmitted after `HeadMoved` before the run
-/// gives up (only this run writes the Chronicle, so the head moves only if
-/// another Warden took it over).
-const HEAD_MOVED_TRIES: u64 = 3;
 
 // ── Inputs and outputs ──────────────────────────────────────────────
 
@@ -1082,46 +1074,11 @@ impl<P: Pool> Run<'_, P> {
         Ok(rec)
     }
 
-    /// The local lsn of the frame carrying `digest`.
-    fn lsn_of(&self, digest: HashVal) -> Result<Lsn, GenesisError> {
-        for f in self.chronicle.frames().map_err(ChronicleError::from)? {
-            if let Ok(Payload::Contract(r)) = Payload::decode(&f.payload) {
-                if r.digest() == digest {
-                    return Ok(f.envelope.lsn);
-                }
-            }
-        }
-        Err(GenesisError::Inconsistent(
-            "a prepared record is not in the local log".into(),
-        ))
-    }
-
-    /// Ship the log to its tail and advance the anchor; the name of a log
-    /// pack carrying `lsn`.
-    fn ship(&mut self, lsn: Lsn) -> Result<String, GenesisError> {
-        let tail = self.chronicle.tail();
-        self.packs.ship_log(&self.chronicle.segments(), tail)?;
-        self.g.coord.advance_shipped(
-            self.g.warden,
-            self.chronicle.id(),
-            self.chronicle.epoch(),
-            tail,
-        )?;
-        self.packs
-            .pack_names()?
-            .into_iter()
-            .find(|n| {
-                name_bounds(n)
-                    .is_some_and(|(end, base, fs)| fs.is_none() && base < lsn && lsn <= end)
-            })
-            .ok_or_else(|| {
-                GenesisError::Inconsistent(format!("no shipped pack carries lsn {}", lsn.get()))
-            })
-    }
-
     /// Submit `rec` (see the module docs): the record accepted for its
-    /// logical id, this one or another.  `failpoint` is called just before
-    /// the first accept.
+    /// logical id, this one or another.  The Warden's one submit path
+    /// ([`crate::submit`], D89) ships, announces and accepts it, after
+    /// this run appends it once.  `failpoint` is called just before the
+    /// first accept.
     fn submit(
         &mut self,
         rec: ContractRecord,
@@ -1132,88 +1089,38 @@ impl<P: Pool> Run<'_, P> {
         if let Some(r) = self.accepted(logical)? {
             return Ok(r);
         }
-        let rec = self.prepare(rec)?;
-        let digest = rec.digest();
-        let lsn = self.lsn_of(digest)?;
-        let pack = self.ship(lsn)?;
-        let (id, epoch) = (self.chronicle.id(), self.chronicle.epoch());
-        let coord = &self.g.coord;
-        let mut failpoint = failpoint;
-        for _ in 0..HEAD_MOVED_TRIES {
-            let sub = submission_id(logical, digest, epoch, self.attempt);
-            self.attempt += 1;
-            if let Err(a) = coord.announce(self.g.warden, id, epoch, sub, logical, digest)? {
-                return self.final_answer(what, logical, a);
-            }
-            if let Some(p) = failpoint.take() {
-                (self.g.failpoint)(p)?;
-            }
-            let mut tries = 0;
-            loop {
-                let head = coord.query_chronicle(id)?.map_or(Head::EMPTY, |v| v.head);
-                let answer = coord.accept(
-                    self.g.warden,
-                    id,
-                    epoch,
-                    sub,
-                    head,
-                    pack.clone(),
-                    Submitted::Contract(rec.clone()),
-                )?;
-                match answer {
-                    Answer::Accepted { .. } | Answer::AlreadyAccepted { .. } => {
-                        return self.accepted(logical)?.ok_or_else(|| {
-                            GenesisError::Inconsistent(format!(
-                                "{what} answered accepted, but the log does not have it"
-                            ))
-                        });
-                    }
-                    Answer::Refused(Transient::NotReadable) if tries + 1 < NOT_READABLE_TRIES => {
-                        tries += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(200 << tries));
-                    }
-                    Answer::Refused(Transient::HeadMoved { .. }) => {
-                        coord.cancel(self.g.warden, id, epoch, sub)?;
-                        break;
-                    }
-                    Answer::Refused(last) => {
-                        let _ = coord.cancel(self.g.warden, id, epoch, sub);
-                        return Err(GenesisError::NotAccepted { record: what, last });
-                    }
-                    Answer::FinalRefused(_) => {
-                        return self.final_answer(what, logical, answer);
-                    }
-                }
-            }
-        }
-        Err(GenesisError::NotAccepted {
-            record: what,
-            last: Transient::HeadMoved {
-                head: coord.query_chronicle(id)?.map_or(Head::EMPTY, |v| v.head),
-            },
-        })
-    }
-
-    /// A final answer: a `Conflict` returns the accepted record; anything
-    /// else stops the run.
-    fn final_answer(
-        &self,
-        what: &'static str,
-        logical: HashVal,
-        a: Answer,
-    ) -> Result<ContractRecord, GenesisError> {
-        match a {
-            Answer::FinalRefused(Final::Conflict) => self.accepted(logical)?.ok_or_else(|| {
-                GenesisError::Inconsistent(format!("{what}: Conflict, but nothing is accepted"))
+        let rec = Submitted::Contract(self.prepare(rec)?);
+        let coord = self.g.coord.as_ref();
+        let pack = submit::put(coord, self.g.warden, &self.chronicle, &self.packs, &rec)
+            .map_err(|e| submit_error(what, e))?;
+        // The failpoint's own error, kept for the caller.
+        let stopped: std::cell::RefCell<Option<GenesisError>> = Default::default();
+        let after_announce = || match failpoint {
+            Some(p) => (self.g.failpoint)(p).map_err(|e| {
+                *stopped.borrow_mut() = Some(e);
+                SubmitError::Stopped(p)
             }),
-            Answer::Accepted { .. } | Answer::AlreadyAccepted { .. } => self
-                .accepted(logical)?
-                .ok_or_else(|| GenesisError::Inconsistent(format!("{what}: not in the log"))),
-            Answer::FinalRefused(reason) => Err(GenesisError::Refused {
-                record: what,
-                reason,
-            }),
-            Answer::Refused(last) => Err(GenesisError::NotAccepted { record: what, last }),
+            None => Ok(()),
+        };
+        let mut attempt = self.attempt;
+        let got = submit::accept_with(
+            coord,
+            self.g.warden,
+            &self.chronicle,
+            rec,
+            pack,
+            &mut attempt,
+            &after_announce,
+        );
+        self.attempt = attempt;
+        match got {
+            Ok(Submitted::Contract(r)) => Ok(r),
+            Ok(_) => Err(GenesisError::Inconsistent(
+                "a Birth under a genesis logical id".into(),
+            )),
+            Err(e) => Err(stopped
+                .into_inner()
+                .unwrap_or_else(|| submit_error(what, e))),
         }
     }
 
@@ -1227,6 +1134,25 @@ impl<P: Pool> Run<'_, P> {
             }
             None => None,
         })
+    }
+}
+
+/// A [`SubmitError`] as this run's error, naming the record.
+fn submit_error(what: &'static str, e: SubmitError) -> GenesisError {
+    match e {
+        SubmitError::Coord(e) => GenesisError::Coord(e),
+        SubmitError::Chronicle(e) => GenesisError::Chronicle(e),
+        SubmitError::Pack(e) => GenesisError::Pack(e),
+        SubmitError::NotInLog => {
+            GenesisError::Inconsistent(format!("{what}: a prepared record is not in the local log"))
+        }
+        SubmitError::Refused(reason) => GenesisError::Refused {
+            record: what,
+            reason,
+        },
+        SubmitError::NotAccepted(last) => GenesisError::NotAccepted { record: what, last },
+        SubmitError::Inconsistent(why) => GenesisError::Inconsistent(format!("{what}: {why}")),
+        SubmitError::Stopped(p) => GenesisError::Failpoint(p),
     }
 }
 
@@ -1276,6 +1202,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
+    use taso_core::coordlog::{Answer, Head};
 
     use crate::chronicle::read_log;
     use crate::coordinator::{Coordinator, LogConfig};
