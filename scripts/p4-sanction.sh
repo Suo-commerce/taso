@@ -106,8 +106,10 @@ cleanup() {
     if [[ -n "$DPID" ]] && kill -0 "$DPID" 2>/dev/null; then
         kill -TERM "$DPID"; wait "$DPID" 2>/dev/null
     fi
-    if [[ -n "$COORD_PID" ]] && kill -0 "$COORD_PID" 2>/dev/null; then
-        kill "$COORD_PID"; wait "$COORD_PID" 2>/dev/null
+    if [[ -n "$COORD_PID" ]]; then
+        kill -0 "$COORD_PID" 2>/dev/null && { kill "$COORD_PID"; wait "$COORD_PID" 2>/dev/null; }
+        # Its socket, only when this run's coordinator made it.
+        rm -f "$SOCK"
     fi
     if [[ $MODE == zfs ]]; then
         for ds in "${ZFS_MADE[@]}"; do
@@ -124,11 +126,12 @@ cleanup() {
         if [[ -n "$BLKD_PID" ]] && kill -0 "$BLKD_PID" 2>/dev/null; then
             blk quit >/dev/null 2>&1 || kill "$BLKD_PID"
             wait "$BLKD_PID" 2>/dev/null
+            # Its socket: this run's daemon made it and is gone.
+            rm -f "$BLK_SOCK"
         fi
         left=$(mounts_under | wc -l)
         [[ "$left" -eq 0 ]] || echo "WARNING: $left mounts left under $MNT"
     fi
-    rm -f "$SOCK"
     exit "$rc"
 }
 trap cleanup EXIT
@@ -138,7 +141,7 @@ trap cleanup EXIT
 [[ $EUID -eq 0 ]] || die "run as root"
 [[ -f Cargo.toml && -d crates/taso-warden ]] || die "run from the repository root"
 for t in runc ldd python3 cargo; do command -v "$t" >/dev/null || die "$t is missing"; done
-[[ ! -S "$SOCK" ]] || die "$SOCK exists: another run's coordinator? (pgrep -x taso-coordd)"
+[[ ! -S "$SOCK" ]] || die "$SOCK exists: another run's coordinator? (pgrep -af 'taso-coordd .*$SOCK')"
 if [[ $MODE == zfs ]]; then
     zfs list -H -o name "$PARENT" >/dev/null || die "no dataset $PARENT (set P4B_ZFS_PARENT)"
     for n in 1 2; do
@@ -149,7 +152,7 @@ if [[ $MODE == zfs ]]; then
 else
     modprobe ublk_drv
     [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
-    [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
+    [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's daemon? (pgrep -af 'taso-blkd .*$BLK_SOCK')"
     mkdir -p "$MNT"
     [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 fi
