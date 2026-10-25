@@ -15,15 +15,28 @@
 //!               { …, "kind": "gap", "kept": 67, "kept_hash": "…",
 //!                 "resumes": 69, "resumes_hash": "…" },
 //!               { …, "kind": "seal", "turn": 6,
-//!                 "verdict": "unverified", "reason": "reborn: …" } ] }
+//!                 "verdict": "unverified", "reason": "reborn: …" } ],
+//!   "coordlog": { "accepted": 1, "holds": ["content:…", "pack:…"],
+//!                 "birth": "accepted" } }
 //! ```
+//!
+//! A Lineage frame names its `origin` (`void`, `fork`, `succession`,
+//! `template`; a Template origin with its `template_id`, `layer_key` and
+//! `asked`); an `fs_shipped` frame its `base` (`full`, `seal`, `origin`
+//! with `base_chronicle`, `base_seal`, `base_hash`).  `coordlog` is the
+//! coordinator log's view of the Chronicle (`null` if it does not know
+//! it): how many of its records are accepted, the objects it holds, and
+//! for a Lineage at lsn 1 whether its `Birth` is accepted (`accepted`,
+//! `none`, or `other` for another record under its logical id; absent
+//! for a Chronicle without a Lineage).  P4 file 5h.
 
 use std::path::Path;
 use std::process::ExitCode;
 
 use serde_json::{json, Value};
-use taso_core::envelope::{ChronicleId, Stream};
-use taso_core::record::{Payload, Verdict};
+use taso_core::coordlog::{ObjectId, Submitted};
+use taso_core::envelope::{ChronicleId, HashVal, Stream};
+use taso_core::record::{Origin, Payload, StreamBase, Verdict};
 use taso_warden::chronicle::read_log;
 use taso_warden::coordinator::Coord;
 use taso_warden::coordsrv::RemoteCoord;
@@ -54,6 +67,45 @@ fn run(sock: &str, state_dir: &Path, id_hex: &str) -> Result<Value, String> {
     let shipped = coord.shipped(id).map_err(|e| format!("shipped: {e}"))?;
     let dir = state_dir.join(id_hex);
     let frames = read_log(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    let lineage = frames
+        .first()
+        .and_then(|f| match Payload::decode(&f.payload) {
+            Ok(Payload::Lineage(l)) => Some(l),
+            _ => None,
+        });
+    let coordlog = match coord
+        .query_chronicle(id)
+        .map_err(|e| format!("query chronicle: {e}"))?
+    {
+        None => Value::Null,
+        Some(view) => {
+            let holds: Vec<String> = view
+                .holds
+                .iter()
+                .map(|o| match o {
+                    ObjectId::Content(k) => format!("content:{}", HashVal::from_bytes(*k)),
+                    ObjectId::Pack(_, name) => format!("pack:{name}"),
+                })
+                .collect();
+            let mut v = json!({ "accepted": view.accepted.len(), "holds": holds });
+            if let Some(l) = &lineage {
+                let birth = Submitted::Birth {
+                    chronicle: id,
+                    lineage: l.clone(),
+                };
+                let state = match coord
+                    .query_logical(birth.logical_id())
+                    .map_err(|e| format!("query logical: {e}"))?
+                {
+                    None => "none",
+                    Some((_, r)) if r.digest() == birth.digest() => "accepted",
+                    Some(_) => "other",
+                };
+                v["birth"] = json!(state);
+            }
+            v
+        }
+    };
     let frames: Vec<Value> = frames
         .iter()
         .map(|f| {
@@ -78,6 +130,7 @@ fn run(sock: &str, state_dir: &Path, id_hex: &str) -> Result<Value, String> {
         "head": { "lsn": head.lsn.get(), "hash": head.hash.to_string() },
         "shipped": { "lsn": shipped.lsn.get(), "hash": shipped.hash.to_string() },
         "frames": frames,
+        "coordlog": coordlog,
     }))
 }
 
@@ -103,9 +156,46 @@ fn describe(v: &mut Value, payload: Option<Payload>) {
             o.insert("reason".into(), json!(reason));
             "seal"
         }
-        Some(Payload::Lineage(_)) => "lineage",
+        Some(Payload::Lineage(l)) => {
+            let origin = match &l.origin {
+                Origin::Void => "void",
+                Origin::Fork { .. } => "fork",
+                Origin::Succession { .. } => "succession",
+                Origin::Template {
+                    template_id,
+                    layer_key,
+                    asked,
+                } => {
+                    o.insert("template_id".into(), json!(hex(template_id.as_bytes())));
+                    o.insert("layer_key".into(), json!(layer_key.to_string()));
+                    o.insert(
+                        "asked".into(),
+                        json!(asked.as_ref().map(|a| format!("{}@{}", a.name, a.version))),
+                    );
+                    "template"
+                }
+            };
+            o.insert("origin".into(), json!(origin));
+            "lineage"
+        }
         Some(Payload::Succession(_)) => "succession",
-        Some(Payload::FsShipped(_)) => "fs_shipped",
+        Some(Payload::FsShipped(r)) => {
+            let base = match &r.base {
+                StreamBase::Full => "full",
+                StreamBase::Seal { .. } => "seal",
+                StreamBase::Origin { parent, .. } => {
+                    o.insert(
+                        "base_chronicle".into(),
+                        json!(hex(parent.chronicle.as_bytes())),
+                    );
+                    o.insert("base_seal".into(), json!(parent.seal.get()));
+                    o.insert("base_hash".into(), json!(parent.seal_hash.to_string()));
+                    "origin"
+                }
+            };
+            o.insert("base".into(), json!(base));
+            "fs_shipped"
+        }
         Some(Payload::Checkpoint(_)) => "checkpoint",
         Some(Payload::Contract(r)) => {
             o.insert("logical_id".into(), json!(r.logical_id().to_string()));
@@ -153,4 +243,8 @@ fn parse_id(hex: &str) -> Result<ChronicleId, String> {
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
     }
     Ok(ChronicleId::from_bytes(b))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
