@@ -38,6 +38,7 @@ pub mod source;
 pub mod source_kube;
 pub mod status_kube;
 pub mod storage;
+pub mod submit;
 pub mod summary;
 pub mod supervisor;
 pub mod template;

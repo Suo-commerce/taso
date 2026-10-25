@@ -1056,6 +1056,8 @@ mod tests {
         next: u64,
         destroyed: Vec<String>,
         created: Vec<String>,
+        /// Clones: dataset → (origin snapshot, the Seal's hash).
+        clones: BTreeMap<String, (String, HashVal)>,
     }
 
     #[derive(Clone)]
@@ -1158,22 +1160,44 @@ mod tests {
                 parent: None,
             })
         }
+        /// A copy of the bound Seal's files (P4 file 5f: a Vessel born
+        /// from a layer).
         fn clone(
             &self,
-            _: &Dataset,
-            _: Lsn,
-            _: HashVal,
-            _: &Dataset,
+            source: &Dataset,
+            seal: Lsn,
+            seal_hash: HashVal,
+            target: &Dataset,
         ) -> Result<DatasetInfo, LayerError> {
-            unsupported()
+            let bound = self.layers(source).list()?;
+            if !bound.contains(&(seal, seal_hash)) {
+                return Err(format!("no Seal {source}@{} with that hash", seal.get()).into());
+            }
+            let p = self.new_dataset(target)?;
+            let from = self.snaps(source).join(seal.get().to_string());
+            let ok = Command::new("cp")
+                .arg("-a")
+                .arg(from.join("."))
+                .arg(&p)
+                .status()?
+                .success();
+            if !ok {
+                return Err("cp -a failed".into());
+            }
+            self.state.lock().unwrap().clones.insert(
+                target.as_str().into(),
+                (source.seal_snapshot(seal), seal_hash),
+            );
+            Ok(self.info(target)?.expect("made"))
         }
         fn info(&self, d: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
             let p = self.data(d);
+            let clone = self.state.lock().unwrap().clones.get(d.as_str()).cloned();
             Ok(p.exists().then(|| DatasetInfo {
                 dataset: d.clone(),
                 mountpoint: Some(p),
-                origin: None,
-                parent: None,
+                origin: clone.as_ref().map(|c| c.0.clone()),
+                parent: clone.map(|c| c.1),
             }))
         }
         fn layers(&self, d: &Dataset) -> DirLayers {
@@ -1777,5 +1801,256 @@ mod tests {
             HashVal::from_bytes(b).to_string(),
             "cccc13deaa40ef3ac092018c1391102800000000000000000000000000000000"
         );
+    }
+
+    // ── Vessels born from the layer (P4 file 5f) ────────────────────
+
+    use crate::vessel::{Host, TemplateBirth, VesselError};
+    use taso_core::record::{vessel_id, LineageRecord, Namespace, Origin, TemplateAsked};
+
+    fn host(c: &Cluster, node: &TemplateLayers<DirPool, DirSend>) -> Host<DirPool> {
+        Host {
+            coord: c.coord.clone(),
+            pool: Clone::clone(&node.pool),
+            root: node.root.clone(),
+            state_dir: node.state_dir.clone(),
+            warden: node.warden,
+        }
+    }
+
+    fn vpacks(
+        c: &Cluster,
+        node: &TemplateLayers<DirPool, DirSend>,
+        id: ChronicleId,
+    ) -> Packs<SharedStore, DirSend> {
+        Packs::new(
+            c.store.clone(),
+            DirSend(node.state_dir.join("unused"), String::new()),
+            PREFIX,
+            id,
+        )
+        .unwrap()
+    }
+
+    fn vfail(name: &'static str) -> impl Fn(&'static str) -> Result<(), VesselError> {
+        move |p| {
+            if p == name {
+                Err(VesselError::Failpoint(p))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn nofail(_: &'static str) -> Result<(), VesselError> {
+        Ok(())
+    }
+
+    const NS: Namespace = Namespace::from_bytes([7; 16]);
+
+    fn birth_of(l: &Layer, asked: Option<TemplateAsked>) -> TemplateBirth {
+        TemplateBirth {
+            template_id: l.template_id,
+            layer_key: l.layer_key,
+            asked,
+        }
+    }
+
+    /// The Birth accepted for `id`, if any.
+    fn accepted_birth(c: &Cluster, id: ChronicleId, lineage: &LineageRecord) -> Option<Submitted> {
+        let b = Submitted::Birth {
+            chronicle: id,
+            lineage: lineage.clone(),
+        };
+        crate::submit::accepted(c.coord.as_ref(), b.logical_id()).unwrap()
+    }
+
+    #[test]
+    fn ten_vessels_are_born_from_one_layer() {
+        use std::os::unix::fs::MetadataExt;
+        let c = Cluster::new();
+        let n1 = c.node(1, StorageKind::Zfs);
+        let l = n1.ensure(c.t0).unwrap();
+        let h = host(&c, &n1);
+        let birth = birth_of(&l, None);
+        for i in 0..10 {
+            let subject = format!("v{i}");
+            let id = vessel_id(NS, subject.as_bytes());
+            let v = h
+                .born_from_template(
+                    NS,
+                    subject.as_bytes(),
+                    &birth,
+                    &vpacks(&c, &n1, id),
+                    &nofail,
+                )
+                .unwrap();
+            assert_eq!(
+                v.lineage().origin,
+                Origin::Template {
+                    template_id: c.t0,
+                    layer_key: l.layer_key,
+                    asked: None
+                }
+            );
+            assert_eq!(v.lineage().ledger_pos, Lsn::new(0));
+            assert!(h.birth_accepted(&v).unwrap());
+            assert_eq!(
+                accepted_birth(&c, id, v.lineage()).map(|r| r.digest()),
+                Some(
+                    Submitted::Birth {
+                        chronicle: id,
+                        lineage: v.lineage().clone()
+                    }
+                    .digest()
+                )
+            );
+            // The layer's files, in the Template range, on the Vessel's
+            // own dataset.
+            let info = h.pool.info(v.dataset()).unwrap().unwrap();
+            assert_eq!(info.parent, Some(l.layer_key));
+            assert_eq!(info.origin_seal(), Some((l.dataset.clone(), LAYER_LSN)));
+            let m = std::fs::metadata(info.mountpoint.unwrap().join("app/main.py")).unwrap();
+            assert_eq!((m.uid(), m.gid()), (TBASE, TBASE));
+            assert_eq!(v.tail().lsn, Lsn::new(1), "the Lineage only");
+            assert!(
+                c.coord.shipped(id).unwrap().lsn >= Lsn::new(1),
+                "shipped first"
+            );
+        }
+        // The Birth holds the layer object for each Vessel.
+        assert!(c
+            .coord
+            .query_chronicle(vessel_id(NS, b"v3"))
+            .unwrap()
+            .unwrap()
+            .holds
+            .contains(&ObjectId::content(l.layer_key)));
+        // Again: opened, nothing appended, nothing accepted twice.
+        let id = vessel_id(NS, b"v0");
+        let v = h
+            .born_from_template(NS, b"v0", &birth, &vpacks(&c, &n1, id), &nofail)
+            .unwrap();
+        assert_eq!(v.tail().lsn, Lsn::new(1));
+        // Opened by id, it is a Template-born Vessel with its Birth.
+        drop(v);
+        let (v, _) = h.open(id).unwrap();
+        assert!(h.birth_accepted(&v).unwrap());
+        // Asked by another name: refused, never re-born.
+        drop(v);
+        let other = birth_of(
+            &l,
+            Some(TemplateAsked {
+                name: "acme".into(),
+                version: 1,
+            }),
+        );
+        assert!(matches!(
+            h.born_from_template(NS, b"v0", &other, &vpacks(&c, &n1, id), &nofail),
+            Err(VesselError::TemplateMismatch)
+        ));
+    }
+
+    #[test]
+    fn an_interrupted_birth_is_finished_and_never_runs_before_its_birth() {
+        let c = Cluster::new();
+        let n1 = c.node(1, StorageKind::Blk);
+        let l = n1.ensure(c.t0).unwrap();
+        let h = host(&c, &n1);
+        let birth = birth_of(&l, None);
+        for (i, at) in [
+            "birth.after_clone",
+            "birth.after_lineage_append",
+            "birth.before_accept",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let subject = format!("f{i}");
+            let id = vessel_id(NS, subject.as_bytes());
+            let packs = vpacks(&c, &n1, id);
+            let e = h
+                .born_from_template(NS, subject.as_bytes(), &birth, &packs, &vfail(at))
+                .err()
+                .expect("stopped");
+            assert!(
+                matches!(e, VesselError::Failpoint(p) if p == at),
+                "{at}: {e}"
+            );
+            let lineage = LineageRecord {
+                origin: Origin::Template {
+                    template_id: c.t0,
+                    layer_key: l.layer_key,
+                    asked: None,
+                },
+                namespace: NS,
+                ledger_pos: Lsn::new(0),
+            };
+            assert!(
+                accepted_birth(&c, id, &lineage).is_none(),
+                "{at}: no Birth yet"
+            );
+            if at != "birth.after_clone" {
+                // An open finds the Lineage without its Birth: not to run.
+                let (v, _) = h.open(id).unwrap();
+                assert!(!h.birth_accepted(&v).unwrap(), "{at}");
+            }
+            // The same call finishes it.
+            let v = h
+                .born_from_template(NS, subject.as_bytes(), &birth, &packs, &nofail)
+                .unwrap();
+            assert_eq!(v.lineage(), &lineage);
+            assert_eq!(v.tail().lsn, Lsn::new(1), "{at}: one Lineage");
+            assert!(h.birth_accepted(&v).unwrap(), "{at}");
+        }
+        // An open finishes a Birth too.
+        let id = vessel_id(NS, b"g");
+        let packs = vpacks(&c, &n1, id);
+        h.born_from_template(NS, b"g", &birth, &packs, &vfail("birth.before_accept"))
+            .err()
+            .expect("stopped");
+        let (mut v, _) = h.open(id).unwrap();
+        h.finish_birth(&mut v, &packs, &nofail).unwrap();
+        assert!(h.birth_accepted(&v).unwrap());
+    }
+
+    #[test]
+    fn a_birth_needs_a_settled_layer_and_an_asked_name_that_names_it() {
+        let c = Cluster::new();
+        let n1 = c.node(1, StorageKind::Zfs);
+        let l = n1.ensure(c.t0).unwrap();
+        let h = host(&c, &n1);
+        // A name that names nothing: the Birth row refuses it.
+        let id = vessel_id(NS, b"n");
+        let asked = birth_of(
+            &l,
+            Some(TemplateAsked {
+                name: "acme".into(),
+                version: 1,
+            }),
+        );
+        let e = h
+            .born_from_template(NS, b"n", &asked, &vpacks(&c, &n1, id), &nofail)
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(
+                e,
+                VesselError::Birth(crate::submit::SubmitError::Refused(Final::Predicate(_)))
+            ),
+            "{e}"
+        );
+        // A layer key that is not the settled one: the clone refuses it
+        // (no such bound Seal here), before anything is registered.
+        let id = vessel_id(NS, b"k");
+        let stray = TemplateBirth {
+            template_id: c.t0,
+            layer_key: HashVal::from_bytes([0x5A; 32]),
+            asked: None,
+        };
+        assert!(matches!(
+            h.born_from_template(NS, b"k", &stray, &vpacks(&c, &n1, id), &nofail),
+            Err(VesselError::Pool(_))
+        ));
     }
 }

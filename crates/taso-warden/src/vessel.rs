@@ -62,12 +62,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use taso_core::coordlog::Submitted;
 use taso_core::decode::DecodeError;
 use taso_core::envelope::{ChronicleHead, ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::{
     vessel_id, Authority, LineageRecord, Namespace, OpId, OpenEffect, Origin, ParentSeal, Payload,
-    PromotionRecord, StreamCut, SuccessionRecord, TurnId, Verdict,
+    PromotionRecord, StreamCut, SuccessionRecord, TemplateAsked, TurnId, Verdict,
 };
 
 use crate::chronicle::{
@@ -77,6 +78,7 @@ use crate::coordinator::{Coord, CoordError};
 use crate::pack::{PackError, Packs};
 use crate::segment::{Frame, Position};
 use crate::ship::{ObjectStore, Sender};
+use crate::template::LAYER_LSN;
 use crate::zfs::{CloneBase, Dataset, DatasetInfo, Runner, Snapshot, Zfs};
 use taso_core::record::FsShippedRecord;
 
@@ -397,6 +399,15 @@ pub enum VesselError {
     /// something ran without a Seal, and freezing that would make a
     /// half-done state the level to step up from.
     NotPristine(Position),
+    /// A Template-born Vessel's `Birth` was not accepted (P4 §5.6).
+    Birth(crate::submit::SubmitError),
+    /// Another `Birth` is accepted for this Vessel than its Lineage.
+    BirthMismatch,
+    /// A Template-born Vessel's existing Lineage names another Template,
+    /// layer or name than the birth asked for.
+    TemplateMismatch,
+    /// A deliberate stop at a named failpoint (tests).
+    Failpoint(&'static str),
     /// Rebirth: a received snapshot is not the one the Seal was taken from.
     WrongSnapshot {
         /// The Seal.
@@ -474,6 +485,10 @@ impl fmt::Display for VesselError {
                 hex(&p.chronicle)
             ),
             Self::LocalState(why) => write!(f, "local state in the way: {why}"),
+            Self::Birth(e) => write!(f, "Birth not accepted: {e}"),
+            Self::BirthMismatch => f.write_str("another Birth is accepted for this vessel than its Lineage"),
+            Self::TemplateMismatch => f.write_str("the vessel exists, born from another Template, layer or name than asked"),
+            Self::Failpoint(at) => write!(f, "stopped at failpoint {at}"),
             Self::WrongSnapshot { seal, expected, got } => {
                 write!(f, "Seal {} was received with guid {got}, not {expected}", seal.get())
             }
@@ -507,6 +522,18 @@ pub struct Host<P: Pool> {
     pub state_dir: PathBuf,
     /// This Warden.
     pub warden: WardenId,
+}
+
+/// The Template a Vessel is born from ([`Host::born_from_template`]):
+/// what its Lineage names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateBirth {
+    /// The Template.
+    pub template_id: ChronicleId,
+    /// Its settled layer of this node's storage kind (`LayerShipped`).
+    pub layer_key: HashVal,
+    /// The `name@version` the config named it by, if any (a label).
+    pub asked: Option<TemplateAsked>,
 }
 
 /// How [`Host::ensure`] found the Vessel.
@@ -706,6 +733,13 @@ impl<P: Pool> Host<P> {
             .expect("root is valid and the suffix is hex")
     }
 
+    /// The layer dataset of the Template `t` on this node,
+    /// `<root>/t-<template_id hex>` (P4 §5.6).
+    pub fn layer_dataset(&self, t: ChronicleId) -> Dataset {
+        Dataset::new(&format!("{}/t-{}", self.root, hex(&t)))
+            .expect("root is valid and the suffix is hex")
+    }
+
     /// The Warden state directory of the Vessel `id`.
     pub fn dir_for(&self, id: ChronicleId) -> PathBuf {
         self.state_dir.join(hex(&id))
@@ -900,7 +934,7 @@ impl<P: Pool> Host<P> {
             namespace,
             ledger_pos,
         };
-        let mut chronicle = self.unborn(id, Some((parent_dataset, ps)))?;
+        let mut chronicle = self.unborn(id, Some((parent_dataset, ps.seal, ps.seal_hash)))?;
         chronicle.append(Stream::Ctl, Payload::Lineage(lineage.clone()))?;
         Ok(Vessel {
             id,
@@ -908,7 +942,130 @@ impl<P: Pool> Host<P> {
             lineage,
             successor: None,
             chronicle,
+            attempt: 0,
         })
+    }
+
+    /// Birth a Vessel for `subject` in `namespace` from a Template's
+    /// layer (P4 spec rev. 17 §5.6, D54), in order, each step finished by
+    /// calling this again with the same arguments: clone the layer's Seal
+    /// (`<root>/t-<hex>@1`, bound to `layer_key`) into the Vessel's
+    /// dataset; append the Lineage, `Origin::Template` with `ledger_pos`
+    /// 0, at lsn 1; ship it and accept `Birth` ([`Host::finish_birth`]).
+    ///
+    /// The layer must be settled and checked on this node
+    /// ([`crate::template::TemplateLayers::ensure`]); the clone refuses a
+    /// layer that is not here with this binding.  A Vessel that exists
+    /// with this Lineage is opened and its `Birth` finished; one with
+    /// another Lineage is refused ([`VesselError::TemplateMismatch`]).
+    pub fn born_from_template<S: ObjectStore, X: Sender>(
+        &self,
+        namespace: Namespace,
+        subject: &[u8],
+        birth: &TemplateBirth,
+        packs: &Packs<S, X>,
+        failpoint: &dyn Fn(&'static str) -> Result<(), VesselError>,
+    ) -> Result<Vessel<P::Layers>, VesselError> {
+        let id = vessel_id(namespace, subject);
+        let lineage = LineageRecord {
+            origin: Origin::Template {
+                template_id: birth.template_id,
+                layer_key: birth.layer_key,
+                asked: birth.asked.clone(),
+            },
+            namespace,
+            ledger_pos: Lsn::new(0),
+        };
+        let mut vessel = match self.registered_head(id)? {
+            Some(h) if h.lsn != Lsn::new(0) => {
+                let (v, _) = self.open_with(id, Some(namespace), false, Claim::Mine)?;
+                if v.lineage != lineage {
+                    return Err(VesselError::TemplateMismatch);
+                }
+                v
+            }
+            _ => {
+                let mut chronicle = self.unborn(
+                    id,
+                    Some((
+                        &self.layer_dataset(birth.template_id),
+                        LAYER_LSN,
+                        birth.layer_key,
+                    )),
+                )?;
+                failpoint("birth.after_clone")?;
+                chronicle.append(Stream::Ctl, Payload::Lineage(lineage.clone()))?;
+                failpoint("birth.after_lineage_append")?;
+                Vessel {
+                    id,
+                    dataset: self.dataset_for(id),
+                    lineage,
+                    successor: None,
+                    chronicle,
+                    attempt: 0,
+                }
+            }
+        };
+        self.finish_birth(&mut vessel, packs, failpoint)?;
+        Ok(vessel)
+    }
+
+    /// Whether `vessel` may run as far as its birth goes: a Template-born
+    /// Vessel only once its `Birth` is accepted (P4 §5.6).  Other origins
+    /// have no `Birth` to wait for in P4.
+    pub fn birth_accepted(&self, vessel: &Vessel<P::Layers>) -> Result<bool, VesselError> {
+        if !matches!(vessel.lineage.origin, Origin::Template { .. }) {
+            return Ok(true);
+        }
+        let birth = Submitted::Birth {
+            chronicle: vessel.id,
+            lineage: vessel.lineage.clone(),
+        };
+        match crate::submit::accepted(self.coord.as_ref(), birth.logical_id())
+            .map_err(VesselError::Coord)?
+        {
+            None => Ok(false),
+            Some(r) if r.digest() == birth.digest() => Ok(true),
+            Some(_) => Err(VesselError::BirthMismatch),
+        }
+    }
+
+    /// Finish a Template-born Vessel's birth: ship its Lineage and accept
+    /// `Birth` (the Birth row: the Template registered, this layer
+    /// shipped, the asked name naming this Template; holds the layer
+    /// object for the Vessel).  An open that finds a Template origin
+    /// without an accepted `Birth` calls this before the Vessel runs.
+    /// Nothing to do for other origins, or once it is accepted.
+    pub fn finish_birth<S: ObjectStore, X: Sender>(
+        &self,
+        vessel: &mut Vessel<P::Layers>,
+        packs: &Packs<S, X>,
+        failpoint: &dyn Fn(&'static str) -> Result<(), VesselError>,
+    ) -> Result<(), VesselError> {
+        if self.birth_accepted(vessel)? {
+            return Ok(());
+        }
+        let birth = Submitted::Birth {
+            chronicle: vessel.id,
+            lineage: vessel.lineage.clone(),
+        };
+        let coord = self.coord.as_ref();
+        let pack = crate::submit::put(coord, self.warden, &vessel.chronicle, packs, &birth)
+            .map_err(VesselError::Birth)?;
+        failpoint("birth.before_accept")?;
+        let got = crate::submit::accept(
+            coord,
+            self.warden,
+            &vessel.chronicle,
+            birth.clone(),
+            pack,
+            &mut vessel.attempt,
+        )
+        .map_err(VesselError::Birth)?;
+        if got.digest() != birth.digest() {
+            return Err(VesselError::BirthMismatch);
+        }
+        Ok(())
     }
 
     /// The turn of `vessel`'s birth Seal: [`BIRTH_TURN`] if it was born
@@ -1037,16 +1194,18 @@ impl<P: Pool> Host<P> {
             lineage,
             successor: None,
             chronicle,
+            attempt: 0,
         })
     }
 
-    /// The Chronicle of a Vessel being born from `parent` (fork or
-    /// succession): make or verify the cloned dataset, then register or
-    /// reopen the Chronicle, which must have no records.
+    /// The Chronicle of a Vessel being born from `parent`, a bound Seal
+    /// `(dataset, lsn, hash)` (a fork's or successor's parent Seal, or a
+    /// Template's layer): make or verify the cloned dataset, then register
+    /// or reopen the Chronicle, which must have no records.
     fn unborn(
         &self,
         id: ChronicleId,
-        parent: Option<(&Dataset, ParentSeal)>,
+        parent: Option<(&Dataset, Lsn, HashVal)>,
     ) -> Result<Chronicle<P::Layers>, VesselError> {
         let registered = match self.registered_head(id)? {
             None => false,
@@ -1054,16 +1213,16 @@ impl<P: Pool> Host<P> {
             Some(_) => return Err(VesselError::AlreadyExists(id)),
         };
         let dataset = self.dataset_for(id);
-        if let Some((parent_ds, ps)) = parent {
+        if let Some((parent_ds, seal, seal_hash)) = parent {
             match self.pool.info(&dataset).map_err(pool_err)? {
                 None => {
                     self.pool
-                        .clone(parent_ds, ps.seal, ps.seal_hash, &dataset)
+                        .clone(parent_ds, seal, seal_hash, &dataset)
                         .map_err(pool_err)?;
                 }
                 Some(info) => {
-                    let ours = info.parent == Some(ps.seal_hash)
-                        && info.origin_seal() == Some((parent_ds.clone(), ps.seal));
+                    let ours = info.parent == Some(seal_hash)
+                        && info.origin_seal() == Some((parent_ds.clone(), seal));
                     if !ours {
                         return Err(VesselError::DatasetConflict(dataset));
                     }
@@ -1146,6 +1305,26 @@ impl<P: Pool> Host<P> {
             .map_err(pool_err)?
             .ok_or_else(|| VesselError::DatasetMissing(dataset.clone()))?;
         match lineage.origin.parent() {
+            None if matches!(lineage.origin, Origin::Template { .. }) => {
+                let Origin::Template {
+                    template_id,
+                    layer_key,
+                    ..
+                } = &lineage.origin
+                else {
+                    unreachable!("matched")
+                };
+                if info.parent != Some(*layer_key) {
+                    return Err(VesselError::LineageMismatch(
+                        "taso:parent is not the Template's layer",
+                    ));
+                }
+                if info.origin_seal() != Some((self.layer_dataset(*template_id), LAYER_LSN)) {
+                    return Err(VesselError::LineageMismatch(
+                        "origin is not the Template's layer",
+                    ));
+                }
+            }
             None => {
                 if info.parent.is_some() || info.origin.is_some() {
                     return Err(VesselError::LineageMismatch(
@@ -1173,6 +1352,7 @@ impl<P: Pool> Host<P> {
                 lineage,
                 successor,
                 chronicle,
+                attempt: 0,
             },
             recovery,
         ))
@@ -1235,7 +1415,7 @@ impl<P: Pool> Host<P> {
             seal: seal.lsn,
             seal_hash: seal.hash,
         };
-        let mut chronicle = self.unborn(id, Some((&old.dataset, ps)))?;
+        let mut chronicle = self.unborn(id, Some((&old.dataset, ps.seal, ps.seal_hash)))?;
         if !resuming {
             old.chronicle
                 .append(Stream::Ctl, Payload::Succession(record.clone()))?;
@@ -1259,6 +1439,7 @@ impl<P: Pool> Host<P> {
             lineage,
             successor: None,
             chronicle,
+            attempt: 0,
         };
         Ok((Some(new), old))
     }
@@ -1302,6 +1483,8 @@ pub struct Vessel<L: Layers> {
     lineage: LineageRecord,
     successor: Option<SuccessionRecord>,
     chronicle: Chronicle<L>,
+    /// The coordinator-log submission counter of this epoch (§9).
+    attempt: u64,
 }
 
 impl<L: Layers> Vessel<L> {
