@@ -104,6 +104,39 @@ pub enum Reply {
     },
 }
 
+impl PendingItem {
+    /// A verdict request by `uid` bound to this item's Candidate and its
+    /// attempt `attempt` (an index into `attempts`): everything a caller
+    /// binds a verdict to (§5.1), its `request_id` derived.
+    pub fn request(
+        &self,
+        attempt: usize,
+        decision: crate::contract::Decision,
+        authority: crate::record::Authority,
+        policy_digest: Option<crate::envelope::HashVal>,
+        uid: u32,
+    ) -> VerdictRequest {
+        let k = &self.candidate;
+        let (s, f) = &self.attempts[attempt];
+        let mut r = VerdictRequest {
+            request_id: crate::envelope::HashVal::from_bytes([0; 32]),
+            candidate_id: k.candidate_id,
+            facts_hash: k.facts_hash,
+            artifact_key: k.artifact_key,
+            requirement: k.requirement,
+            exclude: k.exclude.clone(),
+            attempt_id: s.attempt_id,
+            result_digest: f.result_digest,
+            decision,
+            authority,
+            policy_digest,
+        };
+        r.request_id =
+            crate::contract::request_id(uid, crate::contract::OpKind::Verdict, &r.body());
+        r
+    }
+}
+
 impl Canonical for PendingItem {
     fn canon(&self, out: &mut Canon) {
         self.candidate.canon(out);

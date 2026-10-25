@@ -2125,6 +2125,22 @@ mod tests {
         Packs<SharedStore, Bytes>,
         taso_core::contract::Candidate,
     ) {
+        nominated_with(c, subject, verifier, vconf, MAP)
+    }
+
+    /// [`nominated`] classifying with `map`.
+    fn nominated_with(
+        c: &Cluster,
+        subject: &[u8],
+        verifier: ChronicleId,
+        vconf: &[u8],
+        map: &str,
+    ) -> (
+        Host<crate::vessel::tests::FakePool>,
+        FV,
+        Packs<SharedStore, Bytes>,
+        taso_core::contract::Candidate,
+    ) {
         let host = Host {
             coord: c.coord.clone(),
             pool: crate::vessel::tests::FakePool::default(),
@@ -2170,7 +2186,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
-        let mut conf = SanctionConf::new(MAP.as_bytes().to_vec()).unwrap();
+        let mut conf = SanctionConf::new(map.as_bytes().to_vec()).unwrap();
         conf.min_interval = Duration::ZERO;
         let n = Nominator::new(
             c.store.clone(),
@@ -2675,6 +2691,41 @@ mod tests {
             VerdictAnswer::Refused(Refusal::Closed)
         );
         assert!(sanction_of(&c, cand.candidate_id).is_none());
+    }
+
+    /// A hostile caller (a policy that sanctions anything): a Candidate
+    /// with a secret in its input is never sanctioned, whatever it asks.
+    #[test]
+    fn a_sanction_against_the_hard_rules_is_refused_for_good() {
+        let c = Cluster::new();
+        let map = "version = 1\n[[rule]]\nglob = \"**\"\nclass = \"Source\"\n[[rule]]\nglob = \"app/main.py\"\nclass = \"Secret\"\n";
+        let (_h, mut v, packs, cand) = nominated_with(&c, b"a", c.t0, VCONF, map);
+        assert_eq!(cand.facts.input.secret, 1);
+        let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
+        let r = request(&cand, &f, Decision::Sanction);
+        let vd = verdicts(&c);
+        assert_eq!(
+            vd.handle(&mut v, &packs, &r, PEER).unwrap(),
+            VerdictAnswer::Refused(Refusal::HardRules)
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &r, PEER).unwrap(),
+            VerdictAnswer::Refused(Refusal::HardRules),
+            "again: the same, from the log"
+        );
+        assert!(sanction_of(&c, cand.candidate_id).is_none());
+        // Never is still the caller's to say.
+        let never = request(
+            &cand,
+            &f,
+            Decision::Never {
+                reason: "secret".into(),
+            },
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &never, PEER).unwrap(),
+            VerdictAnswer::ClosedNever
+        );
     }
 
     #[test]

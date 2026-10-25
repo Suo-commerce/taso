@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # p4-decide.sh: verdicts through the decider socket, under taso-wardend
-# (P4 files 8d and 9b; spec rev. 23 §5.1-5.3, D72-D79).
+# (P4 files 8d, 9 and 10; spec rev. 24 §5.1-5.3, §5.7, D72-D80).
 #
 #   scripts/p4-decide.sh zfs     (as root, from the repository root; not
 #                                 through sudo, which drops cargo from PATH)
@@ -13,7 +13,7 @@
 #
 # One machine, node 1 (Warden 1), one coordinator and store.  V, the
 # verifier Template, is made by taso-genesis as in p4-verify.sh.  First
-# eight Vessels (p, f, h, s, c, k, x, y) each run two turns, nominate, and are
+# ten Vessels (p, f, h, s, c, k, x, y, pa, pf) each run two turns, nominate, and are
 # attempted (one daemon run each).  Then the daemon runs in the
 # background with k alone, as a long-running "keeper": the decider socket
 # is up, k's session takes the verdicts on k (between its agent's
@@ -38,6 +38,8 @@
 #  11  sanction.after_commit_accept (x), sanction.before_ready_accept (y):
 #      committed, not finished; the next open finishes each once
 #  12  a Vessel born from p's Template             Born from Template, exit 0
+#  13  taso-policy --once on pa (passes), pf (3)   Committed, ClosedNever; a
+#                                                  dry run sends nothing
 #  10  the coordinator log (last)                  the records each Vessel's
 #                                                  verdicts and finishes accepted
 #
@@ -163,7 +165,7 @@ say "building"
 cargo build -q --release -p taso-warden -p taso-sim -p taso-landlock --bins
 [[ $MODE == blk ]] && cargo build -q --release -p taso-blk
 BIN=$PWD/target/release
-for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock taso-decide; do
+for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock taso-decide taso-policy; do
     [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"
 done
 [[ $MODE == zfs ]] || [[ -x "$BIN/taso-blkd" ]] || die "$BIN/taso-blkd was not built"
@@ -441,14 +443,18 @@ expect "V ready" bash -c "[[ '$V' =~ ^[0-9a-f]{32}$ ]]"
 
 # ── 2. Six Vessels attempted ────────────────────────────────────────
 
-say "2. p h s c k x y: a verifier that passes, f: one that exits 7 (predict: each run exit 0; each one attempt finished as said)"
-declare -A ID SLOT=([p]=1 [f]=2 [h]=3 [s]=4 [c]=5 [k]=6 [x]=10 [y]=11)
-for v in p f h s c k x y; do
-    if [[ $v == f ]]; then vconf "$v" 'exit 7'; else vconf "$v" 'exit 0'; fi
+say "2. p h s c k x y pa: a verifier that passes, f: one that exits 7, pf: 3 (predict: each run exit 0; each one attempt finished as said)"
+declare -A ID SLOT=([p]=1 [f]=2 [h]=3 [s]=4 [c]=5 [k]=6 [x]=10 [y]=11 [pa]=13 [pf]=14)
+for v in p f h s c k x y pa pf; do
+    case $v in
+        f) vconf "$v" 'exit 7' ;;
+        pf) vconf "$v" 'exit 3' ;;
+        *) vconf "$v" 'exit 0' ;;
+    esac
     config 1 "$W/$v.json" "$(vessel "$v" "${SLOT[$v]}" "$(sim "$TURNS" Scratch)")"
     wardend "2-$v" 1 "$W/$v.json"
     expect "$v: exit 0" is "$RC" 0
-    want="Exit { code: 0 }"; [[ $v == f ]] && want="Exit { code: 7 }"
+    want="Exit { code: 0 }"; [[ $v == f ]] && want="Exit { code: 7 }"; [[ $v == pf ]] && want="Exit { code: 3 }"
     expect "$v: finished $want" is "$(finished "2-$v" "$v")" "$want"
     ds=$(dataset_of "2-$v" "$v")
     ID[$v]=${ds##*/v-}
@@ -544,15 +550,15 @@ expect "decider socket" test -S "$DSOCK"
 
 # ── 3. Pending ──────────────────────────────────────────────────────
 
-say "3. pending (predict: eight Candidates, one finished attempt each)"
+say "3. pending (predict: ten Candidates, one finished attempt each)"
 decide 3-pending pending
 expect "taso-decide exit 0" is "$DRC" 0
 declare -A CAND ATT
-for v in p f h s c k x y; do
+for v in p f h s c k x y pa pf; do
     expect "$v: one attempt" is "$(pending_of 3-pending "${ID[$v]}" | wc -l)" 1
     read -r CAND[$v] ATT[$v] < <(pending_of 3-pending "${ID[$v]}") || true
 done
-expect "eight items" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/3-pending.json")" 8
+expect "ten items" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/3-pending.json")" 10
 
 # ── 4. p: sanction ──────────────────────────────────────────────────
 
@@ -642,7 +648,7 @@ decide 9c-c resend "$REQ_C"
 expect "c: Committed" is "$(jf 9c-c answer)" Committed
 decide 9c-pending pending
 expect "s and c finished" is "$(( $(finished_sanction 9c-daemon "${ID[s]}" "$(jf 9c-s template_id)") + $(finished_sanction 9c-daemon "${ID[c]}" "$(jf 9c-c template_id)") ))" 2
-expect "only x and y pending" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/9c-pending.json")" 2
+expect "only x, y, pa and pf pending" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/9c-pending.json")" 4
 stop_daemon
 
 # ── 11. A sanction's finish stopped (file 9) ────────────────────────
@@ -718,12 +724,70 @@ config 1 "$W/b.json" "$(printf '{"subject": "b", "uid_slot": 12, "template": "%s
 wardend 12-b 1 "$W/b.json"
 expect "exit 0" is "$RC" 0
 expect "born from p's Template" is "$(count 12-b.err "\] b: Born from Template $TID")" 1
+
+# ── 13. taso-policy, the default caller (file 10) ───────────────
+
+cat >"$W/policy.toml" <<'EOF2'
+version = 1
+actor = "taso-policy"
+default = "hold"
+
+[[rule]]
+name = "no secrets"
+decision = "never"
+reason = "a secret is in the input"
+when = { input_secret = { min = 1 } }
+
+[[rule]]
+name = "failed"
+decision = "never"
+when = { outcome = { in = ["fail", "timeout", "output_limit"] } }
+
+[[rule]]
+name = "passed"
+decision = "sanction"
+when = { outcome = "pass", input_unknown = 0, input_unsupported = 0 }
+EOF2
+
+# policy CASE ARGS...: taso-policy --once; its lines to $W/out/CASE.jsonl,
+# exit status to PRC.
+policy() {
+    local case=$1; shift
+    PRC=0
+    timeout 300 "$BIN/taso-policy" "$W/keep.json" "$W/policy.toml" --once "$@" \
+        >"$W/out/$case.jsonl" 2>"$W/out/$case.err" || PRC=$?
+}
+
+# pl CASE FIELD [ID]: FIELD of the pass line, or of Vessel ID's line.
+pl() {
+    python3 -c '
+import json, sys
+for l in open(sys.argv[1]):
+    v = json.loads(l)
+    if (sys.argv[3] and v.get("chronicle") == sys.argv[3]) or (not sys.argv[3] and "pass" in v):
+        print(v.get(sys.argv[2], ""))' "$W/out/$1.jsonl" "$2" "${3:-}" | head -1
+}
+
+say "13. taso-policy --once (predict: a dry run decides pa sanction and pf never and sends nothing; then pa Committed by rule passed and finished into its Template, pf ClosedNever by rule failed; a second pass finds nothing pending)"
+daemon 13-daemon "$W/keep-q.json" q
+policy 13-dry --dry-run
+expect "dry run: exit 0" is "$PRC" 0
+expect "dry run: two pending, nothing sent" is "$(pl 13-dry pending) $(pl 13-dry sent)" "2 0"
+expect "dry run: pa sanction, pf never" is "$(pl 13-dry decision "${ID[pa]}") $(pl 13-dry decision "${ID[pf]}")" "sanction never"
+policy 13-once
+expect "exit 0" is "$PRC" 0
+expect "pa: Committed by rule passed" is "$(pl 13-once answer "${ID[pa]}") $(pl 13-once rule "${ID[pa]}")" "Committed passed"
+expect "pf: ClosedNever by rule failed" is "$(pl 13-once answer "${ID[pf]}") $(pl 13-once rule "${ID[pf]}")" "ClosedNever failed"
+expect "pa finished into its Template" is "$(finished_sanction 13-daemon "${ID[pa]}" "$(pl 13-once template_id "${ID[pa]}")")" 1
+policy 13-again
+expect "again: nothing pending" is "$(pl 13-again pending)" 0
+stop_daemon
 
 # ── 10. The coordinator log ─────────────────────────────────────────
 
-say "10. accepted records per Vessel (predict: p 6, f 7, h 7, s 7, c 6, k 6, x 6, y 6: each sanction's SanctionCompleted included)"
-declare -A WANT=([p]=6 [f]=7 [h]=7 [s]=7 [c]=6 [k]=6 [x]=6 [y]=6)
-for v in p f h s c k x y; do
+say "10. accepted records per Vessel (predict: p 6, f 7, h 7, s 7, c 6, k 6, x 6, y 6, pa 6, pf 5: each sanction's SanctionCompleted included)"
+declare -A WANT=([p]=6 [f]=7 [h]=7 [s]=7 [c]=6 [k]=6 [x]=6 [y]=6 [pa]=6 [pf]=5)
+for v in p f h s c k x y pa pf; do
     expect "$v: ${WANT[$v]} accepted" is "$(coordlog_of 1 "${ID[$v]}" | cut -d' ' -f1)" "${WANT[$v]}"
 done
 
