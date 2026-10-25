@@ -20,6 +20,14 @@
 //!   ([`taso_warden::status_kube`]).  The daemon runs until it is told to
 //!   stop.
 //!
+//! # Failpoints
+//!
+//! `TASO_FAILPOINT=<name>` stops every Template birth at that point, one
+//! of [`taso_warden::daemon::BIRTH_FAILPOINTS`] (P4 spec §10.2, file 5;
+//! tests on a node): the Vessel's start is refused with
+//! `stopped at failpoint <name>` and a run without it finishes the birth.
+//! Any other name refuses to start.
+//!
 //! # Stopping
 //!
 //! SIGTERM or SIGINT asks for a stop: every running agent is stopped (its
@@ -154,7 +162,11 @@ fn main() -> ExitCode {
         config.warden.get(),
         storage.kind()
     );
-    let node = match Node::new(config, coord, storage) {
+    let failpoint = std::env::var("TASO_FAILPOINT").ok();
+    let node = match Node::new(config, coord, storage)
+        .map_err(|e| e.to_string())
+        .and_then(|n| n.with_failpoint(failpoint.as_deref()))
+    {
         Ok(n) => Arc::new(n),
         Err(e) => {
             eprintln!("taso-wardend: starting: {e}");

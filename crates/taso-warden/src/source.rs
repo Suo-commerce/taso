@@ -334,6 +334,14 @@ impl Guard {
             blocked_keys: BTreeMap::new(),
             blocked_slots: BTreeMap::new(),
         };
+        // The Template range (P4 §5.6, D53) is no Vessel's: no Vessel and
+        // no fork may run in it.
+        if let Some(t) = g.runtime.template_slot {
+            g.blocked_slots.insert(
+                t,
+                format!("uid slot {t} is the Template range (runtime.template_slot)"),
+            );
+        }
         // Lineages: Vessels joined by parent edges among those held here.
         // A Vessel has one parent (its Chronicle's single Lineage record),
         // so these are trees; the root's key names each one.
@@ -620,6 +628,7 @@ mod tests {
 
     fn runtime() -> RuntimeConf {
         RuntimeConf {
+            template_slot: None,
             rootfs: Some("/srv/taso/rootfs".into()),
             host_uid_base: 200_000,
             landlock_shim: None,
@@ -632,6 +641,7 @@ mod tests {
 
     fn vc(subject: &str, slot: u32) -> VesselConf {
         VesselConf {
+            template: None,
             fork: None,
             namespace: Namespace::from_bytes([7; 16]),
             subject: subject.into(),
@@ -643,6 +653,26 @@ mod tests {
             promote: None,
             forks: None,
         }
+    }
+
+    /// P4 file 5f (D53): the Template range is given to no Vessel.
+    #[test]
+    fn the_template_slot_is_given_to_no_vessel() {
+        let mut g = Guard::seeded(
+            RuntimeConf {
+                template_slot: Some(9),
+                ..runtime()
+            },
+            Vec::new(),
+        );
+        let a = g.admit(vec![vc("a", 1), vc("b", 9)]);
+        assert_eq!(names(&a.set), vec!["a"]);
+        assert_eq!(a.refused.len(), 1);
+        assert!(
+            a.refused[0].reason.contains("Template range"),
+            "{}",
+            a.refused[0].reason
+        );
     }
 
     fn names(set: &[VesselConf]) -> Vec<&str> {

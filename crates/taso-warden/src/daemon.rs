@@ -157,9 +157,15 @@ use crate::segment::Position;
 use crate::ship::{LocalStore, SharedStore};
 use crate::source::{Held, Requested};
 use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
-use crate::vessel::{Ensured, Host, Pool, ReadLog, SealAt, Vessel, VesselError, BIRTH_TURN};
+use crate::template::{TemplateError, TemplateLayers};
+use crate::vessel::{
+    Ensured, Host, Pool, ReadLog, SealAt, TemplateBirth, Vessel, VesselError, BIRTH_TURN,
+};
 use crate::zfs::{Dataset, Snapshot};
+use taso_core::contract::{ContractRecord, StorageKind, TemplateRef};
+use taso_core::coordlog::Submitted;
 use taso_core::model::WardenId;
+use taso_core::record::{Origin, TemplateAsked};
 use taso_field::protocol::PromoteResult;
 
 // ── Config ──────────────────────────────────────────────────────────
@@ -278,6 +284,11 @@ pub struct RuntimeConf {
     /// slot `n` maps its uids 0..65536 to `host_uid_base + n·65536`
     /// ([`VesselConf::uid_slot`]).
     pub host_uid_base: u32,
+    /// The Template uid range's slot (P4 spec rev. 17 §5.6, D53): a
+    /// Template's layer is owned by `host_uid_base + template_slot·65536`,
+    /// the same on every node of a cluster.  Required for Template births;
+    /// no Vessel and no fork slot may use it.
+    pub template_slot: Option<u32>,
     /// The Landlock shim inside the rootfs, if used.
     pub landlock_shim: Option<String>,
     /// The agent's command line (may be empty if every Vessel names its own).
@@ -426,6 +437,11 @@ pub struct VesselConf {
     /// Forked from another Vessel on this node instead of born from the
     /// void ([`ForkConf`]); `None`: a birth.
     pub fork: Option<ForkConf>,
+    /// Born from a Template (P4 §5.5, D50: `"template": "<name>@<version>"`
+    /// or `"<template_id>"`) instead of the void; `None`: not.  Excludes
+    /// `fork`.  A Vessel that exists already must have been born from this
+    /// Template, asked by this name.  (Boxed, as `runtime`.)
+    pub template: Option<Box<TemplateRef>>,
     /// Whether its effects are released or held ([`EffectsConf`],
     /// `"effects": "dispatch" | "hold"`); `None`: by origin (P3 D4: a
     /// fork holds, a Vessel born from the void or by succession
@@ -467,6 +483,7 @@ impl ForksConf {
     /// `seal`.
     pub fn child(parent: &VesselConf, slot: u32, seal: Lsn) -> VesselConf {
         VesselConf {
+            template: None,
             namespace: parent.namespace,
             subject: Self::child_name(&parent.subject, slot),
             takeover: None,
@@ -588,6 +605,19 @@ impl Stop {
     /// Whether a stop was requested.
     pub fn requested(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl RuntimeConf {
+    /// The first host uid of the Template range, if a `template_slot` is
+    /// set and its range fits in a u32.
+    pub fn template_base(&self) -> Option<u32> {
+        let base = self
+            .template_slot?
+            .checked_mul(ID_RANGE)?
+            .checked_add(self.host_uid_base)?;
+        base.checked_add(ID_RANGE - 1)?;
+        Some(base)
     }
 }
 
@@ -1170,6 +1200,12 @@ impl Config {
                     .ok_or_else(|| bad("\"host_uid_base\" must be an integer"))?,
             )
             .map_err(|_| bad("\"host_uid_base\" is too large"))?,
+            template_slot: match opt_u64(r, "template_slot")? {
+                None => None,
+                Some(n) => {
+                    Some(u32::try_from(n).map_err(|_| bad("\"template_slot\" is too large"))?)
+                }
+            },
             landlock_shim: match r.get("landlock_shim") {
                 None | Some(Value::Null) => None,
                 Some(_) => Some(abs_path(r, "landlock_shim")?.to_string_lossy().into_owned()),
@@ -1231,6 +1267,13 @@ impl Config {
                             None | Some(Value::Null) => None,
                             Some(f) => Some(fork_conf(f)?),
                         },
+                        template: match x.get("template") {
+                            None | Some(Value::Null) => None,
+                            Some(Value::String(t)) => Some(Box::new(
+                                TemplateRef::parse(t).map_err(|e| bad(format!("\"template\": {e}")))?,
+                            )),
+                            Some(_) => return Err(bad("\"template\" must be \"<name>@<version>\" or a template_id (32 hex digits)")),
+                        },
                         effects: match x.get("effects") {
                             None | Some(Value::Null) => None,
                             Some(e) => match e.as_str() {
@@ -1256,6 +1299,16 @@ impl Config {
         check_quiescence(&quiescence).map_err(bad)?;
         let mut ids = std::collections::BTreeSet::new();
         let mut slots = std::collections::BTreeMap::new();
+        // The Template range is reserved (D53): named here first, no
+        // Vessel or fork slot may be it.
+        if let Some(t) = runtime.template_slot {
+            if runtime.template_base().is_none() {
+                return Err(bad(format!(
+                    "runtime: template_slot {t} does not fit above host_uid_base"
+                )));
+            }
+            slots.insert(t, "the Template range (runtime.template_slot)".to_string());
+        }
         for vc in &vessels {
             if !ids.insert(*vc.id().as_bytes()) {
                 return Err(bad(format!("vessel {:?} is listed twice", vc.subject)));
@@ -1274,6 +1327,18 @@ impl Config {
             }
             vc.effective(&runtime, &quiescence)
                 .map_err(|e| bad(format!("vessel {:?}: {e}", vc.subject)))?;
+            if vc.template.is_some() && vc.fork.is_some() {
+                return Err(bad(format!(
+                    "vessel {:?}: \"template\" and \"fork\" exclude each other",
+                    vc.subject
+                )));
+            }
+            if vc.template.is_some() && runtime.template_slot.is_none() {
+                return Err(bad(format!(
+                    "vessel {:?}: a Template birth needs runtime.template_slot",
+                    vc.subject
+                )));
+            }
             if vc.fork.as_ref().is_some_and(|f| f.parent == vc.subject) {
                 return Err(bad(format!(
                     "vessel {:?} cannot be forked from itself",
@@ -1915,15 +1980,35 @@ pub fn held_on<H: Holdings>(
     pool: &H,
     root: &Dataset,
     host_uid_base: u32,
+    template_slot: Option<u32>,
     state_dir: &Path,
 ) -> Result<(Vec<Held>, Vec<String>), LayerError> {
     let mut held = Vec::new();
     let mut warnings = Vec::new();
     for ds in pool.children(root)? {
         let name = ds.as_str().rsplit('/').next().unwrap_or_default();
+        // A Template's layer or build (P4 §5.6): no Vessel's, its range
+        // the reserved Template range.
+        if name.starts_with("t-") || name.starts_with("tb-") {
+            continue;
+        }
         let Some(key) = name.strip_prefix("v-").and_then(key_of_hex) else {
             warnings.push(format!("{ds} is not a Vessel dataset (v-<id>): ignored"));
             continue;
+        };
+        let hex = name.strip_prefix("v-").unwrap_or_default();
+        let (parent, from_template) = match crate::vessel::lineage_in(&state_dir.join(hex)) {
+            Ok(l) => (
+                l.as_ref()
+                    .and_then(|l| l.origin.parent().map(|p| *p.chronicle.as_bytes())),
+                l.is_some_and(|l| matches!(l.origin, Origin::Template { .. })),
+            ),
+            Err(e) => {
+                warnings.push(format!(
+                    "{ds}: its local Chronicle's Lineage cannot be read ({e}): taken as no parent"
+                ));
+                (None, false)
+            }
         };
         let mut slots = std::collections::BTreeSet::new();
         for uid in pool.owner_uids(&ds)? {
@@ -1931,6 +2016,10 @@ pub fn held_on<H: Holdings>(
                 continue;
             }
             match uid.checked_sub(host_uid_base) {
+                // A Template-born Vessel's files are the Template range's
+                // (D53), shared by every Vessel born from a Template: they
+                // count for no slot.  Anyone else's count as any slot's.
+                Some(off) if from_template && Some(off / ID_RANGE) == template_slot => {}
                 Some(off) => {
                     slots.insert(off / ID_RANGE);
                 }
@@ -1939,16 +2028,6 @@ pub fn held_on<H: Holdings>(
                 )),
             }
         }
-        let hex = name.strip_prefix("v-").unwrap_or_default();
-        let parent = match crate::vessel::lineage_in(&state_dir.join(hex)) {
-            Ok(l) => l.and_then(|l| l.origin.parent().map(|p| *p.chronicle.as_bytes())),
-            Err(e) => {
-                warnings.push(format!(
-                    "{ds}: its local Chronicle's Lineage cannot be read ({e}): taken as no parent"
-                ));
-                None
-            }
-        };
         held.push(Held { key, slots, parent });
     }
     Ok((held, warnings))
@@ -2003,7 +2082,26 @@ pub struct Node {
     /// Vessels whose run got past its start in this Warden's life (their
     /// datasets settled here): a fork of one may start (C6).
     started: std::sync::Mutex<std::collections::BTreeSet<[u8; 16]>>,
+    /// Template layers on this node (P4 §5.6), if `runtime.template_slot`
+    /// is set.
+    layers: Option<TemplateLayers<Storage, StorageSend>>,
+    /// A failpoint of a Template birth to stop at ([`BIRTH_FAILPOINTS`];
+    /// tests on a node, `TASO_FAILPOINT`).
+    failpoint: Option<&'static str>,
 }
+
+/// The failpoints of a Template birth (P4 spec rev. 17 §10.2, file 5): the
+/// layer's, then the Vessel's.  [`Node::with_failpoint`] stops a birth at
+/// one of them.
+pub const BIRTH_FAILPOINTS: [&str; 7] = [
+    "layer.after_build_put",
+    "layer.before_shipped_accept",
+    "layer.after_shipped_accept",
+    "layer.after_receive",
+    "birth.after_clone",
+    "birth.after_lineage_append",
+    "birth.before_accept",
+];
 
 impl Node {
     /// A node: refuses a host with SELinux ([`refuse_selinux`]), claims
@@ -2029,6 +2127,7 @@ impl Node {
             &storage,
             &config.root,
             config.runtime.host_uid_base,
+            config.runtime.template_slot,
             &config.state_dir,
         )
         .map_err(|e| {
@@ -2038,6 +2137,28 @@ impl Node {
             eprintln!("taso-wardend[{}]: {w}", config.warden.get());
         }
         let store = config.store.open().map_err(ctx("opening the store"))?;
+        let layers = config
+            .runtime
+            .template_base()
+            .map(|template_base| TemplateLayers {
+                pool: Clone::clone(&storage),
+                sender: storage.sender(),
+                storage: match config.storage {
+                    StorageConf::Zfs => StorageKind::Zfs,
+                    StorageConf::Blk { .. } => StorageKind::Blk,
+                },
+                store: store.clone(),
+                prefix: config.prefix.clone(),
+                coord: coord.clone(),
+                warden: config.warden,
+                state_dir: config.state_dir.clone(),
+                root: config.root.clone(),
+                template_base,
+                limits: crate::classify::Limits::default(),
+                reserved: crate::classify::Reserved::defaults(),
+                failpoint: crate::template::no_failpoints(),
+                lock: std::sync::Mutex::new(()),
+            });
         Ok(Self {
             config,
             coord,
@@ -2047,7 +2168,134 @@ impl Node {
             held,
             requested: Requested::new(),
             started: Default::default(),
+            layers,
+            failpoint: None,
         })
+    }
+
+    /// Stop every Template birth at `name`, one of [`BIRTH_FAILPOINTS`]
+    /// (tests on a node); `None`: never.  Refused for any other name.
+    pub fn with_failpoint(mut self, name: Option<&str>) -> Result<Self, String> {
+        let Some(name) = name else {
+            self.failpoint = None;
+            return Ok(self);
+        };
+        let at = BIRTH_FAILPOINTS
+            .iter()
+            .copied()
+            .find(|p| *p == name)
+            .ok_or_else(|| {
+                format!(
+                    "{name:?} is not a failpoint of a Template birth ({})",
+                    BIRTH_FAILPOINTS.join(", ")
+                )
+            })?;
+        if let Some(l) = self.layers.as_mut() {
+            l.failpoint = Box::new(move |p| {
+                if p == at {
+                    Err(TemplateError::Failpoint(p))
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        self.failpoint = Some(at);
+        Ok(self)
+    }
+
+    /// Stop at the Vessel's failpoint, if this is it.
+    fn birth_failpoint(&self, p: &'static str) -> Result<(), VesselError> {
+        if self.failpoint == Some(p) {
+            Err(VesselError::Failpoint(p))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The Template `t` names, and the name it was asked by (§5.5): a
+    /// `name@version` resolved through its accepted `TemplateNamed`.
+    fn resolve_template(
+        &self,
+        t: &TemplateRef,
+    ) -> Result<(ChronicleId, Option<TemplateAsked>), DaemonError> {
+        match t {
+            TemplateRef::Id(id) => Ok((*id, None)),
+            TemplateRef::Named { name, version } => {
+                let logical = t.logical_id().expect("a name has a logical id");
+                match self
+                    .coord
+                    .query_logical(logical)
+                    .map_err(DaemonError::Coord)?
+                {
+                    Some((_, Submitted::Contract(ContractRecord::TemplateNamed(n)))) => Ok((
+                        n.template_id,
+                        Some(TemplateAsked {
+                            name: name.clone(),
+                            version: *version,
+                        }),
+                    )),
+                    None => Err(DaemonError::Refused(format!(
+                        "no Template is named {name}@{version}"
+                    ))),
+                    Some(_) => Err(DaemonError::Refused(format!(
+                        "{name}@{version}: the log holds another record for that name"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Birth `vc` from its Template (§5.6): resolve it, receive its layer
+    /// (building it first if no node has), then [`Host::born_from_template`].
+    fn template_birth(
+        &self,
+        vc: &VesselConf,
+        t: &TemplateRef,
+    ) -> Result<Vessel<StorageLayers>, DaemonError> {
+        let layers = self.layers.as_ref().ok_or_else(|| {
+            DaemonError::Refused("a Template birth needs runtime.template_slot".into())
+        })?;
+        let (template_id, asked) = self.resolve_template(t)?;
+        let layer = layers.ensure(template_id).map_err(|e| {
+            DaemonError::Refused(format!(
+                "the layer of Template {}: {e}",
+                id_hex(template_id)
+            ))
+        })?;
+        for n in &layer.notes {
+            self.log(vc, n);
+        }
+        let birth = TemplateBirth {
+            template_id,
+            layer_key: layer.layer_key,
+            asked,
+        };
+        let v = self
+            .host()
+            .born_from_template(
+                vc.namespace,
+                vc.subject.as_bytes(),
+                &birth,
+                &self.packs(vc.id())?,
+                &|p| self.birth_failpoint(p),
+            )
+            .map_err(|e| {
+                DaemonError::Refused(format!("birth from Template {}: {e}", id_hex(template_id)))
+            })?;
+        self.log(
+            vc,
+            format_args!(
+                "Born from Template {}{} (layer {})",
+                id_hex(template_id),
+                birth
+                    .asked
+                    .as_ref()
+                    .map(|a| format!(", asked as {}@{}", a.name, a.version))
+                    .unwrap_or_default(),
+                birth.layer_key
+            ),
+        );
+        Ok(v)
     }
 
     /// Whether a run of the Vessel `key` got past its start in this
@@ -2157,6 +2405,10 @@ impl Node {
                 );
                 (v, Verdict::Clean)
             }
+            Start::Birth if vc.template.is_some() => {
+                let t = vc.template.as_ref().expect("matched");
+                (self.template_birth(vc, t)?, Verdict::Clean)
+            }
             Start::Birth | Start::Open => {
                 let (v, how) = host.ensure_as(vc.namespace, vc.subject.as_bytes(), claim)?;
                 let verdict = match &how {
@@ -2194,6 +2446,31 @@ impl Node {
                     f.parent
                 )));
             }
+        }
+        // Likewise an entry that names a Template: the Lineage must name
+        // that Template, asked by that name (D50).
+        if let Some(t) = &vc.template {
+            let agrees = match (&vessel.lineage().origin, &**t) {
+                (Origin::Template { template_id, .. }, TemplateRef::Id(id)) => template_id == id,
+                (Origin::Template { asked: Some(a), .. }, TemplateRef::Named { name, version }) => {
+                    a.name == *name && a.version == *version
+                }
+                _ => false,
+            };
+            if !agrees {
+                return Err(DaemonError::Refused(format!(
+                    "the entry names Template {t:?}, but its Lineage record says otherwise"
+                )));
+            }
+        }
+        // A Template-born Vessel runs only once its Birth is accepted
+        // (§5.6): an interrupted birth is finished here, on any start.
+        if matches!(vessel.lineage().origin, Origin::Template { .. }) {
+            let mut vessel = vessel;
+            self.host()
+                .finish_birth(&mut vessel, &self.packs(id)?, &|p| self.birth_failpoint(p))
+                .map_err(|e| DaemonError::Refused(format!("finishing its Birth: {e}")))?;
+            return Ok((vessel, start, verdict));
         }
         Ok((vessel, start, verdict))
     }
@@ -2493,6 +2770,15 @@ impl Node {
         // Which lineage a range may belong to on this node is the source
         // guard's to check (`held_on`, `Guard::seeded`).
         let inherited = match vessel.lineage().origin.parent() {
+            // Born from a Template: the Template range (D53), which the
+            // layer's top directory carries.
+            None if matches!(vessel.lineage().origin, Origin::Template { .. }) => {
+                Some(self.config.runtime.template_base().ok_or_else(|| {
+                    DaemonError::Refused(
+                        "a Template-born Vessel runs over the Template range: runtime.template_slot is not set".into(),
+                    )
+                })?)
+            }
             None => None,
             Some(_) => {
                 use std::os::unix::fs::MetadataExt;
@@ -3027,6 +3313,156 @@ mod tests {
         ]
     }"#;
 
+    /// P4 file 5f: `runtime.template_slot` is reserved and a Vessel's
+    /// `"template"` names an exact Template (D50, D53).
+    #[test]
+    fn template_slot_and_template_entries() {
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            f(&mut v);
+            Config::parse(&v.to_string())
+        };
+        let c = with(&|v| {
+            v["runtime"]["template_slot"] = 9.into();
+            v["vessels"][0]["template"] = "acme-base@3".into();
+            v["vessels"][1]["template"] = "ab".repeat(16).into();
+        })
+        .unwrap();
+        assert_eq!(c.runtime.template_slot, Some(9));
+        assert_eq!(c.runtime.template_base(), Some(200_000 + 9 * ID_RANGE));
+        assert_eq!(
+            c.vessels[0].template.as_deref(),
+            Some(&TemplateRef::Named {
+                name: "acme-base".into(),
+                version: 3
+            })
+        );
+        assert_eq!(
+            c.vessels[1].template.as_deref(),
+            Some(&TemplateRef::Id(ChronicleId::from_bytes([0xab; 16])))
+        );
+        // Not set: no Template range, and no Template birth.
+        assert_eq!(with(&|_| {}).unwrap().runtime.template_base(), None);
+        let refused = |f: &dyn Fn(&mut Value), says: &str| {
+            let e = with(f).unwrap_err().0;
+            assert!(e.contains(says), "{e}");
+        };
+        refused(
+            &|v| v["vessels"][0]["template"] = "acme-base@3".into(),
+            "needs runtime.template_slot",
+        );
+        refused(
+            &|v| {
+                v["runtime"]["template_slot"] = 9.into();
+                v["vessels"][0]["template"] = "acme-base".into();
+            },
+            "\"template\"",
+        );
+        refused(
+            &|v| {
+                v["runtime"]["template_slot"] = 9.into();
+                v["vessels"][0]["template"] = 3.into();
+            },
+            "\"template\" must be",
+        );
+        refused(
+            &|v| {
+                v["runtime"]["template_slot"] = 9.into();
+                v["vessels"][1]["template"] = "acme-base@3".into();
+                v["vessels"][1]["fork"] = serde_json::json!({"parent": "a"});
+            },
+            "exclude each other",
+        );
+        // The Template range is no Vessel's and no fork's.
+        refused(
+            &|v| v["runtime"]["template_slot"] = 7.into(),
+            "share uid_slot 7",
+        );
+        refused(
+            &|v| {
+                v["runtime"]["template_slot"] = 9.into();
+                v["vessels"][0]["forks"] = serde_json::json!({"slots": [9]});
+            },
+            "fork slot 9 is also",
+        );
+        refused(
+            &|v| v["runtime"]["template_slot"] = u64::from(u32::MAX).into(),
+            "does not fit",
+        );
+    }
+
+    /// A Template-born Vessel's files are the Template range's: they
+    /// count for no slot in the guard's seed; another Vessel's files there
+    /// count as usual; a layer's dataset is no Vessel's and no warning.
+    #[test]
+    fn held_on_counts_a_template_born_vessels_template_files_for_no_slot() {
+        use crate::template::LAYER_LSN;
+        let e = vessel_env();
+        let t = ChronicleId::from_bytes([0x77; 16]);
+        let key = taso_core::envelope::HashVal::from_bytes([0x1A; 32]);
+        let layer = e.host.layer_dataset(t);
+        e.host.pool.put_snapshot(layer.as_str(), LAYER_LSN, key);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("store")).unwrap();
+        let store: SharedStore = Arc::new(LocalStore::new(dir.path().join("store")));
+        let tb = vessel_id(ns(1), b"tb");
+        let packs = Packs::new(store, Storage::Zfs(Zfs::cli()).sender(), "p", tb).unwrap();
+        let birth = TemplateBirth {
+            template_id: t,
+            layer_key: key,
+            asked: None,
+        };
+        // Stopped before its Birth: its local log has the Lineage.
+        let r = e
+            .host
+            .born_from_template(ns(1), b"tb", &birth, &packs, &|p| {
+                if p == "birth.before_accept" {
+                    Err(VesselError::Failpoint(p))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(matches!(r, Err(VesselError::Failpoint(_))), "{:?}", r.err());
+        let (void, _) = e.host.ensure(ns(1), b"void").unwrap();
+        let void = void.id();
+        let state = e.host.dir_for(tb).parent().unwrap().to_path_buf();
+        let tbase = 200_000 + 9 * ID_RANGE;
+        let pool = HoldTable(vec![
+            (layer.clone(), vec![tbase]),
+            (e.host.dataset_for(tb), vec![0, tbase, tbase + 5]),
+            (e.host.dataset_for(void), vec![tbase]),
+        ]);
+        let root = Dataset::new("tank/vessels").unwrap();
+        let (held, warnings) = held_on(&pool, &root, 200_000, Some(9), &state).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(held.len(), 2, "the layer is no Vessel's");
+        let by = |k: ChronicleId| held.iter().find(|h| h.key == *k.as_bytes()).unwrap();
+        assert_eq!(by(tb).slots, [].into());
+        assert_eq!(by(tb).parent, None);
+        assert_eq!(by(void).slots, [9].into(), "not born from a Template");
+        // Without a Template range, those files are slot 9's like any.
+        let (held, _) = held_on(&pool, &root, 200_000, None, &state).unwrap();
+        let tbh = held.iter().find(|h| h.key == *tb.as_bytes()).unwrap();
+        assert_eq!(tbh.slots, [9].into());
+    }
+
+    /// The failpoints a node may stop a Template birth at are §10.2's.
+    #[test]
+    fn birth_failpoints_are_the_specs() {
+        assert_eq!(
+            BIRTH_FAILPOINTS,
+            [
+                "layer.after_build_put",
+                "layer.before_shipped_accept",
+                "layer.after_shipped_accept",
+                "layer.after_receive",
+                "birth.after_clone",
+                "birth.after_lineage_append",
+                "birth.before_accept",
+            ]
+        );
+    }
+
     #[test]
     fn storage_is_zfs_or_the_block_log() {
         let with = |storage: Value| {
@@ -3278,6 +3714,7 @@ mod tests {
         assert_eq!(
             child,
             VesselConf {
+                template: None,
                 namespace: parent.namespace,
                 subject: "a-fork-9".into(),
                 takeover: None,
@@ -3608,6 +4045,7 @@ mod tests {
         let mut rt = Config::parse(GOOD).unwrap().runtime;
         rt.landlock_shim = None;
         let vc = |landlock| VesselConf {
+            template: None,
             fork: None,
             namespace: Namespace::from_bytes([1; 16]),
             subject: "a".into(),
@@ -4022,6 +4460,7 @@ mod tests {
             &Zfs::with_runner(pool),
             &Dataset::new("t/v").unwrap(),
             200_000,
+            None,
             no_state.path(),
         )
         .unwrap();
@@ -4051,6 +4490,7 @@ mod tests {
             &Zfs::with_runner(broken),
             &Dataset::new("t/v").unwrap(),
             200_000,
+            None,
             no_state.path(),
         )
         .is_err());
@@ -4091,7 +4531,7 @@ mod tests {
             (e.host.dataset_for(cid), vec![range1, range1 + 1000]),
         ]);
         let root = Dataset::new("tank/vessels").unwrap();
-        let (held, warnings) = held_on(&pool, &root, 200_000, &state).unwrap();
+        let (held, warnings) = held_on(&pool, &root, 200_000, None, &state).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         let by = |k: ChronicleId| held.iter().find(|h| h.key == *k.as_bytes()).unwrap();
         assert_eq!(by(pid).parent, None);
@@ -4106,7 +4546,7 @@ mod tests {
                 std::fs::write(&f, b"not a segment").unwrap();
             }
         }
-        let (held, warnings) = held_on(&pool, &root, 200_000, &state).unwrap();
+        let (held, warnings) = held_on(&pool, &root, 200_000, None, &state).unwrap();
         let child = held.iter().find(|h| h.key == *cid.as_bytes()).unwrap();
         if child.parent.is_some() {
             panic!("an unreadable log must not name a parent");

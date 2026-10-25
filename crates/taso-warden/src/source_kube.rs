@@ -410,6 +410,7 @@ impl<L: ListVessels> KubeSource<L> {
         }
 
         let vc = VesselConf {
+            template: None,
             fork,
             effects: None,
             promote: None,
@@ -718,6 +719,7 @@ mod tests {
             api: None,
         };
         let runtime = RuntimeConf {
+            template_slot: None,
             rootfs: None,
             host_uid_base: 200_000,
             landlock_shim: Some("/usr/lib/taso/landlock".into()),

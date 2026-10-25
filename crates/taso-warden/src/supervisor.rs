@@ -164,7 +164,8 @@ enum State<O> {
         handle: JoinHandle<O>,
         stop: Stop,
         since: Instant,
-        vc: VesselConf,
+        /// (Boxed: the enum stays small.)
+        vc: Box<VesselConf>,
     },
     /// Ran and is not restarted (its policy, or stopped on purpose).
     Done,
@@ -299,12 +300,15 @@ impl<R: RunVessel> Supervisor<R> {
             };
             match out {
                 Some(out) => on_event(Event::Exited {
-                    vc,
+                    vc: *vc,
                     out,
                     stopped,
                     restart_in,
                 }),
-                None => on_event(Event::Panicked { vc, restart_in }),
+                None => on_event(Event::Panicked {
+                    vc: *vc,
+                    restart_in,
+                }),
             }
         }
     }
@@ -335,7 +339,7 @@ impl<R: RunVessel> Supervisor<R> {
                 State::Running { stop, vc, .. } => {
                     if !stop.requested() {
                         stop.request();
-                        on_event(Event::Stopping(vc.clone()));
+                        on_event(Event::Stopping((**vc).clone()));
                     }
                     true // kept until the run has ended
                 }
@@ -378,7 +382,7 @@ impl<R: RunVessel> Supervisor<R> {
                 handle,
                 stop,
                 since: now,
-                vc: run_vc,
+                vc: Box::new(run_vc),
             };
         }
     }
@@ -396,6 +400,7 @@ mod tests {
 
     fn runtime() -> RuntimeConf {
         RuntimeConf {
+            template_slot: None,
             rootfs: Some("/r".into()),
             host_uid_base: 200_000,
             landlock_shim: None,
@@ -408,6 +413,7 @@ mod tests {
 
     fn vc(subject: &str, slot: u32, restart: Restart) -> VesselConf {
         VesselConf {
+            template: None,
             fork: None,
             namespace: Namespace::from_bytes([7; 16]),
             subject: subject.into(),
