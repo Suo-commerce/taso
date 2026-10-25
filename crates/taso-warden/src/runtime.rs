@@ -328,6 +328,154 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
     }))
 }
 
+/// Where a verifier sees its Candidate (P4 spec §3.4).
+pub const CANDIDATE_DIR: &str = "/candidate";
+
+/// Directories a verifier Template must contain at its root (D65): its
+/// root is read-only, so every mount target must exist in it.
+pub const VERIFIER_DIRS: &[&str] = &["proc", "dev", "sys", "tmp", "candidate"];
+
+/// A verifier container (P4 spec rev. 20 §3.4, D65): its Template's layer
+/// as a read-only root, the Candidate read-only at [`CANDIDATE_DIR`],
+/// a tmpfs `/tmp`, nothing else writable; no network, no sockets, no
+/// Landlock shim, no `TASO_*`; ids 0..65536 mapped to the Template range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifierSpec {
+    /// The runc container id.
+    pub id: String,
+    /// The verifier Template's layer, read-only (its Seal's view).
+    pub rootfs: PathBuf,
+    /// The restored Candidate's mountpoint, bound read-only.
+    pub candidate: PathBuf,
+    /// First host uid/gid of the Template range.
+    pub uid_base: u32,
+    /// The vconf's `entry`.
+    pub args: Vec<String>,
+    /// The vconf's `env`.
+    pub env: Vec<String>,
+    /// The memory limit.
+    pub memory_bytes: u64,
+    /// `RLIMIT_CPU`, in seconds.
+    pub cpu_seconds: u64,
+    /// Maximum number of processes.
+    pub pids: u64,
+}
+
+/// The OCI config of a verifier container ([`VerifierSpec`]).
+pub fn verifier_config(spec: &VerifierSpec) -> Result<Value, SpecError> {
+    let id_ok = !spec.id.is_empty()
+        && spec.id.len() <= 128
+        && spec
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if !id_ok {
+        return Err(SpecError::BadId(spec.id.clone()));
+    }
+    for p in [&spec.rootfs, &spec.candidate] {
+        if !p.is_absolute() {
+            return Err(SpecError::NotAbsolute(p.clone()));
+        }
+    }
+    if spec.args.is_empty() {
+        return Err(SpecError::NoArgs);
+    }
+    if spec.uid_base == 0 || spec.uid_base.checked_add(ID_RANGE).is_none() {
+        return Err(SpecError::BadUidRange(spec.uid_base));
+    }
+    for e in &spec.env {
+        let key = e.split_once('=').map(|(k, _)| k);
+        let ok = key.is_some_and(|k| {
+            !k.is_empty()
+                && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                && !RESERVED_ENV.contains(&k)
+                && !k.starts_with("TASO_")
+        });
+        if !ok {
+            return Err(SpecError::BadEnv(e.clone()));
+        }
+    }
+    let mut env = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        "HOME=/tmp".to_string(),
+    ];
+    env.extend(spec.env.iter().cloned());
+    let no_caps = json!([]);
+    let map = json!([{ "containerID": 0, "hostID": spec.uid_base, "size": ID_RANGE }]);
+    Ok(json!({
+        "ociVersion": "1.2.0",
+        "hostname": format!("verifier-{}", &spec.id[..spec.id.len().min(12)]),
+        "process": {
+            "terminal": false,
+            "user": { "uid": 0, "gid": 0 },
+            "args": spec.args,
+            "env": env,
+            "cwd": "/tmp",
+            "noNewPrivileges": true,
+            "capabilities": {
+                "bounding": no_caps, "effective": no_caps, "inheritable": no_caps,
+                "permitted": no_caps, "ambient": no_caps
+            },
+            "rlimits": [
+                { "type": "RLIMIT_NOFILE", "hard": 4096, "soft": 4096 },
+                { "type": "RLIMIT_CPU", "hard": spec.cpu_seconds, "soft": spec.cpu_seconds }
+            ]
+        },
+        "root": { "path": spec.rootfs, "readonly": true },
+        "mounts": [
+            { "destination": "/proc", "type": "proc", "source": "proc", "options": ["nosuid", "noexec", "nodev"] },
+            { "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+              "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] },
+            { "destination": "/dev/pts", "type": "devpts", "source": "devpts",
+              "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"] },
+            { "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
+              "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] },
+            { "destination": "/sys", "type": "none", "source": "/sys",
+              "options": ["rbind", "nosuid", "noexec", "nodev", "ro"] },
+            { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
+              "options": ["nosuid", "nodev", "mode=1777", "size=1g"] },
+            { "destination": CANDIDATE_DIR, "type": "bind", "source": spec.candidate,
+              "options": ["rbind", "ro", "nosuid", "nodev", "noexec"] }
+        ],
+        "linux": {
+            "namespaces": [
+                { "type": "pid" }, { "type": "network" }, { "type": "ipc" }, { "type": "uts" },
+                { "type": "mount" }, { "type": "user" }, { "type": "cgroup" }
+            ],
+            "uidMappings": map,
+            "gidMappings": map,
+            "resources": {
+                "devices": [{ "allow": false, "access": "rwm" }],
+                "memory": { "limit": spec.memory_bytes, "swap": spec.memory_bytes },
+                "pids": { "limit": spec.pids }
+            },
+            "seccomp": {
+                "defaultAction": "SCMP_ACT_ALLOW",
+                "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_AARCH64"],
+                "syscalls": [{ "names": DENIED_SYSCALLS, "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }]
+            },
+            "maskedPaths": [
+                "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
+                "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi",
+                "/sys/firmware", "/sys/devices/virtual/powercap"
+            ],
+            "readonlyPaths": [
+                "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"
+            ]
+        }
+    }))
+}
+
+/// Write a verifier's bundle: `config.json` in `bundle`.
+pub fn write_verifier_bundle(bundle: &Path, spec: &VerifierSpec) -> Result<PathBuf, BundleError> {
+    let config = verifier_config(spec).map_err(BundleError::Spec)?;
+    std::fs::create_dir_all(bundle).map_err(BundleError::Io)?;
+    let path = bundle.join("config.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(&config).expect("JSON"))
+        .map_err(BundleError::Io)?;
+    Ok(path)
+}
+
 /// Directories every Vessel image must contain.
 pub const REQUIRED_DIRS: &[&str] = &["proc", "dev", "sys", "tmp", "work", "run/taso"];
 
@@ -716,6 +864,71 @@ impl<R: RuncRunner> Runc<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P4 file 7a (D65): a verifier's container.
+    #[test]
+    fn a_verifier_runs_on_its_template_read_only_with_no_sockets_or_network() {
+        let spec = VerifierSpec {
+            id: "a-0123".into(),
+            rootfs: "/mnt/t-77/.view".into(),
+            candidate: "/mnt/a-0123".into(),
+            uid_base: 789_824,
+            args: vec!["/bin/check".into()],
+            env: vec!["MODE=strict".into()],
+            memory_bytes: 1 << 30,
+            cpu_seconds: 60,
+            pids: 64,
+        };
+        let c = verifier_config(&spec).unwrap();
+        assert_eq!(c["root"]["readonly"], json!(true));
+        assert_eq!(c["root"]["path"], json!("/mnt/t-77/.view"));
+        let mounts = c["mounts"].as_array().unwrap();
+        let cand = mounts
+            .iter()
+            .find(|m| m["destination"] == json!(CANDIDATE_DIR))
+            .unwrap();
+        for o in ["ro", "noexec", "nosuid", "nodev"] {
+            assert!(
+                cand["options"].as_array().unwrap().contains(&json!(o)),
+                "{o}"
+            );
+        }
+        // Nothing else of the host is writable or reachable: no /work, no
+        // socket.
+        assert!(mounts
+            .iter()
+            .all(|m| m["type"] != json!("bind") || m["destination"] == json!(CANDIDATE_DIR)));
+        let env = c["process"]["env"].as_array().unwrap();
+        assert!(env
+            .iter()
+            .all(|e| !e.as_str().unwrap().starts_with("TASO_")));
+        assert!(env.contains(&json!("MODE=strict")));
+        let ns: Vec<&str> = c["linux"]["namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["type"].as_str().unwrap())
+            .collect();
+        assert!(ns.contains(&"network") && ns.contains(&"user"));
+        assert_eq!(c["linux"]["uidMappings"][0]["hostID"], json!(789_824));
+        let rl = c["process"]["rlimits"].as_array().unwrap();
+        assert!(rl.contains(&json!({ "type": "RLIMIT_CPU", "hard": 60, "soft": 60 })));
+        assert_eq!(
+            c["linux"]["resources"]["memory"]["limit"],
+            json!(1u64 << 30)
+        );
+        for bad in ["TASO_FIELD=/x", "TASO_ANY=1", "PATH=/x", "=x"] {
+            let mut s = spec.clone();
+            s.env = vec![bad.into()];
+            assert!(
+                matches!(verifier_config(&s), Err(SpecError::BadEnv(_))),
+                "{bad}"
+            );
+        }
+        let mut s = spec.clone();
+        s.uid_base = 0;
+        assert!(verifier_config(&s).is_err());
+    }
     use std::cell::RefCell;
 
     fn spec() -> VesselSpec {

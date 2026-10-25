@@ -44,5 +44,6 @@ pub mod summary;
 pub mod supervisor;
 pub mod template;
 pub mod timing;
+pub mod verify;
 pub mod vessel;
 pub mod zfs;
