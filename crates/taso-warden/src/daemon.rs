@@ -162,8 +162,12 @@ use crate::vessel::{
     Ensured, Host, Pool, ReadLog, SealAt, TemplateBirth, Vessel, VesselError, BIRTH_TURN,
 };
 use crate::zfs::{Dataset, Snapshot};
-use taso_core::contract::{ContractRecord, NominatedBy, PathClass, StorageKind, TemplateRef};
+use taso_core::contract::{
+    ContractRecord, LogicalKey, NominatedBy, PathClass, Peer, StorageKind, TemplateRef,
+    VerdictRequest,
+};
 use taso_core::coordlog::Submitted;
+use taso_core::decider::{PendingItem, VerdictAnswer};
 use taso_core::model::WardenId;
 use taso_core::record::{Origin, TemplateAsked};
 use taso_field::protocol::{NominateResult, PromoteResult};
@@ -1801,12 +1805,147 @@ impl crate::field::Nominations<StorageLayers> for NodeNominations<'_, '_, '_> {
     }
 }
 
-/// The session's work between requests: the attempts (D68).
-struct NodeTick<'n, 's, 'e>(&'n std::cell::RefCell<Verifications<'s, 'e>>);
+/// The session's work between requests: the attempts (D68) and the
+/// decider's jobs for this Vessel (D74).
+struct NodeTick<'n, 's, 'e> {
+    node: &'n Node,
+    verif: &'n std::cell::RefCell<Verifications<'s, 'e>>,
+    jobs: std::sync::mpsc::Receiver<Job>,
+}
 
 impl crate::field::Tick<StorageLayers> for NodeTick<'_, '_, '_> {
     fn tick(&mut self, vessel: &mut Vessel<StorageLayers>) {
-        self.0.borrow_mut().tick(vessel);
+        self.verif.borrow_mut().tick(vessel);
+        while let Ok(job) = self.jobs.try_recv() {
+            let verdict = matches!(job, Job::Verdict(..));
+            self.node.do_job(vessel, job);
+            // A Never closes, a Sanction commits: nothing more to attempt
+            // may be the case; a look is cheap.
+            if verdict {
+                self.verif.borrow_mut().want();
+            }
+        }
+    }
+}
+
+/// What the decider socket asks of a Vessel's session (D74).
+enum Job {
+    /// Its pending Candidates (D73).
+    Pending(std::sync::mpsc::Sender<Result<Vec<PendingItem>, String>>),
+    /// A verdict, its `request_id` checked.
+    Verdict(
+        Box<VerdictRequest>,
+        Peer,
+        std::sync::mpsc::Sender<Result<VerdictAnswer, String>>,
+    ),
+}
+
+/// Who has a Vessel on this node, for the decider (D74).
+enum DSlot {
+    /// Being opened, run without a session yet, closed, or open for the
+    /// decider.
+    Busy,
+    /// Its session runs: jobs go to its thread.
+    Running(std::sync::mpsc::Sender<Job>),
+}
+
+/// A Vessel's slot, held until dropped.
+struct SlotGuard<'n> {
+    node: &'n Node,
+    id: [u8; 16],
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.node.slots().remove(&self.id);
+    }
+}
+
+/// How long a decider request waits for a running session to take it.
+const SESSION_WAIT: Duration = Duration::from_secs(30);
+
+/// The decider socket's side of a node (D73, D74).
+pub struct NodeDecider(pub Arc<Node>);
+
+impl crate::decidesrv::Decide for NodeDecider {
+    fn pending(&self) -> Result<Vec<PendingItem>, String> {
+        let node = &*self.0;
+        let mut items = Vec::new();
+        for id in node.local_vessels() {
+            if node.mine_here(id).is_err() {
+                continue;
+            }
+            match node.hold_for_decider(*id.as_bytes()) {
+                // Not running: its local log, read as it is (no open).
+                Ok(_slot) => {
+                    let frames = crate::chronicle::read_log(&node.host().dir_for(id))
+                        .map_err(|e| format!("reading the log of {}: {e}", id_hex(id)))?;
+                    items.extend(
+                        crate::verdict::pending(node.coord.as_ref(), &frames)
+                            .map_err(|e| format!("coordinator: {e}"))?,
+                    );
+                }
+                Err(Some(tx)) => match Node::ask_session(&tx, Job::Pending) {
+                    Ok(r) => items.extend(r?),
+                    // Its session is busy or ended: left out this time.
+                    Err(why) => eprintln!(
+                        "taso-wardend[{}] {}: pending: left out ({why})",
+                        node.config.warden.get(),
+                        id_hex(id)
+                    ),
+                },
+                // Being opened or closed: left out this time.
+                Err(None) => {}
+            }
+        }
+        Ok(items)
+    }
+
+    fn verdict(&self, req: &VerdictRequest, peer: Peer) -> Result<VerdictAnswer, String> {
+        let node = &*self.0;
+        let cid = req.candidate_id;
+        let id = match node
+            .coord
+            .query_logical(taso_core::contract::logical_id(&LogicalKey::Candidate(cid)))
+            .map_err(|e| format!("coordinator: {e}"))?
+        {
+            Some((_, Submitted::Contract(ContractRecord::Candidate(c)))) => c.chronicle,
+            _ => {
+                return Ok(VerdictAnswer::NotHere(format!(
+                    "no Candidate {cid} is accepted"
+                )))
+            }
+        };
+        let job = |tx| Job::Verdict(Box::new(req.clone()), peer, tx);
+        match node.hold_for_decider(*id.as_bytes()) {
+            Ok(_slot) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                match node.open_for(id, job(tx)) {
+                    Ok(()) => rx
+                        .recv()
+                        .map_err(|_| "the verdict was not answered".to_string())?,
+                    Err((why, _)) => Ok(VerdictAnswer::NotHere(why)),
+                }
+            }
+            Err(Some(tx)) => match Node::ask_session(&tx, job) {
+                Ok(r) => r,
+                // Taken but not answered in time: it may still be
+                // recorded, so the same request is to be sent again.
+                Err(why) if why == "timeout" => Ok(VerdictAnswer::Pending(format!(
+                    "the session of Vessel {} has not answered within {}s: send the same request again",
+                    id_hex(id),
+                    SESSION_WAIT.as_secs()
+                ))),
+                Err(why) => Ok(VerdictAnswer::NotHere(format!(
+                    "Vessel {}: {why}",
+                    id_hex(id)
+                ))),
+            },
+            Err(None) => Ok(VerdictAnswer::NotHere(format!(
+                "Vessel {} is being opened or closed on this node: ask again",
+                id_hex(id)
+            ))),
+        }
     }
 }
 
@@ -2505,8 +2644,11 @@ pub struct Node {
     verifier_slots: std::sync::Mutex<usize>,
     /// The node's verifier limits (`verifier.*`, §11.1).
     verifier_limits: crate::verify::VerifierLimits,
-    /// A failpoint of an attempt to stop at (D70).
+    /// A failpoint of an attempt or a verdict to stop at (D70, §10.2
+    /// row 8).
     attempt_failpoint: crate::attempt::Failpoint,
+    /// Who has each Vessel on this node, for the decider (D74).
+    decide_slots: std::sync::Mutex<std::collections::BTreeMap<[u8; 16], DSlot>>,
 }
 
 /// `warden.max_concurrent_verifiers` (§11.1).
@@ -2626,6 +2768,7 @@ impl Node {
             verifier_slots: std::sync::Mutex::new(0),
             verifier_limits: crate::verify::VerifierLimits::default(),
             attempt_failpoint: crate::attempt::no_failpoints(),
+            decide_slots: Default::default(),
         })
     }
 
@@ -2640,14 +2783,16 @@ impl Node {
             .iter()
             .chain(crate::nominate::FAILPOINTS.iter())
             .chain(crate::attempt::FAILPOINTS.iter())
+            .chain(crate::verdict::FAILPOINTS.iter())
             .copied()
             .find(|p| *p == name)
             .ok_or_else(|| {
                 format!(
-                    "{name:?} is not a failpoint of a Template birth, a nomination or an attempt ({}, {}, {})",
+                    "{name:?} is not a failpoint of a Template birth, a nomination, an attempt or a verdict ({}, {}, {}, {})",
                     BIRTH_FAILPOINTS.join(", "),
                     crate::nominate::FAILPOINTS.join(", "),
-                    crate::attempt::FAILPOINTS.join(", ")
+                    crate::attempt::FAILPOINTS.join(", "),
+                    crate::verdict::FAILPOINTS.join(", ")
                 )
             })?;
         self.attempt_failpoint = std::sync::Arc::new(move |p| p == at);
@@ -2754,19 +2899,25 @@ impl Node {
         vc: &VesselConf,
         vessel: &mut Vessel<StorageLayers>,
     ) -> Result<(), DaemonError> {
+        self.settle_attempts_with(vessel, &|m| self.log(vc, m))
+    }
+
+    /// [`Node::settle_attempts`] logging through `log`.
+    fn settle_attempts_with(
+        &self,
+        vessel: &mut Vessel<StorageLayers>,
+        log: &dyn Fn(String),
+    ) -> Result<(), DaemonError> {
         let at = self.attempts();
         let packs = self.packs(vessel.id())?;
         let closed = at.interrupt_open(vessel, &packs).map_err(|e| {
             DaemonError::Refused(format!("closing its open verification attempts: {e}"))
         })?;
         for st in &closed {
-            self.log(
-                vc,
-                format_args!(
-                    "attempt {} of Candidate {}: interrupted (it was open at this start)",
-                    st.attempt_id, st.candidate_id
-                ),
-            );
+            log(format!(
+                "attempt {} of Candidate {}: interrupted (it was open at this start)",
+                st.attempt_id, st.candidate_id
+            ));
         }
         let finished = at
             .finished(vessel)
@@ -2774,21 +2925,175 @@ impl Node {
         for st in finished {
             match crate::attempt::destroy_candidate(&self.storage, &self.config.root, st.attempt_id)
             {
-                Ok(true) => self.log(
-                    vc,
-                    format_args!(
-                        "attempt {}: destroyed its /candidate dataset, left by an earlier run",
-                        st.attempt_id
-                    ),
-                ),
+                Ok(true) => log(format!(
+                    "attempt {}: destroyed its /candidate dataset, left by an earlier run",
+                    st.attempt_id
+                )),
                 Ok(false) => {}
-                Err(e) => self.log(
-                    vc,
-                    format_args!("attempt {}: its /candidate dataset: {e}", st.attempt_id),
-                ),
+                Err(e) => log(format!(
+                    "attempt {}: its /candidate dataset: {e}",
+                    st.attempt_id
+                )),
             }
         }
         Ok(())
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<[u8; 16], DSlot>> {
+        self.decide_slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A run's slot: waits while the decider has the Vessel open.
+    fn hold_for_run(&self, id: [u8; 16]) -> SlotGuard<'_> {
+        loop {
+            {
+                let mut slots = self.slots();
+                if let std::collections::btree_map::Entry::Vacant(e) = slots.entry(id) {
+                    e.insert(DSlot::Busy);
+                    return SlotGuard { node: self, id };
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The decider's slot, or what has the Vessel: its session's jobs, or
+    /// `None` (busy).
+    fn hold_for_decider(
+        &self,
+        id: [u8; 16],
+    ) -> Result<SlotGuard<'_>, Option<std::sync::mpsc::Sender<Job>>> {
+        let mut slots = self.slots();
+        match slots.get(&id) {
+            None => {
+                slots.insert(id, DSlot::Busy);
+                Ok(SlotGuard { node: self, id })
+            }
+            Some(DSlot::Busy) => Err(None),
+            Some(DSlot::Running(tx)) => Err(Some(tx.clone())),
+        }
+    }
+
+    fn verdicts(&self) -> crate::verdict::Verdicts {
+        crate::verdict::Verdicts {
+            coord: self.coord.clone(),
+            warden: self.config.warden,
+            failpoint: self.attempt_failpoint.clone(),
+        }
+    }
+
+    /// Do a decider job on `vessel` (its session's thread, or an open of
+    /// the decider's).
+    fn do_job(&self, vessel: &mut Vessel<StorageLayers>, job: Job) {
+        match job {
+            Job::Pending(tx) => {
+                let r = vessel
+                    .chronicle()
+                    .frames()
+                    .map_err(|e| format!("reading the log of {}: {e}", id_hex(vessel.id())))
+                    .and_then(|f| {
+                        crate::verdict::pending(self.coord.as_ref(), &f)
+                            .map_err(|e| format!("coordinator: {e}"))
+                    });
+                let _ = tx.send(r);
+            }
+            Job::Verdict(req, peer, tx) => {
+                let r = self
+                    .packs(vessel.id())
+                    .map_err(|e| e.to_string())
+                    .and_then(|packs| {
+                        self.verdicts()
+                            .handle(vessel, &packs, &req, peer)
+                            .map_err(|e| e.to_string())
+                    });
+                eprintln!(
+                    "taso-wardend[{}] {}: verdict {} on Candidate {} from uid {} pid {}: {}",
+                    self.config.warden.get(),
+                    id_hex(vessel.id()),
+                    req.request_id,
+                    req.candidate_id,
+                    peer.uid,
+                    peer.pid,
+                    match &r {
+                        Ok(a) => format!("{a:?}"),
+                        Err(e) => format!("failed: {e}"),
+                    }
+                );
+                let _ = tx.send(r);
+            }
+        }
+    }
+
+    /// Whether this Warden holds `id` and has its local log here: why not.
+    fn mine_here(&self, id: ChronicleId) -> Result<(), String> {
+        if !self.host().dir_for(id).exists() {
+            return Err(format!(
+                "Vessel {} has no local log on this node",
+                id_hex(id)
+            ));
+        }
+        match self.coord.ownership(id) {
+            Ok(o) if o.holder == self.config.warden => Ok(()),
+            Ok(o) => Err(format!(
+                "Vessel {} is held by Warden {}",
+                id_hex(id),
+                o.holder.get()
+            )),
+            Err(e) => Err(format!("Vessel {}: coordinator: {e}", id_hex(id))),
+        }
+    }
+
+    /// Open `id` here for the decider (D74), close attempts left open (D69)
+    /// and do `job`: `Err` is the `NotHere` reason.
+    fn open_for(&self, id: ChronicleId, job: Job) -> Result<(), (String, Job)> {
+        if let Err(why) = self.mine_here(id) {
+            return Err((why, job));
+        }
+        let (mut vessel, _) = match self.host().open(id) {
+            Ok(v) => v,
+            Err(e) => return Err((format!("opening Vessel {}: {e}", id_hex(id)), job)),
+        };
+        let label = id_hex(id);
+        let log = |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
+        if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
+            return Err((format!("Vessel {label}: {e}"), job));
+        }
+        self.do_job(&mut vessel, job);
+        Ok(())
+    }
+
+    /// Send `job` to a running session and wait for its answer.
+    fn ask_session<T>(
+        tx: &std::sync::mpsc::Sender<Job>,
+        job: impl FnOnce(std::sync::mpsc::Sender<T>) -> Job,
+    ) -> Result<T, String> {
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        tx.send(job(rtx))
+            .map_err(|_| "the Vessel's run ended".to_string())?;
+        rrx.recv_timeout(SESSION_WAIT).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => "timeout".to_string(),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => "the Vessel's run ended".to_string(),
+        })
+    }
+
+    /// The Vessels whose local logs are on this node.
+    fn local_vessels(&self) -> Vec<ChronicleId> {
+        let Ok(rd) = std::fs::read_dir(&self.config.state_dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ChronicleId> = rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().and_then(key_of_hex))
+            .map(ChronicleId::from_bytes)
+            .filter(|id| {
+                matches!(
+                    crate::vessel::lineage_in(&self.host().dir_for(*id)),
+                    Ok(Some(_))
+                )
+            })
+            .collect();
+        out.sort_by_key(|id| *id.as_bytes());
+        out
     }
 
     /// Nominate `vessel`'s Seal for `vc` (§3.1): the answer for the
@@ -3155,6 +3460,9 @@ impl Node {
         let rt = vc
             .effective(&self.config.runtime, &self.config.quiescence)
             .map_err(DaemonError::Runtime)?;
+        // The decider waits for this run, and this run for an open of the
+        // decider's (D74).
+        let _slot = self.hold_for_run(*vc.id().as_bytes());
         let (mut vessel, start, verdict) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
@@ -3564,7 +3872,13 @@ impl Node {
                     vc,
                     verif: &verif,
                 };
-                let mut ticker = NodeTick(&verif);
+                let (jobs_tx, jobs) = std::sync::mpsc::channel();
+                let mut ticker = NodeTick {
+                    node: self,
+                    verif: &verif,
+                    jobs,
+                };
+                self.slots().insert(*id.as_bytes(), DSlot::Running(jobs_tx));
                 let mut session = Session::new(&mut vessel, verdict)?
                     .with_effects(&mut effects)
                     .with_after_seal(&mut publisher)
@@ -3592,6 +3906,10 @@ impl Node {
                 let (failures, last) = session.after_seal_failures();
                 let last = last.map(str::to_string);
                 drop(session);
+                // No more jobs: a request waiting for one is answered
+                // `NotHere` (its sender is gone with the ticker).
+                self.slots().insert(*id.as_bytes(), DSlot::Busy);
+                drop(ticker);
                 // The agent is done: the attempts still running finish
                 // before the run returns.
                 verif.borrow_mut().drain(&mut vessel);

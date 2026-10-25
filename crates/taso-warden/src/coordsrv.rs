@@ -1230,7 +1230,7 @@ pub struct Server {
 /// Bind the socket in a private staging directory beside `path`, set its
 /// mode and group there, then rename it to `path`.  The directory is
 /// removed on every exit.
-fn bind_private(path: &Path, group: Option<u32>) -> io::Result<UnixListener> {
+pub(crate) fn bind_private(path: &Path, group: Option<u32>) -> io::Result<UnixListener> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

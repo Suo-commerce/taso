@@ -65,6 +65,13 @@ pub fn write_frame(w: &mut impl Write, body: &[u8]) -> Result<(), FrameError> {
 /// a stopped and continued process gets `EINTR` from a socket read with a
 /// timeout even under `SA_RESTART`, and that is not a broken connection.
 pub fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>, FrameError> {
+    read_frame_max(r, MAX_FRAME)
+}
+
+/// [`read_frame`] refusing a body over `max` bytes (at most [`MAX_FRAME`])
+/// before anything is allocated: `TooLarge` with the length read.
+pub fn read_frame_max(r: &mut impl Read, max: u32) -> Result<Option<Vec<u8>>, FrameError> {
+    let max = max.min(MAX_FRAME);
     let mut len = [0u8; 4];
     let mut got = 0;
     while got < 4 {
@@ -77,7 +84,7 @@ pub fn read_frame(r: &mut impl Read) -> Result<Option<Vec<u8>>, FrameError> {
         }
     }
     let len = u32::from_be_bytes(len);
-    if len > MAX_FRAME {
+    if len > max {
         return Err(FrameError::TooLarge(len));
     }
     let mut body = vec![0u8; len as usize];
