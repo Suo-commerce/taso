@@ -494,19 +494,27 @@ wait_for() {
     return 1
 }
 
-# fs_packs ID: the packs of Vessel ID in the store with an fs section
-# (named <end>-<base>-<to>, to not 0).
-fs_packs() { ls "$W/store/p4u/$1/pack" 2>/dev/null | grep -vc -- '-0$' || true; }
-# replacements ID: its log-only packs that replace one (<end>-<base>-0,
-# base not 0 or end > base... any -0 name).
-log_packs() { ls "$W/store/p4u/$1/pack" 2>/dev/null | grep -c -- '-0$' || true; }
+# fs_names ID: the packs of Vessel ID in the store with an fs section:
+# named <end>-<base>-<to>, each 20 digits, <to> not all zeros.
+fs_names() { ls "$W/store/p4u/$1/pack" 2>/dev/null | awk -F- 'NF == 3 && $3 !~ /^0+$/' || true; }
+fs_packs() { fs_names "$1" | wc -l; }
+# replaced ID FILE: how many of the fs packs named in FILE have their
+# log-only replacement <end>-<base>-00000000000000000000 in the store.
+replaced() {
+    local n k=0
+    while read -r n; do
+        [[ -e "$W/store/p4u/$1/pack/${n%-*}-00000000000000000000" ]] && k=$((k + 1))
+    done <"$2"
+    echo "$k"
+}
 
 dataset_exists() { # dataset_exists ID: yes|no
     local ds; ds="$(root_of 1)/v-$1"
     if [[ $MODE == zfs ]]; then
         zfs list -H -o name "$ds" >/dev/null 2>&1 && echo yes || echo no
     else
-        blk names | tr ' ' '\n' | grep -qx "$ds" && echo yes || echo no
+        # `names` answers "ok <name>:<layer> ...".
+        blk names | tr ' ' '\n' | grep -q "^$ds:" && echo yes || echo no
     fi
 }
 
@@ -515,7 +523,10 @@ retired() { # retired ID: true|false, as taso-logcheck reads the coordinator
 }
 
 say "3. the daemon with a TTL of 30 s, TASO_FAILPOINT=purge.before_complete (predict: s sanctioned before its TTL passes; q checked after its run; d1-d3 each stopped at the failpoint within 90 s)"
-for v in d1 d2 d3 s; do expect "$v: fs packs before" bash -c "[[ $(fs_packs "${ID[$v]}") -ge 1 ]]"; done
+for v in d1 d2 d3 s; do
+    fs_names "${ID[$v]}" >"$W/out/fs-before-$v"
+    expect "$v: fs packs before" bash -c "[[ $(wc -l <"$W/out/fs-before-$v") -ge 1 ]]"
+done
 daemon 3-daemon "$W/keep-q.json" q TASO_FAILPOINT=purge.before_complete
 timeout 120 "$BIN/taso-decide" "$W/keep-q.json" pending >"$W/out/3-pending.json"
 read -r CS AS < <(python3 -c '
@@ -545,15 +556,18 @@ expect "s: never purged" is "$(purge_lines 4-daemon "${ID[s]}" '')" 0
 expect "q2: never purged" is "$(purge_lines 4-daemon "$Q2ID" 'Complete')" 0
 stop_daemon
 
-say "5. what is left of d1-d3 (predict: no fs pack, one log-only pack per item; no dataset; a start of d1 refused 'purged at lsn')"
+say "5. what is left of d1-d3 (predict: no fs pack; the purge's items are the fs packs it had, each replaced by its log-only pack; no dataset; a start of d1 refused 'purged at lsn')"
 for v in d1 d2 d3; do
     items=$({ grep -o "\] ${ID[$v]}: purge: Complete { items: [0-9]*" "$W/out/4-daemon.err" || true; } | head -1 | sed 's/.*items: //')
     expect "$v: no fs pack" is "$(fs_packs "${ID[$v]}")" 0
-    expect "$v: a replacement per item ($items)" bash -c "[[ -n '$items' && $(log_packs "${ID[$v]}") -ge '$items' ]]"
+    before=$(wc -l <"$W/out/fs-before-$v")
+    expect "$v: its $before fs packs are the purge's items" is "$items" "$before"
+    expect "$v: each replaced by its log-only pack" is "$(replaced "${ID[$v]}" "$W/out/fs-before-$v")" "$before"
     expect "$v: no dataset" is "$(dataset_exists "${ID[$v]}")" no
 done
 wardend 5-d1 1 "$W/d1.json"
-expect "d1: start refused, purged" is "$(count 5-d1.err 'purged at lsn [0-9]*')" 1
+# A refused start is reported on stdout ("<subject>: <why>").
+expect "d1: start refused, purged" is "$(count 5-d1.out '^d1: .*purged at lsn [0-9]*')" 1
 
 say "6. the sanctioned Vessel s (predict: its dataset stays; not retired)"
 expect "s: dataset" is "$(dataset_exists "${ID[s]}")" yes

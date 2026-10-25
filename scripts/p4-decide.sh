@@ -690,43 +690,6 @@ wardend 12-b 1 "$W/b.json"
 expect "exit 0" is "$RC" 0
 expect "born from p's Template" is "$(count 12-b.err "\] b: Born from Template $TID")" 1
 
-# ── 11. A sanction's finish stopped (file 9) ────────────────────────
-
-say "11a. sanction.after_commit_accept on x (predict: Committed; the finish not run; the sanction stays committed)"
-daemon 11a-daemon "$W/keep-q.json" q TASO_FAILPOINT=sanction.after_commit_accept
-verdict 11a-x x sanction
-expect "Committed" is "$(jf 11a-x answer)" Committed
-TX=$(jf 11a-x template_id)
-expect "stopped after the commit" is "$(count 11a-daemon.err "\] ${ID[x]}: stopped at failpoint sanction.after_commit_accept")" 1
-expect "not finished" is "$(finished_sanction 11a-daemon "${ID[x]}" "$TX")" 0
-stop_daemon
-
-say "11b. sanction.before_ready_accept on y (predict: Committed; the finish stopped before TemplateReady is accepted)"
-daemon 11b-daemon "$W/keep-q.json" q TASO_FAILPOINT=sanction.before_ready_accept
-verdict 11b-y y sanction
-expect "Committed" is "$(jf 11b-y answer)" Committed
-TY=$(jf 11b-y template_id)
-expect "not finished at the failpoint" is "$(count 11b-daemon.err "\] ${ID[y]}: sanction of Candidate [0-9a-f]*: Template $TY not finished: .*stopped at failpoint sanction.before_ready_accept")" 1
-stop_daemon
-
-say "11c. the same requests again, no failpoint (predict: Committed each, the same template_ids; both finished when opened (the restart rule), once each)"
-daemon 11c-daemon "$W/keep-q.json" q
-decide 11c-x resend "$(jf 11a-x request)"
-expect "x: Committed, the same Template" is "$(jf 11c-x answer) $(jf 11c-x template_id)" "Committed $TX"
-decide 11c-y resend "$(jf 11b-y request)"
-expect "y: Committed, the same Template" is "$(jf 11c-y answer) $(jf 11c-y template_id)" "Committed $TY"
-expect "x finished" is "$(finished_sanction 11c-daemon "${ID[x]}" "$TX")" 1
-expect "y finished" is "$(finished_sanction 11c-daemon "${ID[y]}" "$TY")" 1
-stop_daemon
-
-# ── 12. A Vessel born from a sanctioned Template ────────────────────
-
-say "12. b, born from p's Template (predict: exit 0; 'Born from Template' p's; its turns sealed)"
-config 1 "$W/b.json" "$(printf '{"subject": "b", "uid_slot": 12, "template": "%s", %s}' "$TID" "$(sim 1)")"
-wardend 12-b 1 "$W/b.json"
-expect "exit 0" is "$RC" 0
-expect "born from p's Template" is "$(count 12-b.err "\] b: Born from Template $TID")" 1
-
 # ── 13. taso-policy, the default caller (file 10) ───────────────
 
 cat >"$W/policy.toml" <<'EOF2'
