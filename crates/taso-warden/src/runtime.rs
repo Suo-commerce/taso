@@ -391,6 +391,10 @@ pub fn prepare_work_dir(work: &Path, host_uid_base: u32) -> io::Result<()> {
 ///   idmapped instead;
 /// - anything else: refused with `PermissionDenied`, nothing changed.
 ///
+/// In the three accepted cases a `lost+found` directory still owned by
+/// `0:0` (ext4 on the block log makes it so) is given to the returned
+/// range, and nothing else in it ([`own_lost_found`], P4 file 4d).
+///
 /// An `inherited` range that is 0, wraps, or partly overlaps the Vessel's
 /// own is refused with `InvalidInput` before anything is read (the same
 /// rule as [`oci_config`]); one equal to `host_uid_base` is the same as
@@ -425,6 +429,7 @@ pub fn work_dir_range(work: &Path, host_uid_base: u32, inherited: Option<u32>) -
     let (uid, gid) = (m.uid(), m.gid());
     let is = |b: u32| uid == b && gid == b;
     if let Some(d) = inherited.filter(|d| is(*d)) {
+        own_lost_found(work, d)?;
         return Ok(d);
     }
     if !is(0) && !is(host_uid_base) {
@@ -443,7 +448,32 @@ pub fn work_dir_range(work: &Path, host_uid_base: u32, inherited: Option<u32>) -
     }
     std::os::unix::fs::chown(work, Some(host_uid_base), Some(host_uid_base))?;
     std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o750))?;
+    own_lost_found(work, host_uid_base)?;
     Ok(host_uid_base)
+}
+
+/// The name of ext4's reserved directory (P4 spec §4.1.6, `fs.reserved`).
+pub const LOST_FOUND: &str = "lost+found";
+
+/// Give a `lost+found` that `mkfs` left as `0:0` to the dataset's disk
+/// range (P4 file 4d, Jarmo's decision (a), 2026-10-24).  A reserved entry
+/// is owned by slot 0 of the range the tree is stored in (spec §4.1.6), so
+/// one left at host `0:0` makes every walk of the Vessel's Seals refuse it
+/// `ReservedMismatch` (found by `scripts/p4-genesis.sh blk`).  Only the
+/// directory itself changes, and only from exactly `0:0`: anything else —
+/// absent (ZFS), another owner, not a directory (a symlink is never
+/// followed) — is left as it is, for the walk to judge.
+fn own_lost_found(work: &Path, range: u32) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let p = work.join(LOST_FOUND);
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_dir() && m.uid() == 0 && m.gid() == 0 => {
+            std::os::unix::fs::lchown(&p, Some(range), Some(range))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Write `config.json` for `spec` into `bundle` (created if missing).
@@ -1356,6 +1386,98 @@ mod tests {
             assert_eq!(owner(dir.path()), (uid, gid), "{uid}:{gid} unchanged");
             assert_eq!(mode(dir.path()), 0o700, "{uid}:{gid} mode unchanged");
         }
+    }
+
+    // ── lost+found follows the disk range (P4 file 4d, decision (a)) ──
+
+    /// A `lost+found` as `mkfs.ext4` leaves it: `0:0`, mode 0700.
+    fn lost_found(work: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = work.join(LOST_FOUND);
+        std::fs::create_dir(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::chown(&p, Some(0), Some(0)).unwrap();
+        p
+    }
+
+    #[test]
+    #[ignore = "needs root"]
+    fn a_fresh_datasets_lost_found_joins_its_range() {
+        assert!(running_as_root(), "run as root");
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
+        let lf = lost_found(dir.path());
+        assert_eq!(work_dir_range(dir.path(), CHILD, None).unwrap(), CHILD);
+        assert_eq!(owner(&lf), (CHILD, CHILD));
+        assert_eq!(mode(&lf), 0o700, "mode unchanged");
+        // Again: nothing more changes.
+        assert_eq!(work_dir_range(dir.path(), CHILD, None).unwrap(), CHILD);
+        assert_eq!(owner(&lf), (CHILD, CHILD));
+    }
+
+    #[test]
+    #[ignore = "needs root"]
+    fn an_existing_vessels_lost_found_is_fixed_at_its_next_start() {
+        assert!(running_as_root(), "run as root");
+        let dir = tempfile::tempdir().unwrap();
+        // Prepared before file 4d: the top is the Vessel's, lost+found 0:0.
+        std::os::unix::fs::chown(dir.path(), Some(CHILD), Some(CHILD)).unwrap();
+        let lf = lost_found(dir.path());
+        assert_eq!(work_dir_range(dir.path(), CHILD, None).unwrap(), CHILD);
+        assert_eq!(owner(&lf), (CHILD, CHILD));
+    }
+
+    #[test]
+    #[ignore = "needs root"]
+    fn a_forks_lost_found_joins_its_lineages_range() {
+        assert!(running_as_root(), "run as root");
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(PARENT), Some(PARENT)).unwrap();
+        let lf = lost_found(dir.path());
+        assert_eq!(
+            work_dir_range(dir.path(), CHILD, Some(PARENT)).unwrap(),
+            PARENT
+        );
+        assert_eq!(owner(dir.path()), (PARENT, PARENT), "top unchanged");
+        assert_eq!(owner(&lf), (PARENT, PARENT));
+    }
+
+    #[test]
+    #[ignore = "needs root"]
+    fn lost_found_is_left_alone_unless_it_is_a_root_owned_directory() {
+        assert!(running_as_root(), "run as root");
+        // Another owner: left for the walk to judge.
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
+        let lf = lost_found(dir.path());
+        std::os::unix::fs::chown(&lf, Some(OTHER), Some(OTHER)).unwrap();
+        work_dir_range(dir.path(), CHILD, None).unwrap();
+        assert_eq!(owner(&lf), (OTHER, OTHER));
+        // Half root: left too.
+        std::os::unix::fs::chown(&lf, Some(0), Some(OTHER)).unwrap();
+        work_dir_range(dir.path(), CHILD, None).unwrap();
+        assert_eq!(owner(&lf), (0, OTHER));
+
+        // A symlink named lost+found is never followed.
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
+        std::os::unix::fs::chown(target.path(), Some(0), Some(0)).unwrap();
+        std::os::unix::fs::symlink(target.path(), dir.path().join(LOST_FOUND)).unwrap();
+        work_dir_range(dir.path(), CHILD, None).unwrap();
+        assert_eq!(owner(target.path()), (0, 0), "target untouched");
+
+        // A refused dataset: its lost+found is not touched either.
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(OTHER), Some(OTHER)).unwrap();
+        let lf = lost_found(dir.path());
+        assert!(work_dir_range(dir.path(), CHILD, None).is_err());
+        assert_eq!(owner(&lf), (0, 0));
+
+        // No lost+found (ZFS): nothing to do.
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
+        assert_eq!(work_dir_range(dir.path(), CHILD, None).unwrap(), CHILD);
     }
 
     #[test]
