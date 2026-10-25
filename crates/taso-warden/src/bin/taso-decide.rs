@@ -5,6 +5,7 @@
 //! taso-decide <warden-config> pending
 //! taso-decide <warden-config> verdict <candidate_id> <attempt_id> sanction|hold|never
 //!             --actor <name> --reason <text> [--never <why>] [--facts-hash <hex>]
+//!             [--like <request hex>]
 //! taso-decide <warden-config> resend <request hex>
 //! ```
 //!
@@ -12,8 +13,10 @@
 //! (its uid and pid), so run it as the user who decides. `verdict` binds
 //! the request to what `pending` shows of that Candidate and attempt
 //! (`facts_hash`, `artifact_key`, `requirement`, `exclude`,
-//! `result_digest`); `--facts-hash` replaces the bound facts (a stale
-//! request, for tests). `never` needs `--never <why>`. `resend` sends the
+//! `result_digest`); `--like` binds it to an earlier request's (one a
+//! `verdict` printed) instead, for a Candidate no longer pending (closed,
+//! committed); `--facts-hash` replaces the bound facts (a stale request,
+//! for tests). `never` needs `--never <why>`. `resend` sends the
 //! exact request a `verdict` printed (`"request"`), as a retry does: the
 //! same `request_id`.
 //!
@@ -26,7 +29,7 @@
 //!   "attempts": [{"attempt_id": "…", "outcome": "Exit { code: 0 }", "result_digest": "…"}]}]}
 //! {"answer": "Committed", "template_id": "…", "request_id": "…", "request": "…"}
 //! {"answer": "NotCommitted", "rule": "OpenAttempt", "request_id": "…", "request": "…"}
-//! {"error": "…"}
+//! {"error": "…"}                       (a verdict's also has "request_id" and "request")
 //! ```
 //!
 //! # Exit status
@@ -49,7 +52,7 @@ use taso_warden::decidesrv::DeciderClient;
 
 const USAGE: &str = "usage: taso-decide <warden-config> pending\n       \
     taso-decide <warden-config> verdict <candidate_id> <attempt_id> sanction|hold|never \
-    --actor <name> --reason <text> [--never <why>] [--facts-hash <hex>]\n       \
+    --actor <name> --reason <text> [--never <why>] [--facts-hash <hex>] [--like <request hex>]\n       \
     taso-decide <warden-config> resend <request hex>";
 
 fn hex(b: &[u8]) -> String {
@@ -142,6 +145,7 @@ fn main() -> ExitCode {
             decision: Decision,
             authority: Authority,
             facts: Option<HashVal>,
+            like: Option<Box<VerdictRequest>>,
         },
         Resend(Box<VerdictRequest>),
     }
@@ -154,7 +158,8 @@ fn main() -> ExitCode {
             let (Some(cid), Some(attempt)) = (hash(&rest[0]), hash(&rest[1])) else {
                 return usage("a candidate_id and an attempt_id are 64 hex digits");
             };
-            let (mut actor, mut reason, mut never, mut facts) = (None, None, None, None);
+            let (mut actor, mut reason, mut never, mut facts, mut like) =
+                (None, None, None, None, None);
             let mut it = rest[3..].iter();
             while let Some(flag) = it.next() {
                 let Some(val) = it.next() else {
@@ -164,6 +169,10 @@ fn main() -> ExitCode {
                     "--actor" => actor = Some(val.clone()),
                     "--reason" => reason = Some(val.clone()),
                     "--never" => never = Some(val.clone()),
+                    "--like" => match unhex(val).and_then(|b| Request::decode(&b).ok()) {
+                        Some(Request::Verdict { request }) => like = Some(request),
+                        _ => return usage("--like takes the \"request\" a verdict printed"),
+                    },
                     "--facts-hash" => match hash(val) {
                         Some(h) => facts = Some(h),
                         None => return usage("--facts-hash is 64 hex digits"),
@@ -188,6 +197,7 @@ fn main() -> ExitCode {
                 decision,
                 authority: Authority { actor, reason },
                 facts,
+                like,
             }
         }
         "resend" if rest.len() == 1 => {
@@ -204,11 +214,6 @@ fn main() -> ExitCode {
             print(json!({"error": format!("{}: {e}", config.decider.socket.display())}));
             return ExitCode::from(1);
         }
-    };
-    let call = |c: &mut DeciderClient, r: &Request| match c.call(r) {
-        Ok(Reply::Error { message }) => Err(message),
-        Ok(r) => Ok(r),
-        Err(e) => Err(e.to_string()),
     };
     let request = match ask {
         Ask::Pending => {
@@ -234,42 +239,24 @@ fn main() -> ExitCode {
             decision,
             authority,
             facts,
+            like,
         } => {
-            let items = match call(&mut c, &Request::Pending) {
-                Ok(Reply::Pending { items }) => items,
-                Ok(other) => {
-                    print(json!({"error": format!("unexpected reply {other:?}")}));
-                    return ExitCode::from(1);
+            let mut r = match like {
+                Some(l) if l.candidate_id == cid && l.attempt_id == attempt => *l,
+                Some(_) => {
+                    return usage("--like names another Candidate or attempt");
                 }
-                Err(e) => {
-                    print(json!({"error": e}));
-                    return ExitCode::from(1);
-                }
+                None => match bound(&mut c, cid, attempt) {
+                    Ok(r) => r,
+                    Err(code) => return code,
+                },
             };
-            let Some(item) = items.iter().find(|i| i.candidate.candidate_id == cid) else {
-                print(json!({"error": format!("Candidate {cid} is not pending here")}));
-                return ExitCode::from(3);
-            };
-            let Some((_, f)) = item.attempts.iter().find(|(s, _)| s.attempt_id == attempt) else {
-                print(
-                    json!({"error": format!("attempt {attempt} of Candidate {cid} is not finished here")}),
-                );
-                return ExitCode::from(3);
-            };
-            let k = &item.candidate;
-            let mut r = VerdictRequest {
-                request_id: HashVal::from_bytes([0; 32]),
-                candidate_id: cid,
-                facts_hash: facts.unwrap_or(k.facts_hash),
-                artifact_key: k.artifact_key,
-                requirement: k.requirement,
-                exclude: k.exclude.clone(),
-                attempt_id: attempt,
-                result_digest: f.result_digest,
-                decision,
-                authority,
-                policy_digest: None,
-            };
+            if let Some(f) = facts {
+                r.facts_hash = f;
+            }
+            r.decision = decision;
+            r.authority = authority;
+            r.policy_digest = None;
             r.request_id = request_id(
                 rustix::process::getuid().as_raw(),
                 OpKind::Verdict,
@@ -278,14 +265,73 @@ fn main() -> ExitCode {
             r
         }
     };
+    send_verdict(&mut c, &request)
+}
+
+/// A request bound to what `pending` shows of `cid` and `attempt`; its
+/// decision, authority and id are set by the caller.
+fn bound(
+    c: &mut DeciderClient,
+    cid: HashVal,
+    attempt: HashVal,
+) -> Result<VerdictRequest, ExitCode> {
+    let items = match call(c, &Request::Pending) {
+        Ok(Reply::Pending { items }) => items,
+        Ok(other) => {
+            print(json!({"error": format!("unexpected reply {other:?}")}));
+            return Err(ExitCode::from(1));
+        }
+        Err(e) => {
+            print(json!({"error": e}));
+            return Err(ExitCode::from(1));
+        }
+    };
+    let Some(item) = items.iter().find(|i| i.candidate.candidate_id == cid) else {
+        print(json!({"error": format!("Candidate {cid} is not pending here")}));
+        return Err(ExitCode::from(3));
+    };
+    let Some((_, f)) = item.attempts.iter().find(|(s, _)| s.attempt_id == attempt) else {
+        print(
+            json!({"error": format!("attempt {attempt} of Candidate {cid} is not finished here")}),
+        );
+        return Err(ExitCode::from(3));
+    };
+    let k = &item.candidate;
+    Ok(VerdictRequest {
+        request_id: HashVal::from_bytes([0; 32]),
+        candidate_id: cid,
+        facts_hash: k.facts_hash,
+        artifact_key: k.artifact_key,
+        requirement: k.requirement,
+        exclude: k.exclude.clone(),
+        attempt_id: attempt,
+        result_digest: f.result_digest,
+        decision: Decision::Hold,
+        authority: Authority {
+            actor: String::new(),
+            reason: String::new(),
+        },
+        policy_digest: None,
+    })
+}
+
+fn call(c: &mut DeciderClient, r: &Request) -> Result<Reply, String> {
+    match c.call(r) {
+        Ok(Reply::Error { message }) => Err(message),
+        Ok(r) => Ok(r),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn send_verdict(c: &mut DeciderClient, request: &VerdictRequest) -> ExitCode {
     match call(
-        &mut c,
+        c,
         &Request::Verdict {
             request: Box::new(request.clone()),
         },
     ) {
         Ok(Reply::Verdict { answer }) => {
-            print(answer_json(&answer, &request));
+            print(answer_json(&answer, request));
             ExitCode::SUCCESS
         }
         Ok(other) => {
@@ -293,7 +339,12 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
         Err(e) => {
-            print(json!({"error": e}));
+            // The request, to send again (`resend`): it may be recorded.
+            print(json!({
+                "error": e,
+                "request_id": request.request_id.to_string(),
+                "request": hex(&Request::Verdict { request: Box::new(request.clone()) }.encode()),
+            }));
             ExitCode::from(1)
         }
     }

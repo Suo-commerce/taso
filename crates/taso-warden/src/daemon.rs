@@ -3095,6 +3095,7 @@ impl Node {
         };
         let label = id_hex(id);
         let log = |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
+        log("opened here for the decider (D74)".into());
         if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
             return Err((format!("Vessel {label}: {e}"), job));
         }
