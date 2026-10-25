@@ -793,6 +793,33 @@ pub struct Config {
     /// "max_frame_bytes": <n>, "max_connections": <n>}`, each optional;
     /// by default `<run_dir>/decide/decide.sock`, 1 MiB, 8.
     pub decider: crate::decidesrv::DeciderConf,
+    /// Purge at TTL (§6.7, D81): `"purge": {"ttl_seconds": <n>,
+    /// "recheck_seconds": <n>}`; `None` (the default): never.
+    pub purge: Option<PurgeConf>,
+}
+
+/// The node's `"purge"` (§6.7, §11.1, D81).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PurgeConf {
+    /// `purge.ttl`: a Vessel not sanctioned is purged this long after its
+    /// TTL starts.
+    pub ttl: Duration,
+    /// `purge.recheck_interval` (default 1 h).
+    pub recheck: Duration,
+}
+
+fn purge_conf(v: Option<&Value>) -> Result<Option<PurgeConf>, ConfigError> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    only_keys(v, "purge", &["ttl_seconds", "recheck_seconds"])?;
+    let ttl = opt_positive(v, "ttl_seconds")?
+        .ok_or_else(|| bad("\"purge.ttl_seconds\" is needed (a positive integer)"))?;
+    let recheck = opt_positive(v, "recheck_seconds")?.unwrap_or(3600);
+    Ok(Some(PurgeConf {
+        ttl: Duration::from_secs(ttl),
+        recheck: Duration::from_secs(recheck),
+    }))
 }
 
 /// The node's `"decider"` ([`Config::decider`]).
@@ -1553,6 +1580,7 @@ impl Config {
                 .to_string(),
             run_dir: abs_path(&v, "run_dir")?,
             decider: decider_conf(v.get("decider"), &abs_path(&v, "run_dir")?)?,
+            purge: purge_conf(v.get("purge"))?,
             runtime,
             quiescence,
             source,
@@ -1716,6 +1744,13 @@ pub fn verdict_after_rebirth(r: &Reborn) -> Verdict {
 pub fn container_id(id: ChronicleId, warden: WardenId) -> String {
     let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     format!("taso-{hex}-w{}", warden.get())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn id_hex(id: ChronicleId) -> String {
@@ -2825,16 +2860,18 @@ impl Node {
             .chain(crate::attempt::FAILPOINTS.iter())
             .chain(crate::verdict::FAILPOINTS.iter())
             .chain(crate::finish::FAILPOINTS.iter())
+            .chain(crate::purge::FAILPOINTS.iter())
             .copied()
             .find(|p| *p == name)
             .ok_or_else(|| {
                 format!(
-                    "{name:?} is not a failpoint of a Template birth, a nomination, an attempt, a verdict or a sanction's finish ({}, {}, {}, {}, {})",
+                    "{name:?} is not a failpoint of a Template birth, a nomination, an attempt, a verdict, a sanction's finish or a purge ({}, {}, {}, {}, {}, {})",
                     BIRTH_FAILPOINTS.join(", "),
                     crate::nominate::FAILPOINTS.join(", "),
                     crate::attempt::FAILPOINTS.join(", "),
                     crate::verdict::FAILPOINTS.join(", "),
-                    crate::finish::FAILPOINTS.join(", ")
+                    crate::finish::FAILPOINTS.join(", "),
+                    crate::purge::FAILPOINTS.join(", ")
                 )
             })?;
         self.attempt_failpoint = std::sync::Arc::new(move |p| p == at);
@@ -3062,6 +3099,187 @@ impl Node {
                     id_hex(s.template_id)
                 )),
             }
+        }
+    }
+
+    fn purger(&self) -> crate::purge::Purger {
+        crate::purge::Purger {
+            coord: self.coord.clone(),
+            store: self.store.clone(),
+            prefix: self.config.prefix.clone(),
+            warden: self.config.warden,
+            failpoint: self.attempt_failpoint.clone(),
+        }
+    }
+
+    /// `purged at lsn L` if Vessel `id`'s purge is committed (§6.5): L is
+    /// its cutoff Seal's lsn.
+    fn purged_at(&self, id: ChronicleId) -> Result<Option<String>, DaemonError> {
+        Ok(
+            match self
+                .coord
+                .query_logical(taso_core::contract::logical_id(&LogicalKey::Purge(id)))
+                .map_err(DaemonError::Coord)?
+            {
+                Some((_, Submitted::Contract(ContractRecord::PurgeCommitted(p)))) => {
+                    Some(format!("purged at lsn {}", p.cutoff.seal.lsn.get()))
+                }
+                _ => None,
+            },
+        )
+    }
+
+    /// Where Vessel `id`'s TTL start is kept (D81).
+    fn ttl_file(&self, id: ChronicleId) -> PathBuf {
+        self.config.state_dir.join("ttl").join(id_hex(id))
+    }
+
+    /// When Vessel `id`'s TTL started (seconds since the Unix epoch): kept
+    /// once, the first time this Warden runs it or checks it (D81).
+    fn ttl_start(&self, id: ChronicleId) -> io::Result<u64> {
+        let f = self.ttl_file(id);
+        match std::fs::read_to_string(&f) {
+            Ok(t) => t
+                .trim()
+                .parse()
+                .map_err(|_| io::Error::other(format!("{}: not a number", f.display()))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let now = unix_now();
+                if let Some(d) = f.parent() {
+                    std::fs::create_dir_all(d)?;
+                }
+                let tmp = f.with_extension("tmp");
+                std::fs::write(&tmp, format!("{now}\n"))?;
+                std::fs::rename(&tmp, &f)?;
+                Ok(now)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One TTL pass (§6.7, D81): every Vessel held here, not sanctioned,
+    /// whose TTL has passed (or whose purge was deferred or committed
+    /// before: the expiry stands), not running, is opened here (the fence)
+    /// and purged.  What each did is logged.
+    pub fn ttl_pass(&self) {
+        let Some(conf) = self.config.purge else {
+            return;
+        };
+        let now = unix_now();
+        for id in self.local_vessels() {
+            let label = id_hex(id);
+            let log =
+                |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
+            if self.mine_here(id).is_err() {
+                continue;
+            }
+            // An ended purge's dataset, left by a stop before its local
+            // delete (D81): deleted without opening the Vessel.
+            if let Ok(Some(_)) = self.purger().ended(id) {
+                let ds = self.host().dataset_for(id);
+                match self.purger().delete_ended(&self.storage, id, &ds) {
+                    Ok(true) => log(format!("purge: ended; its dataset {ds} deleted now")),
+                    Ok(false) => {}
+                    Err(e) => log(format!("purge: ended; deleting its dataset: {e}")),
+                }
+                continue;
+            }
+            match self.ttl_due(id, now, conf.ttl) {
+                Ok(None) => continue,
+                Ok(Some(why)) => log(format!("purge: {why}")),
+                Err(e) => {
+                    log(format!("purge: not checked: {e}"));
+                    continue;
+                }
+            }
+            let _slot = match self.hold_for_decider(*id.as_bytes()) {
+                Ok(s) => s,
+                Err(Some(_)) => {
+                    log("purge: it is running: checked again after its run".into());
+                    continue;
+                }
+                Err(None) => continue,
+            };
+            let (mut vessel, _) = match self.host().open(id) {
+                Ok(v) => v,
+                Err(e) => {
+                    log(format!("purge: opening it: {e}"));
+                    continue;
+                }
+            };
+            if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
+                log(format!("purge: {e}"));
+                continue;
+            }
+            let packs = match self.packs(id) {
+                Ok(p) => p,
+                Err(e) => {
+                    log(format!("purge: {e}"));
+                    continue;
+                }
+            };
+            match self.purger().purge(&self.storage, &mut vessel, &packs) {
+                Ok(out) => log(format!("purge: {out:?}")),
+                Err(e) => log(format!("purge: stopped: {e}")),
+            }
+        }
+    }
+
+    /// Why Vessel `id` is to be purged now, or `None` (D81).
+    fn ttl_due(&self, id: ChronicleId, now: u64, ttl: Duration) -> Result<Option<String>, String> {
+        let view = self
+            .coord
+            .query_chronicle(id)
+            .map_err(|e| format!("coordinator: {e}"))?;
+        let accepted = |key: LogicalKey| -> Result<bool, String> {
+            Ok(self
+                .coord
+                .query_logical(taso_core::contract::logical_id(&key))
+                .map_err(|e| format!("coordinator: {e}"))?
+                .is_some())
+        };
+        if accepted(LogicalKey::PurgeEnd(id))? {
+            return Ok(None);
+        }
+        if view.is_some_and(|v| v.retired) {
+            return Ok(Some("committed before: finishing it".into()));
+        }
+        let frames = crate::chronicle::read_log(&self.host().dir_for(id))
+            .map_err(|e| format!("reading its log: {e}"))?;
+        let mut deferred = false;
+        for f in &frames {
+            if let Ok(taso_core::record::Payload::Contract(r)) =
+                taso_core::record::Payload::decode(&f.payload)
+            {
+                match *r {
+                    // A sanctioned Vessel is kept (D81).
+                    ContractRecord::SanctionCommitted(s)
+                        if accepted(LogicalKey::Sanction(s.candidate_id))? =>
+                    {
+                        return Ok(None)
+                    }
+                    ContractRecord::PurgeDeferred(d)
+                        if accepted(LogicalKey::PurgeDefer(id, d.checked_at))? =>
+                    {
+                        deferred = true
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if deferred {
+            return Ok(Some("deferred before: checking again".into()));
+        }
+        let start = self
+            .ttl_start(id)
+            .map_err(|e| format!("its TTL start: {e}"))?;
+        if now >= start.saturating_add(ttl.as_secs()) {
+            Ok(Some(format!(
+                "its TTL of {}s from {start} has passed",
+                ttl.as_secs()
+            )))
+        } else {
+            Ok(None)
         }
     }
 
@@ -3370,6 +3588,10 @@ impl Node {
     ) -> Result<(Vessel<StorageLayers>, Start, Verdict), DaemonError> {
         let host = self.host();
         let id = vc.id();
+        // A purged Vessel is never started again (§6.5).
+        if let Some(why) = self.purged_at(id)? {
+            return Err(DaemonError::Refused(why));
+        }
         // What was read is what may be claimed (fencing review F1): a
         // takeover claims the ownership the config names, which `decide`
         // has checked against the read; one stale by the time it acts is
@@ -3638,6 +3860,12 @@ impl Node {
         self.settle_attempts(vc, &mut vessel)?;
         // Sanctions committed and not completed are finished (§5.3 step 6).
         self.finish_sanctions(&mut vessel, &|m| self.log(vc, m));
+        // Its TTL starts at its first run here, if it has not (D81).
+        if self.config.purge.is_some() {
+            if let Err(e) = self.ttl_start(id) {
+                self.log(vc, format_args!("its TTL start: {e}"));
+            }
+        }
         // The entry's Candidate (§3.1), nominated at each start; the same
         // request answers from the log (D61).
         if let Some(c) = vc.candidate.as_deref() {
@@ -4401,6 +4629,36 @@ mod tests {
 
     /// P4 file 6c (D57, D58): the node's `"sanction"`, a Vessel's
     /// `"verifier"` and `"candidate"`, and what each needs.
+    #[test]
+    fn purge_entries() {
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            f(&mut v);
+            Config::parse(&v.to_string())
+        };
+        assert_eq!(with(&|_| {}).unwrap().purge, None, "never, by default");
+        let c = with(&|v| v["purge"] = serde_json::json!({"ttl_seconds": 30})).unwrap();
+        assert_eq!(
+            c.purge,
+            Some(PurgeConf {
+                ttl: Duration::from_secs(30),
+                recheck: Duration::from_secs(3600)
+            })
+        );
+        let c =
+            with(&|v| v["purge"] = serde_json::json!({"ttl_seconds": 30, "recheck_seconds": 2}))
+                .unwrap();
+        assert_eq!(c.purge.unwrap().recheck, Duration::from_secs(2));
+        for (bad, why) in [
+            (serde_json::json!({}), "is needed"),
+            (serde_json::json!({"ttl_seconds": 0}), "at least 1"),
+            (serde_json::json!({"ttl": 5}), "unknown key"),
+        ] {
+            let e = with(&|v| v["purge"] = bad.clone()).unwrap_err();
+            assert!(e.0.contains(why), "{e}");
+        }
+    }
+
     #[test]
     fn decider_entries() {
         let with = |f: &dyn Fn(&mut Value)| {

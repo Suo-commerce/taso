@@ -568,6 +568,23 @@ pub trait Coord: Send + Sync {
         let _ = chronicle;
         Err(no_log())
     }
+
+    /// `query { purge_projection }` (§6.3 step 2): the inventory the
+    /// coordinator would compute now.
+    fn purge_projection(&self, chronicle: ChronicleId) -> Result<Vec<InventoryItem>, CoordError> {
+        let _ = chronicle;
+        Err(no_log())
+    }
+
+    /// What keeps the Chronicle from being purged now (§6.3 step 2's
+    /// pre-check), as a `PurgeDeferred` reason; `None` if nothing does.
+    fn purge_blocker(
+        &self,
+        chronicle: ChronicleId,
+    ) -> Result<Option<taso_core::contract::DeferReason>, CoordError> {
+        let _ = chronicle;
+        Err(no_log())
+    }
 }
 
 /// The answer of a coordinator with no coordinator log.
@@ -1631,6 +1648,25 @@ impl Coord for Coordinator {
     /// The Chronicle's open obligations as the log derives them (§1.5).
     fn obligations(&self, chronicle: ChronicleId) -> Result<Vec<u64>, CoordError> {
         self.read_log(move |log| log.obligations(chronicle))
+    }
+
+    fn purge_projection(&self, chronicle: ChronicleId) -> Result<Vec<InventoryItem>, CoordError> {
+        let shared = self.shared.clone();
+        self.queued(
+            move |t| {
+                let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+                let log = loaded(&mut g, &shared, &t.journal)?;
+                Ok(log.purge_projection(chronicle, &*shared.config.store))
+            },
+            false,
+        )
+    }
+
+    fn purge_blocker(
+        &self,
+        chronicle: ChronicleId,
+    ) -> Result<Option<taso_core::contract::DeferReason>, CoordError> {
+        self.read_log(move |log| log.purge_blocker(chronicle))
     }
 }
 

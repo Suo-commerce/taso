@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
     hold_id, replacement_name, valid_template_name, BornFrom, Candidate, CloseKind, ContractRecord,
-    Decision, Inventory, InventoryItem, LogicalKey, StorageKind, VerificationFinished,
+    Decision, DeferReason, Inventory, InventoryItem, LogicalKey, StorageKind, VerificationFinished,
     VerificationStarted, RECORD_DOMAIN,
 };
 use crate::envelope::{ChronicleId, Epoch, HashVal, Lsn};
@@ -850,6 +850,51 @@ impl CoordLog {
     /// Whether `template` is registered (its `TemplateReady` accepted).
     pub fn is_template(&self, template: ChronicleId) -> bool {
         self.templates.contains_key(template.as_bytes())
+    }
+
+    /// What keeps `chronicle` from being purged now (§6.3 step 2, the
+    /// pre-check of the Purge row's predicate), as a `PurgeDeferred`
+    /// reason; `None` if nothing does.  In the predicate's order:
+    /// an open obligation, a liveness dependency (a fork on it; an open
+    /// sanction), an open attempt, a retention pin.  The inventory is
+    /// the caller's to build ([`CoordLog::purge_projection`]).
+    pub fn purge_blocker(&self, chronicle: ChronicleId) -> Option<DeferReason> {
+        let c = *chronicle.as_bytes();
+        let me = self.chrons.get(&c)?;
+        if !me.obligations.is_empty() {
+            return Some(DeferReason::OpenObligation);
+        }
+        let mut holders: Vec<C16> = Vec::new();
+        for (holder, on, kind) in &self.live {
+            if *on != c {
+                continue;
+            }
+            match kind {
+                Live::OpenSanction { candidate } => {
+                    return Some(DeferReason::OpenSanction {
+                        candidate_id: HashVal::from_bytes(*candidate),
+                    })
+                }
+                Live::Fork => holders.push(*holder),
+            }
+        }
+        if !holders.is_empty() {
+            holders.sort();
+            holders.dedup();
+            return Some(DeferReason::LivenessDependency {
+                holders: holders.into_iter().map(ChronicleId::from_bytes).collect(),
+                unknown: Vec::new(),
+            });
+        }
+        if self.attempts.values().any(|a| {
+            a.finished.is_none() && self.cands[a.started.candidate_id.as_bytes()].chronicle == c
+        }) {
+            return Some(DeferReason::OpenAttempt);
+        }
+        if me.pinned {
+            return Some(DeferReason::RetentionPin);
+        }
+        None
     }
 
     /// `query { purge_projection }` (§6.3 step 2): the inventory the

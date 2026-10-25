@@ -2987,4 +2987,172 @@ mod tests {
             )
             .is_err());
     }
+
+    // ── Purge (P4 file 11) ──────────────────────────────────────────
+
+    use crate::purge::{PurgeError, Purged, Purger};
+    use taso_core::contract::DeferReason;
+
+    fn purger(c: &Cluster) -> Purger {
+        Purger {
+            coord: c.coord.clone(),
+            store: c.store.clone(),
+            prefix: PREFIX.into(),
+            warden: WardenId::new(1),
+            failpoint: attempt::no_failpoints(),
+        }
+    }
+
+    fn fs_pack_names(packs: &Packs<SharedStore, Bytes>) -> (Vec<String>, Vec<String>) {
+        let names = packs.pack_names().unwrap();
+        let (fs, log): (Vec<String>, Vec<String>) = names
+            .into_iter()
+            .partition(|n| crate::pack::name_bounds(n).is_some_and(|(_, _, f)| f.is_some()));
+        (fs, log)
+    }
+
+    #[test]
+    fn a_vessel_is_purged_to_log_only_packs_and_its_dataset_is_gone() {
+        let c = Cluster::new();
+        let (h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let (fs_before, _) = fs_pack_names(&packs);
+        assert_eq!(fs_before.len(), 1, "one shipped Seal with an fs section");
+        assert!(h.pool.guid(v.dataset()).unwrap().is_some());
+        let p = purger(&c);
+        let out = p.purge(&h.pool, &mut v, &packs).unwrap();
+        let Purged::Complete { items, attestation } = out.clone() else {
+            panic!("{out:?}")
+        };
+        assert_eq!(items, 1);
+        let view = c.coord.query_chronicle(v.id()).unwrap().unwrap();
+        assert!(view.retired);
+        let (fs_after, _) = fs_pack_names(&packs);
+        assert!(fs_after.is_empty(), "{fs_after:?}");
+        let replacement = taso_core::contract::replacement_name(&fs_before[0]).unwrap();
+        assert!(packs.has_pack(&replacement).unwrap());
+        // The history still reads and verifies, without the section.
+        let anchor = c.coord.shipped(v.id()).unwrap();
+        assert!(packs.chain(Some(anchor)).is_err(), "the section is gone");
+        let purged: std::collections::BTreeSet<Lsn> = [v.last_seal().unwrap().lsn].into();
+        let chain = packs.chain_after_purge(Some(anchor), &purged).unwrap();
+        // The attestation is of the history before PurgeComplete.
+        let end = chain
+            .frames
+            .iter()
+            .position(|f| {
+                matches!(
+                    Payload::decode(&f.payload),
+                    Ok(Payload::Contract(r)) if matches!(*r, ContractRecord::PurgeComplete(_))
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            crate::pack::frames_digest(&chain.frames[..end]),
+            attestation
+        );
+        // Local state gone; the log stays.
+        assert_eq!(h.pool.guid(v.dataset()).unwrap(), None);
+        // Again: the same answer, nothing more recorded.
+        let tail = v.tail().lsn;
+        assert_eq!(p.purge(&h.pool, &mut v, &packs).unwrap(), out);
+        assert_eq!(v.tail().lsn, tail);
+    }
+
+    #[test]
+    fn what_keeps_a_vessel_is_recorded_as_a_deferral() {
+        let c = Cluster::new();
+        let (h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let p = purger(&c);
+        let at = attempts(&c);
+        // An open attempt.
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        assert_eq!(
+            p.purge(&h.pool, &mut v, &packs).unwrap(),
+            Purged::Deferred(DeferReason::OpenAttempt)
+        );
+        let f = at
+            .finish(&mut v, &packs, &st, VOutcome::Exit { code: 0 }, Vec::new())
+            .unwrap();
+        // A retention pin.
+        c.coord.set_retention_pin(v.id(), true).unwrap();
+        assert_eq!(
+            p.purge(&h.pool, &mut v, &packs).unwrap(),
+            Purged::Deferred(DeferReason::RetentionPin)
+        );
+        c.coord.set_retention_pin(v.id(), false).unwrap();
+        // A committed sanction not finished.
+        let r = request(&cand, &f, Decision::Sanction);
+        assert!(matches!(
+            verdicts(&c).handle(&mut v, &packs, &r, PEER).unwrap(),
+            VerdictAnswer::Committed { .. }
+        ));
+        assert_eq!(
+            p.purge(&h.pool, &mut v, &packs).unwrap(),
+            Purged::Deferred(DeferReason::OpenSanction {
+                candidate_id: cand.candidate_id
+            })
+        );
+        assert!(!c.coord.query_chronicle(v.id()).unwrap().unwrap().retired);
+        // Once its Template is ready, nothing keeps it (the daemon keeps a
+        // sanctioned Vessel by its own rule, D81).
+        let s = sanction_of(&c, cand.candidate_id).unwrap();
+        finisher(&c, 1).finish(&mut v, &packs, &s).unwrap();
+        assert!(matches!(
+            p.purge(&h.pool, &mut v, &packs).unwrap(),
+            Purged::Complete { .. }
+        ));
+        // The Template is untouched: its layer still builds on a node.
+        c.node(1, StorageKind::Zfs).ensure(s.template_id).unwrap();
+    }
+
+    #[test]
+    fn each_purge_failpoint_stops_and_a_rerun_completes_once() {
+        for point in crate::purge::FAILPOINTS {
+            let c = Cluster::new();
+            let (h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+            let mut p = purger(&c);
+            p.failpoint = Arc::new(move |q| q == point);
+            match p.purge(&h.pool, &mut v, &packs) {
+                Err(PurgeError::Failpoint(q)) => assert_eq!(q, point),
+                other => panic!("{point}: {other:?}"),
+            }
+            let p = purger(&c);
+            let out = p.purge(&h.pool, &mut v, &packs).unwrap();
+            assert!(
+                matches!(out, Purged::Complete { items: 1, .. }),
+                "{point}: {out:?}"
+            );
+            let (fs_after, _) = fs_pack_names(&packs);
+            assert!(fs_after.is_empty(), "{point}");
+            assert_eq!(h.pool.guid(v.dataset()).unwrap(), None, "{point}");
+        }
+    }
+
+    #[test]
+    fn an_item_lost_after_the_commit_is_recorded_and_the_purge_is_damaged() {
+        let c = Cluster::new();
+        let (h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let (fs, _) = fs_pack_names(&packs);
+        let mut p = purger(&c);
+        p.failpoint = Arc::new(|q| q == "purge.after_accept");
+        assert!(matches!(
+            p.purge(&h.pool, &mut v, &packs),
+            Err(PurgeError::Failpoint("purge.after_accept"))
+        ));
+        // The original is lost from the store before anything replaced it.
+        let key = format!("{PREFIX}/{}/pack/{}", hex(v.id().as_bytes()), fs[0]);
+        assert!(c.store.delete(&key).unwrap());
+        let out = purger(&c).purge(&h.pool, &mut v, &packs).unwrap();
+        assert_eq!(
+            out,
+            Purged::Damaged {
+                replaced: 0,
+                lost: 1
+            }
+        );
+        // Never fabricated: no replacement.
+        let r = taso_core::contract::replacement_name(&fs[0]).unwrap();
+        assert!(!packs.has_pack(&r).unwrap());
+        assert!(c.coord.query_chronicle(v.id()).unwrap().unwrap().retired);
+    }
 }

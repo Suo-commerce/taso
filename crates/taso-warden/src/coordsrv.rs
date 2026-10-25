@@ -54,6 +54,8 @@
 //!  17 query_logical     logical (32)
 //!  18 query_chronicle   chronicle (16)
 //!  19 obligations       chronicle (16)
+//!  20 purge_projection  chronicle (16)
+//!  21 purge_blocker     chronicle (16)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
@@ -73,7 +75,9 @@
 //! `announce` tag 0, or tag 1 · answer; `accept` and `cancel` an answer;
 //! `query_submission` a status; `query_logical` tag 0, or tag 1 · log
 //! position (8) · record; `query_chronicle` tag 0, or tag 1 · view;
-//! `obligations` count (8) · op ids (8 each).  `announce`, `accept` and
+//! `obligations` count (8) · op ids (8 each); `purge_projection` the
+//! inventory's bytes (P4 file 11); `purge_blocker` tag 0, or tag 1 · the
+//! reason's bytes.  `announce`, `accept` and
 //! `cancel` name the Warden, which must be the Chronicle's holder (its
 //! epoch is the holder's), so a peer map binds them like an append; the
 //! queries are open to any mapped peer.  `set_retention_pin` is an
@@ -179,6 +183,8 @@ const OP_QUERY_SUBMISSION: u8 = 16;
 const OP_QUERY_LOGICAL: u8 = 17;
 const OP_QUERY_CHRONICLE: u8 = 18;
 const OP_OBLIGATIONS: u8 = 19;
+const OP_PURGE_PROJECTION: u8 = 20;
+const OP_PURGE_BLOCKER: u8 = 21;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -300,6 +306,12 @@ enum Request {
         chronicle: ChronicleId,
     },
     Obligations {
+        chronicle: ChronicleId,
+    },
+    PurgeProjection {
+        chronicle: ChronicleId,
+    },
+    PurgeBlocker {
         chronicle: ChronicleId,
     },
 }
@@ -616,6 +628,10 @@ impl Request {
                 o.u8(OP_QUERY_CHRONICLE).bytes(chronicle.as_bytes())
             }
             Self::Obligations { chronicle } => o.u8(OP_OBLIGATIONS).bytes(chronicle.as_bytes()),
+            Self::PurgeProjection { chronicle } => {
+                o.u8(OP_PURGE_PROJECTION).bytes(chronicle.as_bytes())
+            }
+            Self::PurgeBlocker { chronicle } => o.u8(OP_PURGE_BLOCKER).bytes(chronicle.as_bytes()),
         };
         o.0
     }
@@ -737,6 +753,12 @@ impl Request {
             OP_OBLIGATIONS => Self::Obligations {
                 chronicle: i.chronicle()?,
             },
+            OP_PURGE_PROJECTION => Self::PurgeProjection {
+                chronicle: i.chronicle()?,
+            },
+            OP_PURGE_BLOCKER => Self::PurgeBlocker {
+                chronicle: i.chronicle()?,
+            },
             _ => return Err(Malformed("unknown operation")),
         };
         i.end()?;
@@ -766,7 +788,9 @@ impl Request {
             | Self::QuerySubmission { .. }
             | Self::QueryLogical { .. }
             | Self::QueryChronicle { .. }
-            | Self::Obligations { .. } => None,
+            | Self::Obligations { .. }
+            | Self::PurgeProjection { .. }
+            | Self::PurgeBlocker { .. } => None,
         }
     }
 
@@ -789,7 +813,9 @@ impl Request {
             | Self::QuerySubmission { .. }
             | Self::QueryLogical { .. }
             | Self::QueryChronicle { .. }
-            | Self::Obligations { .. } => OkKind::Blob,
+            | Self::Obligations { .. }
+            | Self::PurgeProjection { .. }
+            | Self::PurgeBlocker { .. } => OkKind::Blob,
         }
     }
 }
@@ -1137,6 +1163,30 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
             c.u64(ops.len() as u64);
             for op in ops {
                 c.u64(op);
+            }
+            Reply::Blob(c.into_bytes())
+        }),
+        Request::PurgeProjection { chronicle } => {
+            coord.purge_projection(chronicle).and_then(|items| {
+                let inv = taso_core::contract::Inventory::new(items).map_err(|e| {
+                    CoordError::Unavailable(io::Error::other(format!(
+                        "the purge projection is not an inventory: {e:?}"
+                    )))
+                })?;
+                let mut c = Canon::new();
+                c.bytes(&inv.bytes());
+                Ok(Reply::Blob(c.into_bytes()))
+            })
+        }
+        Request::PurgeBlocker { chronicle } => coord.purge_blocker(chronicle).map(|b| {
+            let mut c = Canon::new();
+            match b {
+                None => {
+                    c.tag(0);
+                }
+                Some(r) => {
+                    c.tag(1).bytes(&r.bytes());
+                }
             }
             Reply::Blob(c.into_bytes())
         }),
@@ -1786,6 +1836,36 @@ impl Coord for RemoteCoord {
         blob_reply(r, |r| {
             let n = r.count()?;
             (0..n).map(|_| r.u64()).collect()
+        })
+    }
+
+    fn purge_projection(
+        &self,
+        chronicle: ChronicleId,
+    ) -> Result<Vec<taso_core::contract::InventoryItem>, CoordError> {
+        let r = self.call(Request::PurgeProjection { chronicle })?;
+        blob_reply(r, |r| {
+            let b = r.bytes()?;
+            taso_core::contract::Inventory::decode(&b)
+                .map(|i| i.items().to_vec())
+                .map_err(|_| JournalError("bad inventory"))
+        })
+    }
+
+    fn purge_blocker(
+        &self,
+        chronicle: ChronicleId,
+    ) -> Result<Option<taso_core::contract::DeferReason>, CoordError> {
+        let r = self.call(Request::PurgeBlocker { chronicle })?;
+        blob_reply(r, |r| match r.u8()? {
+            0 => Ok(None),
+            1 => {
+                let b = r.bytes()?;
+                taso_core::contract::DeferReason::decode(&b)
+                    .map(Some)
+                    .map_err(|_| JournalError("bad defer reason"))
+            }
+            _ => Err(JournalError("bad option tag")),
         })
     }
 }
@@ -2461,6 +2541,18 @@ mod tests {
         assert_eq!(view, coord.query_chronicle(t0).unwrap(), "the same view");
         assert_eq!(view.unwrap().holds.len(), 2);
         assert_eq!(c.obligations(t0).unwrap(), Vec::<u64>::new());
+        // The purge queries (P4 file 11).
+        assert_eq!(c.purge_blocker(t0).unwrap(), None);
+        coord.set_retention_pin(t0, true).unwrap();
+        assert_eq!(
+            c.purge_blocker(t0).unwrap(),
+            Some(taso_core::contract::DeferReason::RetentionPin)
+        );
+        coord.set_retention_pin(t0, false).unwrap();
+        assert_eq!(
+            c.purge_projection(t0).unwrap(),
+            coord.purge_projection(t0).unwrap()
+        );
         let late = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 2);
         assert_eq!(
             c.cancel(A, t0, Epoch::FIRST, late).unwrap(),

@@ -17,7 +17,7 @@
 //!               { …, "kind": "seal", "turn": 6,
 //!                 "verdict": "unverified", "reason": "reborn: …" } ],
 //!   "coordlog": { "accepted": 1, "holds": ["content:…", "pack:…"],
-//!                 "birth": "accepted" } }
+//!                 "retired": false, "birth": "accepted" } }
 //! ```
 //!
 //! A Lineage frame names its `origin` (`void`, `fork`, `succession`,
@@ -25,7 +25,8 @@
 //! `asked`); an `fs_shipped` frame its `base` (`full`, `seal`, `origin`
 //! with `base_chronicle`, `base_seal`, `base_hash`).  `coordlog` is the
 //! coordinator log's view of the Chronicle (`null` if it does not know
-//! it): how many of its records are accepted, the objects it holds, and
+//! it): how many of its records are accepted, the objects it holds,
+//! whether its purge is committed (`retired`, P4 file 11), and
 //! for a Lineage at lsn 1 whether its `Birth` is accepted (`accepted`,
 //! `none`, or `other` for another record under its logical id; absent
 //! for a Chronicle without a Lineage).  P4 file 5h.
@@ -87,7 +88,11 @@ fn run(sock: &str, state_dir: &Path, id_hex: &str) -> Result<Value, String> {
                     ObjectId::Pack(_, name) => format!("pack:{name}"),
                 })
                 .collect();
-            let mut v = json!({ "accepted": view.accepted.len(), "holds": holds });
+            let mut v = json!({
+                "accepted": view.accepted.len(),
+                "holds": holds,
+                "retired": view.retired,
+            });
             if let Some(l) = &lineage {
                 let birth = Submitted::Birth {
                     chronicle: id,

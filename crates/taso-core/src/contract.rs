@@ -650,6 +650,23 @@ pub enum DeferReason {
     CoordinatorUnavailable,
 }
 
+impl DeferReason {
+    /// Its canonical bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        let mut c = Canon::new();
+        self.canon(&mut c);
+        c.into_bytes()
+    }
+
+    /// Strict decoding: the bytes must be exactly one reason.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let v = r.defer_reason()?;
+        r.finish()?;
+        Ok(v)
+    }
+}
+
 impl Canonical for DeferReason {
     fn canon(&self, out: &mut Canon) {
         match self {

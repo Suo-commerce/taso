@@ -28,6 +28,13 @@
 //! `stopped at failpoint <name>` and a run without it finishes the birth.
 //! Any other name refuses to start.
 //!
+//! # Purge at TTL
+//!
+//! With `"purge": {"ttl_seconds": …}`, a thread checks every
+//! `recheck_seconds` (default 3600) and purges each Vessel held here that
+//! is not sanctioned, not running and past its TTL
+//! ([`taso_warden::daemon::Node::ttl_pass`], P4 §6.7).
+//!
 //! # The decider socket
 //!
 //! `decider.socket` (default `<run_dir>/decide/decide.sock`) takes
@@ -201,6 +208,28 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Purge at TTL (P4 §6.7, D81): a pass at start, then every
+    // `purge.recheck_seconds`.
+    let ttl_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ttl = node.config.purge.map(|conf| {
+        let (node, stop) = (node.clone(), ttl_stop.clone());
+        eprintln!(
+            "taso-wardend[{}]: purge at TTL {}s, checked every {}s",
+            warden.get(),
+            conf.ttl.as_secs(),
+            conf.recheck.as_secs()
+        );
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                node.ttl_pass();
+                let t = std::time::Instant::now();
+                while t.elapsed() < conf.recheck && !stop.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        })
+    });
 
     // Seeded with what the pool holds: a uid slot whose range owns a
     // Vessel's files stays that Vessel's across restarts of the Warden.
@@ -245,6 +274,10 @@ fn main() -> ExitCode {
     };
 
     decider.stop();
+    if let Some(t) = ttl {
+        ttl_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = t.join();
+    }
 
     if timing {
         let spans = taso_warden::timing::take();
