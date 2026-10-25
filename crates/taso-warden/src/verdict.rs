@@ -401,7 +401,7 @@ impl Verdicts {
 
     /// Append `rec` to the Vessel's log and have it accepted: the record
     /// accepted for its logical id (this one or another's).
-    fn record<L: Layers, X: Sender>(
+    pub(crate) fn record<L: Layers, X: Sender>(
         &self,
         vessel: &mut Vessel<L>,
         packs: &Packs<SharedStore, X>,
@@ -444,7 +444,7 @@ impl Verdicts {
 
 /// What [`Verdicts::record`] learnt (short-lived, matched at once).
 #[allow(clippy::large_enum_variant)]
-enum Recorded {
+pub(crate) enum Recorded {
     Accepted(ContractRecord),
     Unknown(String),
 }

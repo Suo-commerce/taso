@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # p4-decide.sh: verdicts through the decider socket, under taso-wardend
-# (P4 file 8d; spec rev. 21 §5.1-5.3 steps 1-4, D72-D77).
+# (P4 files 8d and 9b; spec rev. 23 §5.1-5.3, D72-D79).
 #
 #   scripts/p4-decide.sh zfs     (as root, from the repository root; not
 #                                 through sudo, which drops cargo from PATH)
@@ -13,7 +13,7 @@
 #
 # One machine, node 1 (Warden 1), one coordinator and store.  V, the
 # verifier Template, is made by taso-genesis as in p4-verify.sh.  First
-# six Vessels (p, f, h, s, c, k) each run two turns, nominate, and are
+# eight Vessels (p, f, h, s, c, k, x, y) each run two turns, nominate, and are
 # attempted (one daemon run each).  Then the daemon runs in the
 # background with k alone, as a long-running "keeper": the decider socket
 # is up, k's session takes the verdicts on k (between its agent's
@@ -23,9 +23,10 @@
 #
 # Cases (each prints its prediction before it runs, then PASS or FAIL):
 #   1  V from a directory                          taso-genesis, ready
-#   2  six Vessels attempted                       p h s c k pass, f exits 7
-#   3  pending                                     six Candidates, one attempt each
-#   4  sanction p (open here)                      Committed; again: the same
+#   2  eight Vessels attempted                     p h s c k x y pass, f exits 7
+#   3  pending                                     eight Candidates, one attempt each
+#   4  sanction p (open here)                      Committed, finished into its
+#                                                  Template; again: the same
 #   5  f: sanction, never, hold                    Refused AttemptNotPassed,
 #                                                  ClosedNever, Refused Closed
 #   6  h: hold, then sanction                      Held, Committed
@@ -34,8 +35,11 @@
 #                                                  k keeps sealing turns
 #   9  verdict.after_submitted (s), verdict.in_check (c): stop; the same
 #      request sent again to a daemon without the failpoint commits
-#  10  the coordinator log                         the records each Vessel's
-#                                                  verdicts accepted
+#  11  sanction.after_commit_accept (x), sanction.before_ready_accept (y):
+#      committed, not finished; the next open finishes each once
+#  12  a Vessel born from p's Template             Born from Template, exit 0
+#  10  the coordinator log (last)                  the records each Vessel's
+#                                                  verdicts and finishes accepted
 #
 # Touches, and nothing else:
 #   /var/lib/taso-p4d/<mode>                 (removed at start, kept after)
@@ -437,9 +441,9 @@ expect "V ready" bash -c "[[ '$V' =~ ^[0-9a-f]{32}$ ]]"
 
 # ── 2. Six Vessels attempted ────────────────────────────────────────
 
-say "2. p h s c k: a verifier that passes, f: one that exits 7 (predict: each run exit 0; each one attempt finished as said)"
-declare -A ID SLOT=([p]=1 [f]=2 [h]=3 [s]=4 [c]=5 [k]=6)
-for v in p f h s c k; do
+say "2. p h s c k x y: a verifier that passes, f: one that exits 7 (predict: each run exit 0; each one attempt finished as said)"
+declare -A ID SLOT=([p]=1 [f]=2 [h]=3 [s]=4 [c]=5 [k]=6 [x]=10 [y]=11)
+for v in p f h s c k x y; do
     if [[ $v == f ]]; then vconf "$v" 'exit 7'; else vconf "$v" 'exit 0'; fi
     config 1 "$W/$v.json" "$(vessel "$v" "${SLOT[$v]}" "$(sim "$TURNS" Scratch)")"
     wardend "2-$v" 1 "$W/$v.json"
@@ -527,6 +531,10 @@ verdict() {
     decide "$case" verdict "${CAND[$v]}" "${ATT[$v]}" "$d" --actor p4d --reason "file 8d" "$@"
 }
 
+# finished_sanction CASE ID TID: how often the daemon logged Vessel ID's
+# sanction finished into Template TID (file 9).
+finished_sanction() { count "$1.err" "\] $2: sanction of Candidate [0-9a-f]*: Template $3 ready, sanction completed$"; }
+
 # opened CASE ID: how often the daemon opened Vessel ID for the decider.
 opened() { count "$1.err" "\] $2: opened here for the decider (D74)$"; }
 
@@ -536,19 +544,19 @@ expect "decider socket" test -S "$DSOCK"
 
 # ── 3. Pending ──────────────────────────────────────────────────────
 
-say "3. pending (predict: six Candidates, one finished attempt each)"
+say "3. pending (predict: eight Candidates, one finished attempt each)"
 decide 3-pending pending
 expect "taso-decide exit 0" is "$DRC" 0
 declare -A CAND ATT
-for v in p f h s c k; do
+for v in p f h s c k x y; do
     expect "$v: one attempt" is "$(pending_of 3-pending "${ID[$v]}" | wc -l)" 1
     read -r CAND[$v] ATT[$v] < <(pending_of 3-pending "${ID[$v]}") || true
 done
-expect "six items" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/3-pending.json")" 6
+expect "eight items" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/3-pending.json")" 8
 
 # ── 4. p: sanction ──────────────────────────────────────────────────
 
-say "4. sanction p, not running (predict: Committed with a template_id; sent again: the same; opened here once per verdict, twice; p no longer pending)"
+say "4. sanction p, not running (predict: Committed with a template_id; sent again: the same; opened here once per verdict, twice; the sanction finished into that Template once (file 9); p no longer pending)"
 verdict 4-p p sanction
 expect "Committed" is "$(jf 4-p answer)" Committed
 TID=$(jf 4-p template_id)
@@ -557,6 +565,7 @@ decide 4-p-again resend "$(jf 4-p request)"
 expect "again: Committed" is "$(jf 4-p-again answer)" Committed
 expect "again: the same template_id" is "$(jf 4-p-again template_id)" "$TID"
 expect "opened here twice (once per verdict)" is "$(opened 3-daemon "${ID[p]}")" 2
+expect "finished into its Template once" is "$(finished_sanction 3-daemon "${ID[p]}" "$TID")" 1
 decide 4-pending pending
 expect "p no longer pending" is "$(pending_of 4-pending "${ID[p]}" | wc -l)" 0
 
@@ -579,13 +588,14 @@ expect "f no longer pending" is "$(pending_of 5-pending "${ID[f]}" | wc -l)" 0
 
 # ── 6. h: hold, then sanction ───────────────────────────────────────
 
-say "6. h (predict: hold Held, still pending; sanction Committed)"
+say "6. h (predict: hold Held, still pending; sanction Committed, finished into its Template)"
 verdict 6-h-h h hold
 expect "Held" is "$(jf 6-h-h answer)" Held
 decide 6-pending pending
 expect "still pending" is "$(pending_of 6-pending "${ID[h]}" | wc -l)" 1
 verdict 6-h-s h sanction
 expect "Committed" is "$(jf 6-h-s answer)" Committed
+expect "finished into its Template" is "$(finished_sanction 3-daemon "${ID[h]}" "$(jf 6-h-s template_id)")" 1
 
 # ── 7. s: stale facts ───────────────────────────────────────────────
 
@@ -597,9 +607,10 @@ expect "still pending" is "$(pending_of 7-pending "${ID[s]}" | wc -l)" 1
 
 # ── 8. k: on its running session ────────────────────────────────────
 
-say "8. sanction k while its agent runs (predict: Committed; k not opened here; its session logged the verdict; k seals another turn)"
+say "8. sanction k while its agent runs (predict: Committed; finished into its Template on its session; k not opened here; its session logged the verdict; k seals another turn)"
 verdict 8-k k sanction
 expect "Committed" is "$(jf 8-k answer)" Committed
+expect "finished on its session" is "$(finished_sanction 3-daemon "${ID[k]}" "$(jf 8-k template_id)")" 1
 expect "k not opened here" is "$(opened 3-daemon "${ID[k]}")" 0
 expect "the verdict logged for k" is "$(count 3-daemon.err "\] ${ID[k]}: verdict [0-9a-f]* on Candidate ${CAND[k]} from uid 0 pid [0-9]*: Committed")" 1
 expect "k seals a turn after its sanction" sealed_after "${ID[k]}" "$(last_seal 1 "${ID[k]}")"
@@ -630,14 +641,89 @@ expect "s: Committed" is "$(jf 9c-s answer)" Committed
 decide 9c-c resend "$REQ_C"
 expect "c: Committed" is "$(jf 9c-c answer)" Committed
 decide 9c-pending pending
-expect "nothing pending" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/9c-pending.json")" 0
+expect "s and c finished" is "$(( $(finished_sanction 9c-daemon "${ID[s]}" "$(jf 9c-s template_id)") + $(finished_sanction 9c-daemon "${ID[c]}" "$(jf 9c-c template_id)") ))" 2
+expect "only x and y pending" is "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["pending"]))' "$W/out/9c-pending.json")" 2
 stop_daemon
+
+# ── 11. A sanction's finish stopped (file 9) ────────────────────────
+
+say "11a. sanction.after_commit_accept on x (predict: Committed; the finish not run; the sanction stays committed)"
+daemon 11a-daemon "$W/keep-q.json" q TASO_FAILPOINT=sanction.after_commit_accept
+verdict 11a-x x sanction
+expect "Committed" is "$(jf 11a-x answer)" Committed
+TX=$(jf 11a-x template_id)
+expect "stopped after the commit" is "$(count 11a-daemon.err "\] ${ID[x]}: stopped at failpoint sanction.after_commit_accept")" 1
+expect "not finished" is "$(finished_sanction 11a-daemon "${ID[x]}" "$TX")" 0
+stop_daemon
+
+say "11b. sanction.before_ready_accept on y (predict: Committed; the finish stopped before TemplateReady is accepted)"
+daemon 11b-daemon "$W/keep-q.json" q TASO_FAILPOINT=sanction.before_ready_accept
+verdict 11b-y y sanction
+expect "Committed" is "$(jf 11b-y answer)" Committed
+TY=$(jf 11b-y template_id)
+expect "not finished at the failpoint" is "$(count 11b-daemon.err "\] ${ID[y]}: sanction of Candidate [0-9a-f]*: Template $TY not finished: .*stopped at failpoint sanction.before_ready_accept")" 1
+stop_daemon
+
+say "11c. the same requests again, no failpoint (predict: Committed each, the same template_ids; both finished when opened (the restart rule), once each)"
+daemon 11c-daemon "$W/keep-q.json" q
+decide 11c-x resend "$(jf 11a-x request)"
+expect "x: Committed, the same Template" is "$(jf 11c-x answer) $(jf 11c-x template_id)" "Committed $TX"
+decide 11c-y resend "$(jf 11b-y request)"
+expect "y: Committed, the same Template" is "$(jf 11c-y answer) $(jf 11c-y template_id)" "Committed $TY"
+expect "x finished" is "$(finished_sanction 11c-daemon "${ID[x]}" "$TX")" 1
+expect "y finished" is "$(finished_sanction 11c-daemon "${ID[y]}" "$TY")" 1
+stop_daemon
+
+# ── 12. A Vessel born from a sanctioned Template ────────────────────
+
+say "12. b, born from p's Template (predict: exit 0; 'Born from Template' p's; its turns sealed)"
+config 1 "$W/b.json" "$(printf '{"subject": "b", "uid_slot": 12, "template": "%s", %s}' "$TID" "$(sim 1)")"
+wardend 12-b 1 "$W/b.json"
+expect "exit 0" is "$RC" 0
+expect "born from p's Template" is "$(count 12-b.err "\] b: Born from Template $TID")" 1
+
+# ── 11. A sanction's finish stopped (file 9) ────────────────────────
+
+say "11a. sanction.after_commit_accept on x (predict: Committed; the finish not run; the sanction stays committed)"
+daemon 11a-daemon "$W/keep-q.json" q TASO_FAILPOINT=sanction.after_commit_accept
+verdict 11a-x x sanction
+expect "Committed" is "$(jf 11a-x answer)" Committed
+TX=$(jf 11a-x template_id)
+expect "stopped after the commit" is "$(count 11a-daemon.err "\] ${ID[x]}: stopped at failpoint sanction.after_commit_accept")" 1
+expect "not finished" is "$(finished_sanction 11a-daemon "${ID[x]}" "$TX")" 0
+stop_daemon
+
+say "11b. sanction.before_ready_accept on y (predict: Committed; the finish stopped before TemplateReady is accepted)"
+daemon 11b-daemon "$W/keep-q.json" q TASO_FAILPOINT=sanction.before_ready_accept
+verdict 11b-y y sanction
+expect "Committed" is "$(jf 11b-y answer)" Committed
+TY=$(jf 11b-y template_id)
+expect "not finished at the failpoint" is "$(count 11b-daemon.err "\] ${ID[y]}: sanction of Candidate [0-9a-f]*: Template $TY not finished: .*stopped at failpoint sanction.before_ready_accept")" 1
+stop_daemon
+
+say "11c. the same requests again, no failpoint (predict: Committed each, the same template_ids; both finished when opened (the restart rule), once each)"
+daemon 11c-daemon "$W/keep-q.json" q
+decide 11c-x resend "$(jf 11a-x request)"
+expect "x: Committed, the same Template" is "$(jf 11c-x answer) $(jf 11c-x template_id)" "Committed $TX"
+decide 11c-y resend "$(jf 11b-y request)"
+expect "y: Committed, the same Template" is "$(jf 11c-y answer) $(jf 11c-y template_id)" "Committed $TY"
+expect "x finished" is "$(finished_sanction 11c-daemon "${ID[x]}" "$TX")" 1
+expect "y finished" is "$(finished_sanction 11c-daemon "${ID[y]}" "$TY")" 1
+stop_daemon
+
+# ── 12. A Vessel born from a sanctioned Template ────────────────────
+
+say "12. b, born from p's Template (predict: exit 0; 'Born from Template' p's; its turns sealed)"
+config 1 "$W/b.json" "$(printf '{"subject": "b", "uid_slot": 12, "template": "%s", %s}' "$TID" "$(sim 1)")"
+wardend 12-b 1 "$W/b.json"
+expect "exit 0" is "$RC" 0
+expect "born from p's Template" is "$(count 12-b.err "\] b: Born from Template $TID")" 1
 
 # ── 10. The coordinator log ─────────────────────────────────────────
 
-say "10. accepted records per Vessel (predict: p 5, f 7, h 6, s 6, c 5, k 5)"
-declare -A WANT=([p]=5 [f]=7 [h]=6 [s]=6 [c]=5 [k]=5)
-for v in p f h s c k; do
+say "10. accepted records per Vessel (predict: p 6, f 7, h 7, s 7, c 6, k 6, x 6, y 6: each sanction's SanctionCompleted included)"
+declare -A WANT=([p]=6 [f]=7 [h]=7 [s]=7 [c]=6 [k]=6 [x]=6 [y]=6)
+for v in p f h s c k x y; do
     expect "$v: ${WANT[$v]} accepted" is "$(coordlog_of 1 "${ID[$v]}" | cut -d' ' -f1)" "${WANT[$v]}"
 done
 

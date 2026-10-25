@@ -2824,15 +2824,17 @@ impl Node {
             .chain(crate::nominate::FAILPOINTS.iter())
             .chain(crate::attempt::FAILPOINTS.iter())
             .chain(crate::verdict::FAILPOINTS.iter())
+            .chain(crate::finish::FAILPOINTS.iter())
             .copied()
             .find(|p| *p == name)
             .ok_or_else(|| {
                 format!(
-                    "{name:?} is not a failpoint of a Template birth, a nomination, an attempt or a verdict ({}, {}, {}, {})",
+                    "{name:?} is not a failpoint of a Template birth, a nomination, an attempt, a verdict or a sanction's finish ({}, {}, {}, {}, {})",
                     BIRTH_FAILPOINTS.join(", "),
                     crate::nominate::FAILPOINTS.join(", "),
                     crate::attempt::FAILPOINTS.join(", "),
-                    crate::verdict::FAILPOINTS.join(", ")
+                    crate::verdict::FAILPOINTS.join(", "),
+                    crate::finish::FAILPOINTS.join(", ")
                 )
             })?;
         self.attempt_failpoint = std::sync::Arc::new(move |p| p == at);
@@ -3014,6 +3016,55 @@ impl Node {
         }
     }
 
+    fn finisher(&self) -> crate::finish::Finisher {
+        crate::finish::Finisher {
+            coord: self.coord.clone(),
+            store: self.store.clone(),
+            prefix: self.config.prefix.clone(),
+            warden: self.config.warden,
+            state_dir: self.config.state_dir.clone(),
+            claim_wait: crate::finish::CLAIM_WAIT,
+            failpoint: self.attempt_failpoint.clone(),
+        }
+    }
+
+    /// The restart rule (§5.3 step 6): finish every accepted commit of
+    /// `vessel` without its `SanctionCompleted`.  What does not finish
+    /// stays committed and is logged; the next open tries again.
+    fn finish_sanctions(&self, vessel: &mut Vessel<StorageLayers>, log: &dyn Fn(String)) {
+        let fin = self.finisher();
+        let commits = match fin.unfinished(vessel) {
+            Ok(c) => c,
+            Err(e) => return log(format!("reading its sanctions: {e}")),
+        };
+        if commits.is_empty() {
+            return;
+        }
+        let packs = match self.packs(vessel.id()) {
+            Ok(p) => p,
+            Err(e) => return log(format!("finishing its sanctions: {e}")),
+        };
+        for s in commits {
+            match fin.finish(vessel, &packs, &s) {
+                Ok(done) => {
+                    for n in &done.notes {
+                        log(format!("sanction of Candidate {}: {n}", s.candidate_id));
+                    }
+                    log(format!(
+                        "sanction of Candidate {}: Template {} ready, sanction completed",
+                        s.candidate_id,
+                        id_hex(s.template_id)
+                    ));
+                }
+                Err(e) => log(format!(
+                    "sanction of Candidate {}: Template {} not finished: {e}",
+                    s.candidate_id,
+                    id_hex(s.template_id)
+                )),
+            }
+        }
+    }
+
     fn verdicts(&self) -> crate::verdict::Verdicts {
         crate::verdict::Verdicts {
             coord: self.coord.clone(),
@@ -3059,7 +3110,21 @@ impl Node {
                         Err(e) => format!("failed: {e}"),
                     }
                 );
+                let committed = matches!(r, Ok(VerdictAnswer::Committed { .. }));
                 let _ = tx.send(r);
+                // Step 5, right after the commit (the answer is sent: the
+                // finish is the Warden's, and the restart rule's).
+                if committed {
+                    let label = id_hex(vessel.id());
+                    let log = |m: String| {
+                        eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get())
+                    };
+                    if (self.attempt_failpoint)("sanction.after_commit_accept") {
+                        log("stopped at failpoint sanction.after_commit_accept: the sanction stays committed".into());
+                    } else {
+                        self.finish_sanctions(vessel, &log);
+                    }
+                }
             }
         }
     }
@@ -3099,6 +3164,7 @@ impl Node {
         if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
             return Err((format!("Vessel {label}: {e}"), job));
         }
+        self.finish_sanctions(&mut vessel, &log);
         self.do_job(&mut vessel, job);
         Ok(())
     }
@@ -3570,6 +3636,8 @@ impl Node {
         }
         // Open attempts closed, leftovers destroyed (D69, D66).
         self.settle_attempts(vc, &mut vessel)?;
+        // Sanctions committed and not completed are finished (§5.3 step 6).
+        self.finish_sanctions(&mut vessel, &|m| self.log(vc, m));
         // The entry's Candidate (§3.1), nominated at each start; the same
         // request answers from the log (D61).
         if let Some(c) = vc.candidate.as_deref() {

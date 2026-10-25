@@ -2162,6 +2162,14 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
+        // Whole-second times: the test pool's tar streams keep no more.
+        let st = Command::new("sh")
+            .arg("-c")
+            .arg("find \"$0\" -mindepth 1 ! -type d -exec touch -h -d @1700000000 {} + && find \"$0\" -depth -type d -exec touch -d @1600000000 {} +")
+            .arg(&tree)
+            .status()
+            .unwrap();
+        assert!(st.success());
         let mut conf = SanctionConf::new(MAP.as_bytes().to_vec()).unwrap();
         conf.min_interval = Duration::ZERO;
         let n = Nominator::new(
@@ -2735,5 +2743,197 @@ mod tests {
                 VerdictAnswer::Committed { .. }
             ));
         }
+    }
+
+    // ── Finishing a sanction (P4 file 9a) ───────────────────────────
+
+    use crate::finish::{FinishError, Finisher};
+    use taso_core::contract::BornFrom;
+
+    fn finisher(c: &Cluster, warden: u64) -> Finisher {
+        Finisher {
+            coord: c.coord.clone(),
+            store: c.store.clone(),
+            prefix: PREFIX.into(),
+            warden: WardenId::new(warden),
+            state_dir: c.dir.path().join(format!("fstate{warden}")),
+            claim_wait: Duration::ZERO,
+            failpoint: attempt::no_failpoints(),
+        }
+    }
+
+    /// A Vessel whose Candidate is committed: (host, vessel, packs, commit).
+    fn committed(
+        c: &Cluster,
+        subject: &[u8],
+    ) -> (
+        Host<crate::vessel::tests::FakePool>,
+        FV,
+        Packs<SharedStore, Bytes>,
+        taso_core::contract::SanctionCommitted,
+    ) {
+        let (h, mut v, packs, cand) = nominated(c, subject, c.t0, VCONF);
+        let f = attempted(c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
+        let r = request(&cand, &f, Decision::Sanction);
+        let a = verdicts(c).handle(&mut v, &packs, &r, PEER).unwrap();
+        assert!(matches!(a, VerdictAnswer::Committed { .. }), "{a:?}");
+        let s = sanction_of(c, cand.candidate_id).unwrap();
+        (h, v, packs, s)
+    }
+
+    fn ready_of(c: &Cluster, t: ChronicleId) -> Option<TemplateReady> {
+        match c
+            .coord
+            .query_logical(logical_id(&LogicalKey::Template(t)))
+            .unwrap()
+        {
+            Some((_, Submitted::Contract(ContractRecord::TemplateReady(r)))) => Some(*r),
+            None => None,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn completed(c: &Cluster, t: ChronicleId) -> bool {
+        c.coord
+            .query_logical(logical_id(&LogicalKey::SanctionCompleted(t)))
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn a_commit_finishes_into_a_template_a_node_builds() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, s) = committed(&c, b"a");
+        let fin = finisher(&c, 1);
+        assert_eq!(fin.unfinished(&v).unwrap(), vec![s]);
+        let done = fin.finish(&mut v, &packs, &s).unwrap();
+        assert_eq!((done.template_id, done.notes.len()), (s.template_id, 0));
+        let t = ready_of(&c, s.template_id).unwrap();
+        assert_eq!(
+            t.born_from,
+            BornFrom::Sanction {
+                source: v.id(),
+                candidate_id: s.candidate_id,
+                verdict: s.verdict
+            }
+        );
+        assert_eq!(
+            (
+                t.layer,
+                t.output_manifest_key,
+                t.classmap_key,
+                t.vconf_key,
+                t.parent_template
+            ),
+            (
+                s.artifact_key,
+                s.output_manifest_key,
+                s.classmap_key,
+                Some(s.vconf_key),
+                None
+            )
+        );
+        assert_eq!(t.authority.actor, "jarmo", "the verdict's authority (D79)");
+        assert!(completed(&c, s.template_id));
+        assert!(fin.unfinished(&v).unwrap().is_empty());
+        // Again: nothing more recorded.
+        let tail = v.tail().lsn;
+        fin.finish(&mut v, &packs, &s).unwrap();
+        assert_eq!(v.tail().lsn, tail);
+        // The Template's holds keep its definition; a node builds its layer.
+        let node = c.node(1, StorageKind::Zfs);
+        let l = node.ensure(s.template_id).unwrap();
+        assert_eq!(l.template_id, s.template_id);
+        match c
+            .coord
+            .query_logical(logical_id(&LogicalKey::Layer(
+                s.template_id,
+                StorageKind::Zfs,
+            )))
+            .unwrap()
+        {
+            Some((_, Submitted::Contract(ContractRecord::LayerShipped(x)))) => {
+                assert_eq!((x.layer_key, x.guid), (l.layer_key, l.guid))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_finish_failpoint_stops_and_a_rerun_finishes_once() {
+        for point in &crate::finish::FAILPOINTS[1..] {
+            let c = Cluster::new();
+            let (_h, mut v, packs, s) = committed(&c, b"a");
+            let mut fin = finisher(&c, 1);
+            let p = *point;
+            fin.failpoint = Arc::new(move |q| q == p);
+            match fin.finish(&mut v, &packs, &s) {
+                Err(FinishError::Failpoint(q)) => assert_eq!(q, p),
+                other => panic!("{p}: {other:?}"),
+            }
+            let ready = ready_of(&c, s.template_id).is_some();
+            let want_ready = matches!(
+                p,
+                "sanction.after_ready_accept" | "sanction.before_completed_accept"
+            );
+            assert_eq!(ready, want_ready, "{p}");
+            assert!(!completed(&c, s.template_id), "{p}");
+            assert_eq!(fin.unfinished(&v).unwrap(), vec![s], "{p}");
+            let fin = finisher(&c, 1);
+            fin.finish(&mut v, &packs, &s).unwrap();
+            assert!(completed(&c, s.template_id), "{p}");
+            assert!(fin.unfinished(&v).unwrap().is_empty(), "{p}");
+        }
+    }
+
+    #[test]
+    fn a_target_claimed_by_a_lost_node_is_taken_over_with_the_commits_authority() {
+        let c = Cluster::new();
+        let (h, mut v1, packs, s) = committed(&c, b"a");
+        let mut f1 = finisher(&c, 1);
+        f1.failpoint = Arc::new(|q| q == "sanction.after_target_put");
+        assert!(matches!(
+            f1.finish(&mut v1, &packs, &s),
+            Err(FinishError::Failpoint("sanction.after_target_put"))
+        ));
+        // Node 1 is lost; node 2 takes the source over from what is
+        // shipped, and finds the commit unfinished (step 6).
+        let h2 = Host {
+            coord: c.coord.clone(),
+            pool: crate::vessel::tests::FakePool::default(),
+            root: h.root.clone(),
+            state_dir: c.dir.path().join("vstate-node2"),
+            warden: WardenId::new(2),
+        };
+        let (mut v2, _) = h2.rebirth(v1.id(), &packs).unwrap();
+        let f2 = finisher(&c, 2);
+        assert_eq!(f2.unfinished(&v2).unwrap(), vec![s]);
+        let done = f2.finish(&mut v2, &packs, &s).unwrap();
+        assert!(
+            done.notes
+                .iter()
+                .any(|n| n.contains("took Template") && n.contains("from Warden 1")),
+            "{:?}",
+            done.notes
+        );
+        assert!(ready_of(&c, s.template_id).is_some());
+        assert!(completed(&c, s.template_id));
+        let own = c.coord.ownership(s.template_id).unwrap();
+        assert_eq!(own.holder, WardenId::new(2));
+        // The lost node, back, finds it finished: nothing to do.
+        let f1 = finisher(&c, 1);
+        assert!(f1.unfinished(&v1).unwrap().is_empty());
+        // A takeover needs the commit's authority: another is refused.
+        assert!(c
+            .coord
+            .takeover_target(
+                s.template_id,
+                WardenId::new(3),
+                taso_core::coordlog::ClaimAuthority::Sanction {
+                    commit: HashVal::from_bytes([9; 32])
+                },
+                own.epoch
+            )
+            .is_err());
     }
 }
