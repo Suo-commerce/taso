@@ -11,9 +11,10 @@
 //! state is a function of the accepted records, so it can be rebuilt by
 //! replaying them.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 15, BLAKE3
-//! `0ba877a0a48af8e26a3bc0ae68ac3f6b542db701f8701239fffa7b787a5e9912`
-//! (the TemplateName row, D49, from file 5a).
+//! Normative reference: `Taso_spec_p4_contracts` rev. 16, BLAKE3
+//! `1c46c846b3c3ff38f1b7b44513e30f0d7f5fdc1225bd3d133e8985fa402f01d4`
+//! (the TemplateName row, D49, from file 5a; the Layer row and the Birth
+//! row for a Template origin, D52 and D54, from file 5d).
 //!
 //! # What the coordinator knows about packs
 //!
@@ -28,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
     hold_id, replacement_name, valid_template_name, BornFrom, Candidate, CloseKind, ContractRecord,
-    Decision, Inventory, InventoryItem, LogicalKey, VerificationFinished, VerificationStarted,
-    RECORD_DOMAIN,
+    Decision, Inventory, InventoryItem, LogicalKey, StorageKind, VerificationFinished,
+    VerificationStarted, RECORD_DOMAIN,
 };
 use crate::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use crate::record::{LineageRecord, Origin, Payload};
@@ -905,8 +906,18 @@ impl CoordLog {
                 lineage,
             } => {
                 need(*b == chronicle, "not this Chronicle's record")?;
+                if let Origin::Template {
+                    template_id,
+                    layer_key,
+                    asked,
+                } = &lineage.origin
+                {
+                    return self.template_birth(c, *template_id, *layer_key, asked.as_ref(), fx);
+                }
                 let Origin::Fork { parent } = &lineage.origin else {
-                    return Err(Final::Predicate("a Birth is a fork's Lineage"));
+                    return Err(Final::Predicate(
+                        "a Birth is a fork's or a Template-born Vessel's Lineage",
+                    ));
                 };
                 let p = *parent.chronicle.as_bytes();
                 need(
@@ -1370,6 +1381,16 @@ impl CoordLog {
             }
             // D49: any Chronicle with a current epoch may submit it; the row
             // admits only a ready Template and the next version of the name.
+            // D52: one layer per Template and storage kind (the logical id);
+            // held on behalf of the Template.
+            ContractRecord::LayerShipped(l) => {
+                need(
+                    self.templates.contains_key(l.template_id.as_bytes()),
+                    "no ready Template",
+                )?;
+                fx.holds
+                    .push((ObjectId::content(l.layer_key), *l.template_id.as_bytes()));
+            }
             ContractRecord::TemplateNamed(t) => {
                 need(valid_template_name(&t.name), "not a Template name")?;
                 need(
@@ -1390,6 +1411,49 @@ impl CoordLog {
             }
         }
         let _ = pack;
+        Ok(fx)
+    }
+
+    /// The Birth row for a Template-born Vessel (§1.2, D54): the Template
+    /// is registered, the layer is one of its accepted `LayerShipped`, and
+    /// a name it was asked by names it.  Holds the layer object for the
+    /// Vessel; no liveness dependency.
+    fn template_birth(
+        &self,
+        c: C16,
+        template: ChronicleId,
+        layer_key: HashVal,
+        asked: Option<&crate::record::TemplateAsked>,
+        mut fx: Effects,
+    ) -> Plan {
+        need(
+            self.templates.contains_key(template.as_bytes()),
+            "no ready Template",
+        )?;
+        let shipped = [StorageKind::Zfs, StorageKind::Blk].into_iter().any(|k| {
+            matches!(
+                self.entry(&LogicalKey::Layer(template, k)),
+                Some((_, e)) if matches!(
+                    &e.record,
+                    Submitted::Contract(ContractRecord::LayerShipped(l)) if l.layer_key == layer_key
+                )
+            )
+        });
+        need(shipped, "not a shipped layer of this Template")?;
+        if let Some(a) = asked {
+            let names = matches!(
+                self.entry(&LogicalKey::TemplateName(a.name.clone(), a.version)),
+                Some((_, e)) if matches!(
+                    &e.record,
+                    Submitted::Contract(ContractRecord::TemplateNamed(t)) if t.template_id == template
+                )
+            );
+            need(
+                names,
+                "the name it was asked by does not name this Template",
+            )?;
+        }
+        fx.holds.push((ObjectId::content(layer_key), c));
         Ok(fx)
     }
 
@@ -2527,6 +2591,128 @@ mod tests {
         };
         let t0 = genesis_t0(&mut w);
         w.ok(t0, cleaned(t0));
+    }
+
+    /// D52, D54: one layer per Template and storage kind, held by the
+    /// Template; a Template-born Vessel's Birth holds its layer, checks the
+    /// name it was asked by, and adds no liveness dependency.
+    #[test]
+    fn template_births_hold_one_shipped_layer() {
+        use crate::contract::{LayerShipped, StorageKind, TemplateNamed};
+        use crate::record::TemplateAsked;
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let t0 = genesis_t0(&mut w);
+        let (zfs_layer, blk_layer, stray) = (h(0x1A), h(0x1B), h(0x1C));
+        for k in [zfs_layer, blk_layer, stray] {
+            store.put(ObjectId::content(k));
+        }
+        let shipped = |storage, layer_key| {
+            ContractRecord::LayerShipped(LayerShipped {
+                template_id: t0,
+                storage,
+                layer_key,
+                guid: 7,
+            })
+        };
+        // Submitted by the Vessel being born; a Chronicle that is not a
+        // Template has no layer.
+        let v = cid(0x0A);
+        w.log.claim_chronicle(v, ClaimAuthority::Vessel).unwrap();
+        assert!(matches!(
+            w.refused(
+                v,
+                ContractRecord::LayerShipped(LayerShipped {
+                    template_id: v,
+                    storage: StorageKind::Zfs,
+                    layer_key: zfs_layer,
+                    guid: 7
+                })
+            ),
+            Final::Predicate(_)
+        ));
+        // An object that is not in the store is not held.
+        assert!(matches!(
+            w.refused(v, shipped(StorageKind::Zfs, h(0x1D))),
+            Final::NoSuchObject(_)
+        ));
+        w.ok(v, shipped(StorageKind::Zfs, zfs_layer));
+        // One per kind: a second builder's stream conflicts; the other kind
+        // has its own.
+        assert_eq!(
+            w.refused(v, shipped(StorageKind::Zfs, stray)),
+            Final::Conflict
+        );
+        w.ok(v, shipped(StorageKind::Blk, blk_layer));
+        assert_eq!(
+            w.log.holders(&ObjectId::content(zfs_layer)),
+            vec![t0],
+            "held by the Template, not by the Vessel that shipped it"
+        );
+
+        let birth = |c: ChronicleId, layer_key, asked| Submitted::Birth {
+            chronicle: c,
+            lineage: LineageRecord {
+                origin: Origin::Template {
+                    template_id: t0,
+                    layer_key,
+                    asked,
+                },
+                namespace: Namespace::from_bytes([1; 16]),
+                ledger_pos: Lsn::new(0),
+            },
+        };
+        // Not a shipped layer of T0: refused.
+        assert!(matches!(
+            w.submit(v, birth(v, stray, None)),
+            Answer::FinalRefused(Final::Predicate(_))
+        ));
+        // Asked by a name that does not name T0: refused.
+        let asked = Some(TemplateAsked {
+            name: "acme-base".into(),
+            version: 1,
+        });
+        assert!(matches!(
+            w.submit(v, birth(v, zfs_layer, asked.clone())),
+            Answer::FinalRefused(Final::Predicate(_))
+        ));
+        let op = cid(0x0B);
+        w.log.claim_chronicle(op, ClaimAuthority::Vessel).unwrap();
+        w.ok(
+            op,
+            ContractRecord::TemplateNamed(TemplateNamed {
+                name: "acme-base".into(),
+                version: 1,
+                template_id: t0,
+                authority: auth(),
+            }),
+        );
+        assert!(matches!(
+            w.submit(v, birth(v, zfs_layer, asked)),
+            Answer::Accepted { .. }
+        ));
+        // Ten Vessels from T0: ten holds on one layer, and the Template's.
+        for i in 0..9u8 {
+            let c = cid(0xC0 + i);
+            w.log.claim_chronicle(c, ClaimAuthority::Vessel).unwrap();
+            assert!(matches!(
+                w.submit(c, birth(c, zfs_layer, None)),
+                Answer::Accepted { .. }
+            ));
+        }
+        let holders = w.log.holders(&ObjectId::content(zfs_layer));
+        assert_eq!(holders.len(), 11);
+        assert!(holders.contains(&t0) && holders.contains(&v));
+        // No liveness dependency: a Vessel born from T0 retires freely, and
+        // its purge releases only its own hold.
+        let (pc, _) = purge_inventory(&mut w, v);
+        w.ok(v, ContractRecord::PurgeCommitted(pc));
+        assert_eq!(w.log.holders(&ObjectId::content(zfs_layer)).len(), 10);
     }
 
     /// D49: an operator names ready Templates `name@version`, versions in

@@ -2,11 +2,12 @@
 //! purge, genesis and reclamation, with every identity and hash they
 //! carry.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 15 (file 0), frozen
-//! 2026-10-24, BLAKE3
-//! `0ba877a0a48af8e26a3bc0ae68ac3f6b542db701f8701239fffa7b787a5e9912`
-//! (`TemplateNamed` and `TemplateRef`, D49 and D50, from file 5a; the rest
-//! unchanged since rev. 12).  Section numbers below (§) are rev. 15's.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 16 (file 0), frozen
+//! 2026-10-25, BLAKE3
+//! `1c46c846b3c3ff38f1b7b44513e30f0d7f5fdc1225bd3d133e8985fa402f01d4`
+//! (`TemplateNamed` and `TemplateRef`, D49 and D50, from file 5a;
+//! `LayerShipped` and the `layer` kind, D52, from file 5d (rev. 16); the
+//! rest unchanged since rev. 12).  Section numbers below (§) are rev. 16's.
 //!
 //! This module is pure data: the records, their canonical encoding (the
 //! same rules as [`crate::canon`]), their strict decoding, and the
@@ -101,6 +102,8 @@ pub enum ObjectKind {
     Local,
     /// A tombstone pack.
     Tombstone,
+    /// A Template's layer as one full storage stream (D52).
+    Layer,
 }
 
 impl ObjectKind {
@@ -115,6 +118,7 @@ impl ObjectKind {
             Self::Inventory => "taso.inventory.v1",
             Self::Local => "taso.local.v1",
             Self::Tombstone => "taso.tombstone.v1",
+            Self::Layer => "taso.layer.v1",
         }
     }
 }
@@ -1566,6 +1570,52 @@ impl Canonical for TemplateNamed {
     }
 }
 
+/// Which storage a layer stream is for (§5.6, D52): tags `Zfs 0, Blk 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StorageKind {
+    /// ZFS (`zfs send`).
+    Zfs,
+    /// The block log (`taso-blkd export`).
+    Blk,
+}
+
+impl StorageKind {
+    /// Its tag.
+    pub fn tag(self) -> u8 {
+        self as u8
+    }
+}
+
+impl Canonical for StorageKind {
+    fn canon(&self, out: &mut Canon) {
+        out.tag(*self as u8);
+    }
+}
+
+/// A Template's layer for one storage kind is shipped (§5.6, D52): every
+/// node of that kind receives the `layer` object and binds its layer Seal
+/// (lsn 1) to `layer_key`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerShipped {
+    /// The Template.
+    pub template_id: ChronicleId,
+    /// The storage kind the stream is for.
+    pub storage: StorageKind,
+    /// The `layer` object's content key: also the layer Seal's binding.
+    pub layer_key: HashVal,
+    /// The layer Seal's guid as every node receives it.
+    pub guid: u64,
+}
+
+impl Canonical for LayerShipped {
+    fn canon(&self, out: &mut Canon) {
+        self.template_id.canon(out);
+        self.storage.canon(out);
+        self.layer_key.canon(out);
+        out.u64(self.guid);
+    }
+}
+
 /// The longest Template name (§5.5).
 pub const MAX_TEMPLATE_NAME: usize = 64;
 
@@ -1709,6 +1759,8 @@ pub enum ContractRecord {
     GenesisCleanedUp(GenesisCleanedUp),
     /// Tag 21 (D49).
     TemplateNamed(TemplateNamed),
+    /// Tag 22 (D52).
+    LayerShipped(LayerShipped),
 }
 
 impl ContractRecord {
@@ -1739,6 +1791,7 @@ impl ContractRecord {
             }
             Self::GenesisCleanedUp(g) => LogicalKey::GenesisCleaned(g.genesis_id),
             Self::TemplateNamed(t) => LogicalKey::TemplateName(t.name.clone(), t.version),
+            Self::LayerShipped(l) => LogicalKey::Layer(l.template_id, l.storage),
         }
     }
 
@@ -1856,6 +1909,10 @@ impl Canonical for ContractRecord {
                 out.tag(21);
                 r.canon(out);
             }
+            Self::LayerShipped(r) => {
+                out.tag(22);
+                r.canon(out);
+            }
         }
     }
 }
@@ -1912,6 +1969,8 @@ pub enum LogicalKey {
     GenesisCleaned(ChronicleId),
     /// `TemplateNamed`: `name ‖ version` (tag 20; D49).
     TemplateName(String, u32),
+    /// `LayerShipped`: `template_id ‖ storage` (tag 21; D52).
+    Layer(ChronicleId, StorageKind),
 }
 
 impl Canonical for LogicalKey {
@@ -2004,6 +2063,11 @@ impl Canonical for LogicalKey {
             }
             Self::TemplateName(name, version) => {
                 out.tag(20).str(name).u32(*version);
+            }
+            Self::Layer(t, k) => {
+                out.tag(21);
+                t.canon(out);
+                k.canon(out);
             }
         }
     }
@@ -2765,6 +2829,16 @@ impl<'a> Reader<'a> {
                 template_id: self.chronicle()?,
                 authority: self.authority()?,
             }),
+            (_, 22) => ContractRecord::LayerShipped(LayerShipped {
+                template_id: self.chronicle()?,
+                storage: match self.tag()? {
+                    (_, 0) => StorageKind::Zfs,
+                    (_, 1) => StorageKind::Blk,
+                    (at, t) => return Self::bad(at, "storage kind", t),
+                },
+                layer_key: self.hash()?,
+                guid: self.u64()?,
+            }),
             (at, t) => return Self::bad(at, "contract record", t),
         })
     }
@@ -3078,6 +3152,12 @@ mod tests {
                 scratch_guid: Some(0xC1EA),
             }),
             ContractRecord::TemplateNamed(named()),
+            ContractRecord::LayerShipped(LayerShipped {
+                template_id: genesis().genesis_id,
+                storage: StorageKind::Blk,
+                layer_key: h(0x1A),
+                guid: 0x1A1A,
+            }),
         ]
     }
 
@@ -3187,7 +3267,7 @@ mod tests {
             Err(DecodeError::Truncated { .. })
         ));
         assert!(matches!(
-            ContractRecord::decode(&[22]),
+            ContractRecord::decode(&[23]),
             Err(DecodeError::BadTag { .. })
         ));
     }
@@ -3355,6 +3435,7 @@ mod tests {
             ObjectKind::Inventory,
             ObjectKind::Local,
             ObjectKind::Tombstone,
+            ObjectKind::Layer,
         ];
         let keys: BTreeSet<[u8; 32]> = kinds
             .iter()
@@ -3436,11 +3517,12 @@ mod tests {
             claim_id(7, h(6)).to_string(),
             logical_id(&LogicalKey::Birth(cid(1))).to_string(),
             logical_id(&LogicalKey::TemplateName("acme-base".into(), 3)).to_string(),
+            logical_id(&LogicalKey::Layer(cid(1), StorageKind::Zfs)).to_string(),
         ];
         assert_eq!(got, PINS_DERIVED);
     }
 
-    const PINS_RECORDS: [&str; 22] = [
+    const PINS_RECORDS: [&str; 23] = [
         "4c679c6a0022ae188b75236abe543c1fdad404ad556c55f8efecfa1f842053e6",
         "220b967695a40c425c53a626ffed0635d40528a852489b0ad66772c87e6b0e18",
         "7449db856743d73ce30398c37ba97b2295e43b6715875f8f55fe0f859ae15bfe",
@@ -3463,8 +3545,9 @@ mod tests {
         "9de7174a6d7d5362a88b620704dbeff81314ae846ad53bc5373b663caae60133",
         "81568db9b33f001502c0cf7993a2c50cb65ca6df2a1e58c1669a91a802187a7f",
         "95d6743ed38bd728132cccc0a8d38ba1ce439ad9d8bd288a85896ecb9d0dee06",
+        "d0228c5960f0423907f98c700b66fab66ef270acbc4b64ddf1b9b5dac58ec953",
     ];
-    const PINS_DERIVED: [&str; 12] = [
+    const PINS_DERIVED: [&str; 13] = [
         "f6091f83116ec7fcb319e5f951fe6b5c709360d89baa30307925bd36d6a59e05",
         "56ca8a77730eeb5a08131010723d9fd944c83afebcc8590d741761932b5b9d14",
         "fc1e0a251a4a8fb312d6f57acc628772976d614377604f0c58b1eee9f041a6a2",
@@ -3477,6 +3560,7 @@ mod tests {
         "9faafa3b90f351a8a5f09e29101835caf9be58e1371ac1fc7c23a661b59afac0",
         "ca48e4f67689a85d431715b63a5e113e1beddd76e68cc20153b4bb7b46f8665a",
         "5186a5ddb051af1a5cd2e410c9cd31fb2783300f048881f4efc06a62abbe0a07",
+        "354f9819a77dee54227171b93fa37e7d46cabd7d2ebd436c969d0582cd723c88",
     ];
 
     // ── property tests ──────────────────────────────────────────────
@@ -3748,7 +3832,7 @@ mod tests {
             text(),
             (0usize..8),
         )
-            .prop_map(|(c, a, b, n, m, r, s, w)| match n % 12 {
+            .prop_map(|(c, a, b, n, m, r, s, w)| match n % 13 {
                 0 => ContractRecord::Refused(Refused {
                     request_id: a,
                     candidate_id: b,
@@ -3807,6 +3891,16 @@ mod tests {
                 9 => ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
                     genesis_id: c,
                     scratch_guid: (m % 2 == 0).then_some(n),
+                }),
+                11 => ContractRecord::LayerShipped(LayerShipped {
+                    template_id: c,
+                    storage: if m % 2 == 0 {
+                        StorageKind::Zfs
+                    } else {
+                        StorageKind::Blk
+                    },
+                    layer_key: a,
+                    guid: n,
                 }),
                 10 => ContractRecord::TemplateNamed(TemplateNamed {
                     name: s.clone(),

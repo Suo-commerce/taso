@@ -41,7 +41,7 @@ use crate::zfs::Dataset;
 
 /// The content-addressed kinds, in the order the coordinator looks for a
 /// key whose kind it does not know (D35).
-pub const CONTENT_KINDS: [ObjectKind; 7] = [
+pub const CONTENT_KINDS: [ObjectKind; 8] = [
     ObjectKind::Artifact,
     ObjectKind::Manifest,
     ObjectKind::Classmap,
@@ -49,6 +49,7 @@ pub const CONTENT_KINDS: [ObjectKind; 7] = [
     ObjectKind::Inventory,
     ObjectKind::Local,
     ObjectKind::Tombstone,
+    ObjectKind::Layer,
 ];
 
 /// A content kind's directory name (D35); `None` for packs, which live
@@ -62,6 +63,7 @@ pub fn kind_dir(kind: ObjectKind) -> Option<&'static str> {
         ObjectKind::Inventory => "inventory",
         ObjectKind::Local => "local",
         ObjectKind::Tombstone => "tombstone",
+        ObjectKind::Layer => "layer",
         ObjectKind::Pack => return None,
     })
 }
