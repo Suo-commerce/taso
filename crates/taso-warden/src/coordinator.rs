@@ -576,6 +576,13 @@ pub trait Coord: Send + Sync {
         Err(no_log())
     }
 
+    /// The accepted record at log position `pos` (1-based), as the log
+    /// keeps it (`taso ctl explain`, P4 file 12).
+    fn query_entry(&self, pos: u64) -> Result<Option<taso_core::coordlog::LogEntry>, CoordError> {
+        let _ = pos;
+        Err(no_log())
+    }
+
     /// What keeps the Chronicle from being purged now (§6.3 step 2's
     /// pre-check), as a `PurgeDeferred` reason; `None` if nothing does.
     fn purge_blocker(
@@ -1667,6 +1674,10 @@ impl Coord for Coordinator {
         chronicle: ChronicleId,
     ) -> Result<Option<taso_core::contract::DeferReason>, CoordError> {
         self.read_log(move |log| log.purge_blocker(chronicle))
+    }
+
+    fn query_entry(&self, pos: u64) -> Result<Option<taso_core::coordlog::LogEntry>, CoordError> {
+        self.read_log(move |log| log.entry_at(pos))
     }
 }
 

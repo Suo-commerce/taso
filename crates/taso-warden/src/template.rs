@@ -3155,4 +3155,146 @@ mod tests {
         assert!(!packs.has_pack(&r).unwrap());
         assert!(c.coord.query_chronicle(v.id()).unwrap().unwrap().retired);
     }
+
+    // ── explain (P4 file 12) ────────────────────────────────────────
+
+    use crate::explain::{explain, Subject};
+    use serde_json::{json, Value};
+
+    fn explained(c: &Cluster, s: Subject) -> crate::explain::Explained {
+        explain(c.coord.as_ref(), &c.store, PREFIX, s).unwrap()
+    }
+
+    #[test]
+    fn explain_rebuilds_a_sanction_and_every_check_holds() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, s) = committed(&c, b"a");
+        // Committed, not finished: what it waits for.
+        let e = explained(&c, Subject::Chronicle(v.id()));
+        assert!(e.failed().is_empty(), "{:?}", e.failed());
+        let cand = &e.explain["candidates"][0];
+        assert_eq!(cand["candidate_id"], json!(s.candidate_id.to_string()));
+        assert_eq!(cand["outcome"]["sanctioned"]["ready"], json!(false));
+        assert!(cand["pending_reason"]
+            .as_str()
+            .unwrap()
+            .contains("TemplateReady"));
+        assert_eq!(cand["attempts"][0]["outcome"], json!("Exit { code: 0 }"));
+        assert_eq!(cand["verdicts"][0]["decision"], json!("sanction"));
+        assert_eq!(cand["verdicts"][0]["actor"], json!("jarmo"));
+        assert_eq!(cand["verdicts"][0]["peer"]["pid"], json!(4242));
+        finisher(&c, 1).finish(&mut v, &packs, &s).unwrap();
+        let e = explained(&c, Subject::Chronicle(v.id()));
+        assert!(e.failed().is_empty(), "{:?}", e.failed());
+        let cand = &e.explain["candidates"][0];
+        assert_eq!(cand["outcome"]["sanctioned"]["completed"], json!(true));
+        assert_eq!(cand["pending_reason"], Value::Null);
+        // Every kind of check was made.
+        for kind in ["intact:", "carried:", "derived:", "content:"] {
+            assert!(e.checks.iter().any(|k| k.what.starts_with(kind)), "{kind}");
+        }
+        // The Template: its definition and the trail it was born from.
+        let t = explained(&c, Subject::Chronicle(s.template_id));
+        assert!(t.failed().is_empty(), "{:?}", t.failed());
+        assert_eq!(
+            t.explain["born_from"]["sanction"]["trail"]["candidate_id"],
+            json!(s.candidate_id.to_string())
+        );
+        // The Candidate alone.
+        let k = explained(&c, Subject::Candidate(s.candidate_id));
+        assert_eq!(k.explain["candidates"].as_array().unwrap().len(), 1);
+        // T(0), a genesis: no track record.
+        let g = explained(&c, Subject::Chronicle(c.t0));
+        assert!(g.explain["born_from"]["genesis"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("no track record"));
+    }
+
+    #[test]
+    fn explain_fails_its_checks_on_what_was_changed_after_acceptance() {
+        let c = Cluster::new();
+        let (_h, v, _packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        assert!(explained(&c, Subject::Chronicle(v.id()))
+            .failed()
+            .is_empty());
+        // A content object changed in the store.
+        let path = crate::coordstore::object_key_path(
+            PREFIX,
+            ObjectKind::Manifest,
+            cand.output_manifest_key,
+        )
+        .unwrap();
+        c.store
+            .put(&path, &mut Cursor::new(b"tampered".to_vec()))
+            .unwrap();
+        let e = explained(&c, Subject::Chronicle(v.id()));
+        let failed: Vec<String> = e.failed().iter().map(|k| k.what.clone()).collect();
+        // Nothing was excluded, so the input manifest is the output's: the
+        // one object fails both checks that name it, and nothing else.
+        assert_eq!(cand.input_manifest_key, cand.output_manifest_key);
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        assert!(
+            failed
+                .iter()
+                .all(|w| w.starts_with("content: ") && w.ends_with(&path)),
+            "{failed:?}"
+        );
+        // A pack that carried a record, rewritten without it.
+        let view = c.coord.query_chronicle(v.id()).unwrap().unwrap();
+        let e0 = c
+            .coord
+            .query_entry(*view.accepted.last().unwrap())
+            .unwrap()
+            .unwrap();
+        let key = format!("{PREFIX}/{}/pack/{}", hex(v.id().as_bytes()), e0.pack);
+        c.store
+            .put(&key, &mut Cursor::new(b"not a pack".to_vec()))
+            .unwrap();
+        let e = explained(&c, Subject::Chronicle(v.id()));
+        assert!(
+            e.failed().iter().any(|k| k.what.starts_with("carried:")),
+            "{:?}",
+            e.failed()
+        );
+        // The explanation is still given.
+        assert_eq!(
+            e.explain["candidates"][0]["candidate_id"],
+            json!(cand.candidate_id.to_string())
+        );
+    }
+
+    #[test]
+    fn explain_tells_a_purge_and_a_never() {
+        let c = Cluster::new();
+        let (h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 3 });
+        let never = request(
+            &cand,
+            &f,
+            Decision::Never {
+                reason: "exits 3".into(),
+            },
+        );
+        assert_eq!(
+            verdicts(&c).handle(&mut v, &packs, &never, PEER).unwrap(),
+            VerdictAnswer::ClosedNever
+        );
+        assert!(matches!(
+            purger(&c).purge(&h.pool, &mut v, &packs).unwrap(),
+            Purged::Complete { .. }
+        ));
+        let e = explained(&c, Subject::Chronicle(v.id()));
+        assert!(e.failed().is_empty(), "{:?}", e.failed());
+        assert_eq!(e.explain["retired"], json!(true));
+        assert_eq!(
+            e.explain["candidates"][0]["outcome"]["never"]["reason"],
+            json!("exits 3")
+        );
+        assert_eq!(
+            e.explain["purge"]["end"]["complete"]["items_replaced"],
+            json!(1)
+        );
+        assert_eq!(e.explain["purge"]["replaced"], json!(1));
+    }
 }

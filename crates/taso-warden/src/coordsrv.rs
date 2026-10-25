@@ -56,6 +56,7 @@
 //!  19 obligations       chronicle (16)
 //!  20 purge_projection  chronicle (16)
 //!  21 purge_blocker     chronicle (16)
+//!  22 query_entry       log position (8)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
@@ -77,7 +78,8 @@
 //! position (8) · record; `query_chronicle` tag 0, or tag 1 · view;
 //! `obligations` count (8) · op ids (8 each); `purge_projection` the
 //! inventory's bytes (P4 file 11); `purge_blocker` tag 0, or tag 1 · the
-//! reason's bytes.  `announce`, `accept` and
+//! reason's bytes; `query_entry` tag 0, or tag 1 · position (8) · chronicle
+//! (16) · logical (32) · digest (32) · record · pack name (P4 file 12).  `announce`, `accept` and
 //! `cancel` name the Warden, which must be the Chronicle's holder (its
 //! epoch is the holder's), so a peer map binds them like an append; the
 //! queries are open to any mapped peer.  `set_retention_pin` is an
@@ -185,6 +187,7 @@ const OP_QUERY_CHRONICLE: u8 = 18;
 const OP_OBLIGATIONS: u8 = 19;
 const OP_PURGE_PROJECTION: u8 = 20;
 const OP_PURGE_BLOCKER: u8 = 21;
+const OP_QUERY_ENTRY: u8 = 22;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -313,6 +316,9 @@ enum Request {
     },
     PurgeBlocker {
         chronicle: ChronicleId,
+    },
+    QueryEntry {
+        pos: u64,
     },
 }
 
@@ -632,6 +638,7 @@ impl Request {
                 o.u8(OP_PURGE_PROJECTION).bytes(chronicle.as_bytes())
             }
             Self::PurgeBlocker { chronicle } => o.u8(OP_PURGE_BLOCKER).bytes(chronicle.as_bytes()),
+            Self::QueryEntry { pos } => o.u8(OP_QUERY_ENTRY).u64(*pos),
         };
         o.0
     }
@@ -759,6 +766,7 @@ impl Request {
             OP_PURGE_BLOCKER => Self::PurgeBlocker {
                 chronicle: i.chronicle()?,
             },
+            OP_QUERY_ENTRY => Self::QueryEntry { pos: i.u64()? },
             _ => return Err(Malformed("unknown operation")),
         };
         i.end()?;
@@ -790,7 +798,8 @@ impl Request {
             | Self::QueryChronicle { .. }
             | Self::Obligations { .. }
             | Self::PurgeProjection { .. }
-            | Self::PurgeBlocker { .. } => None,
+            | Self::PurgeBlocker { .. }
+            | Self::QueryEntry { .. } => None,
         }
     }
 
@@ -815,7 +824,8 @@ impl Request {
             | Self::QueryChronicle { .. }
             | Self::Obligations { .. }
             | Self::PurgeProjection { .. }
-            | Self::PurgeBlocker { .. } => OkKind::Blob,
+            | Self::PurgeBlocker { .. }
+            | Self::QueryEntry { .. } => OkKind::Blob,
         }
     }
 }
@@ -1178,6 +1188,24 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
                 Ok(Reply::Blob(c.into_bytes()))
             })
         }
+        Request::QueryEntry { pos } => coord.query_entry(pos).map(|e| {
+            let mut c = Canon::new();
+            match e {
+                None => {
+                    c.tag(0);
+                }
+                Some(e) => {
+                    c.tag(1)
+                        .u64(e.pos)
+                        .fixed(e.chronicle.as_bytes())
+                        .fixed(e.logical.as_bytes())
+                        .fixed(e.digest.as_bytes());
+                    put_submitted(&mut c, &e.record);
+                    c.str(&e.pack);
+                }
+            }
+            Reply::Blob(c.into_bytes())
+        }),
         Request::PurgeBlocker { chronicle } => coord.purge_blocker(chronicle).map(|b| {
             let mut c = Canon::new();
             match b {
@@ -1849,6 +1877,22 @@ impl Coord for RemoteCoord {
             taso_core::contract::Inventory::decode(&b)
                 .map(|i| i.items().to_vec())
                 .map_err(|_| JournalError("bad inventory"))
+        })
+    }
+
+    fn query_entry(&self, pos: u64) -> Result<Option<taso_core::coordlog::LogEntry>, CoordError> {
+        let r = self.call(Request::QueryEntry { pos })?;
+        blob_reply(r, |r| match r.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(taso_core::coordlog::LogEntry {
+                pos: r.u64()?,
+                chronicle: ChronicleId::from_bytes(r.fixed()?),
+                logical: HashVal::from_bytes(r.fixed()?),
+                digest: HashVal::from_bytes(r.fixed()?),
+                record: get_submitted(r)?,
+                pack: r.string()?,
+            })),
+            _ => Err(JournalError("bad option tag")),
         })
     }
 
@@ -2553,6 +2597,16 @@ mod tests {
             c.purge_projection(t0).unwrap(),
             coord.purge_projection(t0).unwrap()
         );
+        // The log's entries (P4 file 12).
+        let e = c.query_entry(1).unwrap().unwrap();
+        assert_eq!(e, coord.query_entry(1).unwrap().unwrap());
+        assert_eq!(
+            (e.pos, e.chronicle, e.record.clone(), e.pack.as_str()),
+            (1, t0, r.clone(), "p")
+        );
+        assert_eq!((e.logical, e.digest), (r.logical_id(), r.digest()));
+        assert_eq!(c.query_entry(0).unwrap(), None);
+        assert_eq!(c.query_entry(99).unwrap(), None);
         let late = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 2);
         assert_eq!(
             c.cancel(A, t0, Epoch::FIRST, late).unwrap(),

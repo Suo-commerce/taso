@@ -31,6 +31,8 @@
 #                                                  per item; no dataset; its
 #                                                  start refused "purged at lsn"
 #   6  the sanctioned Vessel                       its dataset; not retired
+#   7  taso-ctl explain d1, s                      every check holds; purged,
+#                                                  sanctioned
 #
 # Touches, and nothing else:
 #   /var/lib/taso-p4u/<mode>                 (removed at start, kept after)
@@ -155,7 +157,7 @@ say "building"
 cargo build -q --release -p taso-warden -p taso-sim -p taso-landlock --bins
 [[ $MODE == blk ]] && cargo build -q --release -p taso-blk
 BIN=$PWD/target/release
-for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock taso-decide taso-policy; do
+for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock taso-decide taso-policy taso-ctl; do
     [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"
 done
 [[ $MODE == zfs ]] || [[ -x "$BIN/taso-blkd" ]] || die "$BIN/taso-blkd was not built"
@@ -572,6 +574,20 @@ expect "d1: start refused, purged" is "$(count 5-d1.out '^d1: .*purged at lsn [0
 say "6. the sanctioned Vessel s (predict: its dataset stays; not retired)"
 expect "s: dataset" is "$(dataset_exists "${ID[s]}")" yes
 expect "s: not retired" is "$(retired "${ID[s]}")" false
+
+# ── 7. taso-ctl explain (file 12) ───────────────────────────────
+
+xj() { # xj FILE EXPR
+    python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); e=v.get("explain",{}); checks=v.get("checks",{}); print(eval(sys.argv[2]))' "$1" "$2"
+}
+
+say "7. taso-ctl explain (predict: exit 0, no failed check; d1 retired, its purge complete with every item replaced; s sanctioned and completed)"
+XRC=0; timeout 120 "$BIN/taso-ctl" "$W/keep-q.json" explain "${ID[d1]}" >"$W/out/7-d1.json" 2>"$W/out/7-d1.err" || XRC=$?
+expect "d1: exit 0, every check held" is "$XRC $(xj "$W/out/7-d1.json" 'len(checks["failed"])')" "0 0"
+expect "d1: retired, purge complete, items replaced" is "$(xj "$W/out/7-d1.json" 'e["retired"], e["purge"]["end"]["complete"]["items_replaced"] == e["purge"]["replaced"] > 0')" "(True, True)"
+XRC=0; timeout 120 "$BIN/taso-ctl" "$W/keep-q.json" explain "${ID[s]}" >"$W/out/7-s.json" 2>"$W/out/7-s.err" || XRC=$?
+expect "s: exit 0, every check held" is "$XRC $(xj "$W/out/7-s.json" 'len(checks["failed"])')" "0 0"
+expect "s: sanctioned, completed" is "$(xj "$W/out/7-s.json" 'e["candidates"][0]["outcome"]["sanctioned"]["completed"]')" True
 
 # ── Result ──────────────────────────────────────────────────────────
 

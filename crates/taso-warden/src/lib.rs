@@ -23,6 +23,7 @@ pub mod coordstore;
 pub mod daemon;
 pub mod decidesrv;
 pub mod effects;
+pub mod explain;
 pub mod field;
 pub mod finish;
 pub mod genesis;

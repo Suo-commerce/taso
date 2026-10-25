@@ -38,6 +38,8 @@
 #  11  sanction.after_commit_accept (x), sanction.before_ready_accept (y):
 #      committed, not finished; the next open finishes each once
 #  12  a Vessel born from p's Template             Born from Template, exit 0
+#  14  taso-ctl explain on p, f, p's Template,    every check holds; the
+#      pa and V                                    decisions as recorded
 #  13  taso-policy --once on pa (passes), pf (3)   Committed, ClosedNever; a
 #                                                  dry run sends nothing
 #  10  the coordinator log (last)                  the records each Vessel's
@@ -165,7 +167,7 @@ say "building"
 cargo build -q --release -p taso-warden -p taso-sim -p taso-landlock --bins
 [[ $MODE == blk ]] && cargo build -q --release -p taso-blk
 BIN=$PWD/target/release
-for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock taso-decide taso-policy; do
+for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock taso-decide taso-policy taso-ctl; do
     [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"
 done
 [[ $MODE == zfs ]] || [[ -x "$BIN/taso-blkd" ]] || die "$BIN/taso-blkd was not built"
@@ -747,6 +749,34 @@ expect "pa finished into its Template" is "$(finished_sanction 13-daemon "${ID[p
 policy 13-again
 expect "again: nothing pending" is "$(pl 13-again pending)" 0
 stop_daemon
+
+# ── 14. taso-ctl explain (file 12) ──────────────────────────────
+
+# explain CASE ID: taso-ctl explain; its JSON to $W/out/CASE.json, exit to XRC.
+explain() {
+    XRC=0
+    timeout 120 "$BIN/taso-ctl" "$W/keep.json" explain "$2" >"$W/out/$1.json" 2>"$W/out/$1.err" || XRC=$?
+}
+# xj CASE EXPR: a Python expression over the explanation `e` and its `checks`.
+xj() {
+    python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); e=v.get("explain",{}); checks=v.get("checks",{}); print(eval(sys.argv[2]))' "$W/out/$1.json" "$2"
+}
+
+say "14. taso-ctl explain, from the coordinator log alone (predict: exit 0, no failed check, each time; p sanctioned into its Template, completed; f never, 'exits 7'; p's Template born from p's Candidate; pa decided by taso-policy with a policy digest; V a genesis with no track record)"
+explain 14-p "${ID[p]}"
+expect "p: exit 0, every check held" is "$XRC $(xj 14-p 'len(checks["failed"])')" "0 0"
+expect "p: sanctioned, completed" is "$(xj 14-p 'e["candidates"][0]["outcome"]["sanctioned"]["completed"]')" True
+expect "p: its Template is the one committed" is "$(xj 14-p 'e["candidates"][0]["outcome"]["sanctioned"]["template_id"]')" "$TID"
+explain 14-f "${ID[f]}"
+expect "f: exit 0, every check held" is "$XRC $(xj 14-f 'len(checks["failed"])')" "0 0"
+expect "f: never, 'exits 7'" is "$(xj 14-f 'e["candidates"][0]["outcome"]["never"]["reason"]')" "exits 7"
+explain 14-t "$TID"
+expect "p's Template: exit 0, every check held" is "$XRC $(xj 14-t 'len(checks["failed"])')" "0 0"
+expect "p's Template born from p's Candidate" is "$(xj 14-t 'e["born_from"]["sanction"]["candidate_id"]')" "${CAND[p]}"
+explain 14-pa "${ID[pa]}"
+expect "pa: decided by taso-policy, with a policy digest" is "$XRC $(xj 14-pa '[x["actor"] for x in e["candidates"][0]["verdicts"]][0]') $(xj 14-pa 'len(e["candidates"][0]["verdicts"][0]["policy_digest"] or "")')" "0 taso-policy 64"
+explain 14-v "$V"
+expect "V: a genesis, no track record" is "$XRC $(xj 14-v '"no track record" in e["born_from"]["genesis"]["note"]')" "0 True"
 
 # ── 10. The coordinator log ─────────────────────────────────────────
 

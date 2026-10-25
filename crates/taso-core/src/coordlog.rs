@@ -783,6 +783,22 @@ impl CoordLog {
         }
     }
 
+    /// The accepted record at log position `pos` (1-based), with the
+    /// Chronicle that submitted it, its logical id and digest as the log
+    /// keeps them, and the pack that carried it (`taso ctl explain`, P4
+    /// file 12).
+    pub fn entry_at(&self, pos: u64) -> Option<LogEntry> {
+        let e = self.log.get((pos as usize).checked_sub(1)?)?;
+        Some(LogEntry {
+            pos,
+            chronicle: ChronicleId::from_bytes(e.chronicle),
+            logical: HashVal::from_bytes(e.logical),
+            digest: HashVal::from_bytes(e.digest),
+            record: e.record.clone(),
+            pack: e.pack.clone(),
+        })
+    }
+
     /// `query { logical }`: the accepted record and its position.
     pub fn query_logical(&self, logical: HashVal) -> Option<(u64, &Submitted)> {
         self.logical
@@ -1685,6 +1701,23 @@ impl CoordLog {
             }
         }
     }
+}
+
+/// One accepted record as the log keeps it ([`CoordLog::entry_at`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+    /// Its position.
+    pub pos: u64,
+    /// The Chronicle that submitted it.
+    pub chronicle: ChronicleId,
+    /// Its logical id, as accepted.
+    pub logical: HashVal,
+    /// Its digest, as accepted.
+    pub digest: HashVal,
+    /// The record.
+    pub record: Submitted,
+    /// The pack that carried it.
+    pub pack: String,
 }
 
 /// `query { chronicle }` (§1.3).
