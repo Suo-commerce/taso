@@ -789,6 +789,45 @@ pub struct Config {
     /// "<path>", "allowed_exclude": [<class>, ...]}`; `None`: this node
     /// nominates nothing.
     pub sanction: Option<SanctionNodeConf>,
+    /// The decider socket (§5.1, §11.1): `"decider": {"socket": "<path>",
+    /// "max_frame_bytes": <n>, "max_connections": <n>}`, each optional;
+    /// by default `<run_dir>/decide/decide.sock`, 1 MiB, 8.
+    pub decider: crate::decidesrv::DeciderConf,
+}
+
+/// The node's `"decider"` ([`Config::decider`]).
+fn decider_conf(
+    v: Option<&Value>,
+    run_dir: &Path,
+) -> Result<crate::decidesrv::DeciderConf, ConfigError> {
+    let mut c = crate::decidesrv::DeciderConf::defaults(run_dir);
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(c);
+    };
+    only_keys(
+        v,
+        "decider",
+        &["socket", "max_frame_bytes", "max_connections"],
+    )?;
+    if v.get("socket").is_some() {
+        c.socket = abs_path(v, "socket")?;
+    }
+    if let Some(n) = opt_positive(v, "max_frame_bytes")? {
+        c.max_frame_bytes = u32::try_from(n)
+            .ok()
+            .filter(|n| *n <= taso_core::frame::MAX_FRAME)
+            .ok_or_else(|| {
+                bad(format!(
+                    "\"decider.max_frame_bytes\" is at most {}",
+                    taso_core::frame::MAX_FRAME
+                ))
+            })?;
+    }
+    if let Some(n) = opt_positive(v, "max_connections")? {
+        c.max_connections =
+            usize::try_from(n).map_err(|_| bad("\"decider.max_connections\" is too large"))?;
+    }
+    Ok(c)
 }
 
 /// The node's `"sanction"` (D58).
@@ -1513,6 +1552,7 @@ impl Config {
                 .unwrap_or("vessels")
                 .to_string(),
             run_dir: abs_path(&v, "run_dir")?,
+            decider: decider_conf(v.get("decider"), &abs_path(&v, "run_dir")?)?,
             runtime,
             quiescence,
             source,
@@ -4292,6 +4332,50 @@ mod tests {
 
     /// P4 file 6c (D57, D58): the node's `"sanction"`, a Vessel's
     /// `"verifier"` and `"candidate"`, and what each needs.
+    #[test]
+    fn decider_entries() {
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            f(&mut v);
+            Config::parse(&v.to_string())
+        };
+        let c = with(&|_| {}).unwrap();
+        assert_eq!(
+            c.decider,
+            crate::decidesrv::DeciderConf::defaults(&c.run_dir),
+            "the defaults"
+        );
+        assert_eq!(c.decider.socket, c.run_dir.join("decide/decide.sock"));
+        assert_eq!(
+            (c.decider.max_frame_bytes, c.decider.max_connections),
+            (1 << 20, 8)
+        );
+        let c = with(&|v| {
+            v["decider"] = serde_json::json!({"socket": "/run/d/s", "max_frame_bytes": 4096, "max_connections": 2})
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                c.decider.socket.as_path(),
+                c.decider.max_frame_bytes,
+                c.decider.max_connections
+            ),
+            (Path::new("/run/d/s"), 4096, 2)
+        );
+        for (bad, why) in [
+            (serde_json::json!({"sock": "/x"}), "unknown key"),
+            (serde_json::json!({"socket": "rel"}), "absolute"),
+            (serde_json::json!({"max_connections": 0}), "at least 1"),
+            (
+                serde_json::json!({"max_frame_bytes": 16_777_217u64}),
+                "at most",
+            ),
+        ] {
+            let e = with(&|v| v["decider"] = bad.clone()).unwrap_err();
+            assert!(e.0.contains(why), "{e}");
+        }
+    }
+
     #[test]
     fn sanction_verifier_and_candidate_entries() {
         let with = |f: &dyn Fn(&mut Value)| {

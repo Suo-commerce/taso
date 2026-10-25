@@ -28,6 +28,12 @@
 //! `stopped at failpoint <name>` and a run without it finishes the birth.
 //! Any other name refuses to start.
 //!
+//! # The decider socket
+//!
+//! `decider.socket` (default `<run_dir>/decide/decide.sock`) takes
+//! verdicts on this node's Vessels while the daemon runs
+//! ([`taso_warden::decidesrv`]; the `taso-decide` command).
+//!
 //! # Stopping
 //!
 //! SIGTERM or SIGINT asks for a stop: every running agent is stopped (its
@@ -174,6 +180,27 @@ fn main() -> ExitCode {
         }
     };
     let warden = node.config.warden;
+    // The decider socket (P4 §5.1, D72): verdicts on this node's Vessels.
+    let decider = match taso_warden::decidesrv::DeciderServer::spawn(
+        &node.config.decider,
+        Arc::new(taso_warden::daemon::NodeDecider(node.clone())),
+    ) {
+        Ok(d) => {
+            eprintln!(
+                "taso-wardend[{}]: decider socket {}",
+                warden.get(),
+                d.path().display()
+            );
+            d
+        }
+        Err(e) => {
+            eprintln!(
+                "taso-wardend: the decider socket {}: {e}",
+                node.config.decider.socket.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     // Seeded with what the pool holds: a uid slot whose range owns a
     // Vessel's files stays that Vessel's across restarts of the Warden.
@@ -216,6 +243,8 @@ fn main() -> ExitCode {
             true
         }
     };
+
+    decider.stop();
 
     if timing {
         let spans = taso_warden::timing::take();
