@@ -213,7 +213,7 @@ pub fn run_capped(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    drop(cmd_stdio_guard(cmd));
+    cmd_stdio_guard(cmd);
     let (out, over) = reading
         .join()
         .map_err(|_| io::Error::other("the output reader panicked"))??;
