@@ -2,8 +2,9 @@
 # p4-genesis.sh: taso-genesis on real storage (P4 file 4c; spec rev. 14 §7,
 # D40-D48).
 #
-#   sudo scripts/p4-genesis.sh zfs     (from the repository root)
-#   sudo scripts/p4-genesis.sh blk
+#   scripts/p4-genesis.sh zfs     (as root, from the repository root; not
+#                                  through sudo, which drops cargo from PATH)
+#   scripts/p4-genesis.sh blk
 #
 # zfs: Vessel roots are new datasets under $P4G_ZFS_PARENT (default
 #      tasotest/vessel): p4g-n1 .. p4g-n4.  They must not exist; they are

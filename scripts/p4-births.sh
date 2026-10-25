@@ -2,8 +2,9 @@
 # p4-births.sh: Vessels born from a Template on real storage, under
 # taso-wardend (P4 file 5h; spec rev. 18 §5.5, §5.6, §10.2, D50-D56).
 #
-#   sudo scripts/p4-births.sh zfs     (from the repository root)
-#   sudo scripts/p4-births.sh blk
+#   scripts/p4-births.sh zfs     (as root, from the repository root; not
+#                                 through sudo, which drops cargo from PATH)
+#   scripts/p4-births.sh blk
 #
 # zfs: Vessel roots are new datasets under $P4B_ZFS_PARENT (default
 #      tasotest/vessel): p4b-n1, p4b-n2.  They must not exist; they are

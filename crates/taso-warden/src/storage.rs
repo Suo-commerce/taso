@@ -84,6 +84,10 @@ pub trait Holdings {
     fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, LayerError>;
     /// The uids owning files in `dataset`.
     fn owner_uids(&self, dataset: &Dataset) -> Result<BTreeSet<u32>, LayerError>;
+    /// The Seal snapshot `dataset` is a clone of, if any (P4 file 5h: a
+    /// Template-born Vessel's dataset, before its Lineage is written, is
+    /// a clone of its layer).
+    fn origin(&self, dataset: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError>;
 }
 
 impl<R: crate::zfs::Runner> Holdings for Zfs<R> {
@@ -92,6 +96,9 @@ impl<R: crate::zfs::Runner> Holdings for Zfs<R> {
     }
     fn owner_uids(&self, dataset: &Dataset) -> Result<BTreeSet<u32>, LayerError> {
         Ok(Zfs::owner_uids(self, dataset)?)
+    }
+    fn origin(&self, dataset: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
+        Ok(self.dataset_info(dataset)?.and_then(|i| i.origin_seal()))
     }
 }
 
@@ -107,6 +114,9 @@ impl Holdings for Storage {
             Self::Zfs(z) => Holdings::owner_uids(z, dataset),
             Self::Blk(p) => p.owner_uids(dataset),
         }
+    }
+    fn origin(&self, dataset: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
+        Ok(Pool::info(self, dataset)?.and_then(|i| i.origin_seal()))
     }
 }
 

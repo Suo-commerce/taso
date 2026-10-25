@@ -1998,11 +1998,13 @@ pub fn held_on<H: Holdings>(
         };
         let hex = name.strip_prefix("v-").unwrap_or_default();
         let (parent, from_template) = match crate::vessel::lineage_in(&state_dir.join(hex)) {
-            Ok(l) => (
-                l.as_ref()
-                    .and_then(|l| l.origin.parent().map(|p| *p.chronicle.as_bytes())),
-                l.is_some_and(|l| matches!(l.origin, Origin::Template { .. })),
+            Ok(Some(l)) => (
+                l.origin.parent().map(|p| *p.chronicle.as_bytes()),
+                matches!(l.origin, Origin::Template { .. }),
             ),
+            // No Lineage yet: a birth stopped after its clone.  A clone of
+            // a Template's layer (`<root>/t-<hex>`) is a Template birth.
+            Ok(None) => (None, is_layer_clone(pool, root, &ds)?),
             Err(e) => {
                 warnings.push(format!(
                     "{ds}: its local Chronicle's Lineage cannot be read ({e}): taken as no parent"
@@ -2031,6 +2033,17 @@ pub fn held_on<H: Holdings>(
         held.push(Held { key, slots, parent });
     }
     Ok((held, warnings))
+}
+
+/// Whether `ds` is a clone of a Template's layer under `root`, a
+/// dataset named `t-<32 hex>` (P4 §5.6).
+fn is_layer_clone<H: Holdings>(pool: &H, root: &Dataset, ds: &Dataset) -> Result<bool, LayerError> {
+    Ok(pool.origin(ds)?.is_some_and(|(o, _)| {
+        o.as_str()
+            .strip_prefix(root.as_str())
+            .and_then(|rest| rest.strip_prefix("/t-"))
+            .is_some_and(|h| key_of_hex(h).is_some())
+    }))
 }
 
 /// The disk range a fork may inherit, from its top directory's owner
@@ -3469,6 +3482,72 @@ mod tests {
         assert_eq!(tbh.slots, [9].into());
     }
 
+    /// P4 file 5h (found on taso-test): a birth stopped after its clone
+    /// leaves a dataset of the Template range and no Lineage yet.  Its
+    /// files count for no slot, as a Template-born Vessel's, because the
+    /// dataset is a clone of a layer under the root; a dataset with no
+    /// Lineage that is not such a clone counts as before.
+    #[test]
+    fn held_on_counts_a_clone_of_a_layer_without_lineage_as_template_born() {
+        let state = tempfile::tempdir().unwrap();
+        let root = Dataset::new("t/v").unwrap();
+        let tbase = 200_000 + 9 * ID_RANGE;
+        let (a, b) = ("aa".repeat(16), "bb".repeat(16));
+        let va = Dataset::new(&format!("t/v/v-{a}")).unwrap();
+        let vb = Dataset::new(&format!("t/v/v-{b}")).unwrap();
+        let layer = Dataset::new(&format!("t/v/t-{}", "77".repeat(16))).unwrap();
+        let elsewhere = Dataset::new(&format!("t/w/t-{}", "77".repeat(16))).unwrap();
+        let pool = |origin_of_b: Dataset| {
+            CloneTable(
+                HoldTable(vec![
+                    (va.clone(), vec![0, tbase]),
+                    (vb.clone(), vec![0, tbase]),
+                ]),
+                vec![
+                    (va.clone(), (layer.clone(), Lsn::new(1))),
+                    (vb.clone(), (origin_of_b, Lsn::new(1))),
+                ],
+            )
+        };
+        let (held, warnings) =
+            held_on(&pool(elsewhere), &root, 200_000, Some(9), state.path()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let by = |k: &str| {
+            held.iter()
+                .find(|h| h.key == key_of_hex(k).unwrap())
+                .unwrap()
+        };
+        assert_eq!(by(&a).slots, [].into(), "a clone of a layer under the root");
+        assert_eq!(by(&b).slots, [9].into(), "a clone of something else");
+        // Without a Template range, those files are slot 9's like any.
+        let (held, _) = held_on(&pool(layer.clone()), &root, 200_000, None, state.path()).unwrap();
+        assert!(held.iter().all(|h| h.slots == [9].into()));
+        let layer = Dataset::new(&format!("t/v/t-{}", "77".repeat(16))).unwrap();
+        // The guard then admits that Vessel's entry in its own slot (12),
+        // where before it was "fixed" to slot 9 and refused.
+        let mut vc = Config::parse(GOOD).unwrap().vessels[0].clone();
+        vc.uid_slot = 12;
+        let id_hex: String = vc
+            .id()
+            .as_bytes()
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect();
+        let leftover = Dataset::new(&format!("t/v/v-{id_hex}")).unwrap();
+        let pool = CloneTable(
+            HoldTable(vec![(leftover.clone(), vec![0, tbase])]),
+            vec![(leftover, (layer, Lsn::new(1)))],
+        );
+        let (held, _) = held_on(&pool, &root, 200_000, Some(9), state.path()).unwrap();
+        assert_eq!(held[0].slots, [].into());
+        let rt = RuntimeConf {
+            template_slot: Some(9),
+            ..Config::parse(GOOD).unwrap().runtime
+        };
+        let admitted = crate::source::Guard::seeded(rt, held).admit(vec![vc]);
+        assert!(admitted.refused.is_empty(), "{:?}", admitted.refused);
+    }
+
     /// The failpoints a node may stop a Template birth at are §10.2's.
     #[test]
     fn birth_failpoints_are_the_specs() {
@@ -4470,6 +4549,20 @@ mod tests {
                     format!("t/v\nt/v/v-{a}\nt/v/v-{b}\nt/v/v-{c}\nt/v/scratch\nt/v/v-XYZ\n"),
                 ),
                 (format!("userspace t/v/v-{a}"), "0\n265536\n265537\n".into()),
+                // No local Lineage for any: each is asked whether it is a
+                // clone of a Template's layer (it is not).
+                (
+                    format!("list t/v/v-{a}"),
+                    format!("t/v/v-{a}\t/t/v/v-{a}\t-\t-\n"),
+                ),
+                (
+                    format!("list t/v/v-{b}"),
+                    format!("t/v/v-{b}\t/t/v/v-{b}\t-\t-\n"),
+                ),
+                (
+                    format!("list t/v/v-{c}"),
+                    format!("t/v/v-{c}\t/t/v/v-{c}\t-\t-\n"),
+                ),
                 (format!("userspace t/v/v-{b}"), "0\n".into()),
                 (
                     format!("userspace t/v/v-{c}"),
@@ -4532,6 +4625,23 @@ mod tests {
                 .find(|(d, _)| d == ds)
                 .map(|(_, u)| u.iter().copied().collect())
                 .unwrap_or_default())
+        }
+        fn origin(&self, _: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
+            Ok(None)
+        }
+    }
+
+    /// A [`HoldTable`] whose datasets may be clones.
+    struct CloneTable(HoldTable, Vec<(Dataset, (Dataset, Lsn))>);
+    impl Holdings for CloneTable {
+        fn children(&self, r: &Dataset) -> Result<Vec<Dataset>, LayerError> {
+            self.0.children(r)
+        }
+        fn owner_uids(&self, ds: &Dataset) -> Result<std::collections::BTreeSet<u32>, LayerError> {
+            self.0.owner_uids(ds)
+        }
+        fn origin(&self, ds: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
+            Ok(self.1.iter().find(|(d, _)| d == ds).map(|(_, o)| o.clone()))
         }
     }
 
