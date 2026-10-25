@@ -641,6 +641,8 @@ mod tests {
 
     fn vc(subject: &str, slot: u32) -> VesselConf {
         VesselConf {
+            candidate: None,
+            verifier: None,
             template: None,
             fork: None,
             namespace: Namespace::from_bytes([7; 16]),

@@ -24,6 +24,11 @@
 //! forks after the last turn.  Every answer goes into the stats; a refusal
 //! is an answer, not an error.
 //!
+//! P4 (file 6c): `--nominate CLASSES` (repeatable) asks, after the last
+//! turn and before any fork, for the newest Seal to be nominated with the
+//! comma-separated classes dropped (`""`: none); each answer goes into
+//! the stats as `nominations`.
+//!
 //! `--bare` runs the same writes with no Field at all: the baseline the
 //! gate compares against ("p95 write latency ≤ 1.5× bare local NVMe").
 //!
@@ -43,7 +48,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use taso_core::record::{Consequence, RetryPolicy};
 use taso_field::protocol::{
-    recv_reply, send_request, EffectResult, ForkResult, PromoteResult, Reply, Request, VERSION,
+    recv_reply, send_request, EffectResult, ForkResult, NominateResult, PromoteResult, Reply,
+    Request, VERSION,
 };
 
 /// The command line.
@@ -71,6 +77,8 @@ struct Opts {
     forks: u64,
     /// Children to promote, right after Hello.
     promote: Vec<String>,
+    /// Nominations asked for after the last turn: the classes each drops.
+    nominate: Vec<Vec<String>>,
 }
 
 impl Default for Opts {
@@ -90,6 +98,7 @@ impl Default for Opts {
             effects: 0,
             forks: 0,
             promote: Vec::new(),
+            nominate: Vec::new(),
         }
     }
 }
@@ -120,6 +129,13 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--effects" => o.effects = num(val()?)?,
             "--forks" => o.forks = num(val()?)?,
             "--promote" => o.promote.push(val()?),
+            "--nominate" => o.nominate.push(
+                val()?
+                    .split(',')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
             "--synchronous" => {
                 o.synchronous = val()?;
                 if !["off", "normal", "full", "extra"].contains(&o.synchronous.as_str()) {
@@ -309,6 +325,25 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
             std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
         }
     }
+    let mut nominations = Vec::new();
+    for exclude in if promoted { &[][..] } else { &o.nominate[..] } {
+        nominations.push(
+            match field.ask(Request::Nominate {
+                seal: None,
+                exclude: exclude.clone(),
+            })? {
+                None => json!({ "retry": "bare: no Field" }),
+                Some(Reply::Nominate { result }) => match result {
+                    NominateResult::Nominated { candidate } => json!({ "nominated": candidate }),
+                    NominateResult::Pending { candidate } => json!({ "pending": candidate }),
+                    NominateResult::Refused { reason } => json!({ "refused": reason }),
+                    NominateResult::Retry { why } => json!({ "retry": why }),
+                    NominateResult::NoVerifier => json!({ "no_verifier": true }),
+                },
+                Some(r) => return Err(format!("unexpected answer to Nominate: {r:?}")),
+            },
+        );
+    }
     let mut forks = Vec::new();
     for _ in 0..fork_asks {
         forks.push(match field.ask(Request::Fork { seal: None })? {
@@ -338,6 +373,7 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
         "turn_end": summary(turn_ends),
         "effects": { "released": released, "held": held, "refused": refused },
         "promotions": promotions,
+        "nominations": nominations,
         "adopted_states": adopted_states,
         "forks": forks,
     }))
@@ -425,8 +461,11 @@ mod tests {
         .unwrap();
         assert_eq!((o.effects, o.forks), (2, 1));
         assert_eq!(o.promote, ["a", "b"]);
+        let o = parse(&s(&["--nominate", "Scratch", "--nominate", ""])).unwrap();
+        assert_eq!(o.nominate, [vec!["Scratch".to_string()], vec![]]);
         for bad in [
-            &["--turns"][..],
+            &["--nominate"][..],
+            &["--turns"],
             &["--turns", "x"],
             &["--turns", "0"],
             &["--synchronous", "maybe"],

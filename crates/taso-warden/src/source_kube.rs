@@ -410,6 +410,8 @@ impl<L: ListVessels> KubeSource<L> {
         }
 
         let vc = VesselConf {
+            candidate: None,
+            verifier: None,
             template: None,
             fork,
             effects: None,

@@ -162,11 +162,11 @@ use crate::vessel::{
     Ensured, Host, Pool, ReadLog, SealAt, TemplateBirth, Vessel, VesselError, BIRTH_TURN,
 };
 use crate::zfs::{Dataset, Snapshot};
-use taso_core::contract::{ContractRecord, StorageKind, TemplateRef};
+use taso_core::contract::{ContractRecord, NominatedBy, PathClass, StorageKind, TemplateRef};
 use taso_core::coordlog::Submitted;
 use taso_core::model::WardenId;
 use taso_core::record::{Origin, TemplateAsked};
-use taso_field::protocol::PromoteResult;
+use taso_field::protocol::{NominateResult, PromoteResult};
 
 // ── Config ──────────────────────────────────────────────────────────
 
@@ -437,6 +437,12 @@ pub struct VesselConf {
     /// Forked from another Vessel on this node instead of born from the
     /// void ([`ForkConf`]); `None`: a birth.
     pub fork: Option<ForkConf>,
+    /// Its verifier requirement (D57, `"verifier"`); `None`: it cannot
+    /// nominate.  (Boxed, as `runtime`.)
+    pub verifier: Option<Box<VerifierConf>>,
+    /// Its Seal nominated at each start (`"candidate"`); needs `verifier`.
+    /// (Boxed, as `runtime`.)
+    pub candidate: Option<Box<CandidateConf>>,
     /// Born from a Template (P4 §5.5, D50: `"template": "<name>@<version>"`
     /// or `"<template_id>"`) instead of the void; `None`: not.  Excludes
     /// `fork`.  A Vessel that exists already must have been born from this
@@ -483,6 +489,8 @@ impl ForksConf {
     /// `seal`.
     pub fn child(parent: &VesselConf, slot: u32, seal: Lsn) -> VesselConf {
         VesselConf {
+            candidate: None,
+            verifier: None,
             template: None,
             namespace: parent.namespace,
             subject: Self::child_name(&parent.subject, slot),
@@ -773,6 +781,39 @@ pub struct Config {
     pub source: SourceConf,
     /// The Vessels to run (a static source; empty for any other).
     pub vessels: Vec<VesselConf>,
+    /// Nominations on this node (P4 §3.1, D58): `"sanction": {"classmap":
+    /// "<path>", "allowed_exclude": [<class>, ...]}`; `None`: this node
+    /// nominates nothing.
+    pub sanction: Option<SanctionNodeConf>,
+}
+
+/// The node's `"sanction"` (D58).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SanctionNodeConf {
+    /// The classification map's file, read when the node starts.
+    pub classmap: PathBuf,
+    /// The classes a nomination may drop (default `[Scratch]`).
+    pub allowed_exclude: std::collections::BTreeSet<PathClass>,
+}
+
+/// A Vessel's `"verifier"` (D57): its verifier requirement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifierConf {
+    /// The verifier Template, `name@version` or a `template_id` (D50).
+    pub template: TemplateRef,
+    /// The verifier config's file: its bytes are the `vconf` object.
+    pub config: PathBuf,
+    /// The requirement's version, set by the operator.
+    pub version: u32,
+}
+
+/// A Vessel's `"candidate"`: its Seal nominated at start (§3.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateConf {
+    /// Which Seal.
+    pub seal: SealAt,
+    /// The classes dropped.
+    pub exclude: std::collections::BTreeSet<PathClass>,
 }
 
 /// Where a node's Vessels live.
@@ -928,6 +969,72 @@ fn opt_strings(v: &Value, key: &str) -> Result<Option<Vec<String>>, ConfigError>
         return Ok(None);
     }
     strings(v, key).map(Some)
+}
+
+/// A list of class names (D58): each one a map assigns, at most once.
+fn classes(v: &Value, what: &str) -> Result<std::collections::BTreeSet<PathClass>, ConfigError> {
+    let Some(a) = v.as_array() else {
+        return Err(bad(format!("{what:?} must be an array of class names")));
+    };
+    let mut out = std::collections::BTreeSet::new();
+    for x in a {
+        let name = x
+            .as_str()
+            .ok_or_else(|| bad(format!("{what:?}: every class must be a string")))?;
+        let c = crate::nominate::class_named(name)
+            .ok_or_else(|| bad(format!("{what:?}: {name:?} is not a class")))?;
+        if !out.insert(c) {
+            return Err(bad(format!("{what:?}: {name:?} is listed twice")));
+        }
+    }
+    Ok(out)
+}
+
+/// The node's `"sanction"` ([`SanctionNodeConf`]).
+fn sanction_conf(v: &Value) -> Result<SanctionNodeConf, ConfigError> {
+    only_keys(v, "sanction", &["classmap", "allowed_exclude"])?;
+    Ok(SanctionNodeConf {
+        classmap: abs_path(v, "classmap")?,
+        allowed_exclude: match v.get("allowed_exclude") {
+            None => [PathClass::Scratch].into(),
+            Some(a) => classes(a, "sanction.allowed_exclude")?,
+        },
+    })
+}
+
+/// A Vessel's `"verifier"` ([`VerifierConf`]).
+fn verifier_conf(v: &Value) -> Result<VerifierConf, ConfigError> {
+    only_keys(v, "verifier", &["template", "config", "version"])?;
+    Ok(VerifierConf {
+        template: TemplateRef::parse(&string(v, "template")?)
+            .map_err(|e| bad(format!("\"verifier.template\": {e}")))?,
+        config: abs_path(v, "config")?,
+        version: u32::try_from(
+            field(v, "version")?
+                .as_u64()
+                .ok_or_else(|| bad("\"verifier.version\" must be an integer"))?,
+        )
+        .map_err(|_| bad("\"verifier.version\" is too large"))?,
+    })
+}
+
+/// A Vessel's `"candidate"` ([`CandidateConf`]).
+fn candidate_conf(v: &Value) -> Result<CandidateConf, ConfigError> {
+    only_keys(v, "candidate", &["seal", "exclude"])?;
+    let seal = match v.get("seal") {
+        None => SealAt::Last,
+        Some(Value::String(s)) if s == "last" => SealAt::Last,
+        Some(n) => SealAt::At(Lsn::new(n.as_u64().filter(|n| *n > 0).ok_or_else(
+            || bad("\"candidate.seal\" must be \"last\" or a positive lsn"),
+        )?)),
+    };
+    Ok(CandidateConf {
+        seal,
+        exclude: match v.get("exclude") {
+            None => std::collections::BTreeSet::new(),
+            Some(a) => classes(a, "candidate.exclude")?,
+        },
+    })
 }
 
 /// A Vessel's `"fork"` ([`ForkConf`]).  Unknown keys are refused: a
@@ -1267,6 +1374,14 @@ impl Config {
                             None | Some(Value::Null) => None,
                             Some(f) => Some(fork_conf(f)?),
                         },
+                        verifier: match x.get("verifier") {
+                            None | Some(Value::Null) => None,
+                            Some(f) => Some(Box::new(verifier_conf(f)?)),
+                        },
+                        candidate: match x.get("candidate") {
+                            None | Some(Value::Null) => None,
+                            Some(f) => Some(Box::new(candidate_conf(f)?)),
+                        },
                         template: match x.get("template") {
                             None | Some(Value::Null) => None,
                             Some(Value::String(t)) => Some(Box::new(
@@ -1327,6 +1442,12 @@ impl Config {
             }
             vc.effective(&runtime, &quiescence)
                 .map_err(|e| bad(format!("vessel {:?}: {e}", vc.subject)))?;
+            if vc.candidate.is_some() && (vc.verifier.is_none() || v.get("sanction").is_none()) {
+                return Err(bad(format!(
+                    "vessel {:?}: a \"candidate\" needs its \"verifier\" and the node's \"sanction\"",
+                    vc.subject
+                )));
+            }
             if vc.template.is_some() && vc.fork.is_some() {
                 return Err(bad(format!(
                     "vessel {:?}: \"template\" and \"fork\" exclude each other",
@@ -1391,6 +1512,23 @@ impl Config {
             runtime,
             quiescence,
             source,
+            sanction: match v.get("sanction") {
+                None | Some(Value::Null) => None,
+                Some(s) => {
+                    let c = sanction_conf(s)?;
+                    for vc in &vessels {
+                        if let Some(k) = &vc.candidate {
+                            if !k.exclude.is_subset(&c.allowed_exclude) {
+                                return Err(bad(format!(
+                                    "vessel {:?}: \"candidate.exclude\" is not within \"sanction.allowed_exclude\"",
+                                    vc.subject
+                                )));
+                            }
+                        }
+                    }
+                    Some(c)
+                }
+            },
             vessels,
         })
     }
@@ -1617,6 +1755,40 @@ struct NodeBranches<'n> {
     /// Requested once a promotion is done: the run ends, and the files are
     /// adopted at the next start (C7).
     promoted: &'n Stop,
+}
+
+/// A Vessel's Nominate requests on this node (§3.1).
+struct NodeNominations<'n> {
+    node: &'n Node,
+    vc: &'n VesselConf,
+}
+
+impl crate::field::Nominations<StorageLayers> for NodeNominations<'_> {
+    fn nominate(
+        &mut self,
+        vessel: &mut Vessel<StorageLayers>,
+        seal: Option<u64>,
+        exclude: &[String],
+    ) -> NominateResult {
+        let mut ex = std::collections::BTreeSet::new();
+        for name in exclude {
+            match crate::nominate::class_named(name) {
+                Some(c) if ex.insert(c) => {}
+                Some(_) => {
+                    return NominateResult::Refused {
+                        reason: format!("{name:?} is listed twice"),
+                    }
+                }
+                None => {
+                    return NominateResult::Refused {
+                        reason: format!("{name:?} is not a class"),
+                    }
+                }
+            }
+        }
+        self.node
+            .nominate(self.vc, vessel, seal.map(Lsn::new), ex, NominatedBy::Agent)
+    }
 }
 
 /// How long an agent that asked for a promotion has to exit by itself
@@ -2101,6 +2273,8 @@ pub struct Node {
     /// A failpoint of a Template birth to stop at ([`BIRTH_FAILPOINTS`];
     /// tests on a node, `TASO_FAILPOINT`).
     failpoint: Option<&'static str>,
+    /// Nominations on this node (P4 §3.1), if `"sanction"` is set.
+    nominator: Option<crate::nominate::Nominator>,
 }
 
 /// The failpoints of a Template birth (P4 spec rev. 17 §10.2, file 5): the
@@ -2172,6 +2346,36 @@ impl Node {
                 failpoint: crate::template::no_failpoints(),
                 lock: std::sync::Mutex::new(()),
             });
+        let nominator = match &config.sanction {
+            None => None,
+            Some(sc) => {
+                let bytes = std::fs::read(&sc.classmap).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "reading the classification map {}: {e}",
+                            sc.classmap.display()
+                        ),
+                    )
+                })?;
+                let mut conf = crate::nominate::SanctionConf::new(bytes).map_err(|e| {
+                    io::Error::other(format!(
+                        "the classification map {}: {e}",
+                        sc.classmap.display()
+                    ))
+                })?;
+                conf.allowed_exclude = sc.allowed_exclude.clone();
+                Some(crate::nominate::Nominator::new(
+                    store.clone(),
+                    config.prefix.clone(),
+                    coord.clone(),
+                    config.warden,
+                    config.runtime.host_uid_base,
+                    config.state_dir.join("nominate-tmp"),
+                    conf,
+                ))
+            }
+        };
         Ok(Self {
             config,
             coord,
@@ -2183,6 +2387,7 @@ impl Node {
             started: Default::default(),
             layers,
             failpoint: None,
+            nominator,
         })
     }
 
@@ -2195,14 +2400,25 @@ impl Node {
         };
         let at = BIRTH_FAILPOINTS
             .iter()
+            .chain(crate::nominate::FAILPOINTS.iter())
             .copied()
             .find(|p| *p == name)
             .ok_or_else(|| {
                 format!(
-                    "{name:?} is not a failpoint of a Template birth ({})",
-                    BIRTH_FAILPOINTS.join(", ")
+                    "{name:?} is not a failpoint of a Template birth or a nomination ({}, {})",
+                    BIRTH_FAILPOINTS.join(", "),
+                    crate::nominate::FAILPOINTS.join(", ")
                 )
             })?;
+        if let Some(n) = self.nominator.as_mut() {
+            n.failpoint = Box::new(move |p| {
+                if p == at {
+                    Err(crate::nominate::NominateError::Failpoint(p))
+                } else {
+                    Ok(())
+                }
+            });
+        }
         if let Some(l) = self.layers.as_mut() {
             l.failpoint = Box::new(move |p| {
                 if p == at {
@@ -2256,6 +2472,60 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Nominate `vessel`'s Seal for `vc` (§3.1): the answer for the
+    /// agent, or why this Vessel cannot nominate.
+    fn nominate(
+        &self,
+        vc: &VesselConf,
+        vessel: &mut Vessel<StorageLayers>,
+        seal: Option<Lsn>,
+        exclude: std::collections::BTreeSet<PathClass>,
+        by: NominatedBy,
+    ) -> NominateResult {
+        let (Some(n), Some(vf)) = (self.nominator.as_ref(), vc.verifier.as_deref()) else {
+            return NominateResult::NoVerifier;
+        };
+        let retry = |why: String| NominateResult::Retry { why };
+        let verifier = match self.resolve_template(&vf.template) {
+            Ok((t, _)) => t,
+            Err(e) => return retry(format!("the verifier Template: {e}")),
+        };
+        let vconf = match std::fs::read(&vf.config) {
+            Ok(b) => b,
+            Err(e) => return retry(format!("reading {}: {e}", vf.config.display())),
+        };
+        let ask = crate::nominate::Ask {
+            seal,
+            exclude,
+            verifier,
+            vconf,
+            version: vf.version,
+            by,
+        };
+        let packs = match self.packs(vessel.id()) {
+            Ok(p) => p,
+            Err(e) => return retry(format!("packs: {e}")),
+        };
+        let ds = vessel.dataset().clone();
+        let view = |lsn: Lsn| Pool::seal_view(&self.storage, &ds, lsn);
+        let hex = |h: taso_core::envelope::HashVal| h.to_string();
+        let answer = match n.nominate(vessel, &packs, &ask, &view) {
+            Ok(crate::nominate::Answer::Nominated(c)) => {
+                NominateResult::Nominated { candidate: hex(c) }
+            }
+            Ok(crate::nominate::Answer::Pending(c)) => {
+                NominateResult::Pending { candidate: hex(c) }
+            }
+            Ok(crate::nominate::Answer::Refused(r)) => NominateResult::Refused {
+                reason: format!("{r:?}"),
+            },
+            Ok(crate::nominate::Answer::Retry(why)) => retry(why),
+            Err(e) => retry(format!("nothing accepted: {e}")),
+        };
+        self.log(vc, format_args!("nomination ({by:?}): {answer:?}"));
+        answer
     }
 
     /// Birth `vc` from its Template (§5.6): resolve it, receive its layer
@@ -2632,6 +2902,21 @@ impl Node {
                 ),
             }
         }
+        // The entry's Candidate (§3.1), nominated at each start; the same
+        // request answers from the log (D61).
+        if let Some(c) = vc.candidate.as_deref() {
+            let seal = match c.seal {
+                SealAt::Last => None,
+                SealAt::At(l) => Some(l),
+            };
+            self.nominate(
+                vc,
+                &mut vessel,
+                seal,
+                c.exclude.clone(),
+                NominatedBy::Config,
+            );
+        }
         let effects_publisher =
             PackPublisher::new(self.packs(id)?, self.coord.clone(), self.config.warden);
         // Who may release effects: the entry's say, else by origin (a
@@ -2950,10 +3235,12 @@ impl Node {
             vc,
             promoted,
         };
+        let mut nominations = NodeNominations { node: self, vc };
         let mut session = Session::new(&mut vessel, verdict)?
             .with_effects(&mut effects)
             .with_after_seal(&mut publisher)
-            .with_branches(&mut branches);
+            .with_branches(&mut branches)
+            .with_nominations(&mut nominations);
         if let Some(w) = watch {
             session = session.with_watch(w);
         }
@@ -3348,6 +3635,116 @@ mod tests {
             { "namespace": "01010101010101010101010101010101", "subject": "b", "takeover": {"holder": 2, "epoch": 5}, "uid_slot": 7 }
         ]
     }"#;
+
+    /// P4 file 6c (D57, D58): the node's `"sanction"`, a Vessel's
+    /// `"verifier"` and `"candidate"`, and what each needs.
+    #[test]
+    fn sanction_verifier_and_candidate_entries() {
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            f(&mut v);
+            Config::parse(&v.to_string())
+        };
+        let full = |v: &mut Value| {
+            v["sanction"] = serde_json::json!({"classmap": "/etc/taso/map.toml"});
+            v["vessels"][0]["verifier"] = serde_json::json!({"template": "checks@2", "config": "/etc/taso/v.toml", "version": 3});
+            v["vessels"][0]["candidate"] =
+                serde_json::json!({"seal": "last", "exclude": ["Scratch"]});
+        };
+        let c = with(&full).unwrap();
+        let s = c.sanction.unwrap();
+        assert_eq!(s.classmap, PathBuf::from("/etc/taso/map.toml"));
+        assert_eq!(
+            s.allowed_exclude,
+            [PathClass::Scratch].into(),
+            "the default"
+        );
+        let vf = c.vessels[0].verifier.as_deref().unwrap();
+        assert_eq!(
+            vf.template,
+            TemplateRef::Named {
+                name: "checks".into(),
+                version: 2
+            }
+        );
+        assert_eq!(
+            (vf.config.as_path(), vf.version),
+            (Path::new("/etc/taso/v.toml"), 3)
+        );
+        let k = c.vessels[0].candidate.as_deref().unwrap();
+        assert_eq!(
+            (k.seal, k.exclude.clone()),
+            (SealAt::Last, [PathClass::Scratch].into())
+        );
+        // A Seal by lsn, nothing dropped.
+        let c = with(&|v| {
+            full(v);
+            v["vessels"][0]["candidate"] = serde_json::json!({"seal": 7});
+        })
+        .unwrap();
+        let k = c.vessels[0].candidate.as_deref().unwrap();
+        assert_eq!((k.seal, k.exclude.len()), (SealAt::At(Lsn::new(7)), 0));
+        let refused = |f: &dyn Fn(&mut Value), says: &str| {
+            let e = with(f).unwrap_err().0;
+            assert!(e.contains(says), "{says}: {e}");
+        };
+        refused(
+            &|v| {
+                full(v);
+                v["vessels"][0].as_object_mut().unwrap().remove("verifier");
+            },
+            "needs its \"verifier\"",
+        );
+        refused(
+            &|v| {
+                full(v);
+                v.as_object_mut().unwrap().remove("sanction");
+            },
+            "the node's \"sanction\"",
+        );
+        refused(
+            &|v| {
+                full(v);
+                v["vessels"][0]["candidate"]["exclude"] = serde_json::json!(["Source"]);
+            },
+            "not within",
+        );
+        refused(
+            &|v| {
+                full(v);
+                v["sanction"]["allowed_exclude"] = serde_json::json!(["Scratch", "Scratch"]);
+            },
+            "listed twice",
+        );
+        refused(
+            &|v| {
+                full(v);
+                v["sanction"]["allowed_exclude"] = serde_json::json!(["Structural"]);
+            },
+            "is not a class",
+        );
+        refused(
+            &|v| {
+                full(v);
+                v["vessels"][0]["verifier"]["template"] = "checks".into();
+            },
+            "verifier.template",
+        );
+        refused(
+            &|v| {
+                full(v);
+                v["vessels"][0]["candidate"]["seal"] = 0.into();
+            },
+            "positive lsn",
+        );
+        refused(
+            &|v| {
+                full(v);
+                v["sanction"]["extra"] = 1.into();
+            },
+            "sanction",
+        );
+    }
 
     /// P4 file 5f: `runtime.template_slot` is reserved and a Vessel's
     /// `"template"` names an exact Template (D50, D53).
@@ -3816,6 +4213,8 @@ mod tests {
         assert_eq!(
             child,
             VesselConf {
+                candidate: None,
+                verifier: None,
                 template: None,
                 namespace: parent.namespace,
                 subject: "a-fork-9".into(),
@@ -4147,6 +4546,8 @@ mod tests {
         let mut rt = Config::parse(GOOD).unwrap().runtime;
         rt.landlock_shim = None;
         let vc = |landlock| VesselConf {
+            candidate: None,
+            verifier: None,
             template: None,
             fork: None,
             namespace: Namespace::from_bytes([1; 16]),

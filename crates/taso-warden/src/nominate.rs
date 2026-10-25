@@ -106,6 +106,20 @@ impl SanctionConf {
     }
 }
 
+/// A class by its name in the classification map (`"Scratch"`, …): one
+/// of the six a map assigns.
+pub fn class_named(name: &str) -> Option<PathClass> {
+    Some(match name {
+        "Source" => PathClass::Source,
+        "Config" => PathClass::Config,
+        "Hook" => PathClass::Hook,
+        "Secret" => PathClass::Secret,
+        "Scratch" => PathClass::Scratch,
+        "Artifact" => PathClass::Artifact,
+        _ => return None,
+    })
+}
+
 /// What is asked for.
 #[derive(Clone, Debug)]
 pub struct Ask {
