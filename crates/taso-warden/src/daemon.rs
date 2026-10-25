@@ -1758,12 +1758,14 @@ struct NodeBranches<'n> {
 }
 
 /// A Vessel's Nominate requests on this node (§3.1).
-struct NodeNominations<'n> {
+struct NodeNominations<'n, 's, 'e> {
     node: &'n Node,
     vc: &'n VesselConf,
+    /// A Candidate nominated is attempted (D68).
+    verif: &'n std::cell::RefCell<Verifications<'s, 'e>>,
 }
 
-impl crate::field::Nominations<StorageLayers> for NodeNominations<'_> {
+impl crate::field::Nominations<StorageLayers> for NodeNominations<'_, '_, '_> {
     fn nominate(
         &mut self,
         vessel: &mut Vessel<StorageLayers>,
@@ -1786,8 +1788,231 @@ impl crate::field::Nominations<StorageLayers> for NodeNominations<'_> {
                 }
             }
         }
-        self.node
-            .nominate(self.vc, vessel, seal.map(Lsn::new), ex, NominatedBy::Agent)
+        let answer =
+            self.node
+                .nominate(self.vc, vessel, seal.map(Lsn::new), ex, NominatedBy::Agent);
+        if matches!(
+            answer,
+            NominateResult::Nominated { .. } | NominateResult::Pending { .. }
+        ) {
+            self.verif.borrow_mut().want();
+        }
+        answer
+    }
+}
+
+/// The session's work between requests: the attempts (D68).
+struct NodeTick<'n, 's, 'e>(&'n std::cell::RefCell<Verifications<'s, 'e>>);
+
+impl crate::field::Tick<StorageLayers> for NodeTick<'_, '_, '_> {
+    fn tick(&mut self, vessel: &mut Vessel<StorageLayers>) {
+        self.0.borrow_mut().tick(vessel);
+    }
+}
+
+/// What an attempt's thread sends back.
+struct Done {
+    started: taso_core::contract::VerificationStarted,
+    result: Result<(taso_core::contract::Outcome, Vec<u8>), crate::attempt::Stopped>,
+}
+
+/// A run's verification attempts (D68): started on the session's
+/// thread, run on threads of `scope`, finished on the session's thread.
+struct Verifications<'s, 'e> {
+    scope: &'s std::thread::Scope<'s, 'e>,
+    node: &'e Node,
+    vc: &'e VesselConf,
+    tx: std::sync::mpsc::Sender<Done>,
+    rx: std::sync::mpsc::Receiver<Done>,
+    /// The Candidates whose attempt runs now.
+    running: std::collections::BTreeSet<[u8; 32]>,
+    /// Look for Candidates to attempt (at the start, after a nomination,
+    /// when a slot frees).
+    want: bool,
+    /// When it last looked.
+    looked: Option<std::time::Instant>,
+}
+
+impl<'s, 'e> Verifications<'s, 'e> {
+    fn new(scope: &'s std::thread::Scope<'s, 'e>, node: &'e Node, vc: &'e VesselConf) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            scope,
+            node,
+            vc,
+            tx,
+            rx,
+            running: Default::default(),
+            want: true,
+            looked: None,
+        }
+    }
+
+    fn want(&mut self) {
+        self.want = true;
+        self.looked = None;
+    }
+
+    fn tick(&mut self, vessel: &mut Vessel<StorageLayers>) {
+        while let Ok(d) = self.rx.try_recv() {
+            self.done(vessel, d);
+        }
+        // At most once a second while waiting for a slot.
+        let due = self
+            .looked
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        if self.want && due {
+            self.launch(vessel);
+        }
+    }
+
+    /// Start an attempt of every open Candidate never attempted, while
+    /// slots are free.
+    fn launch(&mut self, vessel: &mut Vessel<StorageLayers>) {
+        self.looked = Some(std::time::Instant::now());
+        self.want = false;
+        let at = self.node.attempts();
+        let todo = match at.unattempted(vessel) {
+            Ok(t) => t,
+            Err(e) => {
+                self.node
+                    .log(self.vc, format_args!("listing Candidates to verify: {e}"));
+                return;
+            }
+        };
+        let packs = match self.node.packs(vessel.id()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.node.log(self.vc, format_args!("packs: {e}"));
+                return;
+            }
+        };
+        for cand in todo {
+            if self.running.contains(cand.candidate_id.as_bytes()) {
+                continue;
+            }
+            if !self.node.take_verifier_slot() {
+                self.want = true; // later, when a slot frees
+                return;
+            }
+            let st = match at.start(vessel, &packs, &cand) {
+                Ok(st) => st,
+                Err(e) => {
+                    self.node.release_verifier_slot();
+                    self.node.log(
+                        self.vc,
+                        format_args!(
+                            "Candidate {}: its attempt was not started: {e}",
+                            cand.candidate_id
+                        ),
+                    );
+                    continue;
+                }
+            };
+            self.node.log(
+                self.vc,
+                format_args!(
+                    "attempt {} of Candidate {}: started",
+                    st.attempt_id, cand.candidate_id
+                ),
+            );
+            self.running.insert(*cand.candidate_id.as_bytes());
+            let (node, tx) = (self.node, self.tx.clone());
+            self.scope.spawn(move || {
+                let result = match &node.layers {
+                    None => Ok((
+                        taso_core::contract::Outcome::LaunchFailed,
+                        b"a verifier runs on its Template's layer: runtime.template_slot is not set"
+                            .to_vec(),
+                    )),
+                    Some(layers) => {
+                        let (limits, reserved) = (
+                            crate::classify::Limits::default(),
+                            crate::classify::Reserved::defaults(),
+                        );
+                        crate::attempt::AttemptRun {
+                            pool: &node.storage,
+                            layers,
+                            store: &node.store,
+                            prefix: &node.config.prefix,
+                            root: &node.config.root,
+                            run_dir: &node.config.run_dir,
+                            limits: node.verifier_limits,
+                            walk_limits: &limits,
+                            reserved: &reserved,
+                            failpoint: node.attempt_failpoint.clone(),
+                        }
+                        .run(&st, &cand)
+                    }
+                };
+                let _ = tx.send(Done {
+                    started: st,
+                    result,
+                });
+            });
+        }
+    }
+
+    fn done(&mut self, vessel: &mut Vessel<StorageLayers>, d: Done) {
+        self.running.remove(d.started.candidate_id.as_bytes());
+        self.node.release_verifier_slot();
+        self.want();
+        let id = d.started.attempt_id;
+        match d.result {
+            Err(crate::attempt::Stopped(p)) => self.node.log(
+                self.vc,
+                format_args!(
+                    "attempt {id}: stopped at failpoint {p}; it stays open until the next start closes it"
+                ),
+            ),
+            Ok((outcome, output)) => {
+                let finished = self
+                    .node
+                    .packs(vessel.id())
+                    .map_err(|e| e.to_string())
+                    .and_then(|packs| {
+                        self.node
+                            .attempts()
+                            .finish(vessel, &packs, &d.started, outcome, output.clone())
+                            .map_err(|e| e.to_string())
+                    });
+                match finished {
+                    Ok(_) => {
+                        self.node.log(
+                            self.vc,
+                            format_args!(
+                                "attempt {id}: finished {outcome:?}, {} bytes of output",
+                                output.len()
+                            ),
+                        );
+                        if let Err(e) = crate::attempt::destroy_candidate(
+                            &self.node.storage,
+                            &self.node.config.root,
+                            id,
+                        ) {
+                            self.node
+                                .log(self.vc, format_args!("attempt {id}: its /candidate dataset: {e}"));
+                        }
+                    }
+                    Err(e) => self.node.log(
+                        self.vc,
+                        format_args!(
+                            "attempt {id}: ended {outcome:?} but its record was not accepted: {e}; the next start closes it"
+                        ),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Wait for the attempts still running and finish them.
+    fn drain(&mut self, vessel: &mut Vessel<StorageLayers>) {
+        while !self.running.is_empty() {
+            match self.rx.recv() {
+                Ok(d) => self.done(vessel, d),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -2159,9 +2384,9 @@ pub fn held_on<H: Holdings>(
     let mut warnings = Vec::new();
     for ds in pool.children(root)? {
         let name = ds.as_str().rsplit('/').next().unwrap_or_default();
-        // A Template's layer or build (P4 §5.6): no Vessel's, its range
-        // the reserved Template range.
-        if name.starts_with("t-") || name.starts_with("tb-") {
+        // A Template's layer or build (P4 §5.6), or an attempt's
+        // /candidate (D66): no Vessel's, its range the Template range.
+        if name.starts_with("t-") || name.starts_with("tb-") || name.starts_with("a-") {
             continue;
         }
         let Some(key) = name.strip_prefix("v-").and_then(key_of_hex) else {
@@ -2275,7 +2500,17 @@ pub struct Node {
     failpoint: Option<&'static str>,
     /// Nominations on this node (P4 §3.1), if `"sanction"` is set.
     nominator: Option<crate::nominate::Nominator>,
+    /// Verification attempts running on this node, of at most
+    /// `warden.max_concurrent_verifiers` (D68).
+    verifier_slots: std::sync::Mutex<usize>,
+    /// The node's verifier limits (`verifier.*`, §11.1).
+    verifier_limits: crate::verify::VerifierLimits,
+    /// A failpoint of an attempt to stop at (D70).
+    attempt_failpoint: crate::attempt::Failpoint,
 }
+
+/// `warden.max_concurrent_verifiers` (§11.1).
+const MAX_CONCURRENT_VERIFIERS: usize = 2;
 
 /// The failpoints of a Template birth (P4 spec rev. 17 §10.2, file 5): the
 /// layer's, then the Vessel's.  [`Node::with_failpoint`] stops a birth at
@@ -2388,6 +2623,9 @@ impl Node {
             layers,
             failpoint: None,
             nominator,
+            verifier_slots: std::sync::Mutex::new(0),
+            verifier_limits: crate::verify::VerifierLimits::default(),
+            attempt_failpoint: crate::attempt::no_failpoints(),
         })
     }
 
@@ -2401,15 +2639,18 @@ impl Node {
         let at = BIRTH_FAILPOINTS
             .iter()
             .chain(crate::nominate::FAILPOINTS.iter())
+            .chain(crate::attempt::FAILPOINTS.iter())
             .copied()
             .find(|p| *p == name)
             .ok_or_else(|| {
                 format!(
-                    "{name:?} is not a failpoint of a Template birth or a nomination ({}, {})",
+                    "{name:?} is not a failpoint of a Template birth, a nomination or an attempt ({}, {}, {})",
                     BIRTH_FAILPOINTS.join(", "),
-                    crate::nominate::FAILPOINTS.join(", ")
+                    crate::nominate::FAILPOINTS.join(", "),
+                    crate::attempt::FAILPOINTS.join(", ")
                 )
             })?;
+        self.attempt_failpoint = std::sync::Arc::new(move |p| p == at);
         if let Some(n) = self.nominator.as_mut() {
             n.failpoint = Box::new(move |p| {
                 if p == at {
@@ -2472,6 +2713,82 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// An attempt's records for this node (D68).
+    fn attempts(&self) -> crate::attempt::Attempts {
+        crate::attempt::Attempts {
+            coord: self.coord.clone(),
+            warden: self.config.warden,
+            failpoint: self.attempt_failpoint.clone(),
+        }
+    }
+
+    /// Take a verifier slot of this node, if one is free (D68).
+    fn take_verifier_slot(&self) -> bool {
+        let mut n = self
+            .verifier_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *n < MAX_CONCURRENT_VERIFIERS {
+            *n += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release_verifier_slot(&self) {
+        let mut n = self
+            .verifier_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+    }
+
+    /// At an open (D69): every open attempt of `vessel` closed
+    /// `Interrupted`, and every `/candidate` dataset of a finished attempt
+    /// destroyed by guid (D66).
+    fn settle_attempts(
+        &self,
+        vc: &VesselConf,
+        vessel: &mut Vessel<StorageLayers>,
+    ) -> Result<(), DaemonError> {
+        let at = self.attempts();
+        let packs = self.packs(vessel.id())?;
+        let closed = at.interrupt_open(vessel, &packs).map_err(|e| {
+            DaemonError::Refused(format!("closing its open verification attempts: {e}"))
+        })?;
+        for st in &closed {
+            self.log(
+                vc,
+                format_args!(
+                    "attempt {} of Candidate {}: interrupted (it was open at this start)",
+                    st.attempt_id, st.candidate_id
+                ),
+            );
+        }
+        let finished = at
+            .finished(vessel)
+            .map_err(|e| DaemonError::Refused(format!("reading its verification attempts: {e}")))?;
+        for st in finished {
+            match crate::attempt::destroy_candidate(&self.storage, &self.config.root, st.attempt_id)
+            {
+                Ok(true) => self.log(
+                    vc,
+                    format_args!(
+                        "attempt {}: destroyed its /candidate dataset, left by an earlier run",
+                        st.attempt_id
+                    ),
+                ),
+                Ok(false) => {}
+                Err(e) => self.log(
+                    vc,
+                    format_args!("attempt {}: its /candidate dataset: {e}", st.attempt_id),
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Nominate `vessel`'s Seal for `vc` (§3.1): the answer for the
@@ -2902,6 +3219,8 @@ impl Node {
                 ),
             }
         }
+        // Open attempts closed, leftovers destroyed (D69, D66).
+        self.settle_attempts(vc, &mut vessel)?;
         // The entry's Candidate (§3.1), nominated at each start; the same
         // request answers from the log (D61).
         if let Some(c) = vc.candidate.as_deref() {
@@ -3230,46 +3549,63 @@ impl Node {
             let dbs: Vec<&str> = rt.quiescence.iter().map(String::as_str).collect();
             Some(Watch::new(&mount, &dbs).map_err(io("quiescence watch"))?)
         };
-        let mut branches = NodeBranches {
-            node: self,
-            vc,
-            promoted,
-        };
-        let mut nominations = NodeNominations { node: self, vc };
-        let mut session = Session::new(&mut vessel, verdict)?
-            .with_effects(&mut effects)
-            .with_after_seal(&mut publisher)
-            .with_branches(&mut branches)
-            .with_nominations(&mut nominations);
-        if let Some(w) = watch {
-            session = session.with_watch(w);
-        }
-        serve_vessel(
-            &mut session,
-            &socket,
-            &sender,
-            &stop,
-            Duration::from_millis(20),
-            &mut |c| {
-                connections += 1;
-                self.log(
+        // Verification attempts run on their own threads within this scope
+        // (D68); their records go through the session's thread.
+        let (failures, last) =
+            std::thread::scope(|scope| -> Result<(u64, Option<String>), DaemonError> {
+                let verif = std::cell::RefCell::new(Verifications::new(scope, self, vc));
+                let mut branches = NodeBranches {
+                    node: self,
                     vc,
-                    format_args!("{:?} connection ended: {:?}", c.socket, c.ended),
-                );
-            },
-        )
-        .map_err(io("serving the sockets"))?;
-        let (failures, last) = session.after_seal_failures();
+                    promoted,
+                };
+                let mut nominations = NodeNominations {
+                    node: self,
+                    vc,
+                    verif: &verif,
+                };
+                let mut ticker = NodeTick(&verif);
+                let mut session = Session::new(&mut vessel, verdict)?
+                    .with_effects(&mut effects)
+                    .with_after_seal(&mut publisher)
+                    .with_branches(&mut branches)
+                    .with_nominations(&mut nominations)
+                    .with_tick(&mut ticker);
+                if let Some(w) = watch {
+                    session = session.with_watch(w);
+                }
+                serve_vessel(
+                    &mut session,
+                    &socket,
+                    &sender,
+                    &stop,
+                    Duration::from_millis(20),
+                    &mut |c| {
+                        connections += 1;
+                        self.log(
+                            vc,
+                            format_args!("{:?} connection ended: {:?}", c.socket, c.ended),
+                        );
+                    },
+                )
+                .map_err(io("serving the sockets"))?;
+                let (failures, last) = session.after_seal_failures();
+                let last = last.map(str::to_string);
+                drop(session);
+                // The agent is done: the attempts still running finish
+                // before the run returns.
+                verif.borrow_mut().drain(&mut vessel);
+                Ok((failures, last))
+            })?;
         if failures > 0 {
             self.log(
                 vc,
                 format_args!(
                     "{failures} Seal publishes failed, last: {}",
-                    last.unwrap_or("?")
+                    last.as_deref().unwrap_or("?")
                 ),
             );
         }
-        drop(session);
         let agent = agent
             .join()
             .map_err(|_| DaemonError::Io("the runc thread panicked".into()))?
@@ -3860,15 +4196,24 @@ mod tests {
         let void = void.id();
         let state = e.host.dir_for(tb).parent().unwrap().to_path_buf();
         let tbase = 200_000 + 9 * ID_RANGE;
+        let attempt_ds = crate::attempt::candidate_dataset(
+            &e.host.root,
+            taso_core::envelope::HashVal::from_bytes([3; 32]),
+        );
         let pool = HoldTable(vec![
             (layer.clone(), vec![tbase]),
+            (attempt_ds, vec![tbase]),
             (e.host.dataset_for(tb), vec![0, tbase, tbase + 5]),
             (e.host.dataset_for(void), vec![tbase]),
         ]);
         let root = Dataset::new("tank/vessels").unwrap();
         let (held, warnings) = held_on(&pool, &root, 200_000, Some(9), &state).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(held.len(), 2, "the layer is no Vessel's");
+        assert_eq!(
+            held.len(),
+            2,
+            "the layer and the attempt's /candidate are no Vessel's"
+        );
         let by = |k: ChronicleId| held.iter().find(|h| h.key == *k.as_bytes()).unwrap();
         assert_eq!(by(tb).slots, [].into());
         assert_eq!(by(tb).parent, None);

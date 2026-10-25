@@ -183,6 +183,13 @@ pub trait Nominations<L: Layers> {
     ) -> NominateResult;
 }
 
+/// Work the Warden does on the Vessel between requests, on the
+/// session's thread (P4 file 7c: verification attempts' records, D68).
+pub trait Tick<L: Layers> {
+    /// Called between requests, at least every serving tick.
+    fn tick(&mut self, vessel: &mut Vessel<L>);
+}
+
 /// One conversation with a Vessel's harness.
 pub struct Session<'v, L: Layers> {
     vessel: &'v mut Vessel<L>,
@@ -205,6 +212,8 @@ pub struct Session<'v, L: Layers> {
     branches: Option<&'v mut dyn Branches<L>>,
     /// Nominations, if this Vessel may ask for them.
     nominations: Option<&'v mut dyn Nominations<L>>,
+    /// Work between requests.
+    ticker: Option<&'v mut dyn Tick<L>>,
     /// A promotion is done and its files are adopted at the next start
     /// (C7): until then this Vessel takes no Seal (it would move), and the
     /// agent may only record transcript and read results.
@@ -245,6 +254,7 @@ impl<'v, L: Layers> Session<'v, L> {
             after_seal: None,
             branches: None,
             nominations: None,
+            ticker: None,
             adopting: false,
             after_seal_failures: 0,
             last_after_seal_error: None,
@@ -269,6 +279,19 @@ impl<'v, L: Layers> Session<'v, L> {
     pub fn with_after_seal(mut self, hook: &'v mut dyn AfterSeal<L>) -> Self {
         self.after_seal = Some(hook);
         self
+    }
+
+    /// Call `t` between requests ([`Tick`]).
+    pub fn with_tick(mut self, t: &'v mut dyn Tick<L>) -> Self {
+        self.ticker = Some(t);
+        self
+    }
+
+    /// Run the work between requests ([`Tick`]), if any.
+    pub fn tick(&mut self) {
+        if let Some(t) = self.ticker.as_deref_mut() {
+            t.tick(self.vessel);
+        }
     }
 
     /// Hand Nominate requests to `n`.
@@ -904,6 +927,7 @@ pub fn serve_vessel<L: Layers>(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!("tx is held here"),
             }
+            session.tick();
         }
     })?;
     session.after_reply();
