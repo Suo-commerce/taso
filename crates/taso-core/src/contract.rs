@@ -3959,6 +3959,18 @@ pub(crate) mod tests {
 
     proptest! {
         #[test]
+        fn a_purge_blocker_decode_inverts_encode(b in prop_oneof![
+            Just(PurgeBlocker::OpenObligation),
+            (chronicles(), chronicles())
+                .prop_map(|(holders, unknown)| PurgeBlocker::LivenessDependency { holders, unknown }),
+            hash().prop_map(|candidate_id| PurgeBlocker::OpenSanction { candidate_id }),
+            Just(PurgeBlocker::RetentionPin),
+            Just(PurgeBlocker::OpenAttempt),
+        ]) {
+            prop_assert_eq!(PurgeBlocker::decode(&b.bytes()).unwrap(), b);
+        }
+
+        #[test]
         fn decode_inverts_encode(r in arb_record()) {
             let b = r.canon_bytes();
             prop_assert_eq!(ContractRecord::decode(&b).unwrap(), r);
