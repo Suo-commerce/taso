@@ -11,6 +11,7 @@
 
 pub mod adoptcopy;
 pub mod artifact;
+pub mod attempt;
 mod bench;
 pub mod blk;
 pub mod chronicle;

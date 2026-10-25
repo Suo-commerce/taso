@@ -780,7 +780,7 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
 }
 
 /// §4.1.7: the walk equals the manifest entry for entry.
-fn same_entries(walked: &Manifest, want: &Manifest) -> bool {
+pub(crate) fn same_entries(walked: &Manifest, want: &Manifest) -> bool {
     walked.complete() && walked.unsupported.is_empty() && walked.entries == want.entries
 }
 
@@ -789,7 +789,7 @@ fn same_entries(walked: &Manifest, want: &Manifest) -> bool {
 /// 0750; an artifact has no entry for its root) and a `lost+found` the
 /// filesystem made `0:0` (file 4d).  The receive check requires the top
 /// directory to be the range's.
-fn own_top(dir: &Path, base: u32) -> io::Result<()> {
+pub(crate) fn own_top(dir: &Path, base: u32) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     std::os::unix::fs::chown(dir, Some(base), Some(base))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))?;
@@ -2052,5 +2052,392 @@ mod tests {
             h.born_from_template(NS, b"k", &stray, &vpacks(&c, &n1, id), &nofail),
             Err(VesselError::Pool(_))
         ));
+    }
+
+    // ── Verification attempts (P4 file 7b) ──────────────────────────
+
+    use crate::attempt::{self, AttemptError, AttemptRun, Attempts};
+    use crate::nominate::{Answer, Ask, Nominator, SanctionConf};
+    use taso_core::contract::{NominatedBy, Outcome as VOutcome, PathClass};
+    use taso_core::record::{StreamCut, TurnId, Verdict};
+
+    impl Cluster {
+        /// Another Template, by a genesis of `src` on node 0.
+        fn template_from(&self, src: &Path) -> ChronicleId {
+            let n0 = self.dir.path().join("node0");
+            let g = Genesis {
+                pool: DirPool {
+                    root: n0.join("pool"),
+                    state: Arc::default(),
+                },
+                store: self.store.clone(),
+                prefix: PREFIX.into(),
+                coord: self.coord.clone(),
+                warden: WardenId::new(100),
+                state_dir: n0.join("state"),
+                root: Dataset::new("tank/taso").unwrap(),
+                host_uid_base: BASE,
+                limits: Limits::default(),
+                reserved: Reserved::defaults(),
+                failpoint: genesis::no_failpoints(),
+            };
+            let r = g
+                .run(&Request {
+                    source: Source::Dir(src.to_path_buf()),
+                    classmap: MAP.as_bytes().to_vec(),
+                    authority: Authority {
+                        actor: "jarmo".into(),
+                        reason: "a verifier".into(),
+                    },
+                    hook_waiver: None,
+                    best_effort: true,
+                    peer: Peer { uid: 0, pid: 1 },
+                })
+                .unwrap();
+            let Outcome::Ready { template_id, .. } = r.outcome else {
+                panic!("{:?}", r.outcome)
+            };
+            template_id
+        }
+    }
+
+    struct Bytes;
+    impl Sender for Bytes {
+        fn send(&self, d: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream> {
+            Ok(Box::new(Cursor::new(
+                format!("{d} {from:?} {}", to.get()).into_bytes(),
+            )))
+        }
+    }
+
+    type FV = crate::vessel::Vessel<<crate::vessel::tests::FakePool as Pool>::Layers>;
+
+    /// A Vessel (fake pool) with one shipped Seal, nominated with `verifier`
+    /// as its verifier Template and `vconf`: its accepted Candidate.
+    fn nominated(
+        c: &Cluster,
+        subject: &[u8],
+        verifier: ChronicleId,
+        vconf: &[u8],
+    ) -> (
+        Host<crate::vessel::tests::FakePool>,
+        FV,
+        Packs<SharedStore, Bytes>,
+        taso_core::contract::Candidate,
+    ) {
+        let host = Host {
+            coord: c.coord.clone(),
+            pool: crate::vessel::tests::FakePool::default(),
+            root: Dataset::new("tank/vessels").unwrap(),
+            state_dir: c.dir.path().join(format!("vstate-{}", hex(subject))),
+            warden: WardenId::new(1),
+        };
+        let (mut v, _) = host.ensure(NS, subject).unwrap();
+        let packs = Packs::new(c.store.clone(), Bytes, PREFIX, v.id()).unwrap();
+        v.append(Stream::Fs, Payload::Raw(vec![1; 8])).unwrap();
+        let s = v
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                Lsn::new(0),
+                TurnId::new(1),
+            )
+            .unwrap()
+            .seal;
+        let snap = crate::zfs::Snapshot {
+            dataset: v.dataset().clone(),
+            seal: s.lsn,
+            createtxg: 1,
+            guid: crate::vessel::tests::fake_guid(s.lsn),
+            seal_hash: Some(s.hash),
+        };
+        v.publish_seal(&packs, &snap, None).unwrap();
+        // The Seal's files: one source file, owned by the Vessel's slot 1.
+        let tree = c.dir.path().join(format!("seal-{}", hex(subject)));
+        std::fs::create_dir_all(tree.join("app")).unwrap();
+        std::fs::write(tree.join("app/main.py"), "print(1)\n").unwrap();
+        let st = Command::new("chown")
+            .args(["-hR", &format!("{0}:{0}", BASE + SLOT)])
+            .arg(&tree)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let mut conf = SanctionConf::new(MAP.as_bytes().to_vec()).unwrap();
+        conf.min_interval = Duration::ZERO;
+        let n = Nominator::new(
+            c.store.clone(),
+            PREFIX,
+            c.coord.clone(),
+            WardenId::new(1),
+            BASE,
+            c.dir.path().join("ntmp"),
+            conf,
+        );
+        let ask = Ask {
+            seal: None,
+            exclude: [PathClass::Scratch].into(),
+            verifier,
+            vconf: vconf.to_vec(),
+            version: 1,
+            by: NominatedBy::Agent,
+        };
+        let t = tree.clone();
+        let a = n
+            .nominate(&mut v, &packs, &ask, &move |_| {
+                Ok(SealView::new(t.clone(), None))
+            })
+            .unwrap();
+        let Answer::Nominated(cid) = a else {
+            panic!("{a:?}")
+        };
+        let cand = match c
+            .coord
+            .query_logical(logical_id(&LogicalKey::Candidate(cid)))
+            .unwrap()
+        {
+            Some((_, Submitted::Contract(ContractRecord::Candidate(k)))) => *k,
+            other => panic!("{other:?}"),
+        };
+        (host, v, packs, cand)
+    }
+
+    fn attempts(c: &Cluster) -> Attempts {
+        Attempts {
+            coord: c.coord.clone(),
+            warden: WardenId::new(1),
+            failpoint: attempt::no_failpoints(),
+        }
+    }
+
+    const VCONF: &[u8] = b"version = 1\nentry = [\"/bin/sh\", \"-c\", \"exit 0\"]\n";
+
+    #[test]
+    fn an_attempt_holds_the_verifier_layer_and_the_artifact_until_it_finishes() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let at = attempts(&c);
+        assert_eq!(at.unattempted(&v).unwrap(), vec![cand.clone()]);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        assert_eq!(st.started_at, Lsn::new(v.tail().lsn.get() - 1));
+        let holds = c.coord.query_chronicle(v.id()).unwrap().unwrap().holds;
+        let layer = match c
+            .coord
+            .query_logical(logical_id(&LogicalKey::Template(c.t0)))
+            .unwrap()
+        {
+            Some((_, Submitted::Contract(ContractRecord::TemplateReady(t)))) => t.layer,
+            other => panic!("{other:?}"),
+        };
+        assert!(holds.contains(&ObjectId::content(layer)));
+        assert_eq!(at.open(&v).unwrap(), vec![st]);
+        assert!(at.unattempted(&v).unwrap().is_empty());
+        // One attempt at a time.
+        assert!(matches!(
+            at.start(&mut v, &packs, &cand),
+            Err(AttemptError::Submit(_))
+        ));
+        let f = at
+            .finish(
+                &mut v,
+                &packs,
+                &st,
+                VOutcome::Exit { code: 0 },
+                b"ok\n".to_vec(),
+            )
+            .unwrap();
+        assert!(f.is_consistent_with(&st));
+        assert!(at.open(&v).unwrap().is_empty());
+        assert_eq!(at.finished(&v).unwrap(), vec![st]);
+        // A finished Candidate is not attempted again by itself.
+        assert!(at.unattempted(&v).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_start_stopped_before_its_accept_leaves_the_candidate_unattempted() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let mut at = attempts(&c);
+        at.failpoint = Arc::new(|p| p == "verify.before_started_accept");
+        assert!(matches!(
+            at.start(&mut v, &packs, &cand),
+            Err(AttemptError::Failpoint("verify.before_started_accept"))
+        ));
+        at.failpoint = attempt::no_failpoints();
+        assert_eq!(at.unattempted(&v).unwrap(), vec![cand.clone()]);
+        assert!(at.open(&v).unwrap().is_empty());
+        at.start(&mut v, &packs, &cand).unwrap();
+        assert!(at.unattempted(&v).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_open_attempt_is_interrupted_by_the_next_owner_and_the_old_one_cannot_finish() {
+        let c = Cluster::new();
+        let (h, mut v1, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let at = attempts(&c);
+        let st = at.start(&mut v1, &packs, &cand).unwrap();
+        let at2 = Attempts {
+            coord: c.coord.clone(),
+            warden: WardenId::new(2),
+            failpoint: attempt::no_failpoints(),
+        };
+        // Another node takes the Vessel over (a fence) from what is shipped.
+        let h2 = Host {
+            coord: c.coord.clone(),
+            pool: crate::vessel::tests::FakePool::default(),
+            root: h.root.clone(),
+            state_dir: c.dir.path().join("vstate-node2"),
+            warden: WardenId::new(2),
+        };
+        let (mut v2, _) = h2.rebirth(v1.id(), &packs).unwrap();
+        let closed = at2.interrupt_open(&mut v2, &packs).unwrap();
+        assert_eq!(closed, vec![st]);
+        assert!(at2.open(&v2).unwrap().is_empty());
+        let f = match c
+            .coord
+            .query_logical(logical_id(&LogicalKey::AttemptFinished(st.attempt_id)))
+            .unwrap()
+        {
+            Some((_, Submitted::Contract(ContractRecord::VerificationFinished(f)))) => f,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!((f.outcome, f.output.len()), (VOutcome::Interrupted, 0));
+        // The old holder's late result: fenced.
+        assert!(at
+            .finish(&mut v1, &packs, &st, VOutcome::Exit { code: 0 }, Vec::new())
+            .is_err());
+        // Nothing more to interrupt.
+        assert!(at2.interrupt_open(&mut v2, &packs).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_start_naming_no_ready_template_is_refused() {
+        let c = Cluster::new();
+        let nobody = ChronicleId::from_bytes([0x42; 16]);
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", nobody, VCONF);
+        let e = attempts(&c).start(&mut v, &packs, &cand).unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                AttemptError::Submit(crate::submit::SubmitError::Refused(Final::Predicate(_)))
+            ),
+            "{e}"
+        );
+    }
+
+    fn run_with<'a>(
+        c: &'a Cluster,
+        node: &'a TemplateLayers<DirPool, DirSend>,
+        limits: &'a Limits,
+        reserved: &'a [Reserved],
+    ) -> AttemptRun<'a, DirPool, DirSend> {
+        AttemptRun {
+            pool: &node.pool,
+            layers: node,
+            store: &c.store,
+            prefix: PREFIX,
+            root: &node.root,
+            run_dir: Box::leak(Box::new(c.dir.path().join("run"))),
+            limits: crate::verify::VerifierLimits::default(),
+            walk_limits: limits,
+            reserved,
+            failpoint: attempt::no_failpoints(),
+        }
+    }
+
+    #[test]
+    fn what_keeps_an_attempt_from_starting_ends_it_launch_failed() {
+        let c = Cluster::new();
+        let node = c.node(1, StorageKind::Zfs);
+        let (limits, reserved) = (Limits::default(), Reserved::defaults());
+        let run = run_with(&c, &node, &limits, &reserved);
+        // A vconf that is not one.
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, b"entry = [\"/bin/true\"]\n");
+        let st = attempts(&c).start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        assert_eq!(o, VOutcome::LaunchFailed);
+        assert!(String::from_utf8(out).unwrap().contains("version"));
+        // T(0) has no mount targets (it is no verifier image).
+        let (_h, mut v, packs, cand) = nominated(&c, b"b", c.t0, VCONF);
+        let st = attempts(&c).start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        assert_eq!(o, VOutcome::LaunchFailed);
+        assert!(
+            String::from_utf8(out).unwrap().contains("no /proc"),
+            "launch failed for another reason"
+        );
+        // No /candidate dataset was made for it.
+        assert!(!attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id).unwrap());
+    }
+
+    /// A verifier image: the host's `sh` and `cat` with their libraries,
+    /// and the mount targets.
+    fn verifier_tree(at: &Path) {
+        for d in ["proc", "dev", "sys", "tmp", "candidate", "bin"] {
+            std::fs::create_dir_all(at.join(d)).unwrap();
+        }
+        for b in ["sh", "cat"] {
+            let host = Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {b}"))
+                .output()
+                .unwrap();
+            let host = PathBuf::from(String::from_utf8(host.stdout).unwrap().trim());
+            let host = std::fs::canonicalize(host).unwrap();
+            std::fs::copy(&host, at.join("bin").join(b)).unwrap();
+            let libs = Command::new("ldd").arg(&host).output().unwrap();
+            for l in String::from_utf8_lossy(&libs.stdout).split_whitespace() {
+                if l.starts_with('/') {
+                    let dest = at.join(l.trim_start_matches('/'));
+                    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                    std::fs::copy(l, &dest).unwrap();
+                }
+            }
+        }
+        let st = Command::new("chown")
+            .args(["-hR", "0:0"])
+            .arg(at)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        // Whole-second times: the test pool's tar streams keep no more.
+        let st = Command::new("sh")
+            .arg("-c")
+            .arg("find \"$0\" -mindepth 1 ! -type d -exec touch -h -d @1700000000 {} + && find \"$0\" -depth -type d -exec touch -d @1600000000 {} +")
+            .arg(at)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    }
+
+    /// The whole attempt, in a real container (as root, with runc and
+    /// user namespaces): the verifier reads `/candidate`, cannot write it,
+    /// and its exit status and output are the attempt's; `/candidate` is a
+    /// dataset destroyed once the attempt is finished.
+    #[test]
+    #[ignore = "needs root, runc and user namespaces"]
+    fn a_verifier_reads_the_candidate_and_its_exit_is_the_outcome() {
+        let c = Cluster::new();
+        let vt = c.dir.path().join("verifier");
+        verifier_tree(&vt);
+        let verifier = c.template_from(&vt);
+        let node = c.node(1, StorageKind::Zfs);
+        let (limits, reserved) = (Limits::default(), Reserved::defaults());
+        let run = run_with(&c, &node, &limits, &reserved);
+        let script = b"version = 1\nentry = [\"/bin/sh\", \"-c\", \"cat /candidate/app/main.py; if echo x > /candidate/x 2>/dev/null; then exit 9; fi; exit 3\"]\n";
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", verifier, script);
+        let at = attempts(&c);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        assert_eq!(
+            o,
+            VOutcome::Exit { code: 3 },
+            "{}",
+            String::from_utf8_lossy(&out)
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("print(1)\n"), "{text}");
+        assert!(text.contains("Read-only file system"), "{text}");
+        at.finish(&mut v, &packs, &st, o, out).unwrap();
+        assert!(attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id).unwrap());
     }
 }
