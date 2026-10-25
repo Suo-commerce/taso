@@ -1,4 +1,4 @@
-//! The decider socket's messages (P4 spec rev. 21 §5.1, D72, D73, D77).
+//! The decider socket's messages (P4 spec rev. 22 §5.1, D72, D73, D77, D78).
 //!
 //! Framed as the Field's (`crate::frame`). A body is a tag and its fields
 //! in the canonical encoding (§9); decoding is strict: unknown tags,

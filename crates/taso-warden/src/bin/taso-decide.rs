@@ -1,5 +1,5 @@
-//! `taso-decide`: a caller of the decider socket (P4 spec rev. 21 §5.1,
-//! D72, D73, D77; file 8c).
+//! `taso-decide`: a caller of the decider socket (P4 spec rev. 22 §5.1,
+//! D72, D73, D77, D78; file 8c).
 //!
 //! ```text
 //! taso-decide <warden-config> pending
@@ -37,8 +37,8 @@
 //! 0 answered; 1 an `Error` reply or no connection; 2 a bad command line or
 //! configuration; 3 the Candidate or attempt is not pending here.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 21, BLAKE3
-//! `9f602ee814d9e785a7f1dd1012320ef068a100e36a71602d49b07c5990260205`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 22, BLAKE3
+//! `f3a54561505ebef478c43426273d79c789ec60dc74d0ff9c74ae0455720bde46`.
 
 use std::process::ExitCode;
 

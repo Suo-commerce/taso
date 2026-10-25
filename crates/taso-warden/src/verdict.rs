@@ -1,5 +1,5 @@
 //! Verdicts: a caller's decision on a Candidate, recorded and acted on
-//! (P4 spec rev. 21 §5.1, §5.3 steps 1–4; D73, D75–D77; file 8a).
+//! (P4 spec rev. 22 §5.1, §5.3 steps 1–4; D73, D75–D78; file 8a).
 //!
 //! [`Verdicts::handle`] runs §5.3's steps through the Vessel's own log:
 //!
@@ -13,14 +13,14 @@
 //! 3. **Pre-check** of a Sanction: what can still change is answered
 //!    `NotCommitted` (D75); a Candidate closed since is `NotCommitted
 //!    { Closed }`, and a coordinator refusal at step 4 is `NotCommitted
-//!    { Conflict }` with its reason (D78).
+//!    { Conflict }`, its reason logged (D78).
 //! 4. **Commit**: `SanctionCommitted` with `template_id` (§9) and
 //!    `parent_template` (D76).
 //!
 //! [`pending`] is what a caller is shown (D73).
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 21, BLAKE3
-//! `9f602ee814d9e785a7f1dd1012320ef068a100e36a71602d49b07c5990260205`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 22, BLAKE3
+//! `f3a54561505ebef478c43426273d79c789ec60dc74d0ff9c74ae0455720bde46`.
 
 use std::collections::BTreeSet;
 use std::fmt;

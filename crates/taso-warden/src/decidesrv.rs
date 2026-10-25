@@ -1,4 +1,4 @@
-//! The decider socket (P4 spec rev. 21 §5.1, D72; file 8b).
+//! The decider socket (P4 spec rev. 22 §5.1, D72, D78; file 8b).
 //!
 //! A Unix socket, mode 0600 in a 0700 directory; the socket is the
 //! authentication in P4 (D1a): each connection's uid and pid are read
@@ -14,8 +14,8 @@
 //! is recorded. What a [`Decide`] cannot do (it failed) is answered
 //! `Error` and the connection stays open.
 //!
-//! Normative reference: `Taso_spec_p4_contracts` rev. 21, BLAKE3
-//! `9f602ee814d9e785a7f1dd1012320ef068a100e36a71602d49b07c5990260205`.
+//! Normative reference: `Taso_spec_p4_contracts` rev. 22, BLAKE3
+//! `f3a54561505ebef478c43426273d79c789ec60dc74d0ff9c74ae0455720bde46`.
 
 use std::collections::HashMap;
 use std::io;
