@@ -515,7 +515,7 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    const ALL: [Self; 12] = [
+    pub(crate) const ALL: [Self; 12] = [
         Self::StaleFacts,
         Self::Closed,
         Self::NoSuchCandidate,
@@ -2288,23 +2288,23 @@ impl CanonExt for Canon {
 // and sets or ordered lists not in strictly ascending order are refused,
 // so every accepted input re-encodes to itself.
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
 }
 
-type R<T> = Result<T, DecodeError>;
+pub(crate) type R<T> = Result<T, DecodeError>;
 
 impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.b.len() - self.pos
     }
 
-    fn take(&mut self, n: u64) -> R<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: u64) -> R<&'a [u8]> {
         if n > self.remaining() as u64 {
             return Err(DecodeError::Truncated {
                 at: self.pos,
@@ -2316,43 +2316,43 @@ impl<'a> Reader<'a> {
         Ok(&self.b[start..self.pos])
     }
 
-    fn u8(&mut self) -> R<u8> {
+    pub(crate) fn u8(&mut self) -> R<u8> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> R<u32> {
+    pub(crate) fn u32(&mut self) -> R<u32> {
         let mut a = [0u8; 4];
         a.copy_from_slice(self.take(4)?);
         Ok(u32::from_le_bytes(a))
     }
 
-    fn u64(&mut self) -> R<u64> {
+    pub(crate) fn u64(&mut self) -> R<u64> {
         let mut a = [0u8; 8];
         a.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(a))
     }
 
-    fn fixed<const N: usize>(&mut self) -> R<[u8; N]> {
+    pub(crate) fn fixed<const N: usize>(&mut self) -> R<[u8; N]> {
         let mut a = [0u8; N];
         a.copy_from_slice(self.take(N as u64)?);
         Ok(a)
     }
 
-    fn tag(&mut self) -> R<(usize, u8)> {
+    pub(crate) fn tag(&mut self) -> R<(usize, u8)> {
         let at = self.pos;
         Ok((at, self.u8()?))
     }
 
-    fn bad<T>(at: usize, what: &'static str, tag: u8) -> R<T> {
+    pub(crate) fn bad<T>(at: usize, what: &'static str, tag: u8) -> R<T> {
         Err(DecodeError::BadTag { at, what, tag })
     }
 
-    fn bytes(&mut self) -> R<Vec<u8>> {
+    pub(crate) fn bytes(&mut self) -> R<Vec<u8>> {
         let len = self.u64()?;
         Ok(self.take(len)?.to_vec())
     }
 
-    fn string(&mut self) -> R<String> {
+    pub(crate) fn string(&mut self) -> R<String> {
         let len = self.u64()?;
         let at = self.pos;
         let raw = self.take(len)?;
@@ -2361,7 +2361,7 @@ impl<'a> Reader<'a> {
             .map_err(|_| DecodeError::BadUtf8 { at })
     }
 
-    fn option<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
+    pub(crate) fn option<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
         match self.tag()? {
             (_, 0) => Ok(None),
             (_, 1) => f(self).map(Some),
@@ -2369,7 +2369,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn seq<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
+    pub(crate) fn seq<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
         let at = self.pos;
         let n = self.u64()?;
         if n > self.remaining() as u64 {
@@ -2383,7 +2383,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A sequence that must be strictly ascending by `key`.
-    fn ascending<T, K: Ord>(
+    pub(crate) fn ascending<T, K: Ord>(
         &mut self,
         what: &'static str,
         f: impl FnMut(&mut Self) -> R<T>,
@@ -2398,7 +2398,7 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
-    fn finish(&self) -> R<()> {
+    pub(crate) fn finish(&self) -> R<()> {
         match self.remaining() {
             0 => Ok(()),
             extra => Err(DecodeError::Trailing {
@@ -2410,38 +2410,38 @@ impl<'a> Reader<'a> {
 
     // ── leaves ──────────────────────────────────────────────────────
 
-    fn hash(&mut self) -> R<HashVal> {
+    pub(crate) fn hash(&mut self) -> R<HashVal> {
         self.fixed().map(HashVal::from_bytes)
     }
 
-    fn chronicle(&mut self) -> R<ChronicleId> {
+    pub(crate) fn chronicle(&mut self) -> R<ChronicleId> {
         self.fixed().map(ChronicleId::from_bytes)
     }
 
-    fn lsn(&mut self) -> R<Lsn> {
+    pub(crate) fn lsn(&mut self) -> R<Lsn> {
         self.u64().map(Lsn::new)
     }
 
-    fn authority(&mut self) -> R<Authority> {
+    pub(crate) fn authority(&mut self) -> R<Authority> {
         Ok(Authority {
             actor: self.string()?,
             reason: self.string()?,
         })
     }
 
-    fn class(&mut self) -> R<PathClass> {
+    pub(crate) fn class(&mut self) -> R<PathClass> {
         match self.tag()? {
             (_, t) if (t as usize) < PathClass::ALL.len() => Ok(PathClass::ALL[t as usize]),
             (at, t) => Self::bad(at, "path class", t),
         }
     }
 
-    fn class_set(&mut self) -> R<BTreeSet<PathClass>> {
+    pub(crate) fn class_set(&mut self) -> R<BTreeSet<PathClass>> {
         let v = self.ascending("path class set order", Self::class, |c| *c as u8)?;
         Ok(v.into_iter().collect())
     }
 
-    fn counts(&mut self) -> R<ClassCounts> {
+    pub(crate) fn counts(&mut self) -> R<ClassCounts> {
         Ok(ClassCounts {
             source: self.u64()?,
             config: self.u64()?,
@@ -2455,14 +2455,14 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn seal_ref(&mut self) -> R<SealRef> {
+    pub(crate) fn seal_ref(&mut self) -> R<SealRef> {
         Ok(SealRef {
             lsn: self.lsn()?,
             hash: self.hash()?,
         })
     }
 
-    fn requirement(&mut self) -> R<VerifierRequirement> {
+    pub(crate) fn requirement(&mut self) -> R<VerifierRequirement> {
         Ok(VerifierRequirement {
             template: self.chronicle()?,
             vconf_key: self.hash()?,
@@ -2470,7 +2470,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn facts(&mut self) -> R<Facts> {
+    pub(crate) fn facts(&mut self) -> R<Facts> {
         Ok(Facts {
             input: self.counts()?,
             excluded: self.counts()?,
@@ -2481,7 +2481,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn nominated_by(&mut self) -> R<NominatedBy> {
+    pub(crate) fn nominated_by(&mut self) -> R<NominatedBy> {
         match self.tag()? {
             (_, 0) => Ok(NominatedBy::Agent),
             (_, 1) => Ok(NominatedBy::Config),
@@ -2490,7 +2490,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn outcome(&mut self) -> R<Outcome> {
+    pub(crate) fn outcome(&mut self) -> R<Outcome> {
         match self.tag()? {
             (_, 0) => Ok(Outcome::Exit { code: self.u32()? }),
             (_, 1) => Ok(Outcome::Interrupted),
@@ -2501,7 +2501,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn decision(&mut self) -> R<Decision> {
+    pub(crate) fn decision(&mut self) -> R<Decision> {
         match self.tag()? {
             (_, 0) => Ok(Decision::Sanction),
             (_, 1) => Ok(Decision::Hold),
@@ -2512,14 +2512,14 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn peer(&mut self) -> R<Peer> {
+    pub(crate) fn peer(&mut self) -> R<Peer> {
         Ok(Peer {
             uid: self.u32()?,
             pid: self.u32()?,
         })
     }
 
-    fn verdict_request(&mut self) -> R<VerdictRequest> {
+    pub(crate) fn verdict_request(&mut self) -> R<VerdictRequest> {
         Ok(VerdictRequest {
             request_id: self.hash()?,
             candidate_id: self.hash()?,
@@ -2535,14 +2535,14 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn refusal(&mut self) -> R<Refusal> {
+    pub(crate) fn refusal(&mut self) -> R<Refusal> {
         match self.tag()? {
             (_, t) if (t as usize) < Refusal::ALL.len() => Ok(Refusal::ALL[t as usize]),
             (at, t) => Self::bad(at, "refusal", t),
         }
     }
 
-    fn close_kind(&mut self) -> R<CloseKind> {
+    pub(crate) fn close_kind(&mut self) -> R<CloseKind> {
         match self.tag()? {
             (_, 0) => Ok(CloseKind::Never {
                 verdict: self.hash()?,
@@ -2559,7 +2559,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn born_from(&mut self) -> R<BornFrom> {
+    pub(crate) fn born_from(&mut self) -> R<BornFrom> {
         match self.tag()? {
             (_, 0) => Ok(BornFrom::Sanction {
                 source: self.chronicle()?,
@@ -2573,11 +2573,11 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn chronicle_list(&mut self) -> R<Vec<ChronicleId>> {
+    pub(crate) fn chronicle_list(&mut self) -> R<Vec<ChronicleId>> {
         self.ascending("chronicle list order", Self::chronicle, |c| *c.as_bytes())
     }
 
-    fn defer_reason(&mut self) -> R<DeferReason> {
+    pub(crate) fn defer_reason(&mut self) -> R<DeferReason> {
         match self.tag()? {
             (_, 0) => Ok(DeferReason::OpenObligation),
             (_, 1) => Ok(DeferReason::LivenessDependency {
@@ -2595,7 +2595,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn consistency(&mut self) -> R<Consistency> {
+    pub(crate) fn consistency(&mut self) -> R<Consistency> {
         match self.tag()? {
             (_, 0) => Ok(Consistency::Immutable),
             (_, 1) => Ok(Consistency::BestEffort),
@@ -2603,14 +2603,14 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn walk_refusal(&mut self) -> R<WalkRefusal> {
+    pub(crate) fn walk_refusal(&mut self) -> R<WalkRefusal> {
         match self.tag()? {
             (_, t) if (t as usize) < WalkRefusal::ALL.len() => Ok(WalkRefusal::ALL[t as usize]),
             (at, t) => Self::bad(at, "walk refusal", t),
         }
     }
 
-    fn reclaim_outcome(&mut self) -> R<ReclaimOutcome> {
+    pub(crate) fn reclaim_outcome(&mut self) -> R<ReclaimOutcome> {
         match self.tag()? {
             (_, 0) => Ok(ReclaimOutcome::Deleted),
             (_, 1) => Ok(ReclaimOutcome::Absent),
@@ -2618,7 +2618,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn form(&mut self) -> R<ReplacementForm> {
+    pub(crate) fn form(&mut self) -> R<ReplacementForm> {
         match self.tag()? {
             (_, 0) => Ok(ReplacementForm::LogOnly),
             (_, 1) => Ok(ReplacementForm::Tombstone),
@@ -2626,7 +2626,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn nomination_refusal(&mut self) -> R<NominationRefusal> {
+    pub(crate) fn nomination_refusal(&mut self) -> R<NominationRefusal> {
         match self.tag()? {
             (_, 0) => Ok(NominationRefusal::Walk(self.walk_refusal()?)),
             (_, 1) => Ok(NominationRefusal::SealNotAccepted),
@@ -2642,14 +2642,14 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn pack_ref(&mut self) -> R<PackRef> {
+    pub(crate) fn pack_ref(&mut self) -> R<PackRef> {
         Ok(PackRef {
             name: self.string()?,
             digest: self.hash()?,
         })
     }
 
-    fn inventory_item(&mut self) -> R<InventoryItem> {
+    pub(crate) fn inventory_item(&mut self) -> R<InventoryItem> {
         Ok(InventoryItem {
             pack: self.pack_ref()?,
             sections: self.ascending("section order", Self::lsn, |l| *l)?,
@@ -2662,14 +2662,14 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn inventory(&mut self) -> R<Inventory> {
+    pub(crate) fn inventory(&mut self) -> R<Inventory> {
         let items = self.ascending("inventory order", Self::inventory_item, |i| {
             i.pack.name.clone()
         })?;
         Ok(Inventory { items })
     }
 
-    fn local_state(&mut self) -> R<LocalState> {
+    pub(crate) fn local_state(&mut self) -> R<LocalState> {
         Ok(LocalState {
             dataset_guid: self.u64()?,
             layers: self.ascending("layer order", |r| r.u64().map(LayerRef::new), |l| l.get())?,
@@ -2678,7 +2678,7 @@ impl<'a> Reader<'a> {
 
     // ── records ─────────────────────────────────────────────────────
 
-    fn candidate(&mut self) -> R<Candidate> {
+    pub(crate) fn candidate(&mut self) -> R<Candidate> {
         Ok(Candidate {
             candidate_id: self.hash()?,
             chronicle: self.chronicle()?,
@@ -2697,24 +2697,32 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn record(&mut self) -> R<ContractRecord> {
+    pub(crate) fn started(&mut self) -> R<VerificationStarted> {
+        Ok(VerificationStarted {
+            candidate_id: self.hash()?,
+            attempt_id: self.hash()?,
+            artifact_key: self.hash()?,
+            requirement: self.requirement()?,
+            started_at: self.lsn()?,
+        })
+    }
+
+    pub(crate) fn finished(&mut self) -> R<VerificationFinished> {
+        Ok(VerificationFinished {
+            attempt_id: self.hash()?,
+            outcome: self.outcome()?,
+            output_digest: self.hash()?,
+            output: self.bytes()?,
+            result_digest: self.hash()?,
+            finished_at: self.lsn()?,
+        })
+    }
+
+    pub(crate) fn record(&mut self) -> R<ContractRecord> {
         Ok(match self.tag()? {
             (_, 0) => ContractRecord::Candidate(Box::new(self.candidate()?)),
-            (_, 1) => ContractRecord::VerificationStarted(VerificationStarted {
-                candidate_id: self.hash()?,
-                attempt_id: self.hash()?,
-                artifact_key: self.hash()?,
-                requirement: self.requirement()?,
-                started_at: self.lsn()?,
-            }),
-            (_, 2) => ContractRecord::VerificationFinished(VerificationFinished {
-                attempt_id: self.hash()?,
-                outcome: self.outcome()?,
-                output_digest: self.hash()?,
-                output: self.bytes()?,
-                result_digest: self.hash()?,
-                finished_at: self.lsn()?,
-            }),
+            (_, 1) => ContractRecord::VerificationStarted(self.started()?),
+            (_, 2) => ContractRecord::VerificationFinished(self.finished()?),
             (_, 3) => ContractRecord::VerdictSubmitted(Box::new(VerdictSubmitted {
                 request: self.verdict_request()?,
                 peer: self.peer()?,
@@ -2847,7 +2855,7 @@ impl<'a> Reader<'a> {
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
@@ -2894,7 +2902,7 @@ mod tests {
             requirement: req(),
         }
     }
-    fn candidate() -> Candidate {
+    pub(crate) fn candidate() -> Candidate {
         let f = facts();
         Candidate {
             candidate_id: candidate_id(cid(1), h(2), &scratch(), h(3), TRANSFORM_VERSION, &req()),
@@ -2916,7 +2924,7 @@ mod tests {
             nominated_at: Lsn::new(31),
         }
     }
-    fn started() -> VerificationStarted {
+    pub(crate) fn started() -> VerificationStarted {
         let c = candidate();
         VerificationStarted {
             candidate_id: c.candidate_id,
@@ -2926,7 +2934,7 @@ mod tests {
             started_at: Lsn::new(32),
         }
     }
-    fn finished() -> VerificationFinished {
+    pub(crate) fn finished() -> VerificationFinished {
         let s = started();
         let out = b"ok\n".to_vec();
         let od = output_digest(&out);
@@ -2950,7 +2958,7 @@ mod tests {
     fn peer() -> Peer {
         Peer { uid: 1000, pid: 42 }
     }
-    fn verdict_request() -> VerdictRequest {
+    pub(crate) fn verdict_request() -> VerdictRequest {
         let c = candidate();
         let f = finished();
         let mut v = VerdictRequest {

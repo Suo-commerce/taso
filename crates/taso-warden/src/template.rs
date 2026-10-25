@@ -2440,4 +2440,300 @@ mod tests {
         at.finish(&mut v, &packs, &st, o, out).unwrap();
         assert!(attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id).unwrap());
     }
+
+    // ── Verdicts (P4 file 8a) ───────────────────────────────────────
+
+    use crate::verdict::{self, VerdictAnswer, VerdictError, Verdicts};
+    use taso_core::contract::{
+        template_id as template_id_of, Decision, Refusal, VerdictRequest, VerificationFinished,
+    };
+
+    const PEER: Peer = Peer { uid: 0, pid: 4242 };
+
+    fn verdicts(c: &Cluster) -> Verdicts {
+        Verdicts {
+            coord: c.coord.clone(),
+            warden: WardenId::new(1),
+            failpoint: attempt::no_failpoints(),
+        }
+    }
+
+    /// A request by `PEER` for `cand`, naming `f`'s attempt and result.
+    fn request(
+        cand: &taso_core::contract::Candidate,
+        f: &VerificationFinished,
+        decision: Decision,
+    ) -> VerdictRequest {
+        let mut r = VerdictRequest {
+            request_id: HashVal::from_bytes([0; 32]),
+            candidate_id: cand.candidate_id,
+            facts_hash: cand.facts_hash,
+            artifact_key: cand.artifact_key,
+            requirement: cand.requirement,
+            exclude: cand.exclude.clone(),
+            attempt_id: f.attempt_id,
+            result_digest: f.result_digest,
+            decision,
+            authority: Authority {
+                actor: "jarmo".into(),
+                reason: "reviewed".into(),
+            },
+            policy_digest: None,
+        };
+        r.request_id = taso_core::contract::request_id(
+            PEER.uid,
+            taso_core::contract::OpKind::Verdict,
+            &r.body(),
+        );
+        r
+    }
+
+    /// One finished attempt of `cand` ending `o`.
+    fn attempted(
+        c: &Cluster,
+        v: &mut FV,
+        packs: &Packs<SharedStore, Bytes>,
+        cand: &taso_core::contract::Candidate,
+        o: VOutcome,
+    ) -> VerificationFinished {
+        let at = attempts(c);
+        let st = at.start(v, packs, cand).unwrap();
+        at.finish(v, packs, &st, o, b"out\n".to_vec()).unwrap()
+    }
+
+    fn sanction_of(c: &Cluster, cid: HashVal) -> Option<taso_core::contract::SanctionCommitted> {
+        match c
+            .coord
+            .query_logical(logical_id(&LogicalKey::Sanction(cid)))
+            .unwrap()
+        {
+            Some((_, Submitted::Contract(ContractRecord::SanctionCommitted(s)))) => Some(s),
+            None => None,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sanction_of_a_passed_attempt_commits_once() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let vd = verdicts(&c);
+        let cid = cand.candidate_id;
+        // Nothing to decide before an attempt has finished (D73).
+        let frames = v.chronicle().frames().unwrap();
+        assert!(verdict::pending(c.coord.as_ref(), &frames)
+            .unwrap()
+            .is_empty());
+        let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
+        let frames = v.chronicle().frames().unwrap();
+        let p = verdict::pending(c.coord.as_ref(), &frames).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].candidate, cand);
+        assert_eq!(p[0].attempts[0].1, f);
+        let r = request(&cand, &f, Decision::Sanction);
+        let verdict_id = logical_id(&LogicalKey::Verdict(r.request_id));
+        let a = vd.handle(&mut v, &packs, &r, PEER).unwrap();
+        let tid = template_id_of(cid, verdict_id);
+        assert_eq!(a, VerdictAnswer::Committed { template_id: tid });
+        let s = sanction_of(&c, cid).unwrap();
+        assert!(s.is_consistent());
+        assert_eq!(
+            (s.template_id, s.attempt_id, s.result_digest, s.verdict),
+            (tid, f.attempt_id, f.result_digest, verdict_id)
+        );
+        assert_eq!(s.parent_template, None, "a Vessel born from the void");
+        assert_eq!(
+            (
+                s.artifact_key,
+                s.output_manifest_key,
+                s.classmap_key,
+                s.vconf_key
+            ),
+            (
+                cand.artifact_key,
+                cand.output_manifest_key,
+                cand.classmap_key,
+                cand.requirement.vconf_key
+            )
+        );
+        // The same request again, and any other: the commit answers.
+        let tail = v.tail().lsn;
+        assert_eq!(vd.handle(&mut v, &packs, &r, PEER).unwrap(), a);
+        let hold = request(&cand, &f, Decision::Hold);
+        assert_eq!(vd.handle(&mut v, &packs, &hold, PEER).unwrap(), a);
+        assert_eq!(v.tail().lsn, tail, "nothing more recorded");
+        let frames = v.chronicle().frames().unwrap();
+        assert!(verdict::pending(c.coord.as_ref(), &frames)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn step_one_records_the_permanent_refusals() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let vd = verdicts(&c);
+        let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 3 });
+        // A request whose id is not its peer's: nothing recorded.
+        let r = request(&cand, &f, Decision::Sanction);
+        let tail = v.tail().lsn;
+        assert!(matches!(
+            vd.handle(&mut v, &packs, &r, Peer { uid: 7, pid: 1 }),
+            Err(VerdictError::BadRequestId)
+        ));
+        assert_eq!(v.tail().lsn, tail);
+        // A failed attempt is not sanctioned, for good.
+        assert_eq!(
+            vd.handle(&mut v, &packs, &r, PEER).unwrap(),
+            VerdictAnswer::Refused(Refusal::AttemptNotPassed)
+        );
+        let tail = v.tail().lsn;
+        assert_eq!(
+            vd.handle(&mut v, &packs, &r, PEER).unwrap(),
+            VerdictAnswer::Refused(Refusal::AttemptNotPassed)
+        );
+        assert_eq!(v.tail().lsn, tail, "a retry answers from the log");
+        match c
+            .coord
+            .query_logical(logical_id(&LogicalKey::Verdict(r.request_id)))
+            .unwrap()
+        {
+            Some((_, Submitted::Contract(ContractRecord::Refused(x)))) => {
+                assert_eq!(
+                    (x.rule, x.peer, x.candidate_id),
+                    (Refusal::AttemptNotPassed, PEER, cand.candidate_id)
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        // Stale facts; a result that is not the attempt's.
+        let mut stale = request(&cand, &f, Decision::Hold);
+        stale.facts_hash = HashVal::from_bytes([9; 32]);
+        stale.request_id = taso_core::contract::request_id(
+            PEER.uid,
+            taso_core::contract::OpKind::Verdict,
+            &stale.body(),
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &stale, PEER).unwrap(),
+            VerdictAnswer::Refused(Refusal::StaleFacts)
+        );
+        let mut wrong = request(&cand, &f, Decision::Hold);
+        wrong.result_digest = HashVal::from_bytes([8; 32]);
+        wrong.request_id = taso_core::contract::request_id(
+            PEER.uid,
+            taso_core::contract::OpKind::Verdict,
+            &wrong.body(),
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &wrong, PEER).unwrap(),
+            VerdictAnswer::Refused(Refusal::WrongAttempt)
+        );
+        // A Hold of the failed attempt is recorded; a Never closes.
+        let hold = request(&cand, &f, Decision::Hold);
+        assert_eq!(
+            vd.handle(&mut v, &packs, &hold, PEER).unwrap(),
+            VerdictAnswer::Held
+        );
+        let never = request(
+            &cand,
+            &f,
+            Decision::Never {
+                reason: "exits 3".into(),
+            },
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &never, PEER).unwrap(),
+            VerdictAnswer::ClosedNever
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &never, PEER).unwrap(),
+            VerdictAnswer::ClosedNever
+        );
+        let frames = v.chronicle().frames().unwrap();
+        assert!(verdict::pending(c.coord.as_ref(), &frames)
+            .unwrap()
+            .is_empty());
+        // After the close: Closed, for any new request.
+        let other = request(
+            &cand,
+            &f,
+            Decision::Never {
+                reason: "again".into(),
+            },
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &other, PEER).unwrap(),
+            VerdictAnswer::Refused(Refusal::Closed)
+        );
+        assert!(sanction_of(&c, cand.candidate_id).is_none());
+    }
+
+    #[test]
+    fn what_can_still_change_is_answered_and_a_retry_continues() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let vd = verdicts(&c);
+        let at = attempts(&c);
+        let f1 = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
+        let st2 = at.start(&mut v, &packs, &cand).unwrap();
+        let sanction = request(&cand, &f1, Decision::Sanction);
+        assert!(matches!(
+            vd.handle(&mut v, &packs, &sanction, PEER).unwrap(),
+            VerdictAnswer::NotCommitted(Refusal::OpenAttempt)
+        ));
+        let never = request(
+            &cand,
+            &f1,
+            Decision::Never {
+                reason: "no".into(),
+            },
+        );
+        assert_eq!(
+            vd.handle(&mut v, &packs, &never, PEER).unwrap(),
+            VerdictAnswer::NotClosed(Refusal::OpenAttempt)
+        );
+        // The later attempt fails: the same request, sent again, is
+        // answered from its recorded VerdictSubmitted.
+        at.finish(&mut v, &packs, &st2, VOutcome::Exit { code: 1 }, Vec::new())
+            .unwrap();
+        let tail = v.tail().lsn;
+        assert!(matches!(
+            vd.handle(&mut v, &packs, &sanction, PEER).unwrap(),
+            VerdictAnswer::NotCommitted(Refusal::LaterAttemptFailed)
+        ));
+        assert_eq!(v.tail().lsn, tail, "nothing more recorded");
+        // The Never, retried, now closes.
+        assert_eq!(
+            vd.handle(&mut v, &packs, &never, PEER).unwrap(),
+            VerdictAnswer::ClosedNever
+        );
+        assert!(sanction_of(&c, cand.candidate_id).is_none());
+        // The recorded Sanction, sent again after the close.
+        assert!(matches!(
+            vd.handle(&mut v, &packs, &sanction, PEER).unwrap(),
+            VerdictAnswer::NotCommitted(Refusal::Closed)
+        ));
+    }
+
+    #[test]
+    fn a_verdict_stopped_at_a_failpoint_is_finished_by_sending_it_again() {
+        for point in verdict::FAILPOINTS {
+            let c = Cluster::new();
+            let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+            let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
+            let r = request(&cand, &f, Decision::Sanction);
+            let mut vd = verdicts(&c);
+            vd.failpoint = Arc::new(move |p| p == point);
+            assert!(
+                matches!(vd.handle(&mut v, &packs, &r, PEER), Err(VerdictError::Failpoint(p)) if p == point)
+            );
+            assert!(sanction_of(&c, cand.candidate_id).is_none());
+            let vd = verdicts(&c);
+            assert!(matches!(
+                vd.handle(&mut v, &packs, &r, PEER).unwrap(),
+                VerdictAnswer::Committed { .. }
+            ));
+        }
+    }
 }

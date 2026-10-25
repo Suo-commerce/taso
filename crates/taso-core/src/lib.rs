@@ -15,6 +15,7 @@ pub mod adapter;
 pub mod canon;
 pub mod contract;
 pub mod coordlog;
+pub mod decider;
 pub mod decode;
 pub mod envelope;
 pub mod frame;
