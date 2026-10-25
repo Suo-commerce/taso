@@ -542,7 +542,10 @@ for v in d1 d2 d3; do
     expect "$v: stopped at purge.before_complete" wait_for 3-daemon "${ID[$v]}" "stopped: stopped at failpoint purge.before_complete" 90
 done
 QID=$(dataset_of 3-daemon q); QID=${QID##*/v-}
-expect "q: running, checked after its run" bash -c "[[ $(purge_lines 3-daemon "$QID" 'it is running') -ge 1 ]]"
+# q's TTL starts at q's own first run, a little after the d's: wait for
+# its "it is running" line instead of reading it at once (the block log
+# reached the d's failpoints before q's TTL was due, 2026-10-25).
+expect "q: running, checked after its run" wait_for 3-daemon "$QID" 'it is running' 30
 expect "s: never purged" is "$(purge_lines 3-daemon "${ID[s]}" '')" 0
 stop_daemon
 for v in d1 d2 d3; do expect "$v: retired" is "$(retired "${ID[$v]}")" true; done
