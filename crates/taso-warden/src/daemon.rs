@@ -2221,6 +2221,15 @@ impl<'s, 'e> Verifications<'s, 'e> {
 
     /// Wait for the attempts still running and finish them.
     fn drain(&mut self, vessel: &mut Vessel<StorageLayers>) {
+        // A Candidate nominated just before the agent exited may not have
+        // been looked at by a tick yet: launched now (D68, D82), so a run
+        // ends with every attempt it could start finished.
+        while let Ok(d) = self.rx.try_recv() {
+            self.done(vessel, d);
+        }
+        if self.want {
+            self.launch(vessel);
+        }
         while !self.running.is_empty() {
             match self.rx.recv() {
                 Ok(d) => self.done(vessel, d),

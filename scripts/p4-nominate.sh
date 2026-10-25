@@ -296,14 +296,16 @@ wardend() {
 
 expect() { # expect WHAT TEST...: PASS if the test command succeeds
     local what=$1; shift
+    WHY=
     if "$@"; then
         PASS=$((PASS + 1)); echo "  PASS  $what"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL  $what"
+        FAIL=$((FAIL + 1)); echo "  FAIL  $what${WHY:+ ($WHY)}"
     fi
 }
 
-is() { [[ "$1" == "$2" ]]; }
+# is GOT WANT: equal; on a difference, the FAIL line says both.
+is() { [[ "$1" == "$2" ]] || { WHY="got '$1', want '$2'"; return 1; }; }
 count() { grep -c -- "$2" "$W/out/$1" || true; }   # count FILE PATTERN
 
 # vessel SUBJECT SLOT [EXTRA_JSON_FIELDS]: an entry with T(0) as its
@@ -385,7 +387,7 @@ expect "T(0) ready" bash -c "[[ '$T0' =~ ^[0-9a-f]{32}$ ]]"
 # ── 2. The agent nominates ──────────────────────────────────────────
 
 config 1 "$W/n1.json" "$(vessel n1 1 "$(sim "$TURNS" Scratch)")"
-say "2. n1 runs $TURNS turns, then its agent nominates the newest Seal dropping Scratch (predict: exit 0; one 'Nominated'; the coordinator log holds one accepted record for n1 and four content objects: the artifact, the classmap, the vconf and one manifest, since nothing of class Scratch is there and the output manifest is the input's)"
+say "2. n1 runs $TURNS turns, then its agent nominates the newest Seal dropping Scratch (predict: exit 0; one 'Nominated'; the daemon attempts it (D68; this vconf has no version, so 'LaunchFailed'), so the coordinator log holds three accepted records for n1 (Candidate, VerificationStarted, VerificationFinished) and, the attempt finished, four content objects: the artifact, the classmap, the vconf and one manifest, since nothing of class Scratch is there and the output manifest is the input's)"
 wardend 2-n1 1 "$W/n1.json"
 expect "exit 0" is "$RC" 0
 A2=$(answers 2-n1 n1 Agent)
@@ -393,17 +395,18 @@ expect "the agent's nomination: Nominated" is "$(printf '%s\n' "$A2" | grep -c '
 C2=$(printf '%s\n' "$A2" | cand)
 expect "a candidate id" bash -c "[[ '$C2' =~ ^[0-9a-f]{64}$ ]]"
 DS=$(dataset_of 2-n1 n1); N1=${DS##*/v-}
-expect "one accepted record, four content objects held" is "$(coordlog_of 1 "$N1")" "1 4"
-expect "the Candidate is in n1's own log" is "$(contracts_of 1 "$N1")" 1
+expect "its attempt finished LaunchFailed" is "$(count 2-n1.err '\] n1: attempt [0-9a-f]*: finished LaunchFailed')" 1
+expect "three accepted records, four content objects held" is "$(coordlog_of 1 "$N1")" "3 4"
+expect "the three records are in n1's own log" is "$(contracts_of 1 "$N1")" 3
 
 # ── 3. Again, two turns later ───────────────────────────────────────
 
-say "3. n1 again: $TURNS more turns, the agent nominates its new newest Seal (predict: exit 0; Nominated, another candidate id; two accepted records)"
+say "3. n1 again: $TURNS more turns, the agent nominates its new newest Seal (predict: exit 0; Nominated, another candidate id, attempted; six accepted records)"
 wardend 3-n1 1 "$W/n1.json"
 expect "exit 0" is "$RC" 0
 C3=$(answers 3-n1 n1 Agent | cand)
 expect "Nominated, another Candidate" bash -c "[[ '$C3' =~ ^[0-9a-f]{64}$ && '$C3' != '$C2' ]]"
-expect "two accepted records" is "$(coordlog_of 1 "$N1" | cut -d' ' -f1)" 2
+expect "six accepted records" is "$(coordlog_of 1 "$N1" | cut -d' ' -f1)" 6
 L3=$(last_seal 1 "$N1")
 
 # ── 4. The entry's candidate ────────────────────────────────────────
@@ -413,7 +416,7 @@ say "4. n1's entry nominates the Seal at lsn $L3 dropping Scratch, the one its a
 wardend 4-dup 1 "$W/n1-cand.json"
 expect "exit 0" is "$RC" 0
 expect "the entry's nomination refused Duplicate" is "$(answers 4-dup n1 Config)" 'Refused { reason: "Duplicate" }'
-expect "accepted: two Candidates and the refusal" is "$(coordlog_of 1 "$N1" | cut -d' ' -f1)" 3
+expect "accepted: two Candidates with their attempts, and the refusal" is "$(coordlog_of 1 "$N1" | cut -d' ' -f1)" 7
 config 1 "$W/n1-all.json" "$(vessel n1 1 "\"candidate\": {\"seal\": $L3, \"exclude\": []}, $(sim 1)")"
 wardend 4-all 1 "$W/n1-all.json"
 expect "exit 0" is "$RC" 0
@@ -440,7 +443,7 @@ expect "refused Walk(UnknownPaths)" is "$(answers 6-u u Agent)" 'Refused { reaso
 
 # ── 7. Failpoints ───────────────────────────────────────────────────
 
-say "7. the five nominate failpoints, each on its own Vessel's newest Seal by its entry (predict: exit 0 and 'Retry' naming the failpoint, nothing accepted; the rerun of the same Seal: Nominated)"
+say "7. the five nominate failpoints, each on its own Vessel's newest Seal by its entry (predict: exit 0 and 'Retry' naming the failpoint, nothing accepted; the rerun of the same Seal: Nominated and attempted, three accepted records)"
 i=0
 for fp in nominate.after_input_manifest nominate.after_output_manifest nominate.after_artifact_put \
           nominate.after_announce nominate.before_accept; do
@@ -457,7 +460,7 @@ for fp in nominate.after_input_manifest nominate.after_output_manifest nominate.
     wardend "7-f$i-rerun" 1 "$W/f$i-c.json"
     expect "$fp: rerun exit 0" is "$RC" 0
     expect "$fp: rerun Nominated" is "$(answers "7-f$i-rerun" "f$i" Config | grep -c '^Nominated')" 1
-    expect "$fp: one accepted record" is "$(coordlog_of 1 "$FI" | cut -d' ' -f1)" 1
+    expect "$fp: three accepted records" is "$(coordlog_of 1 "$FI" | cut -d' ' -f1)" 3
 done
 
 # ── 8. A candidate without a verifier ───────────────────────────────

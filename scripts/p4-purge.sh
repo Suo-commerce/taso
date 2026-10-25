@@ -303,14 +303,16 @@ wardend() {
 
 expect() { # expect WHAT TEST...: PASS if the test command succeeds
     local what=$1; shift
+    WHY=
     if "$@"; then
         PASS=$((PASS + 1)); echo "  PASS  $what"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL  $what"
+        FAIL=$((FAIL + 1)); echo "  FAIL  $what${WHY:+ ($WHY)}"
     fi
 }
 
-is() { [[ "$1" == "$2" ]]; }
+# is GOT WANT: equal; on a difference, the FAIL line says both.
+is() { [[ "$1" == "$2" ]] || { WHY="got '$1', want '$2'"; return 1; }; }
 count() { grep -c -- "$2" "$W/out/$1" || true; }   # count FILE PATTERN
 
 # vessel SUBJECT SLOT [EXTRA_JSON_FIELDS]: an entry with V as its

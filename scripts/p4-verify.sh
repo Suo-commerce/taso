@@ -296,14 +296,16 @@ wardend() {
 
 expect() { # expect WHAT TEST...: PASS if the test command succeeds
     local what=$1; shift
+    WHY=
     if "$@"; then
         PASS=$((PASS + 1)); echo "  PASS  $what"
     else
-        FAIL=$((FAIL + 1)); echo "  FAIL  $what"
+        FAIL=$((FAIL + 1)); echo "  FAIL  $what${WHY:+ ($WHY)}"
     fi
 }
 
-is() { [[ "$1" == "$2" ]]; }
+# is GOT WANT: equal; on a difference, the FAIL line says both.
+is() { [[ "$1" == "$2" ]] || { WHY="got '$1', want '$2'"; return 1; }; }
 count() { grep -c -- "$2" "$W/out/$1" || true; }   # count FILE PATTERN
 
 # vessel SUBJECT SLOT [EXTRA_JSON_FIELDS]: an entry with V as its
@@ -449,7 +451,9 @@ expect "exit 0" is "$RC" 0
 expect "finished Exit { code: 7 }" is "$(finished 3-f f)" "Exit { code: 7 }"
 
 say "4. /candidate is read-only (predict: writing fails, 'Exit { code: 0 }')"
-attempted 4-w w 3 'if : > /candidate/x 2>/dev/null; then exit 9; fi; exit 0'
+# The write is in a subshell: a failed redirection of a special builtin
+# (':') exits a POSIX shell, which first runs on taso-test showed (Exit 2).
+attempted 4-w w 3 'if (echo x > /candidate/x) 2>/dev/null; then exit 9; fi; exit 0'
 expect "finished Exit { code: 0 }" is "$(finished 4-w w)" "Exit { code: 0 }"
 
 say "5. isolation: no TASO_* environment, no /run/taso, only lo in /proc/net/dev (predict: 'Exit { code: 0 }')"
