@@ -78,19 +78,19 @@ BLKD_PID=; ZFS_BASE=
 mounts_under() {
     awk -v root="$MNT" '$5 == root || index($5, root "/") == 1 { print length($5), $5 }' /proc/self/mountinfo | sort -rn | cut -d' ' -f2-
 }
-blk_raw() { # blk_raw CMD... -> the daemon's answer line (ok ... | err ...)
+blk_raw() { # blk_raw CMD... -> taso-blkd's answer line (ok ... | err ...)
     python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_UNIX); s.settimeout(120); s.connect(sys.argv[1])
-s.sendall((" ".join(sys.argv[2:]) + "\n").encode()); print(s.makefile().readline().strip())' "$BLK_SOCK" "$@" || die "taso-blkd did not answer: $*"
+s.sendall((" ".join(sys.argv[2:]) + "\n").encode()); print(s.makefile().readline().strip())' "$BLK_SOCK" "$@" || die "taso-blkd (the Warden's block log) did not answer: $*"
 }
-blk() { # blk CMD... -> answer (the daemon's protocol, as blk-contract.sh)
+blk() { # blk CMD... -> answer (taso-blkd's protocol, as blk-contract.sh)
     local answer; answer=$(blk_raw "$@")
     case "$answer" in "ok") ;; "ok "*) printf '%s\n' "${answer#ok }" ;; *) die "taso-blkd: $* -> $answer" ;; esac
 }
 # The branch's device: attached here if it has none, or the one the Warden
-# left (the Warden unmounts at exit but does not detach).  Prints "DEV
-# ours|theirs".
+# left (the Warden unmounts at exit but leaves the branch's device
+# attached).  Prints "DEV ours|theirs".
 blk_device() { # blk_device BRANCH
     local answer; answer=$(blk_raw attach "$1")
     case "$answer" in
