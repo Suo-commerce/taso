@@ -57,7 +57,7 @@
 # default /root/taso-p5-bench-<storage>-<time>, kept); KEEP=1 keeps the
 # work directory and datasets.
 #
-# Touches, and nothing else: $DIR = /var/lib/taso-blk/p5-bench (removed at
+# Touches, and nothing else: $DIR = /var/lib/taso-blk/p5-bench, resolved (removed at
 # start, removed at the end unless KEEP), $OUT, the datasets or the log
 # above, /run/taso-p5-bench-blk.sock, /mnt/p5-bench, runc containers under
 # $DIR/run.  Needs root, cargo in PATH (run as root, not through sudo
@@ -74,7 +74,9 @@ TXNS=${TXNS:-4}; ROWS=${ROWS:-8}; ROW_BYTES=${ROW_BYTES:-512}; SYNC=${SYNC:-norm
 LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
 [[ "$FORKS" == 0 || "$P" == 1 ]] || { echo "FORKS needs P=1 (one parent, N children)" >&2; exit 64; }
 ZFS_PARENT=${TASO_ZFS_DATASET:-taso/vessel}
-DIR=/var/lib/taso-blk/p5-bench
+# The real path: runc refuses a rootfs reached through a symlink, and A1
+# makes /var/lib/taso-blk one (taso-p5, 2026-10-26: "invalid rootfs").
+DIR=$(readlink -f /var/lib/taso-blk)/p5-bench
 BLK_SOCK=/run/taso-p5-bench-blk.sock
 MNT=/mnt/p5-bench
 STAMP=$(date +%Y%m%d-%H%M%S)
