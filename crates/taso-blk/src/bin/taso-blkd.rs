@@ -1036,14 +1036,10 @@ fn run_device(
         .depth(g.depth)
         .io_threads_per_queue(g.threads)
         .io_buf_bytes(g.io_bytes)
-        .ctrl_flags(
-            sys::UBLK_F_USER_COPY as u64
-                | if g.threads > 1 {
-                    sys::UBLK_F_PER_IO_DAEMON as u64
-                } else {
-                    0
-                },
-        )
+        // Threads per queue need the driver's UBLK_F_PER_IO_DAEMON, which
+        // the driver advertises on the device itself (Linux 6.16+); it is
+        // not a flag to pass (libublk refuses it: InvalidVal, 2026-10-26).
+        .ctrl_flags(sys::UBLK_F_USER_COPY as u64)
         .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
         .build()
     {
