@@ -44,6 +44,17 @@
 #                  Both storages on one drive: the comparison in §3 is then
 #                  of the storage, not of two drives.  /var/lib/taso-blk is a
 #                  symlink into it, so the blk-*.sh scripts land there too.
+#   6b RCU         /sys/kernel/rcu_expedited=1, now and at boot
+#                  (/etc/tmpfiles.d/taso-rcu.conf; it is a sysfs attribute,
+#                  not a sysctl): a filesystem freeze
+#                  takes the superblock's three write barriers, each a
+#                  full RCU grace period of ~10 ms on a 24-thread host
+#                  (scripts/blk-freeze-ftrace.sh, taso-p5 2026-10-26);
+#                  expedited, they are under a millisecond.  P=64 Seal
+#                  p50 120 -> 80 ms, freeze 70 -> 32, CPU per turn the
+#                  same.  The cost: an expedited grace period sends an IPI
+#                  to every CPU; on a host whose work is Vessels, nothing
+#                  measurable.  A1 sets it; taso init will set it and say so.
 #   7 TMPDIR       /var/lib/taso/tmp, exported for root logins with
 #                  TASO_ZFS_DATASET=taso/vessel and cargo's PATH
 #                  (/etc/profile.d/taso-p5.sh): temporary files of tests and
@@ -267,6 +278,11 @@ EOF
     fi
     ln -sfn "$DATA/taso-blk" /var/lib/taso-blk
 
+    step "6b expedited RCU (the freeze's superblock barriers)"
+    echo 1 >/sys/kernel/rcu_expedited
+    echo "w /sys/kernel/rcu_expedited - - - - 1" >/etc/tmpfiles.d/taso-rcu.conf
+    echo "rcu_expedited=$(cat /sys/kernel/rcu_expedited), kept at boot by /etc/tmpfiles.d/taso-rcu.conf"
+
     step "7 TMPDIR and the login environment"
     cat >/etc/profile.d/taso-p5.sh <<EOF
 # P5 measurement host (scripts/p5-node.sh): temporary files on the measured NVMe.
@@ -309,6 +325,7 @@ report() {
     info "CPU: $(lscpu | awk -F': *' '/^Model name/{print $2; exit}') ($(nproc) threads); memory $(free -g | awk '/Mem:/{print $2}') GiB"
     info "virtualisation: $(systemd-detect-virt 2>/dev/null || true)"
     info "cpufreq governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo none)"
+    [[ "$(cat /sys/kernel/rcu_expedited 2>/dev/null)" == 1 ]] && pass "rcu_expedited=1 (the freeze's barriers)" || bad "rcu_expedited is $(cat /sys/kernel/rcu_expedited 2>/dev/null || echo none), not 1 (setup sets it; a freeze pays ~30 ms of RCU grace periods without it)"
     info "unattended-upgrades timer: $(systemctl is-active apt-daily-upgrade.timer 2>/dev/null || true)"
     [[ "$os_id" == ubuntu && "$os_ver" == 26.04 ]] && pass "Ubuntu 26.04" || bad "not Ubuntu 26.04 ($os_id $os_ver)"
     [[ "${kernel%%.*}" -ge 6 ]] && pass "kernel $kernel" || bad "kernel $kernel is older than 6.0 (ublk)"
