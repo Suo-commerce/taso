@@ -43,8 +43,14 @@
 #     valid prefix (consecutive seq from 1, check word right), and prints,
 #     per stream, on-disk vs acknowledged (the ACKED file copied over
 #     from the laptop).  Reading the result:
-#        synced streams complete, nosync short  = a power loss, flushes
-#                                                 honoured through the stack
+#        synced streams complete, nosync short  = a power loss (or, on a
+#                                                 VM, a kill); every
+#                                                 acknowledged flush survived
+#                                                 it.  Bare metal: the medium
+#                                                 was reached.  VM: the host's
+#                                                 cache and power were never
+#                                                 cut, so nothing is known
+#                                                 about them from inside
 #        all four complete                       = a graceful shutdown (the
 #                                                 kernel flushed the page
 #                                                 cache): NOT a power loss
@@ -264,7 +270,8 @@ if ns is not None:
     on = os.path.getsize(path) // 16 if os.path.exists(path) else 0
     print("reading: " + ("the unsynced stream is complete: the kernel flushed the page cache, so this was a GRACEFUL SHUTDOWN, not a power loss" if on >= ns
           else "the unsynced stream is short: the page cache was lost, so this was a power loss (or equivalent)"))
-print("reading: " + ("every synced stream complete: acknowledged flushes reached the medium" if bad == 0 else "%d synced stream(s) short: an acknowledged flush did not reach the medium" % bad))
+print("reading: " + ("every synced stream complete: every acknowledged flush survived this cut" if bad == 0 else "%d synced stream(s) short: an acknowledged flush did not survive this cut" % bad))
+print("reading: on bare metal a power cut survived is the medium reached; on a VM a kill survived says nothing about the host's own cache or its power")
 sys.exit(1 if bad else 0)
 PY
     ;;
