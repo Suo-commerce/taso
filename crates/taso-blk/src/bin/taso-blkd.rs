@@ -4,7 +4,7 @@
 //! ext4 can sit on top.  One device per attached branch; one log for all.
 //!
 //! ```text
-//!   taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--io-kib N]
+//!   taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N]
 //!             [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N]
 //! ```
 //!
@@ -185,6 +185,10 @@ const MAX_DISCARD: u64 = 1 << 30;
 struct Geometry {
     size: u64,
     depth: u16,
+    /// Hardware queues per device, each served by its own thread: with
+    /// one, requests the kernel has in flight together (13 at a freeze,
+    /// blk-trace-freeze.sh 2026-10-26) are served one after another.
+    queues: u16,
     io_bytes: u32,
     /// Log growth between automatic checkpoints, in bytes (0: none).
     checkpoint_every: u64,
@@ -247,7 +251,7 @@ struct Daemon {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N]";
+    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N]";
     if args.len() < 3 {
         log!("{usage}");
         std::process::exit(64);
@@ -256,6 +260,7 @@ fn main() {
     let mut g = Geometry {
         size: 4 << 30,
         depth: 32,
+        queues: 1,
         // 512 KiB: the geometry of common disks; on taso-test it measured
         // the same as 128 KiB (blk-bench, 2026-10-19, within run noise).
         io_bytes: 512 << 10,
@@ -269,6 +274,7 @@ fn main() {
         match (flag.as_str(), value) {
             ("--size-gib", Some(v)) if v > 0 => g.size = v << 30,
             ("--depth", Some(v)) if (1..=4096).contains(&v) => g.depth = v as u16,
+            ("--queues", Some(v)) if (1..=64).contains(&v) => g.queues = v as u16,
             ("--io-kib", Some(v)) if v >= 4 && v % 4 == 0 && v <= 16384 => {
                 g.io_bytes = (v as u32) << 10
             }
@@ -1019,7 +1025,7 @@ fn run_device(
     let ctrl = match UblkCtrlBuilder::default()
         .name(TARGET)
         .id(-1)
-        .nr_queues(1)
+        .nr_queues(g.queues)
         .depth(g.depth)
         .io_buf_bytes(g.io_bytes)
         .ctrl_flags(sys::UBLK_F_USER_COPY as u64)
