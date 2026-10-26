@@ -123,7 +123,7 @@ if [[ "$STORAGE" == zfs ]]; then
     zfs list -H -o name "$ZFS_PARENT" >/dev/null 2>&1 || die "no dataset $ZFS_PARENT (set TASO_ZFS_DATASET)"
 else
     modprobe ublk_drv; [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
-    [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
+    [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's block log? (pgrep -x taso-blkd)"
     mkdir -p "$MNT"; [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 fi
 [[ -d /var/lib/taso-blk ]] || mkdir -p /var/lib/taso-blk
@@ -216,6 +216,9 @@ PY
         local ds branch dev at="$MNT/.p5-read"
         mkdir -p "$at"
         for ds in $(grep -o "\] p5-bench-$RUN-r$r-v[0-9]*: dataset [^ ]*\$" "$OUT/warden-$r.err" | sed 's/.*: dataset //' | sort -u); do
+            if mountpoint -q "$MNT/$ds"; then   # the Warden leaves the Vessel mounted at exit
+                collect "$MNT/$ds" "$r" "${ds##*/}"; continue
+            fi
             branch=$(blk find "$ds"); read -r dev whose <<<"$(blk_device "$branch")"
             for _ in $(seq 50); do [[ -b "$dev" ]] && break; sleep 0.1; done
             [[ -b "$dev" ]] || die "device $dev for $ds did not appear"
