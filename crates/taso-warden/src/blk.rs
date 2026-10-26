@@ -283,8 +283,15 @@ impl Mounts for System {
     fn mkfs(&self, dev: &Path) -> io::Result<()> {
         // nodiscard: a fresh branch reads zeros already; discarding the
         // whole device would only write records.
+        // No journal: the Chronicle is the Vessel's journal and the Seal
+        // its recovery point.  A crashed Vessel is never mounted as it
+        // was: the Warden resets the branch to the last Seal, whose image
+        // was taken frozen with every write complete, so ext4's journal
+        // would replay nothing - and it cost ten barriers per Seal (an
+        // ordered freeze: 12 log syncs; without the journal: 2; taso-p5,
+        // scripts/blk-freeze-probe.sh, 2026-10-26).
         run(Command::new("mkfs.ext4")
-            .args(["-q", "-F", "-E", "nodiscard"])
+            .args(["-q", "-F", "-O", "^has_journal", "-E", "nodiscard"])
             .arg(dev))
     }
     fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()> {
