@@ -6,7 +6,15 @@
 # call under the freeze with its duration; the lines over 1 ms are the
 # answer.
 #
-#   sudo scripts/blk-freeze-ftrace.sh [DIRTY_KIB]      (default 4096)
+#   sudo scripts/blk-freeze-ftrace.sh [DIRTY_KIB] [RCU_EXPEDITED]   (default 4096, as the host has it)
+#
+# Run 1 (taso-p5, 2026-10-26): before sync_filesystem starts, the freeze
+# takes the superblock's three write barriers (percpu_down_write ->
+# rcu_sync_enter -> synchronize_rcu), each a full RCU grace period of
+# 9-10 ms on this 24-thread host: ~30 ms of a freeze with no I/O in
+# them.  RCU_EXPEDITED=1 writes 1 to /sys/kernel/rcu_expedited for the
+# run (put back after), which makes those grace periods expedited.
+# Prediction: each synchronize_rcu under 1 ms, the freeze ~30 ms shorter.
 #
 # Each device: ext4 without a journal (the Warden's mkfs), lazy init
 # waited out, one warm-up freeze/thaw, then DIRTY_KIB written and closed,
@@ -34,6 +42,8 @@
 
 set -euo pipefail
 DIRTY=${1:-4096}
+RCU=${2:-}
+RCU_WAS=$(cat /sys/kernel/rcu_expedited 2>/dev/null || echo "")
 DIR=/var/lib/taso-blk
 LOG=$DIR/ftrace.log; ERR=$DIR/ftrace.err; IMG=$DIR/ftrace-loop.img
 SOCK=/run/taso-blk-ftrace.sock
@@ -60,6 +70,7 @@ cleanup() {
     local rc=$?
     set +e
     ftrace_off
+    [[ -z "$RCU" || -z "$RCU_WAS" ]] || echo "$RCU_WAS" >/sys/kernel/rcu_expedited
     mountpoint -q "$MNT" && { fsfreeze -u "$MNT" 2>/dev/null; umount "$MNT"; }
     [[ -n "$LOOP" ]] && losetup -d "$LOOP"; rm -f "$IMG"
     if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then (blk quit) >/dev/null 2>&1 || kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; fi
@@ -107,7 +118,7 @@ PY
 import re, sys
 big = []
 for ln in open(sys.argv[1]):
-    m = re.search(r'\|\s+([\d.]+) us\s+\|(.*)$', ln)
+    m = re.search(r'\|\s*[#*!+]?\s*([\d.]+) us\s+\|(.*)$', ln)  # ftrace marks long calls with # * ! +
     if not m: continue
     us = float(m.group(1))
     if us >= 1000: big.append((us, m.group(2).rstrip()))
@@ -117,6 +128,8 @@ PY
     umount "$MNT"
 }
 
+if [[ -n "$RCU" ]]; then echo "$RCU" >/sys/kernel/rcu_expedited; fi
+echo "rcu_expedited=$(cat /sys/kernel/rcu_expedited 2>/dev/null || echo none) (was ${RCU_WAS:-none}); $(nproc) CPUs"
 rm -f "$LOG" "$ERR" "$LOG.ckpt"
 "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 2>>"$ERR" &
 DAEMON_PID=$!
