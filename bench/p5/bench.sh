@@ -252,7 +252,7 @@ PY
     grep -vE "$VESSEL_OK" "$OUT/warden-$r.out" | grep -E "^p5-bench-" | head -5 || true
 }
 subject_of() { # subject_of R DSNAME -> the Vessel's subject, from the Warden's "SUBJECT: dataset ..." line
-    grep -o "\\] [^:]*: dataset [^ ]*$2\\$" "$OUT/warden-$1.err" | head -1 | sed 's/^\\] //; s/: dataset.*//'
+    grep -o "\] [^:]*: dataset [^ ]*$2\$" "$OUT/warden-$1.err" | head -1 | sed 's/^\] //; s/: dataset.*//'
 }
 collect() { # collect MOUNT R SUBJECT: a child's samples (SUBJECT has -fork-) apart from a parent's
     local kind=""; [[ "$3" != *-fork-* ]] || kind="-children"

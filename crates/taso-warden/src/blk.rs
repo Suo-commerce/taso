@@ -1091,18 +1091,29 @@ impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
 
 impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
-        // seal.lookup: everything before the freeze (the branch, its Seals,
-        // its device, what is mounted); seal.snapshot minus the four spans
-        // was 28 ms unexplained in the fork storm of 2026-10-26.
+        // The pool's lock on the block-log connection is held for the
+        // commands (the lookup, the Seal), not through the freeze: a freeze
+        // is the kernel's work on the mount, served by the block log's own
+        // queue threads, and holding the lock through it serialised every
+        // Vessel's Seal behind every other's (seal.lookup 92 ms p50 at 11
+        // Vessels on taso-test, 2026-10-26, for four socket round trips).
         let lookup = crate::timing::span("seal.lookup");
-        let mut d = self.blkd.lock().unwrap();
-        let b = self.branch(&mut *d)?;
-        if seal_at(&mut *d, b, lsn)?.is_some() {
-            return Err(format!("Seal layer {} exists", self.dataset.seal_snapshot(lsn)).into());
-        }
-        let t = tag(lsn, hash);
-        let dev = d.info(b)?.dev;
-        let mounted = self.mounts.source(&self.mountpoint)?;
+        let (b, t, dev, mounted) = {
+            let mut d = self.blkd.lock().unwrap();
+            let b = self.branch(&mut *d)?;
+            if seal_at(&mut *d, b, lsn)?.is_some() {
+                return Err(
+                    format!("Seal layer {} exists", self.dataset.seal_snapshot(lsn)).into(),
+                );
+            }
+            let dev = d.info(b)?.dev;
+            (
+                b,
+                tag(lsn, hash),
+                dev,
+                self.mounts.source(&self.mountpoint)?,
+            )
+        };
         drop(lookup);
         match (dev, mounted) {
             (Some(dev), Some(src)) if src == dev => {
@@ -1114,7 +1125,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 drop(freeze);
                 let sealed = {
                     let _log = crate::timing::span("seal.log");
-                    d.seal(b, &t)
+                    self.blkd.lock().unwrap().seal(b, &t)
                 };
                 let thaw = crate::timing::span("seal.thaw");
                 let thawed = self.mounts.thaw(&self.mountpoint);
@@ -1132,7 +1143,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 .into());
             }
             (_, None) => {
-                d.seal(b, &t)?; // nothing mounted: the device is quiet
+                self.blkd.lock().unwrap().seal(b, &t)?; // nothing mounted: the device is quiet
             }
         }
         Ok(())
