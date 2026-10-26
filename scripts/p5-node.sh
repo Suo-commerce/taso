@@ -13,7 +13,7 @@
 #
 #   1 hostname     taso-p5 (kept over reboots), so a prompt says which
 #                  machine a command runs on
-#   2 packages     apt: git, the C toolchain, pkg-config, clang, libclang-dev
+#   2 packages     apt: git, the C toolchain, pkg-config, libclang-dev
 #                  (libublk's bindings), python3, jq, curl, chrony, runc,
 #                  e2fsprogs, util-linux, fio, zfsutils-linux, nvme-cli
 #   3 coreutils    GNU coreutils in place of uutils (Ubuntu 25.10 and later
@@ -181,7 +181,7 @@ if [[ "$mode" == setup ]]; then
     # on uutils, which step 3 removes, and it is only a bundle.
     toolchain=; has gcc && has make || toolchain=build-essential
     # shellcheck disable=SC2086
-    apt_get install -y git $toolchain pkg-config clang libclang-dev python3 jq curl chrony runc \
+    apt_get install -y git $toolchain pkg-config libclang-dev python3 jq curl chrony runc \
         e2fsprogs util-linux fio zfsutils-linux nvme-cli
 
     step "3 GNU coreutils"
@@ -303,14 +303,19 @@ report() {
     info "CPU: $(lscpu | awk -F': *' '/^Model name/{print $2; exit}') ($(nproc) threads); memory $(free -g | awk '/Mem:/{print $2}') GiB"
     info "virtualisation: $(systemd-detect-virt 2>/dev/null || echo unknown)"
     info "cpufreq governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo none)"
-    info "unattended-upgrades timer: $(systemctl is-active apt-daily-upgrade.timer 2>/dev/null || echo none)"
+    info "unattended-upgrades timer: $(systemctl is-active apt-daily-upgrade.timer 2>/dev/null || true)"
     [[ "$os_id" == ubuntu && "$os_ver" == 26.04 ]] && pass "Ubuntu 26.04" || bad "not Ubuntu 26.04 ($os_id $os_ver)"
     [[ "${kernel%%.*}" -ge 6 ]] && pass "kernel $kernel" || bad "kernel $kernel is older than 6.0 (ublk)"
 
     step "tools"
-    for t in gcc make clang git fio python3 jq runc mkfs.ext4 fsfreeze zpool nvme chronyd; do
+    for t in gcc make git fio python3 jq runc mkfs.ext4 fsfreeze zpool nvme chronyd; do
         has "$t" && pass "$t" || bad "$t missing"
     done
+    if ls /usr/lib/llvm-*/lib/libclang.so* >/dev/null 2>&1 || ls /usr/lib/*-linux-gnu/libclang*.so* >/dev/null 2>&1; then
+        pass "libclang (libublk's bindings are generated with it)"
+    else
+        bad "libclang missing (libclang-dev)"
+    fi
     gnu_coreutils && pass "$(coreutils_version)" || bad "coreutils are $(coreutils_version), not GNU (xfstests and our scripts assume GNU)"
     if [[ -x /root/.cargo/bin/cargo ]]; then pass "$(/root/.cargo/bin/cargo --version)"; else bad "cargo missing"; fi
     modprobe -n ublk_drv 2>/dev/null && pass "ublk_drv available" || bad "ublk_drv not available for $(uname -r)"
@@ -329,13 +334,15 @@ report() {
     info "root on $root_src (disk $root_disk); /tmp is $(findmnt -no FSTYPE /tmp 2>/dev/null || findmnt -no FSTYPE / )"
     info "block devices:"
     lsblk -d -o NAME,SIZE,ROTA,MODEL,TRAN | sed 's/^/        /'
-    for d in /dev/nvme*n[0-9]; do
-        [[ -b "$d" ]] || continue
-        n=$(basename "$d")
-        if disk_is_ours "$d"; then state="ours (taso-zfs + taso-blk)"
+    for n in $(lsblk -dn -o NAME,TYPE | awk '$2 == "disk" {print $1}'); do
+        d=/dev/$n
+        if [[ "$d" != /dev/nvme* ]]; then state="not NVMe (setup refuses it)"
+        elif disk_is_ours "$d"; then state="ours (taso-zfs + taso-blk)"
         elif why=$(disk_empty "$d"); then state="EMPTY, free to name"
         else state="in use: $why"; fi
+        [[ "$n" != "$root_disk" ]] || state+="; holds the root filesystem"
         info "$n: $state"
+        [[ "$d" == /dev/nvme* ]] || continue
         info "  queue: logical $(q "$n" logical_block_size) physical $(q "$n" physical_block_size) write_cache '$(q "$n" write_cache)' fua $(q "$n" fua) rotational $(q "$n" rotational) zoned $(q "$n" zoned) discard_granularity $(q "$n" discard_granularity) nr_requests $(q "$n" nr_requests)"
         if has nvme; then
             info "  nvme: $(nvme id-ctrl "$d" 2>/dev/null | awk -F': *' '/^(mn|fr)/{printf "%s=%s ", $1, $2}') ctratt=$(nvme id-ctrl "$d" 2>/dev/null | awk -F': *' '/^ctratt/{print $2}')"
