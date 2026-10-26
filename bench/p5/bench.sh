@@ -229,20 +229,20 @@ PY
     # the samples each Vessel wrote to its /work
     if [[ "$STORAGE" == zfs ]]; then
         for ds in $(zfs list -H -o name -d 1 "$root" | tail -n +2); do
-            collect "$(zfs get -H -o value mountpoint "$ds")" "$r" "${ds##*/}"
+            collect "$(zfs get -H -o value mountpoint "$ds")" "$r" "$(subject_of "$r" "${ds##*/}")"
         done
     else
         local ds branch dev at="$MNT/.p5-read"
         mkdir -p "$at"
         for ds in $(grep -o "\] p5-bench-$RUN-r$r-v[0-9a-z-]*: dataset [^ ]*\$" "$OUT/warden-$r.err" | sed 's/.*: dataset //' | sort -u); do
             if mountpoint -q "$MNT/$ds"; then   # the Warden leaves the Vessel mounted at exit
-                collect "$MNT/$ds" "$r" "${ds##*/}"; continue
+                collect "$MNT/$ds" "$r" "$(subject_of "$r" "${ds##*/}")"; continue
             fi
             branch=$(blk find "$ds"); read -r dev whose <<<"$(blk_device "$branch")"
             for _ in $(seq 50); do [[ -b "$dev" ]] && break; sleep 0.1; done
             [[ -b "$dev" ]] || die "device $dev for $ds did not appear"
             mount -o ro "$dev" "$at"
-            collect "$at" "$r" "${ds##*/}"
+            collect "$at" "$r" "$(subject_of "$r" "${ds##*/}")"
             umount "$at"; [[ "$whose" == theirs ]] || blk detach "$branch" >/dev/null
         done
         rmdir "$at"
@@ -251,7 +251,10 @@ PY
     echo "warden run $r: exit $rc, $ok of $P Vessels ok, $(awk '{printf "user %.2fs sys %.2fs rss %d KiB", $1, $2, $3}' "$OUT/warden-$r.time")"
     grep -vE "$VESSEL_OK" "$OUT/warden-$r.out" | grep -E "^p5-bench-" | head -5 || true
 }
-collect() { # collect MOUNT R NAME: a child's samples (NAME has -fork-) apart from a parent's
+subject_of() { # subject_of R DSNAME -> the Vessel's subject, from the Warden's "SUBJECT: dataset ..." line
+    grep -o "\\] [^:]*: dataset [^ ]*$2\\$" "$OUT/warden-$1.err" | head -1 | sed 's/^\\] //; s/: dataset.*//'
+}
+collect() { # collect MOUNT R SUBJECT: a child's samples (SUBJECT has -fork-) apart from a parent's
     local kind=""; [[ "$3" != *-fork-* ]] || kind="-children"
     [[ -f "$1/samples" ]] && cat "$1/samples" >>"$OUT/commit$kind.samples"
     [[ -f "$1/turn-samples" ]] && cat "$1/turn-samples" >>"$OUT/turn$kind.samples"

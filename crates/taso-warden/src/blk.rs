@@ -551,7 +551,10 @@ fn mount_branch<D: Blkd, M: Mounts>(
 ) -> Result<PathBuf, LayerError> {
     let dev = match d.info(b)?.dev {
         Some(dev) => dev,
-        None => d.attach(b)?,
+        None => {
+            let _t = crate::timing::span("blk.attach");
+            d.attach(b)?
+        }
     };
     match m.source(mp)? {
         Some(src) if src == dev => {}
@@ -564,7 +567,10 @@ fn mount_branch<D: Blkd, M: Mounts>(
             )
             .into())
         }
-        None => m.mount(&dev, mp)?,
+        None => {
+            let _t = crate::timing::span("blk.mount");
+            m.mount(&dev, mp)?
+        }
     }
     Ok(dev)
 }
@@ -824,9 +830,11 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         if d.find(target.as_str())?.is_some() {
             return Err(format!("dataset {target} already exists").into());
         }
+        let branch_span = crate::timing::span("blk.branch");
         let b = d.branch(layer, target.as_str())?;
         let made = (|| -> Result<(), LayerError> {
             d.flush()?;
+            drop(branch_span);
             self.mount_branch(&mut *d, b, target)?;
             Ok(())
         })();
@@ -1083,6 +1091,10 @@ impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
 
 impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        // seal.lookup: everything before the freeze (the branch, its Seals,
+        // its device, what is mounted); seal.snapshot minus the four spans
+        // was 28 ms unexplained in the fork storm of 2026-10-26.
+        let lookup = crate::timing::span("seal.lookup");
         let mut d = self.blkd.lock().unwrap();
         let b = self.branch(&mut *d)?;
         if seal_at(&mut *d, b, lsn)?.is_some() {
@@ -1091,6 +1103,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
         let t = tag(lsn, hash);
         let dev = d.info(b)?.dev;
         let mounted = self.mounts.source(&self.mountpoint)?;
+        drop(lookup);
         match (dev, mounted) {
             (Some(dev), Some(src)) if src == dev => {
                 // Three spans under seal.snapshot, so a slow Seal names its

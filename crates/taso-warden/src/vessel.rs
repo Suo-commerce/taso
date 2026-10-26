@@ -947,8 +947,14 @@ impl<P: Pool> Host<P> {
             namespace,
             ledger_pos,
         };
-        let mut chronicle = self.unborn(id, Some((parent_dataset, ps.seal, ps.seal_hash)))?;
-        chronicle.append(Stream::Ctl, Payload::Lineage(lineage.clone()))?;
+        let mut chronicle = {
+            let _t = crate::timing::span("fork.unborn");
+            self.unborn(id, Some((parent_dataset, ps.seal, ps.seal_hash)))?
+        };
+        {
+            let _t = crate::timing::span("fork.lineage");
+            chronicle.append(Stream::Ctl, Payload::Lineage(lineage.clone()))?;
+        }
         Ok(Vessel {
             id,
             dataset: self.dataset_for(id),
