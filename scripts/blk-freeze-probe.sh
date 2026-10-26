@@ -11,6 +11,11 @@
 # data written back through the device at the freeze, not the freeze.
 # Run 2 (taso-test): the requests the kernel sends are merged (13-25 per
 # freeze, up to 167 KiB each) and the branch moves them as fast as loop.
+# Run 4 (lever 3): the block log's own per-operation times (taso-blkd
+# stats op_*: count:total_us:store_us:bytes) around each freeze - how long
+# a write request takes in the process and how much of it inside the
+# store's lock.  Prediction (before the run): the store's share is under
+# 10% and the request's time is the ublk round trip and the kernel's copy.
 # Run 3 (lever 2, the metal): how many BARRIERS one freeze sends - the
 # block log's sync count (taso-blkd stats: syncs, now one per group
 # commit round) and the device's flush requests (/sys/block/<dev>/stat,
@@ -90,11 +95,23 @@ def p50(v): v = sorted(v); return v[len(v) // 2]
 def stat():  # writes completed, sectors written, flush requests completed (field 17, 0 if absent)
     f = open("/sys/block/%s/stat" % dev).read().split()
     return int(f[4]), int(f[6]), int(f[16]) if len(f) > 16 else 0
-def syncs():  # the block log's fdatasync count, or -1 on a loop device
-    if dev.startswith("loop"): return -1
+def stats():  # the block log's stats line as a dict, or {} on a loop device
+    if dev.startswith("loop"): return {}
     s = socket.socket(socket.AF_UNIX); s.connect(sock); s.sendall(b"stats\n")
     line = s.makefile().readline(); s.close()
-    return int(line.split("syncs=")[1].split()[0])
+    return dict(kv.split("=", 1) for kv in line.split()[1:] if "=" in kv)
+def syncs(): return int(stats().get("syncs", -1))
+def ops(st):  # op name -> (count, total_us, store_us, bytes)
+    return {k[3:]: tuple(int(x) for x in v.split(":")) for k, v in st.items() if k.startswith("op_")}
+def ops_line(a, b):  # what the device did between two stats readings
+    out = []
+    for k in ("write", "flush", "read"):
+        if k not in a or k not in b: continue
+        n = b[k][0] - a[k][0]
+        if n == 0: continue
+        tot, sto, by = b[k][1] - a[k][1], b[k][2] - a[k][2], b[k][3] - a[k][3]
+        out.append("%s %d x %.2f ms (%.2f in store%s)" % (k, n, tot / n / 1000, sto / n / 1000, ", %d KiB" % (by // 1024) if by else ""))
+    return "; ".join(out)
 fr, th, fl, sy = [], [], [], []
 for _ in range(n):
     subprocess.run(["sync", "-f", mnt], check=True)
@@ -104,13 +121,14 @@ for _ in range(n):
 print("  %-30s idle: freeze p50 %5.1f max %5.1f ms  thaw p50 %4.1f  flush requests/freeze %d  log syncs/freeze %d" % (label, p50(fr), max(fr), p50(th), p50(fl), p50(sy)))
 for kib in (64, 1024, 4096):
     with open(os.path.join(mnt, "dirty.bin"), "wb") as f: f.write(os.urandom(kib << 10))
-    w0, s0, f0 = stat(); y0 = syncs()
+    w0, s0, f0 = stat(); st0 = stats(); y0 = int(st0.get("syncs", -1))
     t = ms(["fsfreeze", "-f", mnt])
-    w1, s1, f1 = stat(); y1 = syncs()
+    w1, s1, f1 = stat(); st1 = stats(); y1 = int(st1.get("syncs", -1))
     subprocess.run(["fsfreeze", "-u", mnt], check=True)
     os.unlink(os.path.join(mnt, "dirty.bin")); subprocess.run(["sync", "-f", mnt], check=True)
     reqs, kb = w1 - w0, (s1 - s0) // 2
     print("  %-30s dirty %5d KiB: freeze %6.1f ms  %3d writes, %6d KiB, %3d flush requests, %3d log syncs" % (label, kib, t, reqs, kb, f1 - f0, y1 - y0))
+    if st0: print("  %-30s   in the block log: %s" % ("", ops_line(ops(st0), ops(st1))))
 PY
 }
 limits() { # limits DEV (kept for a later run) -> the queue limits that shape write-back requests

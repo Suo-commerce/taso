@@ -201,6 +201,39 @@ struct Device {
     thread: JoinHandle<()>,
 }
 
+/// Per-operation time on the device path, for `stats`: how long a request
+/// takes in `handle` altogether, and how much of that inside the store's
+/// lock.  Named by lever 3 of P5 (2026-10-26): 1 MiB of write-back through
+/// a branch took 37 ms with two syncs on taso-p5, and nothing in the store
+/// accounts for it.
+#[derive(Default, Clone, Copy)]
+struct OpTime {
+    count: u64,
+    total_us: u64,
+    store_us: u64,
+    bytes: u64,
+}
+static OPS: Mutex<[OpTime; 4]> = Mutex::new(
+    [OpTime {
+        count: 0,
+        total_us: 0,
+        store_us: 0,
+        bytes: 0,
+    }; 4],
+);
+const OP_READ: usize = 0;
+const OP_WRITE: usize = 1;
+const OP_FLUSH: usize = 2;
+const OP_DISCARD: usize = 3;
+fn note_op(op: usize, started: std::time::Instant, store: std::time::Duration, bytes: u64) {
+    let mut ops = lock(&OPS);
+    let o = &mut ops[op];
+    o.count += 1;
+    o.total_us += started.elapsed().as_micros() as u64;
+    o.store_us += store.as_micros() as u64;
+    o.bytes += bytes;
+}
+
 struct Daemon {
     store: Arc<Mutex<Store>>,
     /// The log's fdatasync, outside the store's lock, one for every group
@@ -902,8 +935,15 @@ impl Daemon {
                 .unwrap_or("?")
                 .to_string()
         };
+        let ops = *lock(&OPS);
+        let op = |name: &str, o: OpTime| {
+            format!(
+                " {name}={}:{}:{}:{}",
+                o.count, o.total_us, o.store_us, o.bytes
+            )
+        };
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -912,7 +952,11 @@ impl Daemon {
             s.map().layers(),
             devices,
             field("Threads:"),
-            field("VmRSS:")
+            field("VmRSS:"),
+            op("op_read", ops[OP_READ]),
+            op("op_write", ops[OP_WRITE]),
+            op("op_flush", ops[OP_FLUSH]),
+            op("op_discard", ops[OP_DISCARD]),
         )
     }
 }
@@ -1088,6 +1132,7 @@ fn handle(
     }
     let (lba, n) = (off / BLOCK, bytes as usize);
     let pos = UblkIOCtx::ublk_user_copy_pos(qid, tag, 0);
+    let started = std::time::Instant::now();
     let io = |e: &dyn std::fmt::Display| {
         log!("taso-blkd: {branch}: op {op} at block {lba}: {e}");
         -libc::EIO
@@ -1098,14 +1143,18 @@ fn handle(
                 return -libc::EINVAL;
             }
             // Bound first: the lock is let go of before any logging.
+            let t = std::time::Instant::now();
             let r = lock_store(store).read(branch, lba, &mut buf[..n]);
+            let in_store = t.elapsed();
             if let Err(e) = r {
                 return io(&e);
             }
-            match cdev.write_all_at(&buf[..n], pos) {
+            let res = match cdev.write_all_at(&buf[..n], pos) {
                 Ok(()) => n as i32,
                 Err(e) => io(&e),
-            }
+            };
+            note_op(OP_READ, started, in_store, bytes);
+            res
         }
         sys::UBLK_IO_OP_WRITE => {
             if n > buf.len() {
@@ -1116,6 +1165,7 @@ fn handle(
             }
             // FUA: the write's group ended under the lock, synced outside it.
             let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
+            let t = std::time::Instant::now();
             let r = {
                 let mut s = lock_store(store);
                 s.write(branch, lba, &buf[..n], false).and_then(|()| {
@@ -1126,28 +1176,39 @@ fn handle(
                     }
                 })
             };
-            match r {
+            let in_store = t.elapsed();
+            let res = match r {
                 Ok(None) => n as i32,
                 Ok(Some(lsn)) => match durable(sync, store, lsn) {
                     Ok(()) => n as i32,
                     Err(e) => io(&e),
                 },
                 Err(e) => io(&e),
-            }
+            };
+            note_op(OP_WRITE, started, in_store, bytes);
+            res
         }
         sys::UBLK_IO_OP_FLUSH => {
+            let t = std::time::Instant::now();
             let r = lock_store(store).flush_pending();
-            match r.and_then(|lsn| durable(sync, store, lsn)) {
+            let in_store = t.elapsed();
+            let res = match r.and_then(|lsn| durable(sync, store, lsn)) {
                 Ok(()) => 0,
                 Err(e) => io(&e),
-            }
+            };
+            note_op(OP_FLUSH, started, in_store, 0);
+            res
         }
         sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
+            let t = std::time::Instant::now();
             let r = lock_store(store).discard(branch, lba, bytes / BLOCK);
-            match r {
+            let in_store = t.elapsed();
+            let res = match r {
                 Ok(()) => 0,
                 Err(e) => io(&e),
-            }
+            };
+            note_op(OP_DISCARD, started, in_store, bytes);
+            res
         }
         _ => -libc::EOPNOTSUPP,
     }
