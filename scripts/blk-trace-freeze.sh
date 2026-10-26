@@ -5,7 +5,13 @@
 # busy of a 44 ms freeze after 4 MiB dirty, no journal) is set against
 # what the kernel sends and when.
 #
-#   sudo scripts/blk-trace-freeze.sh [DIRTY_KIB] [QUEUES]   (default 4096, 1)
+#   sudo scripts/blk-trace-freeze.sh [DIRTY_KIB] [QUEUES] [THREADS]   (default 4096, 1, 1)
+#
+# THREADS: taso-blkd --threads N, serving threads per queue.  Run 2 showed
+# four queues change nothing (one submitting CPU, one hardware queue, one
+# of our threads got all thirteen requests).  Prediction for 4 threads on
+# one queue: the eight 512 KiB writes complete spread over ~4 ms instead
+# of one burst at 7.7 (the store's mutex still serialises ~0.44 ms each).
 #
 # QUEUES: taso-blkd --queues N (run 2, lever 3b: run 1 traced 13 requests
 # in flight served one after another on one queue, 7.7 ms for eight
@@ -37,6 +43,7 @@
 set -euo pipefail
 DIRTY=${1:-4096}
 QUEUES=${2:-1}
+THREADS=${3:-1}
 DIR=/var/lib/taso-blk
 LOG=$DIR/trace.log; ERR=$DIR/trace.err
 SOCK=/run/taso-blk-trace.sock
@@ -74,7 +81,7 @@ mkdir -p "$DIR" "$MNT" "$OUT"; ! mountpoint -q "$MNT" || die "$MNT is mounted"
 command -v cargo >/dev/null || PATH=/root/.cargo/bin:$PATH
 cargo build -q --release -p taso-blk
 rm -f "$LOG" "$ERR" "$LOG.ckpt"
-"$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --queues "$QUEUES" 2>>"$ERR" &
+"$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --queues "$QUEUES" --threads "$THREADS" 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || die "taso-blkd socket did not appear; see $ERR"
@@ -99,7 +106,7 @@ sleep 0.2
 kill -INT "$TRACE_PID"; wait "$TRACE_PID" 2>/dev/null || true; TRACE_PID=
 fsfreeze -u "$MNT"
 blkparse -i "$OUT/trace" -f '%T.%9t %a %d %S %N\n' 2>/dev/null >"$OUT/events.txt" || blkparse -i "$OUT/trace" >"$OUT/events.txt"
-echo "queues $QUEUES; freeze after $DIRTY KiB dirty: $(python3 -c "print('%.1f ms' % (($t1 - $t0) * 1000))")  device $DEV  events in $OUT/events.txt"
+echo "queues $QUEUES, threads $THREADS; freeze after $DIRTY KiB dirty: $(python3 -c "print('%.1f ms' % (($t1 - $t0) * 1000))")  device $DEV  events in $OUT/events.txt"
 python3 - "$OUT/events.txt" <<'PY'
 import sys
 ev = []
