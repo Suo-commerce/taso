@@ -118,7 +118,8 @@ PY
 import re, sys
 big = []
 for ln in open(sys.argv[1]):
-    m = re.search(r'\|\s*[#*!+]?\s*([\d.]+) us\s+\|(.*)$', ln)  # ftrace marks long calls with # * ! +
+    # "  5) # 8881.827 us |   synchronize_rcu();" - the duration before the bar, long calls marked # * ! +
+    m = re.search(r'^\s*\d+\)\s*[#*!+]?\s*([\d.]+) us\s+\|(.*)$', ln)
     if not m: continue
     us = float(m.group(1))
     if us >= 1000: big.append((us, m.group(2).rstrip()))
