@@ -42,6 +42,16 @@
 # as gate-p1 with HUB=0 — the coordinator and the store are not what is
 # measured here.
 #
+# FORKS=N (default 0) is the fork storm (M5): with P=1, the Vessel asks N
+# forks over the Field after its last turn (taso-sim --forks N); the
+# Warden makes a child per ask (uid slots 2..N+1), each child runs the
+# agent for its own TURNS turns, sealing each.  Measured on top: fork.total
+# (the Warden's fork_from_log, per fork), the forks the Warden logged, the
+# storage's bytes before and after the run (block log: taso-blkd's
+# log_bytes; zfs: the base dataset's used) and so bytes per branch, and
+# the children's commit and turn-pause samples apart from the parent's:
+# the parent's are "one alive", the children's "N alive".
+#
 # Environment (gate-p1's): TXNS (4) ROWS (8) ROW_BYTES (512) SYNC (normal)
 # LANDLOCK (1) BATCHED (1) TASO_ZFS_DATASET; OUT (results directory,
 # default /root/taso-p5-bench-<storage>-<time>, kept); KEEP=1 keeps the
@@ -61,7 +71,8 @@ TURNS=${3:-10}
 RUNS=${4:-1}
 [[ "$STORAGE" == zfs || "$STORAGE" == blk ]] || { echo "usage: $0 zfs|blk [P] [TURNS] [RUNS]" >&2; exit 64; }
 TXNS=${TXNS:-4}; ROWS=${ROWS:-8}; ROW_BYTES=${ROW_BYTES:-512}; SYNC=${SYNC:-normal}
-LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}
+LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
+[[ "$FORKS" == 0 || "$P" == 1 ]] || { echo "FORKS needs P=1 (one parent, N children)" >&2; exit 64; }
 ZFS_PARENT=${TASO_ZFS_DATASET:-taso/vessel}
 DIR=/var/lib/taso-blk/p5-bench
 BLK_SOCK=/run/taso-p5-bench-blk.sock
@@ -163,6 +174,10 @@ else
     STORAGE_JSON=$(printf '{"blk": {"socket": "%s", "mounts": "%s", "spool": "%s"}}' "$BLK_SOCK" "$MNT" "$DIR/spool")
 fi
 SIM_ARGS="--turns $TURNS --txns $TXNS --rows $ROWS --row-bytes $ROW_BYTES --synchronous $SYNC"
+[[ "$FORKS" == 0 ]] || SIM_ARGS="$SIM_ARGS --forks $FORKS"
+bytes_used() { # the storage's bytes now
+    if [[ "$STORAGE" == zfs ]]; then zfs list -Hp -o used "$ZFS_BASE"; else blk stats | tr ' ' '\n' | sed -n 's/^log_bytes=//p'; fi
+}
 
 # ---- one run: the Warden with P Vessels -------------------------------------------
 run_warden() { # run_warden R
@@ -191,9 +206,11 @@ json.dump({
         "memory_bytes": 268435456,
         "pids": 64,
     },
-    "vessels": [{"namespace": "75" * 16, "subject": "p5-bench-$RUN-r%s-v%d" % (r, i), "uid_slot": i} for i in range($P)],
+    "vessels": [dict({"namespace": "75" * 16, "subject": "p5-bench-$RUN-r%s-v%d" % (r, i), "uid_slot": i + 1},
+                     **({"forks": {"slots": list(range(2, 2 + $FORKS))}} if $FORKS else {})) for i in range($P)],
 }, open(cfg, "w"), indent=1)
 PY
+    bytes_used >"$OUT/warden-$r.bytes0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
     TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$BIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
@@ -207,6 +224,8 @@ open(out + ".wall", "w").write("%f %f\n" % (t0, t1))
 open(out + ".time", "w").write("%f %f %d\n" % (ru.ru_utime, ru.ru_stime, ru.ru_maxrss))
 sys.exit(rc)
 PY
+    bytes_used >"$OUT/warden-$r.bytes1"
+    grep -c 'forked "' "$OUT/warden-$r.err" >"$OUT/warden-$r.forked" || true
     # the samples each Vessel wrote to its /work
     if [[ "$STORAGE" == zfs ]]; then
         for ds in $(zfs list -H -o name -d 1 "$root" | tail -n +2); do
@@ -215,7 +234,7 @@ PY
     else
         local ds branch dev at="$MNT/.p5-read"
         mkdir -p "$at"
-        for ds in $(grep -o "\] p5-bench-$RUN-r$r-v[0-9]*: dataset [^ ]*\$" "$OUT/warden-$r.err" | sed 's/.*: dataset //' | sort -u); do
+        for ds in $(grep -o "\] p5-bench-$RUN-r$r-v[0-9a-z-]*: dataset [^ ]*\$" "$OUT/warden-$r.err" | sed 's/.*: dataset //' | sort -u); do
             if mountpoint -q "$MNT/$ds"; then   # the Warden leaves the Vessel mounted at exit
                 collect "$MNT/$ds" "$r" "${ds##*/}"; continue
             fi
@@ -232,23 +251,24 @@ PY
     echo "warden run $r: exit $rc, $ok of $P Vessels ok, $(awk '{printf "user %.2fs sys %.2fs rss %d KiB", $1, $2, $3}' "$OUT/warden-$r.time")"
     grep -vE "$VESSEL_OK" "$OUT/warden-$r.out" | grep -E "^p5-bench-" | head -5 || true
 }
-collect() { # collect MOUNT R NAME
-    [[ -f "$1/samples" ]] && cat "$1/samples" >>"$OUT/commit.samples"
-    [[ -f "$1/turn-samples" ]] && cat "$1/turn-samples" >>"$OUT/turn.samples"
+collect() { # collect MOUNT R NAME: a child's samples (NAME has -fork-) apart from a parent's
+    local kind=""; [[ "$3" != *-fork-* ]] || kind="-children"
+    [[ -f "$1/samples" ]] && cat "$1/samples" >>"$OUT/commit$kind.samples"
+    [[ -f "$1/turn-samples" ]] && cat "$1/turn-samples" >>"$OUT/turn$kind.samples"
     [[ -f "$1/sim-stats.json" ]] && cp "$1/sim-stats.json" "$OUT/sim-$2-$3.json"
     return 0
 }
 
 say "$STORAGE: $RUNS run(s) x P=$P, $TURNS turns of $TXNS txns x $ROWS rows x $ROW_BYTES B, synchronous=$SYNC, landlock=$LANDLOCK, batched=$BATCHED"
-: >"$OUT/commit.samples"; : >"$OUT/turn.samples"
+: >"$OUT/commit.samples"; : >"$OUT/turn.samples"; : >"$OUT/commit-children.samples"; : >"$OUT/turn-children.samples"
 for r in $(seq 1 "$RUNS"); do run_warden "$r"; done
 
 # ---- the table -----------------------------------------------------------------
 python3 - "$OUT" "$STORAGE" "$RUNS" "$P" "$TURNS" "$TXNS" "$ROWS" "$ROW_BYTES" "$SYNC" "$LANDLOCK" "$BATCHED" \
-    "$(hostname)" "$(uname -r)" "$(git rev-parse --short HEAD 2>/dev/null || echo ?)" "$HOST_NOTE" "${ZFS_BASE:-$DIR/blk.log}" <<'PY' | tee "$OUT/table.md"
+    "$(hostname)" "$(uname -r)" "$(git rev-parse --short HEAD 2>/dev/null || echo ?)" "$HOST_NOTE" "${ZFS_BASE:-$DIR/blk.log}" "$FORKS" <<'PY' | tee "$OUT/table.md"
 import glob, os, re, sys
-out, storage, runs, p, turns, txns, rows, row_bytes, sync, landlock, batched, host, kernel, commit, note, where = sys.argv[1:]
-runs, p, turns, txns = int(runs), int(p), int(turns), int(txns)
+out, storage, runs, p, turns, txns, rows, row_bytes, sync, landlock, batched, host, kernel, commit, note, where, forks = sys.argv[1:]
+runs, p, turns, txns, forks = int(runs), int(p), int(turns), int(txns), int(forks)
 def q(v, x):
     v = sorted(v)
     return v[min(len(v) - 1, max(0, int(-(-len(v) * x // 1)) - 1))] if v else float("nan")
@@ -269,12 +289,22 @@ print()
 print(f"- host {host}, kernel {kernel}, taso {commit}; {note}; data at {where}")
 print(f"- durability contract: claude/Taso_finding_p5_a2_facts_2026-10-26.md §1 (this host's row)")
 print(f"- workload: gate-p1's taso-sim, {runs} run(s) x P={p}, {turns} turns of {txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}, batched={batched}; in-process coordinator, local store")
-print(f"- Vessels ok {ok} of {runs * p}; commits {len(commits)} of {expected_commits} expected; turns {len(turn)} of {expected_turns}")
+print(f"- Vessels ok {ok} of {runs * (p + forks)}; parent commits {len(commits)} of {expected_commits} expected; parent turns {len(turn)} of {expected_turns}")
+cc, ct, ft = load("commit-children.samples"), load("turn-children.samples"), spans.get("fork.total", [])
+if forks:
+    forked = sum(int(open(f).read().strip() or 0) for f in glob.glob(os.path.join(out, "warden-*.forked")))
+    b0 = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.bytes0")))
+    b1 = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.bytes1")))
+    print(f"- fork storm: {forks} asked per run, {forked} forked (Warden log); children commits {len(cc)}, children turns {len(ct)}")
+    print(f"- storage bytes: {b0} before, {b1} after: {(b1 - b0) / 1024:.0f} KiB for the run, {(b1 - b0) / 1024 / (forked or 1):.1f} KiB per branch (the children's own turns included)")
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
-for name, v in [("commit (SQLite WAL in the Vessel; synchronous=%s: not a durable ack)" % sync, commits), ("turn pause (TurnEnd round trip = durable ack)", turn),
-                ("seal.total", spans.get("seal.total", [])), ("publish.total", spans.get("publish.total", []))]:
+rows_ = [("commit (SQLite WAL in the Vessel; synchronous=%s: not a durable ack)" % sync, commits), ("turn pause (TurnEnd round trip = durable ack)", turn)]
+if forks:
+    rows_ += [("children: commit (N alive)", cc), ("children: turn pause (N alive)", ct), ("fork.total (the Warden's fork_from_log)", ft)]
+rows_ += [("seal.total", spans.get("seal.total", [])), ("publish.total", spans.get("publish.total", []))]
+for name, v in rows_:
     print(f"| {name} | {len(v)} | {q(v, .5):.3f} | {q(v, .95):.3f} | {q(v, .99):.3f} | {q(v, 1):.3f} |")
 print()
 print(f"| rate | value |")

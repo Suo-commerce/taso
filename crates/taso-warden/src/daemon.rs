@@ -2277,9 +2277,11 @@ impl Branches<StorageLayers> for NodeBranches<'_> {
         let seal = host
             .shipped_seal(vessel.id(), at)
             .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?;
-        let child = host
-            .fork_from_log(vessel.id(), SealAt::At(seal.lsn), name.as_bytes())
-            .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?;
+        let child = {
+            let _t = crate::timing::span("fork.total");
+            host.fork_from_log(vessel.id(), SealAt::At(seal.lsn), name.as_bytes())
+                .map_err(|e| format!("fork of {:?} at {at:?}: {e}", self.vc.subject))?
+        };
         let seal = child
             .lineage()
             .origin

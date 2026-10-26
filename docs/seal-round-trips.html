@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Seal round trips</title>
+<style>
+  :root { --bg: #ffffff; --fg: #1a1a1a; --mute: #6b6b6b; --hot: #c0392b; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #16181c; --fg: #e8e8e8; --mute: #9a9a9a; --hot: #ff7b6b; } }
+  :root[data-theme="dark"] { --bg: #16181c; --fg: #e8e8e8; --mute: #9a9a9a; --hot: #ff7b6b; }
+  body { background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 24px 16px; }
+  figure { margin: 0 auto 24px; max-width: 1100px; }
+  svg { max-width: 100%; height: auto; display: block; }
+  figcaption { color: var(--mute); font-size: 14px; margin-top: 8px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  p { max-width: 1100px; margin: 0 auto 12px; }
+</style>
+</head>
+<body>
+<h1>What a Seal costs: the block log against ZFS, one TurnEnd</h1>
+<p>Measured on taso-test (VM, disk round trip ≈ 5 ms), P=1, 2026-10-26: block log Seal 37.7 ms (freeze 37.0, log 0.9, thaw 1.7), ZFS Seal 17.7 ms. The difference is not the Warden's work but where the dirty data's barriers run: through the ublk device and the Warden's own block-log process, each a user/kernel crossing and a disk round trip, against ZFS's transaction group inside one kernel.</p>
+
+<figure>
+<svg viewBox="0 0 1100 640" role="img" aria-label="Sequence of one Seal on the block log: the agent's TurnEnd, the Warden's fsfreeze, ext4's write-back and journal barriers each crossing ublk into the Warden's block-log process and down to the disk and back, then the Seal on the log, the thaw, the Chronicle record, and the acknowledgement; the ZFS sequence beside it has the same TurnEnd and record but a single in-kernel txg sync with two barriers to the disk.">
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="currentColor"/>
+  </marker>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="var(--hot)"/>
+  </marker>
+</defs>
+<g fill="currentColor" font-size="12" stroke="currentColor">
+  <!-- Block log lanes -->
+  <text x="300" y="22" text-anchor="middle" font-size="14" font-weight="600" stroke="none">Block log (ublk)</text>
+  <g stroke="none" font-weight="600">
+    <text x="60"  y="48" text-anchor="middle">agent</text>
+    <text x="180" y="48" text-anchor="middle">Warden</text>
+    <text x="300" y="48" text-anchor="middle">kernel: ext4 + ublk</text>
+    <text x="430" y="48" text-anchor="middle">Warden's block log</text>
+    <text x="430" y="62" text-anchor="middle" font-weight="400" fill="var(--mute)">(user space, blk.log)</text>
+    <text x="540" y="48" text-anchor="middle">disk</text>
+  </g>
+  <g stroke-dasharray="3 4" stroke-width="1">
+    <line x1="60"  y1="70" x2="60"  y2="600"/>
+    <line x1="180" y1="70" x2="180" y2="600"/>
+    <line x1="300" y1="70" x2="300" y2="600"/>
+    <line x1="430" y1="70" x2="430" y2="600"/>
+    <line x1="540" y1="70" x2="540" y2="600"/>
+  </g>
+  <!-- 1 TurnEnd -->
+  <line x1="60" y1="95" x2="180" y2="95" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="120" y="89" text-anchor="middle" stroke="none">TurnEnd</text>
+  <!-- 2 fsfreeze -f -->
+  <line x1="180" y1="125" x2="300" y2="125" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="240" y="119" text-anchor="middle" stroke="none">fsfreeze -f</text>
+  <!-- freeze: barriers, hot -->
+  <g stroke="var(--hot)" fill="var(--hot)">
+    <rect x="296" y="140" width="8" height="300" fill="var(--hot)" opacity="0.25" stroke="none"/>
+    <!-- barrier 1: data write-back -->
+    <line x1="304" y1="160" x2="430" y2="160" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="367" y="154" text-anchor="middle" stroke="none">dirty pages, write</text>
+    <line x1="430" y1="175" x2="540" y2="175" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="485" y="169" text-anchor="middle" stroke="none">append, fsync</text>
+    <line x1="540" y1="190" x2="304" y2="190" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="420" y="204" text-anchor="middle" stroke="none">done</text>
+    <!-- barrier 2: flush -->
+    <line x1="304" y1="235" x2="430" y2="235" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="367" y="229" text-anchor="middle" stroke="none">flush</text>
+    <line x1="430" y1="250" x2="540" y2="250" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="485" y="244" text-anchor="middle" stroke="none">fsync</text>
+    <line x1="540" y1="265" x2="304" y2="265" stroke-width="1.5" marker-end="url(#ah)"/>
+    <!-- barrier 3: journal -->
+    <line x1="304" y1="305" x2="430" y2="305" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="367" y="299" text-anchor="middle" stroke="none">journal blocks, write</text>
+    <line x1="430" y1="320" x2="540" y2="320" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="485" y="314" text-anchor="middle" stroke="none">append, fsync</text>
+    <line x1="540" y1="335" x2="304" y2="335" stroke-width="1.5" marker-end="url(#ah)"/>
+    <!-- barrier 4: commit FUA -->
+    <line x1="304" y1="375" x2="430" y2="375" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="367" y="369" text-anchor="middle" stroke="none">commit block, FUA</text>
+    <line x1="430" y1="390" x2="540" y2="390" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="485" y="384" text-anchor="middle" stroke="none">append, fsync</text>
+    <line x1="540" y1="405" x2="304" y2="405" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="300" y="432" text-anchor="middle" stroke="none" font-size="11">each barrier: user/kernel twice + one disk round trip, in series</text>
+  </g>
+  <line x1="300" y1="450" x2="180" y2="450" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="240" y="444" text-anchor="middle" stroke="none">frozen (37.0 ms)</text>
+  <!-- seal -->
+  <line x1="180" y1="480" x2="430" y2="480" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="305" y="474" text-anchor="middle" stroke="none">seal L, tag</text>
+  <line x1="430" y1="495" x2="540" y2="495" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="485" y="489" text-anchor="middle" stroke="none">fsync</text>
+  <line x1="540" y1="510" x2="180" y2="510" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="360" y="524" text-anchor="middle" stroke="none">sealed (0.9 ms)</text>
+  <!-- thaw -->
+  <line x1="180" y1="545" x2="300" y2="545" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="240" y="539" text-anchor="middle" stroke="none">fsfreeze -u (1.7 ms)</text>
+  <!-- record + ack -->
+  <line x1="180" y1="575" x2="540" y2="575" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="360" y="569" text-anchor="middle" stroke="none">Seal record to the Chronicle segment, fsync (append.total 1.5 ms)</text>
+  <line x1="180" y1="598" x2="60" y2="598" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="120" y="615" text-anchor="middle" stroke="none">ack (turn pause 37.7 ms)</text>
+
+  <!-- divider -->
+  <line x1="620" y1="30" x2="620" y2="620" stroke-dasharray="2 6" stroke="var(--mute)"/>
+
+  <!-- ZFS lanes -->
+  <text x="880" y="22" text-anchor="middle" font-size="14" font-weight="600" stroke="none">ZFS</text>
+  <g stroke="none" font-weight="600">
+    <text x="700" y="48" text-anchor="middle">agent</text>
+    <text x="820" y="48" text-anchor="middle">Warden</text>
+    <text x="940" y="48" text-anchor="middle">kernel: ZFS</text>
+    <text x="1060" y="48" text-anchor="middle">disk</text>
+  </g>
+  <g stroke-dasharray="3 4" stroke-width="1">
+    <line x1="700"  y1="70" x2="700"  y2="600"/>
+    <line x1="820"  y1="70" x2="820"  y2="600"/>
+    <line x1="940"  y1="70" x2="940"  y2="600"/>
+    <line x1="1060" y1="70" x2="1060" y2="600"/>
+  </g>
+  <line x1="700" y1="95" x2="820" y2="95" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="760" y="89" text-anchor="middle" stroke="none">TurnEnd</text>
+  <line x1="820" y1="125" x2="940" y2="125" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="880" y="119" text-anchor="middle" stroke="none">zfs snapshot (channel program)</text>
+  <g stroke="var(--hot)" fill="var(--hot)">
+    <rect x="936" y="140" width="8" height="200" fill="var(--hot)" opacity="0.25" stroke="none"/>
+    <text x="940" y="158" text-anchor="middle" stroke="none" font-size="11">txg sync, in the kernel</text>
+    <line x1="944" y1="185" x2="1060" y2="185" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="1002" y="179" text-anchor="middle" stroke="none">data + metadata, flush</text>
+    <line x1="1060" y1="200" x2="944" y2="200" stroke-width="1.5" marker-end="url(#ah)"/>
+    <line x1="944" y1="245" x2="1060" y2="245" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="1002" y="239" text-anchor="middle" stroke="none">uberblock, flush</text>
+    <line x1="1060" y1="260" x2="944" y2="260" stroke-width="1.5" marker-end="url(#ah)"/>
+    <text x="940" y="330" text-anchor="middle" stroke="none" font-size="11">two barriers, no user-space crossing</text>
+  </g>
+  <line x1="940" y1="360" x2="820" y2="360" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="880" y="354" text-anchor="middle" stroke="none">snapshot done (zfs.program 16.1 ms)</text>
+  <line x1="820" y1="575" x2="1060" y2="575" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="940" y="569" text-anchor="middle" stroke="none">Seal record to the segment, fsync</text>
+  <line x1="820" y1="598" x2="700" y2="598" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="760" y="615" text-anchor="middle" stroke="none">ack (turn pause 17.7 ms)</text>
+</g>
+</svg>
+<figcaption>One Seal at TurnEnd. Red: the barriers the dirty data must clear before the Seal is taken. On the block log every barrier leaves the kernel through ublk into the Warden's block-log process, which appends to its log and fsyncs, and returns — a user/kernel crossing each way plus the disk's round trip, in series. On ZFS the same data clears two barriers inside one kernel. The barrier count on the ext4 side is the ordinary freeze sequence (data, flush, journal, commit) and has not yet been counted on the device; the next run on taso-p5 counts it. Round trip ≈ 5 ms on taso-test's virtual disk, ≈ 1 ms on taso-p5's NVMe (A2), so the absolute cost falls on metal while the barrier count — and so the ratio — does not.</figcaption>
+</figure>
+
+<p>Between Seals neither side does anything: the agent writes into ext4's page cache on both, and the Warden is idle. Fewer barriers per Seal (ext4's journal mode for Vessels, or a Seal that drains the device without a filesystem freeze) is the lever if the P=64 row on taso-p5 asks for one.</p>
+</body>
+</html>
