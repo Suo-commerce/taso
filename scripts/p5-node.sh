@@ -5,6 +5,13 @@
 #   sudo scripts/p5-node.sh check                              read-only
 #   sudo scripts/p5-node.sh setup --disk /dev/nvmeXn1 --commit <sha>
 #
+# Run setup under tmux with a log, from a root shell:
+#   tmux new -s p5
+#   scripts/p5-node.sh setup ... 2>&1 | tee /root/p5-setup.log
+# An ssh session that drops takes a plain run with it (SIGHUP; apt died
+# mid-unpack on taso-p5, 2026-10-26); under tmux the run goes on and
+# `tmux attach -t p5` or the log shows where it is.
+#
 # check reads the host and prints the report; it changes nothing and works
 # on any machine (taso-test included).  setup refuses the host unless it is
 # Ubuntu 26.04, the disk is a whole NVMe drive with no partitions, no
@@ -345,9 +352,9 @@ report() {
         [[ "$d" == /dev/nvme* ]] || continue
         info "  queue: logical $(q "$n" logical_block_size) physical $(q "$n" physical_block_size) write_cache '$(q "$n" write_cache)' fua $(q "$n" fua) rotational $(q "$n" rotational) zoned $(q "$n" zoned) discard_granularity $(q "$n" discard_granularity) nr_requests $(q "$n" nr_requests)"
         if has nvme; then
-            info "  nvme: $(nvme id-ctrl "$d" 2>/dev/null | awk -F': *' '/^(mn|fr)/{printf "%s=%s ", $1, $2}') ctratt=$(nvme id-ctrl "$d" 2>/dev/null | awk -F': *' '/^ctratt/{print $2}')"
+            info "  nvme: $(nvme id-ctrl "$d" 2>/dev/null | awk -F' *: *' '$1 == "mn" || $1 == "fr" || $1 == "ctratt" || $1 == "vwc" {printf "%s=%s ", $1, $2}')"
             info "  nvme: $(nvme id-ctrl -H "$d" 2>/dev/null | grep -iE 'flexible data placement|zoned' | sed 's/^ *//' | tr '\n' ';' | sed 's/;$//')"
-            info "  nvme: vwc=$(nvme id-ctrl "$d" 2>/dev/null | awk -F': *' '/^vwc/{print $2}') (volatile write cache present per the drive; what a flush does to it is A2)"
+            info "  nvme: (vwc=0x1 means a volatile write cache per the drive; what a flush does to it is A2)"
         fi
     done
     if zpool list "$POOL" >/dev/null 2>&1; then
