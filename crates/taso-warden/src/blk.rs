@@ -107,6 +107,17 @@ fn parse_seal_name(name: &str) -> Option<(Dataset, Lsn)> {
 
 /// What the pool needs from `taso-blkd` (implemented by [`Daemon`]).
 pub trait Blkd {
+    /// A connection of its own to the same block log, for a Vessel's Seals:
+    /// the pool's shared connection serialised every Vessel's commands
+    /// through one socket and one serving thread (taso-p5, P=64,
+    /// 2026-10-26: 250 ms of queue per Seal after group commit).  `None`
+    /// (the default, for in-process fakes): the shared connection is used.
+    fn own_connection(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
     /// A new root Seal (zeros).
     fn root(&mut self) -> Result<LayerId, LayerError>;
     /// A branch of `seal` named `name`; a taken name makes nothing.
@@ -181,6 +192,9 @@ impl Daemon {
 }
 
 impl Blkd for Daemon {
+    fn own_connection(&self) -> Option<Self> {
+        Some(Daemon::new(self.socket.clone()))
+    }
     fn root(&mut self) -> Result<LayerId, LayerError> {
         self.call(|c| c.root())
     }
@@ -853,6 +867,8 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
 
     fn layers(&self, dataset: &Dataset) -> BlkLayers<D, M> {
         BlkLayers {
+            own: self.blkd.lock().unwrap().own_connection(),
+            cached: None,
             blkd: self.blkd.clone(),
             mounts: self.mounts.clone(),
             dataset: dataset.clone(),
@@ -1077,6 +1093,11 @@ impl Drop for SpoolFile {
 /// The Seal layers of one dataset.
 pub struct BlkLayers<D: Blkd = Daemon, M: Mounts = System> {
     blkd: Arc<Mutex<D>>,
+    /// This Vessel's own connection for its Seals ([`Blkd::own_connection`]).
+    own: Option<D>,
+    /// The branch and its device, looked up once: neither changes while
+    /// the branch stays mounted from that device (checked at each Seal).
+    cached: Option<(LayerId, Option<PathBuf>)>,
     mounts: Arc<M>,
     dataset: Dataset,
     mountpoint: PathBuf,
@@ -1087,33 +1108,43 @@ impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
         Ok(d.find(self.dataset.as_str())?
             .ok_or_else(|| format!("no dataset {}", self.dataset))?)
     }
+
+    /// Run `f` on this Vessel's own connection, or on the shared one.
+    fn with_conn<T>(&mut self, f: impl FnOnce(&mut D) -> T) -> T {
+        match self.own.as_mut() {
+            Some(d) => f(d),
+            None => f(&mut *self.blkd.lock().unwrap()),
+        }
+    }
 }
 
 impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
-        // The pool's lock on the block-log connection is held for the
-        // commands (the lookup, the Seal), not through the freeze: a freeze
-        // is the kernel's work on the mount, served by the block log's own
-        // queue threads, and holding the lock through it serialised every
-        // Vessel's Seal behind every other's (seal.lookup 92 ms p50 at 11
-        // Vessels on taso-test, 2026-10-26, for four socket round trips).
+        // On this Vessel's own connection, with the branch and its device
+        // cached: a Seal is two commands (the Seals of the branch, to
+        // refuse a repeat; the Seal), and no lock is held across the
+        // freeze, which is the kernel's work on the mount.
         let lookup = crate::timing::span("seal.lookup");
-        let (b, t, dev, mounted) = {
-            let mut d = self.blkd.lock().unwrap();
-            let b = self.branch(&mut *d)?;
-            if seal_at(&mut *d, b, lsn)?.is_some() {
-                return Err(
-                    format!("Seal layer {} exists", self.dataset.seal_snapshot(lsn)).into(),
-                );
-            }
-            let dev = d.info(b)?.dev;
-            (
-                b,
-                tag(lsn, hash),
-                dev,
-                self.mounts.source(&self.mountpoint)?,
-            )
+        let mounted = self.mounts.source(&self.mountpoint)?;
+        let fresh = match &self.cached {
+            Some((_, dev)) if mounted.is_none() || mounted == *dev => false,
+            _ => true, // never looked up, or the device changed (a restart)
         };
+        if fresh {
+            let dataset = self.dataset.clone();
+            let c = self.with_conn(|d| -> Result<_, LayerError> {
+                let b = d
+                    .find(dataset.as_str())?
+                    .ok_or_else(|| format!("no dataset {dataset}"))?;
+                Ok((b, d.info(b)?.dev))
+            })?;
+            self.cached = Some(c);
+        }
+        let (b, dev) = self.cached.clone().expect("cached above");
+        if self.with_conn(|d| seal_at(d, b, lsn))?.is_some() {
+            return Err(format!("Seal layer {} exists", self.dataset.seal_snapshot(lsn)).into());
+        }
+        let t = tag(lsn, hash);
         drop(lookup);
         match (dev, mounted) {
             (Some(dev), Some(src)) if src == dev => {
@@ -1125,7 +1156,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 drop(freeze);
                 let sealed = {
                     let _log = crate::timing::span("seal.log");
-                    self.blkd.lock().unwrap().seal(b, &t)
+                    self.with_conn(|d| d.seal(b, &t))
                 };
                 let thaw = crate::timing::span("seal.thaw");
                 let thawed = self.mounts.thaw(&self.mountpoint);
@@ -1143,7 +1174,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 .into());
             }
             (_, None) => {
-                self.blkd.lock().unwrap().seal(b, &t)?; // nothing mounted: the device is quiet
+                self.with_conn(|d| d.seal(b, &t))?; // nothing mounted: the device is quiet
             }
         }
         Ok(())
