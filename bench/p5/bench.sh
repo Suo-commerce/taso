@@ -35,9 +35,9 @@
 #        taso/vessel, A1's; tasotest/vessel on taso-test), destroyed after.
 #   blk  a fresh taso-blkd on its own log under $DIR (which A1 puts on the
 #        measured drive through /var/lib/taso-blk), mounts under /mnt/p5-bench,
-#        stopped after.  After the Warden exits its mounts are gone, so each
-#        Vessel's samples are read by attaching its branch read-only through
-#        the daemon (find, attach, mount -o ro, umount, detach).
+#        stopped after.  The Warden leaves each Vessel mounted under $MNT at
+#        exit, so its samples are read there; a dataset not mounted is
+#        attached read-only through taso-blkd (find, attach, mount -o ro).
 # Both: an in-process coordinator (redb) and a local pack store under $DIR,
 # as gate-p1 with HUB=0 — the coordinator and the store are not what is
 # measured here.
