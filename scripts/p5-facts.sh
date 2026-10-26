@@ -5,6 +5,7 @@
 #
 #   sudo scripts/p5-facts.sh report                 (a) what the stack reports
 #   sudo scripts/p5-facts.sh flush                  (b) the cost of a flush
+#   sudo scripts/p5-facts.sh logfile [MIB]          (b2) the block log's own append+fdatasync
 #   sudo scripts/p5-facts.sh writer [PORT]          (c) on the host, before the cut
 #        scripts/p5-facts.sh listener HOST[:PORT]   (c) on the laptop, the witness
 #   sudo scripts/p5-facts.sh verify ACKED           (c) on the host, after boot
@@ -24,6 +25,23 @@
 #     flush answered in tens of microseconds is a flush that did not reach
 #     the medium, or a drive with power-loss protection (A2 writes down
 #     which, from (a) and (c)).
+#
+# (b2) logfile: what the block log pays to make an append durable - the
+#     flush that blk-trace-freeze.sh (2026-10-26) showed at 13.4 ms for
+#     4 MiB on taso-p5, on an NVMe that writes over 1 GB/s.  MIB (default
+#     4) appended and fdatasync'd, 20 times each, four ways, on the
+#     block-log partition (/var/lib/taso, ext4 ordered with a journal):
+#       as-is         a growing file, buffered writes (the store today)
+#       preallocated  the same, into a file fallocate'd to its final size
+#       no-journal    the same as-is, in a small ext4 image made with
+#                     -O ^has_journal and mounted by loop on the same
+#                     partition (the drive and its cache the same; only the
+#                     host filesystem's barriers differ)
+#       O_DIRECT      a growing file opened O_DIRECT, 4 KiB-aligned
+#                     buffers, then fdatasync
+#     Predictions (before the run): as-is ~13 ms, preallocated ~6,
+#     no-journal ~5, O_DIRECT ~4 (the drive's write time plus one barrier).
+#     The winner is what the log file becomes (lever 3b).
 #
 # (c) the cut, the real measurement.  writer (host) listens on PORT
 #     (default 7705) and, once the listener (laptop) has connected, appends
@@ -132,6 +150,47 @@ for d, name in ((sys.argv[1], "ext4 on taso-blk"), (sys.argv[2], "zfs taso/vesse
     run(os.path.join(d, "flush-fdatasync.bin"), 0, "write + fdatasync", True)
     run(os.path.join(d, "flush-odsync.bin"), os.O_DSYNC, "O_DSYNC write", False)
     run(os.path.join(d, "flush-nosync.bin"), 0, "write only (page cache)", False)
+PY
+    ;;
+
+# ---- (b2) logfile -----------------------------------------------------------
+logfile)
+    [[ $EUID -eq 0 ]] || die "run as root"
+    MIB=${1:-4}
+    base=$(dirname "$EXT4_DIR"); [[ -d "$base" ]] || die "$base is not here"
+    mkdir -p "$EXT4_DIR"
+    img="$EXT4_DIR/nojournal.img"; mnt="$EXT4_DIR/nojournal"
+    trap 'mountpoint -q "$mnt" 2>/dev/null && umount "$mnt"; losetup -j "$img" 2>/dev/null | cut -d: -f1 | xargs -r losetup -d; rm -f "$img"' EXIT
+    rm -f "$img"; truncate -s 2G "$img"
+    loop=$(losetup -f --show "$img"); mkfs.ext4 -q -F -O ^has_journal "$loop"
+    mkdir -p "$mnt"; mount "$loop" "$mnt"
+    echo "== block log file: ${MIB} MiB appended then fdatasync, 20 x each, on $(findmnt -no SOURCE,FSTYPE,OPTIONS "$base")"
+    python3 - "$EXT4_DIR" "$mnt" "$MIB" <<'PY'
+import mmap, os, sys, time
+d, nj, mib = sys.argv[1], sys.argv[2], int(sys.argv[3])
+N, SIZE = 20, mib << 20
+def pct(xs, p): xs = sorted(xs); return xs[min(len(xs) - 1, int(p * len(xs)))]
+def run(label, path, flags=0, prealloc=False, direct=False):
+    try: os.unlink(path)
+    except FileNotFoundError: pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | flags, 0o600)
+    if prealloc: os.posix_fallocate(fd, 0, SIZE * N)
+    if direct:
+        buf = mmap.mmap(-1, SIZE); buf.write(os.urandom(SIZE))
+    else:
+        buf = os.urandom(SIZE)
+    lat, off = [], 0
+    for _ in range(N):
+        t = time.perf_counter_ns()
+        os.pwrite(fd, buf, off); os.fdatasync(fd)
+        lat.append((time.perf_counter_ns() - t) // 1000); off += SIZE
+    os.close(fd); os.unlink(path)
+    print("  %-14s p50 %7.1f  p90 %7.1f  max %7.1f ms   (%.0f MB/s at p50)" % (label, pct(lat, .5) / 1000, pct(lat, .9) / 1000, max(lat) / 1000, SIZE / (pct(lat, .5) / 1e6) / 1e6))
+run("as-is", os.path.join(d, "log-asis.bin"))
+run("preallocated", os.path.join(d, "log-prealloc.bin"), prealloc=True)
+run("no-journal", os.path.join(nj, "log-nojournal.bin"))
+run("O_DIRECT", os.path.join(d, "log-direct.bin"), flags=os.O_DIRECT, direct=True)
+run("prealloc+direct", os.path.join(d, "log-pd.bin"), flags=os.O_DIRECT, prealloc=True, direct=True)
 PY
     ;;
 
@@ -276,5 +335,5 @@ sys.exit(1 if bad else 0)
 PY
     ;;
 *)
-    echo "usage: $0 report | flush | writer [PORT] | listener HOST[:PORT] [ACKED] | verify ACKED" >&2; exit 64 ;;
+    echo "usage: $0 report | flush | logfile [MIB] | writer [PORT] | listener HOST[:PORT] [ACKED] | verify ACKED" >&2; exit 64 ;;
 esac
