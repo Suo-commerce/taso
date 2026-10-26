@@ -1093,9 +1093,19 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
         let mounted = self.mounts.source(&self.mountpoint)?;
         match (dev, mounted) {
             (Some(dev), Some(src)) if src == dev => {
+                // Three spans under seal.snapshot, so a slow Seal names its
+                // step: the freeze (ext4's sync of the Vessel), the Seal on
+                // the log, the thaw.
+                let freeze = crate::timing::span("seal.freeze");
                 self.mounts.freeze(&self.mountpoint)?;
-                let sealed = d.seal(b, &t);
+                drop(freeze);
+                let sealed = {
+                    let _log = crate::timing::span("seal.log");
+                    d.seal(b, &t)
+                };
+                let thaw = crate::timing::span("seal.thaw");
                 let thawed = self.mounts.thaw(&self.mountpoint);
+                drop(thaw);
                 sealed?;
                 thawed?;
             }
