@@ -112,6 +112,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::PoisonError;
 
 use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
 
@@ -597,13 +598,21 @@ impl Store {
     /// End a group: append a Flush record and make everything durable.
     /// Returns the Flush record's sequence number.
     pub fn flush(&mut self) -> Result<u64, StoreError> {
-        self.check()?;
-        self.append(K_FLUSH, &[])?;
+        let lsn = self.flush_pending()?;
         if let Err(e) = self.file.sync_data() {
             self.poisoned = true;
             return Err(e.into());
         }
         self.stats.syncs += 1;
+        Ok(lsn)
+    }
+
+    /// End a group without making it durable: append the Flush record and
+    /// return its sequence number, for [`Syncer::durable`] to sync outside
+    /// the store's lock.  Nothing is durable until that returns.
+    pub fn flush_pending(&mut self) -> Result<u64, StoreError> {
+        self.check()?;
+        self.append(K_FLUSH, &[])?;
         Ok(self.lsn)
     }
 
@@ -616,6 +625,24 @@ impl Store {
     /// [`Store::seal`], with `tag` (at most [`MAX_TAG`] bytes) kept on the
     /// Seal.
     pub fn seal_tagged(&mut self, branch: LayerId, tag: &[u8]) -> Result<LayerId, StoreError> {
+        let seal = self.seal_record(branch, tag)?;
+        self.flush()?;
+        Ok(seal)
+    }
+
+    /// [`Store::seal_tagged`] with the sync left to [`Syncer::durable`]:
+    /// returns the Seal and the Flush record's sequence number to wait for.
+    pub fn seal_pending(
+        &mut self,
+        branch: LayerId,
+        tag: &[u8],
+    ) -> Result<(LayerId, u64), StoreError> {
+        let seal = self.seal_record(branch, tag)?;
+        let lsn = self.flush_pending()?;
+        Ok((seal, lsn))
+    }
+
+    fn seal_record(&mut self, branch: LayerId, tag: &[u8]) -> Result<LayerId, StoreError> {
         self.check()?;
         if tag.len() > MAX_TAG {
             return Err(StoreError::BadTag(tag.len()));
@@ -633,8 +660,16 @@ impl Store {
         body.extend_from_slice(&branch.get().to_le_bytes());
         body.extend_from_slice(tag);
         self.append(K_SEAL, &body)?;
-        self.flush()?;
         Ok(seal)
+    }
+
+    /// A [`Syncer`] over this log's file, for syncing outside the lock.
+    pub fn syncer(&self) -> io::Result<Syncer> {
+        Ok(Syncer {
+            file: self.file.try_clone()?,
+            state: std::sync::Mutex::new(SyncState::default()),
+            done: std::sync::Condvar::new(),
+        })
     }
 
     /// The tag of a live Seal (empty if it has none); `None` if `seal` is
@@ -1511,6 +1546,82 @@ impl Read for ReadAt<'_> {
 }
 
 /// Make a new directory entry durable.
+/// Group commit: the log's `fdatasync`, run outside the store's mutex, one
+/// for every group ended while the previous sync ran.
+///
+/// A caller ends its group under the store's lock
+/// ([`Store::flush_pending`], [`Store::seal_pending`]), lets the lock go,
+/// and asks for `durable(lsn)`.  Whoever asks while no sync is running
+/// syncs for everyone who has asked so far; the others wait for it, and
+/// whoever it did not cover leads the next.  Holding the mutex through
+/// the sync serialised every Vessel's Seal and every device flush behind
+/// one disk operation at a time (taso-p5, P=64, 2026-10-26: `seal.log`
+/// 690 ms p50 for a 1 ms fsync).
+pub struct Syncer {
+    file: File,
+    state: std::sync::Mutex<SyncState>,
+    done: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct SyncState {
+    /// The highest sequence number asked for.
+    requested: u64,
+    /// Everything up to here is on the medium.
+    durable: u64,
+    /// A sync is running, for everything requested when it started.
+    syncing: bool,
+    /// A sync failed: nothing after `durable` will ever be.
+    failed: bool,
+    /// Syncs made.
+    syncs: u64,
+}
+
+impl Syncer {
+    /// Make everything appended up to `lsn` durable.  Returns whether this
+    /// call ran the sync (false: another caller's covered it).
+    pub fn durable(&self, lsn: u64) -> Result<bool, StoreError> {
+        let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.requested = st.requested.max(lsn);
+        let mut led = false;
+        loop {
+            if st.failed {
+                return Err(StoreError::Poisoned);
+            }
+            if st.durable >= lsn {
+                return Ok(led);
+            }
+            if st.syncing {
+                st = self.done.wait(st).unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            let upto = st.requested;
+            st.syncing = true;
+            drop(st);
+            let r = self.file.sync_data();
+            st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.syncing = false;
+            match r {
+                Ok(()) => {
+                    st.durable = st.durable.max(upto);
+                    st.syncs += 1;
+                    led = true;
+                }
+                Err(_) => st.failed = true,
+            }
+            self.done.notify_all();
+        }
+    }
+
+    /// Syncs made so far.
+    pub fn syncs(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .syncs
+    }
+}
+
 fn sync_dir(path: &Path) -> io::Result<()> {
     let dir = path
         .parent()
@@ -2849,5 +2960,41 @@ mod tests {
         let done = (done.before, done.after, done.live, done.records);
         eprintln!("begin (store held) {begin:?}; copy {copy:?}; catch_up {caught} records {catch:?}; finish (store held) {finish:?}");
         eprintln!("{done:?}");
+    }
+
+    #[test]
+    fn syncer_group_commit_covers_every_group_with_fewer_syncs() {
+        // 32 threads each end a group under the lock and ask the syncer
+        // for it outside: every ask is answered durable, with far fewer
+        // syncs than asks (one per round of leaders), and never fewer
+        // than one.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::create(&dir.path().join("log")).unwrap();
+        let sync = std::sync::Arc::new(store.syncer().unwrap());
+        let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let root = store.lock().unwrap().root_seal().unwrap();
+        let mut threads = Vec::new();
+        for i in 0..32u64 {
+            let (store, sync) = (store.clone(), sync.clone());
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..8 {
+                    let lsn = {
+                        let mut s = store.lock().unwrap();
+                        let b = s.fork(root).unwrap();
+                        s.write(b, i, &[i as u8; BLOCK as usize], false).unwrap();
+                        s.flush_pending().unwrap()
+                    };
+                    sync.durable(lsn).unwrap();
+                }
+            }));
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        let syncs = sync.syncs();
+        assert!(syncs >= 1 && syncs < 256, "syncs {syncs}");
+        // A later ask for an already durable lsn syncs nothing more.
+        assert!(!sync.durable(1).unwrap());
+        assert_eq!(sync.syncs(), syncs);
     }
 }

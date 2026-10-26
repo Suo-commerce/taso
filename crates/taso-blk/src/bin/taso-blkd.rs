@@ -140,7 +140,7 @@ use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use taso_blk::map::{Kind, LayerId, BLOCK};
-use taso_blk::store::{Compacted, Store};
+use taso_blk::store::{Compacted, Store, StoreError, Syncer};
 
 /// The ublk target name of this daemon's devices; it is how a later
 /// daemon recognises leftovers as its own.
@@ -203,6 +203,9 @@ struct Device {
 
 struct Daemon {
     store: Arc<Mutex<Store>>,
+    /// The log's fdatasync, outside the store's lock, one for every group
+    /// ended while the last one ran (Seals, device flushes, FUA writes).
+    sync: Arc<Syncer>,
     devices: Mutex<HashMap<LayerId, Device>>,
     geometry: Geometry,
     /// A compaction is running.
@@ -284,8 +287,14 @@ fn main() {
         raise_open_files()
     );
 
+    let sync = Arc::new(
+        store
+            .syncer()
+            .unwrap_or_else(|e| fail(&format!("cannot clone the log's descriptor: {e}"))),
+    );
     let daemon = Arc::new(Daemon {
         store: Arc::new(Mutex::new(store)),
+        sync,
         devices: Mutex::new(HashMap::new()),
         geometry: g,
         compacting: AtomicBool::new(false),
@@ -568,13 +577,11 @@ impl Daemon {
                 // and the store's mutex is not re-entrant.
                 let branch = layer(1)?;
                 let tag = unhex(words.get(2).copied().unwrap_or(""))?;
-                Ok(self
-                    .store
-                    .lock()
-                    .unwrap()
-                    .seal_tagged(branch, &tag)
-                    .map_err(store_err)?
-                    .to_string())
+                let (seal, lsn) = lock_store(&self.store)
+                    .seal_pending(branch, &tag)
+                    .map_err(store_err)?;
+                self.durable(lsn)?;
+                Ok(seal.to_string())
             }
             "reset" => {
                 let branch = layer(1)?;
@@ -688,13 +695,11 @@ impl Daemon {
                 }
                 Ok(String::new())
             }
-            "flush" => Ok(self
-                .store
-                .lock()
-                .unwrap()
-                .flush()
-                .map_err(store_err)?
-                .to_string()),
+            "flush" => {
+                let lsn = lock_store(&self.store).flush_pending().map_err(store_err)?;
+                self.durable(lsn)?;
+                Ok(lsn.to_string())
+            }
             "stats" => Ok(self.stats()),
             "quit" => Ok(String::new()),
             other => Err(format!("unknown command {other}")),
@@ -829,10 +834,11 @@ impl Daemon {
         }
         let (tx, rx) = mpsc::channel();
         let store = self.store.clone();
+        let sync = self.sync.clone();
         let g = self.geometry;
         let thread = std::thread::Builder::new()
             .name(format!("dev-{branch}"))
-            .spawn(move || run_device(store, branch, g, tx))
+            .spawn(move || run_device(store, sync, branch, g, tx))
             .map_err(|e| format!("cannot start device thread: {e}"))?;
         match rx.recv() {
             Ok(Ok(dev_id)) => {
@@ -874,6 +880,12 @@ impl Daemon {
         }
     }
 
+    /// Everything up to `lsn` on the medium (group commit); a failed sync
+    /// poisons the store, as a failed sync under the lock did.
+    fn durable(&self, lsn: u64) -> Result<(), String> {
+        durable(&self.sync, &self.store, lsn).map_err(|e| e.to_string())
+    }
+
     fn stats(&self) -> String {
         // Never hold the store lock while waiting for the device table:
         // `attach` holds the table while a new device starts, and the
@@ -895,7 +907,7 @@ impl Daemon {
             st.log_bytes,
             st.garbage_bytes,
             st.records,
-            st.syncs,
+            st.syncs + self.sync.syncs(),
             s.lsn(),
             s.map().layers(),
             devices,
@@ -955,6 +967,7 @@ fn is_taso_blkd(pid: i32) -> bool {
 /// id (or why it failed) on `ready` once the device is live.
 fn run_device(
     store: Arc<Mutex<Store>>,
+    sync: Arc<Syncer>,
     branch: LayerId,
     g: Geometry,
     ready: mpsc::Sender<Result<i32, String>>,
@@ -1004,7 +1017,8 @@ fn run_device(
         Ok(())
     };
     let q_store = store.clone();
-    let queue = move |qid: u16, dev: &UblkDev| serve_queue(qid, dev, &q_store, branch);
+    let q_sync = sync.clone();
+    let queue = move |qid: u16, dev: &UblkDev| serve_queue(qid, dev, &q_store, &q_sync, branch);
     let started = ready.clone();
     let on_start = move |c: &UblkCtrl| {
         let _ = started.send(Ok(c.dev_info().dev_id as i32));
@@ -1016,7 +1030,7 @@ fn run_device(
 }
 
 /// Serve one queue: every request becomes one store call.
-fn serve_queue(qid: u16, dev: &UblkDev, store: &Mutex<Store>, branch: LayerId) {
+fn serve_queue(qid: u16, dev: &UblkDev, store: &Mutex<Store>, sync: &Syncer, branch: LayerId) {
     // SAFETY: fds[0] is the device's character file, opened by UblkDev and
     // kept open for the device's whole life, which outlasts this queue.
     // The kernel allows that file to be opened only once, so it is
@@ -1024,7 +1038,7 @@ fn serve_queue(qid: u16, dev: &UblkDev, store: &Mutex<Store>, branch: LayerId) {
     let cdev = ManuallyDrop::new(unsafe { File::from_raw_fd(dev.tgt.fds[0]) });
     let mut buf = vec![0u8; dev.dev_info.max_io_buf_bytes as usize];
     let handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-        let res = handle(q, tag, qid, &cdev, &mut buf, store, branch);
+        let res = handle(q, tag, qid, &cdev, &mut buf, store, sync, branch);
         if let Err(e) =
             q.complete_io_cmd_unified(tag, BufDesc::Slice(&[]), Ok(UblkIORes::Result(res)))
         {
@@ -1040,6 +1054,19 @@ fn serve_queue(qid: u16, dev: &UblkDev, store: &Mutex<Store>, branch: LayerId) {
 }
 
 /// One request.  Returns bytes moved, 0, or a negative errno.
+/// Group commit for `lsn`; a failed sync poisons the store, as a failed
+/// sync under the lock did, so every later call fails the same way.
+fn durable(sync: &Syncer, store: &Mutex<Store>, lsn: u64) -> Result<(), StoreError> {
+    match sync.durable(lsn) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            lock_store(store).poison();
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // the queue's context, the store and its syncer
 fn handle(
     q: &UblkQueue,
     tag: u16,
@@ -1047,6 +1074,7 @@ fn handle(
     cdev: &File,
     buf: &mut [u8],
     store: &Mutex<Store>,
+    sync: &Syncer,
     branch: LayerId,
 ) -> i32 {
     let iod = q.get_iod(tag);
@@ -1086,17 +1114,31 @@ fn handle(
             if let Err(e) = cdev.read_exact_at(&mut buf[..n], pos) {
                 return io(&e);
             }
+            // FUA: the write's group ended under the lock, synced outside it.
             let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
-            let r = lock_store(store).write(branch, lba, &buf[..n], fua);
+            let r = {
+                let mut s = lock_store(store);
+                s.write(branch, lba, &buf[..n], false).and_then(|()| {
+                    if fua {
+                        s.flush_pending().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                })
+            };
             match r {
-                Ok(()) => n as i32,
+                Ok(None) => n as i32,
+                Ok(Some(lsn)) => match durable(sync, store, lsn) {
+                    Ok(()) => n as i32,
+                    Err(e) => io(&e),
+                },
                 Err(e) => io(&e),
             }
         }
         sys::UBLK_IO_OP_FLUSH => {
-            let r = lock_store(store).flush();
-            match r {
-                Ok(_) => 0,
+            let r = lock_store(store).flush_pending();
+            match r.and_then(|lsn| durable(sync, store, lsn)) {
+                Ok(()) => 0,
                 Err(e) => io(&e),
             }
         }
