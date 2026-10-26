@@ -14,9 +14,11 @@
 # transactions of ROWS rows of ROW_BYTES per turn, a quiescent TurnEnd per
 # turn at which the Warden seals and publishes.  What is measured, per
 # Vessel and pooled:
-#   commit       taso-sim's SQLite commit latency inside the Vessel (the
-#                agent's write, acknowledged by SQLite: durable to the
-#                extent synchronous=$SYNC makes it)
+#   commit       taso-sim's SQLite commit latency inside the Vessel: the
+#                agent's write as SQLite acknowledges it.  With WAL and
+#                synchronous=normal (the default) a commit does not fsync,
+#                so this is a page-cache write (66 us on taso-test), not a
+#                durable acknowledgement; the Seal is
 #   turn pause   the agent's TurnEnd round trip: the time the agent waits
 #                for the Warden to seal — the durable acknowledgement as
 #                the agent sees it (H0's "acknowledgement latency")
@@ -76,13 +78,26 @@ BLKD_PID=; ZFS_BASE=
 mounts_under() {
     awk -v root="$MNT" '$5 == root || index($5, root "/") == 1 { print length($5), $5 }' /proc/self/mountinfo | sort -rn | cut -d' ' -f2-
 }
-blk() { # blk CMD... -> answer (the daemon's protocol, as blk-contract.sh)
-    local answer
-    answer=$(python3 -c '
+blk_raw() { # blk_raw CMD... -> the daemon's answer line (ok ... | err ...)
+    python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_UNIX); s.settimeout(120); s.connect(sys.argv[1])
-s.sendall((" ".join(sys.argv[2:]) + "\n").encode()); print(s.makefile().readline().strip())' "$BLK_SOCK" "$@") || die "taso-blkd did not answer: $*"
+s.sendall((" ".join(sys.argv[2:]) + "\n").encode()); print(s.makefile().readline().strip())' "$BLK_SOCK" "$@" || die "taso-blkd did not answer: $*"
+}
+blk() { # blk CMD... -> answer (the daemon's protocol, as blk-contract.sh)
+    local answer; answer=$(blk_raw "$@")
     case "$answer" in "ok") ;; "ok "*) printf '%s\n' "${answer#ok }" ;; *) die "taso-blkd: $* -> $answer" ;; esac
+}
+# The branch's device: attached here if it has none, or the one the Warden
+# left (the Warden unmounts at exit but does not detach).  Prints "DEV
+# ours|theirs".
+blk_device() { # blk_device BRANCH
+    local answer; answer=$(blk_raw attach "$1")
+    case "$answer" in
+        "ok "*) printf '%s ours\n' "${answer#ok }" ;;
+        *"already attached as "*) printf '%s theirs\n' "${answer##*already attached as }" ;;
+        *) die "taso-blkd: attach $1 -> $answer" ;;
+    esac
 }
 cleanup() {
     local rc=$?
@@ -201,11 +216,12 @@ PY
         local ds branch dev at="$MNT/.p5-read"
         mkdir -p "$at"
         for ds in $(grep -o "\] p5-bench-$RUN-r$r-v[0-9]*: dataset [^ ]*\$" "$OUT/warden-$r.err" | sed 's/.*: dataset //' | sort -u); do
-            branch=$(blk find "$ds"); dev=$(blk attach "$branch")
+            branch=$(blk find "$ds"); read -r dev whose <<<"$(blk_device "$branch")"
             for _ in $(seq 50); do [[ -b "$dev" ]] && break; sleep 0.1; done
+            [[ -b "$dev" ]] || die "device $dev for $ds did not appear"
             mount -o ro "$dev" "$at"
             collect "$at" "$r" "${ds##*/}"
-            umount "$at"; blk detach "$branch" >/dev/null
+            umount "$at"; [[ "$whose" == theirs ]] || blk detach "$branch" >/dev/null
         done
         rmdir "$at"
     fi
@@ -254,7 +270,7 @@ print(f"- Vessels ok {ok} of {runs * p}; commits {len(commits)} of {expected_com
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
-for name, v in [("commit (SQLite, in the Vessel)", commits), ("turn pause (TurnEnd round trip = durable ack)", turn),
+for name, v in [("commit (SQLite WAL in the Vessel; synchronous=%s: not a durable ack)" % sync, commits), ("turn pause (TurnEnd round trip = durable ack)", turn),
                 ("seal.total", spans.get("seal.total", [])), ("publish.total", spans.get("publish.total", []))]:
     print(f"| {name} | {len(v)} | {q(v, .5):.3f} | {q(v, .95):.3f} | {q(v, .99):.3f} | {q(v, 1):.3f} |")
 print()
