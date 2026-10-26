@@ -5,27 +5,25 @@
 #
 #   sudo scripts/blk-freeze-probe.sh        (from the repository root)
 #
-# Four filesystems, each frozen and thawed N times (default 20) with
-# nothing dirty, then once more after writing and closing a 1 MiB file:
-#   A  ext4 on a fresh branch, mkfs as the Warden does it (lazy inode-table
-#      init on: a kernel thread keeps zeroing inode tables after mkfs)
-#   B  the same filesystem after ext4lazyinit has finished (waited for)
-#   C  ext4 on a second branch, mkfs with lazy_itable_init=0,lazy_journal_init=0
-#   D  ext4 on a loop device, mkfs as the Warden does it (the kernel path
-#      without the block log, for comparison)
-# Printed per case: fsfreeze -f p50/max ms, fsfreeze -u p50/max ms, and
-# syncfs alone (sync -f) p50 ms; the last line names the cause the numbers
-# support.
+# Run 1 (2026-10-26, taso-test): an idle freeze costs ~2 ms on a branch,
+# lazy init on or off, and ~1.5 ms on loop; a freeze after one 1 MiB file
+# costs 15-32 ms on a branch and 9-20 ms on loop.  The cost is the dirty
+# data written back through the device at the freeze, not the freeze.
+# Run 2 asks how that write-back goes: dirty sizes from 64 KiB to 4 MiB on
+# a branch (lazy init done) and on loop, with the kernel's request count
+# and bytes for the device around each freeze (/sys/block/<dev>/stat:
+# writes completed, sectors written), so the size of the requests the
+# kernel sends is known.  First the idle cycles as before (N, default 20).
 #
-# Predictions (2026-10-26, before the first run):
-#   P1  A: freeze p50 about 37 ms (the Warden's number)
-#   P2  B and C: freeze p50 under 5 ms (lazy init was the cost)
-#   P3  D: freeze p50 under 3 ms
-#   P4  the freeze after a 1 MiB write costs a few ms more than idle, on
-#       every case (the dirty data, flushed through the device)
-# If B stays at A's level, lazy init is not it and the cost is in the
-# freeze path through ublk itself (then: C against D says whether it is
-# the device).
+# Predictions for run 2 (before the run):
+#   Q1  freeze time grows about linearly with the dirty size, on both
+#   Q2  the branch costs more per MiB than loop (the ublk round trip and the
+#       log's own write per request); if that factor is under 2 the device
+#       is not the problem and the Seal's cost is the write-back as such
+#   Q3  requests are large (p50 well over 64 KiB per request, i.e. the
+#       kernel merges pages); if they come as 4 KiB each, the block-log
+#       device's reported limits are making ext4 write a page at a time
+#       and that is the first thing to fix
 #
 # Touches, and nothing else:
 #   /var/lib/taso-blk/freeze.log, .log.ckpt, .err  (removed at start and end)
@@ -73,24 +71,40 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# measure LABEL: N freeze/thaw cycles idle, then one after a 1 MiB write
+# measure LABEL DEV: N idle freeze/thaw cycles, then one freeze after each
+# dirty size, with the device's write requests and bytes around it
 measure() {
-    local label=$1
-    python3 - "$MNT" "$N" "$label" <<'PY' | tee -a "$REPORT"
+    local label=$1 dev=$2
+    python3 - "$MNT" "$N" "$label" "$(basename "$dev")" <<'PY' | tee -a "$REPORT"
 import os, subprocess, sys, time
-mnt, n, label = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+mnt, n, label, dev = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 def ms(cmd):
     t = time.perf_counter(); subprocess.run(cmd, check=True); return (time.perf_counter() - t) * 1000
 def p50(v): v = sorted(v); return v[len(v) // 2]
+def stat():  # writes completed, sectors written (512 B)
+    f = open("/sys/block/%s/stat" % dev).read().split(); return int(f[4]), int(f[6])
 fr, th, sy = [], [], []
 for _ in range(n):
     sy.append(ms(["sync", "-f", mnt]))
     fr.append(ms(["fsfreeze", "-f", mnt])); th.append(ms(["fsfreeze", "-u", mnt]))
-with open(os.path.join(mnt, "dirty.bin"), "wb") as f: f.write(os.urandom(1 << 20))
-dirty = ms(["fsfreeze", "-f", mnt]); subprocess.run(["fsfreeze", "-u", mnt], check=True)
-os.unlink(os.path.join(mnt, "dirty.bin"))
-print("  %-44s freeze p50 %6.1f max %6.1f   thaw p50 %5.1f   syncfs p50 %5.1f   freeze after 1 MiB %6.1f  ms" % (label, p50(fr), max(fr), p50(th), p50(sy), dirty))
+print("  %-28s idle: freeze p50 %5.1f max %5.1f   thaw p50 %4.1f   syncfs p50 %4.1f ms" % (label, p50(fr), max(fr), p50(th), p50(sy)))
+for kib in (64, 256, 1024, 4096):
+    with open(os.path.join(mnt, "dirty.bin"), "wb") as f: f.write(os.urandom(kib << 10))
+    w0, s0 = stat()
+    t = ms(["fsfreeze", "-f", mnt])
+    w1, s1 = stat()
+    subprocess.run(["fsfreeze", "-u", mnt], check=True)
+    os.unlink(os.path.join(mnt, "dirty.bin")); subprocess.run(["sync", "-f", mnt], check=True)
+    reqs, kb = w1 - w0, (s1 - s0) // 2
+    print("  %-28s dirty %5d KiB: freeze %6.1f ms  %4d write requests, %6d KiB written, %5.0f KiB/request, %6.1f MiB/s"
+          % (label, kib, t, reqs, kb, kb / reqs if reqs else 0, (kb / 1024) / (t / 1000) if t else 0))
 PY
+}
+limits() { # limits DEV -> the queue limits that shape write-back requests
+    local n f; n=$(basename "$1")
+    for f in logical_block_size physical_block_size minimum_io_size optimal_io_size max_sectors_kb max_segments; do
+        printf '%s=%s ' "$f" "$(cat "/sys/block/$n/queue/$f")"
+    done
 }
 lazy_wait() { # wait until no ext4lazyinit thread is running (it exits when done)
     for _ in $(seq 600); do pgrep -x ext4lazyinit >/dev/null || return 0; sleep 1; done
@@ -124,34 +138,23 @@ branch_dev() { # branch_dev NAME -> device
     echo "$dev"
 }
 
-say "A: branch, mkfs as the Warden (lazy init on), measured at once"
+say "branch: mkfs as the Warden, lazy init waited out"
 DEV_A=$(branch_dev freeze-a)
 mkfs.ext4 -q -F -E nodiscard "$DEV_A"
 mount -o discard "$DEV_A" "$MNT"
-out "  ext4lazyinit running: $(pgrep -x ext4lazyinit >/dev/null && echo yes || echo no)"
-measure "A fresh, lazy init on"
-
-say "B: the same filesystem after ext4lazyinit finished"
 lazy_wait
-out "  ext4lazyinit running: $(pgrep -x ext4lazyinit >/dev/null && echo yes || echo no)"
-measure "B same fs, lazy init done"
+out "  device $DEV_A: $(limits "$DEV_A")"
+measure "branch" "$DEV_A"
 umount "$MNT"
 
-say "C: branch, mkfs with lazy_itable_init=0,lazy_journal_init=0"
-DEV_C=$(branch_dev freeze-c)
-mkfs.ext4 -q -F -E nodiscard,lazy_itable_init=0,lazy_journal_init=0 "$DEV_C"
-mount -o discard "$DEV_C" "$MNT"
-measure "C fresh, lazy init off"
-umount "$MNT"
-
-say "D: loop device, mkfs as the Warden"
+say "loop: mkfs as the Warden, lazy init waited out"
 truncate -s 8G "$IMG"
 LOOP=$(losetup -f --show --sector-size 4096 "$IMG")
 mkfs.ext4 -q -F -E nodiscard "$LOOP"
 mount -o discard "$LOOP" "$MNT"
-measure "D loop, lazy init on, at once"
 lazy_wait
-measure "D loop, lazy init done"
+out "  device $LOOP: $(limits "$LOOP")"
+measure "loop" "$LOOP"
 umount "$MNT"
 
 say "report saved to $REPORT"
