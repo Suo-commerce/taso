@@ -138,7 +138,6 @@ root_disk=$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -1)
 disk_empty() { # disk_empty /dev/nvmeXn1 -> prints reasons, returns 1 if not empty
     local d=$1 n reasons=
     n=$(basename "$d")
-    [[ "$n" != "$root_disk" ]] || reasons+="holds the root filesystem; "
     [[ -z "$(lsblk -no NAME "$d" | tail -n +2)" ]] || reasons+="has partitions; "
     [[ -z "$(blkid -p -o value -s TYPE "$d" 2>/dev/null)" ]] || reasons+="carries a $(blkid -p -o value -s TYPE "$d") signature; "
     [[ -z "$(lsblk -no MOUNTPOINTS "$d" | tr -d '[:space:]')" ]] || reasons+="is mounted; "
@@ -301,7 +300,7 @@ report() {
     step "host"
     info "$(date -Is)  $(hostname)  $os_id $os_ver  kernel $(uname -r)  $(uname -m)"
     info "CPU: $(lscpu | awk -F': *' '/^Model name/{print $2; exit}') ($(nproc) threads); memory $(free -g | awk '/Mem:/{print $2}') GiB"
-    info "virtualisation: $(systemd-detect-virt 2>/dev/null || echo unknown)"
+    info "virtualisation: $(systemd-detect-virt 2>/dev/null || true)"
     info "cpufreq governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo none)"
     info "unattended-upgrades timer: $(systemctl is-active apt-daily-upgrade.timer 2>/dev/null || true)"
     [[ "$os_id" == ubuntu && "$os_ver" == 26.04 ]] && pass "Ubuntu 26.04" || bad "not Ubuntu 26.04 ($os_id $os_ver)"
@@ -341,6 +340,7 @@ report() {
         elif why=$(disk_empty "$d"); then state="EMPTY, free to name"
         else state="in use: $why"; fi
         [[ "$n" != "$root_disk" ]] || state+="; holds the root filesystem"
+        # (root is refused by the mount and partition checks of disk_empty; named here for the reader)
         info "$n: $state"
         [[ "$d" == /dev/nvme* ]] || continue
         info "  queue: logical $(q "$n" logical_block_size) physical $(q "$n" physical_block_size) write_cache '$(q "$n" write_cache)' fua $(q "$n" fua) rotational $(q "$n" rotational) zoned $(q "$n" zoned) discard_granularity $(q "$n" discard_granularity) nr_requests $(q "$n" nr_requests)"
