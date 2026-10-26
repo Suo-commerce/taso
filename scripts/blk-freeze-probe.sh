@@ -9,21 +9,26 @@
 # lazy init on or off, and ~1.5 ms on loop; a freeze after one 1 MiB file
 # costs 15-32 ms on a branch and 9-20 ms on loop.  The cost is the dirty
 # data written back through the device at the freeze, not the freeze.
-# Run 2 asks how that write-back goes: dirty sizes from 64 KiB to 4 MiB on
-# a branch (lazy init done) and on loop, with the kernel's request count
-# and bytes for the device around each freeze (/sys/block/<dev>/stat:
-# writes completed, sectors written), so the size of the requests the
-# kernel sends is known.  First the idle cycles as before (N, default 20).
+# Run 2 (taso-test): the requests the kernel sends are merged (13-25 per
+# freeze, up to 167 KiB each) and the branch moves them as fast as loop.
+# Run 3 (lever 2, the metal): how many BARRIERS one freeze sends - the
+# block log's sync count (taso-blkd stats: syncs, now one per group
+# commit round) and the device's flush requests (/sys/block/<dev>/stat,
+# field 17: flush requests completed, kernel 5.5+), around each freeze,
+# idle and after each dirty size; and the same freeze with ext4 mounted
+# data=writeback (metadata journalled, data not ordered before it) and
+# with the journal off (tune2fs -O ^has_journal), to see how many barriers
+# each mode needs.  Lever 2 chooses a Vessel's mount mode by this table.
 #
-# Predictions for run 2 (before the run):
-#   Q1  freeze time grows about linearly with the dirty size, on both
-#   Q2  the branch costs more per MiB than loop (the ublk round trip and the
-#       log's own write per request); if that factor is under 2 the device
-#       is not the problem and the Seal's cost is the write-back as such
-#   Q3  requests are large (p50 well over 64 KiB per request, i.e. the
-#       kernel merges pages); if they come as 4 KiB each, the block-log
-#       device's reported limits are making ext4 write a page at a time
-#       and that is the first thing to fix
+# Predictions for run 3 (before the run, 2026-10-26):
+#   R1  an idle freeze sends 1 flush; a dirty one 2-4 (data write-back,
+#       the journal's commit with its own flush/FUA)
+#   R2  data=writeback saves none (the barriers are the journal's, not
+#       the data's) or one
+#   R3  no journal: 1 flush per freeze whatever the dirty size, and the
+#       freeze after 4 MiB at the write-back's cost alone
+#   R4  on taso-p5 (1 ms flush) a dirty freeze costs barriers x ~1 ms plus
+#       the bytes at ~1 GB/s: 4 MiB under 10 ms when alone
 #
 # Touches, and nothing else:
 #   /var/lib/taso-blk/freeze.log, .log.ckpt, .err  (removed at start and end)
@@ -72,35 +77,43 @@ cleanup() {
 trap cleanup EXIT
 
 # measure LABEL DEV: N idle freeze/thaw cycles, then one freeze after each
-# dirty size, with the device's write requests and bytes around it
+# dirty size, with the device's write requests, flush requests (barriers)
+# and the block log's syncs around it
 measure() {
     local label=$1 dev=$2
-    python3 - "$MNT" "$N" "$label" "$(basename "$dev")" <<'PY' | tee -a "$REPORT"
-import os, subprocess, sys, time
-mnt, n, label, dev = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+    python3 - "$MNT" "$N" "$label" "$(basename "$dev")" "$SOCK" <<'PY' | tee -a "$REPORT"
+import os, socket, subprocess, sys, time
+mnt, n, label, dev, sock = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 def ms(cmd):
     t = time.perf_counter(); subprocess.run(cmd, check=True); return (time.perf_counter() - t) * 1000
 def p50(v): v = sorted(v); return v[len(v) // 2]
-def stat():  # writes completed, sectors written (512 B)
-    f = open("/sys/block/%s/stat" % dev).read().split(); return int(f[4]), int(f[6])
-fr, th, sy = [], [], []
+def stat():  # writes completed, sectors written, flush requests completed (field 17, 0 if absent)
+    f = open("/sys/block/%s/stat" % dev).read().split()
+    return int(f[4]), int(f[6]), int(f[16]) if len(f) > 16 else 0
+def syncs():  # the block log's fdatasync count, or -1 on a loop device
+    if dev.startswith("loop"): return -1
+    s = socket.socket(socket.AF_UNIX); s.connect(sock); s.sendall(b"stats\n")
+    line = s.makefile().readline(); s.close()
+    return int(line.split("syncs=")[1].split()[0])
+fr, th, fl, sy = [], [], [], []
 for _ in range(n):
-    sy.append(ms(["sync", "-f", mnt]))
-    fr.append(ms(["fsfreeze", "-f", mnt])); th.append(ms(["fsfreeze", "-u", mnt]))
-print("  %-28s idle: freeze p50 %5.1f max %5.1f   thaw p50 %4.1f   syncfs p50 %4.1f ms" % (label, p50(fr), max(fr), p50(th), p50(sy)))
-for kib in (64, 256, 1024, 4096):
+    subprocess.run(["sync", "-f", mnt], check=True)
+    f0 = stat()[2]; s0 = syncs()
+    fr.append(ms(["fsfreeze", "-f", mnt])); fl.append(stat()[2] - f0); sy.append(syncs() - s0)
+    th.append(ms(["fsfreeze", "-u", mnt]))
+print("  %-30s idle: freeze p50 %5.1f max %5.1f ms  thaw p50 %4.1f  flush requests/freeze %d  log syncs/freeze %d" % (label, p50(fr), max(fr), p50(th), p50(fl), p50(sy)))
+for kib in (64, 1024, 4096):
     with open(os.path.join(mnt, "dirty.bin"), "wb") as f: f.write(os.urandom(kib << 10))
-    w0, s0 = stat()
+    w0, s0, f0 = stat(); y0 = syncs()
     t = ms(["fsfreeze", "-f", mnt])
-    w1, s1 = stat()
+    w1, s1, f1 = stat(); y1 = syncs()
     subprocess.run(["fsfreeze", "-u", mnt], check=True)
     os.unlink(os.path.join(mnt, "dirty.bin")); subprocess.run(["sync", "-f", mnt], check=True)
     reqs, kb = w1 - w0, (s1 - s0) // 2
-    print("  %-28s dirty %5d KiB: freeze %6.1f ms  %4d write requests, %6d KiB written, %5.0f KiB/request, %6.1f MiB/s"
-          % (label, kib, t, reqs, kb, kb / reqs if reqs else 0, (kb / 1024) / (t / 1000) if t else 0))
+    print("  %-30s dirty %5d KiB: freeze %6.1f ms  %3d writes, %6d KiB, %3d flush requests, %3d log syncs" % (label, kib, t, reqs, kb, f1 - f0, y1 - y0))
 PY
 }
-limits() { # limits DEV -> the queue limits that shape write-back requests
+limits() { # limits DEV (kept for a later run) -> the queue limits that shape write-back requests
     local n f; n=$(basename "$1")
     for f in logical_block_size physical_block_size minimum_io_size optimal_io_size max_sectors_kb max_segments; do
         printf '%s=%s ' "$f" "$(cat "/sys/block/$n/queue/$f")"
@@ -113,7 +126,7 @@ lazy_wait() { # wait until no ext4lazyinit thread is running (it exits when done
 
 [[ $EUID -eq 0 ]] || die "run as root"
 [[ -f Cargo.toml && -d crates/taso-blk ]] || die "run from the repository root"
-for c in mkfs.ext4 fsfreeze losetup mount sync python3; do command -v "$c" >/dev/null || die "$c missing"; done
+for c in mkfs.ext4 tune2fs dumpe2fs fsfreeze losetup mount sync python3; do command -v "$c" >/dev/null || die "$c missing"; done
 modprobe ublk_drv; [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
 [[ ! -S "$SOCK" ]] || die "$SOCK exists: another run? (pgrep -af 'taso-blkd.*freeze')"
 [[ ! -e "$IMG" ]] || die "$IMG exists from an earlier run"
@@ -138,23 +151,29 @@ branch_dev() { # branch_dev NAME -> device
     echo "$dev"
 }
 
-say "branch: mkfs as the Warden, lazy init waited out"
-DEV_A=$(branch_dev freeze-a)
-mkfs.ext4 -q -F -E nodiscard "$DEV_A"
-mount -o discard "$DEV_A" "$MNT"
-lazy_wait
-out "  device $DEV_A: $(limits "$DEV_A")"
-measure "branch" "$DEV_A"
-umount "$MNT"
+case_branch() { # case_branch NAME LABEL MKFS_EXTRA MOUNT_OPTS [TUNE]
+    local name=$1 label=$2 extra=$3 opts=$4 tune=${5:-} dev
+    say "$label"
+    dev=$(branch_dev "$name")
+    mkfs.ext4 -q -F -E "nodiscard${extra:+,$extra}" "$dev"
+    [[ -z "$tune" ]] || tune2fs -O "$tune" "$dev" >/dev/null
+    mount -o "$opts" "$dev" "$MNT"
+    lazy_wait
+    out "  mount: $(findmnt -no OPTIONS "$MNT"); journal: $(dumpe2fs -h "$dev" 2>/dev/null | grep -c has_journal)"
+    measure "$label" "$dev"
+    umount "$MNT"
+}
+case_branch freeze-a "branch, ordered (the Warden's mount)" "" "discard"
+case_branch freeze-b "branch, data=writeback" "" "discard,data=writeback"
+case_branch freeze-c "branch, no journal" "" "discard" "^has_journal"
 
-say "loop: mkfs as the Warden, lazy init waited out"
+say "loop, ordered, for comparison"
 truncate -s 8G "$IMG"
 LOOP=$(losetup -f --show --sector-size 4096 "$IMG")
 mkfs.ext4 -q -F -E nodiscard "$LOOP"
 mount -o discard "$LOOP" "$MNT"
 lazy_wait
-out "  device $LOOP: $(limits "$LOOP")"
-measure "loop" "$LOOP"
+measure "loop, ordered" "$LOOP"
 umount "$MNT"
 
 say "report saved to $REPORT"
