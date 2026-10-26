@@ -36,7 +36,8 @@
 #     and sends "stream seq" to the listener after each ack.  The listener
 #     records the last acknowledged seq per stream in ACKED (default
 #     ./p5-facts-acked.txt, rewritten every second) and prints a status
-#     line.  Jarmo then cuts the host the provider's way (Scaleway: Stop;
+#     line; it ends by itself after ten seconds without an acknowledgement
+#     (a receiver never learns otherwise that its peer lost power).  Jarmo then cuts the host the provider's way (Scaleway: Stop;
 #     also Reboot; UpCloud: stop), without stopping the writer.  After
 #     boot, verify (host) reads each stream's file, finds the longest
 #     valid prefix (consecutive seq from 1, check word right), and prints,
@@ -190,7 +191,8 @@ listener)
     python3 - "$host" "$port" "$ACKED" <<'PY'
 import socket, sys, time
 host, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-s = socket.create_connection((host, port), timeout=10); s.settimeout(None)
+s = socket.create_connection((host, port), timeout=10)
+s.settimeout(10)   # the writer acknowledges every few ms; ten seconds of silence is the cut
 print("listener: connected to %s:%d; recording to %s" % (host, port, out), flush=True)
 last, started, buf, tick = {}, time.time(), b"", time.time()
 def dump(reason):
@@ -210,7 +212,9 @@ try:
         if time.time() - tick >= 1:
             tick = time.time(); dump("running")
             print("listener: %4ds  " % (tick - started) + "  ".join("%s=%d" % kv for kv in sorted(last.items())), flush=True)
-except (ConnectionResetError, TimeoutError, OSError) as e:
+except TimeoutError:
+    print("listener: ten seconds without an acknowledgement: the host is gone", flush=True)
+except (ConnectionResetError, OSError) as e:
     print("listener: connection lost (%s)" % e, flush=True)
 except KeyboardInterrupt:
     print("listener: stopped by hand", flush=True)
