@@ -105,6 +105,7 @@ t0=$(date +%s.%N); fsfreeze -f "$MNT"; t1=$(date +%s.%N)
 sleep 0.2
 kill -INT "$TRACE_PID"; wait "$TRACE_PID" 2>/dev/null || true; TRACE_PID=
 fsfreeze -u "$MNT"
+echo "block log ops (count:total_us:store_us:bytes): $(blk stats | tr ' ' '\n' | grep '^op_' | tr '\n' ' ')"
 blkparse -i "$OUT/trace" -f '%T.%9t %a %d %S %N\n' 2>/dev/null >"$OUT/events.txt" || blkparse -i "$OUT/trace" >"$OUT/events.txt"
 echo "queues $QUEUES, threads $THREADS; freeze after $DIRTY KiB dirty: $(python3 -c "print('%.1f ms' % (($t1 - $t0) * 1000))")  device $DEV  events in $OUT/events.txt"
 python3 - "$OUT/events.txt" <<'PY'
