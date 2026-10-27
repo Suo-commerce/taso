@@ -227,6 +227,13 @@ open(out + ".time", "w").write("%f %f %d\n" % (ru.ru_utime, ru.ru_stime, ru.ru_m
 sys.exit(rc)
 PY
     bytes_used >"$OUT/warden-$r.bytes1"
+    # What shipped: the local store's bytes and files after this run (the
+    # packs every Seal published).  The log's growth counts every version
+    # of every block; the packs carry a Seal's live blocks only, so the two
+    # together say whether bytes per branch (383 vs ZFS's 231 KiB at the
+    # storm, 2026-10-26) are the log's garbage or the Seal's content.
+    du -sb "$DIR/store" | cut -f1 >"$OUT/warden-$r.packbytes"
+    find "$DIR/store" -type f | wc -l >"$OUT/warden-$r.packfiles"
     grep -c 'forked "' "$OUT/warden-$r.err" >"$OUT/warden-$r.forked" || true
     # the samples each Vessel wrote to its /work
     if [[ "$STORAGE" == zfs ]]; then
@@ -302,6 +309,10 @@ if forks:
     b1 = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.bytes1")))
     print(f"- fork storm: {forks} asked per run, {forked} forked (Warden log); children commits {len(cc)}, children turns {len(ct)}")
     print(f"- storage bytes: {b0} before, {b1} after: {(b1 - b0) / 1024:.0f} KiB for the run, {(b1 - b0) / 1024 / (forked or 1):.1f} KiB per branch (the children's own turns included)")
+pb = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.packbytes")))
+pf = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.packfiles")))
+seals = len(spans.get("seal.total", []))
+print(f"- packs shipped: {pb / 1024:.0f} KiB in {pf} files for {seals} Seals: {pb / 1024 / (seals or 1):.1f} KiB per Seal" + (f", {pb / 1024 / (forked or 1):.1f} KiB per branch" if forks else ""))
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
