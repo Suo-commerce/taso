@@ -362,6 +362,10 @@ impl Compaction {
         fresh.path = self.log.clone();
         fresh.stats = Stats {
             syncs: store.stats.syncs,
+            write_map_us: store.stats.write_map_us,
+            write_copy_us: store.stats.write_copy_us,
+            write_hash_us: store.stats.write_hash_us,
+            write_pwrite_us: store.stats.write_pwrite_us,
             ..fresh.stats
         };
         let old = std::mem::replace(store, fresh);

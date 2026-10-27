@@ -292,6 +292,17 @@ pub struct Stats {
     pub records: u64,
     /// `fdatasync` calls made by flushes.
     pub syncs: u64,
+    /// Where a write's time under the lock goes, summed over every write
+    /// (µs), for the probe of the serial append (taso-p5, 2026-10-26:
+    /// 0.8 ms per 512 KiB under the lock, four threads changing nothing).
+    /// The map's inserts, one per block.
+    pub write_map_us: u64,
+    /// The copy of the data into the record's body.
+    pub write_copy_us: u64,
+    /// The chain hash, with the record's own copy (every record kind).
+    pub write_hash_us: u64,
+    /// The `pwrite` of the record into the log file (every record kind).
+    pub write_pwrite_us: u64,
 }
 
 /// One block log file and the map it holds.
@@ -453,7 +464,7 @@ impl Store {
             log_bytes: end,
             garbage_bytes: garbage,
             records: good_lsn,
-            syncs: 0,
+            ..Stats::default()
         };
         let store = Self {
             file,
@@ -547,6 +558,7 @@ impl Store {
         }
         // The data starts after the record head and the two fields.
         let data_at = self.tail + REC_HEAD + 16;
+        let t = std::time::Instant::now();
         for i in 0..count {
             if self
                 .map
@@ -556,11 +568,14 @@ impl Store {
                 self.stats.garbage_bytes += BLOCK;
             }
         }
+        self.stats.write_map_us += t.elapsed().as_micros() as u64;
+        let t = std::time::Instant::now();
         let mut body = Vec::with_capacity(16 + data.len());
         body.extend_from_slice(&branch.get().to_le_bytes());
         body.extend_from_slice(&lba.to_le_bytes());
         body.extend_from_slice(data);
-        self.append(K_WRITE, &body)?;
+        self.stats.write_copy_us += t.elapsed().as_micros() as u64;
+        self.append_timed(K_WRITE, &body)?;
         if fua {
             self.flush()?;
         }
@@ -991,12 +1006,23 @@ impl Store {
     /// Append one record at the tail.  The map has already applied it; if
     /// the file write fails, the two disagree and the store is poisoned.
     fn append(&mut self, kind: u8, body: &[u8]) -> Result<(), StoreError> {
+        self.append_timed(kind, body)
+    }
+
+    /// [`append`](Self::append), with the hash and the `pwrite` timed into
+    /// the write counters of [`Stats`] (every kind of record is appended
+    /// this way; the counters are read against the write ops' bytes).
+    fn append_timed(&mut self, kind: u8, body: &[u8]) -> Result<(), StoreError> {
+        let t = std::time::Instant::now();
         let mut rec = Vec::with_capacity(REC_HEAD as usize + body.len() + HASH);
         let hash = encode_record(&mut rec, &self.prev, kind, body);
+        self.stats.write_hash_us += t.elapsed().as_micros() as u64;
+        let t = std::time::Instant::now();
         if let Err(e) = self.file.write_all_at(&rec, self.tail) {
             self.poisoned = true;
             return Err(e.into());
         }
+        self.stats.write_pwrite_us += t.elapsed().as_micros() as u64;
         self.tail += rec.len() as u64;
         self.lsn += 1;
         self.prev = hash;

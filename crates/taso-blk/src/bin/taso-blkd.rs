@@ -234,12 +234,59 @@ const OP_READ: usize = 0;
 const OP_WRITE: usize = 1;
 const OP_FLUSH: usize = 2;
 const OP_DISCARD: usize = 3;
-fn note_op(op: usize, started: std::time::Instant, store: std::time::Duration, bytes: u64) {
+/// `TASO_BLKD_OPLOG=path`: one line per device request, `op bytes start_ns
+/// end_ns copy_ns wait_ns store_ns` on CLOCK_MONOTONIC (blktrace's clock),
+/// for the probe of where a request's time goes (blk-trace-freeze.sh).
+/// Run 3 on taso-p5 (2026-10-26) put the whole write phase of a freeze in
+/// our handler, 0.92 ms per 512 KiB served one after another, and four
+/// threads changed nothing; the three parts name which half it is: the
+/// copy between the kernel and our buffer (`copy`, outside the lock), the
+/// wait for the store's lock (`wait`), the work under it (`store`).  Off
+/// unless set; costs a write per request.
+static OPLOG: Mutex<Option<std::io::BufWriter<File>>> = Mutex::new(None);
+/// The three parts of one request, for the op log and the counters.
+#[derive(Clone, Copy, Default)]
+struct Split {
+    copy: std::time::Duration,
+    wait: std::time::Duration,
+    store: std::time::Duration,
+}
+/// The store's lock, with the wait for it measured.
+fn lock_store_timed<'a>(store: &'a Mutex<Store>, split: &mut Split) -> MutexGuard<'a, Store> {
+    let t = std::time::Instant::now();
+    let s = lock_store(store);
+    split.wait = t.elapsed();
+    s
+}
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes the struct passed by reference, nothing else.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+fn note_op(op: usize, started: std::time::Instant, split: Split, bytes: u64) {
+    if let Some(w) = lock(&OPLOG).as_mut() {
+        use std::io::Write;
+        let end = monotonic_ns();
+        let start = end - started.elapsed().as_nanos() as u64;
+        let _ = writeln!(
+            w,
+            "{} {bytes} {start} {end} {} {} {}",
+            ["read", "write", "flush", "discard"][op],
+            split.copy.as_nanos(),
+            split.wait.as_nanos(),
+            split.store.as_nanos()
+        );
+        let _ = w.flush();
+    }
     let mut ops = lock(&OPS);
     let o = &mut ops[op];
     o.count += 1;
     o.total_us += started.elapsed().as_micros() as u64;
-    o.store_us += store.as_micros() as u64;
+    o.store_us += split.store.as_micros() as u64;
     o.bytes += bytes;
 }
 
@@ -338,6 +385,12 @@ fn main() {
             .syncer()
             .unwrap_or_else(|e| fail(&format!("cannot clone the log's descriptor: {e}"))),
     );
+    if let Ok(path) = std::env::var("TASO_BLKD_OPLOG") {
+        match File::create(&path) {
+            Ok(f) => *lock(&OPLOG) = Some(std::io::BufWriter::new(f)),
+            Err(e) => fail(&format!("cannot create {path}: {e}")),
+        }
+    }
     let daemon = Arc::new(Daemon {
         store: Arc::new(Mutex::new(store)),
         sync,
@@ -955,8 +1008,10 @@ impl Daemon {
                 o.count, o.total_us, o.store_us, o.bytes
             )
         };
+        // op_wsplit: where the writes' time under the lock went, µs summed
+        // over every write: map, copy, hash, pwrite (store.rs Stats).
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -970,6 +1025,10 @@ impl Daemon {
             op("op_write", ops[OP_WRITE]),
             op("op_flush", ops[OP_FLUSH]),
             op("op_discard", ops[OP_DISCARD]),
+            st.write_map_us,
+            st.write_copy_us,
+            st.write_hash_us,
+            st.write_pwrite_us,
         )
     }
 }
@@ -1160,40 +1219,51 @@ fn handle(
                 return -libc::EINVAL;
             }
             // Bound first: the lock is let go of before any logging.
-            let t = std::time::Instant::now();
-            let r = lock_store(store).read(branch, lba, &mut buf[..n]);
-            let in_store = t.elapsed();
+            let mut split = Split::default();
+            let r = {
+                let s = lock_store_timed(store, &mut split);
+                let t = std::time::Instant::now();
+                let r = s.read(branch, lba, &mut buf[..n]);
+                split.store = t.elapsed();
+                r
+            };
             if let Err(e) = r {
                 return io(&e);
             }
+            let t = std::time::Instant::now();
             let res = match cdev.write_all_at(&buf[..n], pos) {
                 Ok(()) => n as i32,
                 Err(e) => io(&e),
             };
-            note_op(OP_READ, started, in_store, bytes);
+            split.copy = t.elapsed();
+            note_op(OP_READ, started, split, bytes);
             res
         }
         sys::UBLK_IO_OP_WRITE => {
             if n > buf.len() {
                 return -libc::EINVAL;
             }
+            let mut split = Split::default();
+            let t = std::time::Instant::now();
             if let Err(e) = cdev.read_exact_at(&mut buf[..n], pos) {
                 return io(&e);
             }
+            split.copy = t.elapsed();
             // FUA: the write's group ended under the lock, synced outside it.
             let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
-            let t = std::time::Instant::now();
             let r = {
-                let mut s = lock_store(store);
-                s.write(branch, lba, &buf[..n], false).and_then(|()| {
+                let mut s = lock_store_timed(store, &mut split);
+                let t = std::time::Instant::now();
+                let r = s.write(branch, lba, &buf[..n], false).and_then(|()| {
                     if fua {
                         s.flush_pending().map(Some)
                     } else {
                         Ok(None)
                     }
-                })
+                });
+                split.store = t.elapsed();
+                r
             };
-            let in_store = t.elapsed();
             let res = match r {
                 Ok(None) => n as i32,
                 Ok(Some(lsn)) => match durable(sync, store, lsn) {
@@ -1202,29 +1272,39 @@ fn handle(
                 },
                 Err(e) => io(&e),
             };
-            note_op(OP_WRITE, started, in_store, bytes);
+            note_op(OP_WRITE, started, split, bytes);
             res
         }
         sys::UBLK_IO_OP_FLUSH => {
-            let t = std::time::Instant::now();
-            let r = lock_store(store).flush_pending();
-            let in_store = t.elapsed();
+            let mut split = Split::default();
+            let r = {
+                let mut s = lock_store_timed(store, &mut split);
+                let t = std::time::Instant::now();
+                let r = s.flush_pending();
+                split.store = t.elapsed();
+                r
+            };
             let res = match r.and_then(|lsn| durable(sync, store, lsn)) {
                 Ok(()) => 0,
                 Err(e) => io(&e),
             };
-            note_op(OP_FLUSH, started, in_store, 0);
+            note_op(OP_FLUSH, started, split, 0);
             res
         }
         sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
-            let t = std::time::Instant::now();
-            let r = lock_store(store).discard(branch, lba, bytes / BLOCK);
-            let in_store = t.elapsed();
+            let mut split = Split::default();
+            let r = {
+                let mut s = lock_store_timed(store, &mut split);
+                let t = std::time::Instant::now();
+                let r = s.discard(branch, lba, bytes / BLOCK);
+                split.store = t.elapsed();
+                r
+            };
             let res = match r {
                 Ok(()) => 0,
                 Err(e) => io(&e),
             };
-            note_op(OP_DISCARD, started, in_store, bytes);
+            note_op(OP_DISCARD, started, split, bytes);
             res
         }
         _ => -libc::EOPNOTSUPP,

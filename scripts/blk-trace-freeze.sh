@@ -81,7 +81,7 @@ mkdir -p "$DIR" "$MNT" "$OUT"; ! mountpoint -q "$MNT" || die "$MNT is mounted"
 command -v cargo >/dev/null || PATH=/root/.cargo/bin:$PATH
 cargo build -q --release -p taso-blk
 rm -f "$LOG" "$ERR" "$LOG.ckpt"
-"$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --queues "$QUEUES" --threads "$THREADS" 2>>"$ERR" &
+TASO_BLKD_OPLOG="$OUT/oplog.txt" "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --queues "$QUEUES" --threads "$THREADS" 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || die "taso-blkd socket did not appear; see $ERR"
@@ -101,12 +101,75 @@ PY
 blktrace -d "$DEV" -o trace -D "$OUT" &
 TRACE_PID=$!
 sleep 0.5
+# MARK: CLOCK_MONOTONIC (the op log's clock) just before the freeze, so the
+# split below takes only the freeze's own ops, not mkfs's and the mount's
+# (run 2 on taso-p5, 2026-10-26, matched the op log from its start).
+MARK=$(python3 -c 'import time; print(time.monotonic_ns())')
 t0=$(date +%s.%N); fsfreeze -f "$MNT"; t1=$(date +%s.%N)
 sleep 0.2
 kill -INT "$TRACE_PID"; wait "$TRACE_PID" 2>/dev/null || true; TRACE_PID=
 fsfreeze -u "$MNT"
 echo "block log ops (count:total_us:store_us:bytes): $(blk stats | tr ' ' '\n' | grep '^op_' | tr '\n' ' ')"
+# %5T.%9t is seconds since the trace's start.  blkparse has no absolute
+# form (run 2 on taso-p5, 2026-10-26: -t left the times relative, 38
+# minutes from the op log's CLOCK_MONOTONIC), so the split below aligns
+# the two clocks itself.  The file is written before anything reads it
+# (run 1 read it first and found no file).
 blkparse -i "$OUT/trace" -f '%T.%9t %a %d %S %N\n' 2>/dev/null >"$OUT/events.txt" || blkparse -i "$OUT/trace" >"$OUT/events.txt"
+# Where a request's time goes: the kernel's D -> our handler's start (the
+# queue), the handler, our end -> the kernel's C (the completion).  Only
+# the ops after MARK (the freeze's own); matched per kind in order.  The
+# clocks are anchored at the batch's first request: its queue is 0 by
+# construction and every other queue is relative to it, so the queue
+# column is a lower bound and handler + complete are exact.  Prediction
+# (before run 3): the writes' completion gap grows along the batch (each
+# completed only when the batch's last handler returns); the flush's
+# completion gap ~6 ms.  Run 2 already showed every write of the batch
+# completing within 0.02 ms of the others, 7.6 ms after issue.
+python3 - "$OUT/events.txt" "$OUT/oplog.txt" "$MARK" <<'PY' | tee -a "$OUT/gaps.txt"
+import sys
+try:
+    ev = [l.split() for l in open(sys.argv[1]) if len(l.split()) > 4 and l.split()[1] in ("D", "C")]
+    mark = int(sys.argv[3])
+    # op bytes start end [copy wait store] (the three parts since b061969; older logs have four fields)
+    ops = [l.split() for l in open(sys.argv[2]) if len(l.split()) in (4, 7) and int(l.split()[2]) >= mark]
+except (OSError, ValueError) as e:
+    print("no gap analysis: %s" % e); sys.exit()
+if not ev:
+    print("no gap analysis: blkparse gave no events"); sys.exit()
+if not ops:
+    print("no gap analysis: no op after the freeze mark in the op log"); sys.exit()
+kind = {"W": "write", "WM": "write", "WS": "write", "WSM": "write", "WFS": "write", "FN": "flush", "F": "flush", "R": "read", "RM": "read", "D": "discard"}
+issued = {}
+rows = []
+for t, a, d, sec, nb in ((float(e[0]), e[1], e[2], e[3], e[4]) for e in ev):
+    k = kind.get(d)
+    if k is None: continue
+    if a == "D": issued.setdefault(k, []).append((t, int(nb) if nb.isdigit() else 0))
+    else:
+        q = issued.get(k, [])
+        if q:
+            ti, nbi = q.pop(0); rows.append((k, nbi, ti, t))
+# our ops, per kind in order
+mine = {}
+for o in ops:
+    parts = tuple(int(x) / 1e6 for x in o[4:7]) if len(o) == 7 else (float('nan'),) * 3
+    mine.setdefault(o[0], []).append((int(o[2]) / 1e9, int(o[3]) / 1e9, parts))
+# Anchor: the earliest issued request against the earliest op after the mark.
+first_issue = min((ti for k, nb, ti, tc in rows), default=None)
+first_op = min((s0 for q in mine.values() for s0, s1, parts in q), default=None)
+if first_issue is None or first_op is None:
+    print("no gap analysis: nothing to match"); sys.exit()
+off = first_op - first_issue
+print("  clocks anchored at the first request (its queue is 0 by construction; queue is a lower bound)")
+print("  %-8s %7s %9s %9s %9s %9s %7s %7s %7s" % ("op", "KiB", "queue ms", "handler", "complete", "D->C", "copy", "wait", "store"))
+for k, nb, ti, tc in rows:
+    m = mine.get(k)
+    if not m: continue
+    s0, s1, (cp, wt, st) = m.pop(0)
+    s0 -= off; s1 -= off
+    print("  %-8s %7d %9.2f %9.2f %9.2f %9.2f %7.2f %7.2f %7.2f" % (k, nb // 1024, (s0 - ti) * 1000, (s1 - s0) * 1000, (tc - s1) * 1000, (tc - ti) * 1000, cp, wt, st))
+PY
 echo "queues $QUEUES, threads $THREADS; freeze after $DIRTY KiB dirty: $(python3 -c "print('%.1f ms' % (($t1 - $t0) * 1000))")  device $DEV  events in $OUT/events.txt"
 python3 - "$OUT/events.txt" <<'PY'
 import sys
@@ -126,8 +189,11 @@ for t, a, d, sec, nb in ev:
         inflight += 1; maxin = max(maxin, inflight)
         if inflight == 1: start = t
     else:
+        # Busy only when this completion empties the queue; a completion
+        # with nothing in flight (issued before the trace started) added a
+        # stale start (run 1: "busy 35.4 ms of 22.1 ms traced").
+        if inflight == 1: busy += t - start; last = t
         inflight = max(0, inflight - 1)
-        if inflight == 0: busy += t - start; last = t
     print("  %7.2f  %s  %-4s %8d %7d  %d" % ((t - t0) * 1000, a, d, sec, nb, inflight))
 n = sum(1 for e in ev if e[1] == "D")
 print("requests %d; max in flight %d; device busy %.1f ms of %.1f ms traced; idle gaps over 1 ms: %d, %s" % (
