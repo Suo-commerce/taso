@@ -420,6 +420,7 @@ mod tests {
             agent: agent.map(|(ok, e)| (ok, e.to_string())),
             settled: Settled {
                 birth: None,
+                was_at: Some(pos(6)),
                 rolled_back_to: Some(pos(4)),
                 last_seal: Some(pos(5)),
             },

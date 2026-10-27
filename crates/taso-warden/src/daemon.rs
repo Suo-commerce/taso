@@ -2378,6 +2378,11 @@ pub struct Report {
 pub struct Settled {
     /// The birth Seal, if this start took it.
     pub birth: Option<Position>,
+    /// The log's tail when the rollback was asked: where the state was.
+    /// Records between it and `rolled_back_to` stay in the log and are
+    /// not in the Vessel's filesystem; the report names them (spec rev. 33,
+    /// D93 class (i)).
+    pub was_at: Option<Position>,
     /// The Seal the state was rolled back to, if any had a layer.
     pub rolled_back_to: Option<Position>,
     /// The last Seal in the log.
@@ -2411,12 +2416,25 @@ pub fn settle_at<L: Layers>(
         None => Some(vessel.seal_birth_at(birth_turn)?.seal),
         Some(_) => None,
     };
+    let was_at = vessel.tail();
     let rolled_back_to = vessel.rollback()?;
     Ok(Settled {
         birth,
+        was_at: Some(was_at),
         rolled_back_to,
         last_seal: vessel.last_seal(),
     })
+}
+
+impl Settled {
+    /// Records after the Seal the state was reset to: in the log, not in
+    /// the Vessel's filesystem.  `0` when nothing was discarded.
+    pub fn discarded(&self) -> u64 {
+        match (self.was_at, self.rolled_back_to) {
+            (Some(at), Some(to)) => at.lsn.get().saturating_sub(to.lsn.get()),
+            _ => 0,
+        }
+    }
 }
 
 /// Why a Vessel could not run.
@@ -3890,12 +3908,24 @@ impl Node {
                 ),
             );
         }
-        match settled.rolled_back_to {
-            Some(s) => self.log(
+        // D93 class (i): a reset from past the last Seal is a loss the Warden
+        // can see, so it is named: where the state was, where it is now, and
+        // how many records stay in the log without being in the filesystem.
+        match (settled.rolled_back_to, settled.was_at) {
+            (Some(s), Some(at)) if settled.discarded() > 0 => self.log(
                 vc,
-                format_args!("state rolled back to the Seal at lsn {}", s.lsn.get()),
+                format_args!(
+                    "state at lsn {} reset to the Seal at lsn {}: {} record(s) after the Seal stay in the log and are not in the Vessel's filesystem",
+                    at.lsn.get(),
+                    s.lsn.get(),
+                    settled.discarded()
+                ),
             ),
-            None => self.log(vc, "no Seal layer here: state not rolled back"),
+            (Some(s), _) => self.log(
+                vc,
+                format_args!("state at its last Seal (lsn {}): nothing reset", s.lsn.get()),
+            ),
+            (None, _) => self.log(vc, "no Seal layer here: state not rolled back"),
         }
         if settled.behind() {
             self.log(
@@ -4411,10 +4441,12 @@ mod tests {
             again,
             Settled {
                 birth: None,
+                was_at: Some(b),
                 rolled_back_to: Some(b),
                 last_seal: Some(b)
             }
         );
+        assert_eq!(again.discarded(), 0);
     }
 
     /// A Vessel with turns: no birth Seal, the state goes back to the last
@@ -4427,15 +4459,20 @@ mod tests {
         turn(&mut v, 1);
         let s2 = turn(&mut v, 2);
         v.append(Stream::Transcript, Payload::Raw(vec![3])).unwrap(); // turn 3, cut short
+        let at = v.tail();
         let s = settle(&mut v).unwrap();
         assert_eq!(
             s,
             Settled {
                 birth: None,
+                was_at: Some(at),
                 rolled_back_to: Some(s2),
                 last_seal: Some(s2)
             }
         );
+        // The cut-short turn's record is the loss the report names (D93).
+        assert_eq!(s.discarded(), at.lsn.get() - s2.lsn.get());
+        assert!(s.discarded() > 0);
     }
 
     /// No Seal but records after Lineage: no birth Seal over unsealed work.
@@ -4468,6 +4505,7 @@ mod tests {
             s,
             Settled {
                 birth: None,
+                was_at: s.was_at,
                 rolled_back_to: Some(b),
                 last_seal: Some(s1)
             }
@@ -4484,18 +4522,21 @@ mod tests {
         assert!(!Settled::default().behind());
         assert!(!Settled {
             birth: None,
+            was_at: Some(p(3)),
             rolled_back_to: Some(p(3)),
             last_seal: Some(p(3))
         }
         .behind());
         assert!(Settled {
             birth: None,
+            was_at: Some(p(5)),
             rolled_back_to: Some(p(2)),
             last_seal: Some(p(3))
         }
         .behind());
         assert!(Settled {
             birth: None,
+            was_at: Some(p(3)),
             rolled_back_to: None,
             last_seal: Some(p(3))
         }
