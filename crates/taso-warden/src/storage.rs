@@ -245,6 +245,12 @@ impl Layers for StorageLayers {
             Self::Blk(l) => l.rollback(lsn, hash),
         }
     }
+    fn discarded_blocks(&self) -> Option<u64> {
+        match self {
+            Self::Zfs(l) => l.discarded_blocks(),
+            Self::Blk(l) => l.discarded_blocks(),
+        }
+    }
 }
 
 impl Sender for StorageSend {

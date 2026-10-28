@@ -690,13 +690,14 @@ impl Daemon {
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
-                self.store
+                let discarded = self
+                    .store
                     .lock()
                     .unwrap()
                     .reset(branch)
                     .map_err(store_err)?;
                 drop(devices);
-                Ok(String::new())
+                Ok(discarded.to_string())
             }
             "export" => {
                 let to = layer(1)?;

@@ -766,12 +766,17 @@ impl Store {
     /// Reset `branch` to the Seal it stands on: its own blocks become
     /// garbage, and it keeps its id, name and Seals.  Durable at the next
     /// flush.  A mounted file system on the branch must be unmounted
-    /// first: its blocks change under it.
-    pub fn reset(&mut self, branch: LayerId) -> Result<(), StoreError> {
+    /// first: its blocks change under it.  Returns how many blocks the
+    /// branch held of its own — what the reset discards from the
+    /// filesystem, which the Warden names (spec rev. 33, D93 class (i):
+    /// an agent's write adds no Chronicle record, so only this count says
+    /// it was lost; E3 [seal write], taso-test 2026-10-28).
+    pub fn reset(&mut self, branch: LayerId) -> Result<u64, StoreError> {
         self.check()?;
         let freed = self.map.reset(branch)?;
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
-        self.append(K_RESET, &branch.get().to_le_bytes())
+        self.append(K_RESET, &branch.get().to_le_bytes())?;
+        Ok(freed.len() as u64)
     }
 
     /// Flush, then write a checkpoint of this durable point next to the

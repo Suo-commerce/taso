@@ -2385,6 +2385,10 @@ pub struct Settled {
     pub was_at: Option<Position>,
     /// The Seal the state was rolled back to, if any had a layer.
     pub rolled_back_to: Option<Position>,
+    /// Blocks of the Vessel's filesystem the rollback discarded, where the
+    /// store counts them (the block log); `None` on ZFS.  The agent's own
+    /// writes after the Seal are here and nowhere else (D93 class (i)).
+    pub discarded_blocks: Option<u64>,
     /// The last Seal in the log.
     pub last_seal: Option<Position>,
 }
@@ -2418,10 +2422,12 @@ pub fn settle_at<L: Layers>(
     };
     let was_at = vessel.tail();
     let rolled_back_to = vessel.rollback()?;
+    let discarded_blocks = rolled_back_to.and(vessel.chronicle().layers().discarded_blocks());
     Ok(Settled {
         birth,
         was_at: Some(was_at),
         rolled_back_to,
+        discarded_blocks,
         last_seal: vessel.last_seal(),
     })
 }
@@ -3909,13 +3915,20 @@ impl Node {
             );
         }
         // D93 class (i): a reset from past the last Seal is a loss the Warden
-        // can see, so it is named: where the state was, where it is now, and
-        // how many records stay in the log without being in the filesystem.
+        // can see, so it is named: where the state was, where it is now, how
+        // many records stay in the log without being in the filesystem, and
+        // how many blocks of the filesystem went — the agent's own writes
+        // after the Seal add no record, so the block count is their only
+        // mention (E3 [seal write], taso-test 2026-10-28).
+        let blocks = match settled.discarded_blocks {
+            Some(n) => format!("; {n} block(s) of the Vessel's filesystem discarded"),
+            None => String::new(),
+        };
         match (settled.rolled_back_to, settled.was_at) {
-            (Some(s), Some(at)) if settled.discarded() > 0 => self.log(
+            (Some(s), Some(at)) if settled.discarded() > 0 || settled.discarded_blocks.unwrap_or(0) > 0 => self.log(
                 vc,
                 format_args!(
-                    "state at lsn {} reset to the Seal at lsn {}: {} record(s) after the Seal stay in the log and are not in the Vessel's filesystem",
+                    "state at lsn {} reset to the Seal at lsn {}: {} record(s) after the Seal stay in the log and are not in the Vessel's filesystem{blocks}",
                     at.lsn.get(),
                     s.lsn.get(),
                     settled.discarded()
@@ -3923,7 +3936,7 @@ impl Node {
             ),
             (Some(s), _) => self.log(
                 vc,
-                format_args!("state at its last Seal (lsn {}): nothing reset", s.lsn.get()),
+                format_args!("state at its last Seal (lsn {}): nothing reset{blocks}", s.lsn.get()),
             ),
             (None, _) => self.log(vc, "no Seal layer here: state not rolled back"),
         }
@@ -4443,6 +4456,7 @@ mod tests {
                 birth: None,
                 was_at: Some(b),
                 rolled_back_to: Some(b),
+                discarded_blocks: None,
                 last_seal: Some(b)
             }
         );
@@ -4467,6 +4481,7 @@ mod tests {
                 birth: None,
                 was_at: Some(at),
                 rolled_back_to: Some(s2),
+                discarded_blocks: None,
                 last_seal: Some(s2)
             }
         );
@@ -4507,6 +4522,7 @@ mod tests {
                 birth: None,
                 was_at: s.was_at,
                 rolled_back_to: Some(b),
+                discarded_blocks: None,
                 last_seal: Some(s1)
             }
         );
@@ -4524,6 +4540,7 @@ mod tests {
             birth: None,
             was_at: Some(p(3)),
             rolled_back_to: Some(p(3)),
+            discarded_blocks: None,
             last_seal: Some(p(3))
         }
         .behind());
@@ -4531,6 +4548,7 @@ mod tests {
             birth: None,
             was_at: Some(p(5)),
             rolled_back_to: Some(p(2)),
+            discarded_blocks: Some(17),
             last_seal: Some(p(3))
         }
         .behind());
@@ -4538,6 +4556,7 @@ mod tests {
             birth: None,
             was_at: Some(p(3)),
             rolled_back_to: None,
+            discarded_blocks: None,
             last_seal: Some(p(3))
         }
         .behind());

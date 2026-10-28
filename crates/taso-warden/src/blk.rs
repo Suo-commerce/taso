@@ -136,8 +136,9 @@ pub trait Blkd {
     fn drop_layer(&mut self, layer: LayerId) -> Result<(), LayerError>;
     /// Stop `branch`'s device.
     fn detach(&mut self, branch: LayerId) -> Result<(), LayerError>;
-    /// Reset a detached `branch` to the Seal it stands on.
-    fn reset(&mut self, branch: LayerId) -> Result<(), LayerError>;
+    /// Reset a detached `branch` to the Seal it stands on.  Returns the
+    /// blocks it held of its own, now discarded.
+    fn reset(&mut self, branch: LayerId) -> Result<u64, LayerError>;
     /// Write Seal `to` (incremental from the Seal `from`, or full) as a
     /// stream into the new file `path`.
     fn export(
@@ -222,7 +223,7 @@ impl Blkd for Daemon {
     fn detach(&mut self, branch: LayerId) -> Result<(), LayerError> {
         self.call(|c| c.detach(branch))
     }
-    fn reset(&mut self, branch: LayerId) -> Result<(), LayerError> {
+    fn reset(&mut self, branch: LayerId) -> Result<u64, LayerError> {
         self.call(|c| c.reset(branch))
     }
     fn export(
@@ -880,6 +881,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             mounts: self.mounts.clone(),
             dataset: dataset.clone(),
             mountpoint: self.mountpoint(dataset),
+            discarded: None,
         }
     }
 
@@ -1108,6 +1110,10 @@ pub struct BlkLayers<D: Blkd = Daemon, M: Mounts = System> {
     mounts: Arc<M>,
     dataset: Dataset,
     mountpoint: PathBuf,
+    /// Blocks the last [`Layers::rollback`] discarded from the filesystem
+    /// (the branch's own, below the Seal it went back to); `None` before
+    /// any.  The Warden names it (D93 class (i)).
+    discarded: Option<u64>,
 }
 
 impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
@@ -1126,6 +1132,9 @@ impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
 }
 
 impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
+    fn discarded_blocks(&self) -> Option<u64> {
+        self.discarded
+    }
     fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
         // On this Vessel's own connection, with the branch and its device
         // cached: a Seal is two commands (the Seals of the branch, to
@@ -1265,7 +1274,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
         if info.dev.is_some() {
             d.detach(b)?;
         }
-        d.reset(b)?;
+        self.discarded = Some(d.reset(b)?);
         d.flush()?;
         if was_mounted {
             mount_branch(&mut *d, &*self.mounts, b, &self.mountpoint)?;
@@ -1379,7 +1388,7 @@ mod tests {
                 .map(|_| ())
                 .ok_or_else(|| format!("{branch} is not attached").into())
         }
-        fn reset(&mut self, branch: LayerId) -> Result<(), LayerError> {
+        fn reset(&mut self, branch: LayerId) -> Result<u64, LayerError> {
             if self.devs.contains_key(&branch) {
                 return Err("attached; detach first".into());
             }
@@ -2067,8 +2076,14 @@ mod tests {
         l.snapshot(Lsn::new(2), h(2)).unwrap();
         write0(&p, &a, 2);
         calls(&p);
+        assert_eq!(l.discarded_blocks(), None, "nothing rolled back yet");
         l.rollback(Lsn::new(2), h(2)).unwrap();
         assert_eq!(block0(&p, &a), 1, "back to the layer");
+        assert_eq!(
+            l.discarded_blocks(),
+            Some(1),
+            "the one block written after the Seal is what the reset discarded (D93 (i))"
+        );
         let c = calls(&p);
         assert_eq!(c.len(), 2, "{c:?}");
         assert_eq!(c[0], "umount /mnt/taso/tank/v-a");

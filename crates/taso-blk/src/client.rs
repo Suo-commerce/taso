@@ -169,8 +169,11 @@ impl Client {
     /// Reset a detached `branch` to the Seal it stands on (its own writes
     /// are dropped; it keeps its id, name and Seals).  Durable at the next
     /// [`Client::flush`].
-    pub fn reset(&mut self, branch: LayerId) -> Result<()> {
-        self.call_empty(&["reset", &branch.to_string()])
+    /// Returns the blocks the branch held of its own, now discarded.
+    pub fn reset(&mut self, branch: LayerId) -> Result<u64> {
+        let a = self.call(&["reset", &branch.to_string()])?;
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("reset answered {a:?}")))
     }
 
     /// Write Seal `to` as a stream into the new file `path` (absolute;

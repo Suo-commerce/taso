@@ -422,6 +422,7 @@ mod tests {
                 birth: None,
                 was_at: Some(pos(6)),
                 rolled_back_to: Some(pos(4)),
+                discarded_blocks: None,
                 last_seal: Some(pos(5)),
             },
             stopped,

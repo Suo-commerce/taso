@@ -159,6 +159,15 @@ pub trait Layers {
         let _ = hash;
         Err(format!("this layer store cannot roll back (to layer {})", lsn.get()).into())
     }
+    /// How many blocks of the filesystem the last [`Layers::rollback`]
+    /// discarded, where the store can count them (the block log: the
+    /// branch's own blocks below the Seal); `None` where it cannot (ZFS)
+    /// or before any rollback.  The Warden names it after a reset (spec
+    /// rev. 33, D93 class (i)): an agent's write adds no Chronicle record,
+    /// so this count is the only word on it.
+    fn discarded_blocks(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// [`Layers`] over a ZFS dataset.
