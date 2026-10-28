@@ -530,9 +530,16 @@ pub fn prepare_work_dir(work: &Path, host_uid_base: u32) -> io::Result<()> {
 /// `None` for a Vessel born from the void.  The top directory's owner now
 /// marks the dataset's **disk range**, set once when it is first prepared
 /// and never changed (fencing review F6, decisions D2/D3 of 2026-10-21):
-/// - fresh (0:0): prepared into the Vessel's own range as before, mode 0750;
-///   returns `host_uid_base`.  A fork of its parent's birth Seal is fresh,
-///   so it becomes its own and needs no idmapping;
+/// - fresh (0:0): prepared, mode 0750, into the `inherited` range when
+///   there is one, else into the Vessel's own; returns that range.  A fork
+///   of its parent's birth Seal is fresh (the Seal was taken before the
+///   parent's dataset was first prepared), and **it inherits its parent's
+///   range all the same** (D95, 2026-10-28): every fork runs over its
+///   lineage's range through an idmapped mount, with no exception, so a
+///   promotion brings back nothing of another range.  Before D95 such a
+///   fork became its own, and promoting it left the parent's filesystem in
+///   the child's range, which the parent then refused to run (E3's first
+///   finding, taso-test 2026-10-28, `[write fork promote]`);
 /// - owned by exactly `host_uid_base`: returns `host_uid_base`, unchanged;
 /// - owned by exactly the `inherited` range: returns it, and **nothing on
 ///   disk is changed** (not the owner, not the mode): the work mount is
@@ -594,10 +601,17 @@ pub fn work_dir_range(work: &Path, host_uid_base: u32, inherited: Option<u32>) -
             ),
         ));
     }
-    std::os::unix::fs::chown(work, Some(host_uid_base), Some(host_uid_base))?;
+    // Fresh, or the Vessel's own: a fresh dataset takes the inherited range
+    // when there is one (D95), else the Vessel's own.
+    let range = if is(0) {
+        inherited.unwrap_or(host_uid_base)
+    } else {
+        host_uid_base
+    };
+    std::os::unix::fs::chown(work, Some(range), Some(range))?;
     std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o750))?;
-    own_lost_found(work, host_uid_base)?;
-    Ok(host_uid_base)
+    own_lost_found(work, range)?;
+    Ok(range)
 }
 
 /// The name of ext4's reserved directory (P4 spec §4.1.6, `fs.reserved`).
@@ -1554,24 +1568,32 @@ mod tests {
 
     #[test]
     #[ignore = "needs root"]
-    fn fork_of_a_birth_seal_becomes_its_own() {
+    fn fork_of_a_birth_seal_inherits_its_parents_range_too() {
+        // D95: a fresh dataset with a lineage is prepared into the lineage's
+        // range, once; from then on it is that range's, like any fork's.
         assert!(running_as_root(), "run as root");
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
         assert_eq!(
             work_dir_range(dir.path(), CHILD, Some(PARENT)).unwrap(),
-            CHILD
+            PARENT
         );
-        assert_eq!(owner(dir.path()), (CHILD, CHILD));
+        assert_eq!(owner(dir.path()), (PARENT, PARENT));
         assert_eq!(mode(dir.path()), 0o750);
-        // From then on it is the child's own: accepted with or without the
-        // lineage, and the parent's range no longer matches it.
         assert_eq!(
             work_dir_range(dir.path(), CHILD, Some(PARENT)).unwrap(),
-            CHILD
+            PARENT
         );
-        assert_eq!(work_dir_range(dir.path(), CHILD, None).unwrap(), CHILD);
-        assert_eq!(owner(dir.path()), (CHILD, CHILD));
+        assert_eq!(
+            owner(dir.path()),
+            (PARENT, PARENT),
+            "set once, unchanged after"
+        );
+        // Without its lineage it is another range's dataset.
+        assert_eq!(
+            work_dir_range(dir.path(), CHILD, None).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

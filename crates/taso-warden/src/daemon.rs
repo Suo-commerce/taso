@@ -4183,10 +4183,39 @@ impl Node {
                 })?)
             }
             None => None,
-            Some(_) => {
+            Some(parent) => {
                 use std::os::unix::fs::MetadataExt;
+                let base = self.config.runtime.host_uid_base;
                 let m = std::fs::symlink_metadata(&mount).map_err(io("reading the dataset"))?;
-                inherited_range((m.uid(), m.gid()), self.config.runtime.host_uid_base)
+                match inherited_range((m.uid(), m.gid()), base) {
+                    Some(d) => Some(d),
+                    // Fresh (0:0): a fork of its parent's birth Seal, taken
+                    // before the parent's dataset was first prepared.  D95:
+                    // it inherits its parent's disk range all the same, read
+                    // from the parent's dataset here (forks are node-bound),
+                    // so a promotion brings nothing of another range back.
+                    None if (m.uid(), m.gid()) == (0, 0) => {
+                        let pds = self.host().dataset_for(parent.chronicle);
+                        let pmount = Pool::info(&self.storage, &pds)
+                            .map_err(|e| DaemonError::Io(e.to_string()))?
+                            .and_then(|i| i.mountpoint)
+                            .ok_or_else(|| {
+                                DaemonError::Io(format!(
+                                    "the parent's dataset {pds} is not mounted here: its range, which this fork inherits (D95), cannot be read"
+                                ))
+                            })?;
+                        let pm = std::fs::symlink_metadata(&pmount)
+                            .map_err(io("reading the parent's dataset"))?;
+                        Some(inherited_range((pm.uid(), pm.gid()), base).ok_or_else(|| {
+                            DaemonError::Io(format!(
+                                "the parent's dataset {pds} is owned by {}:{}, not a range this fork can inherit (D95)",
+                                pm.uid(),
+                                pm.gid()
+                            ))
+                        })?)
+                    }
+                    None => None, // refused below, with the owner named
+                }
             }
         };
         let disk = work_dir_range(&mount, uid, inherited).map_err(io("preparing the dataset"))?;
