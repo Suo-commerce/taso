@@ -998,6 +998,12 @@ impl Store {
         self.poisoned = true;
     }
 
+    /// Whether an append or a sync has failed: every call fails until the
+    /// log is reopened.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     // ── internals ───────────────────────────────────────────────────
 
     fn check(&self) -> Result<(), StoreError> {
@@ -1604,13 +1610,19 @@ struct SyncState {
     syncing: bool,
     /// A sync failed: nothing after `durable` will ever be.
     failed: bool,
+    /// How that sync failed (kept, so the first caller to learn of it can
+    /// name the error; the Syncer is the lowest layer that sees it, spec
+    /// rev. 34, D93 class (i)).  The later callers get `Poisoned`.
+    error: Option<String>,
     /// Syncs made.
     syncs: u64,
 }
 
 impl Syncer {
     /// Make everything appended up to `lsn` durable.  Returns whether this
-    /// call ran the sync (false: another caller's covered it).
+    /// call ran the sync (false: another caller's covered it).  The call
+    /// that ran a sync that failed gets that error; every call after it,
+    /// and every waiter on it, gets [`StoreError::Poisoned`].
     pub fn durable(&self, lsn: u64) -> Result<bool, StoreError> {
         let mut st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         st.requested = st.requested.max(lsn);
@@ -1638,10 +1650,24 @@ impl Syncer {
                     st.syncs += 1;
                     led = true;
                 }
-                Err(_) => st.failed = true,
+                Err(e) => {
+                    st.failed = true;
+                    st.error = Some(e.to_string());
+                    self.done.notify_all();
+                    return Err(e.into());
+                }
             }
             self.done.notify_all();
         }
+    }
+
+    /// How the sync failed, once one has.
+    pub fn failure(&self) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .error
+            .clone()
     }
 
     /// Syncs made so far.

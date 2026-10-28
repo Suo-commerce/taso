@@ -595,10 +595,21 @@ fn serve(d: &Daemon, conn: UnixStream) -> bool {
             continue;
         }
         let quit = words[0] == "quit";
+        let poisoned_before = lock_store(&d.store).is_poisoned();
         let answer = match d.command(&words) {
             Ok(a) if a.is_empty() => "ok".to_string(),
             Ok(a) => format!("ok {a}"),
-            Err(e) => format!("err {e}"),
+            Err(e) => {
+                // The failure that poisoned the store is named here, once,
+                // with its error: the answer carries it up to the Warden,
+                // but a report that only shows the later refusals ("an
+                // earlier append failed") names nothing (spec rev. 34, D93
+                // class (i); E3's error-mode rounds, taso-test 2026-10-28).
+                if !poisoned_before && lock_store(&d.store).is_poisoned() {
+                    log!("taso-blkd: the store is poisoned: {} failed: {e}", words[0]);
+                }
+                format!("err {e}")
+            }
         };
         if writeln!(out, "{answer}").is_err() || quit {
             return quit;
@@ -1181,7 +1192,13 @@ fn durable(sync: &Syncer, store: &Mutex<Store>, lsn: u64) -> Result<(), StoreErr
     match sync.durable(lsn) {
         Ok(_) => Ok(()),
         Err(e) => {
-            lock_store(store).poison();
+            let mut s = lock_store(store);
+            if !s.is_poisoned() {
+                // The first to learn of it names the error the Syncer kept.
+                let why = sync.failure().unwrap_or_else(|| e.to_string());
+                log!("taso-blkd: the store is poisoned: the sync for lsn {lsn} failed: {why}");
+            }
+            s.poison();
             Err(e)
         }
     }
