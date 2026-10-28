@@ -29,6 +29,26 @@
 //! comma-separated classes dropped (`""`: none); each answer goes into
 //! the stats as `nominations`.
 //!
+//! P5 E3 (B2, file E3-3a): `--step DIR` runs no turns of its own.  It is
+//! driven one operation at a time by a crash harness that must place a
+//! failure between two of them.  The agent cannot read the harness's
+//! stdin (it runs under runc, its root read-only), so the channel is
+//! files in `DIR` (default `/tmp/e3`, the container's own tmpfs, never on
+//! the Vessel's dataset or the device being cut): the agent writes
+//! `ready` (JSON: its pid and the turn it resumed after), then for n = 1,
+//! 2, … waits for `op.<n>` (one line), does it, and writes `reply.<n>`
+//! (one JSON line), each file renamed into place whole.  The harness, as
+//! root, reaches `DIR` through `/proc/<pid>/root`, and removes each reply
+//! once read; on its last reply (`exit`, or a promotion) the agent waits,
+//! up to 30 s, until it is taken, since `DIR` goes with the process.  Operations (plan
+//! P5-18): `write [TAG]` one transaction of `--rows` rows of the current
+//! turn, `n = TAG·1 000 000 + i` (a fork's child is driven with tag 1);
+//! `seal` a Transcript entry and a quiescent `TurnEnd`, then the next
+//! turn; `fork`; `promote CHILD` (a promotion ends the run: the agent
+//! exits after the reply and the Warden restarts it, C7); `effect` one
+//! `NoExternalMutation` effect, key `t<turn>-e<k>`; `exit`.  A refusal is
+//! a reply, not an error; a closed Field ends the agent.
+//!
 //! `--bare` runs the same writes with no Field at all: the baseline the
 //! gate compares against ("p95 write latency ≤ 1.5× bare local NVMe").
 //!
@@ -79,6 +99,9 @@ struct Opts {
     promote: Vec<String>,
     /// Nominations asked for after the last turn: the classes each drops.
     nominate: Vec<Vec<String>>,
+    /// Driven one operation at a time through files in this directory
+    /// (P5 E3); no turns of its own.
+    step: Option<PathBuf>,
 }
 
 impl Default for Opts {
@@ -99,6 +122,7 @@ impl Default for Opts {
             forks: 0,
             promote: Vec::new(),
             nominate: Vec::new(),
+            step: None,
         }
     }
 }
@@ -136,6 +160,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                     .map(str::to_string)
                     .collect(),
             ),
+            "--step" => o.step = Some(val()?.into()),
             "--synchronous" => {
                 o.synchronous = val()?;
                 if !["off", "normal", "full", "extra"].contains(&o.synchronous.as_str()) {
@@ -399,7 +424,11 @@ fn main() -> ExitCode {
             }
         }
     };
-    match run(&o, field.as_deref()) {
+    let result = match &o.step {
+        Some(dir) => step::run(&o, field.as_deref(), dir),
+        None => run(&o, field.as_deref()),
+    };
+    match result {
         Ok(stats) => {
             let text = serde_json::to_string_pretty(&stats).expect("JSON");
             if let Err(e) =
@@ -418,12 +447,369 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--step DIR`: one operation at a time, from a crash harness (P5 E3).
+mod step {
+    use super::*;
+    use std::path::Path;
+
+    /// One parsed operation.
+    #[derive(Debug, PartialEq)]
+    pub(crate) enum Op {
+        Write { tag: u64 },
+        Seal,
+        Fork,
+        Promote { child: String },
+        Effect,
+        Exit,
+    }
+
+    pub(crate) fn parse_op(line: &str) -> Result<Op, String> {
+        let mut w = line.split_whitespace();
+        let op = w.next().ok_or("an empty operation")?;
+        let arg = w.next();
+        let op = match (op, arg) {
+            ("write", None) => Op::Write { tag: 0 },
+            ("write", Some(t)) => Op::Write {
+                tag: t.parse().map_err(|_| format!("write: tag {t:?} is not a number"))?,
+            },
+            ("seal", None) => Op::Seal,
+            ("fork", None) => Op::Fork,
+            ("promote", Some(c)) => Op::Promote { child: c.to_string() },
+            ("effect", None) => Op::Effect,
+            ("exit", None) => Op::Exit,
+            _ => return Err(format!("unknown operation {line:?} (write [TAG] | seal | fork | promote CHILD | effect | exit)")),
+        };
+        if w.next().is_some() {
+            return Err(format!("{line:?}: too many words"));
+        }
+        Ok(op)
+    }
+
+    /// Write `name` in `dir` whole: a temporary name, then a rename.
+    fn put(dir: &Path, name: &str, text: &str) -> Result<(), String> {
+        let tmp = dir.join(format!(".{name}.tmp"));
+        std::fs::write(&tmp, text).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, dir.join(name)).map_err(|e| format!("renaming into {name}: {e}"))
+    }
+
+    /// Wait for `op.<n>` in `dir` and return its line.
+    fn next(dir: &Path, n: u64) -> Result<String, String> {
+        let p = dir.join(format!("op.{n}"));
+        loop {
+            match std::fs::read_to_string(&p) {
+                Ok(t) => return Ok(t.trim().to_string()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(e) => return Err(format!("reading {}: {e}", p.display())),
+            }
+        }
+    }
+
+    pub(crate) fn run(
+        o: &Opts,
+        field: Option<&Path>,
+        dir: &Path,
+    ) -> Result<serde_json::Value, String> {
+        let mut field = match field {
+            None => Field(None),
+            Some(path) => Field(Some(
+                UnixStream::connect(path)
+                    .map_err(|e| format!("connect {}: {e}", path.display()))?,
+            )),
+        };
+        let resumed_after = match field.ask(Request::Hello { version: VERSION })? {
+            None => None,
+            Some(Reply::Hello {
+                last_sealed_turn, ..
+            }) => last_sealed_turn,
+            Some(r) => return Err(format!("unexpected answer to Hello: {r:?}")),
+        };
+        let db = rusqlite::Connection::open(&o.db)
+            .map_err(|e| format!("open {}: {e}", o.db.display()))?;
+        db.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        db.pragma_update(None, "synchronous", &o.synchronous)
+            .map_err(|e| e.to_string())?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS events (turn INTEGER, n INTEGER, body BLOB)")
+            .map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        put(
+            dir,
+            "ready",
+            &format!(
+                "{}\n",
+                json!({ "pid": std::process::id(), "resumed_after": resumed_after })
+            ),
+        )?;
+        let body = vec![0x5au8; o.row_bytes];
+        let mut turn = resumed_after.map_or(1, |t| t + 1);
+        let (mut written, mut effects) = (0u64, 0u64);
+        let mut done = Vec::new();
+        for n in 1u64.. {
+            let line = next(dir, n)?;
+            let reply = match parse_op(&line) {
+                Err(e) => json!({ "n": n, "op": line, "refused": e }),
+                Ok(op) => match act(
+                    o,
+                    &mut field,
+                    &db,
+                    &body,
+                    &op,
+                    &mut turn,
+                    &mut written,
+                    &mut effects,
+                ) {
+                    Ok(v) => {
+                        let mut v = v;
+                        v["n"] = json!(n);
+                        v
+                    }
+                    Err(e)
+                        if e.contains("closed the connection")
+                            || e.starts_with("send:")
+                            || e.starts_with("receive:") =>
+                    {
+                        let _ = put(
+                            dir,
+                            &format!("reply.{n}"),
+                            &format!("{}\n", json!({ "n": n, "op": line, "lost": e })),
+                        );
+                        return Err(e);
+                    }
+                    Err(e) => json!({ "n": n, "op": line, "error": e }),
+                },
+            };
+            put(dir, &format!("reply.{n}"), &format!("{reply}\n"))?;
+            done.push(line.clone());
+            let promoted = reply["result"]["adopted"].is_array();
+            if line == "exit" || promoted {
+                // The last reply: DIR goes with this process, so wait until
+                // the harness has taken it (removed it), bounded.
+                let taken = dir.join(format!("reply.{n}"));
+                let until = Instant::now() + Duration::from_secs(30);
+                while taken.exists() && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                break;
+            }
+        }
+        Ok(
+            json!({ "step": done, "resumed_after": resumed_after, "turn": turn, "rows_written": written }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn act(
+        o: &Opts,
+        field: &mut Field,
+        db: &rusqlite::Connection,
+        body: &[u8],
+        op: &Op,
+        turn: &mut u64,
+        written: &mut u64,
+        effects: &mut u64,
+    ) -> Result<serde_json::Value, String> {
+        Ok(match op {
+            Op::Write { tag } => {
+                let t = Instant::now();
+                let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+                {
+                    let mut ins = tx
+                        .prepare_cached("INSERT INTO events VALUES (?1, ?2, ?3)")
+                        .map_err(|e| e.to_string())?;
+                    for i in 0..o.rows {
+                        let nn = tag * 1_000_000 + *written + u64::from(i);
+                        ins.execute(rusqlite::params![*turn as i64, nn as i64, body])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+                tx.commit().map_err(|e| e.to_string())?;
+                *written += u64::from(o.rows);
+                json!({ "op": "write", "turn": *turn, "tag": tag, "rows": o.rows, "ms": t.elapsed().as_secs_f64() * 1000.0 })
+            }
+            Op::Seal => {
+                field.ask(Request::Transcript {
+                    entry: format!("turn {turn}: step").into_bytes(),
+                })?;
+                let r = match field.ask(Request::TurnEnd {
+                    turn: *turn,
+                    quiescent: true,
+                })? {
+                    None => json!({ "op": "seal", "turn": *turn, "sealed": null, "bare": true }),
+                    Some(Reply::TurnEnd { sealed, .. }) => {
+                        json!({ "op": "seal", "turn": *turn, "sealed": sealed })
+                    }
+                    Some(r) => return Err(format!("unexpected answer to TurnEnd: {r:?}")),
+                };
+                *turn += 1;
+                r
+            }
+            Op::Fork => match field.ask(Request::Fork { seal: None })? {
+                None => json!({ "op": "fork", "refused": "bare: no Field" }),
+                Some(Reply::Fork {
+                    result: ForkResult::Forked { child, seal },
+                }) => {
+                    json!({ "op": "fork", "child": child, "seal": seal })
+                }
+                Some(Reply::Fork {
+                    result: ForkResult::Refused { reason },
+                }) => {
+                    json!({ "op": "fork", "refused": reason })
+                }
+                Some(r) => return Err(format!("unexpected answer to Fork: {r:?}")),
+            },
+            Op::Promote { child } => match field.ask(Request::Promote {
+                child: child.clone(),
+                seal: None,
+            })? {
+                None => json!({ "op": "promote", "refused": "bare: no Field" }),
+                Some(Reply::Promote {
+                    child,
+                    result: PromoteResult::Promoted { seal, adopted },
+                }) => {
+                    json!({ "op": "promote", "child": child, "result": { "seal": seal, "adopted": adopted } })
+                }
+                Some(Reply::Promote {
+                    child,
+                    result: PromoteResult::Refused { reason },
+                }) => {
+                    json!({ "op": "promote", "child": child, "refused": reason })
+                }
+                Some(r) => return Err(format!("unexpected answer to Promote: {r:?}")),
+            },
+            Op::Effect => {
+                let k = *effects;
+                *effects += 1;
+                let key = format!("t{turn}-e{k}").into_bytes();
+                match field.ask(Request::Effect {
+                    call: k,
+                    provider: "sim".into(),
+                    request: key.clone(),
+                    footprint: Vec::new(),
+                    retry: RetryPolicy::ProviderDeduplicated { key: key.clone() },
+                    consequence: Consequence::NoExternalMutation,
+                    authority: b"taso-sim".to_vec(),
+                })? {
+                    None => json!({ "op": "effect", "refused": "bare: no Field" }),
+                    Some(Reply::Effect { result, .. }) => json!({
+                        "op": "effect",
+                        "key": String::from_utf8_lossy(&key),
+                        "result": match result {
+                            EffectResult::Released { .. } => json!("released"),
+                            EffectResult::Held { .. } => json!("held"),
+                            EffectResult::Refused { reason } => json!({ "refused": reason }),
+                        },
+                    }),
+                    Some(r) => return Err(format!("unexpected answer to Effect: {r:?}")),
+                }
+            }
+            Op::Exit => json!({ "op": "exit", "turn": *turn }),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn step_operations() {
+        use step::{parse_op, Op};
+        assert_eq!(parse_op("write").unwrap(), Op::Write { tag: 0 });
+        assert_eq!(parse_op("write 1").unwrap(), Op::Write { tag: 1 });
+        assert_eq!(parse_op(" seal ").unwrap(), Op::Seal);
+        assert_eq!(parse_op("fork").unwrap(), Op::Fork);
+        assert_eq!(
+            parse_op("promote v-fork-1").unwrap(),
+            Op::Promote {
+                child: "v-fork-1".into()
+            }
+        );
+        assert_eq!(parse_op("effect").unwrap(), Op::Effect);
+        assert_eq!(parse_op("exit").unwrap(), Op::Exit);
+        for bad in [
+            "",
+            "flush",
+            "purge",
+            "write x",
+            "seal now",
+            "promote",
+            "promote a b",
+        ] {
+            assert!(parse_op(bad).is_err(), "{bad:?}");
+        }
+        let o = parse(&s(&["--step", "/tmp/e3"])).unwrap();
+        assert_eq!(o.step, Some(PathBuf::from("/tmp/e3")));
+    }
+
+    /// Bare (no Field): the file channel end to end, from another thread
+    /// playing the harness.
+    #[test]
+    fn step_drives_writes_through_files() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("e3");
+        let o = Opts {
+            db: d.path().join("state.db"),
+            rows: 3,
+            bare: true,
+            step: Some(dir.clone()),
+            ..Opts::default()
+        };
+        let harness = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                let wait = |name: &str| loop {
+                    if let Ok(t) = std::fs::read_to_string(dir.join(name)) {
+                        return t;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let ready: serde_json::Value = serde_json::from_str(&wait("ready")).unwrap();
+                assert!(ready["resumed_after"].is_null());
+                let mut replies = Vec::new();
+                for (n, op) in ["write", "write 1", "seal", "flush", "exit"]
+                    .iter()
+                    .enumerate()
+                {
+                    let n = n + 1;
+                    std::fs::write(dir.join(format!(".op.{n}")), op).unwrap();
+                    std::fs::rename(dir.join(format!(".op.{n}")), dir.join(format!("op.{n}")))
+                        .unwrap();
+                    let r: serde_json::Value =
+                        serde_json::from_str(&wait(&format!("reply.{n}"))).unwrap();
+                    std::fs::remove_file(dir.join(format!("reply.{n}"))).unwrap();
+                    replies.push(r);
+                }
+                replies
+            })
+        };
+        let out = step::run(&o, None, &dir).unwrap();
+        let r = harness.join().unwrap();
+        assert_eq!(
+            (
+                r[0]["op"].as_str(),
+                r[0]["rows"].as_u64(),
+                r[0]["turn"].as_u64()
+            ),
+            (Some("write"), Some(3), Some(1))
+        );
+        assert_eq!(r[1]["tag"], 1);
+        assert_eq!(r[2]["turn"], 1, "the seal closes turn 1");
+        assert!(r[3]["refused"].is_string(), "flush is no operation (P5-18)");
+        assert_eq!(r[4]["turn"], 2);
+        assert_eq!(out["rows_written"], 6);
+        let db = rusqlite::Connection::open(d.path().join("state.db")).unwrap();
+        let child: i64 = db
+            .query_row("SELECT count(*) FROM events WHERE n >= 1000000", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(child, 3, "tag 1 rows are told apart by n");
     }
 
     #[test]
