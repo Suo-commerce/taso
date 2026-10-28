@@ -88,6 +88,20 @@ swap() { # swap NAME MODE
 # The table: "0 SECTORS flakey DEV OFFSET UP DOWN NFEATURES [FEATURE]": no feature is up.
 mode_of() { dmsetup table "$1" | awk '{ print ($8 == 0) ? "up" : $9 }' | sed 's/_writes//'; }
 
+# The backing's bytes, read with direct I/O.  A buffered read of /dev/loopN
+# goes through that device's own page cache, which dm's bios bypass: udev's
+# blkid probe at attach time leaves the first pages cached as zeros, and
+# every later buffered read (dumpe2fs, sha256sum, dd) returns them — a
+# filesystem's blocks with no superblock (taso-test, 2026-10-28, found by
+# dumpe2fs on the dm device and on the loop right after mkfs).
+read_backing() { # read_backing NAME OUT  (OUT: a file, or - for stdout)
+    local src; src=$(loop_of "$1"); [[ -n "$src" ]] || src=$(backing_of "$1")
+    [[ -z "$(loop_of "$1")" ]] || blockdev --flushbufs "$src"
+    if [[ "$2" == - ]]; then dd if="$src" bs=4M iflag=direct status=none
+    else dd if="$src" of="$2" bs=4M iflag=direct conv=fsync,sparse status=none; fi
+}
+backing_hash() { read_backing "$1" - | sha256sum | cut -d' ' -f1; }
+
 # ── commands ────────────────────────────────────────────────────────────
 do_make() { # make NAME BACKING [MiB]
     local name=$1 backing=$2 mib=${3:-1024} sd loop
@@ -164,11 +178,13 @@ do_image() { # image NAME WORK OUT
     # 4. the device has no opener
     [[ -z "$(ls "/sys/block/$(basename "$(readlink -f "$dev")")/holders" 2>/dev/null)" ]] || harness_fail "$dev still has holders"
     pass "device: no holders"
-    # 5. the raw image, before any mount (the device's buffer cache dropped first)
+    # 5. the raw image, before any mount: the device's buffer cache dropped,
+    #    the backing read with direct I/O (read_backing), sparse (a dense
+    #    2 GiB copy per round fills a VM's disk in a few rounds)
     blockdev --flushbufs "$dev"
-    loop=$(loop_of "$name")
-    dd if="${loop:-$(backing_of "$name")}" of="$out" bs=4M conv=fsync status=none || harness_fail "dd to $out"
-    pass "image: $out ($(stat -c %s "$out") bytes, sha256 $(sha256sum "$out" | cut -c1-16)…)"
+    read_backing "$name" "$out" || harness_fail "reading the backing into $out"
+    dumpe2fs -h "$out" >/dev/null 2>&1 || harness_fail "$out holds no ext4 superblock: the image is not the device's content"
+    pass "image: $out ($(stat -c %s "$out") bytes, sha256 $(sha256sum "$out" | cut -c1-16)…, ext4 superblock present)"
     # 6. the table back to up; the caller mounts OUT's copy (or a loop over it), not this device
     swap "$name" up >/dev/null
     say "$name: up; restart the Warden on a copy of $out, never on $dev"
@@ -191,7 +207,7 @@ do_down() { # down NAME
 
 # ── check: the host, and the three self-checks on a scratch device ─────
 do_check() {
-    local t ms h0 h1 h2
+    local t ms h0 h1 h2 lc
     # Not locals: the EXIT trap reads them after this function has returned.
     CHECK_NAME=e3check; CHECK_IMG=; CHECK_MNT=
     local name=$CHECK_NAME img mnt
@@ -225,7 +241,7 @@ do_check() {
     sync -f "$mnt/after" 2>/dev/null || true      # the sync is acknowledged (drop_writes acks), nothing kept
     umount "$mnt" || umount -l "$mnt"
     blockdev --flushbufs "$(dev_of "$name")"
-    h1=$(sha256sum "$(loop_of "$name")" | cut -d' ' -f1)
+    h1=$(backing_hash "$name")
     swap "$name" up >/dev/null
     mount -o ro,noload "$(dev_of "$name")" "$mnt"   # noload: no journal replay, the image as it is
     if [[ "$(cat "$mnt/synced" 2>/dev/null)" == "synced-marker" ]]; then pass "self-check 1: the synced marker survived the drop swap (swap ${ms} ms)"; else bad "self-check 1: the synced marker is GONE after the drop swap — the swap flushed nothing it should not have, yet the marker is missing; the device is not usable"; fi
@@ -235,7 +251,7 @@ do_check() {
     # Self-check 2: writes admitted under drop leave the backing's hash unchanged
     swap "$name" drop >/dev/null
     if dd if=/dev/urandom of="$(dev_of "$name")" bs=1M count=8 seek=16 conv=fsync status=none; then
-        h2=$(sha256sum "$(loop_of "$name")" | cut -d' ' -f1)
+        h2=$(backing_hash "$name")
         [[ "$h1" == "$h2" ]] && pass "self-check 2: 8 MiB written and fsynced under drop, acknowledged, backing hash unchanged" || bad "self-check 2: backing changed under drop"
     else
         bad "self-check 2: dd under drop failed (drop must acknowledge, not refuse; that is error's job)"
@@ -252,9 +268,18 @@ do_check() {
     # Self-check 3: the teardown (image) leaves the backing unchanged, and the copy equals it
     mkdir -p "$mnt.work"
     do_image "$name" "$mnt.work" "$img.copy" >/dev/null || bad "self-check 3: image failed"
-    h0=$(sha256sum "$(loop_of "$name")" | cut -d' ' -f1)
+    h0=$(backing_hash "$name")
     [[ "$h0" == "$h1" ]] && pass "self-check 3: teardown left the backing unchanged" || bad "self-check 3: the teardown changed the backing"
     [[ "$(sha256sum "$img.copy" | cut -d' ' -f1)" == "$h1" ]] && pass "self-check 3: the raw copy equals the backing" || bad "self-check 3: the copy differs from the backing"
+    # The copy must be a filesystem that mounts and holds the synced marker:
+    # the two hashes above agree even when both read a stale page cache.
+    if lc=$(losetup -f --show "$img.copy") && mount -o ro,noload "$lc" "$mnt" 2>/dev/null; then
+        [[ "$(cat "$mnt/synced" 2>/dev/null)" == "synced-marker" ]] && pass "self-check 3: the copy mounts and holds the synced marker" || bad "self-check 3: the copy mounts but the synced marker is not in it"
+        umount "$mnt"; losetup -d "$lc"
+    else
+        [[ -n "${lc:-}" ]] && losetup -d "$lc"
+        bad "self-check 3: the copy does not mount as ext4 (its superblock is missing: a stale loop page cache, read_backing's reason)"
+    fi
     rm -rf "$mnt.work"
 
     # The swap's time, five more swaps
