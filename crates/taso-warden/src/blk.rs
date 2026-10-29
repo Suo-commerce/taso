@@ -53,7 +53,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use taso_blk::client::{Client, ClientError, Info};
 use taso_blk::map::LayerId;
@@ -358,9 +358,61 @@ fn mount_source(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
 
 // ── the pool ────────────────────────────────────────────────────────
 
+/// One call's connection to `taso-blkd`.  A fresh one of its own when the
+/// daemon gives one ([`Blkd::own_connection`]): no other Vessel's call
+/// waits on it, nor it on theirs, and nothing is held across an attach, a
+/// mount or an export (the fork probe, taso-test, 2026-10-29: forks waited
+/// up to 180 ms on the shared connection while children attached and
+/// mounted under it).  Else, for the in-process fakes, the shared one,
+/// held for the call.
+enum Conn<'a, D> {
+    Own(D),
+    Shared(MutexGuard<'a, D>),
+}
+
+impl<D> std::ops::Deref for Conn<'_, D> {
+    type Target = D;
+    fn deref(&self) -> &D {
+        match self {
+            Conn::Own(d) => d,
+            Conn::Shared(g) => g,
+        }
+    }
+}
+
+impl<D> std::ops::DerefMut for Conn<'_, D> {
+    fn deref_mut(&mut self) -> &mut D {
+        match self {
+            Conn::Own(d) => d,
+            Conn::Shared(g) => g,
+        }
+    }
+}
+
+/// What makes fresh connections: a copy of the daemon handle, never used
+/// for a command itself; `None` when the daemon gives none (the fakes).
+type Maker<D> = Option<Arc<Mutex<D>>>;
+
+/// A fresh connection from `maker`, if it makes them.  Its lock is held
+/// only to copy the handle (no command, no I/O).
+fn fresh<D: Blkd>(maker: &Maker<D>) -> Option<D> {
+    maker
+        .as_ref()
+        .and_then(|m| m.lock().unwrap_or_else(|e| e.into_inner()).own_connection())
+}
+
+/// One call's connection: fresh from `maker`, else `shared`, locked.
+fn conn<'a, D: Blkd>(maker: &Maker<D>, shared: &'a Mutex<D>) -> Conn<'a, D> {
+    match fresh(maker) {
+        Some(d) => Conn::Own(d),
+        None => Conn::Shared(shared.lock().unwrap()),
+    }
+}
+
 /// Vessel datasets as named branches of a block log.
 pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
     blkd: Arc<Mutex<D>>,
+    maker: Maker<D>,
     mounts: Arc<M>,
     mount_root: PathBuf,
     spool: PathBuf,
@@ -370,6 +422,7 @@ impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
     fn clone(&self) -> Self {
         Self {
             blkd: self.blkd.clone(),
+            maker: self.maker.clone(),
             mounts: self.mounts.clone(),
             mount_root: self.mount_root.clone(),
             spool: self.spool.clone(),
@@ -398,8 +451,10 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
         mount_root: impl Into<PathBuf>,
         spool: impl Into<PathBuf>,
     ) -> Self {
+        let maker = blkd.own_connection().map(|d| Arc::new(Mutex::new(d)));
         Self {
             blkd: Arc::new(Mutex::new(blkd)),
+            maker,
             mounts: Arc::new(mounts),
             mount_root: mount_root.into(),
             spool: spool.into(),
@@ -410,14 +465,20 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     pub fn sender(&self) -> BlkSend<D> {
         BlkSend {
             blkd: self.blkd.clone(),
+            maker: self.maker.clone(),
             spool: self.spool.clone(),
         }
+    }
+
+    /// This call's connection ([`Conn`]).
+    fn conn(&self) -> Conn<'_, D> {
+        conn(&self.maker, &self.blkd)
     }
 
     /// The Seal layer of `dataset` at `lsn`, as the publisher wants it
     /// (the shape of a ZFS snapshot), or `None` if there is none.
     pub fn snapshot(&self, dataset: &Dataset, lsn: Lsn) -> Result<Option<Snapshot>, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let Some(b) = d.find(dataset.as_str())? else {
             return Ok(None);
         };
@@ -432,7 +493,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// The datasets directly under `root`.
     pub fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, LayerError> {
         let prefix = format!("{root}/");
-        let names = self.blkd.lock().unwrap().names()?;
+        let names = self.conn().names()?;
         Ok(names
             .into_iter()
             .filter_map(|(n, _)| {
@@ -510,7 +571,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// Give `dataset` a device and mount it, if it has none or is not
     /// mounted (after a daemon restart devices are gone: they are lazy).
     pub fn ensure_mounted(&self, dataset: &Dataset) -> Result<PathBuf, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let b = d
             .find(dataset.as_str())?
             .ok_or_else(|| format!("no dataset {dataset}"))?;
@@ -696,7 +757,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
         let name = format!("{}.view-{}", dataset.as_str(), lsn.get());
         let dir = self.mount_root.join(".views").join(&name);
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let b = d
             .find(dataset.as_str())?
             .ok_or_else(|| format!("no dataset {dataset}"))?;
@@ -717,11 +778,19 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             return Err(e);
         }
         drop(d);
-        let (blkd, mounts, at) = (self.blkd.clone(), self.mounts.clone(), dir.clone());
+        let (blkd, maker, mounts, at) = (
+            self.blkd.clone(),
+            self.maker.clone(),
+            self.mounts.clone(),
+            dir.clone(),
+        );
         Ok(SealView::new(
             dir,
             Some(Box::new(move || {
-                let mut d = blkd.lock().unwrap_or_else(|e| e.into_inner());
+                let mut d = match fresh(&maker) {
+                    Some(d) => Conn::Own(d),
+                    None => Conn::Shared(blkd.lock().unwrap_or_else(|e| e.into_inner())),
+                };
                 if let Err(e) = take_down(&mut *d, &*mounts, v, &at) {
                     eprintln!("taso: leaving a Seal view behind at {}: {e}", at.display());
                 }
@@ -730,7 +799,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     }
 
     fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         Ok(d.find(dataset.as_str())?.map(|b| b.get()))
     }
 
@@ -738,7 +807,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     /// and, for a dataset born from the void, its root Seal.  The block
     /// log refuses to drop a layer something stands on (a clone).
     fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let Some(b) = d.find(dataset.as_str())? else {
             return Ok(false);
         };
@@ -806,7 +875,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     ) -> Result<u64, LayerError> {
         // Out of use first: the branch's blocks change under its ext4.
         {
-            let mut d = self.blkd.lock().unwrap();
+            let mut d = conn(&self.maker, &self.blkd);
             let b = d
                 .find(dataset.as_str())?
                 .ok_or_else(|| format!("no dataset {dataset} to adopt into"))?;
@@ -852,7 +921,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     }
 
     fn create(&self, dataset: &Dataset) -> Result<DatasetInfo, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         if d.find(dataset.as_str())?.is_some() {
             return Err(format!("dataset {dataset} already exists").into());
         }
@@ -883,7 +952,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         seal_hash: HashVal,
         target: &Dataset,
     ) -> Result<DatasetInfo, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let src = d
             .find(source.as_str())?
             .ok_or_else(|| format!("no dataset {source}"))?;
@@ -916,15 +985,16 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     }
 
     fn info(&self, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         self.info_locked(&mut *d, dataset)
     }
 
     fn layers(&self, dataset: &Dataset) -> BlkLayers<D, M> {
         BlkLayers {
-            own: self.blkd.lock().unwrap().own_connection(),
+            own: fresh(&self.maker),
             cached: None,
             blkd: self.blkd.clone(),
+            maker: self.maker.clone(),
             mounts: self.mounts.clone(),
             dataset: dataset.clone(),
             mountpoint: self.mountpoint(dataset),
@@ -942,7 +1012,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     ) -> Result<u64, LayerError> {
         // Already here (an interrupted rebirth got this far): bind and return.
         {
-            let mut d = self.blkd.lock().unwrap();
+            let mut d = conn(&self.maker, &self.blkd);
             if let Some(b) = d.find(dataset.as_str())? {
                 if let Some((_, h)) = seal_at(&mut *d, b, to.0)? {
                     return if h == to.1 {
@@ -958,7 +1028,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             }
         }
         let file = self.spool_in(stream)?; // a stream that fails as it is read leaves nothing
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         match from {
             None => {
                 if d.find(dataset.as_str())?.is_some() {
@@ -1021,7 +1091,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         stream: &mut dyn io::Read,
     ) -> Result<u64, LayerError> {
         {
-            let mut d = self.blkd.lock().unwrap();
+            let mut d = conn(&self.maker, &self.blkd);
             if let Some(b) = d.find(dataset.as_str())? {
                 if let Some((_, h)) = seal_at(&mut *d, b, to.0)? {
                     return if h == to.1 {
@@ -1045,7 +1115,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             .into());
         }
         let file = self.spool_in(stream)?;
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let src = d
             .find(base.dataset.as_str())?
             .ok_or_else(|| format!("no base dataset {}", base.dataset))?;
@@ -1076,6 +1146,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
 /// changed since the base Seal (full if there is none).
 pub struct BlkSend<D: Blkd = Daemon> {
     blkd: Arc<Mutex<D>>,
+    maker: Maker<D>,
     spool: PathBuf,
 }
 
@@ -1084,7 +1155,7 @@ impl<D: Blkd> Sender for BlkSend<D> {
         let err = |e: LayerError| io::Error::other(e.to_string());
         let file = SpoolFile::new(&self.spool, "send")?;
         {
-            let mut d = self.blkd.lock().unwrap();
+            let mut d = conn(&self.maker, &self.blkd);
             let b = d
                 .find(dataset.as_str())
                 .map_err(err)?
@@ -1150,6 +1221,7 @@ impl Drop for SpoolFile {
 /// The Seal layers of one dataset.
 pub struct BlkLayers<D: Blkd = Daemon, M: Mounts = System> {
     blkd: Arc<Mutex<D>>,
+    maker: Maker<D>,
     /// This Vessel's own connection for its Seals ([`Blkd::own_connection`]).
     own: Option<D>,
     /// The branch and its device, looked up once: neither changes while
@@ -1262,7 +1334,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     }
 
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let b = self.branch(&mut *d)?;
         let by_lsn: BTreeMap<Lsn, HashVal> = d
             .seals(b)?
@@ -1276,7 +1348,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     /// on the orphan of a failed Seal, so this refuses ("has layers on top"),
     /// and the Chronicle stops until the open's [`Layers::destroy_orphan`].
     fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let b = self.branch(&mut *d)?;
         if let Some((layer, _)) = seal_at(&mut *d, b, lsn)? {
             d.drop_layer(layer)?;
@@ -1290,7 +1362,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     /// branch held, never sealed (F1, 2026-10-28).  Any other orphan is
     /// dropped as [`Layers::destroy`] drops it.
     fn destroy_orphan(&mut self, lsn: Lsn) -> Result<(), LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let b = self.branch(&mut *d)?;
         let Some((layer, _)) = seal_at(&mut *d, b, lsn)? else {
             return Ok(());
@@ -1321,7 +1393,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     /// layer exists, the hash differs, or the mountpoint is mounted from
     /// something else or busy (unmount fails).
     fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = conn(&self.maker, &self.blkd);
         let b = self.branch(&mut *d)?;
         let own = d.seals(b)?;
         let (layer, bound) = seal_at(&mut *d, b, lsn)?
@@ -1518,10 +1590,84 @@ mod tests {
         fail_mkfs: RefCell<bool>,
         busy: RefCell<bool>,
         fail_thaw: RefCell<bool>,
+        /// Asked at every mkfs, mount and umount: true notes the call in
+        /// `held` (the shared connection is held across it).
+        probe: RefCell<Option<Box<dyn Fn() -> bool>>>,
+        held: RefCell<Vec<String>>,
+    }
+
+    impl FakeMounts {
+        fn check(&self, what: &str) {
+            if self.probe.borrow().as_ref().is_some_and(|f| f()) {
+                self.held.borrow_mut().push(what.to_string());
+            }
+        }
+    }
+
+    /// [`StoreBlkd`] shared by connections of its own, as `taso-blkd`
+    /// serves each connection on its own thread.
+    #[derive(Clone)]
+    struct SharedBlkd(Arc<Mutex<StoreBlkd>>);
+
+    impl Blkd for SharedBlkd {
+        fn own_connection(&self) -> Option<Self> {
+            Some(self.clone())
+        }
+        fn root(&mut self) -> Result<LayerId, LayerError> {
+            self.0.lock().unwrap().root()
+        }
+        fn branch(&mut self, seal: LayerId, name: &str) -> Result<LayerId, LayerError> {
+            self.0.lock().unwrap().branch(seal, name)
+        }
+        fn attach(&mut self, branch: LayerId) -> Result<PathBuf, LayerError> {
+            self.0.lock().unwrap().attach(branch)
+        }
+        fn seal(&mut self, branch: LayerId, tag: &[u8]) -> Result<LayerId, LayerError> {
+            self.0.lock().unwrap().seal(branch, tag)
+        }
+        fn find(&mut self, name: &str) -> Result<Option<LayerId>, LayerError> {
+            self.0.lock().unwrap().find(name)
+        }
+        fn seals(&mut self, branch: LayerId) -> Result<Vec<(LayerId, Vec<u8>)>, LayerError> {
+            self.0.lock().unwrap().seals(branch)
+        }
+        fn info(&mut self, l: LayerId) -> Result<Info, LayerError> {
+            self.0.lock().unwrap().info(l)
+        }
+        fn drop_layer(&mut self, l: LayerId) -> Result<(), LayerError> {
+            self.0.lock().unwrap().drop_layer(l)
+        }
+        fn detach(&mut self, branch: LayerId) -> Result<(), LayerError> {
+            self.0.lock().unwrap().detach(branch)
+        }
+        fn reset(&mut self, branch: LayerId) -> Result<u64, LayerError> {
+            self.0.lock().unwrap().reset(branch)
+        }
+        fn unseal(&mut self, branch: LayerId) -> Result<u64, LayerError> {
+            self.0.lock().unwrap().unseal(branch)
+        }
+        fn export(
+            &mut self,
+            to: LayerId,
+            from: Option<LayerId>,
+            path: &Path,
+        ) -> Result<u64, LayerError> {
+            self.0.lock().unwrap().export(to, from, path)
+        }
+        fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError> {
+            self.0.lock().unwrap().import(branch, path)
+        }
+        fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError> {
+            self.0.lock().unwrap().names()
+        }
+        fn flush(&mut self) -> Result<(), LayerError> {
+            self.0.lock().unwrap().flush()
+        }
     }
 
     impl Mounts for FakeMounts {
         fn mkfs(&self, dev: &Path) -> io::Result<()> {
+            self.check("mkfs");
             self.calls
                 .borrow_mut()
                 .push(format!("mkfs {}", dev.display()));
@@ -1531,6 +1677,7 @@ mod tests {
             Ok(())
         }
         fn mount(&self, dev: &Path, dir: &Path) -> io::Result<()> {
+            self.check(&format!("mount {}", dir.display()));
             self.calls
                 .borrow_mut()
                 .push(format!("mount {} {}", dev.display(), dir.display()));
@@ -1540,6 +1687,7 @@ mod tests {
             Ok(())
         }
         fn mount_ro(&self, dev: &Path, dir: &Path) -> io::Result<()> {
+            self.check(&format!("mount-ro {}", dir.display()));
             self.calls
                 .borrow_mut()
                 .push(format!("mount-ro {} {}", dev.display(), dir.display()));
@@ -1552,6 +1700,7 @@ mod tests {
             Ok(self.table.borrow().get(dir).cloned())
         }
         fn umount(&self, dir: &Path) -> io::Result<()> {
+            self.check(&format!("umount {}", dir.display()));
             self.calls
                 .borrow_mut()
                 .push(format!("umount {}", dir.display()));
@@ -1677,6 +1826,43 @@ mod tests {
         );
         *p.mounts.fail_mkfs.borrow_mut() = false;
         p.create(&ds("tank/v-a")).unwrap();
+    }
+
+    /// With a daemon that gives connections of their own, no attach, mkfs,
+    /// mount or unmount runs while the shared connection is held: another
+    /// Vessel's call (a fork's info, an open's list) never waits on a
+    /// child's attach and mount (the fork probe, taso-test, 2026-10-29).
+    #[test]
+    fn nothing_holds_the_shared_connection_across_a_mount() {
+        let spool = tempfile::tempdir().unwrap().keep();
+        let p = BlkPool::with(
+            SharedBlkd(Arc::new(Mutex::new(StoreBlkd::new()))),
+            FakeMounts::default(),
+            "/mnt/taso",
+            spool,
+        );
+        let shared = p.blkd.clone();
+        *p.mounts.probe.borrow_mut() = Some(Box::new(move || shared.try_lock().is_err()));
+        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        p.create(&a).unwrap();
+        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
+        p.mounts.table.borrow_mut().remove(&p.mountpoint(&c));
+        p.ensure_mounted(&c).unwrap();
+        drop(p.seal_view(&a, Lsn::new(2)).unwrap());
+        let made = std::mem::take(&mut *p.mounts.calls.borrow_mut());
+        for (want, at) in [
+            ("mkfs ", ""),
+            ("mount ", " /mnt/taso/tank/v-c"),
+            ("mount-ro ", ""),
+            ("umount ", ""),
+        ] {
+            assert!(
+                made.iter().any(|m| m.starts_with(want) && m.ends_with(at)),
+                "{want} ran: {made:?}"
+            );
+        }
+        assert_eq!(*p.mounts.held.borrow(), Vec::<String>::new());
     }
 
     #[test]
