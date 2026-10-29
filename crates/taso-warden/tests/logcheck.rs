@@ -33,6 +33,9 @@ impl Layers for Mem {
         self.0.retain(|(l, _)| *l != lsn);
         Ok(())
     }
+    fn rollback(&mut self, _: Lsn, _: HashVal) -> Result<(), LayerError> {
+        Err("the in-memory fake does not roll back".into())
+    }
 }
 
 fn hex(id: ChronicleId) -> String {

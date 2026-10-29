@@ -44,9 +44,8 @@ use taso_core::record::Payload;
 
 use crate::coordinator::Coord;
 use crate::coordstore::object_key_path;
-use crate::finish::NoSend;
 use crate::pack::Packs;
-use crate::ship::SharedStore;
+use crate::ship::{NoSend, SharedStore};
 
 /// One check and its result.
 #[derive(Clone, Debug, PartialEq, Eq)]

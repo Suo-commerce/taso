@@ -33,7 +33,7 @@ mod tests {
     use crate::ledger::{Answer, Declared};
     use crate::pack::{PackPublisher, Packs};
     use crate::segment::Position;
-    use crate::ship::{ByteStream, LocalStore, Sender};
+    use crate::ship::{ByteStream, LocalStore, NoSend, Sender};
     use crate::timing;
     use crate::vessel::tests::{env, ns};
     use crate::vessel::Vessel;
@@ -839,13 +839,6 @@ mod tests {
         use crate::coordinator::{Coord, Coordinator, LogConfig};
         use crate::coordstore::CoordStore;
         use crate::segment::Segment;
-
-        struct NoSend;
-        impl Sender for NoSend {
-            fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> io::Result<ByteStream> {
-                Err(io::ErrorKind::Unsupported.into())
-            }
-        }
 
         let rounds = n(500);
         let dir = tempfile::tempdir().unwrap();

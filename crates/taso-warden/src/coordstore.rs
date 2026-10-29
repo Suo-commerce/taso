@@ -27,7 +27,7 @@
 //! `37c75f30580bf3edd79674be38702d7893af413813bbfe6d4585231e9477144a`.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use taso_core::contract::{object_key, Inventory, InventoryItem, ObjectKind};
@@ -36,8 +36,7 @@ use taso_core::envelope::{ChronicleId, HashVal, Lsn};
 use taso_core::record::{Origin, Payload};
 
 use crate::pack::{name_bounds, Packs};
-use crate::ship::{ByteStream, ObjectStore, Sender};
-use crate::zfs::Dataset;
+use crate::ship::{NoSend, ObjectStore};
 
 /// The content-addressed kinds, in the order the coordinator looks for a
 /// key whose kind it does not know (D35).
@@ -89,18 +88,6 @@ pub struct CoordStore {
     /// Objects verified by this process: a content key and the kind it was
     /// found under, or a pack.
     verified: Mutex<BTreeMap<ObjectId, Option<ObjectKind>>>,
-}
-
-/// Packs are only read here: no `fs` stream is ever produced.
-struct NoSend;
-
-impl Sender for NoSend {
-    fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> io::Result<ByteStream> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the coordinator never sends",
-        ))
-    }
 }
 
 impl CoordStore {
@@ -315,8 +302,9 @@ mod tests {
     };
 
     use crate::segment::{Position, Segment};
-    use crate::ship::LocalStore;
-    use crate::zfs::Snapshot;
+    use crate::ship::{ByteStream, LocalStore, Sender};
+    use crate::zfs::{Dataset, Snapshot};
+    use std::io;
 
     const PREFIX: &str = "taso";
 

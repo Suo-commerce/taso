@@ -47,19 +47,18 @@ use taso_core::contract::{
     logical_id, BornFrom, ContractRecord, LogicalKey, SanctionCommitted, TemplateReady,
 };
 use taso_core::coordlog::{ClaimAuthority, ClaimError, Final, Submitted};
-use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
+use taso_core::envelope::{ChronicleId, Lsn, Stream};
 use taso_core::model::WardenId;
 use taso_core::record::Payload;
 
 use crate::attempt::Failpoint;
-use crate::chronicle::{restore_log, Chronicle, ChronicleError, LayerError, Layers};
+use crate::chronicle::{restore_log, Chronicle, ChronicleError, Layers, NoLayers};
 use crate::coordinator::{Coord, CoordError};
 use crate::pack::{PackError, Packs};
 use crate::segment::Position;
-use crate::ship::{ByteStream, Sender, SharedStore};
+use crate::ship::{NoSend, Sender, SharedStore};
 use crate::submit::{self, SubmitError};
 use crate::vessel::{Vessel, VesselError};
-use crate::zfs::Dataset;
 
 /// The failpoints of a sanction's finish (§10.2 row 9), in order.
 pub const FAILPOINTS: [&str; 6] = [
@@ -561,28 +560,4 @@ fn has_position(dir: &Path, pos: Position) -> Result<bool, FinishError> {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-/// A Template's Chronicle has records only: no layers.
-pub(crate) struct NoLayers;
-
-impl Layers for NoLayers {
-    fn snapshot(&mut self, lsn: Lsn, _: HashVal) -> Result<(), LayerError> {
-        Err(format!("a Template's log has no layers (lsn {})", lsn.get()).into())
-    }
-    fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-        Ok(Vec::new())
-    }
-    fn destroy(&mut self, _: Lsn) -> Result<(), LayerError> {
-        Ok(())
-    }
-}
-
-/// … and no `fs` sections.
-pub(crate) struct NoSend;
-
-impl Sender for NoSend {
-    fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> std::io::Result<ByteStream> {
-        Err(std::io::Error::other("a Template's log has no fs sections"))
-    }
 }

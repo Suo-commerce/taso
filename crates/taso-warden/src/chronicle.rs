@@ -164,11 +164,9 @@ pub trait Layers {
     /// Make the current state the layer at `lsn` again, which must be
     /// bound to `hash`: everything written after it is discarded.  Must
     /// refuse, changing nothing, if a later layer exists; never destroys
-    /// one.  A store that cannot roll back says so (the default).
-    fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
-        let _ = hash;
-        Err(format!("this layer store cannot roll back (to layer {})", lsn.get()).into())
-    }
+    /// one.  Every production store rolls back; a store that cannot says
+    /// so here, in its own words, never by inheriting a default.
+    fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError>;
     /// How many blocks of the filesystem the last [`Layers::rollback`]
     /// discarded, where the store can count them (the block log: the
     /// branch's own blocks below the Seal); `None` where it cannot (ZFS)
@@ -177,6 +175,33 @@ pub trait Layers {
     /// so this count is the only word on it.
     fn discarded_blocks(&self) -> Option<u64> {
         None
+    }
+}
+
+/// [`Layers`] of a Chronicle that has records only -- a Template's log,
+/// a genesis Chronicle, the Warden's own Chronicle.  It never has a Seal
+/// layer: a snapshot or a rollback is refused, the list is empty, and a
+/// destroy has nothing to do.  The one such store; its sibling for
+/// shipping is [`crate::ship::NoSend`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NoLayers;
+
+impl Layers for NoLayers {
+    fn snapshot(&mut self, lsn: Lsn, _: HashVal) -> Result<(), LayerError> {
+        Err(format!("a records-only Chronicle has no layers (lsn {})", lsn.get()).into())
+    }
+    fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
+        Ok(Vec::new())
+    }
+    fn destroy(&mut self, _: Lsn) -> Result<(), LayerError> {
+        Ok(())
+    }
+    fn rollback(&mut self, lsn: Lsn, _: HashVal) -> Result<(), LayerError> {
+        Err(format!(
+            "a records-only Chronicle has no layer to roll back to (lsn {})",
+            lsn.get()
+        )
+        .into())
     }
 }
 
@@ -1993,25 +2018,18 @@ mod tests {
         assert_eq!(calls.len(), 2, "get, then rollback: {calls:?}");
     }
 
-    /// A layer store without rollback says so; nothing pretends it worked.
+    /// The records-only store refuses a snapshot and a rollback in its own
+    /// words; nothing pretends either worked.
     #[test]
-    fn a_store_without_rollback_refuses() {
-        struct NoRollback;
-        impl Layers for NoRollback {
-            fn snapshot(&mut self, _: Lsn, _: HashVal) -> Result<(), LayerError> {
-                Ok(())
-            }
-            fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-                Ok(vec![])
-            }
-            fn destroy(&mut self, _: Lsn) -> Result<(), LayerError> {
-                Ok(())
-            }
-        }
-        let e = NoRollback
-            .rollback(Lsn::new(3), HashVal::from_bytes([3; 32]))
-            .unwrap_err();
-        assert!(e.to_string().contains("cannot roll back"), "{e}");
+    fn a_records_only_chronicle_refuses_layers() {
+        let mut none = NoLayers;
+        let h = HashVal::from_bytes([3; 32]);
+        let e = none.snapshot(Lsn::new(3), h).unwrap_err();
+        assert!(e.to_string().contains("has no layers"), "{e}");
+        let e = none.rollback(Lsn::new(3), h).unwrap_err();
+        assert!(e.to_string().contains("no layer to roll back to"), "{e}");
+        assert!(none.list().unwrap().is_empty());
+        none.destroy(Lsn::new(3)).unwrap();
     }
 
     // ── layers that are not there ───────────────────────────────────

@@ -276,32 +276,12 @@ mod tests {
     use taso_core::coordlog::ClaimAuthority;
     use taso_core::envelope::{ChronicleId, Lsn};
 
-    use crate::chronicle::LayerError;
+    use crate::chronicle::NoLayers;
     use crate::coordinator::{Coordinator, LogConfig};
     use crate::coordstore::CoordStore;
-    use crate::ship::{ByteStream, LocalStore, SharedStore};
-    use crate::zfs::Dataset;
+    use crate::ship::{LocalStore, NoSend, SharedStore};
 
     const PREFIX: &str = "taso";
-
-    struct NoLayers;
-    impl Layers for NoLayers {
-        fn snapshot(&mut self, _: Lsn, _: HashVal) -> Result<(), LayerError> {
-            Err("no layers".into())
-        }
-        fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-            Ok(Vec::new())
-        }
-        fn destroy(&mut self, _: Lsn) -> Result<(), LayerError> {
-            Ok(())
-        }
-    }
-    struct NoSend;
-    impl Sender for NoSend {
-        fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> std::io::Result<ByteStream> {
-            Err(std::io::Error::other("no fs"))
-        }
-    }
 
     struct World {
         dir: tempfile::TempDir,

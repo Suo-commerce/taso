@@ -221,6 +221,22 @@ pub trait Sender {
     fn send(&self, dataset: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream>;
 }
 
+/// [`Sender`] of a Chronicle that ships records only and never an `fs`
+/// stream -- a Template's log, a genesis Chronicle, the Warden's own
+/// Chronicle, and the coordinator's read-only view of a pack directory.
+/// The sibling of [`crate::chronicle::NoLayers`].
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct NoSend;
+
+impl Sender for NoSend {
+    fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> io::Result<ByteStream> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "a records-only Chronicle ships no fs stream",
+        ))
+    }
+}
+
 /// [`Sender`] running `zfs send`.
 #[derive(Clone, Debug)]
 pub struct ZfsSend {

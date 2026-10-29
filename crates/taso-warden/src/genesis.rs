@@ -106,13 +106,13 @@ use taso_core::model::WardenId;
 use taso_core::record::{Authority, Payload};
 
 use crate::artifact::{self, ArtifactError};
-use crate::chronicle::{restore_log, Chronicle, ChronicleError, LayerError, Layers};
+use crate::chronicle::{restore_log, Chronicle, ChronicleError, LayerError, Layers, NoLayers};
 use crate::classify::{self, Classmap, Limits, Manifest, MapError, Owner, Reserved, Unsupported};
 use crate::coordinator::{Coord, CoordError};
 use crate::coordstore::object_key_path;
 use crate::pack::{PackError, Packs};
 use crate::segment::Position;
-use crate::ship::{ByteStream, Sender, SharedStore};
+use crate::ship::{ByteStream, NoSend, SharedStore};
 use crate::submit::{self, SubmitError};
 use crate::template::same_entries;
 use crate::vessel::Pool;
@@ -1163,33 +1163,6 @@ fn kind(r: &ContractRecord) -> &'static str {
 
 // ── Plumbing ────────────────────────────────────────────────────────
 
-/// The genesis Chronicle has no Seals: its layers are none.
-struct NoLayers;
-
-impl Layers for NoLayers {
-    fn snapshot(&mut self, lsn: Lsn, _: HashVal) -> Result<(), LayerError> {
-        Err(format!("a genesis Chronicle has no Seal layers (lsn {})", lsn.get()).into())
-    }
-    fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-        Ok(Vec::new())
-    }
-    fn destroy(&mut self, _: Lsn) -> Result<(), LayerError> {
-        Ok(())
-    }
-}
-
-/// Genesis ships logs only: no `fs` stream is ever produced.
-struct NoSend;
-
-impl Sender for NoSend {
-    fn send(&self, _: &Dataset, _: Option<&str>, _: Lsn) -> io::Result<ByteStream> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "a genesis ships no fs stream",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,6 +1276,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&p);
             let _ = std::fs::remove_file(p.with_extension("hash"));
             Ok(())
+        }
+        fn rollback(&mut self, _: Lsn, _: HashVal) -> Result<(), LayerError> {
+            Err("the directory fake does not roll back".into())
         }
     }
 
