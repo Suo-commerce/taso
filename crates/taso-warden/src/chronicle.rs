@@ -865,12 +865,19 @@ impl<L: Layers> Chronicle<L> {
         );
         let hash = rec.envelope.hash;
         let snap = crate::timing::span("seal.snapshot");
-        match make {
+        let made = match make {
             None => self.layers.snapshot(lsn, hash),
             Some(make) => make(lsn, hash),
-        }
-        .map_err(ChronicleError::Layer)?;
+        };
         drop(snap);
+        if let Err(e) = made {
+            // The layer may exist though the call failed (on the block log:
+            // the Seal made, the thaw after it failed).  Treated as any
+            // orphan of a failed Seal: destroyed, or the Chronicle stops
+            // (destroying an absent layer is nothing).
+            self.drop_orphan(lsn);
+            return Err(ChronicleError::Layer(e));
+        }
         if let Err(why) = check() {
             self.drop_orphan(lsn);
             return Err(ChronicleError::CheckFailed(why));
@@ -2356,16 +2363,42 @@ mod tests {
 
     /// Crash after the snapshot, before the record is written: reopen
     /// destroys the orphan.
+    /// The layer made and the call failed after it (on the block log a
+    /// thaw that failed after the Seal), the Vessel still running: the
+    /// orphan is destroyed at once and the Chronicle goes on (review
+    /// 2026-10-29, after V14).  Before, it was left with no record and the
+    /// next Seal stood on it.
     #[test]
-    fn crash_after_snapshot_before_append() {
+    fn a_layer_made_by_a_failed_snapshot_is_destroyed_at_once() {
         let e = env();
         let mut c = e.create();
         c.append(Stream::Fs, raw(1)).unwrap();
         *e.layers.fail_after_snapshot.borrow_mut() = true;
         assert!(matches!(seal(&mut c, 1), Err(ChronicleError::Layer(_))));
+        assert!(e.layers.snaps().is_empty(), "no orphan left behind");
+        *e.layers.fail_after_snapshot.borrow_mut() = false;
+        let s = seal(&mut c, 2).unwrap();
+        assert_eq!(e.layers.snaps(), vec![(s.seal.lsn, s.seal.hash)]);
+    }
+
+    #[test]
+    fn crash_after_snapshot_before_append() {
+        // A crash runs no cleanup: the live destroy refuses here, as the
+        // block log's does, so the orphan is left for the open.
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        *e.layers.refuse_destroy.borrow_mut() = true;
+        *e.layers.fail_after_snapshot.borrow_mut() = true;
+        assert!(matches!(seal(&mut c, 1), Err(ChronicleError::Layer(_))));
         assert_eq!(e.layers.snaps().len(), 1);
+        assert!(
+            matches!(seal(&mut c, 1), Err(ChronicleError::Poisoned)),
+            "no Seal on top of the orphan"
+        );
         drop(c);
         *e.layers.fail_after_snapshot.borrow_mut() = false;
+        *e.layers.refuse_destroy.borrow_mut() = false;
 
         let (c, r) = e.open(A);
         assert_eq!(r.orphan_layers, vec![Lsn::new(2)]);
