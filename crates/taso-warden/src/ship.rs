@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use taso_core::envelope::Lsn;
 
-use crate::zfs::Dataset;
+use crate::storage::Dataset;
 
 // ── Object store ────────────────────────────────────────────────────
 

@@ -68,7 +68,7 @@ use taso_warden::coordstore::CoordStore;
 use taso_warden::daemon::{refuse_selinux, Config, CoordConf};
 use taso_warden::genesis::{Failpoint, Genesis, GenesisError, Outcome, Report, Request, Source};
 use taso_warden::segment::Position;
-use taso_warden::zfs::Dataset;
+use taso_warden::storage::Dataset;
 
 /// The usage line.
 const USAGE: &str = "usage: taso-genesis <warden-config> --from <source> --classmap <file> \

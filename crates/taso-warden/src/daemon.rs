@@ -156,12 +156,12 @@ use crate::s3::{S3Config, S3Store};
 use crate::segment::Position;
 use crate::ship::{LocalStore, SharedStore};
 use crate::source::{Held, Requested};
+use crate::storage::{Dataset, Snapshot};
 use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
 use crate::template::{TemplateError, TemplateLayers};
 use crate::vessel::{
     Ensured, Host, Pool, ReadLog, SealAt, TemplateBirth, Vessel, VesselError, BIRTH_TURN,
 };
-use crate::zfs::{Dataset, Snapshot};
 use taso_core::contract::{
     ContractRecord, LogicalKey, NominatedBy, PathClass, Peer, StorageKind, TemplateRef,
     VerdictRequest,

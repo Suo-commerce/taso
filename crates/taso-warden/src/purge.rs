@@ -370,7 +370,7 @@ impl Purger {
         &self,
         pool: &P,
         id: taso_core::envelope::ChronicleId,
-        ds: &crate::zfs::Dataset,
+        ds: &crate::storage::Dataset,
     ) -> Result<bool, PurgeError> {
         if self.ended(id)?.is_none() {
             return Ok(false);
@@ -558,7 +558,7 @@ impl Purger {
     fn delete_local<P: Pool>(
         &self,
         pool: &P,
-        ds: &crate::zfs::Dataset,
+        ds: &crate::storage::Dataset,
         local_key: HashVal,
     ) -> Result<(), PurgeError> {
         let path =

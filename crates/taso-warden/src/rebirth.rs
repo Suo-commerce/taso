@@ -56,8 +56,8 @@ use crate::chronicle::{restore_log, Chronicle, ChronicleError, Claim, Layers};
 use crate::pack::{Chain, FsBase, Packs};
 use crate::segment::Position;
 use crate::ship::{ObjectStore, Sender};
+use crate::storage::CloneBase;
 use crate::vessel::{Host, Pool, Vessel, VesselError};
-use crate::zfs::CloneBase;
 
 /// What a rebirth found and did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,7 +262,7 @@ impl<P: Pool> Host<P> {
         &self,
         id: ChronicleId,
         packs: &Packs<S, X>,
-        dataset: &crate::zfs::Dataset,
+        dataset: &crate::storage::Dataset,
         layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
     ) -> Result<(Position, Chain, LineageRecord), VesselError> {
         let anchor = self.coord.shipped(id).map_err(VesselError::Coord)?;
@@ -320,7 +320,7 @@ impl<P: Pool> Host<P> {
     /// not here (`zfs list` fails on a dataset that does not exist).
     fn seals_here(
         &self,
-        dataset: &crate::zfs::Dataset,
+        dataset: &crate::storage::Dataset,
     ) -> Result<Vec<(Lsn, taso_core::envelope::HashVal)>, VesselError> {
         if self
             .pool
@@ -353,7 +353,7 @@ impl<P: Pool> Host<P> {
     fn origin_present(
         &self,
         lineage: &LineageRecord,
-    ) -> Result<Option<(crate::zfs::Dataset, Position)>, VesselError> {
+    ) -> Result<Option<(crate::storage::Dataset, Position)>, VesselError> {
         let Some((chronicle, seal)) = crate::pack::origin_seal(&lineage.origin) else {
             return Ok(None);
         };
@@ -384,7 +384,7 @@ impl<P: Pool> Host<P> {
     fn as_born(
         &self,
         lineage: &LineageRecord,
-        dataset: &crate::zfs::Dataset,
+        dataset: &crate::storage::Dataset,
     ) -> Result<(), VesselError> {
         if self
             .pool
@@ -414,8 +414,8 @@ mod tests {
     use crate::ledger::{Answer, Declared};
     use crate::pack::PackPublisher;
     use crate::ship::{ByteStream, LocalStore};
+    use crate::storage::{Dataset, Snapshot};
     use crate::vessel::tests::{fake_guid, ns, FakePool};
-    use crate::zfs::{Dataset, Snapshot};
     use std::io;
     use std::sync::Arc;
     use taso_core::envelope::{HashVal, Stream};
@@ -475,7 +475,6 @@ mod tests {
         Snapshot {
             dataset: v.dataset().clone(),
             seal: seal.lsn,
-            createtxg: 1,
             guid: fake_guid(seal.lsn),
             seal_hash: Some(seal.hash),
         }
@@ -682,7 +681,6 @@ mod tests {
         Snapshot {
             dataset: h.layer_dataset(T),
             seal: crate::template::LAYER_LSN,
-            createtxg: 1,
             guid: fake_guid(crate::template::LAYER_LSN),
             seal_hash: Some(LAYER_KEY),
         }

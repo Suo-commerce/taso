@@ -61,8 +61,8 @@ use taso_core::envelope::{HashVal, Lsn};
 
 use crate::chronicle::{LayerError, Layers};
 use crate::ship::{ByteStream, Sender};
+use crate::storage::{CloneBase, Dataset, DatasetInfo, Snapshot, SNAP_PREFIX};
 use crate::vessel::{Pool, SealView};
-use crate::zfs::{CloneBase, Dataset, DatasetInfo, Snapshot, SNAP_PREFIX};
 
 // ── tags ────────────────────────────────────────────────────────────
 
@@ -424,7 +424,6 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
         Ok(seal_at(&mut *d, b, lsn)?.map(|(_, hash)| Snapshot {
             dataset: dataset.clone(),
             seal: lsn,
-            createtxg: lsn.get(),
             guid: guid(lsn, hash),
             seal_hash: Some(hash),
         }))

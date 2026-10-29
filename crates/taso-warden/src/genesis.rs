@@ -113,10 +113,10 @@ use crate::coordstore::object_key_path;
 use crate::pack::{PackError, Packs};
 use crate::segment::Position;
 use crate::ship::{ByteStream, NoSend, SharedStore};
+use crate::storage::Dataset;
 use crate::submit::{self, SubmitError};
 use crate::template::same_entries;
 use crate::vessel::Pool;
-use crate::zfs::Dataset;
 
 /// Domain of the synthetic Seal hash the scratch's layer is bound to.
 pub const SCRATCH_DOMAIN: &str = "taso.genesis.scratch.v1";
@@ -1176,8 +1176,8 @@ mod tests {
     use crate::coordinator::{Coordinator, LogConfig};
     use crate::coordstore::CoordStore;
     use crate::ship::{LocalStore, ObjectStore, Sender};
+    use crate::storage::{CloneBase, DatasetInfo};
     use crate::vessel::SealView;
-    use crate::zfs::{CloneBase, DatasetInfo};
 
     const PREFIX: &str = "taso";
     const BASE: u32 = 200_000;

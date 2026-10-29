@@ -140,7 +140,7 @@ use crate::coordinator::Coord;
 use crate::effects::{Publish, PublishError};
 use crate::segment::{self, Frame, Position, Segment, SegmentError, MAX_PAYLOAD};
 use crate::ship::{valid_key, ByteStream, ObjectStore, Sender};
-use crate::zfs::Snapshot;
+use crate::storage::Snapshot;
 
 const MAGIC: [u8; 8] = *b"TASOPAK\0";
 const VERSION: u8 = 1;
@@ -2121,7 +2121,7 @@ impl<S: ObjectStore, X: Sender> Publish for PackPublisher<S, X> {
 mod tests {
     use super::*;
     use crate::ship::LocalStore;
-    use crate::zfs::Dataset;
+    use crate::storage::Dataset;
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2325,7 +2325,6 @@ mod tests {
             Snapshot {
                 dataset: Dataset::new("tank/v").unwrap(),
                 seal: Lsn::new(lsn),
-                createtxg: 1,
                 guid,
                 seal_hash: Some(self.at(lsn).hash),
             }
@@ -4032,7 +4031,6 @@ mod tests {
         Snapshot {
             dataset: Dataset::new("tank/tpl").unwrap(),
             seal: Lsn::new(40),
-            createtxg: 1,
             guid,
             seal_hash: Some(HashVal::from_bytes([0x40; 32])),
         }
@@ -4230,7 +4228,7 @@ mod tests {
         #[test]
         #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
         fn ship_packs_then_receive_elsewhere() {
-            use crate::zfs::CloneBase;
+            use crate::storage::CloneBase;
             let base = std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET");
             let root = format!("{base}/pk-{}", std::process::id());
             zfs(&["create", &root]);

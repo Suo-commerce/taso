@@ -34,10 +34,10 @@ mod tests {
     use crate::pack::{PackPublisher, Packs};
     use crate::segment::Position;
     use crate::ship::{ByteStream, LocalStore, NoSend, Sender};
+    use crate::storage::{Dataset, Snapshot};
     use crate::timing;
     use crate::vessel::tests::{env, ns};
     use crate::vessel::Vessel;
-    use crate::zfs::{Dataset, Snapshot};
 
     fn n(default: usize) -> usize {
         std::env::var("TASO_BENCH_N")
@@ -121,7 +121,6 @@ mod tests {
         let snap = |v: &Vessel<FakeLayers>, s: Position| Snapshot {
             dataset: v.dataset().clone(),
             seal: s.lsn,
-            createtxg: 1,
             guid: fake_guid(s.lsn),
             seal_hash: Some(s.hash),
         };
@@ -304,7 +303,6 @@ mod tests {
         Snapshot {
             dataset: v.dataset().clone(),
             seal: seal.lsn,
-            createtxg: 1,
             guid: 1000 + seal.lsn.get(),
             seal_hash: Some(seal.hash),
         }

@@ -303,7 +303,7 @@ mod tests {
 
     use crate::segment::{Position, Segment};
     use crate::ship::{ByteStream, LocalStore, Sender};
-    use crate::zfs::{Dataset, Snapshot};
+    use crate::storage::{Dataset, Snapshot};
     use std::io;
 
     const PREFIX: &str = "taso";
@@ -401,7 +401,6 @@ mod tests {
             let snap = Snapshot {
                 dataset: Dataset::new("tank/v").unwrap(),
                 seal: p.lsn,
-                createtxg: 1,
                 guid: 7,
                 seal_hash: Some(p.hash),
             };

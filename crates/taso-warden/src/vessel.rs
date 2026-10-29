@@ -78,8 +78,9 @@ use crate::coordinator::{Coord, CoordError};
 use crate::pack::{PackError, Packs};
 use crate::segment::{Frame, Position};
 use crate::ship::{ObjectStore, Sender};
+use crate::storage::{CloneBase, Dataset, DatasetInfo, Snapshot};
 use crate::template::LAYER_LSN;
-use crate::zfs::{CloneBase, Dataset, DatasetInfo, Runner, Snapshot, Zfs};
+use crate::zfs::{Runner, Zfs};
 use taso_core::record::FsShippedRecord;
 
 // ── Pool ────────────────────────────────────────────────────────────
@@ -265,7 +266,8 @@ impl<R: Runner + Clone> Pool for Zfs<R> {
             .and_then(|i| i.mountpoint)
             .ok_or_else(|| format!("{dataset} has no mountpoint"))?;
         Ok(SealView::new(
-            mp.join(".zfs/snapshot").join(crate::zfs::snap_name(lsn)),
+            mp.join(".zfs/snapshot")
+                .join(crate::storage::snap_name(lsn)),
             None,
         ))
     }
@@ -2987,7 +2989,7 @@ pub(crate) mod tests {
         use super::*;
         use crate::pack::{FsBase, Packs, ShippedFs};
         use crate::ship::{ByteStream, LocalStore, ObjectStore, Sender};
-        use crate::zfs::Snapshot;
+        use crate::storage::Snapshot;
         use std::io::{self, Read};
         use std::sync::atomic::{AtomicBool, Ordering};
         use taso_core::envelope::{Envelope, Epoch};
@@ -3129,7 +3131,6 @@ pub(crate) mod tests {
             Snapshot {
                 dataset: v.dataset().clone(),
                 seal: seal.lsn,
-                createtxg: 1,
                 guid: 1000 + seal.lsn.get(),
                 seal_hash: Some(seal.hash),
             }

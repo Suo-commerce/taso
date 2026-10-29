@@ -921,9 +921,9 @@ mod tests {
     use crate::coordinator::{Coordinator, LogConfig};
     use crate::coordstore::CoordStore;
     use crate::ship::{ByteStream, LocalStore, ObjectStore};
+    use crate::storage::{Dataset, Snapshot};
     use crate::vessel::tests::{fake_guid, ns, FakePool};
     use crate::vessel::Host;
-    use crate::zfs::{Dataset, Snapshot};
 
     const PREFIX: &str = "taso";
     const BASE: u32 = 200_000;
@@ -1062,7 +1062,6 @@ class = \"Scratch\"
             let snap = Snapshot {
                 dataset: v.dataset().clone(),
                 seal: s.lsn,
-                createtxg: 1,
                 guid: fake_guid(s.lsn),
                 seal_hash: Some(s.hash),
             };
@@ -1206,7 +1205,6 @@ class = \"Scratch\"
         let snap = Snapshot {
             dataset: v.dataset().clone(),
             seal: s.lsn,
-            createtxg: 1,
             guid: fake_guid(s.lsn),
             seal_hash: Some(s.hash),
         };

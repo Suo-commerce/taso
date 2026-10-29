@@ -85,9 +85,9 @@ use crate::coordinator::{Coord, CoordError};
 use crate::coordstore::object_key_path;
 use crate::pack::{PackError, Packs};
 use crate::ship::{ByteStream, NoSend, Sender, SharedStore};
+use crate::storage::Dataset;
 use crate::submit::{self, SubmitError};
 use crate::vessel::Pool;
-use crate::zfs::Dataset;
 
 /// The lsn of a Template's layer Seal on every node.
 pub const LAYER_LSN: Lsn = Lsn::new(1);
@@ -943,8 +943,8 @@ mod tests {
     use crate::coordstore::CoordStore;
     use crate::genesis::{self, Genesis, Outcome, Request, Source};
     use crate::ship::{LocalStore, ObjectStore};
+    use crate::storage::{CloneBase, DatasetInfo};
     use crate::vessel::SealView;
-    use crate::zfs::{CloneBase, DatasetInfo};
 
     const PREFIX: &str = "taso";
     const BASE: u32 = 200_000;
@@ -2072,10 +2072,9 @@ mod tests {
             )
             .unwrap()
             .seal;
-        let snap = crate::zfs::Snapshot {
+        let snap = crate::storage::Snapshot {
             dataset: v.dataset().clone(),
             seal: s.lsn,
-            createtxg: 1,
             guid: crate::vessel::tests::fake_guid(s.lsn),
             seal_hash: Some(s.hash),
         };

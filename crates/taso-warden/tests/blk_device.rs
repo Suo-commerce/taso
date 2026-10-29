@@ -30,8 +30,8 @@ use taso_warden::coordinator::Coordinator;
 use taso_warden::daemon::StoreConf;
 use taso_warden::pack::Packs;
 use taso_warden::ship::SharedStore;
+use taso_warden::storage::Dataset;
 use taso_warden::vessel::{Host, Pool};
-use taso_warden::zfs::Dataset;
 
 /// The daemon's socket and the mount root, from the environment.
 fn setup() -> (PathBuf, PathBuf) {
@@ -259,7 +259,7 @@ fn rebirth_on_a_second_node_from_shipped_packs() {
     let publish = |h: &Host<BlkPool>,
                    v: &mut taso_warden::vessel::Vessel<taso_warden::blk::BlkLayers>,
                    at: Lsn,
-                   origin: Option<&taso_warden::zfs::Snapshot>| {
+                   origin: Option<&taso_warden::storage::Snapshot>| {
         let snap = h.pool.snapshot(v.dataset(), at).unwrap().unwrap();
         v.publish_seal(&packs(h, v.id()), &snap, origin).unwrap();
     };

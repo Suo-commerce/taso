@@ -47,9 +47,8 @@ use std::sync::{mpsc, Mutex};
 
 use taso_core::envelope::{HashVal, Lsn};
 
-use crate::zfs::{
-    parse_line_for, Dataset, Runner, Snapshot, ZfsError, LIST_COLUMNS, SEAL_PROPERTY,
-};
+use crate::storage::{Dataset, Snapshot};
+use crate::zfs::{parse_line_for, Runner, ZfsError, LIST_COLUMNS, SEAL_PROPERTY};
 
 /// The channel program.  Arguments: pairs of (snapshot name, seal hash).
 /// Returns a table: snapshot name → `{err, guid, txg}`; `guid` and `txg`
@@ -307,12 +306,11 @@ fn decide(
         Some(Entry { err: EEXIST, .. }) => return Err(ZfsError::AlreadyExists(name.to_string())),
         Some(Entry {
             err: 0,
-            made: Some((guid, createtxg)),
+            made: Some((guid, _createtxg)),
         }) => {
             return Ok(Snapshot {
                 dataset: job.dataset.clone(),
                 seal: job.seal,
-                createtxg,
                 guid,
                 seal_hash: Some(job.hash),
             })
@@ -540,10 +538,7 @@ mod tests {
         let fake = FakeZfs::default();
         let zfs = driver(&fake);
         let s = zfs.snapshot(&ds("p/v1"), Lsn::new(3), h(3)).unwrap();
-        assert_eq!(
-            (s.seal, s.seal_hash, s.createtxg),
-            (Lsn::new(3), Some(h(3)), 100)
-        );
+        assert_eq!((s.seal, s.seal_hash), (Lsn::new(3), Some(h(3))));
         assert_eq!(s.dataset, ds("p/v1"));
         assert_eq!(
             s.guid,

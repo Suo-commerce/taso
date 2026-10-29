@@ -49,11 +49,11 @@ use crate::pack::Packs;
 use crate::runtime::{write_verifier_bundle, VerifierSpec, VERIFIER_DIRS};
 use crate::segment::Frame;
 use crate::ship::{Sender, SharedStore};
+use crate::storage::Dataset;
 use crate::submit::{self, SubmitError};
 use crate::template::{own_top, same_entries, TemplateLayers, LAYER_LSN};
 use crate::verify::{outcome_of, run_capped, Vconf, VerifierLimits};
 use crate::vessel::{Pool, Vessel, VesselError};
-use crate::zfs::Dataset;
 
 /// The three failpoints of an attempt (§10.2 row 7).
 pub const FAILPOINTS: [&str; 3] = [

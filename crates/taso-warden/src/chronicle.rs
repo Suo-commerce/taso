@@ -112,7 +112,8 @@ impl fmt::Display for Claim {
         }
     }
 }
-use crate::zfs::{Cli, Dataset, Runner, Zfs};
+use crate::storage::Dataset;
+use crate::zfs::{Cli, Runner, Zfs};
 
 /// File name of the first segment of a Chronicle (base lsn 0).
 const SEGMENT_FILE: &str = "seg-00000000000000000000";
