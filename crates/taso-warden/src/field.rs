@@ -826,6 +826,25 @@ pub struct ConnEnded {
     pub ended: Ended,
 }
 
+/// What happens on a Vessel's sockets that its Warden reports in its own
+/// log ([`serve_vessel`]).
+#[derive(Debug)]
+pub enum ServeEvent<'a> {
+    /// A connection ended.
+    Ended(ConnEnded),
+    /// A request was refused because this Warden no longer holds the
+    /// Vessel: another Warden took it over and the coordinator fenced this
+    /// one's epoch.  The agent is told in the reply; the operator learns it
+    /// from the Warden's own log (E3-4, taso-test 2026-10-29: a fenced
+    /// Warden told its agent and logged nothing).
+    Fenced {
+        /// The request refused.
+        request: &'static str,
+        /// The refusal, as the agent was told it.
+        message: &'a str,
+    },
+}
+
 enum Msg {
     Request {
         id: u64,
@@ -847,14 +866,15 @@ enum Msg {
 /// Each reply is handed to its connection before the after-Seal hook
 /// runs ([`Session::after_reply`]), as in [`serve`].  A malformed body is
 /// answered by its connection's thread and the connection goes on.
-/// `on_end` is told of every connection that ended.
+/// `on_event` is told of every connection that ended, and of every
+/// request refused because this Warden was fenced ([`ServeEvent`]).
 pub fn serve_vessel<L: Layers>(
     session: &mut Session<'_, L>,
     agent: &FieldSocket,
     sender: &FieldSocket,
     stop: &dyn Fn() -> bool,
     tick: Duration,
-    on_end: &mut dyn FnMut(ConnEnded),
+    on_event: &mut dyn FnMut(ServeEvent<'_>),
 ) -> io::Result<()> {
     use std::collections::BTreeMap;
     use std::sync::mpsc;
@@ -910,7 +930,18 @@ pub fn serve_vessel<L: Layers>(
                     let Some((conn, _)) = conns.get_mut(&id) else {
                         continue;
                     };
+                    let name = request_name(&req);
                     let r = session.handle_as(conn, req);
+                    if let Reply::Error {
+                        code: ErrorCode::Fenced,
+                        message,
+                    } = &r
+                    {
+                        on_event(ServeEvent::Fenced {
+                            request: name,
+                            message,
+                        });
+                    }
                     let _ = reply.send(r);
                     // The reply is on its way: now publish the Seal it
                     // announced.
@@ -918,10 +949,10 @@ pub fn serve_vessel<L: Layers>(
                 }
                 Ok(Msg::End { id, ended }) => {
                     if let Some((conn, _)) = conns.remove(&id) {
-                        on_end(ConnEnded {
+                        on_event(ServeEvent::Ended(ConnEnded {
                             socket: conn.socket,
                             ended,
-                        });
+                        }));
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2373,12 +2404,77 @@ mod tests {
                 &sender,
                 &|| done.load(Ordering::SeqCst),
                 Duration::from_millis(5),
-                &mut |c| ends.push(c.socket),
+                &mut |e| {
+                    if let ServeEvent::Ended(c) = e {
+                        ends.push(c.socket)
+                    }
+                },
             )
             .unwrap();
         });
         ends.sort_by_key(|s| *s == Socket::Sender);
         assert_eq!(ends, [Socket::Agent, Socket::Sender]);
+    }
+
+    /// E3-4 (taso-test 2026-10-29): a Warden whose Vessel another Warden
+    /// took over refuses the agent's request `Fenced`, and `serve_vessel`
+    /// reports it as a `Fenced` event, so the Warden's own log says so too.
+    #[test]
+    fn a_request_refused_as_fenced_is_reported() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        // Another Warden takes the Vessel over: this one's epoch is fenced.
+        e.host
+            .coord
+            .transfer(v.id(), taso_core::model::WardenId::new(2))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = FieldSocket::bind(dir.path().join("agent.sock")).unwrap();
+        let sender = FieldSocket::bind(dir.path().join("sender.sock")).unwrap();
+        let done = AtomicBool::new(false);
+        let mut fenced = Vec::new();
+        std::thread::scope(|scope| {
+            let a = agent.path().to_path_buf();
+            let done = &done;
+            scope.spawn(move || {
+                let mut ag = UnixStream::connect(&a).unwrap();
+                send_request(&mut ag, &hello()).unwrap();
+                assert!(matches!(
+                    recv_reply(&mut ag).unwrap().unwrap(),
+                    Reply::Hello { .. }
+                ));
+                send_request(
+                    &mut ag,
+                    &Request::TurnEnd {
+                        turn: 1,
+                        quiescent: true,
+                    },
+                )
+                .unwrap();
+                let r = recv_reply(&mut ag).unwrap().unwrap();
+                assert!(is_error(&r, ErrorCode::Fenced), "{r:?}");
+                drop(ag);
+                done.store(true, Ordering::SeqCst);
+            });
+            let mut session = Session::new(&mut v, Verdict::Clean).unwrap();
+            serve_vessel(
+                &mut session,
+                &agent,
+                &sender,
+                &|| done.load(Ordering::SeqCst),
+                Duration::from_millis(5),
+                &mut |ev| {
+                    if let ServeEvent::Fenced { request, message } = ev {
+                        fenced.push(format!("{request}: {message}"));
+                    }
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(fenced.len(), 1, "{fenced:?}");
+        assert!(fenced[0].starts_with("TurnEnd: "), "{fenced:?}");
     }
 
     /// Review finding 2: who may write an outcome is a trust boundary.  The

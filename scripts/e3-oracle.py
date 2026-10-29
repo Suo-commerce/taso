@@ -257,10 +257,11 @@ def check(r, a):
         else:
             if th.get("acks", 0):
                 fails.append(f"F: after its takeover the old Warden acknowledged {th['acks']} op(s): {th.get('replies')}")
-            if not th.get("fenced") and not told:
-                fails.append(f"F: the old Warden names no refusal (stale epoch) after it woke, to its agent or in its log; its replies: {th.get('replies')}")
-            elif not th.get("fenced"):
-                notes.append("F: the refusal named to the agent only; the old Warden's own log is silent")
+            # Both: the agent in its reply, the operator in the Warden's own log (Jarmo, 2026-10-29: (a)).
+            if not told:
+                fails.append(f"F: the old Warden's replies to its agent name no refusal (stale epoch) after it woke: {th.get('replies')}")
+            if not th.get("fenced"):
+                fails.append("F: the old Warden's own log does not say it was fenced (the agent was told; the operator is not)")
         # H: the store after the old Warden's late writes (§0.4, §11.3).
         pk = t.get("packs") or {}
         if pk.get("added"):
@@ -388,7 +389,7 @@ def selftest():
     LOST = "v: reborn at epoch 2 from anchor lsn 5, records 6..=9 lost\n"
     def TK(shipped=9, acks=0, fenced="chronicle: Fenced", added=(), changed=(), gone=(), c=None, child=None):
         return {"owner": {"holder": 1, "epoch": 1}, "shipped_lsn": shipped, "child": child,
-                "thaw": {"acks": acks, "replies": ["seal: {}", "effect: {}"], "fenced": fenced},
+                "thaw": {"acks": acks, "replies": ['seal: {"error":"the Warden refused: Fenced: chronicle fenced: warden 1 is not the holder (holder is 2)"}'], "fenced": fenced},
                 "packs": {"added": list(added), "changed": list(changed), "gone": list(gone)},
                 "after_thaw": c if c is not None else {"seals": [S(9, {"1": 8})], "opened": True}}
     def tkr(steps, inflight=None):
@@ -401,8 +402,10 @@ def selftest():
         ("tk fail: acknowledged, not shipped, absent, unnamed", {"seals": [], "report": REB, "resume_turn": 0, "opened": True}, TK(shipped=5, c={"seals": [], "opened": True}), 1),
         ("tk fail F: the old Warden acknowledged after its takeover", B9, TK(acks=1), 1),
         ("tk fail F: the old Warden's refusal not named", B9, TK(fenced=None), 1),
-        ("tk pass F: the refusal named to the agent only (a note)", B9,
-         dict(TK(fenced=None), thaw={"acks": 0, "fenced": None, "replies": ['seal: {"error":"the Warden refused: Fenced: chronicle: append refused, chronicle fenced: warden 1 is not the holder (holder is 2)"}']}), 0),
+        ("tk fail F: named to the agent only, the old Warden's log silent", B9,
+         dict(TK(fenced=None), thaw={"acks": 0, "fenced": None, "replies": ['seal: {"error":"the Warden refused: Fenced: chronicle: append refused, chronicle fenced: warden 1 is not the holder (holder is 2)"}']}), 1),
+        ("tk fail F: in the log, the agent not told", B9,
+         dict(TK(), thaw={"acks": 0, "fenced": "v: fenced: TurnEnd refused", "replies": ['seal: {"error":"internal"}']}), 1),
         ("tk: B never took over -- F not graded, line 5 fails alone", dict(B9, opened=False, not_run="refused"), TK(acks=2, fenced=None), 1),
         ("tk pass H2: a pack no record names (a note)", B9, TK(added=["./v/pack/12-5-0"]), 0),
         ("tk fail H3: a named pack's bytes changed", B9, TK(changed=["./v/pack/9-5-9"]), 1),

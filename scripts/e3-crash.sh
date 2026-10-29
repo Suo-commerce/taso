@@ -475,7 +475,8 @@ takeover_tail() { # E3-4, the rest of a takeover round from the point on; round'
             fi
         done
     fi
-    fenced=$(grep -m1 -hoE '.{0,80}(Fenced|StaleEpoch|stale epoch|EpochMismatch|NotHolder).{0,80}' "$R/warden-1.err" "$R/warden-1.out" 2>/dev/null || true)
+    # The Warden's own line when fenced (decided 2026-10-29, (a)): "<vessel>: fenced: <request> refused, ...".
+    fenced=$(grep -m1 -hoE '.{0,80}(: fenced: |Fenced|StaleEpoch|stale epoch|EpochMismatch|NotHolder|not the holder).{0,80}' "$R/warden-1.err" "$R/warden-1.out" 2>/dev/null || true)
     printf '%s\n' "${thaw[@]}" >"$R/thaw.txt"
     node_down "$SOCK" "$MNT/e3" "$RUN/run/runc" "$WARDEN_PID" || echo "A's taso-blkd did not quit" >>"$R/harness.err"
     WARDEN_PID=; kill -9 "$BLKD_PID" 2>/dev/null; wait "$BLKD_PID" 2>/dev/null; BLKD_PID=

@@ -145,7 +145,7 @@ use crate::chronicle::Layers;
 use crate::chronicle::{Claim, LayerError, Recovery};
 use crate::coordinator::{Coord, CoordError};
 use crate::effects::{Effects, Mode};
-use crate::field::{serve_vessel, AfterSeal, Branches, FieldSocket, Session};
+use crate::field::{serve_vessel, AfterSeal, Branches, FieldSocket, ServeEvent, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
 use crate::rebirth::Reborn;
@@ -4478,8 +4478,8 @@ impl Node {
         };
         // Verification attempts run on their own threads within this scope
         // (D68); their records go through the session's thread.
-        let (failures, last) =
-            std::thread::scope(|scope| -> Result<(u64, Option<String>), DaemonError> {
+        let (failures, last) = std::thread::scope(
+            |scope| -> Result<(u64, Option<String>), DaemonError> {
                 let verif =
                     std::cell::RefCell::new(Verifications::new(scope, self, vc.subject.clone()));
                 let mut branches = NodeBranches {
@@ -4514,12 +4514,21 @@ impl Node {
                     &sender,
                     &stop,
                     Duration::from_millis(20),
-                    &mut |c| {
-                        connections += 1;
-                        self.log(
+                    &mut |e| match e {
+                        ServeEvent::Ended(c) => {
+                            connections += 1;
+                            self.log(
+                                vc,
+                                format_args!("{:?} connection ended: {:?}", c.socket, c.ended),
+                            );
+                        }
+                        // The agent is told in its reply; the operator learns it here.
+                        ServeEvent::Fenced { request, message } => self.log(
                             vc,
-                            format_args!("{:?} connection ended: {:?}", c.socket, c.ended),
-                        );
+                            format_args!(
+                                "fenced: {request} refused, another Warden holds this Vessel now: {message}"
+                            ),
+                        ),
                     },
                 )
                 .map_err(io("serving the sockets"))?;
@@ -4534,7 +4543,8 @@ impl Node {
                 // before the run returns.
                 verif.borrow_mut().drain(&mut vessel);
                 Ok((failures, last))
-            })?;
+            },
+        )?;
         if failures > 0 {
             self.log(
                 vc,
