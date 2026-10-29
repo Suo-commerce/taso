@@ -483,7 +483,7 @@ impl fmt::Display for VesselError {
             Self::CrossNamespace => write!(f, "succession across namespaces was not allowed"),
             Self::EmptyAuthority => write!(f, "succession needs an actor and a reason"),
             Self::SelfSuccession => write!(f, "a vessel cannot succeed itself"),
-            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap, FsShipped, Checkpoint, Promotion and contract records are reserved"),
+            Self::ReservedPayload => write!(f, "Lineage, Succession, Gap, FsShipped, Checkpoint, Promotion and contract records are reserved for the Warden"),
             Self::NotThisSeal(why) => write!(f, "not a Seal of this vessel: {why}"),
             Self::NothingShipped(id) => write!(f, "nothing of vessel {} is shipped and anchored", hex(id)),
             Self::ParentMissing(p) => write!(
@@ -1598,25 +1598,15 @@ impl<L: Layers> Vessel<L> {
         self.chronicle.set_roll_at(bytes);
     }
 
-    /// Append a record.  Lineage, Succession, Gap, FsShipped and Checkpoint
-    /// records are refused: only the Warden writes them, each at its own
-    /// step.
+    /// Append a record.  A reserved record ([`Payload::is_reserved`]) is
+    /// refused: only the Warden writes those, each at its own step.
     pub fn append(
         &mut self,
         stream: Stream,
         payload: Payload,
     ) -> Result<ChronicleHead, VesselError> {
         self.writable()?;
-        if matches!(
-            payload,
-            Payload::Lineage(_)
-                | Payload::Succession(_)
-                | Payload::Gap(_)
-                | Payload::FsShipped(_)
-                | Payload::Checkpoint(_)
-                | Payload::Promotion(_)
-                | Payload::Contract(_)
-        ) {
+        if payload.is_reserved() {
             return Err(VesselError::ReservedPayload);
         }
         Ok(self.chronicle.append(stream, payload)?)
@@ -1647,18 +1637,7 @@ impl<L: Layers> Vessel<L> {
         records: Vec<(Stream, Payload)>,
     ) -> Result<ChronicleHead, VesselError> {
         self.writable()?;
-        if records.iter().any(|(_, p)| {
-            matches!(
-                p,
-                Payload::Lineage(_)
-                    | Payload::Succession(_)
-                    | Payload::Gap(_)
-                    | Payload::FsShipped(_)
-                    | Payload::Checkpoint(_)
-                    | Payload::Promotion(_)
-                    | Payload::Contract(_)
-            )
-        }) {
+        if records.iter().any(|(_, p)| p.is_reserved()) {
             return Err(VesselError::ReservedPayload);
         }
         Ok(self.chronicle.append_batch(records)?)

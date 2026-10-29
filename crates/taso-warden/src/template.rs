@@ -789,7 +789,9 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
     }
 }
 
-/// §4.1.7: the walk equals the manifest entry for entry.
+/// §4.1.7: the walk equals the manifest entry for entry (reserved entries
+/// are verified by the walk itself, not listed).  The one comparison
+/// Template, attempt and genesis share.
 pub(crate) fn same_entries(walked: &Manifest, want: &Manifest) -> bool {
     walked.complete() && walked.unsupported.is_empty() && walked.entries == want.entries
 }

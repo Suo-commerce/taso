@@ -114,6 +114,7 @@ use crate::pack::{PackError, Packs};
 use crate::segment::Position;
 use crate::ship::{ByteStream, Sender, SharedStore};
 use crate::submit::{self, SubmitError};
+use crate::template::same_entries;
 use crate::vessel::Pool;
 use crate::zfs::Dataset;
 
@@ -999,12 +1000,6 @@ pub fn judge(m: &Manifest, hook_waived: bool) -> Option<WalkRefusal> {
     }
     debug_assert!(m.entries.iter().all(|e| e.class != PathClass::Structural));
     None
-}
-
-/// §4.1.7: the output walk equals the output manifest entry for entry
-/// (reserved entries are verified by the walk itself, not listed).
-fn same_entries(walked: &Manifest, output: &Manifest) -> bool {
-    walked.complete() && walked.unsupported.is_empty() && walked.entries == output.entries
 }
 
 /// The synthetic Seal hash of the scratch's layer.

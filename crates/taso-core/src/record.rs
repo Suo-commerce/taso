@@ -972,6 +972,26 @@ pub enum Payload {
     Contract(Box<ContractRecord>),
 }
 
+impl Payload {
+    /// Whether the Warden alone writes this kind of record.  An agent's
+    /// append of one is refused: Lineage, Succession, Gap, FsShipped,
+    /// Checkpoint, Promotion and contract records describe the
+    /// Chronicle's own structure and the coordinator's decisions, not the
+    /// agent's work.  The one list every enforcement point uses.
+    pub fn is_reserved(&self) -> bool {
+        matches!(
+            self,
+            Self::Lineage(_)
+                | Self::Succession(_)
+                | Self::Gap(_)
+                | Self::FsShipped(_)
+                | Self::Checkpoint(_)
+                | Self::Promotion(_)
+                | Self::Contract(_)
+        )
+    }
+}
+
 impl Canonical for Payload {
     fn canon(&self, out: &mut Canon) {
         match self {
