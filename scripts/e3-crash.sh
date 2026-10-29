@@ -303,6 +303,10 @@ cfg.update(o)
 if takeover:
     cfg["vessels"][0]["takeover"] = takeover
 if child:   # after its parent: parent before child (P3 C6)
+    # The node takes the existing child over and forks nothing new, so the parent's
+    # entry reserves no fork slot (a slot both reserved and a Vessel's is refused at
+    # start: "fork slot 2 is also <child>'s", taso-test 2026-10-29).
+    cfg["vessels"][0].pop("forks", None)
     cfg["vessels"].append({"namespace": "e3" * 16, "subject": child["subject"], "uid_slot": 2,
                            "fork": {"parent": subject, "seal": child["seal"]}, "takeover": child["takeover"]})
 print(json.dumps(cfg, indent=1))
@@ -391,7 +395,7 @@ import json, os, sys
 subject, out, err = sys.argv[1:4]
 lines = lambda f: open(f, errors="replace").read().splitlines() if os.path.exists(f) else []
 said = next((l[len(subject) + 2:] for l in lines(out) if l.startswith(subject + ": ")), None) \
-    or next((l for l in lines(err) if l.startswith("taso-wardend: starting:")), None)
+    or next((l for l in lines(err) if l.startswith("taso-wardend:")), None)   # e.g. "taso-wardend: <config>: config: ..."
 report = "".join(open(f, errors="replace").read() for f in sys.argv[3:] if os.path.exists(f))
 print(json.dumps({"seals": [], "forks": [], "report": report, "resume_turn": None,
                   "resume_why": "the Warden named no dataset for the Vessel", "acks_after_error": 0,
