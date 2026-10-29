@@ -372,15 +372,29 @@ impl Compaction {
         };
         let old = std::mem::replace(store, fresh);
         let old_log = OldLog(vec![old.file, self.old.try_clone()?]);
-        let checkpoint = sync_dir(&self.log).is_ok()
-            && std::fs::rename(ckpt_path(&self.temp), ckpt_path(&self.log)).is_ok();
+        // The rename is durable only once the directory is: a failed sync
+        // here is the store's device failing, answered as a failed sync is
+        // anywhere in the store (poisoned, an error), never `ok` (F3,
+        // 2026-10-28: E3 hold:compact.written under error answered
+        // `ok ... checkpoint=missing`).  Recovery is correct either way:
+        // the two logs agree.
+        if let Err(e) = sync_dir(&self.log) {
+            let _ = remove_if_there(&ckpt_path(&self.log));
+            let _ = remove_if_there(&ckpt_path(&self.temp));
+            store.poison();
+            return Err(StoreError::Io(e));
+        }
+        let checkpoint = std::fs::rename(ckpt_path(&self.temp), ckpt_path(&self.log)).is_ok();
         if !checkpoint {
             // The old log's checkpoint would not check out against the new
             // log anyway; take it away rather than leave it.
             let _ = remove_if_there(&ckpt_path(&self.log));
             let _ = remove_if_there(&ckpt_path(&self.temp));
         }
-        let _ = sync_dir(&self.log);
+        if let Err(e) = sync_dir(&self.log) {
+            store.poison();
+            return Err(StoreError::Io(e));
+        }
         Ok(Compacted {
             before,
             after: store.tail,

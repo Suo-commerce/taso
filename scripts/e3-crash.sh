@@ -4,7 +4,9 @@
 #
 #   sudo scripts/e3-crash.sh list  [--subset]                 the manifest and its count; runs nothing
 #   sudo scripts/e3-crash.sh round "SEQ" POINT MODE           one round, e.g. round "write seal" boundary:2 drop
-#   sudo scripts/e3-crash.sh run   [--subset] [--limit N]     every round of the manifest, results tee'd
+#   sudo scripts/e3-crash.sh run   [--subset] [--only KIND] [--limit N]
+#                                                            every round of the manifest (or of one point
+#                                                            kind: boundary, timing, hold), results tee'd
 #
 # From the repository root, as root, on a host E3-1's `check` passes on.
 #
@@ -31,8 +33,13 @@
 #
 # Points: boundary:k (after op k's reply, before op k+1; k = the length is
 # after the last op); timing:k+D (op k sent, the swap D ms later, on `seal`
-# only; MISSED, never covered, if the reply was already there).  Holds
-# inside one operation (TASO_E3_HOLD) are E3-3c, not this file.
+# only; MISSED, never covered, if the reply was already there);
+# hold:NAME (E3-3c: the first stack starts with TASO_E3_HOLD=NAME; the
+# harness arms the hold just before the last op, or before a `compact`
+# sent to taso-blkd after the last op for compact.written, sends it without
+# waiting, and cuts when the process says it is held there, so the point
+# is exact and never MISSED; the reborn stack runs without the hold; under
+# error the hold is released after the swap, so the held op meets the error).
 #
 # The model's preconditions (P5-18, C7/M7): at most one fork and one
 # promote; a promote needs a fork before it and no parent `seal` between
@@ -106,6 +113,12 @@ for n in (2, 3):
                     print(f"{s}|timing:{k}+{d}|drop")
         if n == 2 or not subset:
             print(f"{s}|boundary:{n}|error")
+# E3-3c: one round per hold site and mode, the shortest sequence reaching it
+for name, s in (("seal.recorded", "write seal"), ("seal.shipped", "write seal"),
+                ("ledger.shipped", "write effect"), ("fork.branched", "write seal fork"),
+                ("compact.written", "write seal")):
+    for mode in ("drop", "error"):
+        print(f"{s}|hold:{name}|{mode}")
 PY
 }
 
@@ -207,6 +220,11 @@ reply() { # reply PID SECONDS -> REPLY, the reply to the last op sent; fails (WH
     return 1
 }
 step() { REPLY=; WHY="the op file could not be written"; send "$1" "$2" && reply "$1" "${3:-120}"; }   # -> REPLY
+held() { # held NAME SECONDS: the process reached the armed hold NAME (its marker is there)
+    local deadline=$((SECONDS + $2))
+    while ((SECONDS < deadline)); do [[ -f "$RUN/hold/$1.held" ]] && return 0; sleep 0.01; done
+    return 1
+}
 
 teardown() { # every piece of a round, guarded
     set +e
@@ -222,7 +240,7 @@ teardown() { # every piece of a round, guarded
     for l in $(losetup -j "$WORK/rebirth.img" 2>/dev/null | cut -d: -f1; losetup -a 2>/dev/null | grep -F "$WORK/" | cut -d: -f1); do losetup -d "$l" 2>/dev/null; done
     dmsetup info "$DEVNAME" >/dev/null 2>&1 && "$DEVSH" down "$DEVNAME" >/dev/null 2>&1
     rm -f "$WORK/dev.img" "$WORK/rebirth.img" "$SOCK"
-    rm -rf "$RUN/run" "$RUN/read"
+    rm -rf "$RUN/run" "$RUN/read" "$RUN/hold"
     KNOWN=" "
     set -e
 }
@@ -245,24 +263,32 @@ print(json.dumps({
 }, indent=1))
 PY
 }
-start_stack() { # start_stack TAG: taso-blkd and the Warden on $D; logs $R/*-TAG.err
+start_stack() { # start_stack TAG [VAR=VALUE ...]: taso-blkd and the Warden on $D, with the env given; logs $R/*-TAG.err
     # A killed taso-blkd leaves its socket file; the Warden must wait for the
     # new one to *answer*, not for the file (taso-test 2026-10-28: six rounds
     # lost that race, "taso-blkd socket: Connection refused").
     rm -f "$SOCK"
-    "$BIN/taso-blkd" "$D/blk.log" "$SOCK" 2>>"$R/blkd-$1.err" & BLKD_PID=$!
+    env "${@:2}" "$BIN/taso-blkd" "$D/blk.log" "$SOCK" 2>>"$R/blkd-$1.err" & BLKD_PID=$!
     local i; for i in $(seq 600); do blk_raw stats >/dev/null 2>&1 && break; sleep 0.1; done
     blk_raw stats >/dev/null 2>&1 || return 1
-    "$BIN/taso-wardend" "$RUN/w.json" >"$R/warden-$1.out" 2>"$R/warden-$1.err" & WARDEN_PID=$!
+    env "${@:2}" "$BIN/taso-wardend" "$RUN/w.json" >"$R/warden-$1.out" 2>"$R/warden-$1.err" & WARDEN_PID=$!
 }
 
 # ── one round ─────────────────────────────────────────────────────────
 round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's files in $R
     local seq=$1 point=$2 mode=$3 subject O="$R/r.json"
     subject="e3-$(date +%s%N | tail -c 9)"
-    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 ct cr
-    k=${at%%+*}; [[ "$at" == *+* ]] && delay=${at#*+}
-    local -a ops; read -ra ops <<<"$seq"
+    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 ct cr hname="" held_flag=""
+    local -a ops henv=(); read -ra ops <<<"$seq"
+    if [[ "$kind" == hold ]]; then
+        # The held op is the last one; compact.written holds a `compact` sent after it.
+        hname=$at; k=${#ops[@]}; [[ "$hname" == compact.written ]] && k=$((k + 1))
+        held_flag="--held $hname"
+        rm -rf "$RUN/hold"; mkdir -p "$RUN/hold"
+        henv=("TASO_E3_HOLD=$hname" "TASO_E3_HOLD_DIR=$RUN/hold")
+    else
+        k=${at%%+*}; [[ "$at" == *+* ]] && delay=${at#*+}
+    fi
     local tag="[$seq] $point $mode"
     oracle new "$O" --sequence "$seq" --point "$point" --mode "$mode" --rows "$ROWS"
     # 1. the device, the stack, the agent
@@ -271,13 +297,34 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
         || { echo "HARNESS $tag: mkfs or mount of the device"; return; }
     mkdir -p "$D/store" "$D/state" "$D/spool" "$RUN/run"
     config "$subject" || { echo "HARNESS $tag: config"; return; }
-    start_stack 1 || { echo "HARNESS $tag: taso-blkd did not start"; return; }
+    start_stack 1 "${henv[@]}" || { echo "HARNESS $tag: taso-blkd did not start"; return; }
     wait_agent 120 || { echo "HARNESS $tag: no agent came up (see $R/warden-1.err)"; return; }; P=$AGENT
     turn=$(( $(ready_turn "$P") + 1 ))
     # 2. the operations, to the point
     local i=0 op
     for op in "${ops[@]}"; do
         i=$((i + 1))
+        if [[ "$kind" == hold && $i == "$k" ]]; then
+            # Arm, send without waiting, cut once held.  The oracle hears the
+            # request as for any op; a reply already there (seal.shipped: the
+            # publish runs after the reply) is heard as its acknowledgement.
+            case "$op" in
+                write|seal) oracle requested "$O" "$op" turn="$turn" ;;
+                *) oracle requested "$O" "$op" ;;
+            esac
+            : >"$RUN/hold/$hname.arm"
+            send "$P" "$op" || { echo "HARNESS $tag: the op file could not be written"; return; }
+            held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached"; return; }
+            if [[ -f /proc/$P/root/tmp/e3/reply.${NEXT[$P]} ]]; then
+                reply "$P" 5 || { echo "HARNESS $tag: the reply vanished: $WHY"; return; }; rep=$REPLY
+                if [[ "$op" == seal && -n "$(jget "$rep" sealed)" ]]; then
+                    oracle acknowledged "$O" seal turn="$(jget "$rep" turn)" seal="$(jget "$rep" sealed)"
+                else
+                    echo "HARNESS $tag: $op replied before its hold was reached: $rep"; return
+                fi
+            fi
+            break
+        fi
         if [[ "$kind" == timing && $i == "$k" ]]; then
             oracle requested "$O" "$op" turn="$turn"
             send "$P" "$op"; sleep "$(python3 -I -c "print($delay / 1000)")"
@@ -333,10 +380,35 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
         esac
         [[ "$kind" == boundary && $i == "$k" ]] && break
     done
+    if [[ "$hname" == compact.written ]]; then
+        # taso-blkd's compaction, held before its rename; the client waits until the kill closes it.
+        : >"$RUN/hold/$hname.arm"
+        blk_raw compact >"$R/compact.out" 2>&1 &
+        held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached (compact said: $(cat "$R/compact.out"))"; return; }
+    fi
     # 3. the point
     local t0; t0=$(date +%s%N); "$DEVSH" "$mode" "$DEVNAME" >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
-    oracle cut "$O" --swap-ms "$ms" $missed
-    if [[ "$mode" == error ]]; then   # provoke the error, bounded; count what was acknowledged after it
+    # shellcheck disable=SC2086
+    oracle cut "$O" --swap-ms "$ms" $missed $held_flag
+    # At a hold under error: release it, so the held op runs on into the
+    # failing device; its answer, if one comes, counts as any other
+    # acknowledgement after the error (bounded, 10 s).
+    if [[ "$mode" == error && "$kind" == hold ]]; then
+        REPLY=; : >"$RUN/hold/$hname.release"
+        if [[ "$hname" == compact.written ]]; then
+            local w; for w in $(seq 100); do [[ -s "$R/compact.out" ]] && break; sleep 0.1; done
+            [[ "$(cat "$R/compact.out" 2>/dev/null)" == ok* ]] && acks_err=$((acks_err + 1))
+        elif [[ "$hname" != seal.shipped ]] && reply "$P" 10; then   # seal.shipped: its reply came before the hold
+            case "${ops[-1]}" in
+                seal) [[ -n "$(jget "$REPLY" sealed)" ]] && acks_err=$((acks_err + 1)) ;;
+                effect) [[ "$(jget "$REPLY" result)" == released ]] && acks_err=$((acks_err + 1)) ;;
+                fork) [[ -n "$(jget "$REPLY" child)" ]] && acks_err=$((acks_err + 1)) ;;
+            esac
+        fi
+        printf '%s\n' "${REPLY:-}" >"$R/held-reply.json"
+    fi
+    # Provoke the error, bounded; count what was acknowledged after it.
+    if [[ "$mode" == error ]]; then
         if step "$P" seal 30 && [[ -n "$(jget "$REPLY" sealed)" ]]; then acks_err=$((acks_err + 1)); fi
         if step "$P" write 10 && [[ -n "$(jget "$REPLY" rows)" ]]; then acks_err=$((acks_err + 1)); fi
     fi
@@ -412,13 +484,22 @@ PY
     local forks report
     forks=$(cat "$R/warden-1.err" "$R/warden-2.err" 2>/dev/null | grep -o "\] $subject-fork-[0-9]*: dataset " | sed 's/^\] //; s/: dataset $//' | sort -u | tr '\n' ' ')
     report="$R/blkd-2.err $R/warden-2.err"; [[ "$5" == error ]] && report="$report $R/blkd-1.err $R/warden-1.err"
+    # Did the reborn Warden open the Vessel?  Its Opened line on stderr says
+    # so; if absent, its own word about the Vessel on stdout says why (a
+    # refusal, a failed open).  Without this a Vessel never reborn was graded
+    # on taso-blkd's layers alone (F2, 2026-10-28).
+    local opened=false not_run=""
+    grep -q " $subject: Opened(" "$R/warden-2.err" 2>/dev/null && opened=true
+    [[ "$opened" == true ]] || not_run=$(grep -m1 "^$subject: " "$R/warden-2.out" 2>/dev/null | cut -c$((${#subject} + 3))- || true)
     # shellcheck disable=SC2086
-    python3 -I - "[${seals%,}]" "$forks" "$3" "$4" $report <<'PY'
+    python3 -I - "[${seals%,}]" "$forks" "$3" "$4" "$opened" "$not_run" $report <<'PY'
 import json, sys
 seals, forks, resume, acks = json.loads(sys.argv[1]), sys.argv[2].split(), sys.argv[3], int(sys.argv[4])
-report = "".join(open(f, errors="replace").read() for f in sys.argv[5:])
+opened, not_run = sys.argv[5] == "true", sys.argv[6]
+report = "".join(open(f, errors="replace").read() for f in sys.argv[7:])
 print(json.dumps({"seals": seals, "forks": forks, "report": report,
-                  "resume_turn": int(resume) if resume else None, "acks_after_error": acks}, indent=1))
+                  "resume_turn": int(resume) if resume else None, "acks_after_error": acks,
+                  "opened": opened, "not_run": not_run or None}, indent=1))
 PY
 }
 
@@ -461,14 +542,16 @@ case "${1:-}" in
         say "one round; results in $OUT"
         run_one 1 "$2" "$3" "$4" ;;
     run)
-        shift; sub=""; limit=0
-        while (($#)); do case "$1" in --subset) sub=--subset ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--limit N]" ;; esac; shift; done
-        total=$(manifest "$sub" | wc -l); n=0
+        shift; sub=""; limit=0; only=""
+        while (($#)); do case "$1" in --subset) sub=--subset ;; --only) only=$2; shift ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--only KIND] [--limit N]" ;; esac; shift; done
+        [[ -z "$only" || "$only" =~ ^(boundary|timing|hold)$ ]] || die "--only boundary|timing|hold"
+        pick() { manifest "$sub" | { if [[ -n "$only" ]]; then grep -F "|$only:" || true; else cat; fi; }; }
+        total=$(pick | wc -l); n=0
         say "$total rounds$( ((limit > 0)) && echo ", the first $limit"); results in $OUT/results.txt"
         while IFS='|' read -r s p m; do
             n=$((n + 1)); ((limit > 0 && n > limit)) && break
             printf '%4d/%d  ' "$n" "$total"; run_one "$n" "$s" "$p" "$m"
-        done < <(manifest "$sub")
+        done < <(pick)
         python3 -I - "$OUT/results.txt" <<'PY'
 import collections, re, sys
 lines = [l for l in open(sys.argv[1]) if l[:1].isupper()]

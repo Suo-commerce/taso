@@ -2643,9 +2643,22 @@ pub fn held_on<H: Holdings>(
                 l.origin.parent().map(|p| *p.chronicle.as_bytes()),
                 matches!(l.origin, Origin::Template { .. }),
             ),
-            // No Lineage yet: a birth stopped after its clone.  A clone of
-            // a Template's layer (`<root>/t-<hex>`) is a Template birth.
-            Ok(None) => (None, is_layer_clone(pool, root, &ds)?),
+            // No Lineage yet: a birth or a fork stopped after its clone.
+            // A clone of a Template's layer (`<root>/t-<hex>`) is a
+            // Template birth; a clone of a Vessel's Seal (`<root>/v-<hex>`)
+            // is that Vessel's interrupted fork, of its lineage: its files
+            // are in the parent's range (F4, 2026-10-28).
+            Ok(None) => {
+                let origin = pool.origin(&ds)?.map(|(o, _)| o);
+                let under = |kind: &str| {
+                    origin
+                        .as_ref()
+                        .and_then(|o| o.as_str().strip_prefix(root.as_str()))
+                        .and_then(|rest| rest.strip_prefix(kind))
+                        .and_then(key_of_hex)
+                };
+                (under("/v-"), under("/t-").is_some())
+            }
             Err(e) => {
                 warnings.push(format!(
                     "{ds}: its local Chronicle's Lineage cannot be read ({e}): taken as no parent"
@@ -2674,17 +2687,6 @@ pub fn held_on<H: Holdings>(
         held.push(Held { key, slots, parent });
     }
     Ok((held, warnings))
-}
-
-/// Whether `ds` is a clone of a Template's layer under `root`, a
-/// dataset named `t-<32 hex>` (P4 §5.6).
-fn is_layer_clone<H: Holdings>(pool: &H, root: &Dataset, ds: &Dataset) -> Result<bool, LayerError> {
-    Ok(pool.origin(ds)?.is_some_and(|(o, _)| {
-        o.as_str()
-            .strip_prefix(root.as_str())
-            .and_then(|rest| rest.strip_prefix("/t-"))
-            .is_some_and(|h| key_of_hex(h).is_some())
-    }))
 }
 
 /// The disk range a fork may inherit, from its top directory's owner
@@ -3749,6 +3751,23 @@ impl Node {
                     Ensured::Born | Ensured::BirthFinished => Verdict::Clean,
                 };
                 self.log(vc, format_args!("{how:?}"));
+                if let Ensured::Opened(r) = &how {
+                    if !r.orphan_layers.is_empty() {
+                        // As PostgreSQL logs its crash recovery: plainly, once.
+                        let at: Vec<String> = r
+                            .orphan_layers
+                            .iter()
+                            .map(|l| l.get().to_string())
+                            .collect();
+                        self.log(
+                            vc,
+                            format_args!(
+                                "orphan Seal layer(s) at lsn {} destroyed: taken, their records never accepted; what they held was never sealed",
+                                at.join(", ")
+                            ),
+                        );
+                    }
+                }
                 (v, verdict)
             }
             Start::Rebirth => {
@@ -5123,6 +5142,56 @@ mod tests {
     /// files count for no slot, as a Template-born Vessel's, because the
     /// dataset is a clone of a layer under the root; a dataset with no
     /// Lineage that is not such a clone counts as before.
+    /// F4: a fork stopped after its clone, before its Lineage record, is
+    /// the interrupted fork of the Vessel whose Seal it was cloned from:
+    /// one lineage with it, so the guard runs the parent (it refused both:
+    /// "uid slot 1 also owns another Vessel's files ... of another lineage").
+    #[test]
+    fn held_on_takes_a_clone_of_a_vessels_seal_without_lineage_as_its_fork() {
+        let state = tempfile::tempdir().unwrap();
+        let root = Dataset::new("t/v").unwrap();
+        let vc = Config::parse(GOOD).unwrap().vessels[0].clone();
+        let p: String = vc
+            .id()
+            .as_bytes()
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect();
+        let c = "cc".repeat(16);
+        let range = 200_000 + vc.uid_slot * ID_RANGE;
+        let vp = Dataset::new(&format!("t/v/v-{p}")).unwrap();
+        let vchild = Dataset::new(&format!("t/v/v-{c}")).unwrap();
+        // The child: cloned from the parent's Seal at lsn 5, files in the
+        // parent's range (option b), no Lineage record (no local Chronicle).
+        let pool = CloneTable(
+            HoldTable(vec![
+                (vp.clone(), vec![0, range]),
+                (vchild.clone(), vec![0, range]),
+            ]),
+            vec![(vchild, (vp, Lsn::new(5)))],
+        );
+        let (held, warnings) = held_on(&pool, &root, 200_000, None, state.path()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let by = |k: &str| {
+            held.iter()
+                .find(|h| h.key == key_of_hex(k).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            by(&c).parent,
+            key_of_hex(&p),
+            "the interrupted fork's parent"
+        );
+        assert_eq!(by(&p).parent, None);
+        let rt = Config::parse(GOOD).unwrap().runtime;
+        let admitted = crate::source::Guard::seeded(rt, held).admit(vec![vc]);
+        assert!(
+            admitted.refused.is_empty(),
+            "one lineage in its slot: the parent runs ({:?})",
+            admitted.refused
+        );
+    }
+
     #[test]
     fn held_on_counts_a_clone_of_a_layer_without_lineage_as_template_born() {
         let state = tempfile::tempdir().unwrap();

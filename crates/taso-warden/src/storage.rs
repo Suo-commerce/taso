@@ -239,6 +239,12 @@ impl Layers for StorageLayers {
             Self::Blk(l) => l.destroy(lsn),
         }
     }
+    fn destroy_orphan(&mut self, lsn: Lsn) -> Result<(), LayerError> {
+        match self {
+            Self::Zfs(l) => l.destroy_orphan(lsn),
+            Self::Blk(l) => l.destroy_orphan(lsn),
+        }
+    }
     fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
         match self {
             Self::Zfs(l) => l.rollback(lsn, hash),

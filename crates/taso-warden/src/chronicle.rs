@@ -149,8 +149,18 @@ pub trait Layers {
     /// Every Seal layer, as `(lsn, record hash)`, in lsn order.
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError>;
     /// Destroy the layer at `lsn`, if it exists.  Used only for orphans:
-    /// layers whose record was never accepted.
+    /// layers whose record was never accepted.  Called while the Vessel
+    /// runs (a Seal whose record failed): must fail fast, never wait on
+    /// what a running agent holds.
     fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError>;
+    /// Destroy the orphan layer at `lsn` at open, with nothing running on
+    /// the layers.  Where the current state stands on the orphan (the block
+    /// log), the store may take it from under the current state, whose own
+    /// changes since were never sealed either (F1, 2026-10-28).  The
+    /// default is [`Layers::destroy`].
+    fn destroy_orphan(&mut self, lsn: Lsn) -> Result<(), LayerError> {
+        self.destroy(lsn)
+    }
     /// Make the current state the layer at `lsn` again, which must be
     /// bound to `hash`: everything written after it is discarded.  Must
     /// refuse, changing nothing, if a later layer exists; never destroys
@@ -682,7 +692,7 @@ impl<L: Layers> Chronicle<L> {
             } else {
                 chronicle
                     .layers
-                    .destroy(lsn)
+                    .destroy_orphan(lsn)
                     .map_err(ChronicleError::Layer)?;
                 orphan_layers.push(lsn);
             }
@@ -837,9 +847,7 @@ impl<L: Layers> Chronicle<L> {
         .map_err(ChronicleError::Layer)?;
         drop(snap);
         if let Err(why) = check() {
-            // Best effort: if this fails, the next recovery destroys the
-            // orphan, whose record does not exist.
-            let _ = self.layers.destroy(lsn);
+            self.drop_orphan(lsn);
             return Err(ChronicleError::CheckFailed(why));
         }
         taso_core::hold("seal.recorded");
@@ -851,12 +859,22 @@ impl<L: Layers> Chronicle<L> {
             }
             Err(e) => {
                 if self.health != Health::Poisoned {
-                    // Best effort: if this fails, the next recovery
-                    // destroys the orphan.
-                    let _ = self.layers.destroy(lsn);
+                    self.drop_orphan(lsn);
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// Destroy the layer of a Seal whose record was not accepted, while the
+    /// Vessel runs.  If that fails (on the block log it always does: the
+    /// state stands on it), stop: a later Seal would stand on the orphan
+    /// and no open could take it away.  The next open destroys it
+    /// ([`Layers::destroy_orphan`]), as PostgreSQL recovers what it could
+    /// not clean up while running (F1, 2026-10-28).
+    fn drop_orphan(&mut self, lsn: Lsn) {
+        if self.layers.destroy(lsn).is_err() {
+            self.health = Health::Poisoned;
         }
     }
 
@@ -1376,6 +1394,9 @@ mod tests {
         fail_after_snapshot: Rc<RefCell<bool>>,
         /// Every rollback, by target lsn.
         rolled_back: Rc<RefCell<Vec<Lsn>>>,
+        /// `destroy` refuses, as the block log's does while the state
+        /// stands on the layer; `destroy_orphan` (at open) still works.
+        refuse_destroy: Rc<RefCell<bool>>,
     }
 
     impl FakeLayers {
@@ -1400,6 +1421,13 @@ mod tests {
             Ok(self.snaps())
         }
         fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
+            if *self.refuse_destroy.borrow() {
+                return Err(format!("layer {} has layers on top of it", lsn.get()).into());
+            }
+            self.snaps.borrow_mut().remove(&lsn);
+            Ok(())
+        }
+        fn destroy_orphan(&mut self, lsn: Lsn) -> Result<(), LayerError> {
             self.snaps.borrow_mut().remove(&lsn);
             Ok(())
         }
@@ -2405,6 +2433,32 @@ mod tests {
         assert_eq!(c.tail(), tail);
         assert!(!c.is_fenced());
         seal(&mut c, 2).unwrap();
+    }
+
+    /// F1, 2026-10-28: when the orphan of a failed Seal cannot be destroyed
+    /// while the Vessel runs (the block log: the state stands on it), the
+    /// Chronicle stops rather than seal on top of it, and the next open
+    /// destroys it.
+    #[test]
+    fn an_orphan_that_cannot_go_while_running_stops_the_chronicle_and_goes_at_open() {
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        *e.layers.refuse_destroy.borrow_mut() = true;
+        let r = c.seal_checked(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(1), || {
+            Err("wal moved".into())
+        });
+        assert!(matches!(r, Err(ChronicleError::CheckFailed(_))));
+        assert_eq!(e.layers.snaps().len(), 1, "the orphan is still there");
+        assert!(
+            matches!(seal(&mut c, 2), Err(ChronicleError::Poisoned)),
+            "no Seal on top of the orphan"
+        );
+        drop(c);
+        let (mut c, r) = e.open(A);
+        assert_eq!(r.orphan_layers.len(), 1, "the open destroyed it");
+        assert!(e.layers.snaps().is_empty());
+        seal(&mut c, 3).unwrap();
     }
 
     /// A layer whose lsn is accepted but holds another record (a refused

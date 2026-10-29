@@ -2,7 +2,7 @@
 //!
 //! Every change to a device is a **record** appended to one file: block
 //! data (`Write`), TRIM (`Discard`), and the map operations (`RootSeal`,
-//! `Fork`, `Seal`, `DropBranch`, `DropSeal`).  A `Flush` record ends a
+//! `Fork`, `Seal`, `DropBranch`, `DropSeal`, `Reset`, `Unseal`).  A `Flush` record ends a
 //! **group**.  A map location ([`Loc::Log`]) is the byte offset of a
 //! block's data inside its `Write` record, so the log is the only copy.
 //!
@@ -155,7 +155,10 @@ const K_DATA: u8 = 11;
 /// A piece of a compacted log's base state (map, tags, names, sequence
 /// number), in checkpoint encoding; the pieces of the first group joined.
 const K_BASE: u8 = 12;
-const K_LAST: u8 = K_BASE;
+/// A branch moved down past the Seal it alone stood on (an orphan, F1,
+/// 2026-10-28).  A log with one is refused by a store older than this kind.
+const K_UNSEAL: u8 = 13;
+const K_LAST: u8 = K_UNSEAL;
 
 const CKPT_MAGIC: &[u8; 8] = b"TASOCKP1";
 
@@ -779,6 +782,25 @@ impl Store {
         Ok(freed.len() as u64)
     }
 
+    /// Take away the Seal `branch` stands on, which nothing else stands on,
+    /// and stand the branch on that Seal's parent with nothing of its own
+    /// ([`Map::unseal`]).  For a Seal whose record was never accepted (an
+    /// orphan): the branch stood on it since it was taken, so it could not
+    /// be dropped.  The branch keeps its id, its name and its other Seals.
+    /// Durable at the next flush; a mounted file system on the branch must
+    /// be unmounted first.  Returns how many blocks became garbage.
+    pub fn unseal(&mut self, branch: LayerId) -> Result<u64, StoreError> {
+        self.check()?;
+        let seal = self.map.parent(branch)?;
+        let freed = self.map.unseal(branch)?;
+        if let Some(seal) = seal {
+            self.meta.seals.remove(&seal);
+        }
+        self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
+        self.append(K_UNSEAL, &branch.get().to_le_bytes())?;
+        Ok(freed.len() as u64)
+    }
+
     /// Flush, then write a checkpoint of this durable point next to the
     /// log (`<log>.ckpt`, replaced atomically), so the next [`Store::open`]
     /// replays only what comes after it.  Returns its sequence number.
@@ -1233,6 +1255,15 @@ fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError
         K_RESET => {
             need(8)?;
             map.reset(layer(0)).map_err(bad)?.len() as u64
+        }
+        K_UNSEAL => {
+            need(8)?;
+            let seal = map.parent(layer(0)).map_err(bad)?;
+            let freed = map.unseal(layer(0)).map_err(bad)?.len() as u64;
+            if let Some(seal) = seal {
+                meta.seals.remove(&seal);
+            }
+            freed
         }
         K_NAME => {
             let meta_err = |reason| StoreError::ReplayMeta { lsn: p.lsn, reason };
@@ -2125,6 +2156,51 @@ mod tests {
         );
         assert_eq!((s.find("tank/v-a"), s.seals_of(a)), (Some(a), vec![s1]));
         assert_eq!(s.map().parent(a).unwrap(), Some(s1));
+    }
+
+    #[test]
+    fn an_unsealed_branch_stands_below_its_orphan_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (a, s1, orphan);
+        {
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            a = s.fork(root).unwrap();
+            s.name(a, "tank/v-a").unwrap();
+            s.write(a, 0, &blocks(1, 2), false).unwrap();
+            s1 = s.seal_tagged(a, b"t1").unwrap();
+            s.write(a, 0, &blocks(2, 1), false).unwrap();
+            orphan = s.seal_tagged(a, b"t2").unwrap(); // its record never accepted
+            s.write(a, 5, &blocks(3, 1), false).unwrap();
+            assert!(matches!(
+                s.drop_seal(orphan),
+                Err(StoreError::Map(MapError::HasChildren(_)))
+            ));
+            let g = s.stats().garbage_bytes;
+            assert_eq!(
+                s.unseal(a).unwrap(),
+                2,
+                "the orphan's block and the branch's"
+            );
+            assert_eq!(s.stats().garbage_bytes, g + 2 * BLOCK);
+            assert_eq!(
+                (read1(&s, a, 0), read1(&s, a, 1), read1(&s, a, 5)),
+                (1, 1, 0),
+                "reads as s1"
+            );
+            assert_eq!(s.seals_of(a), vec![s1], "the orphan is no Seal of it");
+            s.flush().unwrap();
+        }
+        let (s, _) = Store::open(&path).unwrap();
+        assert_eq!(
+            (read1(&s, a, 0), read1(&s, a, 5)),
+            (1, 0),
+            "the unseal survives a reopen"
+        );
+        assert_eq!((s.find("tank/v-a"), s.seals_of(a)), (Some(a), vec![s1]));
+        assert_eq!(s.map().parent(a).unwrap(), Some(s1));
+        assert!(s.map().kind(orphan).is_err());
     }
 
     /// Every block `0..span` of `layer`, one byte each (blocks are filled

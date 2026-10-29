@@ -176,6 +176,16 @@ impl Client {
             .map_err(|_| ClientError::Protocol(format!("reset answered {a:?}")))
     }
 
+    /// Take away the Seal `branch` alone stands on (an orphan: taken, its
+    /// record never accepted), standing the branch on that Seal's parent
+    /// with nothing of its own.  The branch must be detached.  Returns the
+    /// blocks that became garbage.
+    pub fn unseal(&mut self, branch: LayerId) -> Result<u64> {
+        let a = self.call(&["unseal", &branch.to_string()])?;
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("unseal answered {a:?}")))
+    }
+
     /// Write Seal `to` as a stream into the new file `path` (absolute;
     /// must not exist), incremental from the Seal `from` below it, or full.
     /// Returns the blocks written.

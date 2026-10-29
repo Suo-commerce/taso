@@ -99,6 +99,9 @@ pub enum MapError {
     NotASeal(LayerId),
     /// The Seal still has branches or Seals on top of it.
     HasChildren(LayerId),
+    /// The Seal is a root Seal: a branch must stand on a Seal, so it cannot
+    /// be taken from under one.
+    Root(LayerId),
     /// A block range runs past the end of the address space.
     Overflow,
 }
@@ -110,6 +113,7 @@ impl fmt::Display for MapError {
             Self::NotABranch(l) => write!(f, "{l} is a Seal; Seals never change"),
             Self::NotASeal(l) => write!(f, "{l} is a branch; fork from a Seal"),
             Self::HasChildren(l) => write!(f, "{l} still has layers on top of it"),
+            Self::Root(l) => write!(f, "{l} is a root Seal; a branch cannot stand below it"),
             Self::Overflow => write!(f, "block range overflows"),
         }
     }
@@ -276,6 +280,39 @@ impl Map {
                 Loc::Zero => None,
             })
             .collect())
+    }
+
+    /// Take away the Seal `branch` stands on, which nothing else stands on:
+    /// the branch drops every block it holds and stands on that Seal's
+    /// parent, so it reads exactly as that parent.  For a Seal whose record
+    /// was never accepted (an orphan): the branch stood on it since it was
+    /// taken, so it could not be dropped.  Returns the branch's and the
+    /// Seal's own log locations, now garbage.
+    pub fn unseal(&mut self, branch: LayerId) -> Result<Vec<u64>, MapError> {
+        let seal = self
+            .branch_mut(branch)?
+            .parent
+            .expect("a branch stands on a Seal");
+        let s = self.layer(seal)?;
+        if s.children > 1 {
+            return Err(MapError::HasChildren(seal));
+        }
+        let (Some(below), depth) = (s.parent, s.depth) else {
+            return Err(MapError::Root(seal));
+        };
+        let mut garbage = self.reset(branch)?;
+        // The branch takes the Seal's place on `below`: below's child count
+        // is unchanged once the Seal is gone.
+        self.layers
+            .get_mut(&below)
+            .expect("a parent outlives its children")
+            .children += 1;
+        let b = self.layers.get_mut(&branch).expect("checked above");
+        b.parent = Some(below);
+        b.depth = depth;
+        self.layers.get_mut(&seal).expect("checked above").children -= 1;
+        garbage.extend(self.remove(seal));
+        Ok(garbage)
     }
 
     /// Drop a Seal that nothing stands on.  Returns its own log locations,
@@ -700,6 +737,76 @@ mod tests {
     }
 
     #[test]
+    fn unseal_takes_the_seal_from_under_its_only_branch() {
+        let mut m = Map::new();
+        let s1 = m.root_seal(0);
+        let b = m.fork(s1).unwrap();
+        m.write(b, 1, log(10)).unwrap();
+        let s2 = m.seal(b, 1).unwrap();
+        let s3 = m.seal(b, 2).unwrap(); // the orphan: nothing written since s2
+        m.write(b, 1, log(30)).unwrap();
+        m.write(b, 4, log(40)).unwrap();
+        assert_eq!(
+            m.drop_seal(s3),
+            Err(MapError::HasChildren(s3)),
+            "today's refusal"
+        );
+        let before = m.depth(b).unwrap();
+        let mut g = m.unseal(b).unwrap();
+        g.sort_unstable();
+        assert_eq!(
+            g,
+            vec![30, 40],
+            "the branch's own blocks; the orphan held none"
+        );
+        assert_eq!(m.parent(b).unwrap(), Some(s2));
+        assert_eq!(m.depth(b).unwrap(), before - 1);
+        assert_eq!(m.read(b, 1).unwrap(), Some(log(10)), "reads exactly as s2");
+        assert_eq!(m.read(b, 4).unwrap(), None);
+        assert_eq!(m.kind(s3), Err(MapError::Unknown(s3)));
+        // s2's child count moved from s3 to b: s2 still has one child.
+        assert_eq!(m.drop_seal(s2), Err(MapError::HasChildren(s2)));
+        assert_eq!(m.drop_branch(b).unwrap(), Vec::<u64>::new());
+        assert_eq!(m.drop_seal(s2).unwrap(), vec![10]);
+        assert_eq!(m.drop_seal(s1).unwrap(), Vec::<u64>::new());
+        assert_eq!(m.layers(), 0);
+    }
+
+    #[test]
+    fn unseal_carries_the_orphans_blocks_away() {
+        let mut m = Map::new();
+        let s1 = m.root_seal(0);
+        let b = m.fork(s1).unwrap();
+        m.write(b, 2, log(20)).unwrap();
+        m.seal(b, 1).unwrap(); // the orphan holds block 2
+        let g = m.unseal(b).unwrap();
+        assert_eq!(g, vec![20]);
+        assert_eq!(m.read(b, 2).unwrap(), None, "back to s1");
+        assert_eq!(m.parent(b).unwrap(), Some(s1));
+    }
+
+    #[test]
+    fn unseal_refuses_and_changes_nothing() {
+        let mut m = Map::new();
+        let s1 = m.root_seal(0);
+        let b = m.fork(s1).unwrap();
+        assert_eq!(
+            m.unseal(b),
+            Err(MapError::Root(s1)),
+            "a branch must stand on a Seal"
+        );
+        assert_eq!(m.unseal(s1), Err(MapError::NotABranch(s1)));
+        m.write(b, 1, log(10)).unwrap();
+        let s2 = m.seal(b, 1).unwrap();
+        let other = m.fork(s2).unwrap(); // a second child: s2 carries a fork
+        m.write(b, 3, log(30)).unwrap();
+        assert_eq!(m.unseal(b), Err(MapError::HasChildren(s2)));
+        assert_eq!(m.parent(b).unwrap(), Some(s2), "nothing changed");
+        assert_eq!(m.read(b, 3).unwrap(), Some(log(30)));
+        assert_eq!(m.parent(other).unwrap(), Some(s2));
+    }
+
+    #[test]
     fn dropping_returns_own_blocks_and_respects_children() {
         let mut m = Map::new();
         let s1 = m.root_seal(0);
@@ -783,6 +890,7 @@ mod tests {
         DropBranch(usize),
         DropSeal(usize),
         Reset(usize),
+        Unseal(usize),
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -795,7 +903,8 @@ mod tests {
             2 => ix.clone().prop_map(Op::Seal),
             1 => ix.clone().prop_map(Op::DropBranch),
             1 => ix.clone().prop_map(Op::DropSeal),
-            1 => ix.prop_map(Op::Reset),
+            1 => ix.clone().prop_map(Op::Reset),
+            1 => ix.prop_map(Op::Unseal),
         ]
     }
 
@@ -823,7 +932,7 @@ mod tests {
             for o in ops {
                 let Some(id) = (match &o {
                     Op::Fork(i) | Op::Write(i, _) | Op::Discard(i, _, _) | Op::Seal(i)
-                    | Op::DropBranch(i) | Op::DropSeal(i) | Op::Reset(i) => pick(*i, &model),
+                    | Op::DropBranch(i) | Op::DropSeal(i) | Op::Reset(i) | Op::Unseal(i) => pick(*i, &model),
                 }) else { break };
                 let is_branch = m.kind(id).unwrap() == Kind::Branch;
                 match o {
@@ -867,6 +976,24 @@ mod tests {
                         }
                         Err(e) => prop_assert_eq!((e, is_branch), (MapError::NotABranch(id), false)),
                     },
+                    Op::Unseal(_) => {
+                        let seal = if is_branch { m.parent(id).unwrap() } else { None };
+                        match m.unseal(id) {
+                            Ok(g) => {
+                                free(g, &mut freed);
+                                let seal = seal.expect("a branch has a parent");
+                                prop_assert!(m.kind(seal).is_err(), "the Seal is gone");
+                                model.remove(&seal);
+                                let below = m.parent(id).unwrap().expect("a branch has a parent");
+                                let img = model[&below].clone();
+                                model.insert(id, img);
+                            }
+                            Err(MapError::NotABranch(x)) => prop_assert!(!is_branch && x == id),
+                            Err(MapError::HasChildren(x)) => prop_assert!(is_branch && Some(x) == seal),
+                            Err(MapError::Root(x)) => prop_assert!(is_branch && Some(x) == seal && x == root),
+                            Err(e) => prop_assert!(false, "unexpected {e}"),
+                        }
+                    }
                     Op::DropSeal(_) => match m.drop_seal(id) {
                         Ok(g) => { free(g, &mut freed); model.remove(&id); }
                         Err(MapError::NotASeal(x)) => prop_assert!(is_branch && x == id),

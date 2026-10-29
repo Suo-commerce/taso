@@ -139,6 +139,10 @@ pub trait Blkd {
     /// Reset a detached `branch` to the Seal it stands on.  Returns the
     /// blocks it held of its own, now discarded.
     fn reset(&mut self, branch: LayerId) -> Result<u64, LayerError>;
+    /// Take away the Seal a detached `branch` alone stands on (an orphan:
+    /// taken, its record never accepted); the branch stands on that Seal's
+    /// parent with nothing of its own.  Returns the blocks discarded.
+    fn unseal(&mut self, branch: LayerId) -> Result<u64, LayerError>;
     /// Write Seal `to` (incremental from the Seal `from`, or full) as a
     /// stream into the new file `path`.
     fn export(
@@ -225,6 +229,9 @@ impl Blkd for Daemon {
     }
     fn reset(&mut self, branch: LayerId) -> Result<u64, LayerError> {
         self.call(|c| c.reset(branch))
+    }
+    fn unseal(&mut self, branch: LayerId) -> Result<u64, LayerError> {
+        self.call(|c| c.unseal(branch))
     }
     fn export(
         &mut self,
@@ -565,6 +572,47 @@ fn take_down<D: Blkd, M: Mounts + ?Sized>(
 
 /// Give branch `b` a device if it has none and mount it on `mp` if nothing
 /// is mounted there; refuse if something else is.  Returns the device.
+/// Take branch `b` (described by `info`) off its mount and device, run
+/// `change` on it detached, make that durable, and put it back as it was.
+/// Refused, changing nothing, if the mountpoint is mounted from something
+/// else or busy (the unmount fails).  Returns what `change` returned.
+fn off_and_back<D: Blkd, M: Mounts>(
+    d: &mut D,
+    m: &M,
+    mp: &Path,
+    dataset: &Dataset,
+    b: LayerId,
+    info: &Info,
+    change: impl FnOnce(&mut D) -> Result<u64, LayerError>,
+) -> Result<u64, LayerError> {
+    let was_mounted = match (info.dev.as_ref(), m.source(mp)?) {
+        (Some(dev), Some(src)) if &src == dev => true,
+        (_, Some(src)) => {
+            return Err(format!(
+                "{} is mounted from {}, not from {dataset}'s device",
+                mp.display(),
+                src.display()
+            )
+            .into())
+        }
+        (_, None) => false,
+    };
+    if was_mounted {
+        m.umount(mp)?; // busy: refused here, nothing changed
+    }
+    if info.dev.is_some() {
+        d.detach(b)?;
+    }
+    let n = change(&mut *d)?;
+    d.flush()?;
+    if was_mounted {
+        mount_branch(d, m, b, mp)?;
+    } else if info.dev.is_some() {
+        d.attach(b)?;
+    }
+    Ok(n)
+}
+
 fn mount_branch<D: Blkd, M: Mounts>(
     d: &mut D,
     m: &M,
@@ -882,6 +930,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             dataset: dataset.clone(),
             mountpoint: self.mountpoint(dataset),
             discarded: None,
+            unsealed: 0,
         }
     }
 
@@ -1114,6 +1163,10 @@ pub struct BlkLayers<D: Blkd = Daemon, M: Mounts = System> {
     /// (the branch's own, below the Seal it went back to); `None` before
     /// any.  The Warden names it (D93 class (i)).
     discarded: Option<u64>,
+    /// Blocks an unseal took with an orphan (F1) since the last rollback:
+    /// lost from the filesystem as a reset's are, so the next rollback
+    /// counts them too.
+    unsealed: u64,
 }
 
 impl<D: Blkd, M: Mounts> BlkLayers<D, M> {
@@ -1207,6 +1260,9 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
         Ok(by_lsn.into_iter().collect())
     }
 
+    /// Drop the layer at `lsn`, fast: while the Vessel runs its branch stands
+    /// on the orphan of a failed Seal, so this refuses ("has layers on top"),
+    /// and the Chronicle stops until the open's [`Layers::destroy_orphan`].
     fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
         let mut d = self.blkd.lock().unwrap();
         let b = self.branch(&mut *d)?;
@@ -1214,6 +1270,36 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
             d.drop_layer(layer)?;
             d.flush()?;
         }
+        Ok(())
+    }
+
+    /// At open, nothing running: an orphan the branch stands on is taken
+    /// from under it (unseal), and the next rollback counts what it and the
+    /// branch held, never sealed (F1, 2026-10-28).  Any other orphan is
+    /// dropped as [`Layers::destroy`] drops it.
+    fn destroy_orphan(&mut self, lsn: Lsn) -> Result<(), LayerError> {
+        let mut d = self.blkd.lock().unwrap();
+        let b = self.branch(&mut *d)?;
+        let Some((layer, _)) = seal_at(&mut *d, b, lsn)? else {
+            return Ok(());
+        };
+        let info = d.info(b)?;
+        if info.parent != Some(layer) {
+            d.drop_layer(layer)?;
+            d.flush()?;
+            return Ok(());
+        }
+        let n = off_and_back(
+            &mut *d,
+            &*self.mounts,
+            &self.mountpoint,
+            &self.dataset,
+            b,
+            &info,
+            |d| d.unseal(b),
+        )?;
+        self.unsealed += n;
+        self.cached = None;
         Ok(())
     }
 
@@ -1255,32 +1341,16 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
             )
             .into());
         }
-        let was_mounted = match (info.dev.as_ref(), self.mounts.source(&self.mountpoint)?) {
-            (Some(dev), Some(src)) if &src == dev => true,
-            (_, Some(src)) => {
-                return Err(format!(
-                    "{} is mounted from {}, not from {}'s device",
-                    self.mountpoint.display(),
-                    src.display(),
-                    self.dataset
-                )
-                .into())
-            }
-            (_, None) => false,
-        };
-        if was_mounted {
-            self.mounts.umount(&self.mountpoint)?; // busy: refused here, nothing changed
-        }
-        if info.dev.is_some() {
-            d.detach(b)?;
-        }
-        self.discarded = Some(d.reset(b)?);
-        d.flush()?;
-        if was_mounted {
-            mount_branch(&mut *d, &*self.mounts, b, &self.mountpoint)?;
-        } else if info.dev.is_some() {
-            d.attach(b)?;
-        }
+        let n = off_and_back(
+            &mut *d,
+            &*self.mounts,
+            &self.mountpoint,
+            &self.dataset,
+            b,
+            &info,
+            |d| d.reset(b),
+        )?;
+        self.discarded = Some(n + std::mem::take(&mut self.unsealed));
         Ok(())
     }
 }
@@ -1393,6 +1463,12 @@ mod tests {
                 return Err("attached; detach first".into());
             }
             Ok(self.store.reset(branch)?)
+        }
+        fn unseal(&mut self, branch: LayerId) -> Result<u64, LayerError> {
+            if self.devs.contains_key(&branch) {
+                return Err("attached; detach first".into());
+            }
+            Ok(self.store.unseal(branch)?)
         }
         fn export(
             &mut self,
@@ -1715,6 +1791,43 @@ mod tests {
         Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
         assert!(l.destroy(Lsn::new(2)).is_err(), "the clone stands on it");
         assert_eq!(l.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_open_takes_an_orphan_from_under_its_branch_and_the_rollback_counts_it() {
+        // F1, 2026-10-28: a Seal's layer taken, its record never accepted.
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        let mut l = p.layers(&a);
+        write0(&p, &a, 1);
+        l.snapshot(Lsn::new(2), h(2)).unwrap();
+        write0(&p, &a, 2);
+        l.snapshot(Lsn::new(5), h(5)).unwrap(); // the orphan
+        calls(&p);
+        assert!(
+            l.destroy(Lsn::new(5)).is_err(),
+            "while running: refused at once, nothing unmounted"
+        );
+        assert!(calls(&p).is_empty());
+        l.destroy_orphan(Lsn::new(5)).unwrap();
+        assert_eq!(
+            l.list().unwrap(),
+            [(Lsn::new(2), h(2))],
+            "the orphan is gone"
+        );
+        assert_eq!(block0(&p, &a), 1, "reads as the Seal at lsn 2");
+        let c = calls(&p);
+        assert_eq!(c[0], "umount /mnt/taso/tank/v-a", "{c:?}");
+        assert!(c[1].starts_with("mount "), "remounted: {c:?}");
+        l.rollback(Lsn::new(2), h(2)).unwrap();
+        assert_eq!(
+            l.discarded_blocks(),
+            Some(1),
+            "the orphan's block, lost as a reset's would be, is named (D93 (i))"
+        );
+        l.snapshot(Lsn::new(7), h(7)).unwrap();
+        assert_eq!(l.list().unwrap().len(), 2, "Seals go on as before");
     }
 
     // ── P4 file 4b-0: Seal views and destroying a dataset ───────────

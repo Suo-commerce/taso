@@ -25,6 +25,7 @@
 //! | `info <layer>`   | what a layer is                                  | `ok key=value ...`   |
 //! | `detach <branch>`| stop the branch's device                         | `ok`                 |
 //! | `reset <branch>` | back to the Seal it stands on (detached only)    | `ok`                 |
+//! | `unseal <branch>`| take away the Seal it alone stands on (an orphan), standing on that Seal's parent (detached only) | `ok <blocks>` |
 //! | `export <seal> <base>\|- <file>` | the Seal as a stream into a new file | `ok <blocks>`  |
 //! | `import <branch> <file>` | apply a stream (detached, clean branch)  | `ok <blocks>`        |
 //! | `names`          | every named branch                               | `ok <name>:<branch> ...` |
@@ -692,6 +693,23 @@ impl Daemon {
                     .map_err(store_err)?;
                 self.durable(lsn)?;
                 Ok(seal.to_string())
+            }
+            "unseal" => {
+                // An orphan Seal, taken but its record never accepted, that the
+                // branch stands on (F1, 2026-10-28).  As `reset`: detached only.
+                let branch = layer(1)?;
+                let devices = lock(&self.devices);
+                if devices.contains_key(&branch) {
+                    return Err(format!("{branch} is attached; unmount and detach it first"));
+                }
+                let freed = self
+                    .store
+                    .lock()
+                    .unwrap()
+                    .unseal(branch)
+                    .map_err(store_err)?;
+                drop(devices);
+                Ok(freed.to_string())
             }
             "reset" => {
                 let branch = layer(1)?;
