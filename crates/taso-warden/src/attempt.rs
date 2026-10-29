@@ -337,10 +337,10 @@ impl Attempts {
             return if got.digest() == sub.digest() {
                 Ok(())
             } else {
-                Err(
-                    SubmitError::Inconsistent("another record holds the attempt's logical id")
-                        .into(),
+                Err(SubmitError::Inconsistent(
+                    "another record holds the attempt's logical id".into(),
                 )
+                .into())
             };
         }
         vessel.append_contract(rec)?;
@@ -366,9 +366,10 @@ impl Attempts {
         *vessel.attempt_mut() = attempt;
         let got = got?;
         if got.digest() != sub.digest() {
-            return Err(
-                SubmitError::Inconsistent("another record holds the attempt's logical id").into(),
-            );
+            return Err(SubmitError::Inconsistent(
+                "another record holds the attempt's logical id".into(),
+            )
+            .into());
         }
         Ok(())
     }

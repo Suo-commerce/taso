@@ -62,7 +62,7 @@ pub enum SubmitError {
     /// It stayed transiently refused past the retries.
     NotAccepted(Transient),
     /// The log's answers do not agree with each other.
-    Inconsistent(&'static str),
+    Inconsistent(String),
     /// A deliberate stop at a named failpoint (tests).
     Stopped(&'static str),
 }
@@ -180,7 +180,7 @@ pub fn put<L: Layers, S: ObjectStore, X: Sender>(
                 .is_some_and(|(end, base, fs)| fs.is_none() && base < at.lsn && at.lsn <= end)
         })
         .ok_or(SubmitError::Inconsistent(
-            "no shipped pack carries the record",
+            "no shipped pack carries the record".into(),
         ))?;
     Ok(pack)
 }
@@ -230,8 +230,9 @@ pub fn accept_with<L: Layers>(
             let a = coord.accept(warden, id, epoch, sub, head, pack.clone(), record.clone())?;
             match a {
                 Answer::Accepted { .. } | Answer::AlreadyAccepted { .. } => {
-                    return accepted(coord, logical)?
-                        .ok_or(SubmitError::Inconsistent("accepted, but not in the log"));
+                    return accepted(coord, logical)?.ok_or(SubmitError::Inconsistent(
+                        "accepted, but not in the log".into(),
+                    ));
                 }
                 Answer::Refused(Transient::NotReadable) if tries + 1 < NOT_READABLE_TRIES => {
                     tries += 1;
@@ -258,9 +259,11 @@ fn final_answer(coord: &dyn Coord, logical: HashVal, a: Answer) -> Result<Submit
     match a {
         Answer::FinalRefused(Final::Conflict)
         | Answer::Accepted { .. }
-        | Answer::AlreadyAccepted { .. } => accepted(coord, logical)?.ok_or(
-            SubmitError::Inconsistent("answered accepted or Conflict, but nothing is accepted"),
-        ),
+        | Answer::AlreadyAccepted { .. } => {
+            accepted(coord, logical)?.ok_or(SubmitError::Inconsistent(
+                "answered accepted or Conflict, but nothing is accepted".into(),
+            ))
+        }
         Answer::FinalRefused(r) => Err(SubmitError::Refused(r)),
         Answer::Refused(t) => Err(SubmitError::NotAccepted(t)),
     }

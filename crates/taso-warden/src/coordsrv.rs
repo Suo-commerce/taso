@@ -2667,7 +2667,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             got,
-            Answer::FinalRefused(Final::Predicate("not this Chronicle's record"))
+            Answer::FinalRefused(Final::Predicate("not this Chronicle's record".into()))
         );
         // Takeover by the accepted GenesisStarted; the old holder is
         // refused by name.

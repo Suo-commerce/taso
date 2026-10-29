@@ -134,9 +134,9 @@ impl Verdicts {
             Some(ContractRecord::Refused(r)) => return Ok(VerdictAnswer::Refused(r.rule)),
             Some(ContractRecord::VerdictSubmitted(_)) => {}
             Some(other) => {
-                return Err(SubmitError::Inconsistent(leak(format!(
+                return Err(SubmitError::Inconsistent(format!(
                     "the verdict's logical id holds {other:?}"
-                )))
+                ))
                 .into())
             }
             None => {
@@ -246,9 +246,9 @@ impl Verdicts {
                             template_id: s.template_id,
                         })
                     }
-                    Ok(Recorded::Accepted(other)) => Err(SubmitError::Inconsistent(leak(format!(
+                    Ok(Recorded::Accepted(other)) => Err(SubmitError::Inconsistent(format!(
                         "the sanction's logical id holds {other:?}"
-                    )))
+                    ))
                     .into()),
                     Ok(Recorded::Unknown(why)) => {
                         Ok(VerdictAnswer::Retry(RetryReason::Pending(why)))
@@ -444,9 +444,9 @@ impl Verdicts {
         *vessel.attempt_mut() = attempt;
         match got {
             Ok(Submitted::Contract(r)) => Ok(Recorded::Accepted(r)),
-            Ok(other) => Err(SubmitError::Inconsistent(leak(format!(
+            Ok(other) => Err(SubmitError::Inconsistent(format!(
                 "a contract logical id holds {other:?}"
-            )))
+            ))
             .into()),
             Err(SubmitError::Coord(e)) => Ok(Recorded::Unknown(format!("coordinator: {e}"))),
             Err(e) => Err(e.into()),
@@ -459,10 +459,6 @@ impl Verdicts {
 pub(crate) enum Recorded {
     Accepted(ContractRecord),
     Unknown(String),
-}
-
-fn leak(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
 }
 
 fn frames<L: Layers>(vessel: &Vessel<L>) -> Result<Vec<Frame>, VerdictError> {

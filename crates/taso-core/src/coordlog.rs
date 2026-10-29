@@ -24,6 +24,7 @@
 //! holds other records create, on packs (a fork on its parent's Seal) and
 //! on content-addressed objects (artifacts, manifests, …).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canon::{Canon, Canonical};
@@ -182,8 +183,9 @@ pub enum Final {
     StaleEpoch,
     /// Not announced under this epoch, or announced with other content.
     NotAnnounced,
-    /// The row's predicate failed; the rule's name.
-    Predicate(&'static str),
+    /// The row's predicate failed; the rule's name.  Borrowed when the
+    /// model names it, owned when read back from a journal.
+    Predicate(Cow<'static, str>),
     /// An object to hold is claimed for deletion.
     Claimed(ObjectId),
     /// An object to hold was deleted within the quarantine window.
@@ -431,7 +433,7 @@ fn need(ok: bool, rule: &'static str) -> Result<(), Final> {
     if ok {
         Ok(())
     } else {
-        Err(Final::Predicate(rule))
+        Err(Final::Predicate(rule.into()))
     }
 }
 
@@ -977,7 +979,7 @@ impl CoordLog {
                 }
                 let Origin::Fork { parent } = &lineage.origin else {
                     return Err(Final::Predicate(
-                        "a Birth is a fork's or a Template-born Vessel's Lineage",
+                        "a Birth is a fork's or a Template-born Vessel's Lineage".into(),
                     ));
                 };
                 let p = *parent.chronicle.as_bytes();
@@ -1020,14 +1022,15 @@ impl CoordLog {
                 need(n.chronicle == chronicle, "not this Chronicle's record")?;
             }
             ContractRecord::VerificationStarted(st) => {
-                let k = cand(&st.candidate_id).ok_or(Final::Predicate("no such Candidate"))?;
+                let k =
+                    cand(&st.candidate_id).ok_or(Final::Predicate("no such Candidate".into()))?;
                 need(k.chronicle == c, "not this Chronicle's record")?;
                 need(st.is_consistent(), "inconsistent record")?;
                 need(k.state == CandState::Open, "Candidate not open")?;
                 need(!self.open_attempt(&st.candidate_id), "an attempt is open")?;
                 let tpl = self
                     .template_ready(st.requirement.template)
-                    .ok_or(Final::Predicate("no such verifier Template"))?;
+                    .ok_or(Final::Predicate("no such verifier Template".into()))?;
                 fx.holds.push((ObjectId::content(tpl.layer), c));
                 fx.holds.push((ObjectId::content(st.artifact_key), c));
                 fx.changes.push(Change::AttemptOpen(*st));
@@ -1036,7 +1039,7 @@ impl CoordLog {
                 let a = self
                     .attempts
                     .get(f.attempt_id.as_bytes())
-                    .ok_or(Final::Predicate("no such attempt"))?;
+                    .ok_or(Final::Predicate("no such attempt".into()))?;
                 need(a.finished.is_none(), "attempt not open")?;
                 let k = &self.cands[a.started.candidate_id.as_bytes()];
                 need(k.chronicle == c, "not this Chronicle's record")?;
@@ -1045,8 +1048,8 @@ impl CoordLog {
                 fx.changes.push(Change::AttemptClose(f.clone()));
             }
             ContractRecord::VerdictSubmitted(v) => {
-                let k =
-                    cand(&v.request.candidate_id).ok_or(Final::Predicate("no such Candidate"))?;
+                let k = cand(&v.request.candidate_id)
+                    .ok_or(Final::Predicate("no such Candidate".into()))?;
                 need(k.chronicle == c, "not this Chronicle's record")?;
                 need(v.request.id_matches(v.peer), "inconsistent record")?;
                 if v.request.decision == Decision::Sanction {
@@ -1059,11 +1062,13 @@ impl CoordLog {
                 }
             }
             ContractRecord::Refused(r) => {
-                let k = cand(&r.candidate_id).ok_or(Final::Predicate("no such Candidate"))?;
+                let k =
+                    cand(&r.candidate_id).ok_or(Final::Predicate("no such Candidate".into()))?;
                 need(k.chronicle == c, "not this Chronicle's record")?;
             }
             ContractRecord::CandidateClosed(cl) => {
-                let k = cand(&cl.candidate_id).ok_or(Final::Predicate("no such Candidate"))?;
+                let k =
+                    cand(&cl.candidate_id).ok_or(Final::Predicate("no such Candidate".into()))?;
                 need(k.chronicle == c, "not this Chronicle's record")?;
                 need(k.state == CandState::Open, "Candidate not open")?;
                 need(!self.open_attempt(&cl.candidate_id), "an attempt is open")?;
@@ -1078,7 +1083,8 @@ impl CoordLog {
                     .push(Change::CandClose(*cl.candidate_id.as_bytes()));
             }
             ContractRecord::SanctionCommitted(s) => {
-                let k = cand(&s.candidate_id).ok_or(Final::Predicate("no such Candidate"))?;
+                let k =
+                    cand(&s.candidate_id).ok_or(Final::Predicate("no such Candidate".into()))?;
                 need(k.chronicle == c, "not this Chronicle's record")?;
                 need(s.is_consistent(), "inconsistent record")?;
                 // (1)
@@ -1108,7 +1114,7 @@ impl CoordLog {
                 let a = self
                     .attempts
                     .get(s.attempt_id.as_bytes())
-                    .ok_or(Final::Predicate("no such attempt"))?;
+                    .ok_or(Final::Predicate("no such attempt".into()))?;
                 need(
                     a.started.candidate_id == s.candidate_id
                         && a.started.artifact_key == k.record.artifact_key
@@ -1118,7 +1124,7 @@ impl CoordLog {
                 let (fin, fin_pos) = a
                     .finished
                     .as_ref()
-                    .ok_or(Final::Predicate("attempt not finished"))?;
+                    .ok_or(Final::Predicate("attempt not finished".into()))?;
                 need(
                     fin.outcome.passed() && fin.result_digest == s.result_digest,
                     "attempt did not pass",
@@ -1177,7 +1183,7 @@ impl CoordLog {
                     } => {
                         let (cpos, ce) = self
                             .entry(&LogicalKey::Sanction(candidate_id))
-                            .ok_or(Final::Predicate("no SanctionCommitted"))?;
+                            .ok_or(Final::Predicate("no SanctionCommitted".into()))?;
                         let Submitted::Contract(ContractRecord::SanctionCommitted(s)) = &ce.record
                         else {
                             unreachable!("the Sanction row holds SanctionCommitted");
@@ -1211,7 +1217,7 @@ impl CoordLog {
                     BornFrom::Genesis { genesis_id } => {
                         let (gpos, ge) = self
                             .entry(&LogicalKey::Genesis(genesis_id))
-                            .ok_or(Final::Predicate("no GenesisStarted"))?;
+                            .ok_or(Final::Predicate("no GenesisStarted".into()))?;
                         need(me.head.pos == gpos, "head is not GenesisStarted")?;
                         let Submitted::Contract(ContractRecord::GenesisStarted(g)) = &ge.record
                         else {
@@ -1231,7 +1237,7 @@ impl CoordLog {
             ContractRecord::SanctionCompleted { template_id } => {
                 let (_, ce) = self
                     .entry(&LogicalKey::Template(*template_id))
-                    .ok_or(Final::Predicate("no TemplateReady"))?;
+                    .ok_or(Final::Predicate("no TemplateReady".into()))?;
                 let Submitted::Contract(ContractRecord::TemplateReady(t)) = &ce.record else {
                     unreachable!("the Template row holds TemplateReady");
                 };
@@ -1246,10 +1252,13 @@ impl CoordLog {
                 need(me.obligations.is_empty(), "open obligation")?;
                 for (_, on, kind) in &self.live {
                     if *on == c {
-                        return Err(Final::Predicate(match kind {
-                            Live::Fork => "liveness dependency",
-                            Live::OpenSanction { .. } => "open sanction",
-                        }));
+                        return Err(Final::Predicate(
+                            match kind {
+                                Live::Fork => "liveness dependency",
+                                Live::OpenSanction { .. } => "open sanction",
+                            }
+                            .into(),
+                        ));
                     }
                 }
                 need(
@@ -1262,7 +1271,7 @@ impl CoordLog {
                 need(!me.pinned, "retention pin")?;
                 let inv = store
                     .inventory(p.inventory_key)
-                    .ok_or(Final::Predicate("inventory unreadable"))?;
+                    .ok_or(Final::Predicate("inventory unreadable".into()))?;
                 need(inv.key() == p.inventory_key, "inventory unreadable")?;
                 need(
                     store.exists(&ObjectId::content(p.local_key)),
@@ -1289,12 +1298,12 @@ impl CoordLog {
                 let ps = self
                     .purges
                     .get(&c)
-                    .ok_or(Final::Predicate("no PurgeCommitted"))?;
+                    .ok_or(Final::Predicate("no PurgeCommitted".into()))?;
                 let item = ps
                     .items
                     .iter()
                     .find(|i| i.pack == r.pack)
-                    .ok_or(Final::Predicate("not in the inventory"))?;
+                    .ok_or(Final::Predicate("not in the inventory".into()))?;
                 need(!ps.progressed.contains_key(&r.pack.name), "item progressed")?;
                 need(
                     replacement_name(&r.pack.name).as_deref() == Some(r.replacement_name.as_str()),
@@ -1317,12 +1326,12 @@ impl CoordLog {
                 let ps = self
                     .purges
                     .get(&c)
-                    .ok_or(Final::Predicate("no PurgeCommitted"))?;
+                    .ok_or(Final::Predicate("no PurgeCommitted".into()))?;
                 let item = ps
                     .items
                     .iter()
                     .find(|i| i.pack == l.pack)
-                    .ok_or(Final::Predicate("not in the inventory"))?;
+                    .ok_or(Final::Predicate("not in the inventory".into()))?;
                 need(!ps.progressed.contains_key(&l.pack.name), "item progressed")?;
                 need(
                     !store.exists(&ObjectId::pack(chronicle, &l.pack.name))
@@ -1340,7 +1349,7 @@ impl CoordLog {
                 let ps = self
                     .purges
                     .get(&c)
-                    .ok_or(Final::Predicate("no PurgeCommitted"))?;
+                    .ok_or(Final::Predicate("no PurgeCommitted".into()))?;
                 need(
                     ps.inventory_key == *p.inventory_key.as_bytes(),
                     "not this purge's inventory",
@@ -1369,7 +1378,7 @@ impl CoordLog {
                 let ps = self
                     .purges
                     .get(&c)
-                    .ok_or(Final::Predicate("no PurgeCommitted"))?;
+                    .ok_or(Final::Predicate("no PurgeCommitted".into()))?;
                 need(
                     ps.inventory_key == *p.inventory_key.as_bytes(),
                     "not this purge's inventory",
@@ -1404,7 +1413,7 @@ impl CoordLog {
                 need(g.genesis_id == chronicle, "not this Chronicle's record")?;
                 let (gpos, _) = self
                     .entry(&LogicalKey::Genesis(g.genesis_id))
-                    .ok_or(Final::Predicate("no GenesisStarted"))?;
+                    .ok_or(Final::Predicate("no GenesisStarted".into()))?;
                 need(
                     self.entry(&LogicalKey::Template(g.genesis_id)).is_none(),
                     "Template ready",
@@ -1562,7 +1571,7 @@ impl CoordLog {
                     && !fx.release_created_by.contains(&h.created_by)
             });
             if held_after {
-                return Err(Final::Predicate("claim target held"));
+                return Err(Final::Predicate("claim target held".into()));
             }
         }
         Ok(fx)
@@ -2201,7 +2210,7 @@ mod tests {
         let (pc, _) = purge_inventory(&mut w, f.v);
         assert_eq!(
             w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
-            Final::Predicate("open sanction")
+            Final::Predicate("open sanction".into())
         );
         // Finish: claim the target by the commit's authority, then ready.
         let commit_lid = ContractRecord::SanctionCommitted(s).logical_id();
@@ -2373,7 +2382,7 @@ mod tests {
                     object_key: h(0x30)
                 }
             ),
-            Final::Predicate("held"),
+            Final::Predicate("held".into()),
             "T0's layer is held by T0"
         );
         // After deletion the key is quarantined.
@@ -2447,7 +2456,7 @@ mod tests {
         let (pc, _) = purge_inventory(&mut w, f.v);
         assert_eq!(
             w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
-            Final::Predicate("liveness dependency")
+            Final::Predicate("liveness dependency".into())
         );
     }
 
@@ -2483,7 +2492,7 @@ mod tests {
                     replacement_name: rname.clone(),
                 })
             ),
-            Final::Predicate("replacement does not match the inventory")
+            Final::Predicate("replacement does not match the inventory".into())
         );
         w.ok(
             f.v,
@@ -2505,7 +2514,7 @@ mod tests {
         });
         assert_eq!(
             w.refused(f.v, lost.clone()),
-            Final::Predicate("original or replacement readable")
+            Final::Predicate("original or replacement readable".into())
         );
         // Gone with no replacement: lost; then the purge ends damaged, never complete.
         store.del(&ObjectId::pack(f.v, &it2.pack.name));
@@ -2526,7 +2535,7 @@ mod tests {
                     history_attestation: h(0xC0),
                 })
             ),
-            Final::Predicate("history damaged")
+            Final::Predicate("history damaged".into())
         );
         w.ok(
             f.v,
@@ -3020,7 +3029,7 @@ mod tests {
         // An attempt is open: no second one.
         assert_eq!(
             w.refused(f.v, ContractRecord::VerificationStarted(started(&f.k, 12))),
-            Final::Predicate("an attempt is open")
+            Final::Predicate("an attempt is open".into())
         );
         let fin = finished(&st, 0);
         w.ok(f.v, ContractRecord::VerificationFinished(fin.clone()));
@@ -3035,7 +3044,7 @@ mod tests {
                 f.v,
                 ContractRecord::SanctionCommitted(commit(&f.k, &fin, &hold, f.t0))
             ),
-            Final::Predicate("no Sanction verdict for this attempt")
+            Final::Predicate("no Sanction verdict for this attempt".into())
         );
         // A later attempt that fails blocks the earlier pass.
         let st2 = started(&f.k, 20);
@@ -3048,7 +3057,7 @@ mod tests {
                 f.v,
                 ContractRecord::SanctionCommitted(commit(&f.k, &fin, &vd, f.t0))
             ),
-            Final::Predicate("a later attempt failed")
+            Final::Predicate("a later attempt failed".into())
         );
     }
 
@@ -3070,7 +3079,7 @@ mod tests {
                 f.v,
                 ContractRecord::SanctionCommitted(commit(&f.k, &fin, &vd, f.t0))
             ),
-            Final::Predicate("hard rules")
+            Final::Predicate("hard rules".into())
         );
 
         let store = Store::default();
@@ -3086,7 +3095,7 @@ mod tests {
         let s = ContractRecord::SanctionCommitted(commit(&f.k, &fin, &vd, f.t0));
         assert_eq!(
             w.refused(f.v, s.clone()),
-            Final::Predicate("open obligation")
+            Final::Predicate("open obligation".into())
         );
         // A refused submission reserves nothing: once settled, a new one is accepted.
         w.log.note_obligation(f.v, 5, false);
@@ -3112,7 +3121,7 @@ mod tests {
         let (pc, inv) = purge_inventory(&mut w, f.v);
         assert_eq!(
             w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
-            Final::Predicate("open obligation")
+            Final::Predicate("open obligation".into())
         );
         w.log.note_obligation(f.v, 1, false);
         let e = w.epoch(f.v);
@@ -3133,7 +3142,7 @@ mod tests {
                     how: CloseKind::Cancelled { authority: auth() },
                 })
             ),
-            Final::Predicate("Candidate not open"),
+            Final::Predicate("Candidate not open".into()),
             "closed by the purge"
         );
         finish_purge(&mut w, f.v, &inv);
@@ -3176,7 +3185,7 @@ mod tests {
         };
         assert_eq!(
             w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
-            Final::Predicate("inventory mismatch")
+            Final::Predicate("inventory mismatch".into())
         );
     }
 
@@ -3297,7 +3306,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             w.refused(other, ContractRecord::Candidate(Box::new(f.k.clone()))),
-            Final::Predicate("not this Chronicle's record")
+            Final::Predicate("not this Chronicle's record".into())
         );
         store.del(&ObjectId::content(f.k.artifact_key));
         assert_eq!(
@@ -3309,7 +3318,7 @@ mod tests {
         store.put(ObjectId::content(f.k.artifact_key));
         assert_eq!(
             w.refused(f.v, ContractRecord::Candidate(Box::new(bad))),
-            Final::Predicate("inconsistent record")
+            Final::Predicate("inconsistent record".into())
         );
         let _ = object_key(ObjectKind::Pack, b"");
     }

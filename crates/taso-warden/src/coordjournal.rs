@@ -902,27 +902,14 @@ impl Done {
 
 // ── Decoding answers (the coordinator's wire, `coordsrv`) ──────────
 
-/// A rule name read back from the wire, as the `&'static str`
-/// [`Final::Predicate`] holds: each distinct name is kept once.  The
-/// coordinator's rule names are a fixed set; a name longer than 128 bytes
-/// is refused.
-pub(crate) fn intern(name: &str) -> Result<&'static str, JournalError> {
-    use std::collections::BTreeSet;
-    use std::sync::{Mutex, OnceLock};
-    static NAMES: OnceLock<Mutex<BTreeSet<&'static str>>> = OnceLock::new();
+/// A rule name read back from the wire, owned.  The coordinator's rule
+/// names are a fixed set; a name longer than 128 bytes is refused.
+fn rule_name(r: &mut Rd<'_>) -> Result<std::borrow::Cow<'static, str>, JournalError> {
+    let name = r.string()?;
     if name.len() > 128 {
         return Err(JournalError("rule name too long"));
     }
-    let mut set = NAMES
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if let Some(n) = set.get(name) {
-        return Ok(n);
-    }
-    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    set.insert(leaked);
-    Ok(leaked)
+    Ok(name.into())
 }
 
 pub(crate) fn get_transient(r: &mut Rd<'_>) -> Result<Transient, JournalError> {
@@ -941,7 +928,7 @@ pub(crate) fn get_final(r: &mut Rd<'_>) -> Result<Final, JournalError> {
         0 => Final::Conflict,
         1 => Final::StaleEpoch,
         2 => Final::NotAnnounced,
-        3 => Final::Predicate(intern(&r.string()?)?),
+        3 => Final::Predicate(rule_name(r)?),
         4 => Final::Claimed(get_object(r)?),
         5 => Final::Quarantined(get_object(r)?),
         6 => Final::NoSuchObject(get_object(r)?),

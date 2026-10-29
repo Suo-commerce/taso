@@ -517,7 +517,7 @@ impl Nominator {
         let after_announce = || match fp("nominate.after_announce") {
             Ok(()) => Ok(()),
             Err(NominateError::Failpoint(p)) => Err(SubmitError::Stopped(p)),
-            Err(e) => Err(SubmitError::Inconsistent(leak(e.to_string()))),
+            Err(e) => Err(SubmitError::Inconsistent(e.to_string())),
         };
         let ours = sub.digest();
         let mut attempt = *vessel.attempt_mut();
@@ -541,8 +541,8 @@ impl Nominator {
                     refuse(vessel, NominationRefusal::Duplicate, None)
                 }
             }
-            Ok(other) => Err(NominateError::Submit(SubmitError::Inconsistent(leak(
-                format!("the Candidate's logical id holds {other:?}"),
+            Ok(other) => Err(NominateError::Submit(SubmitError::Inconsistent(format!(
+                "the Candidate's logical id holds {other:?}"
             )))),
             Err(SubmitError::Coord(_)) => Ok(Answer::Pending(cid)),
             Err(e) => Err(e.into()),
@@ -589,8 +589,8 @@ impl Nominator {
             Submitted::Contract(ContractRecord::NominationRefused(r)) => {
                 Ok(Answer::Refused(r.reason))
             }
-            other => Err(NominateError::Submit(SubmitError::Inconsistent(leak(
-                format!("a refusal's logical id holds {other:?}"),
+            other => Err(NominateError::Submit(SubmitError::Inconsistent(format!(
+                "a refusal's logical id holds {other:?}"
             )))),
         }
     }
@@ -697,10 +697,6 @@ impl Nominator {
         self.store.put(&path, data).map_err(NominateError::Store)?;
         Ok(())
     }
-}
-
-fn leak(s: String) -> &'static str {
-    Box::leak(s.into_boxed_str())
 }
 
 /// Whether two nominations are the same kind of request (D61): the agent

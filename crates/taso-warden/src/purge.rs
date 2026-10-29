@@ -31,6 +31,7 @@
 //! Normative reference: `Taso_spec_p4_contracts` rev. 30, BLAKE3
 //! `b5f59255657885a8c056c1e758e76699f1a36485a2e2327ca21d47c6ead1ccd8`.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Read;
@@ -77,7 +78,7 @@ pub enum Purged {
     Blocked(PurgeBlocker),
     /// The coordinator refused the commit for a reason `purge_blocker`
     /// does not name (its rule): Live; nothing more recorded.
-    Refused(&'static str),
+    Refused(Cow<'static, str>),
     /// `PurgeComplete` is accepted.
     Complete {
         /// Items replaced.
@@ -164,7 +165,7 @@ pub struct Purger {
 enum Commit {
     Committed(PurgeCommitted),
     Blocked(PurgeBlocker),
-    Refused(&'static str),
+    Refused(Cow<'static, str>),
 }
 
 impl Purger {
