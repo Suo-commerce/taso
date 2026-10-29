@@ -247,11 +247,20 @@ def check(r, a):
                          "new log became the log, though its rename was held and never made")
     if tk:
         # F: the old Warden, woken, believes it holds the Vessel; the coordinator refuses its old epoch.
+        # Graded only once the new Warden ran the Vessel: until then the old one still holds it, and its
+        # acknowledgements are right (line 5 says the takeover did not happen).
         th = t.get("thaw") or {}
-        if th.get("acks", 0):
-            fails.append(f"F: after its takeover the old Warden acknowledged {th['acks']} op(s): {th.get('replies')}")
-        if not th.get("fenced"):
-            fails.append(f"F: the old Warden's output names no refusal (stale epoch) after it woke; its replies: {th.get('replies')}")
+        fence = r"Fenced|StaleEpoch|stale epoch|EpochMismatch|NotHolder|not the holder|ownership was lost"
+        told = [x for x in th.get("replies", []) if re.search(fence, x)]
+        if a.get("opened") is not True:
+            notes.append("F not checked: the new Warden never took the Vessel over")
+        else:
+            if th.get("acks", 0):
+                fails.append(f"F: after its takeover the old Warden acknowledged {th['acks']} op(s): {th.get('replies')}")
+            if not th.get("fenced") and not told:
+                fails.append(f"F: the old Warden names no refusal (stale epoch) after it woke, to its agent or in its log; its replies: {th.get('replies')}")
+            elif not th.get("fenced"):
+                notes.append("F: the refusal named to the agent only; the old Warden's own log is silent")
         # H: the store after the old Warden's late writes (§0.4, §11.3).
         pk = t.get("packs") or {}
         if pk.get("added"):
@@ -392,6 +401,9 @@ def selftest():
         ("tk fail: acknowledged, not shipped, absent, unnamed", {"seals": [], "report": REB, "resume_turn": 0, "opened": True}, TK(shipped=5, c={"seals": [], "opened": True}), 1),
         ("tk fail F: the old Warden acknowledged after its takeover", B9, TK(acks=1), 1),
         ("tk fail F: the old Warden's refusal not named", B9, TK(fenced=None), 1),
+        ("tk pass F: the refusal named to the agent only (a note)", B9,
+         dict(TK(fenced=None), thaw={"acks": 0, "fenced": None, "replies": ['seal: {"error":"the Warden refused: Fenced: chronicle: append refused, chronicle fenced: warden 1 is not the holder (holder is 2)"}']}), 0),
+        ("tk: B never took over -- F not graded, line 5 fails alone", dict(B9, opened=False, not_run="refused"), TK(acks=2, fenced=None), 1),
         ("tk pass H2: a pack no record names (a note)", B9, TK(added=["./v/pack/12-5-0"]), 0),
         ("tk fail H3: a named pack's bytes changed", B9, TK(changed=["./v/pack/9-5-9"]), 1),
         ("tk fail H: a pack gone", B9, TK(gone=["./v/pack/9-5-9"]), 1),

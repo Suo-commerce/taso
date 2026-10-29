@@ -366,14 +366,16 @@ drain_node() { # drain_node TAG SOCKET SUBJECT WARDEN_PID: every agent of that W
         [[ -n "$DRAIN_DS" ]] || DRAIN_DS=$(grep -m1 -o "\] $subject: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
         if wait_agent 1; then
             a=$AGENT
+            [[ -n "$DRAIN_DS" ]] || DRAIN_DS=$(grep -m1 -o "\] $subject: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
+            [[ -n "$DRAIN_DS" ]] || DRAIN_WHY="agent $a came up before Warden $1 named the Vessel's dataset"
             if [[ -n "$DRAIN_DS" && -z "$DRAIN_RESUME" ]]; then
                 info=$(blk info "$(blk find "$DRAIN_DS")" 2>&1) || true
                 pdev=$(sed -n 's/.* dev=\(\/dev\/[^ ]*\).*/\1/p' <<<"$info")
-                work=$(findmnt -N "$a" -no MAJ:MIN /work 2>/dev/null || true)
+                work=$(findmnt -N "$a" -no MAJ:MIN /work 2>/dev/null | tr -d '[:space:]' || true)
                 if [[ -n "$pdev" && -n "$work" && "$work" == "$(stat -c '%Hr:%Lr' "$pdev")" ]]; then
                     DRAIN_RESUME=$(ready_turn "$a"); DRAIN_WHY=
                 else
-                    DRAIN_WHY="agent $a: /work on ${work:-nothing}; the branch: ${info:-no answer}; its device ${pdev:-none}${pdev:+ is $(stat -c '%Hr:%Lr' "$pdev" 2>/dev/null)}"
+                    DRAIN_WHY="agent $a: /work on ${work:-nothing}, the branch's device ${pdev:-none}${pdev:+ is $(stat -c '%Hr:%Lr' "$pdev" 2>/dev/null)}; taso-blkd: ${info:-no answer}"
                 fi
             fi
             step "$a" exit 30 >/dev/null || true
@@ -699,11 +701,11 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
             # when there was none); every reason not to take its turn is recorded.
             info=$(blk info "$(blk find "$ds")" 2>&1) || true
             pdev=$(sed -n 's/.* dev=\(\/dev\/[^ ]*\).*/\1/p' <<<"$info")
-            work=$(findmnt -N "$a" -no MAJ:MIN /work 2>/dev/null || true)
+            work=$(findmnt -N "$a" -no MAJ:MIN /work 2>/dev/null | tr -d '[:space:]' || true)
             if [[ -n "$pdev" && -n "$work" && "$work" == "$(stat -c '%Hr:%Lr' "$pdev")" ]]; then
                 resume=$(ready_turn "$a"); resume_why=
             elif [[ -z "$resume" ]]; then
-                resume_why="agent $a: /work on ${work:-nothing}; the branch: ${info:-no answer}; its device ${pdev:-none}${pdev:+ is $(stat -c '%Hr:%Lr' "$pdev" 2>/dev/null)}"
+                resume_why="agent $a: /work on ${work:-nothing}, the branch's device ${pdev:-none}${pdev:+ is $(stat -c '%Hr:%Lr' "$pdev" 2>/dev/null)}; taso-blkd: ${info:-no answer}"
             fi
             step "$a" exit 30 >/dev/null || true
         fi
