@@ -278,7 +278,7 @@ start_stack() { # start_stack TAG [VAR=VALUE ...]: taso-blkd and the Warden on $
 round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's files in $R
     local seq=$1 point=$2 mode=$3 subject O="$R/r.json"
     subject="e3-$(date +%s%N | tail -c 9)"
-    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 ct cr hname="" held_flag=""
+    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 ct cr hname="" held_flag="" log_ino=""
     local -a ops henv=(); read -ra ops <<<"$seq"
     if [[ "$kind" == hold ]]; then
         # The held op is the last one; compact.written holds a `compact` sent after it.
@@ -382,6 +382,9 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
     done
     if [[ "$hname" == compact.written ]]; then
         # taso-blkd's compaction, held before its rename; the client waits until the kill closes it.
+        # The log's inode now: the rename would make the temp file the log (a new inode); the
+        # rebirth copy keeps inode numbers, so after it the log must still be this one.
+        log_ino=$(stat -c %i "$D/blk.log")
         : >"$RUN/hold/$hname.arm"
         blk_raw compact >"$R/compact.out" 2>&1 &
         held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached (compact said: $(cat "$R/compact.out"))"; return; }
@@ -428,15 +431,22 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
     fi
     mkdir -p "$RUN/run"; KNOWN=" $(pgrep -x taso-sim | tr '\n' ' ') "
     start_stack 2 || { echo "HARNESS $tag: taso-blkd did not start on the image"; return; }
-    local ds pdev resume="" deadline=$((SECONDS + 180)) a
+    local ds pdev resume="" deadline=$((SECONDS + 180)) a work info resume_why="no agent of the reborn Warden came up"
     ds=$(grep -m1 -o "\] $subject: dataset .*" "$R/warden-1.err" | sed 's/.*: dataset //')
     [[ -n "$ds" ]] || { echo "HARNESS $tag: no dataset line for $subject in warden-1.err"; return; }
     while ((SECONDS < deadline)) && kill -0 "$WARDEN_PID" 2>/dev/null; do
         if wait_agent 1; then
             a=$AGENT
-            pdev=$(blk_raw attach "$(blk find "$ds")" | sed -n 's/.*already attached as //p')
-            if [[ -n "$pdev" && "$(findmnt -N "$a" -no MAJ:MIN /work 2>/dev/null)" == "$(stat -c '%Hr:%Lr' "$pdev")" ]]; then
-                resume=$(ready_turn "$a")
+            # Is this agent the Vessel's?  Its /work must be on the branch's device.
+            # Asked with `info`, which changes nothing (an `attach` started a device
+            # when there was none); every reason not to take its turn is recorded.
+            info=$(blk info "$(blk find "$ds")" 2>&1) || true
+            pdev=$(sed -n 's/.* dev=\(\/dev\/[^ ]*\).*/\1/p' <<<"$info")
+            work=$(findmnt -N "$a" -no MAJ:MIN /work 2>/dev/null || true)
+            if [[ -n "$pdev" && -n "$work" && "$work" == "$(stat -c '%Hr:%Lr' "$pdev")" ]]; then
+                resume=$(ready_turn "$a"); resume_why=
+            elif [[ -z "$resume" ]]; then
+                resume_why="agent $a: /work on ${work:-nothing}; the branch: ${info:-no answer}; its device ${pdev:-none}${pdev:+ is $(stat -c '%Hr:%Lr' "$pdev" 2>/dev/null)}"
             fi
             step "$a" exit 30 >/dev/null || true
         fi
@@ -447,11 +457,11 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
         echo "HARNESS $tag: the reborn Warden did not start: $(grep -m1 "^taso-wardend: starting:" "$R/warden-2.err" | cut -c22-)"; return
     fi
     # 6. what the reborn Warden holds, and the grade
-    gather "$subject" "$ds" "$resume" "$acks_err" "$mode" >"$R/a.json" || { echo "HARNESS $tag: gather"; return; }
+    gather "$subject" "$ds" "$resume" "$acks_err" "$mode" "$resume_why" "$log_ino" >"$R/a.json" || { echo "HARNESS $tag: gather"; return; }
     oracle check "$O" --after "$R/a.json" || true
 }
 
-gather() { # gather SUBJECT DATASET RESUME ACKS_ERR MODE -> a.json on stdout
+gather() { # gather SUBJECT DATASET RESUME ACKS_ERR MODE RESUME_WHY LOG_INO_BEFORE -> a.json on stdout
     local subject=$1 ds=$2 branch layer tg lsn birth seals="" rd="$MNT/.read" tmp="$RUN/read" b dev ok lt
     birth=$(grep -m1 -o "\] $subject: birth Seal at lsn [0-9]*" "$R/warden-1.err" | grep -o '[0-9]*$' || true)
     branch=$(blk find "$ds") || return 1
@@ -491,15 +501,19 @@ PY
     local opened=false not_run=""
     grep -q " $subject: Opened(" "$R/warden-2.err" 2>/dev/null && opened=true
     [[ "$opened" == true ]] || not_run=$(grep -m1 "^$subject: " "$R/warden-2.out" 2>/dev/null | cut -c$((${#subject} + 3))- || true)
+    # The log taso-blkd reopened (compact.written: it must be the one from before the held compaction).
+    local ino_after=""; [[ -n "$7" ]] && ino_after=$(stat -c %i "$D/blk.log" 2>/dev/null || true)
     # shellcheck disable=SC2086
-    python3 -I - "[${seals%,}]" "$forks" "$3" "$4" "$opened" "$not_run" $report <<'PY'
+    python3 -I - "[${seals%,}]" "$forks" "$3" "$4" "$opened" "$not_run" "$6" "$7" "$ino_after" $report <<'PY'
 import json, sys
 seals, forks, resume, acks = json.loads(sys.argv[1]), sys.argv[2].split(), sys.argv[3], int(sys.argv[4])
-opened, not_run = sys.argv[5] == "true", sys.argv[6]
-report = "".join(open(f, errors="replace").read() for f in sys.argv[7:])
+opened, not_run, resume_why = sys.argv[5] == "true", sys.argv[6], sys.argv[7]
+ino = lambda v: int(v) if v else None
+report = "".join(open(f, errors="replace").read() for f in sys.argv[10:])
 print(json.dumps({"seals": seals, "forks": forks, "report": report,
-                  "resume_turn": int(resume) if resume else None, "acks_after_error": acks,
-                  "opened": opened, "not_run": not_run or None}, indent=1))
+                  "resume_turn": int(resume) if resume else None, "resume_why": resume_why or None,
+                  "acks_after_error": acks, "opened": opened, "not_run": not_run or None,
+                  "log_inode": {"before": ino(sys.argv[8]), "after": ino(sys.argv[9])} if sys.argv[8] else None}, indent=1))
 PY
 }
 

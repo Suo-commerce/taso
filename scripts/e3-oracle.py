@@ -31,7 +31,17 @@ A.json (gathered from the reborn Warden by e3-crash.sh; "opened" is whether
 the reborn Warden opened the Vessel, "not_run" its own word why not):
   {"seals": [{"lsn": L, "birth": bool, "export_ok": bool, "rows": {"1": 8, "c2": 8}}],   the parent's Seals
    "forks": ["child name", ...], "report": "the Warden's and taso-blkd's stderr after rebirth",
-   "resume_turn": T|null, "acks_after_error": N, "opened": bool, "not_run": "…"|null}
+   "resume_turn": T|null, "resume_why": "why no resume turn was taken"|null,
+   "acks_after_error": N, "opened": bool, "not_run": "…"|null,
+   "log_inode": {"before": I, "after": I|null}|null}     (compact.written only)
+
+At a hold the point is exact, so three windows are graded exactly
+(E3-3c's open item, accepted 2026-10-28; D96): `seal.recorded`, the Seal
+held before its record was committed is never listed after rebirth (its
+layer destroyed at open); `fork.branched`, the child held before its
+Lineage record is never run; `compact.written`, the log taso-blkd reopens
+is the one from before the held compaction (same inode: the rename never
+happened).
 
 Line 3 checks that a retained Seal is reachable (it exports), not its bytes:
 a Seal's export differs between runs (a fresh mkfs per round, inode times),
@@ -130,6 +140,7 @@ def check(r, a):
     report = a.get("report", "")
     infl = m["inflight"]
     infl_op = infl["op"] if infl and infl["who"] == "parent" else None
+    held = (r.get("cut") or {}).get("held")
     retained_turn = m["last_turn"]
     # 1. every acknowledged Seal listed, its rows as promised
     for lsn, exp in m["seals"].items():
@@ -151,6 +162,10 @@ def check(r, a):
             extra.pop(hit[0])
     for l, s in extra.items():
         rows = s.get("rows", {})
+        if held == "seal.recorded" and infl_op == "seal":
+            fails.append(f"2 (seal.recorded): Seal lsn {l} is listed, but it was held before its record was "
+                         "committed: its layer must be destroyed at open (D96, orphan)")
+            continue
         if infl_op == "seal" and rows == m["parent_now"]:
             notes.append(f"in-flight Seal lsn {l} landed whole"); unsealed = 0; retained_turn = max(retained_turn, infl["d"].get("turn", retained_turn + 1) if infl["d"] else retained_turn + 1)
         elif infl_op == "promote" and m["child_seal"] and rows == m["child_seal"][0]:
@@ -170,6 +185,9 @@ def check(r, a):
     # 2. a child nobody asked for
     if a.get("forks") and not m["forked"] and infl_op != "fork":
         fails.append(f"2: child(ren) {a['forks']} listed and no fork was requested")
+    elif a.get("forks") and held == "fork.branched":
+        fails.append(f"2 (fork.branched): child(ren) {a['forks']} ran, but the fork was held before its Lineage "
+                     "record: an interrupted fork, never a child (D96)")
     # 3. retained Seals reachable
     for lsn in m["seals"]:
         if lsn in listed and not listed[lsn].get("export_ok", False):
@@ -186,6 +204,17 @@ def check(r, a):
         fails.append("5: an effect was in flight and the Warden printed no reconcile line (D93 (ii))")
     if a.get("resume_turn") is not None and a["resume_turn"] != retained_turn:
         fails.append(f"5 (iii): the agent resumes after turn {a['resume_turn']}, the last retained Seal is turn {retained_turn}")
+    elif a.get("resume_turn") is None and a.get("resume_why"):
+        # Not graded yet: the harness has never found the reborn agent's turn
+        # (E3-3c, open).  Said on the result line, so a silent skip cannot pass for a check.
+        notes.append("5 (iii) not checked: " + a["resume_why"][:160])
+    if held == "compact.written":
+        li = a.get("log_inode") or {}
+        if li.get("before") is None or li.get("after") is None:
+            fails.append(f"5 (compact.written): the log's inode was not looked at ({li or 'nothing gathered'}), so which log was reopened is unknown")
+        elif li["after"] != li["before"]:
+            fails.append(f"5 (compact.written): the reopened log is inode {li['after']}, not {li['before']}: the compaction's "
+                         "new log became the log, though its rename was held and never made")
     if r["mode"] == "error":
         # taso-blkd names the failure that poisoned the store, once, with its error
         # ("the store is poisoned: seal failed: ... Input/output error"); the Warden's
@@ -276,6 +305,13 @@ def selftest():
         ("hold pass: seal.recorded, in-flight Seal absent", "seal.recorded", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0}, 0),
         ("hold pass: seal.shipped, acknowledged Seal kept", "seal.shipped", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 0),
         ("hold fail: seal.shipped, acknowledged Seal lost", "seal.shipped", [W(1), SL(9, 1)], None, {"seals": [], "report": RESET, "resume_turn": 0}, 1),
+        # The exact checks: what "landed or not" allowed elsewhere, a hold settles.
+        ("hold fail: seal.recorded, the held Seal listed whole", "seal.recorded", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
+        ("hold pass: fork.branched, no child ran", "fork.branched", [W(1), SL(9, 1)], ("fork", {}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 0),
+        ("hold fail: fork.branched, the held child ran", "fork.branched", [W(1), SL(9, 1)], ("fork", {}), {"seals": [S(9, {"1": 8})], "forks": ["c"], "report": B, "resume_turn": 1}, 1),
+        ("hold pass: compact.written, the old log reopened", "compact.written", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "log_inode": {"before": 12, "after": 12}}, 0),
+        ("hold fail: compact.written, the new log reopened", "compact.written", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "log_inode": {"before": 12, "after": 13}}, 1),
+        ("hold fail: compact.written, the log not looked at", "compact.written", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "log_inode": {"before": 12, "after": None}}, 1),
     ]
     for name, hn, steps, infl, a, want in held:
         rnd(steps, infl)
