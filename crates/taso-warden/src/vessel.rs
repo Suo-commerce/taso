@@ -951,6 +951,7 @@ impl<P: Pool> Host<P> {
             let _t = crate::timing::span("fork.unborn");
             self.unborn(id, Some((parent_dataset, ps.seal, ps.seal_hash)))?
         };
+        taso_core::hold("fork.branched");
         {
             let _t = crate::timing::span("fork.lineage");
             chronicle.append(Stream::Ctl, Payload::Lineage(lineage.clone()))?;
@@ -1885,6 +1886,7 @@ impl<L: Layers> Vessel<L> {
             .ship_log(&self.chronicle.segments(), tail)
             .map_err(VesselError::Pack)?;
         drop(t);
+        taso_core::hold("seal.shipped");
         let _t = crate::timing::span("publish.advance");
         let anchor = self
             .chronicle

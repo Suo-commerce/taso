@@ -842,6 +842,7 @@ impl<L: Layers> Chronicle<L> {
             let _ = self.layers.destroy(lsn);
             return Err(ChronicleError::CheckFailed(why));
         }
+        taso_core::hold("seal.recorded");
         match self.commit(&rec) {
             Ok(head) => {
                 let seal = Position { lsn, hash };

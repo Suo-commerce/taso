@@ -1352,6 +1352,7 @@ dependencies = [
  "libc",
  "libublk",
  "proptest",
+ "taso-core",
  "tempfile",
 ]
 

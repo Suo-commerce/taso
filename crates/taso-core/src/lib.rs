@@ -19,6 +19,9 @@ pub mod decider;
 pub mod decode;
 pub mod envelope;
 pub mod frame;
+pub mod hold;
 pub mod model;
 pub mod navigator;
 pub mod record;
+
+pub use hold::hold;

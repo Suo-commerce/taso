@@ -19,6 +19,7 @@ required-features = ["daemon"]
 
 [dependencies]
 blake3 = { workspace = true }
+taso-core = { path = "../taso-core" }
 libublk = { version = "0.4.8", optional = true }
 libc = { version = "0.2", optional = true }
 

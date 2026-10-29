@@ -353,6 +353,8 @@ impl Compaction {
             ))));
         }
 
+        taso_core::hold("compact.written");
+
         // The switch.  After the rename the old file is gone from the
         // directory, so the store must move to the new one whatever
         // follows.

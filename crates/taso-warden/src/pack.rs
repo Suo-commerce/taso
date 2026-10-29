@@ -2106,6 +2106,7 @@ impl<S: ObjectStore, X: Sender> Publish for PackPublisher<S, X> {
         self.packs
             .ship_log(segments, upto)
             .map_err(|e| PublishError(format!("pack: {e}")))?;
+        taso_core::hold("ledger.shipped");
         let _t = crate::timing::span("pack.advance");
         self.coord
             .advance_shipped(self.warden, chronicle, epoch, upto)
