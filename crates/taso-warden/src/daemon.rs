@@ -1950,7 +1950,7 @@ impl crate::decidesrv::Decide for NodeDecider {
     fn pending(&self) -> Result<Vec<PendingItem>, String> {
         let node = &*self.0;
         let mut items = Vec::new();
-        for id in node.local_vessels() {
+        for id in node.local_vessels()? {
             if node.mine_here(id).is_err() {
                 continue;
             }
@@ -2704,6 +2704,47 @@ fn inherited_range((uid, gid): (u32, u32), host_uid_base: u32) -> Option<u32> {
     (uid == gid && uid != 0 && aligned).then_some(uid)
 }
 
+/// The Vessels under `state_dir` whose local log (at `dir_for(id)`) opens
+/// to a lineage, ascending by id.  Refuses to answer when the directory
+/// itself cannot be read; an entry that cannot be read is given to `warn`
+/// by name and skipped, so one bad Vessel does not hide the rest.
+fn vessels_in(
+    state_dir: &Path,
+    dir_for: impl Fn(ChronicleId) -> PathBuf,
+    warn: impl Fn(String),
+) -> Result<Vec<ChronicleId>, String> {
+    let rd = std::fs::read_dir(state_dir)
+        .map_err(|e| format!("reading the state directory {}: {e}", state_dir.display()))?;
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn(format!(
+                    "an entry of {} cannot be read: {e}",
+                    state_dir.display()
+                ));
+                continue;
+            }
+        };
+        let Some(id) = entry
+            .file_name()
+            .to_str()
+            .and_then(key_of_hex)
+            .map(ChronicleId::from_bytes)
+        else {
+            continue; // not a Vessel directory
+        };
+        match crate::vessel::lineage_in(&dir_for(id)) {
+            Ok(Some(_)) => out.push(id),
+            Ok(None) => {} // a directory without a log yet
+            Err(e) => warn(format!("the log of {} cannot be read: {e}", id_hex(id))),
+        }
+    }
+    out.sort_by_key(|id| *id.as_bytes());
+    Ok(out)
+}
+
 /// A Vessel key from 32 lowercase hex digits.
 fn key_of_hex(s: &str) -> Option<[u8; 16]> {
     if s.len() != 32
@@ -3210,7 +3251,17 @@ impl Node {
             return;
         };
         let now = unix_now();
-        for id in self.local_vessels() {
+        let vessels = match self.local_vessels() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "taso-wardend[{}] TTL pass skipped: {e}",
+                    self.config.warden.get()
+                );
+                return;
+            }
+        };
+        for id in vessels {
             let label = id_hex(id);
             let log =
                 |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
@@ -3282,7 +3333,17 @@ impl Node {
     /// TTL.
     pub fn relaunch_pass(&self) {
         let at = self.attempts();
-        for id in self.local_vessels() {
+        let vessels = match self.local_vessels() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "taso-wardend[{}] relaunch pass skipped: {e}",
+                    self.config.warden.get()
+                );
+                return;
+            }
+        };
+        for id in vessels {
             // Its name in this Warden's log: the config's subject, if any.
             let label = self
                 .config
@@ -3506,24 +3567,18 @@ impl Node {
         })
     }
 
-    /// The Vessels whose local logs are on this node.
-    fn local_vessels(&self) -> Vec<ChronicleId> {
-        let Ok(rd) = std::fs::read_dir(&self.config.state_dir) else {
-            return Vec::new();
-        };
-        let mut out: Vec<ChronicleId> = rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().to_str().and_then(key_of_hex))
-            .map(ChronicleId::from_bytes)
-            .filter(|id| {
-                matches!(
-                    crate::vessel::lineage_in(&self.host().dir_for(*id)),
-                    Ok(Some(_))
-                )
-            })
-            .collect();
-        out.sort_by_key(|id| *id.as_bytes());
-        out
+    /// The Vessels whose local logs are on this node.  A state directory
+    /// that cannot be read is an error, never an empty node: the callers
+    /// (pending work, the TTL pass, the relaunch pass) would otherwise
+    /// take "I cannot see my Vessels" for "I have none".  One entry that
+    /// cannot be read is logged by name and skipped; the rest proceed.
+    fn local_vessels(&self) -> Result<Vec<ChronicleId>, String> {
+        let host = self.host();
+        vessels_in(
+            &self.config.state_dir,
+            |id| host.dir_for(id),
+            |m| eprintln!("taso-wardend[{}] {m}", self.config.warden.get()),
+        )
     }
 
     /// Nominate `vessel`'s Seal for `vc` (§3.1): the answer for the
@@ -6436,6 +6491,35 @@ mod tests {
         // The name the Vessel layer gives a dataset parses back to its id.
         let id = vessel_id(Namespace::from_bytes([7; 16]), b"s");
         assert_eq!(key_of_hex(&id_hex(id)), Some(*id.as_bytes()));
+    }
+
+    #[test]
+    fn an_unreadable_state_directory_is_an_error_not_an_empty_node() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warned = std::cell::RefCell::new(Vec::new());
+        let warn = |m: String| warned.borrow_mut().push(m);
+        let dir_for = |id: ChronicleId| tmp.path().join(id_hex(id));
+        // The directory is not there: refused, with its path.
+        let missing = tmp.path().join("gone");
+        let e = vessels_in(&missing, dir_for, warn).unwrap_err();
+        assert!(e.contains("reading the state directory"), "{e}");
+        assert!(e.contains("gone"), "{e}");
+        assert!(warned.borrow().is_empty());
+        // Readable: a stray file and a Vessel directory without a log are
+        // not Vessels; one whose log is garbage is warned about by name
+        // and skipped, and the answer is still an answer.
+        std::fs::write(tmp.path().join("notes.txt"), b"x").unwrap();
+        let empty = vessel_id(Namespace::from_bytes([1; 16]), b"a");
+        std::fs::create_dir(tmp.path().join(id_hex(empty))).unwrap();
+        let broken = vessel_id(Namespace::from_bytes([2; 16]), b"b");
+        let bdir = tmp.path().join(id_hex(broken));
+        std::fs::create_dir(&bdir).unwrap();
+        std::fs::write(bdir.join("seg-0"), b"not a log").unwrap();
+        let got = vessels_in(tmp.path(), dir_for, warn).unwrap();
+        assert!(got.is_empty(), "{got:?}");
+        let w = warned.borrow();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains(&id_hex(broken)), "{}", w[0]);
     }
 
     #[test]
