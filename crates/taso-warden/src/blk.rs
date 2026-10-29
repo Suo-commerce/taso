@@ -1230,8 +1230,21 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 let thaw = crate::timing::span("seal.thaw");
                 let thawed = self.mounts.thaw(&self.mountpoint);
                 drop(thaw);
-                sealed?;
-                thawed?;
+                // Both results are read: a thaw that failed after a Seal
+                // that failed is the urgent one (the Vessel is still
+                // frozen) and must not hide behind the Seal's error.
+                match (sealed, thawed) {
+                    (Ok(_), Ok(())) => {}
+                    (Err(e), Ok(())) => return Err(e),
+                    (Ok(_), Err(e)) => return Err(e.into()),
+                    (Err(seal), Err(thaw)) => {
+                        return Err(format!(
+                            "seal failed ({seal}) and {} is still frozen: thaw failed ({thaw})",
+                            self.mountpoint.display()
+                        )
+                        .into());
+                    }
+                }
             }
             (_, Some(src)) => {
                 return Err(format!(
@@ -1505,6 +1518,7 @@ mod tests {
         calls: RefCell<Vec<String>>,
         fail_mkfs: RefCell<bool>,
         busy: RefCell<bool>,
+        fail_thaw: RefCell<bool>,
     }
 
     impl Mounts for FakeMounts {
@@ -1567,6 +1581,9 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("thaw {}", dir.display()));
+            if *self.fail_thaw.borrow() {
+                return Err(io::Error::other("device gone"));
+            }
             self.frozen.borrow_mut().retain(|d| d != dir);
             Ok(())
         }
@@ -1717,6 +1734,31 @@ mod tests {
             ["freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a"]
         );
         assert!(p.mounts.frozen.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failed_thaw_is_named_even_when_the_seal_failed_too() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        // Thaw alone fails: its error comes back, not a false success.
+        *p.mounts.fail_thaw.borrow_mut() = true;
+        let e = p
+            .layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("device gone"), "{e}");
+        // Both fail: one error names both and the mount that is still frozen.
+        p.blkd.lock().unwrap().fail_seal = true;
+        let e = p
+            .layers(&a)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("seal failed"), "{e}");
+        assert!(e.contains("device gone"), "{e}");
+        assert!(e.contains("/mnt/taso/tank/v-a is still frozen"), "{e}");
     }
 
     #[test]
