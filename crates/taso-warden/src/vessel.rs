@@ -1280,11 +1280,21 @@ impl<P: Pool> Host<P> {
         let dir = self.dir_for(id);
         std::fs::create_dir_all(&dir)
             .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e.into())))?;
-        let layers = self.pool.layers(&self.dataset_for(id));
-        let (chronicle, _) = if registered {
-            Chronicle::open(&dir, self.coord.clone(), id, self.warden, layers)?
-        } else {
-            Chronicle::create(&dir, self.coord.clone(), id, self.warden, layers)?
+        // The fork probe (P5): `unborn.chronicle` split -- the pool handing out
+        // the Vessel's layer connection (under the Warden's lock on the block
+        // log) apart from the Chronicle's creation and its registration with
+        // the coordinator.
+        let layers = {
+            let _t = crate::timing::span("chronicle.layers");
+            self.pool.layers(&self.dataset_for(id))
+        };
+        let (chronicle, _) = {
+            let _t = crate::timing::span("chronicle.create");
+            if registered {
+                Chronicle::open(&dir, self.coord.clone(), id, self.warden, layers)?
+            } else {
+                Chronicle::create(&dir, self.coord.clone(), id, self.warden, layers)?
+            }
         };
         if chronicle.tail().lsn != Lsn::new(0) {
             return Err(VesselError::AlreadyExists(id));
