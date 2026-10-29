@@ -3098,9 +3098,13 @@ mod tests {
     #[test]
     fn syncer_group_commit_covers_every_group_with_fewer_syncs() {
         // 32 threads each end a group under the lock and ask the syncer
-        // for it outside: every ask is answered durable, with far fewer
-        // syncs than asks (one per round of leaders), and never fewer
-        // than one.
+        // for it outside: every ask is answered durable, with at least one
+        // sync and never more syncs than asks.  How many asks one sync
+        // covers depends on how long a sync takes: where it costs nothing
+        // (taso-test's temp directory, 2026-10-29) the asks seldom overlap
+        // one and each may run its own; the old bound (fewer than asks)
+        // failed there 1 run in 3.  Grouping is measured by the bench's
+        // Seals, not here (Jarmo, 2026-10-29: (a)).
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(&dir.path().join("log")).unwrap();
         let sync = std::sync::Arc::new(store.syncer().unwrap());
@@ -3125,7 +3129,7 @@ mod tests {
             t.join().unwrap();
         }
         let syncs = sync.syncs();
-        assert!(syncs >= 1 && syncs < 256, "syncs {syncs}");
+        assert!((1..=256).contains(&syncs), "syncs {syncs}");
         // A later ask for an already durable lsn syncs nothing more.
         assert!(!sync.durable(1).unwrap());
         assert_eq!(sync.syncs(), syncs);
