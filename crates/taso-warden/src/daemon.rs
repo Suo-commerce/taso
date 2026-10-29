@@ -224,7 +224,20 @@ impl StoreConf {
         Ok(match field(v, "store")? {
             Value::String(_) => StoreConf::Local(abs_path(v, "store")?),
             Value::Object(o) if o.contains_key("s3") => {
+                only_keys(&Value::Object(o.clone()), "store", &["s3"])?;
                 let s = &o["s3"];
+                only_keys(
+                    s,
+                    "store.s3",
+                    &[
+                        "endpoint",
+                        "region",
+                        "bucket",
+                        "access_key_id",
+                        "secret_key_file",
+                        "ca_file",
+                    ],
+                )?;
                 StoreConf::S3 {
                     endpoint: string(s, "endpoint")?,
                     region: string_or(s, "region", "garage")?,
@@ -1353,11 +1366,36 @@ impl Config {
     /// Parse and check a configuration.
     pub fn parse(json: &str) -> Result<Self, ConfigError> {
         let v: Value = serde_json::from_str(json).map_err(|e| bad(format!("not JSON: {e}")))?;
+        // Every object the Warden reads refuses keys it does not know: a
+        // misspelt key never silently leaves a bound unset.
+        only_keys(
+            &v,
+            "config",
+            &[
+                "warden",
+                "coordinator",
+                "root",
+                "storage",
+                "store",
+                "prefix",
+                "run_dir",
+                "state_dir",
+                "runtime",
+                "quiescence",
+                "batched_snapshots",
+                "sanction",
+                "vessels",
+                "source",
+                "purge",
+                "decider",
+            ],
+        )?;
         let warden = field(&v, "warden")?
             .as_u64()
             .filter(|w| *w > 0)
             .ok_or_else(|| bad("\"warden\" must be a positive integer"))?;
         let c = field(&v, "coordinator")?;
+        only_keys(c, "coordinator", &["local", "remote", "serve"])?;
         let coordinator = match (c.get("local"), c.get("remote")) {
             (Some(_), None) => CoordConf::Local {
                 path: abs_path(c, "local")?,
@@ -1378,6 +1416,20 @@ impl Config {
         };
         let root = Dataset::new(&string(&v, "root")?).map_err(|e| bad(e.to_string()))?;
         let r = field(&v, "runtime")?;
+        only_keys(
+            r,
+            "runtime",
+            &[
+                "rootfs",
+                "host_uid_base",
+                "memory_bytes",
+                "pids",
+                "landlock_shim",
+                "template_slot",
+                "args",
+                "env",
+            ],
+        )?;
         let runtime = RuntimeConf {
             rootfs: if r.get("rootfs").is_some() {
                 Some(abs_path(r, "rootfs")?)
@@ -5845,6 +5897,31 @@ mod tests {
                     v["runtime"]["host_uid_base"] = (u64::from(u32::MAX) - 65_536).into();
                     v["vessels"][1]["uid_slot"] = 1.into();
                 }),
+            ),
+            // A misspelt key is refused at every level, never ignored.
+            (
+                "top-level typo",
+                Box::new(|v| v["state_dirr"] = "/x".into()),
+            ),
+            (
+                "coordinator typo",
+                Box::new(|v| v["coordinator"]["sock"] = "/x".into()),
+            ),
+            (
+                "runtime typo leaves no bound unset",
+                Box::new(|v| v["runtime"]["memory_byte"] = 1.into()),
+            ),
+            (
+                "s3 typo",
+                Box::new(
+                    |v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "bucket": "b", "access_key_id": "a", "secret_key_file": "/s", "regoin": "g"}}),
+                ),
+            ),
+            (
+                "store typo beside s3",
+                Box::new(
+                    |v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "bucket": "b", "access_key_id": "a", "secret_key_file": "/s"}, "extra": 1}),
+                ),
             ),
             // A present value of the wrong type is refused, not defaulted.
             ("prefix number", Box::new(|v| v["prefix"] = 7.into())),
