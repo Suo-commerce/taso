@@ -6,7 +6,7 @@
 #   sudo scripts/e3-crash.sh round "SEQ" POINT MODE           one round, e.g. round "write seal" boundary:2 drop
 #   sudo scripts/e3-crash.sh run   [--subset] [--only KIND] [--limit N]
 #                                                            every round of the manifest (or of one point
-#                                                            kind: boundary, timing, hold), results tee'd
+#                                                            kind: boundary, timing, hold, takeover), results tee'd
 #
 # From the repository root, as root, on a host E3-1's `check` passes on.
 #
@@ -39,7 +39,18 @@
 # sent to taso-blkd after the last op for compact.written, sends it without
 # waiting, and cuts when the process says it is held there, so the point
 # is exact and never MISSED; the reborn stack runs without the hold; under
-# error the hold is released after the swap, so the held op meets the error).
+# error the hold is released after the swap, so the held op meets the error);
+# takeover:k or takeover:NAME (E3-4, one-pager rev. 6 § E3-4; spec D97):
+# the coordinator (taso-coordd) and the pack store live under $WORK/h, never
+# cut; Warden A runs on the device as always.  At the point (boundary k, or
+# the shipping hold NAME) A's device drops and A is frozen (SIGSTOP to its
+# Warden and taso-blkd, its containers paused); Warden B takes the Vessel
+# over from the coordinator and the store (and a forked child after it) and
+# is gathered as the reborn Warden is; then A is thawed and its agent asks
+# one Seal and one effect, which must not be acknowledged (line F); the
+# store's packs are listed before and after (lines H2, H3); and Warden C
+# takes over from B and rebuilds from the store once more (line H1).  Drop
+# only; run by hand (`run --only takeover`), not in the subset.
 #
 # The model's preconditions (P5-18, C7/M7): at most one fork and one
 # promote; a promote needs a fork before it and no parent `seal` between
@@ -56,7 +67,9 @@
 # images, results), $RUN (/run/taso-e3-crash: runc state, sockets), /mnt/e3,
 # the dm device e3crash and its loop, a second loop for the rebirth copy,
 # the ublk devices of this run's taso-blkd.  Refuses to start if any of
-# these is in use, or if any taso-sim runs.  Every wait is bounded; a
+# these is in use, or if any taso-sim runs (takeover rounds also touch
+# $WORK/h, $RUN/run-*, $RUN/{coord,blkb,blkc}.sock, $MNT/b and $MNT/c).
+# Every wait is bounded; a
 # teardown that fails is a HARNESS line, never a pass.  Env: E3_WORK,
 # E3_SIZE_MIB (2048), E3_ROWS (8), E3_STEP_MS (25), KEEP_FAILS (3: images
 # of the newest failing rounds kept).
@@ -79,6 +92,10 @@ DEVSH=$PWD/scripts/e3-device.sh
 ORACLE=$PWD/scripts/e3-oracle.py
 BIN=$PWD/target/release
 SOCK=$RUN/blk.sock
+# E3-4 (takeover rounds only): the coordinator, the store and the other nodes, never on the cut device.
+HDIR=$WORK/h
+COORD_SOCK=$RUN/coord.sock
+COORD_PID=; declare -a TK_PIDS=()
 
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 say() { printf '== %s\n' "$*"; }
@@ -113,6 +130,16 @@ for n in (2, 3):
                     print(f"{s}|timing:{k}+{d}|drop")
         if n == 2 or not subset:
             print(f"{s}|boundary:{n}|error")
+# E3-4: the takeover point (one-pager rev. 6): every pair over write, seal,
+# effect, fork at each boundary, and the two shipping holds; drop only; not
+# in the subset (run once by hand, decided 2026-10-29).
+if not subset:
+    for seq in itertools.product(["write", "seal", "effect", "fork"], repeat=2):
+        if valid(seq):
+            for k in (1, 2):
+                print(f"{' '.join(seq)}|takeover:{k}|drop")
+    print("write seal|takeover:seal.shipped|drop")
+    print("write effect|takeover:ledger.shipped|drop")
 # E3-3c: one round per hold site and mode, the shortest sequence reaching it
 for name, s in (("seal.recorded", "write seal"), ("seal.shipped", "write seal"),
                 ("ledger.shipped", "write effect"), ("fork.branched", "write seal fork"),
@@ -140,6 +167,7 @@ for t in runc python3 cargo dmsetup losetup mkfs.ext4 fuser findmnt stat pgrep n
 mountpoint -q "$D" 2>/dev/null && die "$D is mounted: another round? (umount it)"
 dmsetup info "$DEVNAME" >/dev/null 2>&1 && die "the dm device $DEVNAME exists: an earlier round? (scripts/e3-device.sh down $DEVNAME)"
 [[ ! -S "$SOCK" ]] || die "$SOCK exists: a taso-blkd of an earlier round? (pgrep -af taso-blkd)"
+for x in "$COORD_SOCK" "$RUN/blkb.sock" "$RUN/blkc.sock"; do [[ ! -S "$x" ]] || die "$x exists: a takeover round's process left? (pgrep -af 'taso-(coordd|blkd)')"; done
 pgrep -x taso-sim >/dev/null && die "a taso-sim runs (a bench or an earlier round); E3 tells agents apart by pid and needs none but its own"
 "$DEVSH" check >/dev/null 2>&1 || die "scripts/e3-device.sh check does not pass here; run it for the reason"
 mkdir -p "$WORK" "$RUN" "$MNT"
@@ -147,7 +175,7 @@ mkdir -p "$WORK" "$RUN" "$MNT"
 
 say "building (release)"
 cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock -p taso-blk
-for b in taso-wardend taso-sim taso-landlock taso-blkd; do [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"; done
+for b in taso-wardend taso-sim taso-landlock taso-blkd taso-coordd taso-logcheck; do [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"; done
 ROOTFS=$WORK/rootfs
 rm -rf "$ROOTFS"
 copy_with_libs() {
@@ -230,7 +258,13 @@ teardown() { # every piece of a round, guarded
     set +e
     [[ -n "$WARDEN_PID" ]] && kill -9 "$WARDEN_PID" 2>/dev/null; WARDEN_PID=
     [[ -n "$BLKD_PID" ]] && { kill -9 "$BLKD_PID" 2>/dev/null; wait "$BLKD_PID" 2>/dev/null; }; BLKD_PID=
-    for c in $(runc --root "$RUN/run/runc" list -q 2>/dev/null); do runc --root "$RUN/run/runc" delete --force "$c" 2>/dev/null; done
+    local p; for p in "${TK_PIDS[@]}"; do kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; done; TK_PIDS=()
+    [[ -n "$COORD_PID" ]] && { kill -9 "$COORD_PID" 2>/dev/null; wait "$COORD_PID" 2>/dev/null; }; COORD_PID=
+    local rr; for rr in "$RUN"/run/runc "$RUN"/run-*/runc; do
+        [[ -d "$rr" ]] || continue
+        # A takeover round pauses A's containers: resumed first, so the kill reaches them.
+        for c in $(runc --root "$rr" list -q 2>/dev/null); do runc --root "$rr" resume "$c" 2>/dev/null; runc --root "$rr" delete --force "$c" 2>/dev/null; done
+    done
     for m in $(awk -v r="$MNT" '$5 == r || index($5, r "/") == 1 { print length($5), $5 }' /proc/self/mountinfo | sort -rn | cut -d' ' -f2-); do
         [[ "$m" == "$MNT" ]] || umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
     done
@@ -239,18 +273,20 @@ teardown() { # every piece of a round, guarded
     # And every loop over a file of ours, remembered or not (the leak above).
     for l in $(losetup -j "$WORK/rebirth.img" 2>/dev/null | cut -d: -f1; losetup -a 2>/dev/null | grep -F "$WORK/" | cut -d: -f1); do losetup -d "$l" 2>/dev/null; done
     dmsetup info "$DEVNAME" >/dev/null 2>&1 && "$DEVSH" down "$DEVNAME" >/dev/null 2>&1
-    rm -f "$WORK/dev.img" "$WORK/rebirth.img" "$SOCK"
-    rm -rf "$RUN/run" "$RUN/read" "$RUN/hold"
+    rm -f "$WORK/dev.img" "$WORK/rebirth.img" "$SOCK" "$COORD_SOCK" "$RUN/blkb.sock" "$RUN/blkc.sock"
+    rm -rf "$RUN/run" "$RUN"/run-* "$RUN/read" "$RUN/hold" "$HDIR"
     KNOWN=" "
     set -e
 }
 trap 'teardown' EXIT
 
-config() { # config SUBJECT -> $RUN/w.json
-    python3 -I - "$1" "$D" "$RUN" "$MNT" "$ROOTFS" "$SOCK" "$ROWS" >"$RUN/w.json" <<'PY'
+config() { # config SUBJECT [OUT [OVERRIDES]] -> OUT ($RUN/w.json)
+    # OVERRIDES (JSON, takeover rounds): top-level keys replaced; "takeover"
+    # goes to the Vessel's entry, "child" adds the forked child's entry.
+    python3 -I - "$1" "$D" "$RUN" "$MNT" "$ROOTFS" "$SOCK" "$ROWS" "${3:-null}" >"${2:-$RUN/w.json}" <<'PY'
 import json, sys
-subject, d, run, mnt, rootfs, sock, rows = sys.argv[1:]
-print(json.dumps({
+subject, d, run, mnt, rootfs, sock, rows, over = sys.argv[1:]
+cfg = {
     "warden": 1, "coordinator": {"local": d + "/coord.redb"}, "root": "e3/r",
     "storage": {"blk": {"socket": sock, "mounts": mnt, "spool": d + "/spool"}},
     "state_dir": d + "/state", "store": d + "/store", "prefix": "vessels", "run_dir": run + "/run",
@@ -260,7 +296,16 @@ print(json.dumps({
                          "--synchronous", "full", "--db", "/work/state.db", "--stats", "/work/sim-stats.json"],
                 "memory_bytes": 268435456, "pids": 64},
     "vessels": [{"namespace": "e3" * 16, "subject": subject, "uid_slot": 1, "forks": {"slots": [2]}}],
-}, indent=1))
+}
+o = json.loads(over) or {}
+takeover, child = o.pop("takeover", None), o.pop("child", None)
+cfg.update(o)
+if takeover:
+    cfg["vessels"][0]["takeover"] = takeover
+if child:   # after its parent: parent before child (P3 C6)
+    cfg["vessels"].append({"namespace": "e3" * 16, "subject": child["subject"], "uid_slot": 2,
+                           "fork": {"parent": subject, "seal": child["seal"]}, "takeover": child["takeover"]})
+print(json.dumps(cfg, indent=1))
 PY
 }
 start_stack() { # start_stack TAG [VAR=VALUE ...]: taso-blkd and the Warden on $D, with the env given; logs $R/*-TAG.err
@@ -274,12 +319,215 @@ start_stack() { # start_stack TAG [VAR=VALUE ...]: taso-blkd and the Warden on $
     env "${@:2}" "$BIN/taso-wardend" "$RUN/w.json" >"$R/warden-$1.out" 2>"$R/warden-$1.err" & WARDEN_PID=$!
 }
 
+# ── E3-4: the takeover round's other nodes ────────────────────────────
+# One-pager rev. 6 § E3-4; spec D97.  Every process here is in TK_PIDS or
+# COORD_PID, so teardown reaches it; every wait is bounded.
+coord_up() { # the coordinator, its redb and the pack store under $HDIR (never cut)
+    mkdir -p "$HDIR/store"; rm -f "$COORD_SOCK"
+    "$BIN/taso-coordd" "$HDIR/coord.redb" "$COORD_SOCK" 2>>"$R/coordd.err" & COORD_PID=$!
+    local i; for i in $(seq 100); do [[ -S "$COORD_SOCK" ]] && return 0; sleep 0.05; done
+    return 1
+}
+tk_over() { # tk_over WARDEN NODE TAKEOVER CHILD -> the config overrides of node NODE (b, c) under $HDIR
+    python3 -I - "$@" "$COORD_SOCK" "$HDIR" "$RUN" "$MNT" <<'PY'
+import json, sys
+w, n, takeover, child, coord, h, run, mnt = sys.argv[1:]
+print(json.dumps({"warden": int(w), "coordinator": {"remote": coord}, "root": "e3/" + n,
+                  "storage": {"blk": {"socket": f"{run}/blk{n}.sock", "mounts": f"{mnt}/{n}", "spool": f"{h}/{n}/spool"}},
+                  "state_dir": f"{h}/{n}/state", "store": f"{h}/store", "run_dir": f"{run}/run-{n}",
+                  "takeover": json.loads(takeover), "child": json.loads(child)}))
+PY
+}
+start_node() { # start_node TAG CONFIG BLKLOG SOCKET: another node's taso-blkd and Warden -> NODE_W; logs $R/*-TAG.*
+    local SOCK=$4 i
+    rm -f "$SOCK"; mkdir -p "$(dirname "$3")"
+    "$BIN/taso-blkd" "$3" "$SOCK" 2>>"$R/blkd-$1.err" & TK_PIDS+=($!)
+    for i in $(seq 600); do blk_raw stats >/dev/null 2>&1 && break; sleep 0.1; done
+    blk_raw stats >/dev/null 2>&1 || return 1
+    "$BIN/taso-wardend" "$2" >"$R/warden-$1.out" 2>"$R/warden-$1.err" & NODE_W=$!; TK_PIDS+=("$NODE_W")
+}
+node_down() { # node_down SOCKET MOUNT_ROOT RUNC_ROOT [WARDEN_PID]: the Warden killed, its containers deleted,
+              # every mount under MOUNT_ROOT gone (innermost first), its taso-blkd told to quit (its devices detached)
+    local SOCK=$1 m c i
+    [[ -n "${4:-}" ]] && { kill -9 "$4" 2>/dev/null; wait "$4" 2>/dev/null; }
+    for c in $(runc --root "$3" list -q 2>/dev/null); do runc --root "$3" resume "$c" 2>/dev/null; runc --root "$3" delete --force "$c" 2>/dev/null; done
+    for m in $(awk -v r="$2" '$5 == r || index($5, r "/") == 1 { print length($5), $5 }' /proc/self/mountinfo | sort -rn | cut -d' ' -f2-); do
+        umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+    done
+    blk_raw quit >/dev/null 2>&1 || true
+    for i in $(seq 100); do [[ -S "$SOCK" ]] || return 0; sleep 0.1; done
+    return 1
+}
+drain_node() { # drain_node TAG SOCKET SUBJECT WARDEN_PID: every agent of that Warden told `exit`; the Vessel's own
+               # agent's turn taken -> DRAIN_DS, DRAIN_RESUME, DRAIN_WHY; fails if the Warden is still up after 180 s
+    local SOCK=$2 subject=$3 deadline=$((SECONDS + 180)) a info pdev work
+    DRAIN_DS=; DRAIN_RESUME=; DRAIN_WHY="no agent of Warden $1 came up"
+    while ((SECONDS < deadline)) && kill -0 "$4" 2>/dev/null; do
+        [[ -n "$DRAIN_DS" ]] || DRAIN_DS=$(grep -m1 -o "\] $subject: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
+        if wait_agent 1; then
+            a=$AGENT
+            if [[ -n "$DRAIN_DS" && -z "$DRAIN_RESUME" ]]; then
+                info=$(blk info "$(blk find "$DRAIN_DS")" 2>&1) || true
+                pdev=$(sed -n 's/.* dev=\(\/dev\/[^ ]*\).*/\1/p' <<<"$info")
+                work=$(findmnt -N "$a" -no MAJ:MIN /work 2>/dev/null || true)
+                if [[ -n "$pdev" && -n "$work" && "$work" == "$(stat -c '%Hr:%Lr' "$pdev")" ]]; then
+                    DRAIN_RESUME=$(ready_turn "$a"); DRAIN_WHY=
+                else
+                    DRAIN_WHY="agent $a: /work on ${work:-nothing}; the branch: ${info:-no answer}; its device ${pdev:-none}${pdev:+ is $(stat -c '%Hr:%Lr' "$pdev" 2>/dev/null)}"
+                fi
+            fi
+            step "$a" exit 30 >/dev/null || true
+        fi
+    done
+    kill -0 "$4" 2>/dev/null && return 1
+    [[ -n "$DRAIN_DS" ]] || DRAIN_DS=$(grep -m1 -o "\] $subject: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
+    return 0
+}
+gather_none() { # gather_none TAG SUBJECT -> a.json for a Warden that named no dataset for the Vessel (it never ran it)
+    python3 -I - "$2" "$R/warden-$1.out" "$R/warden-$1.err" "$R/blkd-$1.err" <<'PY'
+import json, os, sys
+subject, out, err = sys.argv[1:4]
+lines = lambda f: open(f, errors="replace").read().splitlines() if os.path.exists(f) else []
+said = next((l[len(subject) + 2:] for l in lines(out) if l.startswith(subject + ": ")), None) \
+    or next((l for l in lines(err) if l.startswith("taso-wardend: starting:")), None)
+report = "".join(open(f, errors="replace").read() for f in sys.argv[3:] if os.path.exists(f))
+print(json.dumps({"seals": [], "forks": [], "report": report, "resume_turn": None,
+                  "resume_why": "the Warden named no dataset for the Vessel", "acks_after_error": 0,
+                  "opened": False, "not_run": said or "no dataset line, and no word why"}, indent=1))
+PY
+}
+packs_list() { # packs_list OUT: every pack file in the store, "sha256  path", sorted
+    (cd "$HDIR/store" && find . -path '*/pack/*' -type f -print0 | sort -z | xargs -0 -r sha256sum) >"$1"
+}
+is_ack() { # is_ack OP REPLY: the reply acknowledges the op
+    case "$1" in
+        seal) [[ -n "$(jget "$2" sealed)" ]] ;;
+        effect) [[ "$(jget "$2" result)" == released ]] ;;
+        fork) [[ -n "$(jget "$2" child)" ]] ;;
+        *) [[ -n "$(jget "$2" rows)" ]] ;;
+    esac
+}
+owner_of() { python3 -I -c 'import json,sys; o=json.load(open(sys.argv[1]))["ownership"]; print(json.dumps({"holder": o["holder"], "epoch": o["epoch"]}))' "$1"; }
+
+takeover_tail() { # E3-4, the rest of a takeover round from the point on; round's locals in scope
+    local ds id owner shipped childj=null cds cid cseal t0 ms c op acks=0 fenced wb wc a_ok=true
+    local -a thaw=()
+    # Read as an operator would, just before the point: who holds the Vessel
+    # (B's takeover names exactly that) and the shipped anchor (line 1, D97).
+    ds=$(grep -m1 -o "\] $subject: dataset .*" "$R/warden-1.err" | sed 's/.*: dataset //')
+    [[ -n "$ds" ]] || { echo "HARNESS $tag: no dataset line for $subject in warden-1.err"; return; }
+    id=${ds##*/v-}
+    "$BIN/taso-logcheck" "$COORD_SOCK" "$D/state" "$id" >"$R/a-logcheck.json" 2>"$R/a-logcheck.err" \
+        || { echo "HARNESS $tag: taso-logcheck of A's Vessel: $(head -c 200 "$R/a-logcheck.err")"; return; }
+    owner=$(owner_of "$R/a-logcheck.json"); shipped=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["shipped"]["lsn"])' "$R/a-logcheck.json")
+    if [[ -n "$child" ]]; then
+        cds=$(grep -m1 -o "\] $child: dataset .*" "$R/warden-1.err" | sed 's/.*: dataset //')
+        cseal=$(grep -m1 -o "forked \"$child\" .* at Seal lsn [0-9]*" "$R/warden-1.err" | grep -o '[0-9]*$' || true)
+        [[ -n "$cds" && -n "$cseal" ]] || { echo "HARNESS $tag: the child $child's dataset or fork Seal is not in warden-1.err"; return; }
+        cid=${cds##*/v-}
+        "$BIN/taso-logcheck" "$COORD_SOCK" "$D/state" "$cid" >"$R/a-child-logcheck.json" 2>>"$R/a-logcheck.err" \
+            || { echo "HARNESS $tag: taso-logcheck of the child $child"; return; }
+        childj="{\"subject\": \"$child\", \"seal\": $cseal, \"takeover\": $(owner_of "$R/a-child-logcheck.json")}"
+    fi
+    # 3. the point: A's disk drops, and A falls silent -- frozen, not killed.
+    t0=$(date +%s%N); "$DEVSH" "$mode" "$DEVNAME" >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    kill -STOP "$WARDEN_PID" "$BLKD_PID" 2>/dev/null || true
+    for c in $(runc --root "$RUN/run/runc" list -q 2>/dev/null); do runc --root "$RUN/run/runc" pause "$c" 2>>"$R/harness.err" || true; done
+    # shellcheck disable=SC2086
+    oracle cut "$O" --swap-ms "$ms" $missed $held_flag
+    # 4. Warden B takes the Vessel over from the coordinator and the store (the child after it).
+    mkdir -p "$HDIR/b/state" "$HDIR/b/spool" "$MNT/b"
+    config "$subject" "$RUN/w-b.json" "$(tk_over 2 b "$owner" "$childj")" || { echo "HARNESS $tag: B's config"; return; }
+    start_node 2 "$RUN/w-b.json" "$HDIR/b/blk.log" "$RUN/blkb.sock" || { echo "HARNESS $tag: B's taso-blkd did not start"; return; }
+    wb=$NODE_W
+    drain_node 2 "$RUN/blkb.sock" "$subject" "$wb" || { echo "HARNESS $tag: Warden B did not finish in 180 s"; return; }
+    if [[ -n "$DRAIN_DS" ]]; then
+        SOCK=$RUN/blkb.sock GATHER_TAG=2 gather "$subject" "$DRAIN_DS" "$DRAIN_RESUME" 0 "$mode" "$DRAIN_WHY" "" >"$R/a.json" \
+            || { echo "HARNESS $tag: gather from B"; return; }
+    else
+        gather_none 2 "$subject" >"$R/a.json"
+    fi
+    node_down "$RUN/blkb.sock" "$MNT/b" "$RUN/run-b/runc" || echo "B's taso-blkd did not quit" >>"$R/harness.err"
+    packs_list "$R/packs-before.txt"
+    # 5. A wakes up believing it holds the Vessel: one Seal and one effect asked (line F).
+    [[ -n "$hname" ]] && : >"$RUN/hold/$hname.release"
+    for c in $(runc --root "$RUN/run/runc" list -q 2>/dev/null); do runc --root "$RUN/run/runc" resume "$c" 2>>"$R/harness.err" || true; done
+    kill -CONT "$BLKD_PID" "$WARDEN_PID" 2>/dev/null || true
+    if [[ -n "$inflight" ]]; then   # the held op's own reply, if it comes now
+        if reply "$P" 30; then
+            thaw+=("held ${ops[-1]}: $REPLY"); is_ack "${ops[-1]}" "$REPLY" && acks=$((acks + 1))
+        else
+            thaw+=("held ${ops[-1]}: no reply ($WHY)"); a_ok=false   # the agent is still inside it: nothing more to ask
+        fi
+    fi
+    if [[ "$a_ok" == true ]]; then
+        for op in seal effect; do
+            if step "$P" "$op" 30; then
+                thaw+=("$op: $REPLY"); is_ack "$op" "$REPLY" && acks=$((acks + 1))
+            else
+                thaw+=("$op: no reply ($WHY)"); break
+            fi
+        done
+    fi
+    fenced=$(grep -m1 -hoE '.{0,80}(Fenced|StaleEpoch|stale epoch|EpochMismatch|NotHolder).{0,80}' "$R/warden-1.err" "$R/warden-1.out" 2>/dev/null || true)
+    printf '%s\n' "${thaw[@]}" >"$R/thaw.txt"
+    node_down "$SOCK" "$MNT/e3" "$RUN/run/runc" "$WARDEN_PID" || echo "A's taso-blkd did not quit" >>"$R/harness.err"
+    WARDEN_PID=; kill -9 "$BLKD_PID" 2>/dev/null; wait "$BLKD_PID" 2>/dev/null; BLKD_PID=
+    packs_list "$R/packs-after.txt"
+    # 6. Warden C takes over from B and rebuilds from the store once more (line H1).
+    if [[ -n "$DRAIN_DS" ]] && "$BIN/taso-logcheck" "$COORD_SOCK" "$HDIR/b/state" "$id" >"$R/b-logcheck.json" 2>"$R/b-logcheck.err"; then
+        mkdir -p "$HDIR/c/state" "$HDIR/c/spool" "$MNT/c"
+        config "$subject" "$RUN/w-c.json" "$(tk_over 3 c "$(owner_of "$R/b-logcheck.json")" null)" || { echo "HARNESS $tag: C's config"; return; }
+        start_node 3 "$RUN/w-c.json" "$HDIR/c/blk.log" "$RUN/blkc.sock" || { echo "HARNESS $tag: C's taso-blkd did not start"; return; }
+        wc=$NODE_W
+        drain_node 3 "$RUN/blkc.sock" "$subject" "$wc" || { echo "HARNESS $tag: Warden C did not finish in 180 s"; return; }
+        if [[ -n "$DRAIN_DS" ]]; then
+            SOCK=$RUN/blkc.sock GATHER_TAG=3 gather "$subject" "$DRAIN_DS" "$DRAIN_RESUME" 0 "$mode" "$DRAIN_WHY" "" >"$R/c.json" \
+                || { echo "HARNESS $tag: gather from C"; return; }
+        else
+            gather_none 3 "$subject" >"$R/c.json"
+        fi
+        node_down "$RUN/blkc.sock" "$MNT/c" "$RUN/run-c/runc" || echo "C's taso-blkd did not quit" >>"$R/harness.err"
+    else
+        echo '{"skipped": "B never ran the Vessel, or its ownership could not be read"}' >"$R/c.json"
+    fi
+    # What the oracle needs beyond the reborn Warden's own (lines 1, F, H; 5a).
+    python3 -I - "$R" "$owner" "$shipped" "$childj" "$acks" "$fenced" "${child:-}" <<'PY'
+import json, os, re, sys
+r, owner, shipped, childj, acks, fenced, child = sys.argv[1:]
+packs = lambda f: dict(reversed(l.split(None, 1)) for l in open(os.path.join(r, f)).read().splitlines() if l.strip())
+before, after = packs("packs-before.txt"), packs("packs-after.txt")
+a = json.load(open(os.path.join(r, "a.json")))
+ch = None
+if child:
+    err = open(os.path.join(r, "warden-2.err"), errors="replace").read()
+    out = open(os.path.join(r, "warden-2.out"), errors="replace").read() if os.path.exists(os.path.join(r, "warden-2.out")) else ""
+    said = next((l[len(child) + 2:] for l in out.splitlines() if l.startswith(child + ": ")), None)
+    ch = dict(json.loads(childj), ran=bool(re.search(rf" {re.escape(child)}: (Opened\(|reborn at epoch)", err)), refused=said)
+a["takeover"] = {
+    "owner": json.loads(owner), "shipped_lsn": int(shipped), "child": ch,
+    "thaw": {"acks": int(acks), "replies": open(os.path.join(r, "thaw.txt")).read().splitlines(), "fenced": fenced or None},
+    "packs": {"added": sorted(set(after) - set(before)), "changed": sorted(n for n in before if n in after and after[n] != before[n]),
+              "gone": sorted(set(before) - set(after))},
+    "after_thaw": json.load(open(os.path.join(r, "c.json"))),
+}
+json.dump(a, open(os.path.join(r, "a.json"), "w"), indent=1)
+PY
+    oracle check "$O" --after "$R/a.json" || true
+}
+
 # ── one round ─────────────────────────────────────────────────────────
 round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's files in $R
     local seq=$1 point=$2 mode=$3 subject O="$R/r.json"
     subject="e3-$(date +%s%N | tail -c 9)"
-    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 ct cr hname="" held_flag="" log_ino=""
+    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 ct cr hname="" held_flag="" log_ino="" tk="" inflight=""
     local -a ops henv=(); read -ra ops <<<"$seq"
+    if [[ "$kind" == takeover ]]; then
+        # E3-4: the point is a boundary or a shipping hold, driven as those are;
+        # what follows the point is takeover_tail's.
+        tk=1
+        if [[ "$at" =~ ^[0-9]+$ ]]; then kind=boundary; else kind=hold; fi
+    fi
     if [[ "$kind" == hold ]]; then
         # The held op is the last one; compact.written holds a `compact` sent after it.
         hname=$at; k=${#ops[@]}; [[ "$hname" == compact.written ]] && k=$((k + 1))
@@ -296,7 +544,14 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
     mkfs.ext4 -q -F "/dev/mapper/$DEVNAME" && mkdir -p "$D" && mount -o errors=remount-ro "/dev/mapper/$DEVNAME" "$D" \
         || { echo "HARNESS $tag: mkfs or mount of the device"; return; }
     mkdir -p "$D/store" "$D/state" "$D/spool" "$RUN/run"
-    config "$subject" || { echo "HARNESS $tag: config"; return; }
+    if [[ -n "$tk" ]]; then
+        # E3-4: the coordinator and the pack store are shared by every node, never on the cut device.
+        coord_up || { echo "HARNESS $tag: taso-coordd did not start (see $R/coordd.err)"; return; }
+        config "$subject" "$RUN/w.json" "{\"coordinator\": {\"remote\": \"$COORD_SOCK\"}, \"store\": \"$HDIR/store\"}" \
+            || { echo "HARNESS $tag: config"; return; }
+    else
+        config "$subject" || { echo "HARNESS $tag: config"; return; }
+    fi
     start_stack 1 "${henv[@]}" || { echo "HARNESS $tag: taso-blkd did not start"; return; }
     wait_agent 120 || { echo "HARNESS $tag: no agent came up (see $R/warden-1.err)"; return; }; P=$AGENT
     turn=$(( $(ready_turn "$P") + 1 ))
@@ -315,8 +570,9 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
             : >"$RUN/hold/$hname.arm"
             send "$P" "$op" || { echo "HARNESS $tag: the op file could not be written"; return; }
             held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached"; return; }
+            inflight=1
             if [[ -f /proc/$P/root/tmp/e3/reply.${NEXT[$P]} ]]; then
-                reply "$P" 5 || { echo "HARNESS $tag: the reply vanished: $WHY"; return; }; rep=$REPLY
+                reply "$P" 5 || { echo "HARNESS $tag: the reply vanished: $WHY"; return; }; rep=$REPLY; inflight=
                 if [[ "$op" == seal && -n "$(jget "$rep" sealed)" ]]; then
                     oracle acknowledged "$O" seal turn="$(jget "$rep" turn)" seal="$(jget "$rep" sealed)"
                 else
@@ -389,6 +645,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
         blk_raw compact >"$R/compact.out" 2>&1 &
         held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached (compact said: $(cat "$R/compact.out"))"; return; }
     fi
+    if [[ -n "$tk" ]]; then takeover_tail; return; fi
     # 3. the point
     local t0; t0=$(date +%s%N); "$DEVSH" "$mode" "$DEVNAME" >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
     # shellcheck disable=SC2086
@@ -462,6 +719,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
 }
 
 gather() { # gather SUBJECT DATASET RESUME ACKS_ERR MODE RESUME_WHY LOG_INO_BEFORE -> a.json on stdout
+    # The reborn Warden's logs are $R/*-$GATHER_TAG.* (2; a takeover round's C is 3), its taso-blkd at $SOCK.
     local subject=$1 ds=$2 branch layer tg lsn birth seals="" rd="$MNT/.read" tmp="$RUN/read" b dev ok lt
     birth=$(grep -m1 -o "\] $subject: birth Seal at lsn [0-9]*" "$R/warden-1.err" | grep -o '[0-9]*$' || true)
     branch=$(blk find "$ds") || return 1
@@ -493,14 +751,16 @@ PY
     done
     local forks report
     forks=$(cat "$R/warden-1.err" "$R/warden-2.err" 2>/dev/null | grep -o "\] $subject-fork-[0-9]*: dataset " | sed 's/^\] //; s/: dataset $//' | sort -u | tr '\n' ' ')
-    report="$R/blkd-2.err $R/warden-2.err"; [[ "$5" == error ]] && report="$report $R/blkd-1.err $R/warden-1.err"
+    local gt=${GATHER_TAG:-2}
+    report="$R/blkd-$gt.err $R/warden-$gt.err"; [[ "$5" == error ]] && report="$report $R/blkd-1.err $R/warden-1.err"
     # Did the reborn Warden open the Vessel?  Its Opened line on stderr says
     # so; if absent, its own word about the Vessel on stdout says why (a
     # refusal, a failed open).  Without this a Vessel never reborn was graded
     # on taso-blkd's layers alone (F2, 2026-10-28).
     local opened=false not_run=""
-    grep -q " $subject: Opened(" "$R/warden-2.err" 2>/dev/null && opened=true
-    [[ "$opened" == true ]] || not_run=$(grep -m1 "^$subject: " "$R/warden-2.out" 2>/dev/null | cut -c$((${#subject} + 3))- || true)
+    # A Vessel rebuilt from the store says "reborn at epoch" instead (E3-4: B and C).
+    grep -qE " $subject: (Opened\(|reborn at epoch)" "$R/warden-$gt.err" 2>/dev/null && opened=true
+    [[ "$opened" == true ]] || not_run=$(grep -m1 "^$subject: " "$R/warden-$gt.out" 2>/dev/null | cut -c$((${#subject} + 3))- || true)
     # The log taso-blkd reopened (compact.written: it must be the one from before the held compaction).
     local ino_after=""; [[ -n "$7" ]] && ino_after=$(stat -c %i "$D/blk.log" 2>/dev/null || true)
     # shellcheck disable=SC2086
@@ -558,7 +818,7 @@ case "${1:-}" in
     run)
         shift; sub=""; limit=0; only=""
         while (($#)); do case "$1" in --subset) sub=--subset ;; --only) only=$2; shift ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--only KIND] [--limit N]" ;; esac; shift; done
-        [[ -z "$only" || "$only" =~ ^(boundary|timing|hold)$ ]] || die "--only boundary|timing|hold"
+        [[ -z "$only" || "$only" =~ ^(boundary|timing|hold|takeover)$ ]] || die "--only boundary|timing|hold|takeover"
         pick() { manifest "$sub" | { if [[ -n "$only" ]]; then grep -F "|$only:" || true; else cat; fi; }; }
         total=$(pick | wc -l); n=0
         say "$total rounds$( ((limit > 0)) && echo ", the first $limit"); results in $OUT/results.txt"
