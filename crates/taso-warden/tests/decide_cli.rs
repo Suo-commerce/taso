@@ -51,7 +51,7 @@ fn pending_verdict_like_and_resend() {
     std::fs::write(
         &cfg,
         format!(
-            r#"{{"warden": 1, "coordinator": {{"remote": "/nonexistent/coord.sock"}},
+            r#"{{"warden": 1, "coordinator": {{"remote": "/nonexistent/coord.sock"}}, "storage": "zfs",
                "root": "tank/vessel", "state_dir": "/var/lib/taso/state",
                "store": "/srv/taso/store", "run_dir": "{}",
                "runtime": {{"rootfs": "/srv/taso/rootfs", "host_uid_base": 200000,

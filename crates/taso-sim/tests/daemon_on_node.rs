@@ -86,6 +86,7 @@ fn config_with(
     let v = json!({
         "warden": warden,
         "coordinator": { "local": tmp.join("coord.redb") },
+        "storage": "zfs",
         "root": format!("{base}/{node}"),
         "state_dir": tmp.join(node).join("state"),
         "store": tmp.join("store"),

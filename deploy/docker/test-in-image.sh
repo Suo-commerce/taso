@@ -131,6 +131,7 @@ cat >"$WORK/wardend.json" <<EOF
 {
   "warden": 1,
   "coordinator": { "local": "/var/lib/taso/coord.redb" },
+  "storage": "zfs",
   "root": "$DS",
   "state_dir": "/var/lib/taso/state",
   "store": "/var/lib/taso/store",

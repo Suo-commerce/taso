@@ -149,6 +149,7 @@ args = ["/usr/bin/taso-sim"] + "${SIM_ARGS[*]}".split() + ["--samples", "/work/s
 json.dump({
     "warden": 1,
     "coordinator": json.loads('$COORD_JSON'),
+    "storage": "zfs",
     "root": "$root",
     "state_dir": "$WORK/w-$r/state",
     "store": json.loads('$STORE_JSON'),

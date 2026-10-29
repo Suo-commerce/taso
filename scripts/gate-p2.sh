@@ -154,6 +154,7 @@ takeover = {"holder": int(takeover.split("@")[0]), "epoch": int(takeover.split("
 json.dump({
     "warden": int(warden),
     "coordinator": {"remote": "$SOCK"},
+    "storage": "zfs",
     "root": "$BASE/" + node,
     "state_dir": "$WORK/" + node + "/state",
     "store": json.loads('$STORE_JSON'),

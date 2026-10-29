@@ -156,6 +156,7 @@ if landlock == "1":
 json.dump({
     "warden": 1,
     "coordinator": {"remote": sock},
+    "storage": "zfs",
     "root": base,
     "state_dir": f"{work}/state",
     "store": f"{work}/store",
@@ -188,6 +189,7 @@ if landlock == "1":
 json.dump({
     "warden": 1,
     "coordinator": {"remote": sock},
+    "storage": "zfs",
     "root": base,
     "state_dir": f"{work}/state",
     "store": f"{work}/store",

@@ -214,6 +214,7 @@ cat >"$CONFIG" <<EOF
 {
   "warden": 1,
   "coordinator": { "local": "$WORK/coord.redb" },
+  "storage": "zfs",
   "root": "$BASE",
   "state_dir": "$WORK/state",
   "store": "$WORK/store",

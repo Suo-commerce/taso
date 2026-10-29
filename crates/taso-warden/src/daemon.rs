@@ -882,12 +882,15 @@ pub struct CandidateConf {
     pub exclude: std::collections::BTreeSet<PathClass>,
 }
 
-/// Where a node's Vessels live.
+/// Where a node's Vessels live.  The config says which (`"storage"`);
+/// there is no default, so a Warden never assumes an engine.  The block
+/// log is Taso's storage; ZFS stays while the tests and the gates still
+/// run on it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StorageConf {
-    /// ZFS datasets under `root`.
+    /// ZFS datasets under `root` (`"storage": "zfs"`).
     Zfs,
-    /// The block log served by `taso-blkd`.
+    /// The block log served by `taso-blkd` (`"storage": {"blk": {...}}`).
     Blk {
         /// The daemon's control socket.
         socket: PathBuf,
@@ -918,7 +921,9 @@ impl StorageConf {
 
 fn storage_conf(v: &Value) -> Result<StorageConf, ConfigError> {
     match v.get("storage") {
-        None => Ok(StorageConf::Zfs),
+        None => Err(bad(
+            "\"storage\" is required: \"zfs\", or {\"blk\": {\"socket\", \"mounts\", \"spool\"}}",
+        )),
         Some(Value::String(s)) if s == "zfs" => Ok(StorageConf::Zfs),
         Some(o @ Value::Object(m)) if m.contains_key("blk") => {
             only_keys(o, "storage", &["blk"])?;
@@ -4852,6 +4857,7 @@ mod tests {
         "warden": 1,
         "coordinator": { "local": "/var/lib/taso/coord.redb", "serve": "/run/taso/coord.sock" },
         "root": "tank/vessel",
+        "storage": "zfs",
         "state_dir": "/var/lib/taso/state",
         "store": "/srv/taso/store",
         "run_dir": "/run/taso",
@@ -5348,6 +5354,13 @@ mod tests {
                 mounts: "/srv/taso".into(),
                 spool: "/var/lib/taso-blk/spool".into()
             }
+        );
+        let mut none: Value = serde_json::from_str(GOOD).unwrap();
+        none.as_object_mut().unwrap().remove("storage");
+        let e = Config::parse(&none.to_string()).unwrap_err().to_string();
+        assert!(
+            e.contains("\"storage\" is required"),
+            "no default engine: {e}"
         );
         for bad in [
             serde_json::json!("btrfs"),

@@ -87,6 +87,7 @@ configs:
       {
         "warden": 1,
         "coordinator": { "remote": "/run/taso-coord/coord.sock" },
+        "storage": "zfs",
         "root": "${TASO_DATASET:?set TASO_DATASET to a dataset the Warden may use, e.g. tasotest/vessel}",
         "state_dir": "/var/lib/taso/state",
         "store": "/srv/taso/store",
