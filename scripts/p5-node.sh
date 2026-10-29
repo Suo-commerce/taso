@@ -22,7 +22,8 @@
 #                  machine a command runs on
 #   2 packages     apt: git, the C toolchain, pkg-config, libclang-dev
 #                  (libublk's bindings), python3, jq, curl, chrony, runc,
-#                  e2fsprogs, util-linux, fio, zfsutils-linux, nvme-cli
+#                  e2fsprogs, util-linux, fio, zfsutils-linux, nvme-cli,
+#                  blktrace (the kernel's request trace, blk-trace-freeze.sh)
 #   3 coreutils    GNU coreutils in place of uutils (Ubuntu 25.10 and later
 #                  ship uutils; xfstests and our scripts assume GNU: 271 quick
 #                  tests failed on an option before testing anything,
@@ -43,7 +44,11 @@
 #                                 benchmark scratch, TMPDIR)
 #                  Both storages on one drive: the comparison in §3 is then
 #                  of the storage, not of two drives.  /var/lib/taso-blk is a
-#                  symlink into it, so the blk-*.sh scripts land there too.
+#                  bind mount of /var/lib/taso/taso-blk (kept at boot in
+#                  /etc/fstab), so the blk-*.sh scripts land there too.  Not
+#                  a symlink: runc refuses a rootfs reached through one
+#                  ("invalid rootfs", taso-p5 2026-10-26); a symlink left by
+#                  an earlier setup is replaced.
 #   6b RCU         /sys/kernel/rcu_expedited=1, now and at boot
 #                  (/etc/tmpfiles.d/taso-rcu.conf; it is a sysfs attribute,
 #                  not a sysctl): a filesystem freeze
@@ -65,7 +70,9 @@
 #   9 build        cargo build --release of taso-blkd, taso-wardend,
 #                  taso-coordd and taso-logcheck, installed to /usr/local/bin
 #                  (log /root/taso-build.log, shown only on failure)
-#  10 the report   printed and saved to /var/lib/taso/p5-node-report.txt
+#  10 the report   printed and saved to /var/lib/taso/p5-node-report.txt;
+#                  then the two `source` lines that give the shell setup ran
+#                  from the environment of step 7 (new root logins have it)
 #
 # Not done here, on purpose: no coordinator or Warden is started (B1's
 # harness starts what it measures and stops it after), no CPU governor,
@@ -138,6 +145,8 @@ sys.exit("apt lock %s still held" % held)
 PY
 }
 apt_get() { apt_wait; apt-get -o DPkg::Lock::Timeout=600 -q "$@"; }
+# Whether two paths are the same directory (device and inode), through a bind mount or not.
+same_dir() { [[ -d "$1" && -d "$2" && "$(stat -c %d:%i "$1")" == "$(stat -c %d:%i "$2")" ]]; }
 coreutils_version() { ls --version 2>/dev/null | head -n 1; }
 gnu_coreutils() { coreutils_version | grep -q 'GNU coreutils'; }
 has() { command -v "$1" >/dev/null 2>&1; }
@@ -199,7 +208,7 @@ if [[ "$mode" == setup ]]; then
     toolchain=; has gcc && has make || toolchain=build-essential
     # shellcheck disable=SC2086
     apt_get install -y git $toolchain pkg-config libclang-dev python3 jq curl chrony runc \
-        e2fsprogs util-linux fio zfsutils-linux nvme-cli
+        e2fsprogs util-linux fio zfsutils-linux nvme-cli blktrace
 
     step "3 GNU coreutils"
     if gnu_coreutils; then
@@ -273,10 +282,27 @@ EOF
     mountpoint -q "$DATA" || { systemctl daemon-reload 2>/dev/null || true; mount "$DATA"; }
     [[ "$(findmnt -no SOURCE "$DATA")" == "$(readlink -f "$BLK_PART")" ]] || die "$DATA is mounted from $(findmnt -no SOURCE "$DATA"), not $BLK_PART"
     mkdir -p "$DATA/tmp" "$DATA/taso-blk"; chmod 1777 "$DATA/tmp"
-    if [[ -e /var/lib/taso-blk && ! -L /var/lib/taso-blk ]]; then
-        die "/var/lib/taso-blk exists and is not a symlink; move it aside (the blk-*.sh scripts must land on $DATA)"
+    # /var/lib/taso-blk: a bind mount of $DATA/taso-blk, never a symlink (runc
+    # refuses a rootfs through one).  An earlier setup's symlink is replaced;
+    # anything else already there is refused, not moved.
+    if [[ -L /var/lib/taso-blk ]]; then
+        rm /var/lib/taso-blk; echo "/var/lib/taso-blk: the earlier symlink removed"
     fi
-    ln -sfn "$DATA/taso-blk" /var/lib/taso-blk
+    if mountpoint -q /var/lib/taso-blk; then
+        same_dir /var/lib/taso-blk "$DATA/taso-blk" || die "/var/lib/taso-blk is a mount of something else ($(findmnt -no SOURCE /var/lib/taso-blk)); nothing changed"
+    else
+        if [[ -e /var/lib/taso-blk ]]; then
+            [[ -d /var/lib/taso-blk && -z "$(ls -A /var/lib/taso-blk)" ]] \
+                || die "/var/lib/taso-blk exists and is not an empty directory; move it aside (the blk-*.sh scripts must land on $DATA)"
+        fi
+        mkdir -p /var/lib/taso-blk
+        grep -q "^$DATA/taso-blk[[:space:]]" /etc/fstab \
+            || echo "$DATA/taso-blk /var/lib/taso-blk none bind,x-systemd.requires-mounts-for=$DATA 0 0" >>/etc/fstab
+        systemctl daemon-reload 2>/dev/null || true
+        mount /var/lib/taso-blk
+    fi
+    same_dir /var/lib/taso-blk "$DATA/taso-blk" || die "/var/lib/taso-blk is not $DATA/taso-blk after the bind mount"
+    echo "/var/lib/taso-blk: a bind mount of $DATA/taso-blk"
 
     step "6b expedited RCU (the freeze's superblock barriers)"
     echo 1 >/sys/kernel/rcu_expedited
@@ -331,7 +357,7 @@ report() {
     [[ "${kernel%%.*}" -ge 6 ]] && pass "kernel $kernel" || bad "kernel $kernel is older than 6.0 (ublk)"
 
     step "tools"
-    for t in gcc make git fio python3 jq runc mkfs.ext4 fsfreeze zpool nvme chronyd; do
+    for t in gcc make git fio python3 jq runc mkfs.ext4 fsfreeze zpool nvme chronyd blktrace; do
         has "$t" && pass "$t" || bad "$t missing"
     done
     if ls /usr/lib/llvm-*/lib/libclang.so* >/dev/null 2>&1 || ls /usr/lib/*-linux-gnu/libclang*.so* >/dev/null 2>&1; then
@@ -386,7 +412,13 @@ report() {
     else
         bad "$DATA is not a mount point (the block log would be on the root disk)"
     fi
-    [[ "$(readlink -f /var/lib/taso-blk 2>/dev/null)" == "$DATA/taso-blk" ]] && pass "/var/lib/taso-blk -> $DATA/taso-blk" || bad "/var/lib/taso-blk is not a link into $DATA"
+    if [[ -L /var/lib/taso-blk ]]; then
+        bad "/var/lib/taso-blk is a symlink (runc refuses a rootfs through one); setup replaces it with a bind mount"
+    elif mountpoint -q /var/lib/taso-blk && same_dir /var/lib/taso-blk "$DATA/taso-blk"; then
+        pass "/var/lib/taso-blk: a bind mount of $DATA/taso-blk"
+    else
+        bad "/var/lib/taso-blk is not a bind mount of $DATA/taso-blk"
+    fi
     if [[ -f /etc/profile.d/taso-p5.sh ]] && [[ -d "$DATA/tmp" ]] && [[ "$(findmnt -no TARGET -T "$DATA/tmp" 2>/dev/null)" == "$DATA" ]]; then
         pass "TMPDIR=$DATA/tmp, on the measured drive"
     else
@@ -402,6 +434,10 @@ if [[ "$mode" == setup ]]; then
     mkdir -p "$DATA"
     report | tee "$REPORT"
     echo "saved to $REPORT"
+    echo
+    echo "For this shell (setup's environment does not reach it; new root logins have it):"
+    echo "  source /etc/profile.d/taso-p5.sh"
+    echo "  source /root/.cargo/env"
 else
     report
 fi
