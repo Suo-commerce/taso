@@ -227,11 +227,7 @@ impl StoreConf {
                 let s = &o["s3"];
                 StoreConf::S3 {
                     endpoint: string(s, "endpoint")?,
-                    region: s
-                        .get("region")
-                        .and_then(Value::as_str)
-                        .unwrap_or("garage")
-                        .to_string(),
+                    region: string_or(s, "region", "garage")?,
                     bucket: string(s, "bucket")?,
                     access_key_id: string(s, "access_key_id")?,
                     secret_key_file: abs_path(s, "secret_key_file")?,
@@ -1013,6 +1009,18 @@ fn bool_or(v: &Value, key: &str, default: bool) -> Result<bool, ConfigError> {
     }
 }
 
+/// An optional string: `default` when the key is absent; a present value
+/// of another type is refused, never defaulted.
+fn string_or(v: &Value, key: &str, default: &str) -> Result<String, ConfigError> {
+    match v.get(key) {
+        None => Ok(default.to_string()),
+        Some(x) => x
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| bad(format!("{key:?} must be a string"))),
+    }
+}
+
 /// Refuse keys of `v` not in `keys`: in objects where a misspelt key
 /// would quietly loosen a bound.
 fn only_keys(v: &Value, what: &str, keys: &[&str]) -> Result<(), ConfigError> {
@@ -1573,11 +1581,7 @@ impl Config {
             batched_snapshots: bool_or(&v, "batched_snapshots", true)?,
             storage: storage_conf(&v)?,
             store: StoreConf::parse_in(&v)?,
-            prefix: v
-                .get("prefix")
-                .and_then(Value::as_str)
-                .unwrap_or("vessels")
-                .to_string(),
+            prefix: string_or(&v, "prefix", "vessels")?,
             run_dir: abs_path(&v, "run_dir")?,
             decider: decider_conf(v.get("decider"), &abs_path(&v, "run_dir")?)?,
             purge: purge_conf(v.get("purge"))?,
@@ -5774,11 +5778,27 @@ mod tests {
                     v["vessels"][1]["uid_slot"] = 1.into();
                 }),
             ),
+            // A present value of the wrong type is refused, not defaulted.
+            ("prefix number", Box::new(|v| v["prefix"] = 7.into())),
+            (
+                "s3 region number",
+                Box::new(
+                    |v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "region": 1, "bucket": "b", "access_key_id": "a", "secret_key_file": "/s"}}),
+                ),
+            ),
         ];
         for (name, edit) in cases {
             assert!(with(edit).is_err(), "{name} was accepted");
         }
         assert!(Config::parse("not json").is_err());
+        // Absent, the two still default.
+        let c = Config::parse(GOOD).unwrap();
+        assert_eq!(c.prefix, "vessels");
+        let s3 = with(
+            |v| v["store"] = serde_json::json!({"s3": {"endpoint": "http://x:1", "bucket": "b", "access_key_id": "a", "secret_key_file": "/s"}}),
+        )
+        .unwrap();
+        assert!(matches!(s3.store, StoreConf::S3 { ref region, .. } if region == "garage"));
         let remote =
             with(|v| v["coordinator"] = serde_json::json!({ "remote": "/run/taso/coord.sock" }))
                 .unwrap();
