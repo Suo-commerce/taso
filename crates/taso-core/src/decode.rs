@@ -76,25 +76,32 @@ impl std::error::Error for DecodeError {}
 
 // ── Reader ──────────────────────────────────────────────────────────
 
-/// A cursor over canonical bytes.
-struct Reader<'a> {
+/// A cursor over canonical bytes: the one strict reader every canonical
+/// format in this crate decodes with.  The record decoders are here; the
+/// contract decoders are a second `impl` block in [`crate::contract`].
+pub(crate) struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
 }
 
-type R<T> = Result<T, DecodeError>;
+pub(crate) type R<T> = Result<T, DecodeError>;
 
 impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
 
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.b.len() - self.pos
     }
 
+    /// The offset of the next byte: where an error about it is reported.
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
     /// Take `n` bytes, or fail without consuming.
-    fn take(&mut self, n: u64) -> R<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: u64) -> R<&'a [u8]> {
         if n > self.remaining() as u64 {
             return Err(DecodeError::Truncated {
                 at: self.pos,
@@ -106,33 +113,37 @@ impl<'a> Reader<'a> {
         Ok(&self.b[start..self.pos])
     }
 
-    fn u8(&mut self) -> R<u8> {
+    pub(crate) fn u8(&mut self) -> R<u8> {
         Ok(self.take(1)?[0])
     }
 
-    fn u64(&mut self) -> R<u64> {
+    pub(crate) fn u64(&mut self) -> R<u64> {
         let mut a = [0u8; 8];
         a.copy_from_slice(self.take(8)?);
         Ok(u64::from_le_bytes(a))
     }
 
-    fn u32(&mut self) -> R<u32> {
+    pub(crate) fn u32(&mut self) -> R<u32> {
         Ok(u32::from_le_bytes(self.fixed::<4>()?))
     }
 
-    fn fixed<const N: usize>(&mut self) -> R<[u8; N]> {
+    pub(crate) fn fixed<const N: usize>(&mut self) -> R<[u8; N]> {
         let mut a = [0u8; N];
         a.copy_from_slice(self.take(N as u64)?);
         Ok(a)
     }
 
     /// A tag, with its offset (for errors).
-    fn tag(&mut self) -> R<(usize, u8)> {
+    pub(crate) fn tag(&mut self) -> R<(usize, u8)> {
         let at = self.pos;
         Ok((at, self.u8()?))
     }
 
-    fn bool(&mut self) -> R<bool> {
+    pub(crate) fn bad<T>(at: usize, what: &'static str, tag: u8) -> R<T> {
+        Err(DecodeError::BadTag { at, what, tag })
+    }
+
+    pub(crate) fn bool(&mut self) -> R<bool> {
         match self.tag()? {
             (_, 0) => Ok(false),
             (_, 1) => Ok(true),
@@ -144,12 +155,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn bytes(&mut self) -> R<Vec<u8>> {
+    pub(crate) fn bytes(&mut self) -> R<Vec<u8>> {
         let len = self.u64()?;
         Ok(self.take(len)?.to_vec())
     }
 
-    fn string(&mut self) -> R<String> {
+    pub(crate) fn string(&mut self) -> R<String> {
         let len = self.u64()?;
         let at = self.pos;
         let raw = self.take(len)?;
@@ -158,7 +169,7 @@ impl<'a> Reader<'a> {
             .map_err(|_| DecodeError::BadUtf8 { at })
     }
 
-    fn option<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
+    pub(crate) fn option<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
         match self.tag()? {
             (_, 0) => Ok(None),
             (_, 1) => f(self).map(Some),
@@ -173,7 +184,7 @@ impl<'a> Reader<'a> {
     /// A count-prefixed sequence.  Every element is at least one byte, so a
     /// count larger than the remaining input is refused before any
     /// allocation.
-    fn seq<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
+    pub(crate) fn seq<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
         let at = self.pos;
         let n = self.u64()?;
         if n > self.remaining() as u64 {
@@ -186,7 +197,7 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    fn finish(&self) -> R<()> {
+    pub(crate) fn finish(&self) -> R<()> {
         match self.remaining() {
             0 => Ok(()),
             extra => Err(DecodeError::Trailing {
@@ -198,15 +209,15 @@ impl<'a> Reader<'a> {
 
     // ── envelope and record types ───────────────────────────────────
 
-    fn lsn(&mut self) -> R<Lsn> {
+    pub(crate) fn lsn(&mut self) -> R<Lsn> {
         self.u64().map(Lsn::new)
     }
 
-    fn hash(&mut self) -> R<HashVal> {
+    pub(crate) fn hash(&mut self) -> R<HashVal> {
         self.fixed().map(HashVal::from_bytes)
     }
 
-    fn chronicle(&mut self) -> R<ChronicleId> {
+    pub(crate) fn chronicle(&mut self) -> R<ChronicleId> {
         self.fixed().map(ChronicleId::from_bytes)
     }
 
@@ -404,7 +415,7 @@ impl<'a> Reader<'a> {
         })
     }
 
-    fn authority(&mut self) -> R<Authority> {
+    pub(crate) fn authority(&mut self) -> R<Authority> {
         Ok(Authority {
             actor: self.string()?,
             reason: self.string()?,

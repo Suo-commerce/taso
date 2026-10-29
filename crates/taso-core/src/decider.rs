@@ -19,9 +19,9 @@
 
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
-    Candidate, Reader, Refusal, VerdictRequest, VerificationFinished, VerificationStarted,
+    Candidate, Refusal, VerdictRequest, VerificationFinished, VerificationStarted,
 };
-use crate::decode::DecodeError;
+use crate::decode::{DecodeError, Reader};
 use crate::envelope::ChronicleId;
 
 /// The protocol version.

@@ -44,7 +44,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::canon::{Canon, Canonical};
-use crate::decode::DecodeError;
+use crate::decode::{DecodeError, Reader, R};
 use crate::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use crate::record::{Authority, LayerRef};
 
@@ -2267,100 +2267,8 @@ impl CanonExt for Canon {
 // and sets or ordered lists not in strictly ascending order are refused,
 // so every accepted input re-encodes to itself.
 
-pub(crate) struct Reader<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-pub(crate) type R<T> = Result<T, DecodeError>;
-
+/// The contract decoders, on the crate's one [`Reader`] (`crate::decode`).
 impl<'a> Reader<'a> {
-    pub(crate) fn new(b: &'a [u8]) -> Self {
-        Self { b, pos: 0 }
-    }
-
-    pub(crate) fn remaining(&self) -> usize {
-        self.b.len() - self.pos
-    }
-
-    pub(crate) fn take(&mut self, n: u64) -> R<&'a [u8]> {
-        if n > self.remaining() as u64 {
-            return Err(DecodeError::Truncated {
-                at: self.pos,
-                need: n,
-            });
-        }
-        let start = self.pos;
-        self.pos += n as usize;
-        Ok(&self.b[start..self.pos])
-    }
-
-    pub(crate) fn u8(&mut self) -> R<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    pub(crate) fn u32(&mut self) -> R<u32> {
-        let mut a = [0u8; 4];
-        a.copy_from_slice(self.take(4)?);
-        Ok(u32::from_le_bytes(a))
-    }
-
-    pub(crate) fn u64(&mut self) -> R<u64> {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(self.take(8)?);
-        Ok(u64::from_le_bytes(a))
-    }
-
-    pub(crate) fn fixed<const N: usize>(&mut self) -> R<[u8; N]> {
-        let mut a = [0u8; N];
-        a.copy_from_slice(self.take(N as u64)?);
-        Ok(a)
-    }
-
-    pub(crate) fn tag(&mut self) -> R<(usize, u8)> {
-        let at = self.pos;
-        Ok((at, self.u8()?))
-    }
-
-    pub(crate) fn bad<T>(at: usize, what: &'static str, tag: u8) -> R<T> {
-        Err(DecodeError::BadTag { at, what, tag })
-    }
-
-    pub(crate) fn bytes(&mut self) -> R<Vec<u8>> {
-        let len = self.u64()?;
-        Ok(self.take(len)?.to_vec())
-    }
-
-    pub(crate) fn string(&mut self) -> R<String> {
-        let len = self.u64()?;
-        let at = self.pos;
-        let raw = self.take(len)?;
-        std::str::from_utf8(raw)
-            .map(str::to_owned)
-            .map_err(|_| DecodeError::BadUtf8 { at })
-    }
-
-    pub(crate) fn option<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
-        match self.tag()? {
-            (_, 0) => Ok(None),
-            (_, 1) => f(self).map(Some),
-            (at, t) => Self::bad(at, "option", t),
-        }
-    }
-
-    pub(crate) fn seq<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
-        let at = self.pos;
-        let n = self.u64()?;
-        if n > self.remaining() as u64 {
-            return Err(DecodeError::Truncated { at, need: n });
-        }
-        let mut out = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            out.push(f(self)?);
-        }
-        Ok(out)
-    }
-
     /// A sequence that must be strictly ascending by `key`.
     pub(crate) fn ascending<T, K: Ord>(
         &mut self,
@@ -2368,44 +2276,13 @@ impl<'a> Reader<'a> {
         f: impl FnMut(&mut Self) -> R<T>,
         key: impl Fn(&T) -> K,
     ) -> R<Vec<T>> {
-        let at = self.pos;
+        let at = self.position();
         let v = self.seq(f)?;
         let keys: Vec<K> = v.iter().map(key).collect();
         if !strictly_ascending(&keys) {
             return Self::bad(at, what, 0);
         }
         Ok(v)
-    }
-
-    pub(crate) fn finish(&self) -> R<()> {
-        match self.remaining() {
-            0 => Ok(()),
-            extra => Err(DecodeError::Trailing {
-                at: self.pos,
-                extra,
-            }),
-        }
-    }
-
-    // ── leaves ──────────────────────────────────────────────────────
-
-    pub(crate) fn hash(&mut self) -> R<HashVal> {
-        self.fixed().map(HashVal::from_bytes)
-    }
-
-    pub(crate) fn chronicle(&mut self) -> R<ChronicleId> {
-        self.fixed().map(ChronicleId::from_bytes)
-    }
-
-    pub(crate) fn lsn(&mut self) -> R<Lsn> {
-        self.u64().map(Lsn::new)
-    }
-
-    pub(crate) fn authority(&mut self) -> R<Authority> {
-        Ok(Authority {
-            actor: self.string()?,
-            reason: self.string()?,
-        })
     }
 
     pub(crate) fn class(&mut self) -> R<PathClass> {
@@ -2469,7 +2346,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    pub(crate) fn outcome(&mut self) -> R<Outcome> {
+    pub(crate) fn contract_outcome(&mut self) -> R<Outcome> {
         match self.tag()? {
             (_, 0) => Ok(Outcome::Exit { code: self.u32()? }),
             (_, 1) => Ok(Outcome::Interrupted),
@@ -2687,7 +2564,7 @@ impl<'a> Reader<'a> {
     pub(crate) fn finished(&mut self) -> R<VerificationFinished> {
         Ok(VerificationFinished {
             attempt_id: self.hash()?,
-            outcome: self.outcome()?,
+            outcome: self.contract_outcome()?,
             output_digest: self.hash()?,
             output: self.bytes()?,
             result_digest: self.hash()?,
