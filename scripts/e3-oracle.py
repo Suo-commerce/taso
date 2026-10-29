@@ -46,6 +46,19 @@ happened).
 Line 3 checks that a retained Seal is reachable (it exports), not its bytes:
 a Seal's export differs between runs (a fresh mkfs per round, inode times),
 so a healthy run's hash is no baseline (found writing E3-3b, 2026-10-27).
+
+A takeover round (E3-4, one-pager rev. 6; spec D97) adds to A.json
+  "takeover": {"owner": {...}, "shipped_lsn": L, "child": {...}|null,
+               "thaw": {"acks": N, "replies": [...], "fenced": "…"|null},
+               "packs": {"added": [...], "changed": [...], "gone": [...]},
+               "after_thaw": A.json of a third Warden that rebuilt from the store}
+and is graded on what the new Warden B holds: line 1 by the shipped anchor
+(an acknowledged Seal not yet shipped may be absent, its span named by
+B's rebirth line), line F (the old Warden acknowledges nothing after its
+takeover and names the refusal), H1 (a third Warden rebuilds the same
+Seals from the store after the old Warden woke), H2 (a pack no record
+names: a note), H3 (a named pack whose bytes changed: §11.3's limit, a
+FAIL), and 5a (a forked child either runs on B or is refused by name).
 """
 import copy, json, os, re, sys, time
 
@@ -142,15 +155,31 @@ def check(r, a):
     infl_op = infl["op"] if infl and infl["who"] == "parent" else None
     held = (r.get("cut") or {}).get("held")
     retained_turn = m["last_turn"]
-    # 1. every acknowledged Seal listed, its rows as promised
+    # E3-4: graded on the Warden that took the Vessel over, by what was shipped (D97).
+    tk, t = r["point"].startswith("takeover:"), a.get("takeover")
+    if tk and not t:
+        return ["harness: a takeover round with no takeover facts gathered"], notes
+    shipped = t["shipped_lsn"] if tk else None
+    lost_unshipped = []
+    # 1. every acknowledged Seal listed, its rows as promised (after a takeover: every shipped one)
     for lsn, exp in m["seals"].items():
         s = listed.get(lsn)
-        if s is None:
+        if s is None and tk and lsn > shipped:
+            lost_unshipped.append(lsn)   # D97: acknowledged, not shipped; it lived only on the old node
+        elif s is None:
             fails.append(f"1: acknowledged Seal lsn {lsn} (turn {m['acked_turns'][lsn]}) is not listed after rebirth")
         elif s.get("rows", {}) != exp:
             stray = sorted(k for k in s.get("rows", {}) if k.startswith("c") and k not in exp)
             fails.append(f"{'4' if stray else '1'}: Seal lsn {lsn} holds {s.get('rows')}, promised {exp}"
                          + (f" (the child's turn(s) {stray} in a parent Seal before any promotion)" if stray else ""))
+    if tk:
+        # The turn the agent may resume after is the last Seal the new Warden holds (D97).
+        retained_turn = max([m["acked_turns"][l] for l in m["seals"] if l in listed], default=0)
+        if lost_unshipped and not re.search(r"reborn at epoch \d+ from anchor lsn \d+, records \d+\.\.=\d+ lost", report):
+            fails.append(f"1 (D97): acknowledged Seal(s) lsn {lost_unshipped}, past the shipped anchor {shipped}, are absent "
+                         "and the new Warden does not name the span it lost (its Gap record, D93 (i))")
+        elif lost_unshipped:
+            notes.append(f"acknowledged Seal(s) lsn {lost_unshipped} not shipped: lost with the old node, named (D97)")
     # Seals listed and never acknowledged: the adoption, an in-flight Seal that landed, or nothing allowed
     extra = {l: s for l, s in listed.items() if l not in m["seals"]}
     unsealed = m["writes_after_seal"]
@@ -179,7 +208,8 @@ def check(r, a):
     # SQLite write adds no Chronicle record, and the Warden appends housekeeping after a Seal anyway
     # (taso-test 2026-10-28, [seal write]: "lsn 6 reset to the Seal at lsn 5: 1 record(s)" with the write unnamed).
     m_blocks = re.search(r"(\d+) block\(s\) of the Vessel's filesystem discarded", report)
-    if unsealed and not (m_blocks and int(m_blocks.group(1)) > 0):
+    # Not after a takeover: the old node's unsealed writes were never shipped and died with it (class (iii), D97).
+    if unsealed and not tk and not (m_blocks and int(m_blocks.group(1)) > 0):
         fails.append(f"1: {unsealed} acknowledged write(s) after the last retained Seal were discarded by the rollback "
                      "and the report does not name them as blocks (D92, D93 (i); the store knows the count)")
     # 2. a child nobody asked for
@@ -198,7 +228,7 @@ def check(r, a):
     # gather that did not look (`opened` absent) is not judged here.
     if a.get("opened") is False:
         fails.append(f"5: the reborn Warden did not run the Vessel: {a.get('not_run') or 'no reason printed'}")
-    if not re.search(r"taso-blkd: recovered ", report):
+    if not tk and not re.search(r"taso-blkd: recovered ", report):   # a takeover's taso-blkd starts a new log
         fails.append("5: taso-blkd printed no recovery line")
     if infl_op == "effect" and not re.search(r"effects \(\w+\) reconciled: ", report):
         fails.append("5: an effect was in flight and the Warden printed no reconcile line (D93 (ii))")
@@ -215,6 +245,37 @@ def check(r, a):
         elif li["after"] != li["before"]:
             fails.append(f"5 (compact.written): the reopened log is inode {li['after']}, not {li['before']}: the compaction's "
                          "new log became the log, though its rename was held and never made")
+    if tk:
+        # F: the old Warden, woken, believes it holds the Vessel; the coordinator refuses its old epoch.
+        th = t.get("thaw") or {}
+        if th.get("acks", 0):
+            fails.append(f"F: after its takeover the old Warden acknowledged {th['acks']} op(s): {th.get('replies')}")
+        if not th.get("fenced"):
+            fails.append(f"F: the old Warden's output names no refusal (stale epoch) after it woke; its replies: {th.get('replies')}")
+        # H: the store after the old Warden's late writes (§0.4, §11.3).
+        pk = t.get("packs") or {}
+        if pk.get("added"):
+            notes.append(f"H2: {len(pk['added'])} pack(s) of the old Warden's in the store, named by no accepted record")
+        if pk.get("changed"):
+            fails.append(f"H3 (§11.3's limit reached): named pack(s) whose bytes changed after the takeover: {pk['changed']}")
+        if pk.get("gone"):
+            fails.append(f"H: pack(s) gone from the store after the takeover: {pk['gone']}")
+        c = t.get("after_thaw") or {}
+        if "skipped" in c:
+            notes.append("H1 not checked: " + c["skipped"])
+        elif c.get("opened") is not True:
+            fails.append(f"H1: after the old Warden woke, a third Warden could not rebuild the Vessel from the store: {c.get('not_run') or 'no reason printed'}")
+        else:
+            cl = {x["lsn"]: x.get("rows", {}) for x in c.get("seals", []) if not x.get("birth")}
+            bl = {l: x.get("rows", {}) for l, x in listed.items()}
+            if cl != bl:
+                fails.append(f"H1: rebuilt from the store after the old Warden woke, the Seals are {cl}, not the new Warden's {bl}")
+        # 5a: a fork is reborn where its parent's Seal is (P3 option c), a node the parent was reborn on included.
+        ch = t.get("child")
+        if ch and not ch.get("ran") and not ch.get("refused"):
+            fails.append(f"5a: the child {ch['subject']} neither ran on the new Warden nor was refused by name")
+        elif ch and not ch.get("ran"):
+            notes.append(f"5a: the new Warden refused the child: {ch['refused'][:120]}")
     if r["mode"] == "error":
         # taso-blkd names the failure that poisoned the store, once, with its error
         # ("the store is poisoned: seal failed: ... Input/output error"); the Warden's
@@ -313,6 +374,39 @@ def selftest():
         ("hold fail: compact.written, the new log reopened", "compact.written", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "log_inode": {"before": 12, "after": 13}}, 1),
         ("hold fail: compact.written, the log not looked at", "compact.written", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "log_inode": {"before": 12, "after": None}}, 1),
     ]
+    # E3-4: graded on the new Warden B, by the shipped anchor (D97), then F, H and 5a.
+    REB = "v: reborn at epoch 2 from anchor lsn 9\n"
+    LOST = "v: reborn at epoch 2 from anchor lsn 5, records 6..=9 lost\n"
+    def TK(shipped=9, acks=0, fenced="chronicle: Fenced", added=(), changed=(), gone=(), c=None, child=None):
+        return {"owner": {"holder": 1, "epoch": 1}, "shipped_lsn": shipped, "child": child,
+                "thaw": {"acks": acks, "replies": ["seal: {}", "effect: {}"], "fenced": fenced},
+                "packs": {"added": list(added), "changed": list(changed), "gone": list(gone)},
+                "after_thaw": c if c is not None else {"seals": [S(9, {"1": 8})], "opened": True}}
+    def tkr(steps, inflight=None):
+        rnd(steps, inflight); r = load(R); r["point"] = "takeover:2"; save(R, r); return load(R)
+    B9 = {"seals": [S(9, {"1": 8})], "report": REB, "resume_turn": 1, "opened": True}
+    takeover = [
+        ("tk pass: the shipped Seal on B", B9, TK(), 0),
+        ("tk fail: the shipped Seal not on B", {"seals": [], "report": REB, "resume_turn": 0, "opened": True}, TK(c={"seals": [], "opened": True}), 1),
+        ("tk pass: acknowledged, not shipped, absent, the span named", {"seals": [], "report": LOST, "resume_turn": 0, "opened": True}, TK(shipped=5, c={"seals": [], "opened": True}), 0),
+        ("tk fail: acknowledged, not shipped, absent, unnamed", {"seals": [], "report": REB, "resume_turn": 0, "opened": True}, TK(shipped=5, c={"seals": [], "opened": True}), 1),
+        ("tk fail F: the old Warden acknowledged after its takeover", B9, TK(acks=1), 1),
+        ("tk fail F: the old Warden's refusal not named", B9, TK(fenced=None), 1),
+        ("tk pass H2: a pack no record names (a note)", B9, TK(added=["./v/pack/12-5-0"]), 0),
+        ("tk fail H3: a named pack's bytes changed", B9, TK(changed=["./v/pack/9-5-9"]), 1),
+        ("tk fail H: a pack gone", B9, TK(gone=["./v/pack/9-5-9"]), 1),
+        ("tk fail H1: no third Warden could rebuild", B9, TK(c={"seals": [], "opened": False, "not_run": "chain: digest mismatch"}), 1),
+        ("tk fail H1: rebuilt, other Seals", B9, TK(c={"seals": [S(9, {"1": 5})], "opened": True}), 1),
+        ("tk fail 5a: the child neither ran nor was refused", B9, TK(child={"subject": "c", "ran": False, "refused": None}), 1),
+        ("tk pass 5a: the child refused by name", B9, TK(child={"subject": "c", "ran": False, "refused": "a fork is reborn only where its parent's Seal is"}), 0),
+        ("tk fail: no takeover facts gathered", B9, None, 1),
+    ]
+    for name, a, t, want in takeover:
+        r = tkr([W(1), SL(9, 1)])
+        fails, _ = check(r, dict(a, **({"takeover": t} if t else {})))
+        got = 1 if fails else 0
+        bad += got != want
+        print(f"{'OK ' if got == want else 'BAD'}  {name}" + ("" if got == want else f" — got {'fail' if got else 'pass'}: {fails}"))
     for name, hn, steps, infl, a, want in held:
         rnd(steps, infl)
         r = load(R); r["point"] = "hold:" + hn; save(R, r)
@@ -334,7 +428,7 @@ def selftest():
         a = R + ".a"; save(a, {}); missed = do_check(R, a)
     bad += missed != 2
     print(f"{'OK ' if missed == 2 else 'BAD'}  missed point is MISSED, never covered")
-    total = len(cases) + len(held) + 2
+    total = len(cases) + len(takeover) + len(held) + 2
     print(f"selftest: {total - bad}/{total} OK")
     return 1 if bad else 0
 
