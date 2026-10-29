@@ -307,7 +307,19 @@ impl ObjectStore for S3Store {
         let dir = format!("{prefix}/");
         let mut keys = Vec::new();
         let mut token: Option<String> = None;
+        let mut pages = 0u32;
         loop {
+            // An endpoint that repeats its continuation token, or never
+            // runs out of them, would keep this loop going through
+            // requests that each succeed; both are errors here, never a
+            // listing cut short and handed back as complete.
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("list {prefix}: more than {MAX_LIST_PAGES} pages; the endpoint does not finish"),
+                ));
+            }
             let mut query = vec![("list-type", "2"), ("prefix", dir.as_str())];
             if let Some(t) = &token {
                 query.push(("continuation-token", t.as_str()));
@@ -326,6 +338,12 @@ impl ObjectStore for S3Store {
                     .filter(|k| k.starts_with(&dir) && valid_key(k)),
             );
             match page.next {
+                Some(t) if token.as_deref() == Some(t.as_str()) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("list {prefix}: the endpoint repeated its continuation token; the listing does not advance"),
+                    ));
+                }
                 Some(t) => token = Some(t),
                 None => break,
             }
@@ -420,6 +438,13 @@ fn parse_list(body: &str) -> io::Result<Page> {
     };
     Ok(Page { keys, next })
 }
+
+/// The most pages one listing follows before it is an error.  A Chronicle's
+/// pack directory, the prefix the Warden lists, holds one pack per Seal;
+/// at S3's 1000 keys a page this is ten million Seals of one Vessel --
+/// unreachable by design, so a constant rather than a config key.  Hitting
+/// it says so; it never truncates.
+const MAX_LIST_PAGES: u32 = 10_000;
 
 // ── Signature Version 4 ─────────────────────────────────────────────
 
@@ -836,6 +861,9 @@ class H(http.server.BaseHTTPRequestHandler):
             xml = "<ListBucketResult>" + "".join("<Contents><Key>%s</Key></Contents>" % x for x in page)
             xml += "<IsTruncated>%s</IsTruncated>" % ("true" if more else "false")
             if more: xml += "<NextContinuationToken>%d</NextContinuationToken>" % (start + 2)
+            # A broken endpoint: under stuck/ the token never advances.
+            if prefix.startswith("stuck/"):
+                xml = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>0</NextContinuationToken>"
             return self.reply(200, (xml + "</ListBucketResult>").encode())
         if k not in objs: return self.error(404, "NoSuchKey")
         self.reply(200, objs[k], "application/octet-stream")
@@ -892,6 +920,11 @@ class H(http.server.BaseHTTPRequestHandler):
             "the others stay"
         );
         assert!(store.delete("../x").is_err(), "invalid keys are refused");
+        let e = store.list("stuck").unwrap_err();
+        assert!(
+            e.to_string().contains("repeated its continuation token"),
+            "a listing that does not advance is an error, not a loop: {e}"
+        );
         drop(srv);
         assert_eq!(
             store.exists("d/a").unwrap_err().kind(),
