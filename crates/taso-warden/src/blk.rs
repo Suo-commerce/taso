@@ -510,7 +510,10 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// Give `dataset` a device and mount it, if it has none or is not
     /// mounted (after a daemon restart devices are gone: they are lazy).
     pub fn ensure_mounted(&self, dataset: &Dataset) -> Result<PathBuf, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = {
+            let _t = crate::timing::span("blk.ensure.lock");
+            self.blkd.lock().unwrap()
+        };
         let b = d
             .find(dataset.as_str())?
             .ok_or_else(|| format!("no dataset {dataset}"))?;
@@ -883,7 +886,13 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         seal_hash: HashVal,
         target: &Dataset,
     ) -> Result<DatasetInfo, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        // The fork probe (P5): the wait for the pool's one connection,
+        // apart from the calls made on it.
+        let mut d = {
+            let _t = crate::timing::span("blk.clone.lock");
+            self.blkd.lock().unwrap()
+        };
+        let find_span = crate::timing::span("blk.clone.find");
         let src = d
             .find(source.as_str())?
             .ok_or_else(|| format!("no dataset {source}"))?;
@@ -899,6 +908,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         if d.find(target.as_str())?.is_some() {
             return Err(format!("dataset {target} already exists").into());
         }
+        drop(find_span);
         let branch_span = crate::timing::span("blk.branch");
         let b = d.branch(layer, target.as_str())?;
         let made = (|| -> Result<(), LayerError> {
@@ -912,11 +922,16 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             let _ = d.flush();
             return Err(e);
         }
+        let _t = crate::timing::span("blk.clone.info");
         Ok(self.info_locked(&mut *d, target)?.expect("just made"))
     }
 
     fn info(&self, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
-        let mut d = self.blkd.lock().unwrap();
+        let mut d = {
+            let _t = crate::timing::span("blk.info.lock");
+            self.blkd.lock().unwrap()
+        };
+        let _t = crate::timing::span("blk.info.ask");
         self.info_locked(&mut *d, dataset)
     }
 

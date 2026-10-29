@@ -856,18 +856,23 @@ impl<P: Pool> Host<P> {
         at: SealAt,
         subject: &[u8],
     ) -> Result<Vessel<P::Layers>, VesselError> {
-        let log = self.read_log_of(parent)?;
+        let log = {
+            let _t = crate::timing::span("fork.readlog");
+            self.read_log_of(parent)?
+        };
         // An interrupted fork: its dataset is already a clone of the Seal
         // it was started from.  "last" then means that Seal, not the
         // parent's newest now (the parent may have sealed again since);
         // an explicit lsn is left as asked, and one that is not the
         // dataset's is refused by `unborn` as a conflict.
         let child_ds = self.dataset_for(vessel_id(log.lineage.namespace, subject));
-        let started = self
-            .pool
-            .info(&child_ds)
-            .map_err(pool_err)?
-            .and_then(|i| i.origin_seal());
+        let started = {
+            let _t = crate::timing::span("fork.started");
+            self.pool
+                .info(&child_ds)
+                .map_err(pool_err)?
+                .and_then(|i| i.origin_seal())
+        };
         let at = match (at, started) {
             (SealAt::Last, Some((ds, lsn))) if ds == self.dataset_for(parent) => SealAt::At(lsn),
             (at, _) => at,
@@ -1229,15 +1234,26 @@ impl<P: Pool> Host<P> {
         id: ChronicleId,
         parent: Option<(&Dataset, Lsn, HashVal)>,
     ) -> Result<Chronicle<P::Layers>, VesselError> {
-        let registered = match self.registered_head(id)? {
+        // The spans split `fork.unborn` (P5, the fork probe): the
+        // coordinator's answer, the dataset's, the clone, the Chronicle.
+        let head = {
+            let _t = crate::timing::span("unborn.head");
+            self.registered_head(id)?
+        };
+        let registered = match head {
             None => false,
             Some(h) if h.lsn == Lsn::new(0) => true,
             Some(_) => return Err(VesselError::AlreadyExists(id)),
         };
         let dataset = self.dataset_for(id);
         if let Some((parent_ds, seal, seal_hash)) = parent {
-            match self.pool.info(&dataset).map_err(pool_err)? {
+            let info = {
+                let _t = crate::timing::span("unborn.info");
+                self.pool.info(&dataset).map_err(pool_err)?
+            };
+            match info {
                 None => {
+                    let _t = crate::timing::span("unborn.clone");
                     self.pool
                         .clone(parent_ds, seal, seal_hash, &dataset)
                         .map_err(pool_err)?;
@@ -1251,6 +1267,7 @@ impl<P: Pool> Host<P> {
                 }
             }
         }
+        let _t = crate::timing::span("unborn.chronicle");
         self.chronicle(id, registered)
     }
 
