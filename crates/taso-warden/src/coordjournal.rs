@@ -352,13 +352,20 @@ impl StoreView for Recorder<'_> {
         };
         a
     }
-    fn fs_packs(&self, chronicle: ChronicleId) -> Vec<InventoryItem> {
+    fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>> {
         let a = self.inner.fs_packs(chronicle);
         let mut o = self.out.borrow_mut();
         call_fs_packs(&mut o, chronicle);
-        o.u64(a.len() as u64);
-        for it in &a {
-            o.bytes(&item_bytes(it));
+        match &a {
+            None => {
+                o.tag(0);
+            }
+            Some(items) => {
+                o.tag(1).u64(items.len() as u64);
+                for it in items {
+                    o.bytes(&item_bytes(it));
+                }
+            }
         }
         a
     }
@@ -502,16 +509,21 @@ impl StoreView for Replayer<'_> {
         })
         .flatten()
     }
-    fn fs_packs(&self, chronicle: ChronicleId) -> Vec<InventoryItem> {
+    fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>> {
         let mut c = Canon::new();
         call_fs_packs(&mut c, chronicle);
-        self.expect(c, |r| {
-            let n = r.count()?;
-            (0..n)
-                .map(|_| item_from(&r.bytes()?).ok_or(JournalError("bad item")))
-                .collect()
+        self.expect(c, |r| match r.u8()? {
+            0 => Ok(None),
+            1 => {
+                let n = r.count()?;
+                (0..n)
+                    .map(|_| item_from(&r.bytes()?).ok_or(JournalError("bad item")))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Some)
+            }
+            _ => Err(JournalError("bad option tag")),
         })
-        .unwrap_or_default()
+        .flatten()
     }
     fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Vec<ObjectId> {
         let mut c = Canon::new();
@@ -1215,8 +1227,9 @@ mod tests {
         fn inventory(&self, _: HashVal) -> Option<Inventory> {
             Some(Inventory::new(vec![]).unwrap())
         }
-        fn fs_packs(&self, _: ChronicleId) -> Vec<InventoryItem> {
-            Vec::new()
+        fn fs_packs(&self, ch: ChronicleId) -> Option<Vec<InventoryItem>> {
+            // Chronicle 7 cannot be listed; the rest list to nothing.
+            (ch != c(7)).then(Vec::new)
         }
         fn seal_closure(&self, ch: ChronicleId, _: Lsn) -> Vec<ObjectId> {
             vec![
@@ -1238,6 +1251,8 @@ mod tests {
         assert_eq!(rec.inventory(h(4)), Some(Inventory::new(vec![]).unwrap()));
         let closure = rec.seal_closure(c(1), Lsn::new(5));
         assert_eq!(closure.len(), 3);
+        assert_eq!(rec.fs_packs(c(1)), Some(Vec::new()));
+        assert_eq!(rec.fs_packs(c(7)), None, "unlistable is recorded as such");
         let bytes = rec.into_bytes();
 
         let rep = Replayer::new(&bytes);
@@ -1245,6 +1260,8 @@ mod tests {
         assert!(rep.exists(&ObjectId::content(h(3))));
         assert_eq!(rep.inventory(h(4)), Some(Inventory::new(vec![]).unwrap()));
         assert_eq!(rep.seal_closure(c(1), Lsn::new(5)), closure, "order kept");
+        assert_eq!(rep.fs_packs(c(1)), Some(Vec::new()));
+        assert_eq!(rep.fs_packs(c(7)), None, "and replays as such");
         assert!(!rep.diverged.get());
         assert_eq!(rep.pos.get(), bytes.len());
 

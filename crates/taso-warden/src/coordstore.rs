@@ -263,17 +263,29 @@ impl StoreView for CoordStore {
         Inventory::decode(&bytes).ok()
     }
 
-    fn fs_packs(&self, chronicle: ChronicleId) -> Vec<InventoryItem> {
-        let Some(packs) = self.packs(chronicle) else {
-            return Vec::new();
+    fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>> {
+        let packs = self.packs(chronicle)?;
+        let names = match packs.pack_names() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("taso-coordd: listing the packs of {chronicle:?}: {e}");
+                return None;
+            }
         };
-        packs
-            .pack_names()
-            .unwrap_or_default()
+        let mut out = Vec::new();
+        for n in names
             .into_iter()
             .filter(|n| name_bounds(n).is_some_and(|(_, _, fs)| fs.is_some()))
-            .filter_map(|n| packs.inventory_item(&n).ok())
-            .collect()
+        {
+            match packs.inventory_item(&n) {
+                Ok(it) => out.push(it),
+                Err(e) => {
+                    eprintln!("taso-coordd: inspecting pack {n} of {chronicle:?}: {e}");
+                    return None;
+                }
+            }
+        }
+        Some(out)
     }
 
     fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Vec<ObjectId> {
@@ -561,7 +573,7 @@ mod tests {
     fn inventories_are_read_by_key() {
         let w = world();
         let cs = CoordStore::new(w.store.clone(), PREFIX);
-        let items = cs.fs_packs(w.parent.id);
+        let items = cs.fs_packs(w.parent.id).expect("every pack accounted for");
         assert_eq!(items.len(), 1, "one fs-bearing pack");
         assert_eq!(items[0].sections, vec![w.seal]);
         let inv = Inventory::new(items).unwrap();
@@ -573,11 +585,31 @@ mod tests {
         assert_eq!(cs.inventory(h(3)), None);
     }
 
+    /// A pack that cannot be inspected is not left out of the answer: there
+    /// is no answer, so no purge is computed from the packs that could be.
+    #[test]
+    fn an_uninspectable_pack_means_no_pack_list() {
+        let w = world();
+        let c = w.parent.id;
+        let names = w.parent.packs.pack_names().unwrap();
+        let hex: String = c.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let fs_pack = names
+            .iter()
+            .find(|n| name_bounds(n).is_some_and(|(_, _, fs)| fs.is_some()))
+            .unwrap();
+        let path = file_of(&w, &format!("{PREFIX}/{hex}/pack/{fs_pack}"));
+        let mut b = std::fs::read(&path).unwrap();
+        b.truncate(b.len() / 2);
+        std::fs::write(&path, &b).unwrap();
+        let cs = CoordStore::new(w.store.clone(), PREFIX);
+        assert_eq!(cs.fs_packs(c), None, "a short list is not an answer");
+    }
+
     #[test]
     fn a_replacement_is_verified_against_its_item() {
         let w = world();
         let cs = CoordStore::new(w.store.clone(), PREFIX);
-        let item = cs.fs_packs(w.parent.id).pop().unwrap();
+        let item = cs.fs_packs(w.parent.id).unwrap().pop().unwrap();
         assert_eq!(cs.verify_replacement(w.parent.id, &item), None);
         let d = w.parent.packs.install_replacement(&item).unwrap();
         assert_eq!(cs.verify_replacement(w.parent.id, &item), Some(d));
@@ -667,7 +699,7 @@ mod tests {
         let names = w.parent.packs.pack_names().unwrap();
         assert!(cs.carries(c, names.last().unwrap(), contract().digest()));
         assert!(names.iter().all(|n| cs.exists(&ObjectId::pack(c, n))));
-        let item = cs.fs_packs(c).pop().unwrap();
+        let item = cs.fs_packs(c).unwrap().pop().unwrap();
         assert_eq!(item.sections, vec![w.seal]);
         let closure = cs.seal_closure(c, w.seal);
         assert!(!closure.is_empty() && closure.iter().all(|o| cs.exists(o)));

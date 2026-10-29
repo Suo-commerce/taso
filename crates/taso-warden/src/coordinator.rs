@@ -815,8 +815,8 @@ impl StoreView for NoStore {
     fn inventory(&self, _: HashVal) -> Option<Inventory> {
         None
     }
-    fn fs_packs(&self, _: ChronicleId) -> Vec<InventoryItem> {
-        Vec::new()
+    fn fs_packs(&self, _: ChronicleId) -> Option<Vec<InventoryItem>> {
+        Some(Vec::new())
     }
     fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<ObjectId> {
         Vec::new()
@@ -1663,7 +1663,12 @@ impl Coord for Coordinator {
             move |t| {
                 let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
                 let log = loaded(&mut g, &shared, &t.journal)?;
-                Ok(log.purge_projection(chronicle, &*shared.config.store))
+                log.purge_projection(chronicle, &*shared.config.store)
+                    .ok_or_else(|| {
+                        CoordError::Unavailable(std::io::Error::other(format!(
+                            "the store could not account for every pack of {chronicle:?}"
+                        )))
+                    })
             },
             false,
         )
@@ -2877,8 +2882,8 @@ mod log_tests {
         fn inventory(&self, _: HashVal) -> Option<Inventory> {
             None
         }
-        fn fs_packs(&self, _: ChronicleId) -> Vec<InventoryItem> {
-            Vec::new()
+        fn fs_packs(&self, _: ChronicleId) -> Option<Vec<InventoryItem>> {
+            Some(Vec::new())
         }
         fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<ObjectId> {
             Vec::new()

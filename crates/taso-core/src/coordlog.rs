@@ -88,8 +88,11 @@ pub trait StoreView {
     fn exists(&self, object: &ObjectId) -> bool;
     /// The inventory object under `key`, if readable.
     fn inventory(&self, key: HashVal) -> Option<Inventory>;
-    /// Every fs-bearing pack of `chronicle`, as inventory items.
-    fn fs_packs(&self, chronicle: ChronicleId) -> Vec<InventoryItem>;
+    /// Every fs-bearing pack of `chronicle`, as inventory items; `None`
+    /// when the store could not list them all or inspect one of them.  A
+    /// short list is never an answer: a purge computed from one would end
+    /// `PurgeComplete` with packs left behind.
+    fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>>;
     /// The objects needed to restore `chronicle` at Seal `seal`.
     fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Vec<ObjectId>;
     /// The trailer digest of `item`'s replacement if it is in the store
@@ -917,15 +920,17 @@ impl CoordLog {
 
     /// `query { purge_projection }` (§6.3 step 2): the inventory the
     /// coordinator would compute now — the fs packs of `chronicle` no
-    /// other Chronicle holds — ascending by name.
+    /// other Chronicle holds — ascending by name; `None` when the store
+    /// could not account for every pack (no projection, rather than one
+    /// that leaves packs behind).
     pub fn purge_projection(
         &self,
         chronicle: ChronicleId,
         store: &dyn StoreView,
-    ) -> Vec<InventoryItem> {
+    ) -> Option<Vec<InventoryItem>> {
         let c = *chronicle.as_bytes();
         let mut v: Vec<InventoryItem> = store
-            .fs_packs(chronicle)
+            .fs_packs(chronicle)?
             .into_iter()
             .filter(|it| {
                 let obj = ObjectId::pack(chronicle, &it.pack.name);
@@ -936,7 +941,7 @@ impl CoordLog {
             })
             .collect();
         v.sort_by(|a, b| a.pack.name.cmp(&b.pack.name));
-        v
+        Some(v)
     }
 
     // ── Predicates and effects (§1.2) ───────────────────────────────
@@ -1277,7 +1282,9 @@ impl CoordLog {
                     store.exists(&ObjectId::content(p.local_key)),
                     "local state unreadable",
                 )?;
-                let projected = self.purge_projection(chronicle, store);
+                let projected = self
+                    .purge_projection(chronicle, store)
+                    .ok_or(Final::Predicate("packs unreadable".into()))?;
                 need(inv.items() == projected.as_slice(), "inventory mismatch")?;
                 fx.retire = true;
                 fx.release_all_of = Some(c);
@@ -1768,6 +1775,8 @@ mod tests {
         carried: RefCell<BTreeMap<(C16, String), BTreeSet<H32>>>,
         inventories: RefCell<BTreeMap<H32, Inventory>>,
         fs: RefCell<BTreeMap<C16, Vec<InventoryItem>>>,
+        /// Chronicles whose packs the store cannot list (a listing failure).
+        unlistable: RefCell<BTreeSet<C16>>,
         closure: RefCell<BTreeMap<C16, Vec<ObjectId>>>,
         replacements: RefCell<BTreeMap<(C16, String), HashVal>>,
     }
@@ -1802,15 +1811,20 @@ mod tests {
         fn inventory(&self, key: HashVal) -> Option<Inventory> {
             self.inventories.borrow().get(key.as_bytes()).cloned()
         }
-        fn fs_packs(&self, c: ChronicleId) -> Vec<InventoryItem> {
-            self.fs
+        fn fs_packs(&self, c: ChronicleId) -> Option<Vec<InventoryItem>> {
+            if self.unlistable.borrow().contains(c.as_bytes()) {
+                return None;
+            }
+            let v = self
+                .fs
                 .borrow()
                 .get(c.as_bytes())
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|i| self.exists(&ObjectId::pack(c, &i.pack.name)))
-                .collect()
+                .collect();
+            Some(v)
         }
         fn seal_closure(&self, c: ChronicleId, _seal: Lsn) -> Vec<ObjectId> {
             self.closure
@@ -2136,7 +2150,7 @@ mod tests {
     }
 
     fn purge_inventory(w: &mut W, v: ChronicleId) -> (PurgeCommitted, Inventory) {
-        let inv = Inventory::new(w.log.purge_projection(v, w.store)).unwrap();
+        let inv = Inventory::new(w.log.purge_projection(v, w.store).unwrap()).unwrap();
         w.store
             .inventories
             .borrow_mut()
@@ -2423,7 +2437,7 @@ mod tests {
             "V's Candidate holds it"
         );
         assert_eq!(
-            w.log.purge_projection(f.v, &store).len(),
+            w.log.purge_projection(f.v, &store).unwrap().len(),
             2,
             "V's own holds do not count"
         );
@@ -2449,7 +2463,7 @@ mod tests {
             },
         };
         assert!(matches!(w.submit(fork, birth), Answer::Accepted { .. }));
-        let proj = w.log.purge_projection(f.v, &store);
+        let proj = w.log.purge_projection(f.v, &store).unwrap();
         assert_eq!(proj.len(), 1, "the forked pack is not V's to delete");
         assert_ne!(proj[0].pack.name, first);
         // And V cannot retire while the fork is open (a liveness dependency).
@@ -3164,7 +3178,7 @@ mod tests {
             now: 100,
         };
         let f = vessel(&mut w);
-        let full = w.log.purge_projection(f.v, &store);
+        let full = w.log.purge_projection(f.v, &store).unwrap();
         let short = Inventory::new(full[..1].to_vec()).unwrap();
         store
             .inventories
@@ -3186,6 +3200,45 @@ mod tests {
         assert_eq!(
             w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
             Final::Predicate("inventory mismatch".into())
+        );
+    }
+
+    /// A store that cannot account for every pack gives no projection,
+    /// and a purge commit against it is refused -- never computed from
+    /// the packs that happened to list.
+    #[test]
+    fn an_unlistable_pack_set_gives_no_projection_and_refuses_the_purge() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let full = Inventory::new(w.log.purge_projection(f.v, &store).unwrap()).unwrap();
+        store
+            .inventories
+            .borrow_mut()
+            .insert(*full.key().as_bytes(), full.clone());
+        store.put(ObjectId::content(h(0x70)));
+        store.unlistable.borrow_mut().insert(*f.v.as_bytes());
+        assert_eq!(w.log.purge_projection(f.v, &store), None, "no projection");
+        let pc = PurgeCommitted {
+            chronicle: f.v,
+            cutoff: crate::contract::Cutoff {
+                seal: SealRef {
+                    lsn: Lsn::new(9),
+                    hash: h(9),
+                },
+                fs_shipped: Lsn::new(10),
+            },
+            inventory_key: full.key(),
+            local_key: h(0x70),
+        };
+        assert_eq!(
+            w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
+            Final::Predicate("packs unreadable".into())
         );
     }
 

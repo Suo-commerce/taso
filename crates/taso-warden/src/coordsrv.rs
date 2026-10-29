@@ -2508,8 +2508,8 @@ mod tests {
         fn inventory(&self, _: HashVal) -> Option<taso_core::contract::Inventory> {
             None
         }
-        fn fs_packs(&self, _: ChronicleId) -> Vec<taso_core::contract::InventoryItem> {
-            Vec::new()
+        fn fs_packs(&self, _: ChronicleId) -> Option<Vec<taso_core::contract::InventoryItem>> {
+            Some(Vec::new())
         }
         fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<taso_core::coordlog::ObjectId> {
             Vec::new()
