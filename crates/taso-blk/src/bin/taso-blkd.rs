@@ -134,7 +134,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
@@ -209,6 +209,17 @@ struct Geometry {
 struct Device {
     dev_id: i32,
     thread: JoinHandle<()>,
+}
+
+/// A branch's entry in the device table.  `Starting` while its device
+/// starts (several ms of the kernel's work, ~8 under a storm of forks on
+/// taso-test, 2026-10-29): the table is not held across that, so a call
+/// about another branch (an `info`, another `attach`) never waits on it;
+/// a call that needs this branch's own entry settled waits for it
+/// ([`Daemon::settled`]).
+enum Slot {
+    Starting,
+    Running(Device),
 }
 
 /// Per-operation time on the device path, for `stats`: how long a request
@@ -296,7 +307,9 @@ struct Daemon {
     /// The log's fdatasync, outside the store's lock, one for every group
     /// ended while the last one ran (Seals, device flushes, FUA writes).
     sync: Arc<Syncer>,
-    devices: Mutex<HashMap<LayerId, Device>>,
+    devices: Mutex<HashMap<LayerId, Slot>>,
+    /// Signalled when a `Starting` entry becomes `Running` or goes.
+    settle: Condvar,
     geometry: Geometry,
     /// A compaction is running.
     compacting: AtomicBool,
@@ -396,6 +409,7 @@ fn main() {
         store: Arc::new(Mutex::new(store)),
         sync,
         devices: Mutex::new(HashMap::new()),
+        settle: Condvar::new(),
         geometry: g,
         compacting: AtomicBool::new(false),
     });
@@ -698,7 +712,7 @@ impl Daemon {
                 // An orphan Seal, taken but its record never accepted, that the
                 // branch stands on (F1, 2026-10-28).  As `reset`: detached only.
                 let branch = layer(1)?;
-                let devices = lock(&self.devices);
+                let devices = self.settled(branch);
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -715,7 +729,7 @@ impl Daemon {
                 let branch = layer(1)?;
                 // Hold the device table so no attach can start in between;
                 // the table is always taken before the store, never after.
-                let devices = lock(&self.devices);
+                let devices = self.settled(branch);
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -767,7 +781,7 @@ impl Daemon {
                     .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
                 let mut r = std::io::BufReader::with_capacity(1 << 20, file);
                 // As for reset: the device table first, so no attach starts.
-                let devices = lock(&self.devices);
+                let devices = self.settled(branch);
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -854,12 +868,12 @@ impl Daemon {
     /// `kind=… parent=… name=… tag=… origin=… dev=…` for a live layer.
     fn info(&self, l: LayerId) -> Result<String, String> {
         // The device table first, then the store: never both at once.
-        let dev = self
-            .devices
-            .lock()
-            .unwrap()
-            .get(&l)
-            .map(|d| format!("/dev/ublkb{}", d.dev_id));
+        // Settled for this layer only: a device starting for another
+        // branch is not waited for.
+        let dev = match self.settled(l).get(&l) {
+            Some(Slot::Running(d)) => Some(format!("/dev/ublkb{}", d.dev_id)),
+            _ => None,
+        };
         let s = lock_store(&self.store);
         let kind = s.map().kind(l).map_err(|e| e.to_string())?;
         let parent = s.map().parent(l).map_err(|e| e.to_string())?;
@@ -954,13 +968,46 @@ impl Daemon {
         {
             return Err(format!("{branch} is a Seal; attach a branch"));
         }
-        let mut devices = lock(&self.devices);
-        if let Some(d) = devices.get(&branch) {
-            return Err(format!(
-                "{branch} is already attached as /dev/ublkb{}",
-                d.dev_id
-            ));
+        {
+            let mut devices = lock(&self.devices);
+            match devices.get(&branch) {
+                Some(Slot::Running(d)) => {
+                    return Err(format!(
+                        "{branch} is already attached as /dev/ublkb{}",
+                        d.dev_id
+                    ))
+                }
+                Some(Slot::Starting) => {
+                    return Err(format!(
+                        "{branch} is already attached (its device is starting)"
+                    ))
+                }
+                None => {}
+            }
+            devices.insert(branch, Slot::Starting);
         }
+        // The table is let go of while the device starts.
+        taso_core::hold("blkd.attach");
+        let started = self.start_device(branch);
+        let mut devices = lock(&self.devices);
+        let answer = match started {
+            Ok(dev) => {
+                let path = format!("/dev/ublkb{}", dev.dev_id);
+                devices.insert(branch, Slot::Running(dev));
+                Ok(path)
+            }
+            Err(e) => {
+                devices.remove(&branch);
+                Err(e)
+            }
+        };
+        drop(devices);
+        self.settle.notify_all();
+        answer
+    }
+
+    /// Start `branch`'s device and wait for it to be up (no lock held).
+    fn start_device(&self, branch: LayerId) -> Result<Device, String> {
         let (tx, rx) = mpsc::channel();
         let store = self.store.clone();
         let sync = self.sync.clone();
@@ -970,10 +1017,7 @@ impl Daemon {
             .spawn(move || run_device(store, sync, branch, g, tx))
             .map_err(|e| format!("cannot start device thread: {e}"))?;
         match rx.recv() {
-            Ok(Ok(dev_id)) => {
-                devices.insert(branch, Device { dev_id, thread });
-                Ok(format!("/dev/ublkb{dev_id}"))
-            }
+            Ok(Ok(dev_id)) => Ok(Device { dev_id, thread }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(format!("device for {branch} did not start: {e}"))
@@ -985,14 +1029,23 @@ impl Daemon {
         }
     }
 
+    /// The device table, once `branch`'s entry is not `Starting`.
+    fn settled(&self, branch: LayerId) -> MutexGuard<'_, HashMap<LayerId, Slot>> {
+        let mut devices = lock(&self.devices);
+        while matches!(devices.get(&branch), Some(Slot::Starting)) {
+            devices = self
+                .settle
+                .wait(devices)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        devices
+    }
+
     /// Stop `branch`'s device and wait for its thread.
     fn detach(&self, branch: LayerId) -> Result<(), String> {
-        let d = self
-            .devices
-            .lock()
-            .unwrap()
-            .remove(&branch)
-            .ok_or_else(|| format!("{branch} is not attached"))?;
+        let Some(Slot::Running(d)) = self.settled(branch).remove(&branch) else {
+            return Err(format!("{branch} is not attached"));
+        };
         UblkCtrl::new_simple(d.dev_id)
             .and_then(|c| c.kill_dev())
             .map_err(|e| format!("cannot stop /dev/ublkb{}: {e:?}", d.dev_id))?;
@@ -1016,9 +1069,9 @@ impl Daemon {
     }
 
     fn stats(&self) -> String {
-        // Never hold the store lock while waiting for the device table:
-        // `attach` holds the table while a new device starts, and the
-        // kernel's first reads of that device need the store.
+        // Never hold the store lock while waiting for the device table: a
+        // call settling a branch holds the table, and a starting device's
+        // first reads (the kernel's) need the store.
         let devices = lock(&self.devices).len();
         let s = lock_store(&self.store);
         let st = s.stats();

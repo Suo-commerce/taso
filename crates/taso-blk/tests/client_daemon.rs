@@ -313,3 +313,91 @@ fn the_daemon_works_when_its_log_cannot_be_written() {
         "quit exits cleanly although nothing could be logged"
     );
 }
+
+/// A device starting for one branch holds up no call about another: the
+/// daemon is held inside an attach (after its table entry is made, where
+/// the device would start), and a second client's `info` of another layer,
+/// a `branch` and a `reset` of another branch answer while it is held
+/// (the fork probe, taso-test, 2026-10-29: a fork's `info` waited behind
+/// every attach in progress).  A call about the held branch itself waits
+/// for it: its `reset` is refused only once the attach has ended, as
+/// attached or not.  Without root and ublk the attach then fails; either
+/// way the table settles.
+#[test]
+fn an_attach_holds_up_no_call_about_another_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, sock, holds) = (
+        dir.path().join("log"),
+        dir.path().join("sock"),
+        dir.path().join("holds"),
+    );
+    std::fs::create_dir_all(&holds).unwrap();
+    std::fs::write(holds.join("blkd.attach.arm"), "").unwrap();
+    let _d = Daemon::spawn(
+        Command::new(env!("CARGO_BIN_EXE_taso-blkd"))
+            .arg(&log)
+            .arg(&sock)
+            .env("TASO_E3_HOLD", "blkd.attach")
+            .env("TASO_E3_HOLD_DIR", &holds),
+        &sock,
+    );
+    let mut c = Client::connect(&sock).unwrap();
+    let root = c.root().unwrap();
+    let a = c.branch(root, Some("tank/held")).unwrap();
+    let b = c.branch(root, Some("tank/other")).unwrap();
+    let attaching = {
+        let sock = sock.clone();
+        thread::spawn(move || Client::connect(&sock).unwrap().attach(a))
+    };
+    let held = holds.join("blkd.attach.held");
+    for _ in 0..250 {
+        if held.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(held.exists(), "the attach reached its hold");
+
+    // Another client, about other layers, while the attach is held.
+    let asked = std::time::Instant::now();
+    let other = thread::spawn({
+        let sock = sock.clone();
+        move || {
+            let mut c = Client::connect(&sock).unwrap();
+            let info = c.info(b).unwrap();
+            c.branch(root, Some("tank/third")).unwrap();
+            c.reset(b).unwrap();
+            info
+        }
+    });
+    for _ in 0..100 {
+        if other.is_finished() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        other.is_finished(),
+        "info, branch and reset of other branches waited {:?} behind a held attach",
+        asked.elapsed()
+    );
+    assert_eq!(other.join().unwrap().dev, None);
+
+    // About the held branch: its reset waits for the attach to end.
+    let same = thread::spawn({
+        let sock = sock.clone();
+        move || Client::connect(&sock).unwrap().reset(a)
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        !same.is_finished(),
+        "a reset of the branch being attached waits for it"
+    );
+    std::fs::write(holds.join("blkd.attach.release"), "").unwrap();
+    let attached = attaching.join().unwrap();
+    let reset = same.join().unwrap();
+    match attached {
+        Ok(_) => assert!(reset.is_err(), "attached: its reset is refused"),
+        Err(_) => assert!(reset.is_ok(), "never attached: its reset goes ahead"),
+    }
+}
