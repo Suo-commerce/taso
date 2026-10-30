@@ -333,7 +333,7 @@ fn an_attach_holds_up_no_call_about_another_branch() {
     );
     std::fs::create_dir_all(&holds).unwrap();
     std::fs::write(holds.join("blkd.attach.arm"), "").unwrap();
-    let _d = Daemon::spawn(
+    let d = Daemon::spawn(
         Command::new(env!("CARGO_BIN_EXE_taso-blkd"))
             .arg(&log)
             .arg(&sock)
@@ -397,7 +397,12 @@ fn an_attach_holds_up_no_call_about_another_branch() {
     let attached = attaching.join().unwrap();
     let reset = same.join().unwrap();
     match attached {
-        Ok(_) => assert!(reset.is_err(), "attached: its reset is refused"),
+        Ok(_) => {
+            assert!(reset.is_err(), "attached: its reset is refused");
+            c.detach(a).unwrap(); // no device left behind (root and ublk)
+        }
         Err(_) => assert!(reset.is_ok(), "never attached: its reset goes ahead"),
     }
+    c.quit().unwrap();
+    assert!(d.wait(), "quit exits cleanly");
 }
