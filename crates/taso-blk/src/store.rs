@@ -1251,7 +1251,7 @@ impl Store {
     /// Whether an append or a sync has failed: every call fails until the
     /// log is reopened.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned || self.tracker.failed()
     }
 
     // ── internals ───────────────────────────────────────────────────
@@ -1602,6 +1602,12 @@ impl Writer {
                 Err(e.into())
             }
         }
+    }
+
+    /// How a write outside the lock failed, once one has (the store is
+    /// then poisoned).
+    pub fn failure(&self) -> Option<String> {
+        self.tracker.failure()
     }
 
     /// Give a reservation up without writing it (the caller lost its
@@ -3512,6 +3518,9 @@ mod tests {
         };
         writer.fail(&r, "the queue lost its buffer");
         let mut s = store.lock().unwrap();
+        // What taso-blkd asks before naming the failure (D93): a write that
+        // failed outside the lock poisons as one inside it does.
+        assert!(s.is_poisoned());
         assert!(matches!(s.flush(), Err(StoreError::Poisoned)));
         assert!(matches!(
             s.write(b, 1, &blocks(5, 1), false),

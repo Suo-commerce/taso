@@ -141,7 +141,7 @@ use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use taso_blk::map::{Kind, LayerId, BLOCK};
-use taso_blk::store::{Compacted, Store, StoreError, Syncer};
+use taso_blk::store::{write_digest, AlignedBuf, Compacted, Store, StoreError, Syncer, Writer};
 
 /// The ublk target name of this daemon's devices; it is how a later
 /// daemon recognises leftovers as its own.
@@ -203,6 +203,8 @@ struct Geometry {
     compact_pct: u64,
     /// ... and at least this many bytes.
     compact_min: u64,
+    /// Bytes the extender keeps the log written ahead of its tail.
+    ahead: u64,
 }
 
 /// A running device: its ublk id and the thread that owns it.
@@ -247,7 +249,9 @@ const OP_WRITE: usize = 1;
 const OP_FLUSH: usize = 2;
 const OP_DISCARD: usize = 3;
 /// `TASO_BLKD_OPLOG=path`: one line per device request, `op bytes start_ns
-/// end_ns copy_ns wait_ns store_ns` on CLOCK_MONOTONIC (blktrace's clock),
+/// end_ns copy_ns wait_ns store_ns hash_ns commit_ns` on CLOCK_MONOTONIC
+/// (blktrace's clock; the last two from P5 L3, a write's parts outside
+/// the lock),
 /// for the probe of where a request's time goes (blk-trace-freeze.sh).
 /// Run 3 on taso-p5 (2026-10-26) put the whole write phase of a freeze in
 /// our handler, 0.92 ms per 512 KiB served one after another, and four
@@ -256,13 +260,25 @@ const OP_DISCARD: usize = 3;
 /// wait for the store's lock (`wait`), the work under it (`store`).  Off
 /// unless set; costs a write per request.
 static OPLOG: Mutex<Option<std::io::BufWriter<File>>> = Mutex::new(None);
-/// The three parts of one request, for the op log and the counters.
+/// The parts of one request, for the op log and the counters.  Since the
+/// layout revision (P5 L3) a write's digest and its record's write run
+/// outside the lock: `store` is then the reservation alone.
 #[derive(Clone, Copy, Default)]
 struct Split {
     copy: std::time::Duration,
     wait: std::time::Duration,
     store: std::time::Duration,
+    /// The body's digest, before the lock (writes).
+    hash: std::time::Duration,
+    /// The record's write, after the lock (writes).
+    commit: std::time::Duration,
 }
+/// A write's digest and commit times, summed (µs), for `op_wsplit`: the
+/// store's own counters see only what it does itself.
+static WSPLIT_OUT: Mutex<(u64, u64)> = Mutex::new((0, 0));
+/// Whether the failure that poisoned the store has been logged by a queue
+/// (a record's write outside the lock).
+static POISON_SAID: AtomicBool = AtomicBool::new(false);
 /// The store's lock, with the wait for it measured.
 fn lock_store_timed<'a>(store: &'a Mutex<Store>, split: &mut Split) -> MutexGuard<'a, Store> {
     let t = std::time::Instant::now();
@@ -286,11 +302,13 @@ fn note_op(op: usize, started: std::time::Instant, split: Split, bytes: u64) {
         let start = end - started.elapsed().as_nanos() as u64;
         let _ = writeln!(
             w,
-            "{} {bytes} {start} {end} {} {} {}",
+            "{} {bytes} {start} {end} {} {} {} {} {}",
             ["read", "write", "flush", "discard"][op],
             split.copy.as_nanos(),
             split.wait.as_nanos(),
-            split.store.as_nanos()
+            split.store.as_nanos(),
+            split.hash.as_nanos(),
+            split.commit.as_nanos()
         );
         let _ = w.flush();
     }
@@ -317,7 +335,7 @@ struct Daemon {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N]";
+    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N] [--ahead-mib N]";
     if args.len() < 3 {
         log!("{usage}");
         std::process::exit(64);
@@ -334,6 +352,7 @@ fn main() {
         checkpoint_every: 256 << 20,
         compact_pct: 0,
         compact_min: 1 << 30,
+        ahead: 32 << 20,
     };
     let mut rest = args[3..].iter();
     while let Some(flag) = rest.next() {
@@ -349,6 +368,7 @@ fn main() {
             ("--checkpoint-mib", Some(v)) if v <= 1 << 20 => g.checkpoint_every = v << 20,
             ("--compact-pct", Some(v)) if v <= 99 => g.compact_pct = v,
             ("--compact-min-mib", Some(v)) if v <= 1 << 24 => g.compact_min = v << 20,
+            ("--ahead-mib", Some(v)) if v <= 1 << 14 => g.ahead = v << 20,
             _ => {
                 log!("bad argument {flag}\n{usage}");
                 std::process::exit(64);
@@ -388,10 +408,16 @@ fn main() {
     let listener = UnixListener::bind(&socket)
         .unwrap_or_else(|e| fail(&format!("cannot bind {}: {e}", socket.display())));
     log!(
-        "taso-blkd: serving {} on {} (open-file limit {})",
+        "taso-blkd: serving {} on {} (open-file limit {}; log {}, written ahead {} MiB)",
         log.display(),
         socket.display(),
-        raise_open_files()
+        raise_open_files(),
+        if store.is_direct() {
+            "direct"
+        } else {
+            "buffered: the file system refused O_DIRECT"
+        },
+        g.ahead >> 20
     );
 
     let sync = Arc::new(
@@ -419,6 +445,13 @@ fn main() {
             .name("upkeep".into())
             .spawn(move || upkeep(&d))
             .unwrap_or_else(|e| fail(&format!("cannot start the upkeep thread: {e}")));
+    }
+    if g.ahead > 0 {
+        let d = daemon.clone();
+        std::thread::Builder::new()
+            .name("extender".into())
+            .spawn(move || extender(&d))
+            .unwrap_or_else(|e| fail(&format!("cannot start the extender thread: {e}")));
     }
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
@@ -528,6 +561,42 @@ fn upkeep(d: &Daemon) {
                 Err(e) => log!("taso-blkd: checkpoint: {e}"),
             }
         }
+    }
+}
+
+/// Keep the log written `--ahead-mib` ahead of its tail, so the records'
+/// direct writes overwrite written extents (which ext4 lets run side by
+/// side) instead of extending the file (which it runs one at a time; P5
+/// L0, 2026-10-30: four threads 0.77× one when extending, 2.0× over
+/// written extents).  The zeros are written under the store's lock, one
+/// MiB at a time: outside it a reservation could overtake the zeroing and
+/// the zeros overwrite its record; under it a record never lies past the
+/// edge being zeroed.  The design said "outside the lock"; this is why
+/// not.  Whether it stays is the metal's to decide (l-j): `--ahead-mib 0`
+/// turns it off.
+fn extender(d: &Daemon) {
+    const STEP: u64 = 1 << 20;
+    let target = d.geometry.ahead;
+    let mut said = false;
+    loop {
+        let r = {
+            let mut s = lock_store(&d.store);
+            if s.is_poisoned() || s.ahead() >= target {
+                None
+            } else {
+                Some(s.extend_ahead(STEP))
+            }
+        };
+        match r {
+            // Short: again at once, the lock let go in between.
+            Some(Ok(())) => continue,
+            Some(Err(e)) if !said => {
+                log!("taso-blkd: writing the log ahead: {e}");
+                said = true;
+            }
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -1091,10 +1160,15 @@ impl Daemon {
                 o.count, o.total_us, o.store_us, o.bytes
             )
         };
-        // op_wsplit: where the writes' time under the lock went, µs summed
-        // over every write: map, copy, hash, pwrite (store.rs Stats).
+        // op_wsplit: where the writes' time went, µs summed over every
+        // write: map, copy, hash, pwrite (store.rs Stats).  Since P5 L3 the
+        // device's writes hash and write outside the lock: those parts are
+        // added from WSPLIT_OUT, and `store` in op_write is the
+        // reservation alone.  direct: the log is open O_DIRECT; ahead_bytes:
+        // written ahead of the tail (log_bytes counts records only).
+        let (hash_out, commit_out) = *lock(&WSPLIT_OUT);
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{} direct={} ahead_bytes={}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -1110,8 +1184,10 @@ impl Daemon {
             op("op_discard", ops[OP_DISCARD]),
             st.write_map_us,
             st.write_copy_us,
-            st.write_hash_us,
-            st.write_pwrite_us,
+            st.write_hash_us + hash_out,
+            st.write_pwrite_us + commit_out,
+            u8::from(s.is_direct()),
+            s.ahead(),
         )
     }
 }
@@ -1239,9 +1315,12 @@ fn serve_queue(qid: u16, dev: &UblkDev, store: &Mutex<Store>, sync: &Syncer, bra
     // The kernel allows that file to be opened only once, so it is
     // borrowed, never closed here (ManuallyDrop).
     let cdev = ManuallyDrop::new(unsafe { File::from_raw_fd(dev.tgt.fds[0]) });
-    let mut buf = vec![0u8; dev.dev_info.max_io_buf_bytes as usize];
+    // Aligned, so the store reads into it and writes from it directly.
+    let mut buf = AlignedBuf::zeroed(dev.dev_info.max_io_buf_bytes as usize);
+    // This queue's handle for writing reserved records outside the lock.
+    let writer = lock_store(store).writer();
     let handler = move |q: &UblkQueue, tag: u16, _io: &UblkIOCtx| {
-        let res = handle(q, tag, qid, &cdev, &mut buf, store, sync, branch);
+        let res = handle(q, tag, qid, &cdev, &mut buf, store, sync, &writer, branch);
         if let Err(e) =
             q.complete_io_cmd_unified(tag, BufDesc::Slice(&[]), Ok(UblkIORes::Result(res)))
         {
@@ -1275,7 +1354,7 @@ fn durable(sync: &Syncer, store: &Mutex<Store>, lsn: u64) -> Result<(), StoreErr
     }
 }
 
-#[allow(clippy::too_many_arguments)] // the queue's context, the store and its syncer
+#[allow(clippy::too_many_arguments)] // the queue's context, the store, its syncer and writer
 fn handle(
     q: &UblkQueue,
     tag: u16,
@@ -1284,6 +1363,7 @@ fn handle(
     buf: &mut [u8],
     store: &Mutex<Store>,
     sync: &Syncer,
+    writer: &Writer,
     branch: LayerId,
 ) -> i32 {
     let iod = q.get_iod(tag);
@@ -1338,29 +1418,60 @@ fn handle(
                 return io(&e);
             }
             split.copy = t.elapsed();
-            // FUA: the write's group ended under the lock, synced outside it.
+            // The body's digest before the lock; under it only the map and
+            // the record's place (the reservation); the record written
+            // after it, directly into the log (the layout revision, P5 L3).
+            let t = std::time::Instant::now();
+            let digest = write_digest(branch, lba, &buf[..n]);
+            split.hash = t.elapsed();
+            // FUA: the write's group ended under the lock, synced outside it
+            // (the Syncer waits for the record's write first).
             let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
             let r = {
                 let mut s = lock_store_timed(store, &mut split);
                 let t = std::time::Instant::now();
-                let r = s.write(branch, lba, &buf[..n], false).and_then(|()| {
+                let r = s.reserve_write(branch, lba, n, &digest).and_then(|r| {
                     if fua {
-                        s.flush_pending().map(Some)
+                        s.flush_pending().map(|lsn| (r, Some(lsn)))
                     } else {
-                        Ok(None)
+                        Ok((r, None))
                     }
                 });
                 split.store = t.elapsed();
                 r
             };
             let res = match r {
-                Ok(None) => n as i32,
-                Ok(Some(lsn)) => match durable(sync, store, lsn) {
-                    Ok(()) => n as i32,
-                    Err(e) => io(&e),
-                },
                 Err(e) => io(&e),
+                Ok((r, fua_lsn)) => {
+                    let t = std::time::Instant::now();
+                    let written = writer.commit(&r, &buf[..n]);
+                    split.commit = t.elapsed();
+                    match (written, fua_lsn) {
+                        (Err(e), _) => {
+                            // The write that poisons the store, named once
+                            // (D93 class (i)), as a failed sync is in
+                            // `durable`.
+                            if !POISON_SAID.swap(true, Ordering::SeqCst) {
+                                log!(
+                                    "taso-blkd: the store is poisoned: {}",
+                                    writer.failure().unwrap_or_else(|| e.to_string())
+                                );
+                            }
+                            io(&e)
+                        }
+                        (Ok(()), None) => n as i32,
+                        (Ok(()), Some(lsn)) => match durable(sync, store, lsn) {
+                            Ok(()) => n as i32,
+                            Err(e) => io(&e),
+                        },
+                    }
+                }
             };
+            {
+                let mut w = lock(&WSPLIT_OUT);
+                w.0 += split.hash.as_micros() as u64;
+                w.1 += split.commit.as_micros() as u64;
+            }
             note_op(OP_WRITE, started, split, bytes);
             res
         }
