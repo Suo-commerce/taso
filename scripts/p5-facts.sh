@@ -6,6 +6,7 @@
 #   sudo scripts/p5-facts.sh report                 (a) what the stack reports
 #   sudo scripts/p5-facts.sh flush                  (b) the cost of a flush
 #   sudo scripts/p5-facts.sh logfile [MIB]          (b2) the block log's own append+fdatasync
+#   sudo scripts/p5-facts.sh appends [KIB] [REC]    (b3) do O_DIRECT appends to one file overlap?
 #   sudo scripts/p5-facts.sh writer [PORT]          (c) on the host, before the cut
 #        scripts/p5-facts.sh listener HOST[:PORT]   (c) on the laptop, the witness
 #   sudo scripts/p5-facts.sh verify ACKED           (c) on the host, after boot
@@ -42,6 +43,46 @@
 #     Predictions (before the run): as-is ~13 ms, preallocated ~6,
 #     no-journal ~5, O_DIRECT ~4 (the drive's write time plus one barrier).
 #     The winner is what the log file becomes (lever 3b).
+#
+# (b3) appends: the fact the record layout revision rests on
+#     (Taso_design_layout_2026-10-30, L0).  The revision reserves a
+#     record's place under the store's lock and writes it O_DIRECT after
+#     letting the lock go, so several queue threads' writes could be in
+#     flight at once -- if the kernel lets them.  ext4 takes the inode's
+#     lock exclusively for a direct write that extends the file, and may
+#     for one into a preallocated (allocated, unwritten) extent; it takes
+#     it shared only for an overwrite of written extents.  T threads (1,
+#     then 4) together append REC records of KIB KiB to ONE file, each
+#     record's offset taken from a shared counter under a lock (the
+#     reservation) and written outside it (the write), at two sizes
+#     unless one is given: 4 KiB x 1024 (a single-block write -- the
+#     Vessel's own metadata -- bounded by the write's latency, where a
+#     lock shows) and 512 KiB x 32 (the kernel's largest request,
+#     bounded by the drive's bandwidth, where no lock can show and the
+#     drive's rate is the number); the file made four ways:
+#       buffered      a growing file, page-cache writes (the store today)
+#       growing       a growing file, O_DIRECT
+#       preallocated  O_DIRECT into a file fallocate'd to its final size
+#       written-ahead O_DIRECT into a file already written once (zeros,
+#                     synced): the appends are overwrites
+#     Per way: the same REC records written by one thread and by four
+#     (the wall time of each batch, the pwrite p50 and max -- a blocked
+#     pwrite still counts its wait, so the wall is the measure -- and
+#     one fdatasync after it, timed: what the group's sync costs once
+#     the data went direct), then the speedup of four over one: 1.0
+#     means the writes ran one at a time whatever the threads did, near
+#     4 means they overlapped.  Predictions (before the run): buffered
+#     and growing serialise at 4 KiB (speedup ~1, the inode lock);
+#     preallocated serialises too (the unwritten extents' conversion);
+#     written-ahead overlaps (speedup 2-4, within what the drive gives);
+#     at 512 KiB every way is ~1 (the drive's bandwidth), the direct
+#     pwrite of 512 KiB ~0.35 ms on the metal's PM981 at one thread; the
+#     fdatasync after direct writes small (a barrier, no writeback),
+#     after buffered writes the writeback of the whole batch.  First
+#     run (the P5 chat's own VM, 2026-10-30, mechanism only): at 4 KiB
+#     growing 0.99, preallocated 1.25, written-ahead 2.35; at 512 KiB
+#     all 0.9-1.1.  Runs on the block-log partition's ext4
+#     (/var/lib/taso/facts); tmpfs refuses O_DIRECT and is refused here.
 #
 # (c) the cut, the real measurement.  writer (host) listens on PORT
 #     (default 7705) and, once the listener (laptop) has connected, appends
@@ -194,6 +235,76 @@ run("prealloc+direct", os.path.join(d, "log-pd.bin"), flags=os.O_DIRECT, preallo
 PY
     ;;
 
+# ---- (b3) appends -------------------------------------------------------------
+appends)
+    [[ $EUID -eq 0 ]] || die "run as root"
+    base=$(dirname "$EXT4_DIR"); [[ -d "$base" ]] || die "$base is not here"
+    fstype=$(findmnt -no FSTYPE --target "$base"); [[ "$fstype" != tmpfs ]] || die "$base is tmpfs, which refuses O_DIRECT"
+    mkdir -p "$EXT4_DIR"
+    if [[ -n "${1:-}" ]]; then sizes="$1:${2:-32}"; else sizes="4:1024 512:32"; fi
+    echo "== appends: REC records of KIB KiB to one file by 1 and by 4 threads, four ways, on $(findmnt -no SOURCE,FSTYPE,OPTIONS --target "$base")"
+    for sz in $sizes; do
+    KIB=${sz%%:*}; REC=${sz##*:}
+    echo "-- $REC records of $KIB KiB ($(( KIB * REC / 1024 )) MiB a batch)"
+    python3 - "$EXT4_DIR" "$KIB" "$REC" <<'PY'
+import mmap, os, sys, threading, time
+d, kib, rec = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+SIZE = kib << 10
+def pct(xs, p): xs = sorted(xs); return xs[min(len(xs) - 1, int(p * len(xs)))]
+
+def prepare(path, way, total):
+    """Make the file the way asks for; return the fd to append to."""
+    try: os.unlink(path)
+    except FileNotFoundError: pass
+    if way == "buffered":
+        return os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    if way == "written-ahead":
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+        zero = bytes(1 << 20); off = 0
+        while off < total:
+            n = os.pwrite(fd, zero[:min(len(zero), total - off)], off); off += n
+        os.fdatasync(fd); os.close(fd)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_DIRECT, 0o600)
+    if way == "preallocated":
+        os.posix_fallocate(fd, 0, total)
+    return fd
+
+def run(way, threads):
+    """REC records in all, split among the threads; returns the wall time."""
+    path = os.path.join(d, "appends-%s.bin" % way)
+    total = rec * SIZE
+    fd = prepare(path, way, total)
+    counter = [0]; lock = threading.Lock()
+    lat = [[] for _ in range(threads)]
+    def worker(i):
+        buf = mmap.mmap(-1, SIZE); buf.write(os.urandom(SIZE))   # page-aligned, as O_DIRECT needs
+        for _ in range(rec // threads + (1 if i < rec % threads else 0)):
+            with lock:                                          # the reservation
+                off = counter[0]; counter[0] += SIZE
+            t = time.perf_counter_ns()
+            os.pwrite(fd, buf, off)                             # the write, outside it
+            lat[i].append(time.perf_counter_ns() - t)
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(threads)]
+    wall = time.perf_counter_ns()
+    for t in ts: t.start()
+    for t in ts: t.join()
+    wall = time.perf_counter_ns() - wall
+    t = time.perf_counter_ns(); os.fdatasync(fd); sync = time.perf_counter_ns() - t
+    os.close(fd); os.unlink(path)
+    allv = [x for l in lat for x in l]
+    print("  %-14s T=%d  wall %7.1f ms  pwrite p50 %6.2f max %6.2f ms  fdatasync %6.1f ms  (%.0f MB/s)"
+          % (way, threads, wall / 1e6, pct(allv, .5) / 1e6, max(allv) / 1e6, sync / 1e6, total / (wall / 1e9) / 1e6))
+    return wall
+
+for way in ("buffered", "growing", "preallocated", "written-ahead"):
+    run(way, 1)                 # a warm-up: the first file of a way pays its own allocation
+    one = run(way, 1)
+    four = run(way, 4)
+    print("  %-14s speedup T=4 over T=1: %4.2f  (1.0 the writes ran one at a time, ~4 they overlapped)" % (way, one / four))
+PY
+    done
+    ;;
+
 # ---- (c) writer, on the host --------------------------------------------------
 writer)
     [[ $EUID -eq 0 ]] || die "run as root"
@@ -335,5 +446,5 @@ sys.exit(1 if bad else 0)
 PY
     ;;
 *)
-    echo "usage: $0 report | flush | logfile [MIB] | writer [PORT] | listener HOST[:PORT] [ACKED] | verify ACKED" >&2; exit 64 ;;
+    echo "usage: $0 report | flush | logfile [MIB] | appends [KIB] [REC] | writer [PORT] | listener HOST[:PORT] [ACKED] | verify ACKED" >&2; exit 64 ;;
 esac
