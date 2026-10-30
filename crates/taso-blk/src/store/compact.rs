@@ -54,9 +54,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    ckpt_path, encode_record, read_record, record_len, remove_if_there, sync_dir, write_checkpoint,
-    FlushPoint, Meta, ReadAt, Stats, Store, StoreError, COMPACT_MAGIC, HASH, HEADER_LEN, K_BASE,
-    K_DATA, K_FLUSH, MAX_BODY, MAX_DATA,
+    ckpt_path, encode_record, read_record, remove_if_there, sync_dir, write_checkpoint, FlushPoint,
+    Meta, ReadAt, Stats, Store, StoreError, COMPACT_MAGIC, HASH, HEADER_LEN, K_BASE, K_DATA,
+    K_FLUSH, MAX_BODY, MAX_DATA,
 };
 use crate::map::{Map, BLOCK};
 
@@ -283,10 +283,13 @@ impl Compaction {
                     },
                 );
                 while bytes < WRITE_BUF {
-                    let Some((kind, body, hash)) = read_record(&mut r, &self.read_prev)? else {
+                    let mut pos = self.read_pos;
+                    let Some((kind, body, hash, _)) =
+                        read_record(&mut r, &mut pos, &self.read_prev)?
+                    else {
                         break;
                     };
-                    self.read_pos += record_len(kind, body.len());
+                    self.read_pos = pos;
                     self.read_prev = hash;
                     bytes += body.len();
                     batch.push((kind, body));
@@ -414,7 +417,7 @@ impl Compaction {
 
     /// Append one record to the new log (gathered in `buf`).
     fn put(&mut self, kind: u8, body: &[u8]) -> io::Result<()> {
-        self.prev = encode_record(&mut self.buf, &self.prev, kind, body);
+        self.prev = encode_record(&mut self.buf, self.tail, &self.prev, kind, body);
         if self.buf.len() >= WRITE_BUF {
             self.write_buf()?;
         }

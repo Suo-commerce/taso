@@ -173,8 +173,13 @@ fn the_client_and_the_daemon_agree() {
     assert!(c.checkpoint().unwrap() > 0);
     let k = c.compact().unwrap();
     let n = |key: &str| k[key].parse::<u64>().unwrap();
+    // A compacted log's base is a block-kind record (a head block, its
+    // state padded to a block), so compacting a nearly empty log can add
+    // up to two blocks (P5 l-l, 2026-10-30: 5 473 -> 12 374 bytes here,
+    // nothing live).  taso-blkd compacts by itself only past
+    // --compact-min-mib of garbage, where this never shows.
     assert!(
-        n("after") <= n("before") && n("live") <= n("after"),
+        n("after") <= n("before") + 2 * 4096 && n("live") <= n("after"),
         "{k:?}"
     );
     assert_eq!(

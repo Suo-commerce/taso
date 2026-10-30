@@ -26,15 +26,28 @@
 //!
 //! # Records and recovery (format `TASOBLK4`, the layout revision of P5)
 //!
-//! A record is a **head block** and zero or more **data blocks**; every
-//! block is 4 KiB and every record starts on a block.  The header is one
-//! block too.
+//! Two shapes of record, one head (43 bytes, then the fields).  A
+//! **write** (and a compacted log's `Data` and `Base`) is a **head block**
+//! and its **data blocks**, starting on a block of its own; every other
+//! record is **small**: its head and fields packed after the record
+//! before it, never across a block (if it would not fit, it starts on
+//! the next block, the bytes skipped left zero).  The header is one
+//! block.  Blocks are 4 KiB.
 //!
 //! ```text
-//!   head block: magic u32 | kind u8 | flen u16 | dlen u32 | hash [32] | fields (flen bytes) | zeros
-//!   data blocks: data (dlen bytes) | zeros to the next block
+//!   head:        magic u32 | kind u8 | flen u16 | dlen u32 | hash [32] | fields (flen bytes)
+//!   a write:     head | zeros to the block's end | data (dlen bytes, whole blocks)
+//!   a small one: head (dlen 0), packed
 //!   hash = BLAKE3(previous record's hash || kind || flen || dlen || BLAKE3(fields || data))
 //! ```
+//!
+//! Packing the small records (P5 l-l, 2026-10-30) took back the +48 %
+//! bytes per branch that a block for every Flush, Seal and Discard cost
+//! on taso-test.  A small record joins the records already in its block,
+//! and the block is written again whole, as a byte-packed log's last page
+//! always is: a write that tears does so at sector boundaries, each sector
+//! old or new, and both agree on the records already there.  A write's
+//! blocks are never shared, so it can be written outside the lock.
 //!
 //! The **fields** are a record's small part (a write's branch and lba, a
 //! Seal's branch and tag, …), inside the head block; the **data** is its
@@ -382,6 +395,9 @@ pub struct Store {
     lsn: u64,
     /// Hash of the last record (or of the header).
     prev: [u8; HASH],
+    /// The block the tail is in, as on disk up to the tail (zeros after):
+    /// a small record joins it and the block is written whole.
+    part: AlignedBuf,
     /// The writes reserved and not yet written ([`Store::reserve_write`]).
     tracker: Arc<Tracker>,
     stats: Stats,
@@ -425,6 +441,7 @@ impl Store {
             edge: HEADER_LEN,
             lsn: 0,
             prev: seed(&header),
+            part: AlignedBuf::zeroed(BLOCK as usize),
             tracker: Arc::new(Tracker::default()),
             stats: Stats {
                 log_bytes: HEADER_LEN,
@@ -493,10 +510,9 @@ impl Store {
         // A compacted log's base: where its data records are, and the
         // joined base pieces.  Only in the first group of the file.
         let mut base = Base::default();
-        while let Some((kind, body, hash)) = read_record(&mut r, &prev)? {
+        while let Some((kind, body, hash, at)) = read_record(&mut r, &mut pos, &prev)? {
             lsn += 1;
-            let data_at = pos + BLOCK;
-            pos += record_len(kind, body.len());
+            let data_at = at + BLOCK;
             prev = hash;
             if kind == K_DATA || kind == K_BASE {
                 let in_base = compacted && start == HEADER_LEN && groups == 0 && pending.is_empty();
@@ -546,19 +562,27 @@ impl Store {
         // leaves the records or nothing, never a half.  The file is never
         // shrunk.
         let cut = scan_cut(file, end, len)?;
+        // The tail's block as it is up to the tail: small records join it.
+        let mut part = AlignedBuf::zeroed(BLOCK as usize);
+        let block_at = end - end % BLOCK;
+        if end % BLOCK != 0 {
+            let n = (end % BLOCK) as usize;
+            file.read_exact_at(&mut part[..n], block_at)?;
+        }
         drop(plain);
         let (file, direct) = open_direct(path, false, io == Io::Direct)?;
-        if end < len {
+        if cut > 0 {
             let zeros = AlignedBuf::zeroed(1 << 20);
-            // Whole blocks: a torn last block is zeroed to its end.
+            // Whole blocks after the tail's, then the tail's own block
+            // (its records kept, zeros after them) last.
             let stop = (end + cut).next_multiple_of(BLOCK);
-            let mut at = end + BLOCK;
+            let mut at = block_at + BLOCK;
             while at < stop {
                 let n = ((stop - at) as usize).min(zeros.len());
                 file.write_all_at(&zeros[..n], at)?;
                 at += n as u64;
             }
-            file.write_all_at(&zeros[..BLOCK as usize], end)?;
+            file.write_all_at(&part, block_at)?;
             file.sync_all()?;
         }
         let stats = Stats {
@@ -580,6 +604,7 @@ impl Store {
             edge: len.max(end),
             lsn: good_lsn,
             prev: good_prev,
+            part,
             tracker: Arc::new(Tracker::default()),
             stats,
             poisoned: false,
@@ -723,7 +748,11 @@ impl Store {
         if self.map.kind(branch)? != Kind::Branch {
             return Err(MapError::NotABranch(branch).into());
         }
-        let data_at = self.tail + BLOCK;
+        // A write starts on a block of its own: the rest of the tail's
+        // block stays zeros (already on disk with the small records in
+        // it), so no block is shared with a write done outside the lock.
+        let start = place(self.tail, K_WRITE, 16);
+        let data_at = start + BLOCK;
         let t = std::time::Instant::now();
         for i in 0..count {
             if self
@@ -748,13 +777,13 @@ impl Store {
             digest,
         );
         let r = Reservation {
-            offset: self.tail,
+            offset: start,
             lsn: self.lsn + 1,
             head,
         };
         let total = BLOCK + data_len as u64;
         self.tracker.add(r.lsn, r.offset, total);
-        self.tail += total;
+        self.tail = start + total;
         self.edge = self.edge.max(self.tail);
         self.lsn += 1;
         self.prev = hash;
@@ -798,13 +827,14 @@ impl Store {
         self.check()?;
         let bytes = bytes.next_multiple_of(BLOCK);
         let chunk = AlignedBuf::zeroed((1 << 20).min(bytes) as usize);
-        let mut at = self.edge;
-        while at < self.edge + bytes {
-            let n = ((self.edge + bytes - at) as usize).min(chunk.len());
+        let from = self.edge.next_multiple_of(BLOCK);
+        let mut at = from;
+        while at < from + bytes {
+            let n = ((from + bytes - at) as usize).min(chunk.len());
             self.file.write_all_at(&chunk[..n], at)?;
             at += n as u64;
         }
-        self.edge += bytes;
+        self.edge = from + bytes;
         Ok(())
     }
 
@@ -1286,41 +1316,44 @@ impl Store {
         }
     }
 
-    /// Append one record at the tail, whole, under the lock: every kind
-    /// but a write's data goes this way (one head block; a compacted
-    /// log's data and base records are written by the compaction).  The
-    /// map has already applied it; if the file write fails, the two
-    /// disagree and the store is poisoned.
+    /// Append one small record at the tail, under the lock: every kind but
+    /// a write (written by [`Store::reserve_write`] and [`Writer::commit`])
+    /// and a compacted log's base (written by the compaction).  It joins
+    /// the records already in the tail's block, and the whole block is
+    /// written again, as a byte-packed log's last page always is: a write
+    /// that tears does so at sector boundaries, each sector old or new,
+    /// and both agree on the records already there.  The map has already
+    /// applied it; if the file write fails, the two disagree and the store
+    /// is poisoned.
     fn append(&mut self, kind: u8, body: &[u8]) -> Result<(), StoreError> {
-        let (fields, data) = split_body(kind, body);
+        debug_assert!(!is_block_kind(kind), "a block kind is not appended here");
+        let fields = body;
         let t = std::time::Instant::now();
-        let digest = body_digest(fields, data);
-        let mut head = AlignedBuf::zeroed(BLOCK as usize);
+        let digest = body_digest(fields, &[]);
+        let start = place(self.tail, kind, fields.len());
+        if start.is_multiple_of(BLOCK) {
+            self.part.fill(0); // a new block
+        }
+        let off = (start % BLOCK) as usize;
+        let len = REC_HEAD as usize + fields.len();
         let hash = encode_head(
-            &mut head,
+            &mut self.part[off..off + len],
             &self.prev,
             kind,
             fields,
-            data.len() as u32,
+            0,
             &digest,
         );
         self.stats.write_hash_us += t.elapsed().as_micros() as u64;
         let t = std::time::Instant::now();
-        let r = self.file.write_all_at(&head, self.tail).and_then(|()| {
-            if data.is_empty() {
-                return Ok(());
-            }
-            let mut copy = AlignedBuf::zeroed(padded(data.len()));
-            copy[..data.len()].copy_from_slice(data);
-            self.file.write_all_at(&copy, self.tail + BLOCK)
-        });
-        if let Err(e) = r {
+        let block_at = start - off as u64;
+        if let Err(e) = self.file.write_all_at(&self.part, block_at) {
             self.poisoned = true;
             return Err(e.into());
         }
         self.stats.write_pwrite_us += t.elapsed().as_micros() as u64;
-        self.tail += record_len(kind, body.len());
-        self.edge = self.edge.max(self.tail);
+        self.tail = start + len as u64;
+        self.edge = self.edge.max(block_at + BLOCK);
         self.lsn += 1;
         self.prev = hash;
         self.stats.log_bytes = self.tail;
@@ -1339,10 +1372,38 @@ fn padded(n: usize) -> usize {
     n.next_multiple_of(BLOCK as usize)
 }
 
-/// A record's length on disk: its head block and its data blocks.
-fn record_len(kind: u8, body_len: usize) -> u64 {
-    let (_, data) = split_len(kind, body_len);
-    BLOCK + padded(data) as u64
+/// A kind that starts on a block of its own (a head block, then its data
+/// blocks): a write, and a compacted log's data and base.  Every other
+/// kind is **small**: its head and fields packed after the record before
+/// it, in the same block (P5 l-l, 2026-10-30: a block for every Flush,
+/// Seal and Discard cost +48 % bytes per branch on taso-test).
+fn is_block_kind(kind: u8) -> bool {
+    matches!(kind, K_WRITE | K_DATA | K_BASE)
+}
+
+/// Where a record of `kind` with `flen` bytes of fields starts when the
+/// last one ended at `at`: there, or at the next block for a block kind,
+/// or for a small one that would not fit in what is left of the block (a
+/// small record never crosses a block).  The bytes skipped are zeros.
+fn place(at: u64, kind: u8, flen: usize) -> u64 {
+    let off = at % BLOCK;
+    if off == 0 {
+        return at;
+    }
+    if is_block_kind(kind) || BLOCK - off < REC_HEAD + flen as u64 {
+        at.next_multiple_of(BLOCK)
+    } else {
+        at
+    }
+}
+
+/// A record's length on disk from where it starts.
+fn record_len(kind: u8, flen: usize, dlen: usize) -> u64 {
+    if is_block_kind(kind) {
+        BLOCK + padded(dlen) as u64
+    } else {
+        REC_HEAD + flen as u64
+    }
 }
 
 /// How a record's body splits into its fields (in the head block) and
@@ -1380,7 +1441,8 @@ pub fn write_digest(branch: LayerId, lba: u64, data: &[u8]) -> [u8; HASH] {
     body_digest(&fields, data)
 }
 
-/// Fill `head` (one zeroed block) with a record's head: magic, kind, the
+/// Fill `head` (zeroed, at least the head and the fields long: a whole
+/// block for a block kind) with a record's head: magic, kind, the
 /// lengths, the chain hash, the fields.  Returns the chain hash.
 fn encode_head(
     head: &mut [u8],
@@ -1390,7 +1452,7 @@ fn encode_head(
     dlen: u32,
     digest: &[u8; HASH],
 ) -> [u8; HASH] {
-    debug_assert!(head.len() == BLOCK as usize && fields.len() <= MAX_FIELDS);
+    debug_assert!(head.len() >= REC_HEAD as usize + fields.len() && fields.len() <= MAX_FIELDS);
     let hash = chain(prev, kind, fields.len() as u16, dlen, digest);
     head[0..4].copy_from_slice(&REC_MAGIC.to_le_bytes());
     head[4] = kind;
@@ -1401,25 +1463,41 @@ fn encode_head(
     hash
 }
 
-/// Append one whole record (its head block and its data blocks, padded)
-/// to `out`, which must hold whole blocks; returns the chain hash.  For
-/// a compaction, which gathers records into a buffer of its own.
-fn encode_record(out: &mut Vec<u8>, prev: &[u8; HASH], kind: u8, body: &[u8]) -> [u8; HASH] {
-    debug_assert!((out.len() as u64).is_multiple_of(BLOCK));
+/// Append one record to `out`, whose first byte is at file offset
+/// `base`, placed as [`place`] says (zeros before it if it moves to the
+/// next block); returns the chain hash.  For a compaction, which gathers
+/// records into a buffer of its own.
+fn encode_record(
+    out: &mut Vec<u8>,
+    base: u64,
+    prev: &[u8; HASH],
+    kind: u8,
+    body: &[u8],
+) -> [u8; HASH] {
     let (fields, data) = split_body(kind, body);
     let digest = body_digest(fields, data);
-    let at = out.len();
-    out.resize(at + BLOCK as usize, 0);
+    let at = base + out.len() as u64;
+    let start = place(at, kind, fields.len());
+    out.resize(out.len() + (start - at) as usize, 0);
+    let i = out.len();
+    let head = if is_block_kind(kind) {
+        BLOCK as usize
+    } else {
+        REC_HEAD as usize + fields.len()
+    };
+    out.resize(i + head, 0);
     let hash = encode_head(
-        &mut out[at..],
+        &mut out[i..],
         prev,
         kind,
         fields,
         data.len() as u32,
         &digest,
     );
-    out.extend_from_slice(data);
-    out.resize(at + record_len(kind, body.len()) as usize, 0);
+    if is_block_kind(kind) {
+        out.extend_from_slice(data);
+        out.resize(i + record_len(kind, fields.len(), data.len()) as usize, 0);
+    }
     hash
 }
 
@@ -1433,9 +1511,9 @@ fn chain(prev: &[u8; HASH], kind: u8, flen: u16, dlen: u32, digest: &[u8; HASH])
     *h.finalize().as_bytes()
 }
 
-/// A verified record: its kind, its body (fields, then data) and its
-/// chain hash.
-type Record = (u8, Vec<u8>, [u8; HASH]);
+/// A verified record: its kind, its body (fields, then data), its chain
+/// hash, and where it starts in the file.
+type Record = (u8, Vec<u8>, [u8; HASH], u64);
 
 /// What a head block says, before its chain is checked.
 struct Head {
@@ -1445,17 +1523,21 @@ struct Head {
     hash: [u8; HASH],
 }
 
-/// Parse a head block: `None` unless its magic, kind and lengths are
-/// those of a record (a zero block, a torn block and a data block are
-/// not).
+/// Parse a record's head (its first [`REC_HEAD`] bytes): `None` unless
+/// its magic, kind and lengths are those of a record (zeros, a torn head
+/// and a data block are not; a small kind never has data).
 fn parse_head(block: &[u8]) -> Option<Head> {
-    if block.len() < BLOCK as usize || block[0..4] != REC_MAGIC.to_le_bytes() {
+    if block.len() < REC_HEAD as usize || block[0..4] != REC_MAGIC.to_le_bytes() {
         return None;
     }
     let kind = block[4];
     let flen = u16::from_le_bytes(block[5..7].try_into().unwrap()) as usize;
     let dlen = u32::from_le_bytes(block[7..11].try_into().unwrap());
-    if !(K_WRITE..=K_LAST).contains(&kind) || flen > MAX_FIELDS || dlen > MAX_DATA {
+    if !(K_WRITE..=K_LAST).contains(&kind)
+        || flen > MAX_FIELDS
+        || dlen > MAX_DATA
+        || (!is_block_kind(kind) && dlen != 0)
+    {
         return None;
     }
     Some(Head {
@@ -1466,55 +1548,114 @@ fn parse_head(block: &[u8]) -> Option<Head> {
     })
 }
 
-/// Read and verify the next record.  `None` at a clean end or at anything
-/// that is not a whole, verified record (torn, bad magic, bad hash).
-fn read_record(r: &mut impl Read, prev: &[u8; HASH]) -> io::Result<Option<Record>> {
-    let mut head = vec![0u8; BLOCK as usize];
+/// Read and verify the next record from `r`, which is positioned at
+/// `*pos` (the end of the record before), and move `*pos` past what was
+/// read.  Where a record starts follows [`place`]: if what is left of
+/// the block cannot hold a head, or holds zeros where a head would be,
+/// the next record starts on the next block.  `None` at a clean end or
+/// at anything that is not a whole, verified record (torn, bad magic,
+/// bad hash, a small record crossing a block, a block kind not on one).
+fn read_record(r: &mut impl Read, pos: &mut u64, prev: &[u8; HASH]) -> io::Result<Option<Record>> {
+    fn skip(r: &mut impl Read, pos: &mut u64, n: u64) -> io::Result<bool> {
+        let mut scratch = [0u8; BLOCK as usize];
+        let ok = read_full(r, &mut scratch[..n as usize])?;
+        *pos += n;
+        Ok(ok)
+    }
+    let off = *pos % BLOCK;
+    if off != 0 && BLOCK - off < REC_HEAD && !skip(r, pos, BLOCK - off)? {
+        return Ok(None);
+    }
+    let mut head = [0u8; REC_HEAD as usize];
     if !read_full(r, &mut head)? {
         return Ok(None);
     }
-    let Some(h) = parse_head(&head) else {
-        return Ok(None);
-    };
-    let mut body = head[REC_HEAD as usize..REC_HEAD as usize + h.flen].to_vec();
-    if h.dlen > 0 {
-        let mut data = vec![0u8; padded(h.dlen)];
-        if !read_full(r, &mut data)? {
+    let mut at = *pos;
+    *pos += REC_HEAD;
+    let mut h = parse_head(&head);
+    if h.is_none() && !at.is_multiple_of(BLOCK) {
+        // Zeros after the last small record of a block: the next record
+        // starts on the next block.
+        if !skip(r, pos, BLOCK - at % BLOCK - REC_HEAD)? || !read_full(r, &mut head)? {
             return Ok(None);
         }
-        body.extend_from_slice(&data[..h.dlen]);
+        at = *pos;
+        *pos += REC_HEAD;
+        h = parse_head(&head);
+    }
+    let Some(h) = h else {
+        return Ok(None);
+    };
+    let mut body;
+    if is_block_kind(h.kind) {
+        if !at.is_multiple_of(BLOCK) {
+            return Ok(None);
+        }
+        let mut rest = vec![0u8; (BLOCK - REC_HEAD) as usize];
+        if !read_full(r, &mut rest)? {
+            return Ok(None);
+        }
+        *pos += BLOCK - REC_HEAD;
+        body = rest[..h.flen].to_vec();
+        if h.dlen > 0 {
+            let mut data = vec![0u8; padded(h.dlen)];
+            if !read_full(r, &mut data)? {
+                return Ok(None);
+            }
+            *pos += data.len() as u64;
+            body.extend_from_slice(&data[..h.dlen]);
+        }
+    } else {
+        if at % BLOCK + REC_HEAD + h.flen as u64 > BLOCK {
+            return Ok(None);
+        }
+        body = vec![0u8; h.flen];
+        if !read_full(r, &mut body)? {
+            return Ok(None);
+        }
+        *pos += h.flen as u64;
     }
     let (fields, data) = body.split_at(h.flen);
     let digest = body_digest(fields, data);
     if chain(prev, h.kind, h.flen as u16, h.dlen as u32, &digest) != h.hash {
         return Ok(None);
     }
-    Ok(Some((h.kind, body, h.hash)))
+    Ok(Some((h.kind, body, h.hash, at)))
 }
 
-/// What was recorded after `tail`, in bytes: the records (whole or
-/// torn) up to the first all-zero head block or the file's end.  Walks
-/// by record length while blocks parse as heads, block by block once one
-/// does not.
+/// What was recorded after `tail`, in bytes: anything not zero in the
+/// rest of the tail's block, then whole blocks up to the first all-zero
+/// one or the file's end (a block-kind head carries its data blocks with
+/// it, which may be zeros).
 fn scan_cut(file: &File, tail: u64, len: u64) -> io::Result<u64> {
     let mut block = vec![0u8; BLOCK as usize];
-    let mut at = tail;
+    let (mut at, mut end) = (tail, tail);
+    if at % BLOCK != 0 && at < len {
+        let stop = at.next_multiple_of(BLOCK).min(len);
+        let n = (stop - at) as usize;
+        file.read_exact_at(&mut block[..n], at)?;
+        if block[..n].iter().any(|b| *b != 0) {
+            end = stop;
+        }
+        at = stop;
+    }
     while at < len {
         let n = ((len - at) as usize).min(block.len());
         file.read_exact_at(&mut block[..n], at)?;
-        if n < block.len() {
-            // A torn block at the end of the file: counted whole.
-            return Ok(len - tail);
+        if block[..n].iter().all(|b| *b == 0) {
+            break;
         }
-        if block.iter().all(|b| *b == 0) {
+        if n < block.len() {
+            end = len; // a torn block at the end of the file
             break;
         }
         at += match parse_head(&block) {
-            Some(h) => BLOCK + padded(h.dlen) as u64,
-            None => BLOCK,
+            Some(h) if is_block_kind(h.kind) => BLOCK + padded(h.dlen) as u64,
+            _ => BLOCK,
         };
+        end = at.min(len);
     }
-    Ok(at.min(len) - tail)
+    Ok(end - tail)
 }
 
 /// How the store writes and reads its log: straight to the drive, or
@@ -2165,12 +2306,12 @@ fn load_checkpoint(path: &Path, file: &File, len: u64) -> Option<Checkpoint> {
     let prev: [u8; HASH] = r.get(HASH..2 * HASH)?.try_into().ok()?;
     r = &r[2 * HASH..];
     // The Flush record that ends at `end`: exactly where the checkpoint
-    // says (one head block), with the chain hash it names.
-    let flush_len = BLOCK;
+    // says (a small record, its head alone), with the chain hash it names.
+    let flush_len = REC_HEAD;
     let empty = body_digest(&[], &[]);
     if end > len
         || end < HEADER_LEN + flush_len
-        || !end.is_multiple_of(BLOCK)
+        || (end - flush_len) % BLOCK + flush_len > BLOCK
         || chain(&before, K_FLUSH, 0, 0, &empty) != prev
     {
         return None;
@@ -2600,7 +2741,9 @@ mod tests {
             s.flush().unwrap();
         }
         let f = OpenOptions::new().write(true).open(&path).unwrap();
-        f.write_all_at(&[0xFF], mid + BLOCK + 20).unwrap(); // inside the block data
+        // Inside the write's data: the write starts on the next block.
+        f.write_all_at(&[0xFF], mid.next_multiple_of(BLOCK) + BLOCK + 20)
+            .unwrap();
         drop(f);
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!(read1(&s, b, 0), 1);
@@ -2633,8 +2776,11 @@ mod tests {
         // Discard (2) and Flush (8): valid kinds only the hash can catch.
         // Every byte of the head block's fixed part and fields, then the
         // data block sampled (its bytes are alike to the chain).
-        let head = (mid..mid + REC_HEAD + 16).collect::<Vec<_>>();
-        let data = (mid + BLOCK..end).step_by(997);
+        // The write starts on the block after `mid` (the bytes between are
+        // zeros, no record's, and a flip there is no record's either).
+        let w = mid.next_multiple_of(BLOCK);
+        let head = (w..w + REC_HEAD + 16).collect::<Vec<_>>();
+        let data = (w + BLOCK..end).step_by(997);
         for at in head.into_iter().chain(data) {
             for mask in [0x01u8, 0x03, 0x09, 0x80] {
                 let mut bytes = good.clone();
@@ -2678,6 +2824,42 @@ mod tests {
                 error: MapError::Unknown(_)
             })
         ));
+    }
+
+    /// What l-l is for: a Flush, a Seal, a fork cost their head and fields,
+    /// packed, not a block each; a write starts on the next block.
+    #[test]
+    fn small_records_are_packed_and_a_write_starts_on_a_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = new_store(&dir);
+        let root = s.root_seal().unwrap(); // RootSeal, Flush
+        assert_eq!(s.stats().log_bytes, HEADER_LEN + 2 * REC_HEAD);
+        let b = s.fork(root).unwrap(); // Fork: 8 bytes of fields
+        assert_eq!(s.stats().log_bytes, HEADER_LEN + 3 * REC_HEAD + 8);
+        let before = s.stats().log_bytes;
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        assert_eq!(
+            s.stats().log_bytes,
+            before.next_multiple_of(BLOCK) + 2 * BLOCK,
+            "a write on a block of its own: head block and data"
+        );
+        // A hundred Flushes fill blocks without crossing one.
+        for _ in 0..100 {
+            let at = s.stats().log_bytes;
+            s.flush().unwrap();
+            let start = s.stats().log_bytes - REC_HEAD;
+            assert!(start == at || start == at.next_multiple_of(BLOCK));
+            assert_eq!(
+                start / BLOCK,
+                (start + REC_HEAD - 1) / BLOCK,
+                "inside one block"
+            );
+        }
+        let path = s.path().to_path_buf();
+        let (want, layers) = (snapshot(&s, &[root, b], 1), [root, b]);
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, snapshot(&s, &layers, 1)), (0, want));
     }
 
     #[test]
@@ -3388,12 +3570,24 @@ mod tests {
                     *want_len,
                     "cut at {len}, checkpoint {with_ckpt}"
                 );
-                assert_eq!(rec.cut, len - want_len);
+                // At most what lies past the tail: a cut that ends in the
+                // zeros padding a block (small records packed, l-l) cuts
+                // nothing there.  And it is made: a second open cuts none.
+                assert!(
+                    rec.cut <= len - want_len,
+                    "cut at {len}: {} > {}",
+                    rec.cut,
+                    len - want_len
+                );
                 assert_eq!(
                     &snapshot(&s, layers, 9),
                     want,
                     "cut at {len}, checkpoint {with_ckpt}: state must be the last flush"
                 );
+                drop(s);
+                let (s, again) = Store::open(&cut_path).unwrap();
+                assert_eq!(again.cut, 0, "cut at {len}: the cut was made");
+                assert_eq!(&snapshot(&s, layers, 9), want, "cut at {len}, reopened");
                 if !with_ckpt {
                     assert_eq!(rec.checkpoint, None);
                 } else if let Some(c) = &ckpt {
@@ -3465,6 +3659,27 @@ mod tests {
             let len = std::fs::metadata(&path).unwrap().len();
             let cut = HEADER_LEN + at.index((len - HEADER_LEN + 1) as usize) as u64;
             check_cuts(&path, &layers, &points, [cut, len].into_iter());
+        }
+    }
+
+    impl Store {
+        /// Append a record of any kind, block kinds too, as a compaction
+        /// writes it (for tests of what replay refuses).
+        fn append_any(&mut self, kind: u8, body: &[u8]) {
+            let block_at = self.tail - self.tail % BLOCK;
+            let mut out = self.part[..(self.tail % BLOCK) as usize].to_vec();
+            self.prev = encode_record(&mut out, block_at, &self.prev, kind, body);
+            let end = block_at + out.len() as u64;
+            out.resize(padded(out.len()), 0);
+            let mut buf = AlignedBuf::zeroed(out.len());
+            buf.copy_from_slice(&out);
+            self.file.write_all_at(&buf, block_at).unwrap();
+            self.part.fill(0);
+            let n = (end % BLOCK) as usize;
+            self.part[..n].copy_from_slice(&out[out.len() - BLOCK as usize..][..n]);
+            self.tail = end;
+            self.edge = self.edge.max(block_at + buf.len() as u64);
+            self.lsn += 1;
         }
     }
 
@@ -3588,10 +3803,16 @@ mod tests {
             s.write(b, 0, &blocks(1, 1), true).unwrap();
             tail = s.stats().log_bytes;
             s.extend_ahead(1 << 20).unwrap();
-            assert_eq!(s.ahead(), 1 << 20);
+            // The tail is inside a block (a Flush packed after the
+            // write): ahead counts the rest of that block too.
+            assert_eq!(s.ahead(), tail.next_multiple_of(BLOCK) - tail + (1 << 20));
         }
         let len = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(len, tail + (1 << 20), "the zeros are on disk");
+        assert_eq!(
+            len,
+            tail.next_multiple_of(BLOCK) + (1 << 20),
+            "the zeros are on disk"
+        );
         let (mut s, rec) = Store::open(&path).unwrap();
         assert_eq!(
             (rec.cut, s.stats().log_bytes),
@@ -3603,9 +3824,14 @@ mod tests {
             len,
             "and not shrunk"
         );
-        assert_eq!(s.ahead(), 1 << 20);
+        let ahead = s.ahead();
+        assert_eq!(ahead, len - tail);
         s.write(b, 1, &blocks(2, 1), true).unwrap();
-        assert_eq!(s.ahead(), (1 << 20) - 3 * BLOCK, "written over the zeros");
+        assert_eq!(
+            s.ahead(),
+            ahead - (s.stats().log_bytes - tail),
+            "written over the zeros"
+        );
         drop(s);
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!((rec.cut, read1(&s, b, 0), read1(&s, b, 1)), (0, 1, 2));
@@ -3777,10 +4003,12 @@ mod tests {
             want,
             "the same store, seen from outside"
         );
-        assert_eq!(
-            done.before,
-            before.log_bytes + 2 * BLOCK,
-            "the old log and the two flushes of the compaction"
+        // The old log and the compaction's two Flushes (small records,
+        // packed; one may move to the next block).
+        let flushes = done.before - before.log_bytes;
+        assert!(
+            (2 * REC_HEAD..2 * REC_HEAD + BLOCK).contains(&flushes),
+            "the two flushes of the compaction: {flushes} bytes"
         );
         assert_eq!(done.after, s.stats().log_bytes);
         assert!(done.checkpoint);
@@ -3906,7 +4134,7 @@ mod tests {
         // In a log that was never compacted.
         let path = dir.path().join("log");
         let (mut s, _, _) = busy_store(&path);
-        s.append(K_DATA, &blocks(1, 1)).unwrap();
+        s.append_any(K_DATA, &blocks(1, 1));
         s.flush().unwrap();
         drop(s);
         assert!(matches!(
@@ -3917,7 +4145,7 @@ mod tests {
         let path = dir.path().join("log2");
         let (mut s, _, _) = busy_store(&path);
         compact(&mut s);
-        s.append(K_BASE, &[0; 8]).unwrap();
+        s.append_any(K_BASE, &[0; 8]);
         s.flush().unwrap();
         drop(s);
         std::fs::remove_file(ckpt_path(&path)).unwrap();
