@@ -141,7 +141,7 @@ if not subset:
     print("write seal|takeover:seal.shipped|drop")
     print("write effect|takeover:ledger.shipped|drop")
 # E3-3c: one round per hold site and mode, the shortest sequence reaching it
-for name, s in (("seal.recorded", "write seal"), ("seal.shipped", "write seal"),
+for name, s in (("seal.recorded", "write seal"), ("seal.frozen", "write seal"), ("seal.shipped", "write seal"),
                 ("ledger.shipped", "write effect"), ("fork.branched", "write seal fork"),
                 ("compact.written", "write seal")):
     for mode in ("drop", "error"):
@@ -254,6 +254,16 @@ held() { # held NAME SECONDS: the process reached the armed hold NAME (its marke
     return 1
 }
 
+thaw_vessels() { # every Vessel mount under $MNT thawed, bounded (a no-op on one not frozen)
+    # A Vessel left frozen (the seal.frozen hold, or a Warden killed between
+    # its freeze and thaw) blocks every writer in the kernel, unkillably, and
+    # an umount of it; its image was taken at the freeze, so a thaw changes
+    # nothing the round grades.
+    local m; for m in $(findmnt -rn -o TARGET,SOURCE | awk -v r="$MNT" 'index($1, r "/") == 1 && $2 ~ /^\/dev\/ublkb/ { print $1 }'); do
+        timeout 5 fsfreeze -u "$m" 2>/dev/null || true
+    done
+}
+
 teardown() { # every piece of a round, guarded
     set +e
     [[ -n "$WARDEN_PID" ]] && kill -9 "$WARDEN_PID" 2>/dev/null; WARDEN_PID=
@@ -265,6 +275,7 @@ teardown() { # every piece of a round, guarded
         # A takeover round pauses A's containers: resumed first, so the kill reaches them.
         for c in $(runc --root "$rr" list -q 2>/dev/null); do runc --root "$rr" resume "$c" 2>/dev/null; runc --root "$rr" delete --force "$c" 2>/dev/null; done
     done
+    thaw_vessels
     for m in $(awk -v r="$MNT" '$5 == r || index($5, r "/") == 1 { print length($5), $5 }' /proc/self/mountinfo | sort -rn | cut -d' ' -f2-); do
         [[ "$m" == "$MNT" ]] || umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
     done
@@ -673,6 +684,15 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
             esac
         fi
         printf '%s\n' "${REPLY:-}" >"$R/held-reply.json"
+    fi
+    # seal.frozen: the Warden's own thaw (under error, released) has answered
+    # or is still held (under drop); whatever it did, the Vessel is thawed
+    # now, or its agent's next write could never be killed.  Which thaw path
+    # the Warden took is kept for reading (3570b49's: the Seal made, the
+    # thaw failed).
+    if [[ "$hname" == seal.frozen ]]; then
+        grep -iE 'thaw|frozen' "$R/warden-1.err" "$R/warden-1.out" 2>/dev/null >"$R/thaw.txt" || echo "no thaw failure in the Warden's log" >"$R/thaw.txt"
+        thaw_vessels
     fi
     # Provoke the error, bounded; count what was acknowledged after it.
     if [[ "$mode" == error ]]; then

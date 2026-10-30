@@ -36,7 +36,7 @@ the reborn Warden opened the Vessel, "not_run" its own word why not):
    "log_inode": {"before": I, "after": I|null}|null}     (compact.written only)
 
 At a hold the point is exact, so three windows are graded exactly
-(E3-3c's open item, accepted 2026-10-28; D96): `seal.recorded`, the Seal
+(E3-3c's open item, accepted 2026-10-28; D96): `seal.recorded` and `seal.frozen`, the Seal
 held before its record was committed is never listed after rebirth (its
 layer destroyed at open); `fork.branched`, the child held before its
 Lineage record is never run; `compact.written`, the log taso-blkd reopens
@@ -191,8 +191,8 @@ def check(r, a):
             extra.pop(hit[0])
     for l, s in extra.items():
         rows = s.get("rows", {})
-        if held == "seal.recorded" and infl_op == "seal":
-            fails.append(f"2 (seal.recorded): Seal lsn {l} is listed, but it was held before its record was "
+        if held in ("seal.recorded", "seal.frozen") and infl_op == "seal":
+            fails.append(f"2 ({held}): Seal lsn {l} is listed, but it was held before its record was "
                          "committed: its layer must be destroyed at open (D96, orphan)")
             continue
         if infl_op == "seal" and rows == m["parent_now"]:
@@ -378,6 +378,8 @@ def selftest():
         ("hold fail: seal.shipped, acknowledged Seal lost", "seal.shipped", [W(1), SL(9, 1)], None, {"seals": [], "report": RESET, "resume_turn": 0}, 1),
         # The exact checks: what "landed or not" allowed elsewhere, a hold settles.
         ("hold fail: seal.recorded, the held Seal listed whole", "seal.recorded", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
+        ("hold pass: seal.frozen, in-flight Seal absent", "seal.frozen", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0}, 0),
+        ("hold fail: seal.frozen, the held Seal listed whole", "seal.frozen", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
         ("hold pass: fork.branched, no child ran", "fork.branched", [W(1), SL(9, 1)], ("fork", {}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 0),
         ("hold fail: fork.branched, the held child ran", "fork.branched", [W(1), SL(9, 1)], ("fork", {}), {"seals": [S(9, {"1": 8})], "forks": ["c"], "report": B, "resume_turn": 1}, 1),
         ("hold pass: compact.written, the old log reopened", "compact.written", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "log_inode": {"before": 12, "after": 12}}, 0),

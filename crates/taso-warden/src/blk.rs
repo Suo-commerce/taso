@@ -1298,6 +1298,8 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                     let _log = crate::timing::span("seal.log");
                     self.with_conn(|d| d.seal(b, &t))
                 };
+                // E3: the Seal made (or refused), the Vessel still frozen.
+                taso_core::hold("seal.frozen");
                 let thaw = crate::timing::span("seal.thaw");
                 let thawed = self.mounts.thaw(&self.mountpoint);
                 drop(thaw);
