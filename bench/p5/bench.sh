@@ -208,6 +208,9 @@ NOISY_ARGS="--turns $TURNS --txns $NOISY_TXNS --rows $NOISY_ROWS --row-bytes $NO
 bytes_used() { # the storage's bytes now
     if [[ "$STORAGE" == zfs ]]; then zfs list -Hp -o used "$ZFS_BASE"; else blk stats | tr ' ' '\n' | sed -n 's/^log_bytes=//p'; fi
 }
+log_syncs() { # the block log's fdatasyncs so far (taso-blkd stats; design 2's r-a); 0 on zfs
+    if [[ "$STORAGE" == zfs ]]; then echo 0; else blk stats | tr ' ' '\n' | sed -n 's/^syncs=//p'; fi
+}
 
 # ---- one run: the Warden with P Vessels -------------------------------------------
 run_warden() { # run_warden R
@@ -249,6 +252,7 @@ json.dump({
 }, open(cfg, "w"), indent=1)
 PY
     bytes_used >"$OUT/warden-$r.bytes0"
+    log_syncs >"$OUT/warden-$r.syncs0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
     TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$BIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
@@ -263,6 +267,7 @@ open(out + ".time", "w").write("%f %f %d\n" % (ru.ru_utime, ru.ru_stime, ru.ru_m
 sys.exit(rc)
 PY
     bytes_used >"$OUT/warden-$r.bytes1"
+    log_syncs >"$OUT/warden-$r.syncs1"
     # What shipped: the local store's bytes and files after this run (the
     # packs every Seal published).  The log's growth counts every version
     # of every block; the packs carry a Seal's live blocks only, so the two
@@ -357,6 +362,14 @@ pb = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.pack
 pf = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.packfiles")))
 seals = len(spans.get("seal.total", []))
 print(f"- packs shipped: {pb / 1024:.0f} KiB in {pf} files for {seals} Seals: {pb / 1024 / (seals or 1):.1f} KiB per Seal" + (f", {pb / 1024 / (forked or 1):.1f} KiB per branch" if forks else ""))
+if storage != "zfs":
+    # Design 2's question (r-a): how many of the log's fdatasyncs a Seal
+    # costs once the Syncer has merged what overlapped.  Alone a Seal pays
+    # 3 (the freeze's two barriers and the Seal's own); every sync of the
+    # run is counted, device flushes between Seals included.
+    y0 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs0")))
+    y1 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs1")))
+    print(f"- block log syncs: {y1 - y0} in the run for {seals} Seals: {(y1 - y0) / (seals or 1):.2f} per Seal (a lone Seal pays 3)")
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
