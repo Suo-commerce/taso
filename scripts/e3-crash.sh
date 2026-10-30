@@ -151,6 +151,9 @@ for shape in ("all", "stagger"):
     for name in ("seal.frozen", "seal.recorded", "seal.shipped"):
         for mode in ("drop", "error"):
             print(f"write seal|burst:{shape}:hold+{name}|{mode}")
+# E3-c2 x E3-4 (c-g): B takes both Vessels over, after the burst or at the first shipping hold.
+print("write seal|burst:all:takeover|drop")
+print("write seal|burst:all:takeover+seal.shipped|drop")
 # E3-3c: one round per hold site and mode, the shortest sequence reaching it
 for name, s in (("seal.recorded", "write seal"), ("seal.frozen", "write seal"), ("seal.shipped", "write seal"),
                 ("ledger.shipped", "write effect"), ("fork.branched", "write seal fork"),
@@ -570,19 +573,22 @@ vessel_of() { # vessel_of PID DS... -> the index of the dataset whose device is 
     return 1
 }
 burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the merged line on stdout
-    local seq=$1 point=$2 mode=$3 rest shape what hname="" delay=0 base ms v op rep lsn i deadline a out rc
+    local seq=$1 point=$2 mode=$3 rest shape what hname="" delay=0 base ms v op rep lsn i deadline a out rc tk="" opoint
     rest=${point#burst:}; shape=${rest%%:*}; what=${rest#*:}
     case "$what" in
         timing+*) delay=${what#timing+} ;;
         hold+*) hname=${what#hold+} ;;
+        takeover) tk=1 ;;
+        takeover+*) tk=1; hname=${what#takeover+} ;;
         *) echo "HARNESS $tag: unknown burst point $what"; return ;;
     esac
     base="e3-$(date +%s%N | tail -c 9)"
     local -a bsubj=("$base-a" "$base-b") bwtag=(0 2) BO=("$R/r-a.json" "$R/r-b.json") BP=() bturn=() bds=() backs=(0 0) \
         brep=("" "") bres=("" "") bwhy=("no agent of the reborn Warden came up" "no agent of the reborn Warden came up") henv=() bout=() bmissed=() \
         brc=(0 0) bheld=()
+    opoint=$point; [[ -n "$tk" ]] && opoint="takeover:$point"   # the oracle grades a takeover by what was shipped (D97)
     for v in 0 1; do
-        oracle new "${BO[v]}" --sequence "$seq write seal" --point "$point" --mode "$mode" --rows "$ROWS"
+        oracle new "${BO[v]}" --sequence "$seq write seal" --point "$opoint" --mode "$mode" --rows "$ROWS"
     done
     if [[ -n "$hname" ]]; then
         rm -rf "$RUN/hold"; mkdir -p "$RUN/hold"
@@ -593,7 +599,14 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
     mkfs.ext4 -q -F "/dev/mapper/$DEVNAME" && mkdir -p "$D" && mount -o errors=remount-ro "/dev/mapper/$DEVNAME" "$D" \
         || { echo "HARNESS $tag: mkfs or mount of the device"; return; }
     mkdir -p "$D/store" "$D/state" "$D/spool" "$RUN/run"
-    config "${bsubj[0]}" "$RUN/w.json" "{\"also\": {\"subject\": \"${bsubj[1]}\"}}" || { echo "HARNESS $tag: config"; return; }
+    if [[ -n "$tk" ]]; then
+        # E3-4 x 2: the coordinator and the pack store shared by every node, never on the cut device.
+        coord_up || { echo "HARNESS $tag: taso-coordd did not start (see $R/coordd.err)"; return; }
+        config "${bsubj[0]}" "$RUN/w.json" "{\"coordinator\": {\"remote\": \"$COORD_SOCK\"}, \"store\": \"$HDIR/store\", \"also\": {\"subject\": \"${bsubj[1]}\"}}" \
+            || { echo "HARNESS $tag: config"; return; }
+    else
+        config "${bsubj[0]}" "$RUN/w.json" "{\"also\": {\"subject\": \"${bsubj[1]}\"}}" || { echo "HARNESS $tag: config"; return; }
+    fi
     start_stack 1 "${henv[@]}" || { echo "HARNESS $tag: taso-blkd did not start"; return; }
     deadline=$((SECONDS + 120))
     while ((SECONDS < deadline)) && [[ -z "${bds[0]:-}" || -z "${bds[1]:-}" ]]; do
@@ -637,6 +650,12 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
     # 4. the point
     if [[ -n "$hname" ]]; then
         held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached"; return; }
+    elif [[ -n "$tk" ]]; then   # takeover at the boundary: both burst Seals answered first
+        for v in 0 1; do
+            reply "${BP[v]}" 60 || { echo "HARNESS $tag: ${bsubj[v]}'s burst seal got no reply: $WHY"; return; }; rep=$REPLY
+            lsn=$(jget "$rep" sealed); brep[v]=1
+            oracle acknowledged "${BO[v]}" seal turn="$(jget "$rep" turn)" ${lsn:+seal=$lsn}
+        done
     else
         sleep "$(python3 -I -c "print($delay / 1000)")"
     fi
@@ -650,6 +669,7 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
     done
     if [[ -z "$hname" && -n "${brep[0]}" && -n "${brep[1]}" ]]; then bmissed=(--missed); fi
     [[ -n "$hname" ]] && bheld=(--held "$hname")
+    if [[ -n "$tk" ]]; then burst_tk_tail; return; fi
     local t0; t0=$(date +%s%N); "$DEVSH" "$mode" "$DEVNAME" >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
     for v in 0 1; do oracle cut "${BO[v]}" --swap-ms "$ms" "${bmissed[@]}" "${bheld[@]}"; done
     echo "held (no reply at the cut): $(for v in 0 1; do [[ -n "${brep[v]}" ]] || printf '%s ' "${bsubj[v]}"; done)" >"$R/held.txt"
@@ -695,6 +715,139 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
     for v in 0 1; do
         GATHER_OWN_TAG=${bwtag[v]} GATHER_ONLY=${bsubj[v]} gather "${bsubj[v]}" "${bds[v]}" "${bres[v]}" "${backs[v]}" "$mode" "${bwhy[v]}" "" \
             >"$R/a-$v.json" || { echo "HARNESS $tag: gather of ${bsubj[v]}"; return; }
+        rc=0; out=$(oracle check "${BO[v]}" --after "$R/a-$v.json") || rc=$?
+        bout[v]=$out; brc[v]=$rc
+    done
+    burst_line "$tag" "${brc[0]}" "${brc[1]}" "${bout[0]}" "${bout[1]}"
+}
+tk_drain() { # tk_drain TAG SOCKET WARDEN_PID: every agent of that Warden told `exit` -> TD_DS, TD_RES, TD_WHY per Vessel (burst_round's bsubj)
+    local SOCK=$2 deadline=$((SECONDS + 180)) a v
+    TD_DS=("" ""); TD_RES=("" ""); TD_WHY=("no agent of Warden $1 came up" "no agent of Warden $1 came up")
+    while ((SECONDS < deadline)) && kill -0 "$3" 2>/dev/null; do
+        for v in 0 1; do
+            [[ -n "${TD_DS[v]}" ]] || TD_DS[v]=$(grep -m1 -o "\] ${bsubj[v]}: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
+        done
+        if wait_agent 1; then
+            a=$AGENT
+            if v=$(vessel_of "$a" "${TD_DS[0]:-none}" "${TD_DS[1]:-none}"); then TD_RES[v]=$(ready_turn "$a"); TD_WHY[v]=
+            else echo "Warden $1's agent $a: on neither Vessel's device" >>"$R/harness.err"; fi
+            step "$a" exit 30 >/dev/null || true
+        fi
+    done
+    kill -0 "$3" 2>/dev/null && return 1
+    for v in 0 1; do
+        [[ -n "${TD_DS[v]}" ]] || TD_DS[v]=$(grep -m1 -o "\] ${bsubj[v]}: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
+    done
+    return 0
+}
+tk_two() { # tk_two WARDEN NODE OWNER_A OWNER_B -> the overrides of node NODE taking both Vessels over
+    python3 -I - "$(tk_over "$1" "$2" "$3" null)" "${bsubj[1]}" "$4" <<'PY'
+import json, sys
+o = json.loads(sys.argv[1]); o["also"] = {"subject": sys.argv[2], "takeover": json.loads(sys.argv[3])}
+print(json.dumps(o))
+PY
+}
+burst_tk_tail() { # E3-c2 x E3-4: the rest of a two-Vessel takeover round from the point on; burst_round's locals in scope
+    local v t0 ms c wb wc op ok
+    local -a ids=() owners=() shipped=() acks=(0 0) fenced=("" "") thaw=() bids=() bowners=()
+    # Read as an operator would, just before the point: each Vessel's holder and shipped anchor.
+    for v in 0 1; do
+        ids[v]=${bds[v]##*/v-}
+        "$BIN/taso-logcheck" "$COORD_SOCK" "$D/state" "${ids[v]}" >"$R/a-logcheck-$v.json" 2>>"$R/a-logcheck.err" \
+            || { echo "HARNESS $tag: taso-logcheck of ${bsubj[v]} on A: $(head -c 200 "$R/a-logcheck.err")"; return; }
+        owners[v]=$(owner_of "$R/a-logcheck-$v.json")
+        shipped[v]=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["shipped"]["lsn"])' "$R/a-logcheck-$v.json")
+    done
+    # The point: A's disk drops, and A falls silent -- frozen, not killed.
+    t0=$(date +%s%N); "$DEVSH" "$mode" "$DEVNAME" >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    kill -STOP "$WARDEN_PID" "$BLKD_PID" 2>/dev/null || true
+    for c in $(runc --root "$RUN/run/runc" list -q 2>/dev/null); do runc --root "$RUN/run/runc" pause "$c" 2>>"$R/harness.err" || true; done
+    for v in 0 1; do oracle cut "${BO[v]}" --swap-ms "$ms" "${bheld[@]}"; done
+    echo "held (no reply at the cut): $(for v in 0 1; do [[ -n "${brep[v]}" ]] || printf '%s ' "${bsubj[v]}"; done)" >"$R/held.txt"
+    # Warden B takes both Vessels over from the coordinator and the store.
+    mkdir -p "$HDIR/b/state" "$HDIR/b/spool" "$MNT/b"
+    config "${bsubj[0]}" "$RUN/w-b.json" "$(tk_two 2 b "${owners[0]}" "${owners[1]}")" || { echo "HARNESS $tag: B's config"; return; }
+    start_node 2 "$RUN/w-b.json" "$HDIR/b/blk.log" "$RUN/blkb.sock" || { echo "HARNESS $tag: B's taso-blkd did not start"; return; }
+    wb=$NODE_W
+    tk_drain 2 "$RUN/blkb.sock" "$wb" || { echo "HARNESS $tag: Warden B did not finish in 180 s"; return; }
+    for v in 0 1; do
+        if [[ -n "${TD_DS[v]}" ]]; then
+            SOCK=$RUN/blkb.sock GATHER_TAG=2 GATHER_OWN_TAG=${bwtag[v]} GATHER_ONLY=${bsubj[v]} \
+                gather "${bsubj[v]}" "${TD_DS[v]}" "${TD_RES[v]}" 0 "$mode" "${TD_WHY[v]}" "" >"$R/a-$v.json" \
+                || { echo "HARNESS $tag: gather of ${bsubj[v]} from B"; return; }
+            bids[v]=${TD_DS[v]##*/v-}
+        else
+            gather_none 2 "${bsubj[v]}" >"$R/a-$v.json"
+        fi
+    done
+    node_down "$RUN/blkb.sock" "$MNT/b" "$RUN/run-b/runc" || echo "B's taso-blkd did not quit" >>"$R/harness.err"
+    packs_list "$R/packs-before.txt"
+    # A wakes up believing it holds both: each agent's in-flight Seal answered, then one Seal and one effect (line F).
+    [[ -n "$hname" ]] && : >"$RUN/hold/$hname.release"
+    for c in $(runc --root "$RUN/run/runc" list -q 2>/dev/null); do runc --root "$RUN/run/runc" resume "$c" 2>>"$R/harness.err" || true; done
+    kill -CONT "$BLKD_PID" "$WARDEN_PID" 2>/dev/null || true
+    for v in 0 1; do
+        thaw=(); ok=true
+        if [[ -z "${brep[v]}" ]]; then
+            if reply "${BP[v]}" 30; then thaw+=("held seal: $REPLY"); is_ack seal "$REPLY" && acks[v]=$((acks[v] + 1))
+            else thaw+=("held seal: no reply ($WHY)"); ok=false; fi
+        fi
+        if [[ "$ok" == true ]]; then
+            for op in seal effect; do
+                if step "${BP[v]}" "$op" 30; then thaw+=("$op: $REPLY"); is_ack "$op" "$REPLY" && acks[v]=$((acks[v] + 1))
+                else thaw+=("$op: no reply ($WHY)"); break; fi
+            done
+        fi
+        printf '%s\n' "${thaw[@]}" >"$R/thaw-$v.txt"
+        fenced[v]=$(grep -h -F "${bsubj[v]}" "$R/warden-1.err" "$R/warden-1.out" 2>/dev/null \
+            | grep -m1 -oE '.{0,80}(: fenced: |Fenced|StaleEpoch|stale epoch|EpochMismatch|NotHolder|not the holder).{0,80}' || true)
+    done
+    node_down "$SOCK" "$MNT/e3" "$RUN/run/runc" "$WARDEN_PID" || echo "A's taso-blkd did not quit" >>"$R/harness.err"
+    WARDEN_PID=; kill -9 "$BLKD_PID" 2>/dev/null; wait "$BLKD_PID" 2>/dev/null; BLKD_PID=
+    packs_list "$R/packs-after.txt"
+    # Warden C takes both over from B and rebuilds from the store once more (line H1).
+    ok=true
+    for v in 0 1; do
+        if [[ -n "${bids[v]:-}" ]] && "$BIN/taso-logcheck" "$COORD_SOCK" "$HDIR/b/state" "${bids[v]}" >"$R/b-logcheck-$v.json" 2>>"$R/b-logcheck.err"; then
+            bowners[v]=$(owner_of "$R/b-logcheck-$v.json")
+        else ok=false; fi
+    done
+    if [[ "$ok" == true ]]; then
+        mkdir -p "$HDIR/c/state" "$HDIR/c/spool" "$MNT/c"
+        config "${bsubj[0]}" "$RUN/w-c.json" "$(tk_two 3 c "${bowners[0]}" "${bowners[1]}")" || { echo "HARNESS $tag: C's config"; return; }
+        start_node 3 "$RUN/w-c.json" "$HDIR/c/blk.log" "$RUN/blkc.sock" || { echo "HARNESS $tag: C's taso-blkd did not start"; return; }
+        wc=$NODE_W
+        tk_drain 3 "$RUN/blkc.sock" "$wc" || { echo "HARNESS $tag: Warden C did not finish in 180 s"; return; }
+        for v in 0 1; do
+            if [[ -n "${TD_DS[v]}" ]]; then
+                SOCK=$RUN/blkc.sock GATHER_TAG=3 GATHER_OWN_TAG=${bwtag[v]} GATHER_ONLY=${bsubj[v]} \
+                    gather "${bsubj[v]}" "${TD_DS[v]}" "${TD_RES[v]}" 0 "$mode" "${TD_WHY[v]}" "" >"$R/c-$v.json" \
+                    || { echo "HARNESS $tag: gather of ${bsubj[v]} from C"; return; }
+            else
+                gather_none 3 "${bsubj[v]}" >"$R/c-$v.json"
+            fi
+        done
+        node_down "$RUN/blkc.sock" "$MNT/c" "$RUN/run-c/runc" || echo "C's taso-blkd did not quit" >>"$R/harness.err"
+    else
+        for v in 0 1; do echo '{"skipped": "B never ran both Vessels, or an ownership could not be read"}' >"$R/c-$v.json"; done
+    fi
+    # Each Vessel's takeover facts (lines 1, F, H), graded on its own; one line for the round.
+    for v in 0 1; do
+        python3 -I - "$R" "$v" "${owners[v]}" "${shipped[v]}" "${acks[v]}" "${fenced[v]}" <<'PY'
+import json, os, sys
+r, v, owner, shipped, acks, fenced = sys.argv[1:]
+packs = lambda f: dict(reversed(l.split(None, 1)) for l in open(os.path.join(r, f)).read().splitlines() if l.strip())
+before, after = packs("packs-before.txt"), packs("packs-after.txt")
+p = os.path.join(r, f"a-{v}.json"); a = json.load(open(p))
+a["takeover"] = {
+    "owner": json.loads(owner), "shipped_lsn": int(shipped), "child": None,
+    "thaw": {"acks": int(acks), "replies": open(os.path.join(r, f"thaw-{v}.txt")).read().splitlines(), "fenced": fenced or None},
+    "packs": {"added": sorted(set(after) - set(before)), "changed": sorted(n for n in before if n in after and after[n] != before[n]),
+              "gone": sorted(set(before) - set(after))},
+    "after_thaw": json.load(open(os.path.join(r, f"c-{v}.json"))),
+}
+json.dump(a, open(p, "w"), indent=1)
+PY
         rc=0; out=$(oracle check "${BO[v]}" --after "$R/a-$v.json") || rc=$?
         bout[v]=$out; brc[v]=$rc
     done
