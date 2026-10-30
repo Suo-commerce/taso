@@ -52,6 +52,20 @@
 # the children's commit and turn-pause samples apart from the parent's:
 # the parent's are "one alive", the children's "N alive".
 #
+# BIG_MIB=N (default 0; B1's "first 4 KiB write into a 1 GiB file in a
+# fork", with FORKS and N=1024): each Vessel's agent makes a file of N MiB
+# beside its database before its first turn (taso-sim --big-file-mib), so
+# the parent's Seals carry it; a child finds it inherited whole and writes
+# 4 KiB into its middle and fdatasyncs first, timed: one sample per child.
+# Compare: K4 (taso-blkd alone, 2026-10-18), 2.5 ms p50 at 1 GiB.
+#
+# NOISY=1 (needs P >= 2; B1's "Seal p50/p95 at 8 and 64 Vessels with one
+# noisy neighbour"): Vessel v0 is the neighbour, its agent writing
+# NOISY_TXNS (64) transactions of NOISY_ROWS (256) rows of NOISY_ROW_BYTES
+# (4096) per turn, 64 MiB a turn by default, unsynced; the other P-1 run the
+# workload above.  Its commits and turn pauses are reported apart; the
+# seal and publish spans pool every Vessel (they carry no Vessel).
+#
 # Environment (gate-p1's): TXNS (4) ROWS (8) ROW_BYTES (512) SYNC (normal)
 # LANDLOCK (1) BATCHED (1) TASO_ZFS_DATASET; OUT (results directory,
 # default /root/taso-p5-bench-<storage>-<time>, kept); KEEP=1 keeps the
@@ -72,7 +86,10 @@ RUNS=${4:-1}
 [[ "$STORAGE" == zfs || "$STORAGE" == blk ]] || { echo "usage: $0 zfs|blk [P] [TURNS] [RUNS]" >&2; exit 64; }
 TXNS=${TXNS:-4}; ROWS=${ROWS:-8}; ROW_BYTES=${ROW_BYTES:-512}; SYNC=${SYNC:-normal}
 LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
+BIG_MIB=${BIG_MIB:-0}; NOISY=${NOISY:-0}
+NOISY_TXNS=${NOISY_TXNS:-64}; NOISY_ROWS=${NOISY_ROWS:-256}; NOISY_ROW_BYTES=${NOISY_ROW_BYTES:-4096}
 [[ "$FORKS" == 0 || "$P" == 1 ]] || { echo "FORKS needs P=1 (one parent, N children)" >&2; exit 64; }
+[[ "$NOISY" == 0 || "$P" -ge 2 ]] || { echo "NOISY needs P >= 2 (one neighbour, P-1 others)" >&2; exit 64; }
 ZFS_PARENT=${TASO_ZFS_DATASET:-taso/vessel}
 # The real path: runc refuses a rootfs reached through a symlink, and A1
 # makes /var/lib/taso-blk one (taso-p5, 2026-10-26: "invalid rootfs").
@@ -177,6 +194,8 @@ else
 fi
 SIM_ARGS="--turns $TURNS --txns $TXNS --rows $ROWS --row-bytes $ROW_BYTES --synchronous $SYNC"
 [[ "$FORKS" == 0 ]] || SIM_ARGS="$SIM_ARGS --forks $FORKS"
+[[ "$BIG_MIB" == 0 ]] || SIM_ARGS="$SIM_ARGS --big-file-mib $BIG_MIB --first-write-samples /work/first-write"
+NOISY_ARGS="--turns $TURNS --txns $NOISY_TXNS --rows $NOISY_ROWS --row-bytes $NOISY_ROW_BYTES --synchronous $SYNC"
 bytes_used() { # the storage's bytes now
     if [[ "$STORAGE" == zfs ]]; then zfs list -Hp -o used "$ZFS_BASE"; else blk stats | tr ' ' '\n' | sed -n 's/^log_bytes=//p'; fi
 }
@@ -189,7 +208,16 @@ run_warden() { # run_warden R
     python3 - "$cfg" "$r" "$root" <<PY
 import json, sys
 cfg, r, root = sys.argv[1:4]
-args = ["/usr/bin/taso-sim"] + "$SIM_ARGS".split() + ["--samples", "/work/samples", "--turn-samples", "/work/turn-samples", "--stats", "/work/sim-stats.json"]
+outs = ["--samples", "/work/samples", "--turn-samples", "/work/turn-samples", "--stats", "/work/sim-stats.json"]
+args = ["/usr/bin/taso-sim"] + "$SIM_ARGS".split() + outs
+noisy = "$NOISY" == "1"
+def vessel(i):
+    v = {"namespace": "75" * 16, "subject": "p5-bench-$RUN-r%s-v%d" % (r, i) + ("-noisy" if noisy and i == 0 else ""), "uid_slot": i + 1}
+    if $FORKS:
+        v["forks"] = {"slots": list(range(2, 2 + $FORKS))}
+    if noisy and i == 0:
+        v["runtime"] = {"args": ["/usr/bin/taso-sim"] + "$NOISY_ARGS".split() + outs}
+    return v
 json.dump({
     "warden": 1,
     "coordinator": {"local": "$DIR/coord.redb"},
@@ -208,8 +236,7 @@ json.dump({
         "memory_bytes": 268435456,
         "pids": 64,
     },
-    "vessels": [dict({"namespace": "75" * 16, "subject": "p5-bench-$RUN-r%s-v%d" % (r, i), "uid_slot": i + 1},
-                     **({"forks": {"slots": list(range(2, 2 + $FORKS))}} if $FORKS else {})) for i in range($P)],
+    "vessels": [vessel(i) for i in range($P)],
 }, open(cfg, "w"), indent=1)
 PY
     bytes_used >"$OUT/warden-$r.bytes0"
@@ -263,24 +290,27 @@ PY
 subject_of() { # subject_of R DSNAME -> the Vessel's subject, from the Warden's "SUBJECT: dataset ..." line
     grep -o "\] [^:]*: dataset [^ ]*$2\$" "$OUT/warden-$1.err" | head -1 | sed 's/^\] //; s/: dataset.*//'
 }
-collect() { # collect MOUNT R SUBJECT: a child's samples (SUBJECT has -fork-) apart from a parent's
-    local kind=""; [[ "$3" != *-fork-* ]] || kind="-children"
+collect() { # collect MOUNT R SUBJECT: a child's samples (SUBJECT has -fork-), the noisy neighbour's (-noisy), apart from the others'
+    local kind=""; [[ "$3" != *-fork-* ]] || kind="-children"; [[ "$3" != *-noisy* ]] || kind="-noisy"
     [[ -f "$1/samples" ]] && cat "$1/samples" >>"$OUT/commit$kind.samples"
     [[ -f "$1/turn-samples" ]] && cat "$1/turn-samples" >>"$OUT/turn$kind.samples"
+    [[ -f "$1/first-write" ]] && cat "$1/first-write" >>"$OUT/first-write$kind.samples"
     [[ -f "$1/sim-stats.json" ]] && cp "$1/sim-stats.json" "$OUT/sim-$2-$3.json"
     return 0
 }
 
 say "$STORAGE: $RUNS run(s) x P=$P, $TURNS turns of $TXNS txns x $ROWS rows x $ROW_BYTES B, synchronous=$SYNC, landlock=$LANDLOCK, batched=$BATCHED"
 : >"$OUT/commit.samples"; : >"$OUT/turn.samples"; : >"$OUT/commit-children.samples"; : >"$OUT/turn-children.samples"
+: >"$OUT/commit-noisy.samples"; : >"$OUT/turn-noisy.samples"; : >"$OUT/first-write.samples"; : >"$OUT/first-write-children.samples"
 for r in $(seq 1 "$RUNS"); do run_warden "$r"; done
 
 # ---- the table -----------------------------------------------------------------
 python3 - "$OUT" "$STORAGE" "$RUNS" "$P" "$TURNS" "$TXNS" "$ROWS" "$ROW_BYTES" "$SYNC" "$LANDLOCK" "$BATCHED" \
-    "$(hostname)" "$(uname -r)" "$(git rev-parse --short HEAD 2>/dev/null || echo ?)" "$HOST_NOTE" "${ZFS_BASE:-$DIR/blk.log}" "$FORKS" <<'PY' | tee "$OUT/table.md"
+    "$(hostname)" "$(uname -r)" "$(git rev-parse --short HEAD 2>/dev/null || echo ?)" "$HOST_NOTE" "${ZFS_BASE:-$DIR/blk.log}" "$FORKS" \
+    "$BIG_MIB" "$NOISY" "$NOISY_TXNS x $NOISY_ROWS rows x $NOISY_ROW_BYTES B" <<'PY' | tee "$OUT/table.md"
 import glob, os, re, sys
-out, storage, runs, p, turns, txns, rows, row_bytes, sync, landlock, batched, host, kernel, commit, note, where, forks = sys.argv[1:]
-runs, p, turns, txns, forks = int(runs), int(p), int(turns), int(txns), int(forks)
+out, storage, runs, p, turns, txns, rows, row_bytes, sync, landlock, batched, host, kernel, commit, note, where, forks, big_mib, noisy, noisy_load = sys.argv[1:]
+runs, p, turns, txns, forks, big_mib, noisy = int(runs), int(p), int(turns), int(txns), int(forks), int(big_mib), noisy == "1"
 def q(v, x):
     v = sorted(v)
     return v[min(len(v) - 1, max(0, int(-(-len(v) * x // 1)) - 1))] if v else float("nan")
@@ -294,13 +324,18 @@ wall = sum(float(b) - float(a) for a, b in (open(f).read().split() for f in glob
 cpu = sum(float(open(f).read().split()[0]) + float(open(f).read().split()[1]) for f in glob.glob(os.path.join(out, "warden-*.time")))
 rss = max((int(open(f).read().split()[2]) for f in glob.glob(os.path.join(out, "warden-*.time"))), default=0)
 ok = sum(len(re.findall(os.environ["VESSEL_OK"], open(f).read(), re.M)) for f in glob.glob(os.path.join(out, "warden-*.out")))
-expected_commits = runs * p * turns * txns
-expected_turns = runs * p * turns
+quiet = p - 1 if noisy else p
+expected_commits = runs * quiet * turns * txns
+expected_turns = runs * quiet * turns
 print(f"# P5 bench — {storage}, P={p}, {host}")
 print()
 print(f"- host {host}, kernel {kernel}, taso {commit}; {note}; data at {where}")
 print(f"- durability contract: claude/Taso_finding_p5_a2_facts_2026-10-26.md §1 (this host's row)")
 print(f"- workload: gate-p1's taso-sim, {runs} run(s) x P={p}, {turns} turns of {txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}, batched={batched}; in-process coordinator, local store")
+if noisy:
+    print(f"- noisy neighbour: v0 of {p}, {turns} turns of {noisy_load} unsynced; the other {p - 1} as above (\"parent\" rows below are theirs)")
+if big_mib:
+    print(f"- big file: {big_mib} MiB made by each agent before its first turn; a child's first 4 KiB write + fdatasync into it is timed")
 print(f"- Vessels ok {ok} of {runs * (p + forks)}; parent commits {len(commits)} of {expected_commits} expected; parent turns {len(turn)} of {expected_turns}")
 cc, ct, ft = load("commit-children.samples"), load("turn-children.samples"), spans.get("fork.total", [])
 if forks:
@@ -319,6 +354,10 @@ print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
 rows_ = [("commit (SQLite WAL in the Vessel; synchronous=%s: not a durable ack)" % sync, commits), ("turn pause (TurnEnd round trip = durable ack)", turn)]
 if forks:
     rows_ += [("children: commit (N alive)", cc), ("children: turn pause (N alive)", ct), ("fork.total (the Warden's fork_from_log)", ft)]
+if big_mib:
+    rows_ += [(f"children: first 4 KiB write + fdatasync into the inherited {big_mib} MiB file", load("first-write-children.samples"))]
+if noisy:
+    rows_ += [("noisy neighbour: commit", load("commit-noisy.samples")), ("noisy neighbour: turn pause", load("turn-noisy.samples"))]
 rows_ += [("seal.total", spans.get("seal.total", [])), ("publish.total", spans.get("publish.total", []))]
 for name, v in rows_:
     print(f"| {name} | {len(v)} | {q(v, .5):.3f} | {q(v, .95):.3f} | {q(v, .99):.3f} | {q(v, 1):.3f} |")
@@ -326,7 +365,8 @@ print()
 print(f"| rate | value |")
 print(f"| --- | ---: |")
 print(f"| Warden wall time, all runs | {wall:.1f} s |")
-all_turns, all_commits = len(turn) + len(ct), len(commits) + len(cc)
+all_turns = len(turn) + len(ct) + len(load("turn-noisy.samples"))
+all_commits = len(commits) + len(cc) + len(load("commit-noisy.samples"))
 print(f"| durable turns / s (Seals acknowledged, every Vessel) | {all_turns / wall if wall else 0:.1f} |")
 print(f"| commits / s (every Vessel) | {all_commits / wall if wall else 0:.1f} |")
 print(f"| Warden CPU (user+sys) | {cpu:.2f} s = {cpu / all_turns * 1000 if all_turns else 0:.1f} ms per turn |")

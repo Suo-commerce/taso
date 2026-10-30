@@ -49,6 +49,13 @@
 //! `NoExternalMutation` effect, key `t<turn>-e<k>`; `exit`.  A refusal is
 //! a reply, not an error; a closed Field ends the agent.
 //!
+//! P5 B1 (the first write into a large file in a fork): `--big-file-mib N`
+//! makes `big` beside the database, N MiB, written and synced before the
+//! first turn, if it is not there whole; if it is (inherited: a fork's
+//! child, or a Vessel reborn) the agent writes 4 KiB into its middle and
+//! fdatasyncs, timed, before anything else, into `--first-write-samples`
+//! (microseconds, one line).
+//!
 //! `--bare` runs the same writes with no Field at all: the baseline the
 //! gate compares against ("p95 write latency ≤ 1.5× bare local NVMe").
 //!
@@ -102,6 +109,10 @@ struct Opts {
     /// Driven one operation at a time through files in this directory
     /// (P5 E3); no turns of its own.
     step: Option<PathBuf>,
+    /// A file of this many MiB beside the database (P5 B1); 0: none.
+    big_file_mib: u64,
+    /// Where the first 4 KiB write into an inherited big file is timed.
+    first_write_samples: Option<PathBuf>,
 }
 
 impl Default for Opts {
@@ -123,6 +134,8 @@ impl Default for Opts {
             promote: Vec::new(),
             nominate: Vec::new(),
             step: None,
+            big_file_mib: 0,
+            first_write_samples: None,
         }
     }
 }
@@ -161,6 +174,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                     .collect(),
             ),
             "--step" => o.step = Some(val()?.into()),
+            "--big-file-mib" => o.big_file_mib = num(val()?)?,
+            "--first-write-samples" => o.first_write_samples = Some(val()?.into()),
             "--synchronous" => {
                 o.synchronous = val()?;
                 if !["off", "normal", "full", "extra"].contains(&o.synchronous.as_str()) {
@@ -174,6 +189,42 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         return Err("--turns, --txns and --rows must be positive".into());
     }
     Ok(o)
+}
+
+/// `--big-file-mib`: make the file whole, or, inherited whole, time the
+/// first 4 KiB written into its middle and made durable.  Returns that time.
+fn big_file(o: &Opts) -> Result<Option<Duration>, String> {
+    use std::os::unix::fs::FileExt;
+    if o.big_file_mib == 0 {
+        return Ok(None);
+    }
+    let path = o.db.with_file_name("big");
+    let size = o.big_file_mib << 20;
+    let err = |what: &str, e: std::io::Error| format!("{what} {}: {e}", path.display());
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() == size) {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| err("open", e))?;
+        let block = [0xa5u8; 4096];
+        let t = Instant::now();
+        f.write_all_at(&block, (size / 2) & !4095)
+            .map_err(|e| err("write", e))?;
+        f.sync_data().map_err(|e| err("fdatasync", e))?;
+        let took = t.elapsed();
+        if let Some(out) = &o.first_write_samples {
+            std::fs::write(out, format!("{}\n", took.as_micros()))
+                .map_err(|e| format!("writing {}: {e}", out.display()))?;
+        }
+        return Ok(Some(took));
+    }
+    let f = std::fs::File::create(&path).map_err(|e| err("create", e))?;
+    let chunk = vec![0x3cu8; 1 << 20];
+    for i in 0..o.big_file_mib {
+        f.write_all_at(&chunk, i << 20).map_err(|e| err("write", e))?;
+    }
+    f.sync_all().map_err(|e| err("fsync", e))?;
+    Ok(None)
 }
 
 /// Quantiles of a set of durations, in milliseconds.
@@ -266,6 +317,12 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
             });
         }
     }
+
+    let first_write = if promotions.iter().any(|p| p.get("adopted").is_some()) {
+        None
+    } else {
+        big_file(o)?
+    };
 
     let db =
         rusqlite::Connection::open(&o.db).map_err(|e| format!("open {}: {e}", o.db.display()))?;
@@ -401,6 +458,7 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
         "nominations": nominations,
         "adopted_states": adopted_states,
         "forks": forks,
+        "first_write_ms": first_write.map(|d| d.as_secs_f64() * 1000.0),
     }))
 }
 
@@ -1131,5 +1189,36 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    /// `--big-file-mib`: the first run makes the file and times nothing;
+    /// a run that finds it whole (a fork's child) times one 4 KiB write.
+    #[test]
+    fn a_big_file_is_made_once_then_its_first_write_is_timed() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = Opts {
+            turns: 1,
+            txns: 1,
+            rows: 1,
+            row_bytes: 8,
+            db: dir.path().join("s.db"),
+            stats: dir.path().join("x"),
+            bare: true,
+            big_file_mib: 2,
+            first_write_samples: Some(dir.path().join("first")),
+            ..Opts::default()
+        };
+        let made = run(&o, None).unwrap();
+        assert_eq!(made["first_write_ms"], json!(null));
+        assert_eq!(std::fs::metadata(dir.path().join("big")).unwrap().len(), 2 << 20);
+        assert!(!dir.path().join("first").exists());
+        let child = run(&o, None).unwrap();
+        assert!(child["first_write_ms"].as_f64().unwrap() > 0.0);
+        let first = std::fs::read_to_string(dir.path().join("first")).unwrap();
+        assert_eq!(first.lines().filter(|l| l.parse::<u64>().is_ok()).count(), 1);
+        let big = std::fs::read(dir.path().join("big")).unwrap();
+        assert_eq!(big.len(), 2 << 20);
+        assert_eq!(&big[1 << 20..(1 << 20) + 4096], &[0xa5u8; 4096][..]);
+        assert_eq!(big[0], 0x3c);
     }
 }
