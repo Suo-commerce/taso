@@ -24,25 +24,64 @@
 //! - [`Store::seal`] appends the Seal and flushes: a Seal is always
 //!   durable, and it stands for every record before it.
 //!
-//! # Records and recovery
+//! # Records and recovery (format `TASOBLK4`, the layout revision of P5)
+//!
+//! A record is a **head block** and zero or more **data blocks**; every
+//! block is 4 KiB and every record starts on a block.  The header is one
+//! block too.
 //!
 //! ```text
-//!   magic u32 | len u32 | kind u8 | body (len bytes) | hash [32]
-//!   hash = BLAKE3(previous record's hash || kind || len || body)
+//!   head block: magic u32 | kind u8 | flen u16 | dlen u32 | hash [32] | fields (flen bytes) | zeros
+//!   data blocks: data (dlen bytes) | zeros to the next block
+//!   hash = BLAKE3(previous record's hash || kind || flen || dlen || BLAKE3(fields || data))
 //! ```
+//!
+//! The **fields** are a record's small part (a write's branch and lba, a
+//! Seal's branch and tag, …), inside the head block; the **data** is its
+//! bulk (a write's block data, whole blocks, so no padding; a compacted
+//! log's `Data` and `Base` records).  The chain is over the body's
+//! digest (the body being `fields || data`), so whoever has the body can
+//! hash it before the store's lock and the chain under the lock is one
+//! hash of 81 bytes.  Because no two records share a block, a record can
+//! be written after the lock is let go ([`Store::reserve_write`]), and
+//! with the file open `O_DIRECT` a write lands on the drive, so a group's
+//! `fdatasync` has nothing to write back.  (The layout changes once:
+//! `TASOBLK2`/`TASOBLK3` logs are refused by name, never migrated.)
 //!
 //! The header's hash seeds the chain.  [`Store::open`] reads the log from
 //! the start, checks every record against the chain, and replays it into
 //! a fresh [`Map`] (same calls, same ids).  It stops at the first record
-//! that is short, has a bad magic or a wrong hash, and cuts the file back
-//! to the end of the **last Flush** it verified: what was durable.
+//! that is short, has a bad magic or a wrong hash, and takes the end of
+//! the **last Flush** it verified as the tail: what was durable.  It
+//! never shrinks the file: the **cut** is made by writing one zero block
+//! at the new tail (a block that starts with zeros is never a record),
+//! because the file may be written ahead of its tail
+//! ([`Store::extend_ahead`]) and those zeros are to be kept.
+//! [`Recovered::cut`] counts the bytes from the tail to the first all-zero
+//! head block (or the file's end): the records after the last Flush,
+//! whole or torn.  A write whose data blocks landed but whose head block
+//! did not is not counted (its head reads as zeros); it was not
+//! acknowledged either way, and the next records overwrite it.
 //!
 //! Known limit (spike): a bad record is treated as the end of the log,
 //! as PostgreSQL's and SQLite's write-ahead logs do.  A torn tail after a
 //! crash looks like that; so would media corruption in the middle of the
-//! log, which would cut durable groups.  [`Recovered::cut`] reports what
-//! was dropped.  Protection against media corruption comes later from a
-//! second copy (shipped packs), not from this file.
+//! log, which would cut durable groups.  Protection against media
+//! corruption comes later from a second copy (shipped packs), not from
+//! this file.
+//!
+//! # Writes in flight (the split write, for `taso-blkd`)
+//!
+//! [`Store::reserve_write`] does under the lock only what must be
+//! serialised: the map's entries, the head block with the chain hash,
+//! the record's place.  The caller writes the record with
+//! [`Writer::commit`] after letting the lock go.  Until it does, the map
+//! points at blocks that are not yet on disk; the store's **tracker**
+//! knows every such reservation, and a read that meets one waits for its
+//! write, as do a flush, a checkpoint and a compaction (they wait for the
+//! **written floor**: the highest sequence number with nothing
+//! outstanding at or below it).  A write that fails outside the lock
+//! poisons the store like one that fails inside it.
 //!
 //! # Tags, origins and names (for the Warden's `Pool` and `Layers`)
 //!
@@ -110,35 +149,43 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
 
 mod compact;
 pub use compact::{Compacted, Compaction, OldLog};
 
-const FILE_MAGIC: &[u8; 8] = b"TASOBLK2";
+const FILE_MAGIC: &[u8; 8] = b"TASOBLK4";
 /// A log written by a compaction: it may begin with a base
 /// ([`K_DATA`] and [`K_BASE`] records).  Otherwise the same records.  A
 /// separate magic, so a version that does not know base records refuses
 /// the log instead of taking its first record for a torn end.
-const COMPACT_MAGIC: &[u8; 8] = b"TASOBLK3";
-/// The spike's format (no tags, origins or names).
-const OLD_MAGIC: &[u8; 8] = b"TASOBLK1";
+const COMPACT_MAGIC: &[u8; 8] = b"TASOBLK5";
+/// The formats before the layout revision: the spike's (`TASOBLK1`, no
+/// tags, origins or names) and the byte-packed records (`TASOBLK2`, its
+/// compacted form `TASOBLK3`).  Refused by name, never read.
+const OLD_MAGICS: [&[u8; 8]; 3] = [b"TASOBLK1", b"TASOBLK2", b"TASOBLK3"];
 /// Largest Seal tag, in bytes.
 pub const MAX_TAG: usize = 64;
 /// Largest branch name, in bytes.
 pub const MAX_NAME: usize = 255;
-const HEADER_LEN: u64 = 16;
+/// The header is one block: the magic, then zeros.
+const HEADER_LEN: u64 = BLOCK;
 const REC_MAGIC: u32 = 0x5442_4c4b; // "TBLK"
-/// magic + len + kind
-const REC_HEAD: u64 = 4 + 4 + 1;
+/// The fixed part of a head block: magic + kind + flen + dlen + hash.
+const REC_HEAD: u64 = 4 + 1 + 2 + 4 + HASH as u64;
 const HASH: usize = 32;
-/// Largest record body accepted: a write of 4096 blocks (16 MiB) plus its
-/// fields.  Bounds what recovery allocates for a corrupt length.
-const MAX_BODY: u32 = 4096 * BLOCK as u32 + 64;
+/// Largest fields a head block holds.
+const MAX_FIELDS: usize = (BLOCK - REC_HEAD) as usize;
+/// Largest record data accepted: a write of 4096 blocks (16 MiB).  Bounds
+/// what recovery allocates for a corrupt length.
+const MAX_DATA: u32 = 4096 * BLOCK as u32;
+/// Largest record body (fields and data together), as the compaction's
+/// buffer sizes it.
+const MAX_BODY: u32 = MAX_DATA + MAX_FIELDS as u32;
 
 const K_WRITE: u8 = 1;
 const K_DISCARD: u8 = 2;
@@ -178,8 +225,8 @@ pub enum StoreError {
     Map(MapError),
     /// The file is not a block log (bad header).
     NotALog,
-    /// A log in the spike's format (`TASOBLK1`), which this version does
-    /// not read.
+    /// A log in a format before the layout revision (`TASOBLK1`,
+    /// `TASOBLK2` or `TASOBLK3`), which this version does not read.
     OldFormat,
     /// A verified record does not replay: the log contradicts itself.
     Replay {
@@ -230,7 +277,7 @@ impl std::fmt::Display for StoreError {
             Self::NotALog => write!(f, "not a taso-blk log"),
             Self::OldFormat => write!(
                 f,
-                "a taso-blk log in the spike's format (TASOBLK1); this version reads TASOBLK2"
+                "a taso-blk log in a format before the layout revision (TASOBLK1, TASOBLK2 or TASOBLK3); this version reads TASOBLK4 and TASOBLK5, and a log is made again, never migrated"
             ),
             Self::BadTag(n) => write!(f, "a tag of {n} bytes; at most {MAX_TAG}"),
             Self::BadName(n) => write!(
@@ -276,8 +323,9 @@ pub struct Recovered {
     pub records: u64,
     /// Groups (Flush records) replayed.
     pub groups: u64,
-    /// Bytes cut from the end of the file: records after the last Flush,
-    /// and anything torn or unverifiable.
+    /// Bytes after the tail that were records, whole or torn: from the end
+    /// of the last Flush to the first all-zero head block or the file's
+    /// end.  Never acknowledged as durable.
     pub cut: u64,
     /// The sequence number of the checkpoint the replay started from, or
     /// `None` for a full replay.
@@ -310,16 +358,25 @@ pub struct Stats {
 
 /// One block log file and the map it holds.
 pub struct Store {
+    /// The log, open `O_DIRECT` when the file system allows it
+    /// ([`Store::is_direct`]): every read and write through it is
+    /// block-aligned.
     file: File,
+    direct: bool,
     path: PathBuf,
     map: Map,
     meta: Meta,
     /// End of the last record: where the next one goes.
     tail: u64,
+    /// How far the file is written (its length): at least `tail`, more
+    /// when it is written ahead ([`Store::extend_ahead`]).
+    edge: u64,
     /// Sequence number of the last record (records count from 1).
     lsn: u64,
     /// Hash of the last record (or of the header).
     prev: [u8; HASH],
+    /// The writes reserved and not yet written ([`Store::reserve_write`]).
+    tracker: Arc<Tracker>,
     stats: Stats,
     poisoned: bool,
 }
@@ -328,11 +385,7 @@ impl Store {
     /// Create a new, empty log at `path` (which must not exist) and make
     /// its existence durable.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let (file, direct) = open_direct(path, true)?;
         // A checkpoint of an earlier log under this name is not ours, nor
         // is an unfinished compaction of one.
         for stale in [
@@ -342,19 +395,22 @@ impl Store {
         ] {
             remove_if_there(&stale)?;
         }
-        let mut header = [0u8; HEADER_LEN as usize];
+        let mut header = AlignedBuf::zeroed(HEADER_LEN as usize);
         header[..8].copy_from_slice(FILE_MAGIC);
         file.write_all_at(&header, 0)?;
         file.sync_all()?;
         sync_dir(path)?;
         Ok(Self {
             file,
+            direct,
             path: path.to_path_buf(),
             map: Map::new(),
             meta: Meta::default(),
             tail: HEADER_LEN,
+            edge: HEADER_LEN,
             lsn: 0,
             prev: seed(&header),
+            tracker: Arc::new(Tracker::default()),
             stats: Stats {
                 log_bytes: HEADER_LEN,
                 ..Stats::default()
@@ -368,22 +424,24 @@ impl Store {
     ///
     /// One pass.  A group's map changes are held back until its Flush is
     /// verified, then applied together, so records after the last Flush
-    /// never reach the map.
+    /// never reach the map.  The replay reads through a plain descriptor
+    /// (buffered, one pass); the store then serves through a direct one.
     pub fn open(path: &Path) -> Result<(Self, Recovered), StoreError> {
-        let file = OpenOptions::new().read(true).write(true).open(path)?;
-        let len = file.metadata()?.len();
+        let plain = OpenOptions::new().read(true).open(path)?;
+        let len = plain.metadata()?.len();
         if len < HEADER_LEN {
             return Err(StoreError::NotALog);
         }
         let mut header = [0u8; HEADER_LEN as usize];
-        file.read_exact_at(&mut header, 0)?;
-        if &header[..8] == OLD_MAGIC {
+        plain.read_exact_at(&mut header, 0)?;
+        if OLD_MAGICS.contains(&&header[..8].try_into().expect("8 bytes")) {
             return Err(StoreError::OldFormat);
         }
         let compacted = &header[..8] == COMPACT_MAGIC;
         if &header[..8] != FILE_MAGIC && !compacted {
             return Err(StoreError::NotALog);
         }
+        let file = &plain;
         // A compaction that did not finish left its new log beside this
         // one; this one is still the log.
         for stale in [
@@ -394,7 +452,7 @@ impl Store {
         }
 
         // Start from a checkpoint if one checks out, else from the header.
-        let ck = load_checkpoint(path, &file, len);
+        let ck = load_checkpoint(path, file, len);
         let from = ck.as_ref().map(|c| c.lsn);
         let (mut map, mut meta, start, start_lsn, start_prev, mut garbage) = match ck {
             Some(c) => (c.map, c.meta, c.end, c.lsn, c.prev, c.garbage),
@@ -403,7 +461,7 @@ impl Store {
         let mut r = BufReader::with_capacity(
             1 << 20,
             ReadAt {
-                file: &file,
+                file,
                 pos: start,
                 end: len,
             },
@@ -417,8 +475,8 @@ impl Store {
         let mut base = Base::default();
         while let Some((kind, body, hash)) = read_record(&mut r, &prev)? {
             lsn += 1;
-            let data_at = pos + REC_HEAD;
-            pos += REC_HEAD + body.len() as u64 + HASH as u64;
+            let data_at = pos + BLOCK;
+            pos += record_len(kind, body.len());
             prev = hash;
             if kind == K_DATA || kind == K_BASE {
                 let in_base = compacted && start == HEADER_LEN && groups == 0 && pending.is_empty();
@@ -458,9 +516,29 @@ impl Store {
                 pending.push(Pending::of(kind, &body, data_at, lsn));
             }
         }
-        let cut = len - end;
-        if cut > 0 {
-            file.set_len(end)?;
+        drop(r);
+        // The cut: what was recorded after the tail, up to the first
+        // all-zero head block (the file written ahead, or nothing) or the
+        // file's end.  Zeroed, so that beyond the tail the file holds
+        // only zeros (the invariant the count rests on: a stale data
+        // block could otherwise be counted as a cut at a later open);
+        // the block at the tail last, so a crash in the middle of this
+        // leaves the records or nothing, never a half.  The file is never
+        // shrunk.
+        let cut = scan_cut(file, end, len)?;
+        drop(plain);
+        let (file, direct) = open_direct(path, false)?;
+        if end < len {
+            let zeros = AlignedBuf::zeroed(1 << 20);
+            // Whole blocks: a torn last block is zeroed to its end.
+            let stop = (end + cut).next_multiple_of(BLOCK);
+            let mut at = end + BLOCK;
+            while at < stop {
+                let n = ((stop - at) as usize).min(zeros.len());
+                file.write_all_at(&zeros[..n], at)?;
+                at += n as u64;
+            }
+            file.write_all_at(&zeros[..BLOCK as usize], end)?;
             file.sync_all()?;
         }
         let stats = Stats {
@@ -471,12 +549,15 @@ impl Store {
         };
         let store = Self {
             file,
+            direct,
             path: path.to_path_buf(),
             map,
             meta,
             tail: end,
+            edge: len.max(end),
             lsn: good_lsn,
             prev: good_prev,
+            tracker: Arc::new(Tracker::default()),
             stats,
             poisoned: false,
         };
@@ -552,15 +633,74 @@ impl Store {
             return Err(StoreError::BadLength(data.len()));
         }
         let count = data.len() as u64 / BLOCK;
-        if 16 + data.len() > MAX_BODY as usize {
+        if data.len() > MAX_DATA as usize {
             return Err(StoreError::TooLarge(data.len()));
         }
         lba.checked_add(count).ok_or(MapError::Overflow)?;
         if self.map.kind(branch)? != Kind::Branch {
             return Err(MapError::NotABranch(branch).into());
         }
-        // The data starts after the record head and the two fields.
-        let data_at = self.tail + REC_HEAD + 16;
+        // The whole write, in one call: the digest, the reservation, the
+        // record written (from an aligned copy of the data), and the
+        // reservation closed.  What `taso-blkd` does in three steps.
+        let t = std::time::Instant::now();
+        let digest = write_digest(branch, lba, data);
+        self.stats.write_hash_us += t.elapsed().as_micros() as u64;
+        let t = std::time::Instant::now();
+        let mut copy = AlignedBuf::zeroed(data.len());
+        copy.copy_from_slice(data);
+        self.stats.write_copy_us += t.elapsed().as_micros() as u64;
+        let r = self.reserve_write(branch, lba, data.len(), &digest)?;
+        let t = std::time::Instant::now();
+        let written = self
+            .file
+            .write_all_at(&r.head, r.offset)
+            .and_then(|()| self.file.write_all_at(&copy, r.offset + BLOCK));
+        self.stats.write_pwrite_us += t.elapsed().as_micros() as u64;
+        match written {
+            Ok(()) => self.tracker.done(r.lsn),
+            Err(e) => {
+                self.tracker.fail(r.lsn, &e);
+                self.poisoned = true;
+                return Err(e.into());
+            }
+        }
+        if fua {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// The first step of a write done in three, for `taso-blkd`: under
+    /// the lock, check and enter the write in the map, build its head
+    /// block, and reserve its place in the log.  `digest` is the body's
+    /// digest, [`write_digest`], computed by the caller before taking the
+    /// lock.  The caller then writes the record with [`Writer::commit`]
+    /// after letting the lock go; until it does, the blocks are entered
+    /// but not on disk, and every read of them waits (the tracker).  A
+    /// reservation that is never committed leaves a hole the next open
+    /// cuts at — and a sync waits for it forever, so a caller that cannot
+    /// commit must [`Writer::fail`] it.
+    pub fn reserve_write(
+        &mut self,
+        branch: LayerId,
+        lba: u64,
+        data_len: usize,
+        digest: &[u8; HASH],
+    ) -> Result<Reservation, StoreError> {
+        self.check()?;
+        if data_len == 0 || !(data_len as u64).is_multiple_of(BLOCK) {
+            return Err(StoreError::BadLength(data_len));
+        }
+        if data_len > MAX_DATA as usize {
+            return Err(StoreError::TooLarge(data_len));
+        }
+        let count = data_len as u64 / BLOCK;
+        lba.checked_add(count).ok_or(MapError::Overflow)?;
+        if self.map.kind(branch)? != Kind::Branch {
+            return Err(MapError::NotABranch(branch).into());
+        }
+        let data_at = self.tail + BLOCK;
         let t = std::time::Instant::now();
         for i in 0..count {
             if self
@@ -572,17 +712,74 @@ impl Store {
             }
         }
         self.stats.write_map_us += t.elapsed().as_micros() as u64;
-        let t = std::time::Instant::now();
-        let mut body = Vec::with_capacity(16 + data.len());
-        body.extend_from_slice(&branch.get().to_le_bytes());
-        body.extend_from_slice(&lba.to_le_bytes());
-        body.extend_from_slice(data);
-        self.stats.write_copy_us += t.elapsed().as_micros() as u64;
-        self.append_timed(K_WRITE, &body)?;
-        if fua {
-            self.flush()?;
+        let mut fields = [0u8; 16];
+        fields[..8].copy_from_slice(&branch.get().to_le_bytes());
+        fields[8..].copy_from_slice(&lba.to_le_bytes());
+        let mut head = AlignedBuf::zeroed(BLOCK as usize);
+        let hash = encode_head(
+            &mut head,
+            &self.prev,
+            K_WRITE,
+            &fields,
+            data_len as u32,
+            digest,
+        );
+        let r = Reservation {
+            offset: self.tail,
+            lsn: self.lsn + 1,
+            head,
+        };
+        let total = BLOCK + data_len as u64;
+        self.tracker.add(r.lsn, r.offset, total);
+        self.tail += total;
+        self.edge = self.edge.max(self.tail);
+        self.lsn += 1;
+        self.prev = hash;
+        self.stats.log_bytes = self.tail;
+        self.stats.records += 1;
+        Ok(r)
+    }
+
+    /// A handle for writing reserved records outside the lock: the log's
+    /// file (a second descriptor, direct like the store's) and the
+    /// tracker.  Made once per queue thread.
+    pub fn writer(&self) -> Writer {
+        Writer {
+            file: self.file.try_clone().expect("dup of the log's descriptor"),
+            tracker: Arc::clone(&self.tracker),
         }
+    }
+
+    /// Whether the log is open `O_DIRECT` (false where the file system
+    /// refused it: tmpfs, some overlays — the layout is the same, the
+    /// writes go through the page cache, and the sync writes them back).
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// Write `bytes` of zeros past the end of the file (from its current
+    /// length), so that the records to come overwrite written extents
+    /// instead of extending the file — an extending direct write takes
+    /// the inode's lock exclusively and runs one at a time; an overwrite
+    /// takes it shared (P5 L0, 2026-10-30).  How far the file is written
+    /// ahead of the tail is [`Store::ahead`].
+    pub fn extend_ahead(&mut self, bytes: u64) -> Result<(), StoreError> {
+        self.check()?;
+        let bytes = bytes.next_multiple_of(BLOCK);
+        let chunk = AlignedBuf::zeroed((1 << 20).min(bytes) as usize);
+        let mut at = self.edge;
+        while at < self.edge + bytes {
+            let n = ((self.edge + bytes - at) as usize).min(chunk.len());
+            self.file.write_all_at(&chunk[..n], at)?;
+            at += n as u64;
+        }
+        self.edge += bytes;
         Ok(())
+    }
+
+    /// Bytes written ahead of the tail (zeros the next records overwrite).
+    pub fn ahead(&self) -> u64 {
+        self.edge - self.tail
     }
 
     /// Discard (TRIM) `count` blocks from `lba`: they read as zeros.
@@ -604,9 +801,24 @@ impl Store {
         if buf.is_empty() || !(buf.len() as u64).is_multiple_of(BLOCK) {
             return Err(StoreError::BadLength(buf.len()));
         }
+        // A direct read needs an aligned buffer; a caller's that is not
+        // (tests, export) goes through one block of our own.
+        let aligned = (buf.as_ptr() as usize).is_multiple_of(BLOCK as usize);
+        let mut bounce = (!aligned).then(|| AlignedBuf::zeroed(BLOCK as usize));
         for (i, chunk) in buf.chunks_mut(BLOCK as usize).enumerate() {
             match self.map.read(layer, lba + i as u64)? {
-                Some(Loc::Log(off)) => self.file.read_exact_at(chunk, off)?,
+                Some(Loc::Log(off)) => {
+                    // A block whose write is reserved but not yet on disk:
+                    // wait for it (the tracker).
+                    self.tracker.wait_offset(off)?;
+                    match &mut bounce {
+                        Some(b) => {
+                            self.file.read_exact_at(b, off)?;
+                            chunk.copy_from_slice(b);
+                        }
+                        None => self.file.read_exact_at(chunk, off)?,
+                    }
+                }
                 Some(Loc::Zero) | None => chunk.fill(0),
             }
         }
@@ -617,9 +829,14 @@ impl Store {
     /// Returns the Flush record's sequence number.
     pub fn flush(&mut self) -> Result<u64, StoreError> {
         let lsn = self.flush_pending()?;
-        if let Err(e) = self.file.sync_data() {
+        // Every reserved write before the Flush must be on disk first.
+        if let Err(e) = self
+            .tracker
+            .wait_floor(lsn)
+            .and_then(|()| self.file.sync_data().map_err(StoreError::Io))
+        {
             self.poisoned = true;
-            return Err(e.into());
+            return Err(e);
         }
         self.stats.syncs += 1;
         Ok(lsn)
@@ -682,9 +899,11 @@ impl Store {
     }
 
     /// A [`Syncer`] over this log's file, for syncing outside the lock.
+    /// It waits for the store's reserved writes before every sync.
     pub fn syncer(&self) -> io::Result<Syncer> {
         Ok(Syncer {
             file: self.file.try_clone()?,
+            tracker: Arc::clone(&self.tracker),
             state: std::sync::Mutex::new(SyncState::default()),
             done: std::sync::Condvar::new(),
         })
@@ -1029,34 +1248,48 @@ impl Store {
     // ── internals ───────────────────────────────────────────────────
 
     fn check(&self) -> Result<(), StoreError> {
-        if self.poisoned {
+        if self.poisoned || self.tracker.failed() {
             Err(StoreError::Poisoned)
         } else {
             Ok(())
         }
     }
 
-    /// Append one record at the tail.  The map has already applied it; if
-    /// the file write fails, the two disagree and the store is poisoned.
+    /// Append one record at the tail, whole, under the lock: every kind
+    /// but a write's data goes this way (one head block; a compacted
+    /// log's data and base records are written by the compaction).  The
+    /// map has already applied it; if the file write fails, the two
+    /// disagree and the store is poisoned.
     fn append(&mut self, kind: u8, body: &[u8]) -> Result<(), StoreError> {
-        self.append_timed(kind, body)
-    }
-
-    /// [`append`](Self::append), with the hash and the `pwrite` timed into
-    /// the write counters of [`Stats`] (every kind of record is appended
-    /// this way; the counters are read against the write ops' bytes).
-    fn append_timed(&mut self, kind: u8, body: &[u8]) -> Result<(), StoreError> {
+        let (fields, data) = split_body(kind, body);
         let t = std::time::Instant::now();
-        let mut rec = Vec::with_capacity(REC_HEAD as usize + body.len() + HASH);
-        let hash = encode_record(&mut rec, &self.prev, kind, body);
+        let digest = body_digest(fields, data);
+        let mut head = AlignedBuf::zeroed(BLOCK as usize);
+        let hash = encode_head(
+            &mut head,
+            &self.prev,
+            kind,
+            fields,
+            data.len() as u32,
+            &digest,
+        );
         self.stats.write_hash_us += t.elapsed().as_micros() as u64;
         let t = std::time::Instant::now();
-        if let Err(e) = self.file.write_all_at(&rec, self.tail) {
+        let r = self.file.write_all_at(&head, self.tail).and_then(|()| {
+            if data.is_empty() {
+                return Ok(());
+            }
+            let mut copy = AlignedBuf::zeroed(padded(data.len()));
+            copy[..data.len()].copy_from_slice(data);
+            self.file.write_all_at(&copy, self.tail + BLOCK)
+        });
+        if let Err(e) = r {
             self.poisoned = true;
             return Err(e.into());
         }
         self.stats.write_pwrite_us += t.elapsed().as_micros() as u64;
-        self.tail += rec.len() as u64;
+        self.tail += record_len(kind, body.len());
+        self.edge = self.edge.max(self.tail);
         self.lsn += 1;
         self.prev = hash;
         self.stats.log_bytes = self.tail;
@@ -1070,52 +1303,382 @@ fn seed(header: &[u8]) -> [u8; HASH] {
     *blake3::hash(header).as_bytes()
 }
 
-/// Append one whole record (head, body, chain hash) to `out`; returns its
-/// chain hash.
-fn encode_record(out: &mut Vec<u8>, prev: &[u8; HASH], kind: u8, body: &[u8]) -> [u8; HASH] {
-    let hash = chain(prev, kind, body);
-    out.extend_from_slice(&REC_MAGIC.to_le_bytes());
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.push(kind);
-    out.extend_from_slice(body);
-    out.extend_from_slice(&hash);
-    hash
+/// Round `n` bytes up to whole blocks.
+fn padded(n: usize) -> usize {
+    n.next_multiple_of(BLOCK as usize)
 }
 
-fn chain(prev: &[u8; HASH], kind: u8, body: &[u8]) -> [u8; HASH] {
+/// A record's length on disk: its head block and its data blocks.
+fn record_len(kind: u8, body_len: usize) -> u64 {
+    let (_, data) = split_len(kind, body_len);
+    BLOCK + padded(data) as u64
+}
+
+/// How a record's body splits into its fields (in the head block) and
+/// its data (the blocks after it), by kind: a write's first 16 bytes
+/// are its fields, a compacted log's data and base records are all data,
+/// everything else is all fields.
+fn split_len(kind: u8, body_len: usize) -> (usize, usize) {
+    let fields = match kind {
+        K_WRITE => body_len.min(16),
+        K_DATA | K_BASE => 0,
+        _ => body_len,
+    };
+    (fields, body_len - fields)
+}
+
+fn split_body(kind: u8, body: &[u8]) -> (&[u8], &[u8]) {
+    body.split_at(split_len(kind, body.len()).0)
+}
+
+/// The body's digest, `BLAKE3(fields || data)`: the part of the chain a
+/// caller computes before the lock.
+fn body_digest(fields: &[u8], data: &[u8]) -> [u8; HASH] {
     let mut h = blake3::Hasher::new();
-    h.update(prev);
-    h.update(&[kind]);
-    h.update(&(body.len() as u32).to_le_bytes());
-    h.update(body);
+    h.update(fields);
+    h.update(data);
     *h.finalize().as_bytes()
 }
 
-/// A verified record: its kind, its body and its chain hash.
+/// The body's digest of a write record of `data` at `lba` of `branch`,
+/// for [`Store::reserve_write`].  Computed outside the lock.
+pub fn write_digest(branch: LayerId, lba: u64, data: &[u8]) -> [u8; HASH] {
+    let mut fields = [0u8; 16];
+    fields[..8].copy_from_slice(&branch.get().to_le_bytes());
+    fields[8..].copy_from_slice(&lba.to_le_bytes());
+    body_digest(&fields, data)
+}
+
+/// Fill `head` (one zeroed block) with a record's head: magic, kind, the
+/// lengths, the chain hash, the fields.  Returns the chain hash.
+fn encode_head(
+    head: &mut [u8],
+    prev: &[u8; HASH],
+    kind: u8,
+    fields: &[u8],
+    dlen: u32,
+    digest: &[u8; HASH],
+) -> [u8; HASH] {
+    debug_assert!(head.len() == BLOCK as usize && fields.len() <= MAX_FIELDS);
+    let hash = chain(prev, kind, fields.len() as u16, dlen, digest);
+    head[0..4].copy_from_slice(&REC_MAGIC.to_le_bytes());
+    head[4] = kind;
+    head[5..7].copy_from_slice(&(fields.len() as u16).to_le_bytes());
+    head[7..11].copy_from_slice(&dlen.to_le_bytes());
+    head[11..11 + HASH].copy_from_slice(&hash);
+    head[11 + HASH..11 + HASH + fields.len()].copy_from_slice(fields);
+    hash
+}
+
+/// Append one whole record (its head block and its data blocks, padded)
+/// to `out`, which must hold whole blocks; returns the chain hash.  For
+/// a compaction, which gathers records into a buffer of its own.
+fn encode_record(out: &mut Vec<u8>, prev: &[u8; HASH], kind: u8, body: &[u8]) -> [u8; HASH] {
+    debug_assert!((out.len() as u64).is_multiple_of(BLOCK));
+    let (fields, data) = split_body(kind, body);
+    let digest = body_digest(fields, data);
+    let at = out.len();
+    out.resize(at + BLOCK as usize, 0);
+    let hash = encode_head(
+        &mut out[at..],
+        prev,
+        kind,
+        fields,
+        data.len() as u32,
+        &digest,
+    );
+    out.extend_from_slice(data);
+    out.resize(at + record_len(kind, body.len()) as usize, 0);
+    hash
+}
+
+fn chain(prev: &[u8; HASH], kind: u8, flen: u16, dlen: u32, digest: &[u8; HASH]) -> [u8; HASH] {
+    let mut h = blake3::Hasher::new();
+    h.update(prev);
+    h.update(&[kind]);
+    h.update(&flen.to_le_bytes());
+    h.update(&dlen.to_le_bytes());
+    h.update(digest);
+    *h.finalize().as_bytes()
+}
+
+/// A verified record: its kind, its body (fields, then data) and its
+/// chain hash.
 type Record = (u8, Vec<u8>, [u8; HASH]);
+
+/// What a head block says, before its chain is checked.
+struct Head {
+    kind: u8,
+    flen: usize,
+    dlen: usize,
+    hash: [u8; HASH],
+}
+
+/// Parse a head block: `None` unless its magic, kind and lengths are
+/// those of a record (a zero block, a torn block and a data block are
+/// not).
+fn parse_head(block: &[u8]) -> Option<Head> {
+    if block.len() < BLOCK as usize || block[0..4] != REC_MAGIC.to_le_bytes() {
+        return None;
+    }
+    let kind = block[4];
+    let flen = u16::from_le_bytes(block[5..7].try_into().unwrap()) as usize;
+    let dlen = u32::from_le_bytes(block[7..11].try_into().unwrap());
+    if !(K_WRITE..=K_LAST).contains(&kind) || flen > MAX_FIELDS || dlen > MAX_DATA {
+        return None;
+    }
+    Some(Head {
+        kind,
+        flen,
+        dlen: dlen as usize,
+        hash: block[11..11 + HASH].try_into().unwrap(),
+    })
+}
 
 /// Read and verify the next record.  `None` at a clean end or at anything
 /// that is not a whole, verified record (torn, bad magic, bad hash).
 fn read_record(r: &mut impl Read, prev: &[u8; HASH]) -> io::Result<Option<Record>> {
-    let mut head = [0u8; REC_HEAD as usize];
+    let mut head = vec![0u8; BLOCK as usize];
     if !read_full(r, &mut head)? {
         return Ok(None);
     }
-    let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
-    let len = u32::from_le_bytes(head[4..8].try_into().unwrap());
-    let kind = head[8];
-    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_LAST).contains(&kind) {
+    let Some(h) = parse_head(&head) else {
+        return Ok(None);
+    };
+    let mut body = head[REC_HEAD as usize..REC_HEAD as usize + h.flen].to_vec();
+    if h.dlen > 0 {
+        let mut data = vec![0u8; padded(h.dlen)];
+        if !read_full(r, &mut data)? {
+            return Ok(None);
+        }
+        body.extend_from_slice(&data[..h.dlen]);
+    }
+    let (fields, data) = body.split_at(h.flen);
+    let digest = body_digest(fields, data);
+    if chain(prev, h.kind, h.flen as u16, h.dlen as u32, &digest) != h.hash {
         return Ok(None);
     }
-    let mut body = vec![0u8; len as usize];
-    let mut hash = [0u8; HASH];
-    if !read_full(r, &mut body)? || !read_full(r, &mut hash)? {
-        return Ok(None);
+    Ok(Some((h.kind, body, h.hash)))
+}
+
+/// What was recorded after `tail`, in bytes: the records (whole or
+/// torn) up to the first all-zero head block or the file's end.  Walks
+/// by record length while blocks parse as heads, block by block once one
+/// does not.
+fn scan_cut(file: &File, tail: u64, len: u64) -> io::Result<u64> {
+    let mut block = vec![0u8; BLOCK as usize];
+    let mut at = tail;
+    while at < len {
+        let n = ((len - at) as usize).min(block.len());
+        file.read_exact_at(&mut block[..n], at)?;
+        if n < block.len() {
+            // A torn block at the end of the file: counted whole.
+            return Ok(len - tail);
+        }
+        if block.iter().all(|b| *b == 0) {
+            break;
+        }
+        at += match parse_head(&block) {
+            Some(h) => BLOCK + padded(h.dlen) as u64,
+            None => BLOCK,
+        };
     }
-    if chain(prev, kind, &body) != hash {
-        return Ok(None);
+    Ok(at.min(len) - tail)
+}
+
+/// Open the log `O_DIRECT`, or plain where the file system refuses it
+/// (`EINVAL`: tmpfs, some overlays); says which.  `create` makes it.
+fn open_direct(path: &Path, create: bool) -> io::Result<(File, bool)> {
+    let mut o = OpenOptions::new();
+    o.read(true).write(true);
+    if create {
+        o.create_new(true);
     }
-    Ok(Some((kind, body, hash)))
+    match o.custom_flags(libc::O_DIRECT).open(path) {
+        Ok(f) => Ok((f, true)),
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            let mut o = OpenOptions::new();
+            o.read(true).write(true);
+            if create {
+                o.create_new(true);
+            }
+            Ok((o.open(path)?, false))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// A buffer aligned to a block, as direct I/O needs: for the head block
+/// of a record, a write's data, a read's blocks.  Owned memory with the
+/// aligned part found inside it (no unsafe).
+pub struct AlignedBuf {
+    mem: Vec<u8>,
+    start: usize,
+    len: usize,
+}
+
+impl AlignedBuf {
+    /// `len` zero bytes (a multiple of the block, rounded up), aligned to
+    /// a block.
+    pub fn zeroed(len: usize) -> Self {
+        let len = padded(len.max(1));
+        let mem = vec![0u8; len + BLOCK as usize];
+        let start = mem.as_ptr().align_offset(BLOCK as usize);
+        Self { mem, start, len }
+    }
+}
+
+impl std::ops::Deref for AlignedBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.mem[self.start..self.start + self.len]
+    }
+}
+
+impl std::ops::DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.mem[self.start..self.start + self.len]
+    }
+}
+
+/// A write's place in the log, reserved under the lock
+/// ([`Store::reserve_write`]) and written outside it ([`Writer::commit`]).
+pub struct Reservation {
+    /// Where the record goes: its head block, then its data.
+    pub offset: u64,
+    /// The record's sequence number.
+    pub lsn: u64,
+    head: AlignedBuf,
+}
+
+/// Writes reserved records outside the lock.  [`Store::writer`].
+pub struct Writer {
+    file: File,
+    tracker: Arc<Tracker>,
+}
+
+impl Writer {
+    /// Write the reserved record: its head block and `data` (the bytes
+    /// the digest was computed over, in an aligned buffer, whole blocks)
+    /// at its place, and close the reservation.  A failed write poisons
+    /// the store.
+    pub fn commit(&self, r: &Reservation, data: &[u8]) -> Result<(), StoreError> {
+        debug_assert!((data.as_ptr() as usize).is_multiple_of(BLOCK as usize));
+        let res = self
+            .file
+            .write_all_at(&r.head, r.offset)
+            .and_then(|()| self.file.write_all_at(data, r.offset + BLOCK));
+        match res {
+            Ok(()) => {
+                self.tracker.done(r.lsn);
+                Ok(())
+            }
+            Err(e) => {
+                self.tracker.fail(r.lsn, &e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Give a reservation up without writing it (the caller lost its
+    /// data): the store is poisoned, as after a failed write, so nothing
+    /// is acknowledged over the hole.
+    pub fn fail(&self, r: &Reservation, why: &str) {
+        self.tracker.fail(r.lsn, &io::Error::other(why.to_string()));
+    }
+}
+
+/// The writes reserved and not yet on disk, shared by the store, its
+/// [`Writer`]s and its [`Syncer`].
+#[derive(Default)]
+pub struct Tracker {
+    state: Mutex<TrackState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct TrackState {
+    /// Outstanding reservations: sequence number → (offset, length).
+    open: BTreeMap<u64, (u64, u64)>,
+    /// A write outside the lock failed: the store is poisoned.
+    failed: Option<String>,
+}
+
+impl Tracker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TrackState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, lsn: u64, offset: u64, len: u64) {
+        self.lock().open.insert(lsn, (offset, len));
+    }
+
+    fn done(&self, lsn: u64) {
+        self.lock().open.remove(&lsn);
+        self.changed.notify_all();
+    }
+
+    fn fail(&self, lsn: u64, e: &io::Error) {
+        let mut st = self.lock();
+        st.open.remove(&lsn);
+        st.failed
+            .get_or_insert_with(|| format!("the write of record {lsn} failed: {e}"));
+        self.changed.notify_all();
+    }
+
+    fn failed(&self) -> bool {
+        self.lock().failed.is_some()
+    }
+
+    /// How a write outside the lock failed, once one has.
+    pub fn failure(&self) -> Option<String> {
+        self.lock().failed.clone()
+    }
+
+    /// Wait until nothing at or before `lsn` is outstanding.
+    pub fn wait_floor(&self, lsn: u64) -> Result<(), StoreError> {
+        let mut st = self.lock();
+        loop {
+            if st.failed.is_some() {
+                return Err(StoreError::Poisoned);
+            }
+            match st.open.keys().next() {
+                Some(&first) if first <= lsn => {
+                    st = self
+                        .changed
+                        .wait(st)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// Wait while an outstanding reservation covers the byte at `off`.
+    fn wait_offset(&self, off: u64) -> Result<(), StoreError> {
+        let mut st = self.lock();
+        loop {
+            if st.failed.is_some() {
+                return Err(StoreError::Poisoned);
+            }
+            let covered = st
+                .open
+                .values()
+                .any(|&(at, len)| at <= off && off < at + len);
+            if !covered {
+                return Ok(());
+            }
+            st = self
+                .changed
+                .wait(st)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Reservations not yet written.
+    pub fn outstanding(&self) -> usize {
+        self.lock().open.len()
+    }
 }
 
 /// Fill `buf` completely; `false` if the stream ends first.
@@ -1144,23 +1707,19 @@ struct Pending {
     fields: Vec<u8>,
     /// Bytes of block data after the fields (writes only).
     data_len: usize,
-    /// Offset of the record's body in the file.
-    body_at: u64,
+    /// Offset of the record's data in the file (its second block).
+    data_at: u64,
     lsn: u64,
 }
 
 impl Pending {
-    fn of(kind: u8, body: &[u8], body_at: u64, lsn: u64) -> Self {
-        let fields = if kind == K_WRITE {
-            body.len().min(16)
-        } else {
-            body.len()
-        };
+    fn of(kind: u8, body: &[u8], data_at: u64, lsn: u64) -> Self {
+        let (fields, _) = split_len(kind, body.len());
         Self {
             kind,
             fields: body[..fields].to_vec(),
             data_len: body.len() - fields,
-            body_at,
+            data_at,
             lsn,
         }
     }
@@ -1192,7 +1751,7 @@ fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError
                 .ok_or_else(|| bad(MapError::Overflow))?;
             let mut freed = 0;
             for i in 0..count {
-                let at = p.body_at + 16 + i * BLOCK;
+                let at = p.data_at + i * BLOCK;
                 if map.write(id, lba + i, Loc::Log(at)).map_err(bad)?.is_some() {
                     freed += 1;
                 }
@@ -1529,17 +2088,20 @@ fn load_checkpoint(path: &Path, file: &File, len: u64) -> Option<Checkpoint> {
     let prev: [u8; HASH] = r.get(HASH..2 * HASH)?.try_into().ok()?;
     r = &r[2 * HASH..];
     // The Flush record that ends at `end`: exactly where the checkpoint
-    // says, with the chain hash it names.
-    let flush_len = REC_HEAD + HASH as u64;
-    if end > len || end < HEADER_LEN + flush_len || chain(&before, K_FLUSH, &[]) != prev {
+    // says (one head block), with the chain hash it names.
+    let flush_len = BLOCK;
+    let empty = body_digest(&[], &[]);
+    if end > len
+        || end < HEADER_LEN + flush_len
+        || !end.is_multiple_of(BLOCK)
+        || chain(&before, K_FLUSH, 0, 0, &empty) != prev
+    {
         return None;
     }
     let mut rec = vec![0u8; flush_len as usize];
     file.read_exact_at(&mut rec, end - flush_len).ok()?;
-    let ok = u32::from_le_bytes(rec[0..4].try_into().unwrap()) == REC_MAGIC
-        && u32::from_le_bytes(rec[4..8].try_into().unwrap()) == 0
-        && rec[8] == K_FLUSH
-        && rec[REC_HEAD as usize..] == prev;
+    let ok = parse_head(&rec)
+        .is_some_and(|h| h.kind == K_FLUSH && h.flen == 0 && h.dlen == 0 && h.hash == prev);
     if !ok {
         return None;
     }
@@ -1627,6 +2189,7 @@ impl Read for ReadAt<'_> {
 /// 690 ms p50 for a 1 ms fsync).
 pub struct Syncer {
     file: File,
+    tracker: Arc<Tracker>,
     state: std::sync::Mutex<SyncState>,
     done: std::sync::Condvar,
 }
@@ -1672,7 +2235,16 @@ impl Syncer {
             let upto = st.requested;
             st.syncing = true;
             drop(st);
-            let r = self.file.sync_data();
+            // Every reserved write up to here must be on disk before the
+            // sync means anything (the tracker).
+            let r = match self.tracker.wait_floor(upto) {
+                Ok(()) => self.file.sync_data(),
+                Err(_) => Err(io::Error::other(
+                    self.tracker
+                        .failure()
+                        .unwrap_or_else(|| "a reserved write failed".to_string()),
+                )),
+            };
             st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.syncing = false;
             match r {
@@ -1862,13 +2434,28 @@ mod tests {
             s.write(b, 0, &blocks(2, 1), false).unwrap();
             s.write(b, 1, &blocks(3, 1), false).unwrap();
         }
+        let len = std::fs::metadata(&path).unwrap().len();
         let (mut s, rec) = Store::open(&path).unwrap();
-        assert!(rec.cut > 0);
+        assert_eq!(rec.cut, len - durable_len, "two records after the flush");
+        assert_eq!(s.stats().log_bytes, durable_len);
         assert_eq!(
             std::fs::metadata(&path).unwrap().len(),
-            durable_len,
-            "the cut is on disk"
+            len,
+            "the file is never shrunk"
         );
+        let mut at_tail = vec![1u8; BLOCK as usize];
+        std::fs::File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut at_tail, durable_len)
+            .unwrap();
+        assert!(
+            at_tail.iter().all(|b| *b == 0),
+            "the cut is a zero block at the tail"
+        );
+        drop(s);
+        let (s2, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.cut, 0, "a second open finds the cut made");
+        s = s2;
         assert_eq!((read1(&s, b, 0), read1(&s, b, 1)), (1, 0));
         // And the log goes on from there.
         s.write(b, 1, &blocks(4, 1), true).unwrap();
@@ -1929,12 +2516,12 @@ mod tests {
             s.flush().unwrap();
         }
         let f = OpenOptions::new().write(true).open(&path).unwrap();
-        f.write_all_at(&[0xFF], mid + REC_HEAD + 20).unwrap(); // inside the block data
+        f.write_all_at(&[0xFF], mid + BLOCK + 20).unwrap(); // inside the block data
         drop(f);
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!(read1(&s, b, 0), 1);
         assert!(rec.cut > 0);
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), mid);
+        assert_eq!(s.stats().log_bytes, mid);
     }
 
     /// Flip each byte of the last group's write record in turn (magic,
@@ -1960,7 +2547,11 @@ mod tests {
         let flipped = path.with_extension("flip");
         // 0x01 flips a bit; 0x03 and 0x09 also turn kind Write (1) into
         // Discard (2) and Flush (8): valid kinds only the hash can catch.
-        for at in mid..end {
+        // Every byte of the head block's fixed part and fields, then the
+        // data block sampled (its bytes are alike to the chain).
+        let head = (mid..mid + REC_HEAD + 16).collect::<Vec<_>>();
+        let data = (mid + BLOCK..end).step_by(997);
+        for at in head.into_iter().chain(data) {
             for mask in [0x01u8, 0x03, 0x09, 0x80] {
                 let mut bytes = good.clone();
                 bytes[at as usize] ^= mask;
@@ -2524,13 +3115,19 @@ mod tests {
     }
 
     #[test]
-    fn a_log_in_the_spike_format_is_refused_by_name() {
+    fn a_log_in_an_old_format_is_refused_by_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old");
-        let mut header = [0u8; HEADER_LEN as usize];
-        header[..8].copy_from_slice(OLD_MAGIC);
-        std::fs::write(&path, header).unwrap();
-        assert!(matches!(Store::open(&path), Err(StoreError::OldFormat)));
+        for magic in OLD_MAGICS {
+            let mut header = [0u8; HEADER_LEN as usize];
+            header[..8].copy_from_slice(magic);
+            std::fs::write(&path, header).unwrap();
+            assert!(
+                matches!(Store::open(&path), Err(StoreError::OldFormat)),
+                "{}",
+                String::from_utf8_lossy(magic)
+            );
+        }
     }
 
     #[test]
@@ -2787,6 +3384,187 @@ mod tests {
         }
     }
 
+    // ── The split write, the tracker and the file written ahead ──────
+
+    /// A store behind a mutex, as `taso-blkd` holds it: reserve under the
+    /// lock, write outside it.
+    fn shared_store(dir: &tempfile::TempDir) -> (Arc<Mutex<Store>>, LayerId) {
+        let mut s = new_store(dir);
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        s.flush().unwrap();
+        (Arc::new(Mutex::new(s)), b)
+    }
+
+    #[test]
+    fn a_read_of_a_reserved_block_waits_for_its_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, b) = shared_store(&dir);
+        let data = blocks(2, 1);
+        let digest = write_digest(b, 0, &data);
+        let (r, writer) = {
+            let mut s = store.lock().unwrap();
+            let r = s.reserve_write(b, 0, data.len(), &digest).unwrap();
+            (r, s.writer())
+        };
+        assert_eq!(store.lock().unwrap().tracker.outstanding(), 1);
+        // A reader on another queue: the map already points at the new
+        // block, which is not on disk yet.  It must wait and see 2, never
+        // the zeros that are there.
+        let reader = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                let v = read1(&store.lock().unwrap(), b, 0);
+                (v, t.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut copy = AlignedBuf::zeroed(data.len());
+        copy.copy_from_slice(&data);
+        writer.commit(&r, &copy).unwrap();
+        let (v, waited) = reader.join().unwrap();
+        assert_eq!(v, 2, "the read saw the write, not the hole");
+        assert!(
+            waited >= std::time::Duration::from_millis(90),
+            "the read waited for the write: {waited:?}"
+        );
+        assert_eq!(store.lock().unwrap().tracker.outstanding(), 0);
+    }
+
+    #[test]
+    fn a_flush_waits_for_every_reserved_write_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, b) = shared_store(&dir);
+        let data = blocks(3, 2);
+        let digest = write_digest(b, 4, &data);
+        let (r, writer, syncer) = {
+            let mut s = store.lock().unwrap();
+            let r = s.reserve_write(b, 4, data.len(), &digest).unwrap();
+            let lsn = s.flush_pending().unwrap();
+            assert_eq!(lsn, r.lsn + 1, "the Flush follows the reservation");
+            (r, s.writer(), s.syncer().unwrap())
+        };
+        let lsn = r.lsn + 1;
+        let sync = std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            syncer.durable(lsn).unwrap();
+            t.elapsed()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut copy = AlignedBuf::zeroed(data.len());
+        copy.copy_from_slice(&data);
+        writer.commit(&r, &copy).unwrap();
+        let waited = sync.join().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(90),
+            "the sync waited for the write: {waited:?}"
+        );
+        // And what was synced is on disk, whole.
+        let path = store.lock().unwrap().path().to_path_buf();
+        drop(store);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, read1(&s, b, 4), read1(&s, b, 5)), (0, 3, 3));
+    }
+
+    #[test]
+    fn a_reserved_write_that_fails_poisons_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, b) = shared_store(&dir);
+        let data = blocks(4, 1);
+        let digest = write_digest(b, 0, &data);
+        let (r, writer) = {
+            let mut s = store.lock().unwrap();
+            let r = s.reserve_write(b, 0, data.len(), &digest).unwrap();
+            (r, s.writer())
+        };
+        writer.fail(&r, "the queue lost its buffer");
+        let mut s = store.lock().unwrap();
+        assert!(matches!(s.flush(), Err(StoreError::Poisoned)));
+        assert!(matches!(
+            s.write(b, 1, &blocks(5, 1), false),
+            Err(StoreError::Poisoned)
+        ));
+        assert!(s.tracker.failure().unwrap().contains("lost its buffer"));
+    }
+
+    #[test]
+    fn a_log_written_ahead_opens_with_no_cut_and_goes_on_over_the_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (b, tail);
+        {
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            b = s.fork(root).unwrap();
+            s.write(b, 0, &blocks(1, 1), true).unwrap();
+            tail = s.stats().log_bytes;
+            s.extend_ahead(1 << 20).unwrap();
+            assert_eq!(s.ahead(), 1 << 20);
+        }
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len, tail + (1 << 20), "the zeros are on disk");
+        let (mut s, rec) = Store::open(&path).unwrap();
+        assert_eq!(
+            (rec.cut, s.stats().log_bytes),
+            (0, tail),
+            "zeros ahead are not a cut"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "and not shrunk"
+        );
+        assert_eq!(s.ahead(), 1 << 20);
+        s.write(b, 1, &blocks(2, 1), true).unwrap();
+        assert_eq!(s.ahead(), (1 << 20) - 3 * BLOCK, "written over the zeros");
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, read1(&s, b, 0), read1(&s, b, 1)), (0, 1, 2));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+    }
+
+    #[test]
+    fn a_data_block_that_landed_without_its_head_is_not_a_record() {
+        // Two writes in flight; the later one's data lands, its head does
+        // not (the cut hit between them).  Replay stops at the zero head;
+        // the data beyond it is overwritten by what comes next.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (b, tail);
+        {
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            b = s.fork(root).unwrap();
+            s.write(b, 0, &blocks(1, 1), true).unwrap();
+            tail = s.stats().log_bytes;
+            s.extend_ahead(4 * BLOCK).unwrap();
+            let data = blocks(9, 1);
+            let r = s
+                .reserve_write(b, 3, data.len(), &write_digest(b, 3, &data))
+                .unwrap();
+            // Only the data block lands.
+            let mut copy = AlignedBuf::zeroed(data.len());
+            copy.copy_from_slice(&data);
+            s.file.write_all_at(&copy, r.offset + BLOCK).unwrap();
+            s.file.sync_all().unwrap();
+            s.tracker.done(r.lsn);
+            std::mem::forget(s); // a crash: no cut made, nothing else written
+        }
+        let (mut s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, s.stats().log_bytes), (0, tail));
+        assert_eq!(
+            read1(&s, b, 3),
+            0,
+            "the orphan data is no block of the Vessel"
+        );
+        s.write(b, 1, &blocks(2, 1), true).unwrap();
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, read1(&s, b, 1), read1(&s, b, 3)), (0, 2, 0));
+    }
+
     // ── Compaction ──────────────────────────────────────────────────
 
     /// What a caller can see of a store, for before/after checks (not the
@@ -2830,7 +3608,7 @@ mod tests {
         );
         assert_eq!(
             done.before,
-            before.log_bytes + 2 * (REC_HEAD + HASH as u64),
+            before.log_bytes + 2 * BLOCK,
             "the old log and the two flushes of the compaction"
         );
         assert_eq!(done.after, s.stats().log_bytes);
