@@ -221,7 +221,8 @@ fn big_file(o: &Opts) -> Result<Option<Duration>, String> {
     let f = std::fs::File::create(&path).map_err(|e| err("create", e))?;
     let chunk = vec![0x3cu8; 1 << 20];
     for i in 0..o.big_file_mib {
-        f.write_all_at(&chunk, i << 20).map_err(|e| err("write", e))?;
+        f.write_all_at(&chunk, i << 20)
+            .map_err(|e| err("write", e))?;
     }
     f.sync_all().map_err(|e| err("fsync", e))?;
     Ok(None)
@@ -1210,12 +1211,18 @@ mod tests {
         };
         let made = run(&o, None).unwrap();
         assert_eq!(made["first_write_ms"], json!(null));
-        assert_eq!(std::fs::metadata(dir.path().join("big")).unwrap().len(), 2 << 20);
+        assert_eq!(
+            std::fs::metadata(dir.path().join("big")).unwrap().len(),
+            2 << 20
+        );
         assert!(!dir.path().join("first").exists());
         let child = run(&o, None).unwrap();
         assert!(child["first_write_ms"].as_f64().unwrap() > 0.0);
         let first = std::fs::read_to_string(dir.path().join("first")).unwrap();
-        assert_eq!(first.lines().filter(|l| l.parse::<u64>().is_ok()).count(), 1);
+        assert_eq!(
+            first.lines().filter(|l| l.parse::<u64>().is_ok()).count(),
+            1
+        );
         let big = std::fs::read(dir.path().join("big")).unwrap();
         assert_eq!(big.len(), 2 << 20);
         assert_eq!(&big[1 << 20..(1 << 20) + 4096], &[0xa5u8; 4096][..]);
