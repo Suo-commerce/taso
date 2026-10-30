@@ -86,6 +86,7 @@ MNT=/mnt/e3
 DEVNAME=e3crash
 SIZE_MIB=${E3_SIZE_MIB:-2048}
 ROWS=${E3_ROWS:-8}
+STAGGER_MS=${E3_STAGGER_MS:-10}   # E3-c2: the second Vessel's Seal after the first's, in a staggered burst
 STEP_MS=${E3_STEP_MS:-10}   # a Seal takes ~40 ms on taso-test: 25 put three of four delays past it (111 MISSED of 220)
 KEEP_FAILS=${KEEP_FAILS:-3}
 DEVSH=$PWD/scripts/e3-device.sh
@@ -140,6 +141,16 @@ if not subset:
                 print(f"{' '.join(seq)}|takeover:{k}|drop")
     print("write seal|takeover:seal.shipped|drop")
     print("write effect|takeover:ledger.shipped|drop")
+# E3-c2 (design rev. 2, decided 2026-10-30): two Vessels on one Warden, each
+# `write seal` first, then a burst -- both `write`, then both `seal` without
+# waiting (all: together; stagger: the second STAGGER_MS after the first) --
+# cut at a timing point or a hold; in the subset from the start (c-e).
+for shape in ("all", "stagger"):
+    for d in (0, 5, 10, 20, 40):
+        print(f"write seal|burst:{shape}:timing+{d}|drop")
+    for name in ("seal.frozen", "seal.recorded", "seal.shipped"):
+        for mode in ("drop", "error"):
+            print(f"write seal|burst:{shape}:hold+{name}|{mode}")
 # E3-3c: one round per hold site and mode, the shortest sequence reaching it
 for name, s in (("seal.recorded", "write seal"), ("seal.frozen", "write seal"), ("seal.shipped", "write seal"),
                 ("ledger.shipped", "write effect"), ("fork.branched", "write seal fork"),
@@ -310,6 +321,10 @@ cfg = {
 }
 o = json.loads(over) or {}
 takeover, child = o.pop("takeover", None), o.pop("child", None)
+also = o.pop("also", None)   # E3-c2: a second Vessel (slot 3; slot 2 is the first's fork slot)
+if also:
+    cfg["vessels"].append({"namespace": "e3" * 16, "subject": also["subject"], "uid_slot": 3,
+                           **({"takeover": also["takeover"]} if also.get("takeover") else {})})
 cfg.update(o)
 if takeover:
     cfg["vessels"][0]["takeover"] = takeover
@@ -534,6 +549,176 @@ PY
     oracle check "$O" --after "$R/a.json" || true
 }
 
+# ── E3-c2: two Vessels, their Seals overlapping at the point ──────────
+# Design claude/Taso_design_e3_c2_2026-10-30.md rev. 2.  Each Vessel has
+# its own oracle record (r-a.json, r-b.json) and its own gather (a-a.json,
+# a-b.json), graded by the serial oracle's lines unchanged; the rows carry
+# the Vessel's write tag (a: 0, b: 2), and a Seal holding the other's rows
+# never equals a promise (C1).  An acknowledgement is a reply the harness
+# read before the swap began (c-a); which Vessels a hold held is read from
+# the replies (c-h): a Vessel with no reply at the cut is in flight.
+vessel_of() { # vessel_of PID DS... -> the index of the dataset whose device is the agent's /work
+    local p=$1 i=0 d info pdev work; shift
+    work=$(findmnt -N "$p" -no MAJ:MIN /work 2>/dev/null | tr -d '[:space:]' || true)
+    [[ -n "$work" ]] || return 1
+    for d in "$@"; do
+        info=$(blk info "$(blk find "$d")" 2>&1) || true
+        pdev=$(sed -n 's/.* dev=\(\/dev\/[^ ]*\).*/\1/p' <<<"$info")
+        if [[ -n "$pdev" && "$work" == "$(stat -c '%Hr:%Lr' "$pdev" 2>/dev/null)" ]]; then echo "$i"; return 0; fi
+        i=$((i + 1))
+    done
+    return 1
+}
+burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the merged line on stdout
+    local seq=$1 point=$2 mode=$3 rest shape what hname="" delay=0 base ms v op rep lsn i deadline a out rc
+    rest=${point#burst:}; shape=${rest%%:*}; what=${rest#*:}
+    case "$what" in
+        timing+*) delay=${what#timing+} ;;
+        hold+*) hname=${what#hold+} ;;
+        *) echo "HARNESS $tag: unknown burst point $what"; return ;;
+    esac
+    base="e3-$(date +%s%N | tail -c 9)"
+    local -a bsubj=("$base-a" "$base-b") bwtag=(0 2) BO=("$R/r-a.json" "$R/r-b.json") BP=() bturn=() bds=() backs=(0 0) \
+        brep=("" "") bres=("" "") bwhy=("no agent of the reborn Warden came up" "no agent of the reborn Warden came up") henv=() bout=() bmissed=() \
+        brc=(0 0) bheld=()
+    for v in 0 1; do
+        oracle new "${BO[v]}" --sequence "$seq write seal" --point "$point" --mode "$mode" --rows "$ROWS"
+    done
+    if [[ -n "$hname" ]]; then
+        rm -rf "$RUN/hold"; mkdir -p "$RUN/hold"
+        henv=("TASO_E3_HOLD=$hname" "TASO_E3_HOLD_DIR=$RUN/hold")
+    fi
+    # 1. the device, the stack, the two agents (which is which: by the device under /work)
+    "$DEVSH" make "$DEVNAME" "$WORK/dev.img" "$SIZE_MIB" >/dev/null || { echo "HARNESS $tag: make"; return; }
+    mkfs.ext4 -q -F "/dev/mapper/$DEVNAME" && mkdir -p "$D" && mount -o errors=remount-ro "/dev/mapper/$DEVNAME" "$D" \
+        || { echo "HARNESS $tag: mkfs or mount of the device"; return; }
+    mkdir -p "$D/store" "$D/state" "$D/spool" "$RUN/run"
+    config "${bsubj[0]}" "$RUN/w.json" "{\"also\": {\"subject\": \"${bsubj[1]}\"}}" || { echo "HARNESS $tag: config"; return; }
+    start_stack 1 "${henv[@]}" || { echo "HARNESS $tag: taso-blkd did not start"; return; }
+    deadline=$((SECONDS + 120))
+    while ((SECONDS < deadline)) && [[ -z "${bds[0]:-}" || -z "${bds[1]:-}" ]]; do
+        for v in 0 1; do bds[v]=$(grep -m1 -o "\] ${bsubj[v]}: dataset .*" "$R/warden-1.err" 2>/dev/null | sed 's/.*: dataset //' || true); done
+        sleep 0.1
+    done
+    [[ -n "${bds[0]:-}" && -n "${bds[1]:-}" ]] || { echo "HARNESS $tag: the Warden named no dataset for both Vessels (see $R/warden-1.err)"; return; }
+    for i in 1 2; do
+        wait_agent 120 || { echo "HARNESS $tag: agent $i of 2 did not come up (see $R/warden-1.err)"; return; }
+        v=$(vessel_of "$AGENT" "${bds[0]}" "${bds[1]}") || { echo "HARNESS $tag: agent $AGENT is on neither Vessel's device"; return; }
+        BP[v]=$AGENT; bturn[v]=$(( $(ready_turn "$AGENT") + 1 ))
+    done
+    [[ -n "${BP[0]:-}" && -n "${BP[1]:-}" ]] || { echo "HARNESS $tag: both agents are on one Vessel"; return; }
+    # 2. the prefix, one Vessel after the other, each op waited for
+    wr() { [[ ${bwtag[$1]} == 0 ]] && echo write || echo "write ${bwtag[$1]}"; }
+    for v in 0 1; do
+        for op in $seq; do
+            oracle requested "${BO[v]}" "$op" turn="${bturn[v]}"
+            if [[ "$op" == write ]]; then
+                step "${BP[v]}" "$(wr "$v")" || { echo "HARNESS $tag: ${bsubj[v]}'s write got no reply: $WHY"; return; }; rep=$REPLY
+                oracle acknowledged "${BO[v]}" write turn="$(jget "$rep" turn)" rows="$(jget "$rep" rows)"
+            else
+                step "${BP[v]}" seal || { echo "HARNESS $tag: ${bsubj[v]}'s seal got no reply: $WHY"; return; }; rep=$REPLY
+                lsn=$(jget "$rep" sealed)
+                oracle acknowledged "${BO[v]}" seal turn="$(jget "$rep" turn)" ${lsn:+seal=$lsn}
+                bturn[v]=$(( $(jget "$rep" turn) + 1 ))
+            fi
+        done
+    done
+    # 3. the burst: both writes, then both Seals without waiting
+    for v in 0 1; do
+        oracle requested "${BO[v]}" write turn="${bturn[v]}"
+        step "${BP[v]}" "$(wr "$v")" || { echo "HARNESS $tag: ${bsubj[v]}'s burst write got no reply: $WHY"; return; }; rep=$REPLY
+        oracle acknowledged "${BO[v]}" write turn="$(jget "$rep" turn)" rows="$(jget "$rep" rows)"
+    done
+    [[ -n "$hname" ]] && : >"$RUN/hold/$hname.arm"
+    for v in 0 1; do oracle requested "${BO[v]}" seal turn="${bturn[v]}"; done
+    send "${BP[0]}" seal || { echo "HARNESS $tag: the op file could not be written"; return; }
+    [[ "$shape" == stagger ]] && sleep "$(python3 -I -c "print($STAGGER_MS / 1000)")"
+    send "${BP[1]}" seal || { echo "HARNESS $tag: the op file could not be written"; return; }
+    # 4. the point
+    if [[ -n "$hname" ]]; then
+        held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached"; return; }
+    else
+        sleep "$(python3 -I -c "print($delay / 1000)")"
+    fi
+    # What was acknowledged is what was read before the swap began (c-a).
+    for v in 0 1; do
+        if [[ -f /proc/${BP[v]}/root/tmp/e3/reply.${NEXT[${BP[v]}]} ]]; then
+            reply "${BP[v]}" 5 || { echo "HARNESS $tag: ${bsubj[v]}'s reply vanished: $WHY"; return; }; rep=$REPLY
+            lsn=$(jget "$rep" sealed); brep[v]=1
+            oracle acknowledged "${BO[v]}" seal turn="$(jget "$rep" turn)" ${lsn:+seal=$lsn}
+        fi
+    done
+    if [[ -z "$hname" && -n "${brep[0]}" && -n "${brep[1]}" ]]; then bmissed=(--missed); fi
+    [[ -n "$hname" ]] && bheld=(--held "$hname")
+    local t0; t0=$(date +%s%N); "$DEVSH" "$mode" "$DEVNAME" >/dev/null; ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    for v in 0 1; do oracle cut "${BO[v]}" --swap-ms "$ms" "${bmissed[@]}" "${bheld[@]}"; done
+    echo "held (no reply at the cut): $(for v in 0 1; do [[ -n "${brep[v]}" ]] || printf '%s ' "${bsubj[v]}"; done)" >"$R/held.txt"
+    if [[ "$mode" == error ]]; then
+        [[ -n "$hname" ]] && : >"$RUN/hold/$hname.release"
+        for v in 0 1; do   # the in-flight Seal's own answer, after the error
+            if [[ -z "${brep[v]}" ]] && reply "${BP[v]}" 10 && [[ -n "$(jget "$REPLY" sealed)" ]]; then backs[v]=$((backs[v] + 1)); fi
+        done
+    fi
+    [[ "$hname" == seal.frozen ]] && thaw_vessels
+    if [[ "$mode" == error ]]; then
+        for v in 0 1; do
+            if step "${BP[v]}" seal 30 && [[ -n "$(jget "$REPLY" sealed)" ]]; then backs[v]=$((backs[v] + 1)); fi
+            if step "${BP[v]}" "$(wr "$v")" 10 && [[ -n "$(jget "$REPLY" rows)" ]]; then backs[v]=$((backs[v] + 1)); fi
+        done
+    fi
+    # 5. dead at the point; the image; the rebirth on a copy
+    kill -9 "$WARDEN_PID" 2>/dev/null || true; kill -9 "$BLKD_PID" 2>/dev/null || true
+    wait "$BLKD_PID" 2>/dev/null || true; WARDEN_PID=; BLKD_PID=
+    if ! "$DEVSH" image "$DEVNAME" "$RUN" "$R/image.raw" >"$R/image.txt" 2>&1; then
+        echo "HARNESS $tag: image ($(tail -1 "$R/image.txt"))"; return
+    fi
+    if ! { cp --sparse=always "$R/image.raw" "$WORK/rebirth.img" && LOOP2=$(losetup -f --show "$WORK/rebirth.img") && mount "$LOOP2" "$D"; } 2>"$R/rebirth.err"; then
+        echo "HARNESS $tag: the rebirth copy could not be mounted: $(tr '\n' ' ' <"$R/rebirth.err")"; return
+    fi
+    mkdir -p "$RUN/run"; KNOWN=" $(pgrep -x taso-sim | tr '\n' ' ') "
+    start_stack 2 || { echo "HARNESS $tag: taso-blkd did not start on the image"; return; }
+    deadline=$((SECONDS + 180))
+    while ((SECONDS < deadline)) && kill -0 "$WARDEN_PID" 2>/dev/null; do
+        if wait_agent 1; then
+            a=$AGENT
+            if v=$(vessel_of "$a" "${bds[0]}" "${bds[1]}"); then bres[v]=$(ready_turn "$a"); bwhy[v]=
+            else bwhy=("agent $a on neither Vessel's device" "agent $a on neither Vessel's device"); fi
+            step "$a" exit 30 >/dev/null || true
+        fi
+    done
+    if kill -0 "$WARDEN_PID" 2>/dev/null; then echo "HARNESS $tag: the reborn Warden did not finish in 180 s"; return; fi
+    WARDEN_PID=
+    if grep -q "^taso-wardend: starting:" "$R/warden-2.err"; then
+        echo "HARNESS $tag: the reborn Warden did not start: $(grep -m1 "^taso-wardend: starting:" "$R/warden-2.err" | cut -c22-)"; return
+    fi
+    # 6. each Vessel graded on its own; one line for the round
+    for v in 0 1; do
+        GATHER_OWN_TAG=${bwtag[v]} GATHER_ONLY=${bsubj[v]} gather "${bsubj[v]}" "${bds[v]}" "${bres[v]}" "${backs[v]}" "$mode" "${bwhy[v]}" "" \
+            >"$R/a-$v.json" || { echo "HARNESS $tag: gather of ${bsubj[v]}"; return; }
+        rc=0; out=$(oracle check "${BO[v]}" --after "$R/a-$v.json") || rc=$?
+        bout[v]=$out; brc[v]=$rc
+    done
+    burst_line "$tag" "${brc[0]}" "${brc[1]}" "${bout[0]}" "${bout[1]}"
+}
+burst_line() { # burst_line TAG RC_A RC_B LINES_A LINES_B: FAIL if either failed; MISSED only if both were; else PASS
+    local t=$1 v l notes=""
+    local -a rc=("$2" "$3") out=("$4" "$5") name=(a b)
+    if [[ ${rc[0]} == 1 || ${rc[1]} == 1 ]]; then
+        echo "FAIL    $t"
+        for v in 0 1; do
+            [[ ${rc[v]} == 1 ]] || continue
+            while IFS= read -r l; do [[ "$l" == "        "* ]] && echo "        ${name[v]}: ${l#        }"; done <<<"${out[v]}"
+        done
+    elif [[ ${rc[0]} == 2 && ${rc[1]} == 2 ]]; then
+        echo "MISSED  $t: both Seals had replied before the swap; not covered"
+    else
+        for v in 0 1; do
+            l=$(head -1 <<<"${out[v]}"); [[ "$l" == *"("*")" ]] && notes="$notes${name[v]}: ${l#*(}"; notes=${notes%)}; [[ "$l" == *"("*")" ]] && notes="$notes; "
+        done
+        echo "PASS    $t${notes:+ (${notes%; })}"
+    fi
+}
+
 # ── one round ─────────────────────────────────────────────────────────
 round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's files in $R
     local seq=$1 point=$2 mode=$3 subject O="$R/r.json"
@@ -556,6 +741,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
         k=${at%%+*}; [[ "$at" == *+* ]] && delay=${at#*+}
     fi
     local tag="[$seq] $point $mode"
+    if [[ "$kind" == burst ]]; then burst_round "$seq" "$point" "$mode"; return; fi
     oracle new "$O" --sequence "$seq" --point "$point" --mode "$mode" --rows "$ROWS"
     # 1. the device, the stack, the agent
     "$DEVSH" make "$DEVNAME" "$WORK/dev.img" "$SIZE_MIB" >/dev/null || { echo "HARNESS $tag: make"; return; }
@@ -761,15 +947,18 @@ gather() { # gather SUBJECT DATASET RESUME ACKS_ERR MODE RESUME_WHY LOG_INO_BEFO
         rm -rf "$tmp/db"; mkdir -p "$tmp/db"
         if mount -o ro "$dev" "$rd" 2>/dev/null; then cp "$rd"/state.db* "$tmp/db/" 2>/dev/null || true; umount "$rd"; fi
         blk detach "$b" >/dev/null; blk drop "$b" >/dev/null
-        seals="$seals$(python3 -I - "$tmp/db/state.db" "$lsn" "$ok" "${birth:-0}" <<'PY'
+        seals="$seals$(python3 -I - "$tmp/db/state.db" "$lsn" "$ok" "${birth:-0}" "${GATHER_OWN_TAG:-0}" <<'PY'
 import json, os, sqlite3, sys
-db, lsn, ok, birth = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "true", int(sys.argv[4])
+db, lsn, ok, birth, own = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "true", int(sys.argv[4]), int(sys.argv[5])
 rows = {}
 if os.path.exists(db):
     c = sqlite3.connect(db)
     try:
-        for k, n in c.execute("SELECT CASE WHEN n >= 1000000 THEN 'c' || turn ELSE CAST(turn AS TEXT) END, count(*) FROM events GROUP BY 1"):
-            rows[k] = n
+        # n = TAG * 1 000 000 + i: the Vessel's own tag as plain turns, a fork's child (1) as "cT",
+        # any other tag as "x<TAG>:T" -- another Vessel's rows (E3-c2, C1), never equal to a promise.
+        for tag, turn, n in c.execute("SELECT n / 1000000, turn, count(*) FROM events GROUP BY 1, 2"):
+            k = str(turn) if tag == own else f"c{turn}" if tag == 1 else f"x{tag}:{turn}"
+            rows[k] = rows.get(k, 0) + n
     except sqlite3.OperationalError:
         pass
 print(json.dumps({"lsn": lsn, "birth": lsn == birth, "export_ok": ok, "rows": rows}) + ",")
@@ -792,11 +981,17 @@ PY
     local ino_after=""; [[ -n "$7" ]] && ino_after=$(stat -c %i "$D/blk.log" 2>/dev/null || true)
     # shellcheck disable=SC2086
     python3 -I - "[${seals%,}]" "$forks" "$3" "$4" "$opened" "$not_run" "$6" "$7" "$ino_after" $report <<'PY'
-import json, sys
+import json, os, sys
 seals, forks, resume, acks = json.loads(sys.argv[1]), sys.argv[2].split(), sys.argv[3], int(sys.argv[4])
 opened, not_run, resume_why = sys.argv[5] == "true", sys.argv[6], sys.argv[7]
 ino = lambda v: int(v) if v else None
-report = "".join(open(f, errors="replace").read() for f in sys.argv[10:])
+only = os.environ.get("GATHER_ONLY")   # E3-c2: the Warden's lines about this Vessel only (taso-blkd's whole)
+def lines(f):
+    t = open(f, errors="replace").read()
+    if only and "/warden-" in f:
+        t = "".join(l for l in t.splitlines(True) if only in l)
+    return t
+report = "".join(lines(f) for f in sys.argv[10:])
 print(json.dumps({"seals": seals, "forks": forks, "report": report,
                   "resume_turn": int(resume) if resume else None, "resume_why": resume_why or None,
                   "acks_after_error": acks, "opened": opened, "not_run": not_run or None,
@@ -845,7 +1040,7 @@ case "${1:-}" in
     run)
         shift; sub=""; limit=0; only=""
         while (($#)); do case "$1" in --subset) sub=--subset ;; --only) only=$2; shift ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--only KIND] [--limit N]" ;; esac; shift; done
-        [[ -z "$only" || "$only" =~ ^(boundary|timing|hold|takeover)$ ]] || die "--only boundary|timing|hold|takeover"
+        [[ -z "$only" || "$only" =~ ^(boundary|timing|hold|takeover|burst)$ ]] || die "--only boundary|timing|hold|takeover|burst"
         pick() { manifest "$sub" | { if [[ -n "$only" ]]; then grep -F "|$only:" || true; else cat; fi; }; }
         total=$(pick | wc -l); n=0
         say "$total rounds$( ((limit > 0)) && echo ", the first $limit"); results in $OUT/results.txt"

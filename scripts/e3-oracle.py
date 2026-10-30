@@ -47,6 +47,12 @@ Line 3 checks that a retained Seal is reachable (it exports), not its bytes:
 a Seal's export differs between runs (a fresh mkfs per round, inode times),
 so a healthy run's hash is no baseline (found writing E3-3b, 2026-10-27).
 
+E3-c2 (design claude/Taso_design_e3_c2_2026-10-30.md rev. 2): two Vessels,
+each with its own record and its own A.json, graded by these lines alone.
+The gather counts the Vessel's own write tag as plain turns and another
+Vessel's as "x<TAG>:<turn>"; such a key in any listed Seal is C1 (one
+Vessel's rows in another's Seal), and never equals a promise.
+
 A takeover round (E3-4, one-pager rev. 6; spec D97) adds to A.json
   "takeover": {"owner": {...}, "shipped_lsn": L, "child": {...}|null,
                "thaw": {"acks": N, "replies": [...], "fenced": "…"|null},
@@ -180,6 +186,11 @@ def check(r, a):
                          "and the new Warden does not name the span it lost (its Gap record, D93 (i))")
         elif lost_unshipped:
             notes.append(f"acknowledged Seal(s) lsn {lost_unshipped} not shipped: lost with the old node, named (D97)")
+    # C1 (E3-c2): another Vessel's rows in any Seal of this one.
+    for lsn, s in sorted(listed.items()):
+        foreign = sorted(k for k in s.get("rows", {}) if k.startswith("x"))
+        if foreign:
+            fails.append(f"C1: Seal lsn {lsn} holds another Vessel's rows {foreign} (tag:turn)")
     # Seals listed and never acknowledged: the adoption, an in-flight Seal that landed, or nothing allowed
     extra = {l: s for l, s in listed.items() if l not in m["seals"]}
     unsealed = m["writes_after_seal"]
@@ -348,6 +359,8 @@ def selftest():
         ("2 fail: a Seal nobody asked for", rnd([("effect", {})]), {"seals": [S(9, {})], "report": B, "resume_turn": 0}, 1),
         ("2 fail: a child nobody asked for", ws, {"seals": [S(9, {"1": 8})], "forks": ["x"], "report": B, "resume_turn": 1}, 1),
         ("3 fail: retained Seal does not export", ws, {"seals": [S(9, {"1": 8}, ok=False)], "report": B, "resume_turn": 1}, 1),
+        ("C1 fail: an acknowledged Seal holds the other Vessel's rows too", ws, {"seals": [S(9, {"1": 8, "x2:1": 8})], "report": B, "resume_turn": 1}, 1),
+        ("C1 fail: an in-flight Seal landed with the other Vessel's rows", rnd([W(1)], ("seal", {"turn": 1})), {"seals": [S(9, {"1": 8, "x2:2": 8})], "report": B, "resume_turn": 1}, 1),
         ("4 pass: fork isolated", rnd(fk + [SL(14, 2)]), {"seals": [S(9, {"1": 8}), S(14, {"1": 8})], "forks": ["c"], "report": B, "resume_turn": 2}, 0),
         ("4 fail: child's turn in the parent", rnd(fk + [SL(14, 2)]), {"seals": [S(9, {"1": 8}), S(14, {"1": 8, "c2": 8})], "forks": ["c"], "report": B, "resume_turn": 2}, 1),
         ("4 pass: promotion adopted whole", pr, {"seals": [S(9, {"1": 8}), S(16, {"1": 8, "c2": 8})], "forks": ["c"], "report": B, "resume_turn": 2}, 0),
