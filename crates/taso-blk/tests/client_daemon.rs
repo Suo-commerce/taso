@@ -256,7 +256,7 @@ fn the_daemon_compacts_by_itself_and_keeps_what_is_live() {
         }
     }
     assert!(compacted, "no automatic compaction within 15 s");
-    assert_eq!(&std::fs::read(&log).unwrap()[..8], b"TASOBLK3");
+    assert_eq!(&std::fs::read(&log).unwrap()[..8], b"TASOBLK5");
     let out = dir.path().join("out.blks");
     c.export(sealed, None, &out).unwrap();
     assert_eq!(

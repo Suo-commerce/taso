@@ -151,7 +151,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 
 use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
 
@@ -362,6 +362,11 @@ pub struct Store {
     /// ([`Store::is_direct`]): every read and write through it is
     /// block-aligned.
     file: File,
+    /// The same log for the [`Writer`]s and the [`Syncer`]: a handle the
+    /// store shares with them and a compaction's switch
+    /// ([`Compaction::finish`]) points at the new log, so a Syncer made
+    /// before the switch syncs the log after it.
+    shared: Arc<LogFile>,
     direct: bool,
     path: PathBuf,
     map: Map,
@@ -400,8 +405,10 @@ impl Store {
         file.write_all_at(&header, 0)?;
         file.sync_all()?;
         sync_dir(path)?;
+        let shared = Arc::new(LogFile(RwLock::new(file.try_clone()?)));
         Ok(Self {
             file,
+            shared,
             direct,
             path: path.to_path_buf(),
             map: Map::new(),
@@ -547,8 +554,10 @@ impl Store {
             records: good_lsn,
             ..Stats::default()
         };
+        let shared = Arc::new(LogFile(RwLock::new(file.try_clone()?)));
         let store = Self {
             file,
+            shared,
             direct,
             path: path.to_path_buf(),
             map,
@@ -741,11 +750,11 @@ impl Store {
     }
 
     /// A handle for writing reserved records outside the lock: the log's
-    /// file (a second descriptor, direct like the store's) and the
-    /// tracker.  Made once per queue thread.
+    /// shared file and the tracker.  Made once per queue thread; it
+    /// follows the store through a compaction's switch.
     pub fn writer(&self) -> Writer {
         Writer {
-            file: self.file.try_clone().expect("dup of the log's descriptor"),
+            file: Arc::clone(&self.shared),
             tracker: Arc::clone(&self.tracker),
         }
     }
@@ -902,7 +911,7 @@ impl Store {
     /// It waits for the store's reserved writes before every sync.
     pub fn syncer(&self) -> io::Result<Syncer> {
         Ok(Syncer {
-            file: self.file.try_clone()?,
+            file: Arc::clone(&self.shared),
             tracker: Arc::clone(&self.tracker),
             state: std::sync::Mutex::new(SyncState::default()),
             done: std::sync::Condvar::new(),
@@ -1551,9 +1560,24 @@ pub struct Reservation {
     head: AlignedBuf,
 }
 
+/// The log's file as the [`Writer`]s and the [`Syncer`] see it: swapped
+/// by a compaction's switch while they are not writing (the store is
+/// held and the floor waited for).
+pub struct LogFile(RwLock<File>);
+
+impl LogFile {
+    fn get(&self) -> std::sync::RwLockReadGuard<'_, File> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, file: File) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = file;
+    }
+}
+
 /// Writes reserved records outside the lock.  [`Store::writer`].
 pub struct Writer {
-    file: File,
+    file: Arc<LogFile>,
     tracker: Arc<Tracker>,
 }
 
@@ -1564,10 +1588,10 @@ impl Writer {
     /// the store.
     pub fn commit(&self, r: &Reservation, data: &[u8]) -> Result<(), StoreError> {
         debug_assert!((data.as_ptr() as usize).is_multiple_of(BLOCK as usize));
-        let res = self
-            .file
+        let file = self.file.get();
+        let res = file
             .write_all_at(&r.head, r.offset)
-            .and_then(|()| self.file.write_all_at(data, r.offset + BLOCK));
+            .and_then(|()| file.write_all_at(data, r.offset + BLOCK));
         match res {
             Ok(()) => {
                 self.tracker.done(r.lsn);
@@ -2188,7 +2212,7 @@ impl Read for ReadAt<'_> {
 /// one disk operation at a time (taso-p5, P=64, 2026-10-26: `seal.log`
 /// 690 ms p50 for a 1 ms fsync).
 pub struct Syncer {
-    file: File,
+    file: Arc<LogFile>,
     tracker: Arc<Tracker>,
     state: std::sync::Mutex<SyncState>,
     done: std::sync::Condvar,
@@ -2238,7 +2262,7 @@ impl Syncer {
             // Every reserved write up to here must be on disk before the
             // sync means anything (the tracker).
             let r = match self.tracker.wait_floor(upto) {
-                Ok(()) => self.file.sync_data(),
+                Ok(()) => self.file.get().sync_data(),
                 Err(_) => Err(io::Error::other(
                     self.tracker
                         .failure()
@@ -2262,6 +2286,13 @@ impl Syncer {
             }
             self.done.notify_all();
         }
+    }
+
+    /// The inode of the file the next sync goes to (a check that it is
+    /// the log: after a compaction's switch it must be the new one).
+    pub fn log_ino(&self) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(self.file.get().metadata()?.ino())
     }
 
     /// How the sync failed, once one has.
@@ -3580,6 +3611,45 @@ mod tests {
         let mut c = s.compaction().unwrap();
         c.copy().unwrap();
         c.finish(s).unwrap()
+    }
+
+    /// The daemon makes its Syncer and its Writers once; a compaction's
+    /// switch must not leave them on the old, renamed-away log (found
+    /// reading `finish` for L2, 2026-10-30: before, the group commit's
+    /// `fdatasync` after a compaction went to the old file).
+    #[test]
+    fn a_syncer_and_a_writer_made_before_a_compaction_follow_it_to_the_new_log() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (mut s, layers, _) = busy_store(&path);
+        let syncer = s.syncer().unwrap();
+        let writer = s.writer();
+        let old_ino = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(syncer.log_ino().unwrap(), old_ino);
+        compact(&mut s);
+        let new_ino = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(new_ino, old_ino, "the compaction made a new file");
+        assert_eq!(
+            syncer.log_ino().unwrap(),
+            new_ino,
+            "the Syncer syncs the new log"
+        );
+        // And a reserved write through the old Writer lands in the new log
+        // and is waited for by the old Syncer.
+        let b = layers[3];
+        let data = blocks(66, 1);
+        let r = s
+            .reserve_write(b, 7, data.len(), &write_digest(b, 7, &data))
+            .unwrap();
+        let lsn = s.flush_pending().unwrap();
+        let mut copy = AlignedBuf::zeroed(data.len());
+        copy.copy_from_slice(&data);
+        writer.commit(&r, &copy).unwrap();
+        syncer.durable(lsn).unwrap();
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, read1(&s, b, 7)), (0, 66));
     }
 
     #[test]

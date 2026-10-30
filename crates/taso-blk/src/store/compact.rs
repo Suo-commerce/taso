@@ -8,7 +8,7 @@
 //! one's place.
 //!
 //! ```text
-//!   new log:  "TASOBLK3" | Data* | Base+ | Flush | (old log's later records, re-chained)
+//!   new log:  "TASOBLK5" | Data* | Base+ | Flush | (old log's later records, re-chained)
 //!             Data  = live blocks, packed, no map effect
 //!             Base  = pieces of: lsn | map | tags and names (checkpoint encoding),
 //!                     every log location pointing into the Data records
@@ -51,16 +51,17 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{
-    ckpt_path, encode_record, read_record, remove_if_there, sync_dir, write_checkpoint, FlushPoint,
-    Meta, ReadAt, Stats, Store, StoreError, COMPACT_MAGIC, HASH, HEADER_LEN, K_BASE, K_DATA,
-    K_FLUSH, MAX_BODY, REC_HEAD,
+    ckpt_path, encode_record, read_record, record_len, remove_if_there, sync_dir, write_checkpoint,
+    FlushPoint, Meta, ReadAt, Stats, Store, StoreError, COMPACT_MAGIC, HASH, HEADER_LEN, K_BASE,
+    K_DATA, K_FLUSH, MAX_BODY, MAX_DATA,
 };
 use crate::map::{Map, BLOCK};
 
 /// Blocks per data record: as many as one record may hold.
-const DATA_BLOCKS: u64 = (MAX_BODY as u64 - 64) / BLOCK;
+const DATA_BLOCKS: u64 = MAX_DATA as u64 / BLOCK;
 /// Bytes of base state per record.
 const BASE_PIECE: usize = 4 << 20;
 /// Records are gathered into writes of about this size.
@@ -103,7 +104,9 @@ pub struct OldLog(#[allow(dead_code)] Vec<File>);
 pub struct Compaction {
     log: PathBuf,
     temp: PathBuf,
-    /// The old log, read only.
+    /// The old log, read only: a plain descriptor of its own (the store's
+    /// is direct, and these reads are neither aligned nor sized for it;
+    /// what the chain verifies is whole, whichever cache it came from).
     old: File,
     new: File,
     /// The state at the durable point the base stands for.
@@ -164,7 +167,7 @@ impl Store {
         Ok(Compaction {
             log: self.path.clone(),
             temp,
-            old: self.file.try_clone()?,
+            old: File::open(&self.path)?,
             new,
             map: Some(map),
             meta: Some(meta),
@@ -200,18 +203,15 @@ impl Compaction {
         locs.sort_unstable();
         // Block i of `locs` goes to data record i / DATA_BLOCKS, slot
         // i % DATA_BLOCKS; every data record but the last is full, so its
-        // place follows from i alone.
-        let full = REC_HEAD + DATA_BLOCKS * BLOCK + HASH as u64;
+        // place follows from i alone: after the record's head block.
+        let full = BLOCK + DATA_BLOCKS * BLOCK;
         let new_of = |i: usize| {
-            HEADER_LEN
-                + (i as u64 / DATA_BLOCKS) * full
-                + REC_HEAD
-                + (i as u64 % DATA_BLOCKS) * BLOCK
+            HEADER_LEN + (i as u64 / DATA_BLOCKS) * full + BLOCK + (i as u64 % DATA_BLOCKS) * BLOCK
         };
         let mut data = vec![0u8; (DATA_BLOCKS * BLOCK) as usize];
         for (k, chunk) in locs.chunks(DATA_BLOCKS as usize).enumerate() {
             debug_assert_eq!(
-                self.tail + self.buf.len() as u64 + REC_HEAD,
+                self.tail + self.buf.len() as u64 + BLOCK,
                 new_of(k * DATA_BLOCKS as usize)
             );
             // Read runs that are contiguous in the old log with one call.
@@ -286,7 +286,7 @@ impl Compaction {
                     let Some((kind, body, hash)) = read_record(&mut r, &self.read_prev)? else {
                         break;
                     };
-                    self.read_pos += REC_HEAD + body.len() as u64 + HASH as u64;
+                    self.read_pos += record_len(kind, body.len());
                     self.read_prev = hash;
                     bytes += body.len();
                     batch.push((kind, body));
@@ -362,6 +362,12 @@ impl Compaction {
         self.done = true;
         let before = store.tail;
         fresh.path = self.log.clone();
+        // The Writers and the Syncer made from the old store follow it to
+        // the new log: the shared file points at the new one, the tracker
+        // is the same (nothing is outstanding: the flush above waited).
+        store.shared.set(fresh.file.try_clone()?);
+        fresh.shared = Arc::clone(&store.shared);
+        fresh.tracker = Arc::clone(&store.tracker);
         fresh.stats = Stats {
             syncs: store.stats.syncs,
             write_map_us: store.stats.write_map_us,
