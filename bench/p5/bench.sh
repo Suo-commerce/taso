@@ -66,6 +66,12 @@
 # workload above.  Its commits and turn pauses are reported apart; the
 # seal and publish spans pool every Vessel (they carry no Vessel).
 #
+# BLKD_ARGS (default none): extra flags for taso-blkd, e.g. "--ahead-mib 0"
+# (the layout revision's l-j, the log written ahead of its tail, measured
+# on and off: Taso_design_layout_2026-10-30).  The table's conditions line
+# carries them and taso-blkd's own word on how it serves the log (direct or
+# buffered, written ahead or not).
+#
 # Environment (gate-p1's): TXNS (4) ROWS (8) ROW_BYTES (512) SYNC (normal)
 # LANDLOCK (1) BATCHED (1) TASO_ZFS_DATASET; OUT (results directory,
 # default /root/taso-p5-bench-<storage>-<time>, kept); KEEP=1 keeps the
@@ -86,7 +92,7 @@ RUNS=${4:-1}
 [[ "$STORAGE" == zfs || "$STORAGE" == blk ]] || { echo "usage: $0 zfs|blk [P] [TURNS] [RUNS]" >&2; exit 64; }
 TXNS=${TXNS:-4}; ROWS=${ROWS:-8}; ROW_BYTES=${ROW_BYTES:-512}; SYNC=${SYNC:-normal}
 LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
-BIG_MIB=${BIG_MIB:-0}; NOISY=${NOISY:-0}
+BIG_MIB=${BIG_MIB:-0}; NOISY=${NOISY:-0}; BLKD_ARGS=${BLKD_ARGS:-}
 NOISY_TXNS=${NOISY_TXNS:-64}; NOISY_ROWS=${NOISY_ROWS:-256}; NOISY_ROW_BYTES=${NOISY_ROW_BYTES:-4096}
 [[ "$FORKS" == 0 || "$P" == 1 ]] || { echo "FORKS needs P=1 (one parent, N children)" >&2; exit 64; }
 [[ "$NOISY" == 0 || "$P" -ge 2 ]] || { echo "NOISY needs P >= 2 (one neighbour, P-1 others)" >&2; exit 64; }
@@ -185,10 +191,13 @@ if [[ "$STORAGE" == zfs ]]; then
     zfs create "$ZFS_BASE"
     STORAGE_JSON='"zfs"'
 else
-    "$BIN/taso-blkd" "$DIR/blk.log" "$BLK_SOCK" 2>>"$DIR/blkd.err" &
+    # shellcheck disable=SC2086  # BLKD_ARGS is flags, split on purpose
+    "$BIN/taso-blkd" "$DIR/blk.log" "$BLK_SOCK" $BLKD_ARGS 2>>"$DIR/blkd.err" &
     BLKD_PID=$!
     for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
     [[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $DIR/blkd.err"
+    # How taso-blkd serves the log, in its own words (the serving line).
+    HOST_NOTE="$HOST_NOTE; taso-blkd ${BLKD_ARGS:-(default flags)}: $(sed -n 's/.*(open-file limit [0-9]*; \(.*\))$/\1/p' "$DIR/blkd.err" | tail -1)"
     mkdir -p "$DIR/spool"
     STORAGE_JSON=$(printf '{"blk": {"socket": "%s", "mounts": "%s", "spool": "%s"}}' "$BLK_SOCK" "$MNT" "$DIR/spool")
 fi

@@ -290,6 +290,20 @@ if [ "$ROLE" = vessel-blk ]; then
         ssh-keygen -q -t ed25519 -N '' -C "warden-$NAME@$(hostname)" -f /root/.ssh/taso-coord
     fi
 
+    # A log in a format before the layout revision (P5, 2026-10-30) is
+    # refused by the new taso-blkd, which systemd would then restart for
+    # ever.  Said here instead, with what to do; never removed by this
+    # script (it is the node's data, and the operator's call).
+    if [ -f /var/lib/taso/blk.log ]; then
+        magic=$(head -c 8 /var/lib/taso/blk.log)
+        case "$magic" in
+            TASOBLK4|TASOBLK5) ;;
+            TASOBLK1|TASOBLK2|TASOBLK3)
+                die "/var/lib/taso/blk.log is a block log in the old format $magic, which this taso-blkd refuses (a log is made again, never migrated).  Its Vessels are lost with it.  To make it again: systemctl stop taso-blkd; rm /var/lib/taso/blk.log /var/lib/taso/blk.log.ckpt; then run this again" ;;
+            *) die "/var/lib/taso/blk.log is not a block log (starts ${magic@Q})" ;;
+        esac
+    fi
+
     # The block log daemon.  The gate script (gate-p2-blk.sh) uses this one
     # in the two-node layout and starts its own in the one-machine layout.
     unit taso-blkd "/usr/local/bin/taso-blkd /var/lib/taso/blk.log /run/taso/blk.sock $BLKD_ARGS"
