@@ -112,7 +112,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
 
@@ -311,6 +311,11 @@ pub struct Stats {
 /// One block log file and the map it holds.
 pub struct Store {
     file: File,
+    /// The log as the [`Syncer`] sees it: a handle the store shares with
+    /// it, which a compaction's switch points at the new log
+    /// ([`Compaction::finish`]), so a Syncer made before the switch syncs
+    /// the log after it.
+    shared: Arc<LogFile>,
     path: PathBuf,
     map: Map,
     meta: Meta,
@@ -348,6 +353,7 @@ impl Store {
         file.sync_all()?;
         sync_dir(path)?;
         Ok(Self {
+            shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
             file,
             path: path.to_path_buf(),
             map: Map::new(),
@@ -470,6 +476,7 @@ impl Store {
             ..Stats::default()
         };
         let store = Self {
+            shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
             file,
             path: path.to_path_buf(),
             map,
@@ -684,7 +691,7 @@ impl Store {
     /// A [`Syncer`] over this log's file, for syncing outside the lock.
     pub fn syncer(&self) -> io::Result<Syncer> {
         Ok(Syncer {
-            file: self.file.try_clone()?,
+            file: Arc::clone(&self.shared),
             state: std::sync::Mutex::new(SyncState::default()),
             done: std::sync::Condvar::new(),
         })
@@ -1626,7 +1633,7 @@ impl Read for ReadAt<'_> {
 /// one disk operation at a time (taso-p5, P=64, 2026-10-26: `seal.log`
 /// 690 ms p50 for a 1 ms fsync).
 pub struct Syncer {
-    file: File,
+    file: Arc<LogFile>,
     state: std::sync::Mutex<SyncState>,
     done: std::sync::Condvar,
 }
@@ -1647,6 +1654,20 @@ struct SyncState {
     error: Option<String>,
     /// Syncs made.
     syncs: u64,
+}
+
+/// The log's file as the [`Syncer`] sees it: swapped by a compaction's
+/// switch (the store is held then, and flushed).
+pub struct LogFile(RwLock<File>);
+
+impl LogFile {
+    fn get(&self) -> std::sync::RwLockReadGuard<'_, File> {
+        self.0.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, file: File) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = file;
+    }
 }
 
 impl Syncer {
@@ -1672,7 +1693,7 @@ impl Syncer {
             let upto = st.requested;
             st.syncing = true;
             drop(st);
-            let r = self.file.sync_data();
+            let r = self.file.get().sync_data();
             st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.syncing = false;
             match r {
@@ -1690,6 +1711,13 @@ impl Syncer {
             }
             self.done.notify_all();
         }
+    }
+
+    /// The inode of the file the next sync goes to (a check that it is
+    /// the log: after a compaction's switch it must be the new one).
+    pub fn log_ino(&self) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(self.file.get().metadata()?.ino())
     }
 
     /// How the sync failed, once one has.
@@ -2802,6 +2830,39 @@ mod tests {
         let mut c = s.compaction().unwrap();
         c.copy().unwrap();
         c.finish(s).unwrap()
+    }
+
+    /// taso-blkd makes its Syncer once, at start.  A compaction's switch
+    /// replaces the store with the new log; before this the Syncer kept the
+    /// old, renamed-away file, so every group commit after a compaction
+    /// synced a file no one would read again and nothing acknowledged after
+    /// it was made durable by its sync (found on the layout branch, P5 L2,
+    /// 2026-10-30; on main since the Syncer, lever 1).
+    #[test]
+    fn a_syncer_made_before_a_compaction_syncs_the_new_log() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (mut s, layers, _) = busy_store(&path);
+        let syncer = s.syncer().unwrap();
+        let old_ino = std::fs::metadata(&path).unwrap().ino();
+        assert_eq!(syncer.log_ino().unwrap(), old_ino);
+        compact(&mut s);
+        let new_ino = std::fs::metadata(&path).unwrap().ino();
+        assert_ne!(new_ino, old_ino, "the compaction made a new file");
+        assert_eq!(
+            syncer.log_ino().unwrap(),
+            new_ino,
+            "the Syncer syncs the new log"
+        );
+        // And a group ended after the switch is made durable by it.
+        let b = layers[3];
+        s.write(b, 7, &blocks(66, 1), false).unwrap();
+        let lsn = s.flush_pending().unwrap();
+        syncer.durable(lsn).unwrap();
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, read1(&s, b, 7)), (0, 66));
     }
 
     #[test]

@@ -362,6 +362,11 @@ impl Compaction {
         self.done = true;
         let before = store.tail;
         fresh.path = self.log.clone();
+        // The Syncer made from the old store follows it to the new log:
+        // the shared handle points at the new file (the store is flushed,
+        // nothing is waiting on the old one).
+        store.shared.set(fresh.file.try_clone()?);
+        fresh.shared = std::sync::Arc::clone(&store.shared);
         fresh.stats = Stats {
             syncs: store.stats.syncs,
             write_map_us: store.stats.write_map_us,
