@@ -729,6 +729,11 @@ tk_drain() { # tk_drain TAG SOCKET WARDEN_PID: every agent of that Warden told `
         done
         if wait_agent 1; then
             a=$AGENT
+            # The agent may come up before its Warden names the dataset: read the names again
+            # now, or the agent matches neither (taso-test 2026-10-30: b's resume never taken).
+            for v in 0 1; do
+                [[ -n "${TD_DS[v]}" ]] || TD_DS[v]=$(grep -m1 -o "\] ${bsubj[v]}: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
+            done
             if v=$(vessel_of "$a" "${TD_DS[0]:-none}" "${TD_DS[1]:-none}"); then TD_RES[v]=$(ready_turn "$a"); TD_WHY[v]=
             else echo "Warden $1's agent $a: on neither Vessel's device" >>"$R/harness.err"; fi
             step "$a" exit 30 >/dev/null || true
