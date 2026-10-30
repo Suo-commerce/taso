@@ -334,7 +334,8 @@ impl Compaction {
         drop((map, meta));
 
         // Open the new log as the next start would, and check it agrees.
-        let (mut fresh, rec) = Store::open(&self.temp)?;
+        // The same I/O as the store it replaces.
+        let (mut fresh, rec) = Store::open_with(&self.temp, store.io())?;
         let agrees = rec.checkpoint == Some(base_at.lsn)
             && rec.cut == 0
             && fresh.lsn == store.lsn

@@ -368,6 +368,8 @@ pub struct Store {
     /// before the switch syncs the log after it.
     shared: Arc<LogFile>,
     direct: bool,
+    /// What was asked for (`direct` is what the file system allowed).
+    io: Io,
     path: PathBuf,
     map: Map,
     meta: Meta,
@@ -390,7 +392,12 @@ impl Store {
     /// Create a new, empty log at `path` (which must not exist) and make
     /// its existence durable.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
-        let (file, direct) = open_direct(path, true)?;
+        Self::create_with(path, Io::Direct)
+    }
+
+    /// [`Store::create`], with the log's writes `io` ([`Io`]).
+    pub fn create_with(path: &Path, io: Io) -> Result<Self, StoreError> {
+        let (file, direct) = open_direct(path, true, io == Io::Direct)?;
         // A checkpoint of an earlier log under this name is not ours, nor
         // is an unfinished compaction of one.
         for stale in [
@@ -410,6 +417,7 @@ impl Store {
             file,
             shared,
             direct,
+            io,
             path: path.to_path_buf(),
             map: Map::new(),
             meta: Meta::default(),
@@ -434,6 +442,11 @@ impl Store {
     /// never reach the map.  The replay reads through a plain descriptor
     /// (buffered, one pass); the store then serves through a direct one.
     pub fn open(path: &Path) -> Result<(Self, Recovered), StoreError> {
+        Self::open_with(path, Io::Direct)
+    }
+
+    /// [`Store::open`], with the log's writes `io` ([`Io`]).
+    pub fn open_with(path: &Path, io: Io) -> Result<(Self, Recovered), StoreError> {
         let plain = OpenOptions::new().read(true).open(path)?;
         let len = plain.metadata()?.len();
         if len < HEADER_LEN {
@@ -534,7 +547,7 @@ impl Store {
         // shrunk.
         let cut = scan_cut(file, end, len)?;
         drop(plain);
-        let (file, direct) = open_direct(path, false)?;
+        let (file, direct) = open_direct(path, false, io == Io::Direct)?;
         if end < len {
             let zeros = AlignedBuf::zeroed(1 << 20);
             // Whole blocks: a torn last block is zeroed to its end.
@@ -559,6 +572,7 @@ impl Store {
             file,
             shared,
             direct,
+            io,
             path: path.to_path_buf(),
             map,
             meta,
@@ -764,6 +778,14 @@ impl Store {
     /// writes go through the page cache, and the sync writes them back).
     pub fn is_direct(&self) -> bool {
         self.direct
+    }
+
+    /// The I/O the store was opened with (what was asked; [`is_direct`]
+    /// is what the file system allowed).
+    ///
+    /// [`is_direct`]: Store::is_direct
+    pub fn io(&self) -> Io {
+        self.io
     }
 
     /// Write `bytes` of zeros past the end of the file (from its current
@@ -1495,13 +1517,38 @@ fn scan_cut(file: &File, tail: u64, len: u64) -> io::Result<u64> {
     Ok(at.min(len) - tail)
 }
 
-/// Open the log `O_DIRECT`, or plain where the file system refuses it
-/// (`EINVAL`: tmpfs, some overlays); says which.  `create` makes it.
-fn open_direct(path: &Path, create: bool) -> io::Result<(File, bool)> {
+/// How the store writes and reads its log: straight to the drive, or
+/// through the host's page cache.  The layout is the same either way.
+///
+/// Measured on taso-test (P5, 2026-10-30), the two are a trade, not a
+/// speed-up: `Direct` makes each write wait for the drive, so a Vessel
+/// pays for its own bytes when it writes them and a Seal's sync is a
+/// barrier only (a quiet Vessel's p95 beside a noisy one 304 → 47 ms),
+/// but every small write and every read pays the drive's latency too
+/// (a fork 45 → 137 ms on the VM).  `Buffered` lets the page cache
+/// absorb the writes and the next sync write them back, whoever's Seal
+/// that is.  Which one a node runs is the operator's choice
+/// (`taso-blkd --io`); the metal prices it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Io {
+    /// `O_DIRECT` (falls back to buffered where the file system refuses
+    /// it: [`Store::is_direct`] says which).
+    Direct,
+    /// Through the page cache, as before the layout revision.
+    Buffered,
+}
+
+/// Open the log `O_DIRECT` if `direct` is asked and the file system
+/// allows it (`EINVAL`: tmpfs, some overlays refuse), else plain; says
+/// which.  `create` makes it.
+fn open_direct(path: &Path, create: bool, direct: bool) -> io::Result<(File, bool)> {
     let mut o = OpenOptions::new();
     o.read(true).write(true);
     if create {
         o.create_new(true);
+    }
+    if !direct {
+        return Ok((o.open(path)?, false));
     }
     match o.custom_flags(libc::O_DIRECT).open(path) {
         Ok(f) => Ok((f, true)),
@@ -3659,6 +3706,51 @@ mod tests {
         drop(s);
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!((rec.cut, read1(&s, b, 7)), (0, 66));
+    }
+
+    /// The same log, written through the page cache: the format, the
+    /// split write, the cut and a compaction behave as direct, and the
+    /// mode survives the compaction's switch.
+    #[test]
+    fn a_buffered_store_is_the_same_store_and_keeps_its_mode_through_a_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create_with(&path, Io::Buffered).unwrap();
+        assert_eq!((s.io(), s.is_direct()), (Io::Buffered, false));
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(1, 2), false).unwrap();
+        let data = blocks(2, 1);
+        let r = s
+            .reserve_write(b, 5, data.len(), &write_digest(b, 5, &data))
+            .unwrap();
+        let mut copy = AlignedBuf::zeroed(data.len());
+        copy.copy_from_slice(&data);
+        s.writer().commit(&r, &copy).unwrap();
+        s.flush().unwrap();
+        for v in 0..20u8 {
+            s.write(b, 0, &blocks(v + 3, 1), false).unwrap();
+        }
+        s.write(b, 9, &blocks(7, 1), false).unwrap(); // after the last flush: cut
+        compact(&mut s);
+        assert_eq!(s.io(), Io::Buffered, "the compaction kept the mode");
+        assert!(!s.is_direct());
+        drop(s);
+        let (s, rec) = Store::open_with(&path, Io::Buffered).unwrap();
+        assert_eq!(rec.cut, 0, "the compaction flushed what came before it");
+        assert_eq!(
+            (
+                read1(&s, b, 0),
+                read1(&s, b, 1),
+                read1(&s, b, 5),
+                read1(&s, b, 9)
+            ),
+            (22, 1, 2, 7)
+        );
+        // And the same log opens direct: the layout does not depend on it.
+        drop(s);
+        let (s, _) = Store::open(&path).unwrap();
+        assert_eq!(read1(&s, b, 5), 2);
     }
 
     #[test]

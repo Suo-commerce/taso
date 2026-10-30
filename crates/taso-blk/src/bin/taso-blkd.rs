@@ -141,7 +141,7 @@ use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use taso_blk::map::{Kind, LayerId, BLOCK};
-use taso_blk::store::{write_digest, AlignedBuf, Compacted, Store, StoreError, Syncer, Writer};
+use taso_blk::store::{write_digest, AlignedBuf, Compacted, Io, Store, StoreError, Syncer, Writer};
 
 /// The ublk target name of this daemon's devices; it is how a later
 /// daemon recognises leftovers as its own.
@@ -335,7 +335,7 @@ struct Daemon {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N] [--ahead-mib N]";
+    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N] [--ahead-mib N] [--io buffered|direct]";
     if args.len() < 3 {
         log!("{usage}");
         std::process::exit(64);
@@ -354,8 +354,23 @@ fn main() {
         compact_min: 1 << 30,
         ahead: 32 << 20,
     };
+    // How the log is written: through the page cache (the default, as
+    // before the layout revision) or straight to the drive.  A trade the
+    // operator chooses (store::Io); the metal prices it.
+    let mut io = Io::Buffered;
     let mut rest = args[3..].iter();
     while let Some(flag) = rest.next() {
+        if flag == "--io" {
+            io = match rest.next().map(String::as_str) {
+                Some("buffered") => Io::Buffered,
+                Some("direct") => Io::Direct,
+                _ => {
+                    log!("bad argument --io: buffered or direct\n{usage}");
+                    std::process::exit(64);
+                }
+            };
+            continue;
+        }
         let value = rest.next().and_then(|v| v.parse::<u64>().ok());
         match (flag.as_str(), value) {
             ("--size-gib", Some(v)) if v > 0 => g.size = v << 30,
@@ -377,7 +392,7 @@ fn main() {
     }
 
     let store = if log.exists() {
-        match Store::open(&log) {
+        match Store::open_with(&log, io) {
             Ok((s, rec)) => {
                 log!(
                     "taso-blkd: recovered {}: {} records, {} groups, {} bytes cut ({})",
@@ -395,7 +410,7 @@ fn main() {
             Err(e) => fail(&format!("cannot open {}: {e}", log.display())),
         }
     } else {
-        Store::create(&log)
+        Store::create_with(&log, io)
             .unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", log.display())))
     };
 
@@ -412,12 +427,12 @@ fn main() {
         log.display(),
         socket.display(),
         raise_open_files(),
-        if store.is_direct() {
-            "direct"
-        } else {
-            "buffered: the file system refused O_DIRECT"
+        match (io, store.is_direct()) {
+            (_, true) => "direct",
+            (Io::Direct, false) => "buffered: the file system refused O_DIRECT",
+            (Io::Buffered, false) => "buffered",
         },
-        g.ahead >> 20
+        if store.is_direct() { g.ahead >> 20 } else { 0 }
     );
 
     let sync = Arc::new(
@@ -446,7 +461,10 @@ fn main() {
             .spawn(move || upkeep(&d))
             .unwrap_or_else(|e| fail(&format!("cannot start the upkeep thread: {e}")));
     }
-    if g.ahead > 0 {
+    // Written ahead only matters to direct writes (an overwrite of written
+    // extents is what ext4 lets run side by side); buffered, no extender.
+    let direct = lock_store(&daemon.store).is_direct();
+    if g.ahead > 0 && direct {
         let d = daemon.clone();
         std::thread::Builder::new()
             .name("extender".into())
