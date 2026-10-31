@@ -47,7 +47,10 @@
 # under $RUN/run; the listener writes ACKED in the laptop's current
 # directory.  Refuses to start if a taso-blkd, taso-wardend or taso-sim
 # already runs.  Env: B3_VESSELS (8), B3_WRITES (3), B3_ROWS (64),
-# B3_ROW_BYTES (1024), B3_PORT (7706).  Needs python3 (stdlib only) on
+# B3_ROW_BYTES (1024), B3_PORT (7706); B3_FIRST=DIR for a repeated verify
+# of the same round: the cut's recovery and the settle lines (line 4) are
+# read from that earlier verify's results, the rebirth that saw the cut.
+# Needs python3 (stdlib only) on
 # both sides; nsenter (util-linux) and runc on the host.
 
 set -Eeuo pipefail
@@ -150,7 +153,9 @@ start_stack() { # start_stack TAG: taso-blkd and the Warden on $WORK; logs $WORK
     "$BIN/taso-wardend" "$CFG" >"$WORK/warden-$1.out" 2>"$WORK/warden-$1.err" & WARDEN_PID=$!
 }
 stop_stack() { # the Warden, its containers, the mounts, taso-blkd; guarded
-    set +e
+    # Failures here are expected (a process already gone, a mount already
+    # off): no ERR trap inside, so no ABORT lines that are not aborts.
+    trap - ERR; set +e
     [[ -n "$WARDEN_PID" ]] && { kill "$WARDEN_PID" 2>/dev/null; for _ in $(seq 100); do kill -0 "$WARDEN_PID" 2>/dev/null || break; sleep 0.1; done; kill -9 "$WARDEN_PID" 2>/dev/null; }
     WARDEN_PID=
     for c in $(runc --root "$RUN/run/runc" list -q 2>/dev/null); do runc --root "$RUN/run/runc" delete --force "$c" 2>/dev/null; done
@@ -159,7 +164,7 @@ stop_stack() { # the Warden, its containers, the mounts, taso-blkd; guarded
     done
     [[ -n "$BLKD_PID" ]] && { blk_raw quit >/dev/null 2>&1; for _ in $(seq 100); do kill -0 "$BLKD_PID" 2>/dev/null || break; sleep 0.1; done; kill -9 "$BLKD_PID" 2>/dev/null; }
     BLKD_PID=
-    set -e
+    set -e; trap 'printf "ABORT: line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 }
 
 # The driver: finds the agents, maps each to its Vessel by its host uid
@@ -324,7 +329,23 @@ fi
 # ── verify: the rebirth, graded ──────────────────────────────────────
 ACKED=${1:-}; [[ -f "$ACKED" ]] || die "usage: $0 verify ACKED (the witness's file, copied from the laptop)"
 [[ -f "$CFG" && -f "$WORK/blk.log" ]] || die "no B3 work directory at $WORK (run first)"
-[[ "$(cat "$WORK/commit")" == "$COMMIT" ]] || die "the tree is at $COMMIT, the round ran at $(cat "$WORK/commit"): check out that commit"
+RAN=$(cat "$WORK/commit")
+# The binaries are the round's ($BIN, built by `run`); the tree may differ
+# from the round's commit only in this script.
+if [[ "$RAN" != "$COMMIT" ]]; then
+    git diff --quiet "$RAN" HEAD -- . ':(exclude)bench/p5/b3-power.sh' \
+        || die "the tree is at $COMMIT, the round ran at $RAN, and they differ beyond this script: check out $RAN"
+    say "the round ran at $RAN; this tree differs from it only in bench/p5/b3-power.sh"
+fi
+# B3_FIRST=DIR: an earlier verify of this round (its results directory).
+# The first rebirth after the cut is the one that saw it: taso-blkd's
+# recovery and the Warden's settle lines (line 4) are read from there.
+FIRST=${B3_FIRST:-}
+if [[ -n "$FIRST" ]]; then
+    [[ -f "$FIRST/blkd-verify.err" && -f "$FIRST/warden-verify.err" ]] \
+        || die "B3_FIRST=$FIRST holds no blkd-verify.err and warden-verify.err"
+    say "taso-blkd's recovery and the Warden's settle lines from the first rebirth: $FIRST"
+fi
 OUT=$WORK/verify-$(date +%Y%m%d-%H%M%S); mkdir -p "$OUT"
 say "B3 verify at $COMMIT, witness file $ACKED, results in $OUT"
 cp "$ACKED" "$OUT/acked.json"
@@ -333,20 +354,24 @@ trap 'stop_stack' EXIT
 start_stack verify
 say "taso-blkd and the Warden started on the cut log; waiting for $P agents"
 rc=0
-python3 -I - "$P" "$ROWS" "$OUT" "$WORK" <<PY || rc=$?
+python3 -I - "$P" "$ROWS" "$OUT" "$WORK" "$FIRST" <<PY || rc=$?
 $DRIVER
-p, rows, outdir, work = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]
+import shutil
+p, rows, outdir, work, first = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
 w = json.load(open(outdir + "/acked.json"))
 if not w.get("hello"):
     print("HARNESS: the witness file has no hello: it never heard the host"); sys.exit(2)
 found = agents(p, 300)
 time.sleep(2)   # the Warden's settle lines are written before an agent starts; let stderr land
-blkd = open(work + "/blkd-verify.err").read()
-warden = open(work + "/warden-verify.err").read()
+src = first or work
+blkd = open(src + "/blkd-verify.err").read()
+warden = open(src + "/warden-verify.err").read()
 rec = re.findall(r"recovered .*", blkd)
 run_blkd = open(work + "/blkd-run.err").read() if os.path.exists(work + "/blkd-run.err") else ""
 lines, verdict = [], 0
-lines.append(f"taso-blkd after the cut: {rec[-1] if rec else '(no recovered line: a fresh log?)'}")
+if first:
+    lines.append(f"recovery and settle lines from the first rebirth after the cut: {first}")
+lines.append(f"taso-blkd after the cut: {rec[0] if first and rec else rec[-1] if rec else '(no recovered line: a fresh log?)'}")
 lines.append(f"before the cut (as much of taso-blkd's log as survived): {len(re.findall(r'checkpoint at record', run_blkd))} checkpoint(s), {len(re.findall(r'compacted:', run_blkd))} compaction(s)")
 for i in range(p):
     x = w["vessels"].get(str(i), {"writes": {}, "seal_requested": 0, "seal_acked": 0, "errors": []})
@@ -371,11 +396,20 @@ for i in range(p):
     if R < a_s: fails.append(f"1: an acknowledged Seal is lost (resumed after turn {R}, the Seal of turn {a_s} was acknowledged)")
     if R > q_s: fails.append(f"2: a Seal never asked (resumed after turn {R}, the last requested was turn {q_s})")
     # 3: the rows, through the agent's own mount
+    # Read from a copy (E3's way: cp state.db*): opened in place through
+    # /proc/<pid>/root, SQLite refused (taso-p5, 2026-10-31: "unable to
+    # open database file" on all eight).  The agent is idle between ops,
+    # so the database and its WAL are copied whole; the -shm is rebuilt.
+    src_db, cp_dir = f"/proc/{a.pid}/root/work/state.db", f"{outdir}/db-v{i}"
     try:
-        db = sqlite3.connect(f"file:/proc/{a.pid}/root/work/state.db?mode=ro", uri=True, timeout=30)
+        os.makedirs(cp_dir, exist_ok=True)
+        for sfx in ("", "-wal"):
+            if os.path.exists(src_db + sfx):
+                shutil.copyfile(src_db + sfx, f"{cp_dir}/state.db{sfx}")
+        db = sqlite3.connect(f"{cp_dir}/state.db", timeout=30)
         have = dict(db.execute("SELECT turn, count(*) FROM events GROUP BY turn").fetchall())
         db.close()
-    except sqlite3.Error as e:
+    except (OSError, sqlite3.Error) as e:
         print(f"HARNESS v{i}: its database could not be read: {e}"); verdict = max(verdict, 2); continue
     for t in range(1, R + 1):
         want = wr.get(t, 0) * rows
