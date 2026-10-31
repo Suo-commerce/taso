@@ -58,6 +58,10 @@
 # the parent's Seals carry it; a child finds it inherited whole and writes
 # 4 KiB into its middle and fdatasyncs first, timed: one sample per child.
 # Compare: K4 (taso-blkd alone, 2026-10-18), 2.5 ms p50 at 1 GiB.
+# MEM_MIB (default 256) is each agent's memory limit: at 256 a 1 GiB
+# file got the agent OOM-killed by its memory cgroup while writing it
+# (taso-p5, 2026-10-31: its dirty pages, not its own memory); BIG_MIB=1024
+# runs with MEM_MIB=2048.
 #
 # NOISY=1 (needs P >= 2; B1's "Seal p50/p95 at 8 and 64 Vessels with one
 # noisy neighbour"): Vessel v0 is the neighbour, its agent writing
@@ -86,7 +90,8 @@ RUNS=${4:-1}
 [[ "$STORAGE" == zfs || "$STORAGE" == blk ]] || { echo "usage: $0 zfs|blk [P] [TURNS] [RUNS]" >&2; exit 64; }
 TXNS=${TXNS:-4}; ROWS=${ROWS:-8}; ROW_BYTES=${ROW_BYTES:-512}; SYNC=${SYNC:-normal}
 LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
-BIG_MIB=${BIG_MIB:-0}; NOISY=${NOISY:-0}
+BIG_MIB=${BIG_MIB:-0}; NOISY=${NOISY:-0}; MEM_MIB=${MEM_MIB:-256}
+[[ "$MEM_MIB" =~ ^[1-9][0-9]*$ ]] || { echo "MEM_MIB=$MEM_MIB: a whole number of MiB" >&2; exit 64; }
 NOISY_TXNS=${NOISY_TXNS:-64}; NOISY_ROWS=${NOISY_ROWS:-256}; NOISY_ROW_BYTES=${NOISY_ROW_BYTES:-4096}
 [[ "$FORKS" == 0 || "$P" == 1 ]] || { echo "FORKS needs P=1 (one parent, N children)" >&2; exit 64; }
 [[ "$NOISY" == 0 || "$P" -ge 2 ]] || { echo "NOISY needs P >= 2 (one neighbour, P-1 others)" >&2; exit 64; }
@@ -236,7 +241,7 @@ json.dump({
         "host_uid_base": 200000,
         "landlock_shim": "/usr/lib/taso/landlock" if "$LANDLOCK" == "1" else None,
         "args": args,
-        "memory_bytes": 268435456,
+        "memory_bytes": $MEM_MIB << 20,
         "pids": 64,
     },
     "vessels": [vessel(i) for i in range($P)],
