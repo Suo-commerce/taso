@@ -270,8 +270,8 @@ pub trait Mounts {
     fn thaw(&self, dir: &Path) -> io::Result<()>;
 }
 
-/// The real [`Mounts`]: `mkfs.ext4`, `mount`, `fsfreeze`, and
-/// `/proc/self/mountinfo`.
+/// The real [`Mounts`]: `mkfs.ext4`, `mount`, the kernel's freeze and thaw
+/// calls, and `/proc/self/mountinfo`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct System;
 
@@ -284,6 +284,53 @@ fn run(cmd: &mut Command) -> io::Result<()> {
             "{cmd:?}: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )))
+    }
+}
+
+/// `FIFREEZE` and `FITHAW` (linux/fs.h: `_IOWR('X', 119, int)` and
+/// `_IOWR('X', 120, int)`): the two calls `fsfreeze -f` and `fsfreeze -u`
+/// make.
+const FIFREEZE: u32 = 0xC004_5877;
+const FITHAW: u32 = 0xC004_5878;
+
+/// Freeze (`FIFREEZE`) or thaw (`FITHAW`) the filesystem mounted at `dir`
+/// by the kernel call itself.  The Warden used to start `fsfreeze` for each:
+/// on taso-test at 64 concurrent Seals a freeze took 21 ms p50 that way and
+/// 3.9 ms as the call, a thaw 9.3 and 3.3 (scripts/p5-fsfreeze-probe.sh,
+/// 2026-11-02); starting a program alone cost 11 ms there.  No `PATH`
+/// lookup either: a program found by name ran as root on every Seal.
+///
+/// `dir` is opened as a directory, never through a symlink, and closed on
+/// exec; the call needs CAP_SYS_ADMIN, as `fsfreeze` did.
+///
+/// The crate's one exception to `deny(unsafe_code)` (lib.rs); the test
+/// `one_unsafe_exception_in_the_crate` keeps it the only one.
+#[allow(unsafe_code)]
+fn fs_freeze_call(dir: &Path, request: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let what = if request == FIFREEZE {
+        "freeze"
+    } else {
+        "thaw"
+    };
+    let say = |e: io::Error, step: &str| {
+        io::Error::new(e.kind(), format!("{what} {}: {step}{e}", dir.display()))
+    };
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .map_err(|e| say(e, "open: "))?;
+    // SAFETY: `f` is an open descriptor we own for the whole call; the
+    // request takes an `int` argument that the kernel does not read
+    // (fs/ioctl.c: ioctl_fsfreeze / ioctl_fsthaw), so no pointer is passed
+    // and no memory of ours is written.
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), request as _, 0 as libc::c_int) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(say(io::Error::last_os_error(), ""))
     }
 }
 
@@ -327,10 +374,10 @@ impl Mounts for System {
         run(Command::new("umount").arg(dir))
     }
     fn freeze(&self, dir: &Path) -> io::Result<()> {
-        run(Command::new("fsfreeze").arg("-f").arg(dir))
+        fs_freeze_call(dir, FIFREEZE)
     }
     fn thaw(&self, dir: &Path) -> io::Result<()> {
-        run(Command::new("fsfreeze").arg("-u").arg(dir))
+        fs_freeze_call(dir, FITHAW)
     }
 }
 
@@ -1445,6 +1492,78 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
 
 #[cfg(test)]
 mod tests {
+    /// The crate denies unsafe code with one named exception
+    /// (`fs_freeze_call`).  Any other `allow` of it fails here, so a new one
+    /// is a change to this test, made on purpose and seen in review.
+    #[test]
+    fn one_unsafe_exception_in_the_crate() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    out.push((p, text));
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        // Spelled in two parts so this test does not count itself.
+        let needle = ["allow(", "unsafe_code)"].concat();
+        let found: Vec<String> = files
+            .iter()
+            .flat_map(|(p, t)| {
+                t.lines()
+                    .filter(|l| l.contains(&needle) && !l.trim_start().starts_with("//"))
+                    .map(move |l| format!("{}: {}", p.display(), l.trim()))
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "allows of unsafe code: {found:#?}");
+        assert!(found[0].contains("blk.rs"), "{found:#?}");
+        let blk = &files.iter().find(|(p, _)| p.ends_with("blk.rs")).unwrap().1;
+        let at = blk.find(&format!("#[{needle}]")).unwrap();
+        assert!(
+            blk[at..]
+                .lines()
+                .nth(1)
+                .unwrap()
+                .starts_with("fn fs_freeze_call("),
+            "the exception is fs_freeze_call"
+        );
+        let lib = &files
+            .iter()
+            .find(|(p, _)| p.ends_with("src/lib.rs"))
+            .unwrap()
+            .1;
+        assert!(lib.contains("#![deny(unsafe_code)]"));
+    }
+
+    /// The freeze call refuses what `fsfreeze` would have followed: a
+    /// symlink, a file, a missing path - each named in its error.  (The call
+    /// on a real mount is `tests/blk_device.rs`'s, as root.)
+    #[test]
+    fn the_freeze_call_opens_only_a_real_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let file = d.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        for (p, req) in [
+            (&link, super::FIFREEZE),
+            (&file, super::FITHAW),
+            (&d.path().join("gone"), super::FIFREEZE),
+        ] {
+            let e = super::fs_freeze_call(p, req).unwrap_err().to_string();
+            assert!(e.contains("open: "), "{e}");
+            assert!(e.contains(&p.display().to_string()), "{e}");
+        }
+    }
+
     use super::*;
     use crate::coordinator::Coordinator;
     use crate::segment::Position;

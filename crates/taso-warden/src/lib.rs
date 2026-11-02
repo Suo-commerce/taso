@@ -6,7 +6,11 @@
 //!
 //! Normative references: spec v1.0 (build plan) and spec v0.4 (primitives).
 
-#![forbid(unsafe_code)]
+// One named exception, and only one: `blk::fs_freeze_call` (FIFREEZE /
+// FITHAW, the Seal's freeze without starting `fsfreeze` - P5, the 50 ms
+// line, bite 1).  A test in blk.rs fails if any other `allow` of unsafe
+// code appears in this crate.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod adoptcopy;
