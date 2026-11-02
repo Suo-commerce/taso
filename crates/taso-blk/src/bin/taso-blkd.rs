@@ -1093,8 +1093,11 @@ impl Daemon {
         };
         // op_wsplit: where the writes' time under the lock went, µs summed
         // over every write: map, copy, hash, pwrite (store.rs Stats).
+        // sync_us: the syncs= above, timed: count, total µs, longest µs
+        // (the store's and the Syncer's; P5 bite 3).
+        let (sync_us, sync_max_us) = self.sync.sync_time();
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -1112,6 +1115,9 @@ impl Daemon {
             st.write_copy_us,
             st.write_hash_us,
             st.write_pwrite_us,
+            st.syncs + self.sync.syncs(),
+            st.sync_us + sync_us,
+            st.sync_max_us.max(sync_max_us),
         )
     }
 }

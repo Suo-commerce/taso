@@ -207,6 +207,9 @@ bytes_used() { # the storage's bytes now
 log_syncs() { # the block log's fdatasyncs so far (taso-blkd stats: the store's and the Syncer's); 0 on zfs
     if [[ "$STORAGE" == zfs ]]; then echo 0; else blk stats | tr ' ' '\n' | sed -n 's/^syncs=//p'; fi
 }
+log_sync_us() { # those syncs timed, COUNT:TOTAL_US:MAX_US (taso-blkd stats sync_us, bite 3); empty on zfs or an older taso-blkd
+    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^sync_us=//p'; fi
+}
 
 # ---- one run: the Warden with P Vessels -------------------------------------------
 run_warden() { # run_warden R
@@ -249,6 +252,7 @@ json.dump({
 PY
     bytes_used >"$OUT/warden-$r.bytes0"
     log_syncs >"$OUT/warden-$r.syncs0"
+    log_sync_us >"$OUT/warden-$r.syncus0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
     TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$BIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
@@ -264,6 +268,7 @@ sys.exit(rc)
 PY
     bytes_used >"$OUT/warden-$r.bytes1"
     log_syncs >"$OUT/warden-$r.syncs1"
+    log_sync_us >"$OUT/warden-$r.syncus1"
     # What shipped: the local store's bytes and files after this run (the
     # packs every Seal published).  The log's growth counts every version
     # of every block; the packs carry a Seal's live blocks only, so the two
@@ -368,6 +373,16 @@ if storage != "zfs":
     y0 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs0")))
     y1 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs1")))
     print(f"- block log syncs: {y1 - y0} in the run for {seals} Seals: {(y1 - y0) / (seals or 1):.2f} per Seal (births included; a lone Seal pays 3)")
+    # Bite 3: what one of those syncs costs (taso-blkd times each fdatasync):
+    # the mean over the run's syncs, and the longest since taso-blkd started.
+    n = us = mx = 0
+    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.syncus0"))):
+        a, b = (open(f).read().strip() for f in (f0, f0[:-1] + "1"))
+        if a and b:
+            (c0, t0, _), (c1, t1, m1) = (map(int, x.split(":")) for x in (a, b))
+            n, us, mx = n + c1 - c0, us + t1 - t0, max(mx, m1)
+    if n:
+        print(f"- a block log sync: {us / n / 1000:.2f} ms mean over the run's {n}; the longest {mx / 1000:.2f} ms (since taso-blkd started)")
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")

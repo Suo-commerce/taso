@@ -295,6 +295,12 @@ pub struct Stats {
     pub records: u64,
     /// `fdatasync` calls made by flushes.
     pub syncs: u64,
+    /// Their time: summed, and the longest (µs).  With the [`Syncer`]'s,
+    /// what one block-log sync costs (P5, the 50 ms line, bite 3: how much
+    /// of a Seal's `seal.log` is the sync and how much waiting for one).
+    pub sync_us: u64,
+    /// The longest of them (µs).
+    pub sync_max_us: u64,
     /// Where a write's time under the lock goes, summed over every write
     /// (µs), for the probe of the serial append (taso-p5, 2026-10-26:
     /// 0.8 ms per 512 KiB under the lock, four threads changing nothing).
@@ -624,11 +630,15 @@ impl Store {
     /// Returns the Flush record's sequence number.
     pub fn flush(&mut self) -> Result<u64, StoreError> {
         let lsn = self.flush_pending()?;
+        let t = std::time::Instant::now();
         if let Err(e) = self.file.sync_data() {
             self.poisoned = true;
             return Err(e.into());
         }
+        let us = t.elapsed().as_micros() as u64;
         self.stats.syncs += 1;
+        self.stats.sync_us += us;
+        self.stats.sync_max_us = self.stats.sync_max_us.max(us);
         Ok(lsn)
     }
 
@@ -1654,6 +1664,9 @@ struct SyncState {
     error: Option<String>,
     /// Syncs made.
     syncs: u64,
+    /// Their time, summed, and the longest (µs).
+    sync_us: u64,
+    sync_max_us: u64,
 }
 
 /// The log's file as the [`Syncer`] sees it: swapped by a compaction's
@@ -1693,13 +1706,17 @@ impl Syncer {
             let upto = st.requested;
             st.syncing = true;
             drop(st);
+            let t = std::time::Instant::now();
             let r = self.file.get().sync_data();
+            let us = t.elapsed().as_micros() as u64;
             st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.syncing = false;
             match r {
                 Ok(()) => {
                     st.durable = st.durable.max(upto);
                     st.syncs += 1;
+                    st.sync_us += us;
+                    st.sync_max_us = st.sync_max_us.max(us);
                     led = true;
                 }
                 Err(e) => {
@@ -1735,6 +1752,12 @@ impl Syncer {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .syncs
+    }
+
+    /// The time of the syncs made so far: summed and the longest (µs).
+    pub fn sync_time(&self) -> (u64, u64) {
+        let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (st.sync_us, st.sync_max_us)
     }
 }
 
@@ -3191,8 +3214,12 @@ mod tests {
         }
         let syncs = sync.syncs();
         assert!((1..=256).contains(&syncs), "syncs {syncs}");
+        // Each sync's time is counted: the longest within the sum.
+        let (total, max) = sync.sync_time();
+        assert!(max <= total, "longest {max} us, total {total} us");
         // A later ask for an already durable lsn syncs nothing more.
         assert!(!sync.durable(1).unwrap());
         assert_eq!(sync.syncs(), syncs);
+        assert_eq!(sync.sync_time(), (total, max), "no sync, no time");
     }
 }
