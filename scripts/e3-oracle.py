@@ -41,7 +41,11 @@ held before its record was committed is never listed after rebirth (its
 layer destroyed at open); `fork.branched`, the child held before its
 Lineage record is never run; `compact.written`, the log taso-blkd reopens
 is the one from before the held compaction (same inode: the rename never
-happened).
+happened).  `seal.thawing` (bite 2, 2026-11-02) holds a Seal's thaw while
+its record's commit goes on beside it, so the cut usually finds the record
+accepted and the Vessel still frozen: graded by the in-flight rule, not as
+a window (the Seal landed whole, or is absent if the commit had not
+landed); never listed partly.
 
 Line 3 checks that a retained Seal is reachable (it exports), not its bytes:
 a Seal's export differs between runs (a fresh mkfs per round, inode times),

@@ -155,7 +155,8 @@ for shape in ("all", "stagger"):
 print("write seal|burst:all:takeover|drop")
 print("write seal|burst:all:takeover+seal.shipped|drop")
 # E3-3c: one round per hold site and mode, the shortest sequence reaching it
-for name, s in (("seal.recorded", "write seal"), ("seal.frozen", "write seal"), ("seal.shipped", "write seal"),
+for name, s in (("seal.recorded", "write seal"), ("seal.frozen", "write seal"), ("seal.thawing", "write seal"),
+                ("seal.shipped", "write seal"),
                 ("ledger.shipped", "write effect"), ("fork.branched", "write seal fork"),
                 ("compact.written", "write seal")):
     for mode in ("drop", "error"):
@@ -269,7 +270,7 @@ held() { # held NAME SECONDS: the process reached the armed hold NAME (its marke
 }
 
 thaw_vessels() { # every Vessel mount under $MNT thawed, bounded (a no-op on one not frozen)
-    # A Vessel left frozen (the seal.frozen hold, or a Warden killed between
+    # A Vessel left frozen (the seal.frozen or seal.thawing hold, or a Warden killed between
     # its freeze and thaw) blocks every writer in the kernel, unkillably, and
     # an umount of it; its image was taken at the freeze, so a thaw changes
     # nothing the round grades.
@@ -679,7 +680,7 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
             if [[ -z "${brep[v]}" ]] && reply "${BP[v]}" 10 && [[ -n "$(jget "$REPLY" sealed)" ]]; then backs[v]=$((backs[v] + 1)); fi
         done
     fi
-    [[ "$hname" == seal.frozen ]] && thaw_vessels
+    [[ "$hname" == seal.frozen || "$hname" == seal.thawing ]] && thaw_vessels
     if [[ "$mode" == error ]]; then
         for v in 0 1; do
             if step "${BP[v]}" seal 30 && [[ -n "$(jget "$REPLY" sealed)" ]]; then backs[v]=$((backs[v] + 1)); fi
@@ -932,6 +933,11 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
             : >"$RUN/hold/$hname.arm"
             send "$P" "$op" || { echo "HARNESS $tag: the op file could not be written"; return; }
             held "$hname" 10 || { echo "HARNESS $tag: the hold was never reached"; return; }
+            # seal.thawing (bite 2) holds the thaw while the record's commit
+            # goes on beside it: give the commit time to land, so the cut
+            # finds it recorded with the Vessel still frozen.  If it has not
+            # landed, the in-flight Seal is absent, which the oracle allows too.
+            [[ "$hname" == seal.thawing ]] && sleep 0.5
             inflight=1
             if [[ -f /proc/$P/root/tmp/e3/reply.${NEXT[$P]} ]]; then
                 reply "$P" 5 || { echo "HARNESS $tag: the reply vanished: $WHY"; return; }; rep=$REPLY; inflight=
@@ -1034,7 +1040,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
     # now, or its agent's next write could never be killed.  Which thaw path
     # the Warden took is kept for reading (3570b49's: the Seal made, the
     # thaw failed).
-    if [[ "$hname" == seal.frozen ]]; then
+    if [[ "$hname" == seal.frozen || "$hname" == seal.thawing ]]; then
         grep -iE 'thaw|frozen' "$R/warden-1.err" "$R/warden-1.out" 2>/dev/null >"$R/thaw.txt" || echo "no thaw failure in the Warden's log" >"$R/thaw.txt"
         thaw_vessels
     fi
