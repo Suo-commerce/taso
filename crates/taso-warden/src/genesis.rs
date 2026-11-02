@@ -853,6 +853,7 @@ impl<P: Pool> Genesis<P> {
         let mut layers = self.pool.layers(scratch);
         layers
             .snapshot(seal, scratch_hash(gid))
+            .and_then(crate::chronicle::Thaw::run)
             .map_err(GenesisError::Pool)?;
         let view = self
             .pool
@@ -1231,7 +1232,11 @@ mod tests {
     }
 
     impl Layers for DirLayers {
-        fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        fn snapshot(
+            &mut self,
+            lsn: Lsn,
+            hash: HashVal,
+        ) -> Result<crate::chronicle::Thaw, LayerError> {
             std::fs::create_dir_all(&self.snaps)?;
             let to = self.snaps.join(lsn.get().to_string());
             if to.exists() {
@@ -1250,7 +1255,7 @@ mod tests {
             if self.mangle {
                 std::fs::write(to.join("stray"), b"not in the manifest")?;
             }
-            Ok(())
+            Ok(crate::chronicle::Thaw::none())
         }
         fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
             let mut out = Vec::new();
@@ -1898,6 +1903,8 @@ class = "Scratch"
         g.pool
             .layers(&v)
             .snapshot(Lsn::new(5), HashVal::from_bytes([5; 32]))
+            .unwrap()
+            .run()
             .unwrap();
         let req = request(Source::Seal {
             dataset: v.clone(),
@@ -1945,6 +1952,8 @@ class = "Scratch"
             g.pool
                 .layers(&v)
                 .snapshot(Lsn::new(2), HashVal::from_bytes([2; 32]))
+                .unwrap()
+                .run()
                 .unwrap();
             let e = g
                 .run(&request(Source::Seal {

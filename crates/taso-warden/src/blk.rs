@@ -59,7 +59,7 @@ use taso_blk::client::{Client, ClientError, Info};
 use taso_blk::map::LayerId;
 use taso_core::envelope::{HashVal, Lsn};
 
-use crate::chronicle::{LayerError, Layers};
+use crate::chronicle::{LayerError, Layers, Thaw};
 use crate::ship::{ByteStream, Sender};
 use crate::storage::{CloneBase, Dataset, DatasetInfo, Snapshot, SNAP_PREFIX};
 use crate::vessel::{Pool, SealView};
@@ -253,7 +253,9 @@ impl Blkd for Daemon {
 }
 
 /// The file-system operations the pool needs (implemented by [`System`]).
-pub trait Mounts {
+/// Shareable between threads: a Seal's thaw runs on a thread of its own,
+/// beside the Seal record's commit (bite 2).
+pub trait Mounts: Send + Sync + 'static {
     /// Make an ext4 file system on `dev`.
     fn mkfs(&self, dev: &Path) -> io::Result<()>;
     /// Mount `dev` on the directory `dir` (created if missing).
@@ -1306,7 +1308,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     fn discarded_blocks(&self) -> Option<u64> {
         self.discarded
     }
-    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError> {
         // On this Vessel's own connection, with the branch and its device
         // cached: a Seal is two commands (the Seals of the branch, to
         // refuse a repeat; the Seal), and no lock is held across the
@@ -1335,9 +1337,10 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
         drop(lookup);
         match (dev, mounted) {
             (Some(dev), Some(src)) if src == dev => {
-                // Three spans under seal.snapshot, so a slow Seal names its
-                // step: the freeze (ext4's sync of the Vessel), the Seal on
-                // the log, the thaw.
+                // Spans so a slow Seal names its step: the freeze (ext4's
+                // sync of the Vessel) and the Seal on the log under
+                // seal.snapshot; the thaw (seal.thaw) after it, beside the
+                // record's commit (bite 2).
                 let freeze = crate::timing::span("seal.freeze");
                 self.mounts.freeze(&self.mountpoint)?;
                 drop(freeze);
@@ -1347,22 +1350,27 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 };
                 // E3: the Seal made (or refused), the Vessel still frozen.
                 taso_core::hold("seal.frozen");
-                let thaw = crate::timing::span("seal.thaw");
-                let thawed = self.mounts.thaw(&self.mountpoint);
-                drop(thaw);
-                // Both results are read: a thaw that failed after a Seal
-                // that failed is the urgent one (the Vessel is still
-                // frozen) and must not hide behind the Seal's error.
-                match (sealed, thawed) {
-                    (Ok(_), Ok(())) => {}
-                    (Err(e), Ok(())) => return Err(e),
-                    (Ok(_), Err(e)) => return Err(e.into()),
-                    (Err(seal), Err(thaw)) => {
-                        return Err(format!(
-                            "seal failed ({seal}) and {} is still frozen: thaw failed ({thaw})",
-                            self.mountpoint.display()
-                        )
-                        .into());
+                let (mounts, dir) = (Arc::clone(&self.mounts), self.mountpoint.clone());
+                let thaw = Thaw::later(move || {
+                    let _thaw = crate::timing::span("seal.thaw");
+                    Ok(mounts.thaw(&dir)?)
+                });
+                match sealed {
+                    // The layer exists: its thaw goes back to the Chronicle,
+                    // which runs it beside the Seal record's commit.
+                    Ok(_) => return Ok(thaw),
+                    // No layer: thaw now.  A thaw that failed after a Seal
+                    // that failed is the urgent one (the Vessel is still
+                    // frozen) and must not hide behind the Seal's error.
+                    Err(seal) => {
+                        return Err(match thaw.run() {
+                            Ok(()) => seal,
+                            Err(t) => format!(
+                                "seal failed ({seal}) and {} is still frozen: thaw failed ({t})",
+                                self.mountpoint.display()
+                            )
+                            .into(),
+                        })
                     }
                 }
             }
@@ -1379,7 +1387,7 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
                 self.with_conn(|d| d.seal(b, &t))?; // nothing mounted: the device is quiet
             }
         }
-        Ok(())
+        Ok(Thaw::none())
     }
 
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
@@ -1568,7 +1576,7 @@ mod tests {
     use crate::coordinator::Coordinator;
     use crate::segment::Position;
     use crate::vessel::{Host, Vessel};
-    use std::cell::RefCell;
+
     use std::collections::HashMap;
     use taso_blk::client::LayerKind;
     use taso_blk::map::Kind;
@@ -1702,19 +1710,33 @@ mod tests {
         }
     }
 
+    /// `RefCell`'s `borrow`/`borrow_mut` over an `RwLock`: the fake's
+    /// fields as before, shareable with the thread a Seal's thaw runs on.
+    #[derive(Default)]
+    struct Shared<T>(std::sync::RwLock<T>);
+
+    impl<T> Shared<T> {
+        fn borrow(&self) -> std::sync::RwLockReadGuard<'_, T> {
+            self.0.read().unwrap()
+        }
+        fn borrow_mut(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+            self.0.write().unwrap()
+        }
+    }
+
     /// An in-memory mount table that records every call.
     #[derive(Default)]
     struct FakeMounts {
-        table: RefCell<HashMap<PathBuf, PathBuf>>,
-        frozen: RefCell<Vec<PathBuf>>,
-        calls: RefCell<Vec<String>>,
-        fail_mkfs: RefCell<bool>,
-        busy: RefCell<bool>,
-        fail_thaw: RefCell<bool>,
+        table: Shared<HashMap<PathBuf, PathBuf>>,
+        frozen: Shared<Vec<PathBuf>>,
+        calls: Shared<Vec<String>>,
+        fail_mkfs: Shared<bool>,
+        busy: Shared<bool>,
+        fail_thaw: Shared<bool>,
         /// Asked at every mkfs, mount and umount: true notes the call in
         /// `held` (the shared connection is held across it).
-        probe: RefCell<Option<Box<dyn Fn() -> bool>>>,
-        held: RefCell<Vec<String>>,
+        probe: Shared<Option<Box<dyn Fn() -> bool + Send + Sync>>>,
+        held: Shared<Vec<String>>,
     }
 
     impl FakeMounts {
@@ -1966,7 +1988,11 @@ mod tests {
         *p.mounts.probe.borrow_mut() = Some(Box::new(move || shared.try_lock().is_err()));
         let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
         p.create(&a).unwrap();
-        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
         Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
         p.mounts.table.borrow_mut().remove(&p.mountpoint(&c));
         p.ensure_mounted(&c).unwrap();
@@ -1993,8 +2019,8 @@ mod tests {
         p.create(&a).unwrap();
         calls(&p);
         let mut l = p.layers(&a);
-        l.snapshot(Lsn::new(2), h(2)).unwrap();
-        l.snapshot(Lsn::new(5), h(5)).unwrap();
+        l.snapshot(Lsn::new(2), h(2)).unwrap().run().unwrap();
+        l.snapshot(Lsn::new(5), h(5)).unwrap().run().unwrap();
         assert_eq!(
             calls(&p),
             [
@@ -2047,13 +2073,11 @@ mod tests {
         let p = pool();
         let a = ds("tank/v-a");
         p.create(&a).unwrap();
-        // Thaw alone fails: its error comes back, not a false success.
+        // Thaw alone fails: the Seal is made and its thaw handed back
+        // (bite 2), whose run returns the error, not a false success.
         *p.mounts.fail_thaw.borrow_mut() = true;
-        let e = p
-            .layers(&a)
-            .snapshot(Lsn::new(2), h(2))
-            .unwrap_err()
-            .to_string();
+        let thaw = p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        let e = thaw.run().unwrap_err().to_string();
         assert!(e.contains("device gone"), "{e}");
         // Both fail: one error names both and the mount that is still frozen.
         p.blkd.lock().unwrap().fail_seal = true;
@@ -2074,7 +2098,11 @@ mod tests {
         p.create(&a).unwrap();
         p.mounts.table.borrow_mut().clear(); // as after a reboot
         calls(&p);
-        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
         assert!(calls(&p).is_empty());
         assert_eq!(p.layers(&a).list().unwrap(), [(Lsn::new(2), h(2))]);
     }
@@ -2084,8 +2112,16 @@ mod tests {
         let p = pool();
         let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
         p.create(&a).unwrap();
-        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
-        p.layers(&a).snapshot(Lsn::new(4), h(4)).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(4), h(4))
+            .unwrap()
+            .run()
+            .unwrap();
         assert!(
             Pool::clone(&p, &a, Lsn::new(2), h(9), &c).is_err(),
             "bound to another record"
@@ -2110,7 +2146,11 @@ mod tests {
             p.layers(&c).list().unwrap().is_empty(),
             "a clone has no layers of its own"
         );
-        p.layers(&c).snapshot(Lsn::new(3), h(33)).unwrap();
+        p.layers(&c)
+            .snapshot(Lsn::new(3), h(33))
+            .unwrap()
+            .run()
+            .unwrap();
         assert_eq!(
             p.info(&c).unwrap().unwrap().origin_seal(),
             Some((a.clone(), Lsn::new(2))),
@@ -2133,8 +2173,8 @@ mod tests {
         let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
-        l.snapshot(Lsn::new(2), h(2)).unwrap();
-        l.snapshot(Lsn::new(4), h(4)).unwrap();
+        l.snapshot(Lsn::new(2), h(2)).unwrap().run().unwrap();
+        l.snapshot(Lsn::new(4), h(4)).unwrap().run().unwrap();
         l.destroy(Lsn::new(9)).unwrap(); // absent: fine
         Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
         assert!(l.destroy(Lsn::new(2)).is_err(), "the clone stands on it");
@@ -2149,9 +2189,9 @@ mod tests {
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
         write0(&p, &a, 1);
-        l.snapshot(Lsn::new(2), h(2)).unwrap();
+        l.snapshot(Lsn::new(2), h(2)).unwrap().run().unwrap();
         write0(&p, &a, 2);
-        l.snapshot(Lsn::new(5), h(5)).unwrap(); // the orphan
+        l.snapshot(Lsn::new(5), h(5)).unwrap().run().unwrap(); // the orphan
         calls(&p);
         assert!(
             l.destroy(Lsn::new(5)).is_err(),
@@ -2174,7 +2214,7 @@ mod tests {
             Some(1),
             "the orphan's block, lost as a reset's would be, is named (D93 (i))"
         );
-        l.snapshot(Lsn::new(7), h(7)).unwrap();
+        l.snapshot(Lsn::new(7), h(7)).unwrap().run().unwrap();
         assert_eq!(l.list().unwrap().len(), 2, "Seals go on as before");
     }
 
@@ -2185,7 +2225,11 @@ mod tests {
         let p = pool();
         let a = ds("tank/v-a");
         p.create(&a).unwrap();
-        p.layers(&a).snapshot(Lsn::new(3), h(3)).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap()
+            .run()
+            .unwrap();
         assert!(p.seal_view(&a, Lsn::new(9)).is_err(), "no such Seal");
         calls(&p);
         let view = p.seal_view(&a, Lsn::new(3)).unwrap();
@@ -2227,7 +2271,11 @@ mod tests {
         let p = pool();
         let a = ds("tank/v-a");
         p.create(&a).unwrap();
-        p.layers(&a).snapshot(Lsn::new(3), h(3)).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap()
+            .run()
+            .unwrap();
         std::mem::forget(p.seal_view(&a, Lsn::new(3)).unwrap());
         calls(&p);
         let view = p.seal_view(&a, Lsn::new(3)).unwrap();
@@ -2244,8 +2292,16 @@ mod tests {
         assert_eq!(p.guid(&a).unwrap(), None);
         assert!(!Pool::destroy(&p, &a, 1).unwrap(), "nothing to destroy");
         p.create(&a).unwrap();
-        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
-        p.layers(&a).snapshot(Lsn::new(4), h(4)).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(4), h(4))
+            .unwrap()
+            .run()
+            .unwrap();
         let g = p.guid(&a).unwrap().unwrap();
         // A clone on one of its layers: refused, nothing touched.
         Pool::clone(&p, &a, Lsn::new(2), h(2), &c).unwrap();
@@ -2336,7 +2392,11 @@ mod tests {
         p.create(&c).unwrap();
         p.create(&ds("tank/other")).unwrap();
         p.create(&ds("tank/vessels/v-a/deeper")).unwrap();
-        p.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
         let snap = p.snapshot(&a, Lsn::new(2)).unwrap().unwrap();
         assert_eq!(
             (snap.name(), snap.guid, snap.seal_hash),
@@ -2379,9 +2439,17 @@ mod tests {
         let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
         na.create(&a).unwrap();
         write0(&na, &a, 1);
-        na.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        na.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
         write0(&na, &a, 2);
-        na.layers(&a).snapshot(Lsn::new(5), h(5)).unwrap();
+        na.layers(&a)
+            .snapshot(Lsn::new(5), h(5))
+            .unwrap()
+            .run()
+            .unwrap();
 
         // Full, then incremental, as rebirth does.
         let g = nb
@@ -2429,7 +2497,11 @@ mod tests {
         // A clone of a's first Seal, received as a clone on the other node.
         Pool::clone(&na, &a, Lsn::new(2), h(2), &c).unwrap();
         write0(&na, &c, 9);
-        na.layers(&c).snapshot(Lsn::new(3), h(33)).unwrap();
+        na.layers(&c)
+            .snapshot(Lsn::new(3), h(33))
+            .unwrap()
+            .run()
+            .unwrap();
         let first = sent(&na, &c, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(3));
         let base = CloneBase {
             dataset: a.clone(),
@@ -2470,9 +2542,17 @@ mod tests {
         let a = ds("tank/v-a");
         na.create(&a).unwrap();
         write0(&na, &a, 1);
-        na.layers(&a).snapshot(Lsn::new(2), h(2)).unwrap();
+        na.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
         write0(&na, &a, 2);
-        na.layers(&a).snapshot(Lsn::new(5), h(5)).unwrap();
+        na.layers(&a)
+            .snapshot(Lsn::new(5), h(5))
+            .unwrap()
+            .run()
+            .unwrap();
         let full = sent(&na, &a, None, Lsn::new(2));
         assert!(nb
             .receive(
@@ -2534,7 +2614,7 @@ mod tests {
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
         write0(&p, &a, 1);
-        l.snapshot(Lsn::new(2), h(2)).unwrap();
+        l.snapshot(Lsn::new(2), h(2)).unwrap().run().unwrap();
         write0(&p, &a, 2);
         calls(&p);
         assert_eq!(l.discarded_blocks(), None, "nothing rolled back yet");
@@ -2562,8 +2642,8 @@ mod tests {
         let a = ds("tank/v-a");
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
-        l.snapshot(Lsn::new(2), h(2)).unwrap();
-        l.snapshot(Lsn::new(4), h(4)).unwrap();
+        l.snapshot(Lsn::new(2), h(2)).unwrap().run().unwrap();
+        l.snapshot(Lsn::new(4), h(4)).unwrap().run().unwrap();
         write0(&p, &a, 9);
         calls(&p);
         assert!(l

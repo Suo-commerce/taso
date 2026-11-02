@@ -2290,13 +2290,17 @@ pub(crate) mod tests {
     }
 
     impl Layers for FakeLayers {
-        fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        fn snapshot(
+            &mut self,
+            lsn: Lsn,
+            hash: HashVal,
+        ) -> Result<crate::chronicle::Thaw, LayerError> {
             let mut p = self.pool.0.borrow_mut();
             let d = p.get_mut(&self.ds).ok_or("no dataset")?;
             if d.snaps.insert(lsn, hash).is_some() {
                 return Err("exists".into());
             }
-            Ok(())
+            Ok(crate::chronicle::Thaw::none())
         }
         fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
             // As `zfs list`: a dataset that does not exist is an error.

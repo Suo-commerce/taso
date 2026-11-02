@@ -578,6 +578,7 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
         self.pool
             .layers(&bd)
             .snapshot(LAYER_LSN, build_hash(t))
+            .and_then(crate::chronicle::Thaw::run)
             .map_err(TemplateError::Pool)?;
         // The full stream, to a temporary file: its key, then the put.
         let tmp_dir = self.state_dir.join("layers").join("tmp");
@@ -1017,7 +1018,11 @@ mod tests {
     }
 
     impl Layers for DirLayers {
-        fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        fn snapshot(
+            &mut self,
+            lsn: Lsn,
+            hash: HashVal,
+        ) -> Result<crate::chronicle::Thaw, LayerError> {
             std::fs::create_dir_all(&self.snaps)?;
             let to = self.snaps.join(lsn.get().to_string());
             if to.exists() {
@@ -1025,7 +1030,7 @@ mod tests {
             }
             copy_tree(&self.data, &to)?;
             std::fs::write(to.with_extension("hash"), hash.as_bytes())?;
-            Ok(())
+            Ok(crate::chronicle::Thaw::none())
         }
         fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
             let mut out = Vec::new();
@@ -1148,7 +1153,7 @@ mod tests {
             if !child.wait()?.success() {
                 return Err("tar -x failed".into());
             }
-            self.layers(d).snapshot(to.0, to.1)?;
+            self.layers(d).snapshot(to.0, to.1)?.run()?;
             Ok(crate::blk::guid(to.0, to.1))
         }
         fn adopt(

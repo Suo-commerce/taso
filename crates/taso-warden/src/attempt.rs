@@ -530,6 +530,7 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
         self.pool
             .layers(&ds)
             .snapshot(CANDIDATE_LSN, st.artifact_key)
+            .and_then(crate::chronicle::Thaw::run)
             .map_err(|e| format!("sealing {ds}: {e}"))?;
         let cand_view = self
             .pool

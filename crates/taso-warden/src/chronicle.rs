@@ -138,6 +138,77 @@ const LOCK_FILE: &str = "LOCK";
 /// Error from a layer store.
 pub type LayerError = Box<dyn std::error::Error + Send + Sync>;
 
+/// What a [`Layers::snapshot`] leaves to do once it has made the layer:
+/// the thaw of a frozen Vessel (the block log), or nothing (ZFS, whose
+/// snapshot freezes nothing).  The Chronicle runs it beside the Seal
+/// record's commit and answers the Seal only once both are done (P5, the
+/// 50 ms line, bite 2: `claude/Taso_design_seal_overlap_2026-11-02.md`).
+///
+/// A thaw is never lost: one dropped without being run runs then, so no
+/// path out of a Seal leaves its Vessel frozen.
+#[must_use = "a Vessel stays frozen until its thaw runs"]
+pub struct Thaw(Option<Box<dyn FnOnce() -> Result<(), LayerError> + Send>>);
+
+impl Thaw {
+    /// Nothing to do after the layer.
+    pub fn none() -> Self {
+        Self(None)
+    }
+    /// `thaw` is to run after the layer, before the Seal is answered.
+    pub fn later(thaw: impl FnOnce() -> Result<(), LayerError> + Send + 'static) -> Self {
+        Self(Some(Box::new(thaw)))
+    }
+    /// Run it here and now.
+    pub fn run(mut self) -> Result<(), LayerError> {
+        self.0.take().map_or(Ok(()), |f| f())
+    }
+    /// Start it on a thread of `scope` (none for nothing to do); its
+    /// result is [`Thawing::finish`]'s.  The thread holds at E3's
+    /// `seal.thawing` first, so a crash can be put exactly where the
+    /// record is committed and the Vessel still frozen.
+    fn start<'scope>(mut self, scope: &'scope std::thread::Scope<'scope, '_>) -> Thawing<'scope> {
+        Thawing(self.0.take().map(|f| {
+            scope.spawn(move || {
+                taso_core::hold("seal.thawing");
+                f()
+            })
+        }))
+    }
+}
+
+impl Drop for Thaw {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            let _ = f();
+        }
+    }
+}
+
+impl fmt::Debug for Thaw {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Thaw(pending)"
+        } else {
+            "Thaw(none)"
+        })
+    }
+}
+
+/// A [`Thaw`] running beside the commit.
+struct Thawing<'scope>(Option<std::thread::ScopedJoinHandle<'scope, Result<(), LayerError>>>);
+
+impl Thawing<'_> {
+    /// Wait for it.
+    fn finish(self) -> Result<(), LayerError> {
+        match self.0 {
+            None => Ok(()),
+            Some(h) => h
+                .join()
+                .unwrap_or_else(|_| Err("the thaw's thread panicked".into())),
+        }
+    }
+}
+
 /// Where Seal layers live: ZFS snapshots in Phase 1 (Btrfs is the
 /// fallback; v1.0 §3).
 ///
@@ -145,8 +216,11 @@ pub type LayerError = Box<dyn std::error::Error + Send + Sync>;
 /// else on the dataset is ignored, never destroyed.
 pub trait Layers {
     /// Freeze the current state as the layer for the Seal record at `lsn`
-    /// with hash `hash`.  An existing layer at `lsn` is an error.
-    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError>;
+    /// with hash `hash`.  An existing layer at `lsn` is an error.  What is
+    /// left to do once the layer exists (a frozen Vessel's thaw) comes
+    /// back as a [`Thaw`]; every store says what, none by default (the
+    /// lesson of a wrapper that forwards, 2026-10-29).
+    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError>;
     /// Every Seal layer, as `(lsn, record hash)`, in lsn order.
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError>;
     /// Destroy the layer at `lsn`, if it exists.  Used only for orphans:
@@ -188,7 +262,7 @@ pub trait Layers {
 pub(crate) struct NoLayers;
 
 impl Layers for NoLayers {
-    fn snapshot(&mut self, lsn: Lsn, _: HashVal) -> Result<(), LayerError> {
+    fn snapshot(&mut self, lsn: Lsn, _: HashVal) -> Result<Thaw, LayerError> {
         Err(format!("a records-only Chronicle has no layers (lsn {})", lsn.get()).into())
     }
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
@@ -226,9 +300,10 @@ impl<R: Runner> ZfsLayers<R> {
 }
 
 impl<R: Runner> Layers for ZfsLayers<R> {
-    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError> {
+        // A ZFS snapshot is atomic and freezes nothing: no thaw.
         self.zfs.snapshot(&self.dataset, lsn, hash)?;
-        Ok(())
+        Ok(Thaw::none())
     }
 
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
@@ -313,6 +388,16 @@ pub enum ChronicleError {
     },
     /// A Checkpoint needs the Lineage record, and this log has none.
     NoLineage,
+    /// The Seal at `seal` is recorded and accepted, and its Vessel's thaw
+    /// failed after it: the Seal stands (it is the Vessel's last), the
+    /// Vessel is still frozen, and the Chronicle stops until it is opened
+    /// again, which settles the Vessel from that Seal (bite 2, s-c).
+    ThawFailed {
+        /// The Seal that stands.
+        seal: Lsn,
+        /// Why the thaw failed.
+        why: String,
+    },
 }
 
 impl fmt::Display for ChronicleError {
@@ -344,6 +429,12 @@ impl fmt::Display for ChronicleError {
                 write!(f, "record at lsn {} does not decode: {error}", lsn.get())
             }
             Self::NoLineage => write!(f, "the log has no Lineage record to checkpoint"),
+            Self::ThawFailed { seal, why } => write!(
+                f,
+                "the Seal at lsn {} is recorded; its Vessel's thaw failed after it, so the \
+                 Vessel is still frozen ({why}); reopen to settle it from that Seal",
+                seal.get()
+            ),
             Self::GapPending { kept, head } => write!(
                 f,
                 "a takeover after a gap ({}..={}) was interrupted; open_after_gap finishes it",
@@ -868,34 +959,75 @@ impl<L: Layers> Chronicle<L> {
         let snap = crate::timing::span("seal.snapshot");
         let made = match make {
             None => self.layers.snapshot(lsn, hash),
-            Some(make) => make(lsn, hash),
+            // A promotion's adoption: nothing frozen to thaw (s-e).
+            Some(make) => make(lsn, hash).map(|()| Thaw::none()),
         };
         drop(snap);
-        if let Err(e) = made {
-            // The layer may exist though the call failed (on the block log:
-            // the Seal made, the thaw after it failed).  Treated as any
-            // orphan of a failed Seal: destroyed, or the Chronicle stops
-            // (destroying an absent layer is nothing).
-            self.drop_orphan(lsn);
-            return Err(ChronicleError::Layer(e));
-        }
-        if let Err(why) = check() {
-            self.drop_orphan(lsn);
-            return Err(ChronicleError::CheckFailed(why));
-        }
-        taso_core::hold("seal.recorded");
-        match self.commit(&rec) {
-            Ok(head) => {
+        let thaw = match made {
+            Ok(thaw) => thaw,
+            Err(e) => {
+                // The layer may exist though the call failed (on the block
+                // log: the Seal made, then refused or failed).  Treated as
+                // any orphan of a failed Seal: destroyed, or the Chronicle
+                // stops (destroying an absent layer is nothing).
+                self.drop_orphan(lsn);
+                return Err(ChronicleError::Layer(e));
+            }
+        };
+        // The layer exists.  The thaw (the kernel's, on the Vessel's own
+        // filesystem) and the check and commit (this Chronicle's segment and
+        // the coordinator) need nothing of each other, so they run side by
+        // side, and the Seal is answered only once both are done: the agent
+        // sees no difference (bite 2).  A crash can now also leave the
+        // record accepted with the Vessel still frozen; the next open
+        // settles from that Seal, as after any crash (D92).
+        let (checked, committed, thawed) = std::thread::scope(|scope| {
+            let thawing = thaw.start(scope);
+            let checked = check();
+            let committed = checked.is_ok().then(|| {
+                taso_core::hold("seal.recorded");
+                self.commit(&rec)
+            });
+            (checked, committed, thawing.finish())
+        });
+        match (checked, committed, thawed) {
+            (Ok(()), Some(Ok(head)), Ok(())) => {
                 let seal = Position { lsn, hash };
                 self.last_seal = Some(seal);
                 Ok(Sealed { seal, head })
             }
-            Err(e) => {
+            (Ok(()), Some(Ok(_)), Err(why)) => {
+                // s-c: the record is accepted, so the Seal stands and is the
+                // Vessel's last; the Vessel is still frozen, so nothing more
+                // may run on it.  The Chronicle stops (as when an orphan
+                // cannot be destroyed) and the next open settles from here.
+                self.last_seal = Some(Position { lsn, hash });
+                self.health = Health::Poisoned;
+                Err(ChronicleError::ThawFailed {
+                    seal: lsn,
+                    why: why.to_string(),
+                })
+            }
+            (Err(why), _, thawed) => {
+                self.drop_orphan(lsn);
+                // A failed thaw is the urgent one (the Vessel is still
+                // frozen), as it was when the thaw came before the check.
+                Err(match thawed {
+                    Ok(()) => ChronicleError::CheckFailed(why),
+                    Err(t) => ChronicleError::Layer(t),
+                })
+            }
+            (Ok(()), Some(Err(e)), _) => {
+                // The record was not accepted: the layer is an orphan, as
+                // before.  The commit's error is the one returned, failed
+                // thaw or not: it fences or poisons the Chronicle, which
+                // stops the run either way.
                 if self.health != Health::Poisoned {
                     self.drop_orphan(lsn);
                 }
                 Err(e)
             }
+            (Ok(()), None, _) => unreachable!("a passed check always commits"),
         }
     }
 
@@ -1430,6 +1562,14 @@ mod tests {
         /// `destroy` refuses, as the block log's does while the state
         /// stands on the layer; `destroy_orphan` (at open) still works.
         refuse_destroy: Rc<RefCell<bool>>,
+        /// Every snapshot hands back a thaw, as the block log's does, so
+        /// every Seal here runs its thaw beside its commit (bite 2).  The
+        /// thaw counts itself, sleeps `thaw_ms`, then fails if told to.
+        thaws: Arc<std::sync::atomic::AtomicUsize>,
+        thaw_fails: Arc<std::sync::atomic::AtomicBool>,
+        thaw_ms: Arc<std::sync::atomic::AtomicU64>,
+        /// When the last thaw ended.
+        thaw_end: Arc<std::sync::Mutex<Option<Instant>>>,
     }
 
     impl FakeLayers {
@@ -1439,7 +1579,7 @@ mod tests {
     }
 
     impl Layers for FakeLayers {
-        fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+        fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError> {
             let mut s = self.snaps.borrow_mut();
             if s.contains_key(&lsn) {
                 return Err(format!("layer {} exists", lsn.get()).into());
@@ -1448,7 +1588,22 @@ mod tests {
             if *self.fail_after_snapshot.borrow() {
                 return Err("crash after snapshot".into());
             }
-            Ok(())
+            use std::sync::atomic::Ordering::SeqCst;
+            let (n, fails, ms, end) = (
+                Arc::clone(&self.thaws),
+                Arc::clone(&self.thaw_fails),
+                Arc::clone(&self.thaw_ms),
+                Arc::clone(&self.thaw_end),
+            );
+            Ok(Thaw::later(move || {
+                std::thread::sleep(Duration::from_millis(ms.load(SeqCst)));
+                n.fetch_add(1, SeqCst);
+                *end.lock().unwrap() = Some(Instant::now());
+                if fails.load(SeqCst) {
+                    return Err("thaw: device gone".into());
+                }
+                Ok(())
+            }))
         }
         fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
             Ok(self.snaps())
@@ -1949,6 +2104,8 @@ mod tests {
         e.layers
             .clone()
             .snapshot(Lsn::new(9), HashVal::from_bytes([9; 32]))
+            .unwrap()
+            .run()
             .unwrap();
         let err = c.rollback_to_last_seal().unwrap_err();
         assert!(err.to_string().contains("past the last Seal"), "{err}");
@@ -1957,6 +2114,8 @@ mod tests {
         e.layers
             .clone()
             .snapshot(s1.lsn, HashVal::from_bytes([7; 32]))
+            .unwrap()
+            .run()
             .unwrap();
         let err = c.rollback_to_last_seal().unwrap_err();
         assert!(
@@ -2083,7 +2242,12 @@ mod tests {
         let mut c = e.create();
         let h = c.append(Stream::Ctl, raw(1)).unwrap();
         drop(c);
-        e.layers.clone().snapshot(h.lsn, h.hash).unwrap();
+        e.layers
+            .clone()
+            .snapshot(h.lsn, h.hash)
+            .unwrap()
+            .run()
+            .unwrap();
         let (_c, r) = e.open(A);
         assert_eq!(r.orphan_layers, vec![h.lsn]);
         assert!(e.layers.snaps().is_empty());
@@ -2440,6 +2604,8 @@ mod tests {
         let mut layers = e.layers.clone();
         layers
             .snapshot(rec.envelope.lsn, rec.envelope.hash)
+            .unwrap()
+            .run()
             .unwrap();
         let (mut seg, _) = Segment::open(&seg_path, e.coord.head(cid()).unwrap()).unwrap();
         seg.append(&rec.envelope, &rec.payload.canon_bytes())
@@ -2464,6 +2630,89 @@ mod tests {
         assert!(r.orphan_layers.is_empty());
         assert_eq!(r.last_seal, Some(s.seal));
         assert_eq!(e.layers.snaps(), vec![(s.seal.lsn, s.seal.hash)]);
+    }
+
+    /// Bite 2: the thaw runs beside the check and the commit, and the Seal
+    /// is answered only once it has finished.  The thaw here takes 300 ms;
+    /// the check runs before it ends, and the Seal returns after.
+    #[test]
+    fn a_seals_thaw_runs_beside_its_commit_and_ends_before_its_answer() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        e.layers.thaw_ms.store(300, SeqCst);
+        let checked = std::cell::Cell::new(None);
+        let s = c
+            .seal_checked(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(1), || {
+                checked.set(Some(Instant::now()));
+                Ok(())
+            })
+            .unwrap();
+        let answered = Instant::now();
+        let ended = e.layers.thaw_end.lock().unwrap().expect("the thaw ran");
+        assert_eq!(e.layers.thaws.load(SeqCst), 1);
+        assert!(
+            checked.get().unwrap() < ended,
+            "the check ran while the thaw did"
+        );
+        assert!(ended <= answered, "the Seal was answered after its thaw");
+        assert_eq!(c.last_seal(), Some(s.seal));
+    }
+
+    /// Bite 2, s-c: a thaw that fails after the Seal's record is accepted
+    /// leaves the Seal standing (it is recorded: no orphan is destroyed),
+    /// names both, and stops the Chronicle; the next open finds that Seal
+    /// as the last and nothing to clean up.
+    #[test]
+    fn a_thaw_that_fails_after_the_record_leaves_the_seal_standing() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        e.layers.thaw_fails.store(true, SeqCst);
+        let r = seal(&mut c, 1);
+        let Err(ChronicleError::ThawFailed { seal: at, why }) = r else {
+            panic!("expected ThawFailed, got {r:?}")
+        };
+        assert_eq!(at, Lsn::new(2));
+        assert!(why.contains("device gone"), "{why}");
+        assert_eq!(e.layers.snaps().len(), 1, "the recorded Seal's layer stays");
+        assert_eq!(c.last_seal().map(|p| p.lsn), Some(Lsn::new(2)));
+        assert!(
+            matches!(seal(&mut c, 2), Err(ChronicleError::Poisoned)),
+            "nothing more runs on a frozen Vessel"
+        );
+        drop(c);
+        e.layers.thaw_fails.store(false, SeqCst);
+        let (mut c, r) = e.open(A);
+        assert_eq!(r.last_seal.map(|p| p.lsn), Some(Lsn::new(2)));
+        assert!(r.orphan_layers.is_empty(), "the Seal was no orphan");
+        seal(&mut c, 2).unwrap();
+    }
+
+    /// Bite 2: a failed check with a failed thaw returns the thaw's error
+    /// (the Vessel is still frozen: the urgent one), and the layer, which
+    /// has no record, is destroyed as before.
+    #[test]
+    fn a_failed_check_with_a_failed_thaw_names_the_thaw() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let e = env();
+        let mut c = e.create();
+        c.append(Stream::Fs, raw(1)).unwrap();
+        e.layers.thaw_fails.store(true, SeqCst);
+        let r = c.seal_checked(cut(), Verdict::Clean, Lsn::new(0), TurnId::new(1), || {
+            Err("wal moved".into())
+        });
+        assert!(
+            matches!(&r, Err(ChronicleError::Layer(e)) if e.to_string().contains("device gone")),
+            "{r:?}"
+        );
+        assert!(
+            e.layers.snaps().is_empty(),
+            "no record: the layer is an orphan, destroyed"
+        );
+        assert_eq!(c.last_seal(), None);
     }
 
     /// A failed check after the snapshot leaves neither a layer nor a
@@ -2523,6 +2772,8 @@ mod tests {
         let mut layers = e.layers.clone();
         layers
             .snapshot(Lsn::new(1), HashVal::from_bytes([0xEE; 32]))
+            .unwrap()
+            .run()
             .unwrap();
         c.append(Stream::Fs, raw(1)).unwrap();
         drop(c);

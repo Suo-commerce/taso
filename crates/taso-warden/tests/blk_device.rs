@@ -372,7 +372,11 @@ fn seal_views_and_destroy_on_real_devices() {
     let mp = pool.create(&ds).unwrap().mountpoint.unwrap();
     std::fs::write(mp.join("a"), b"sealed").unwrap();
     let h = HashVal::from_bytes([3; 32]);
-    pool.layers(&ds).snapshot(Lsn::new(3), h).unwrap();
+    pool.layers(&ds)
+        .snapshot(Lsn::new(3), h)
+        .unwrap()
+        .run()
+        .unwrap();
     std::fs::write(mp.join("a"), b"after the Seal").unwrap();
 
     let view = pool.seal_view(&ds, Lsn::new(3)).unwrap();

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use taso_core::envelope::{HashVal, Lsn};
 
 use crate::blk::{BlkLayers, BlkPool, BlkSend};
-use crate::chronicle::{LayerError, Layers, ZfsLayers};
+use crate::chronicle::{LayerError, Layers, Thaw, ZfsLayers};
 use crate::ship::{ByteStream, Sender, ZfsSend};
 use crate::vessel::{Pool, SealView};
 use crate::zfs::{Cli, Zfs};
@@ -227,7 +227,7 @@ impl Pool for Storage {
 }
 
 impl Layers for StorageLayers {
-    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError> {
         match self {
             Self::Zfs(l) => l.snapshot(lsn, hash),
             Self::Blk(l) => l.snapshot(lsn, hash),

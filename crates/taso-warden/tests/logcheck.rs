@@ -22,9 +22,13 @@ const B: WardenId = WardenId::new(2);
 #[derive(Default)]
 struct Mem(Vec<(Lsn, HashVal)>);
 impl Layers for Mem {
-    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
+    fn snapshot(
+        &mut self,
+        lsn: Lsn,
+        hash: HashVal,
+    ) -> Result<taso_warden::chronicle::Thaw, LayerError> {
         self.0.push((lsn, hash));
-        Ok(())
+        Ok(taso_warden::chronicle::Thaw::none())
     }
     fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
         Ok(self.0.clone())
