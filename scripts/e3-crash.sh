@@ -882,7 +882,7 @@ burst_line() { # burst_line TAG RC_A RC_B LINES_A LINES_B: FAIL if either failed
 round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's files in $R
     local seq=$1 point=$2 mode=$3 subject O="$R/r.json"
     subject="e3-$(date +%s%N | tail -c 9)"
-    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 ct cr hname="" held_flag="" log_ino="" tk="" inflight=""
+    local kind=${point%%:*} at=${point#*:} k delay=0 P C child="" turn rep lsn ms missed="" acks_err=0 held_ack="" ct cr hname="" held_flag="" log_ino="" tk="" inflight=""
     local -a ops henv=(); read -ra ops <<<"$seq"
     if [[ "$kind" == takeover ]]; then
         # E3-4: the point is a boundary or a shipping hold, driven as those are;
@@ -1028,7 +1028,15 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
             [[ "$(cat "$R/compact.out" 2>/dev/null)" == ok* ]] && acks_err=$((acks_err + 1))
         elif [[ "$hname" != seal.shipped ]] && reply "$P" 10; then   # seal.shipped: its reply came before the hold
             case "${ops[-1]}" in
-                seal) [[ -n "$(jget "$REPLY" sealed)" ]] && acks_err=$((acks_err + 1)) ;;
+                # seal.thawing (bite 2): the held Seal's record may be committed
+                # before the error and its thaw held past it, so its answer can
+                # rightly come after the error.  Not counted as an ack after it:
+                # kept as an acknowledged Seal, which the oracle then requires
+                # in the image, whole (line 1) -- found by the first run,
+                # taso-test 2026-11-02, round 424.
+                seal) if [[ -n "$(jget "$REPLY" sealed)" ]]; then
+                          if [[ "$hname" == seal.thawing ]]; then held_ack=$(jget "$REPLY" sealed); else acks_err=$((acks_err + 1)); fi
+                      fi ;;
                 effect) [[ "$(jget "$REPLY" result)" == released ]] && acks_err=$((acks_err + 1)) ;;
                 fork) [[ -n "$(jget "$REPLY" child)" ]] && acks_err=$((acks_err + 1)) ;;
             esac
@@ -1091,7 +1099,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
         echo "HARNESS $tag: the reborn Warden did not start: $(grep -m1 "^taso-wardend: starting:" "$R/warden-2.err" | cut -c22-)"; return
     fi
     # 6. what the reborn Warden holds, and the grade
-    gather "$subject" "$ds" "$resume" "$acks_err" "$mode" "$resume_why" "$log_ino" >"$R/a.json" || { echo "HARNESS $tag: gather"; return; }
+    HELD_ACK="$held_ack" gather "$subject" "$ds" "$resume" "$acks_err" "$mode" "$resume_why" "$log_ino" >"$R/a.json" || { echo "HARNESS $tag: gather"; return; }
     oracle check "$O" --after "$R/a.json" || true
 }
 
@@ -1159,6 +1167,7 @@ report = "".join(lines(f) for f in sys.argv[10:])
 print(json.dumps({"seals": seals, "forks": forks, "report": report,
                   "resume_turn": int(resume) if resume else None, "resume_why": resume_why or None,
                   "acks_after_error": acks, "opened": opened, "not_run": not_run or None,
+                  "held_acked_seal": int(os.environ["HELD_ACK"]) if os.environ.get("HELD_ACK") else None,
                   "log_inode": {"before": ino(sys.argv[8]), "after": ino(sys.argv[9])} if sys.argv[8] else None}, indent=1))
 PY
 }

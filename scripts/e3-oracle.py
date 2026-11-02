@@ -33,6 +33,7 @@ the reborn Warden opened the Vessel, "not_run" its own word why not):
    "forks": ["child name", ...], "report": "the Warden's and taso-blkd's stderr after rebirth",
    "resume_turn": T|null, "resume_why": "why no resume turn was taken"|null,
    "acks_after_error": N, "opened": bool, "not_run": "…"|null,
+   "held_acked_seal": L|null,   (seal.thawing under error: the held Seal, answered after the error)
    "log_inode": {"before": I, "after": I|null}|null}     (compact.written only)
 
 At a hold the point is exact, so three windows are graded exactly
@@ -218,6 +219,20 @@ def check(r, a):
             fails.append(f"{'2' if infl_op == 'seal' else '4'}: in-flight {infl_op} left Seal lsn {l} not whole: {rows}")
         else:
             fails.append(f"2: Seal lsn {l} is listed and was never requested: {rows}")
+    # 1c (bite 2, seal.thawing under error): the held Seal's record was committed before the error
+    # and its thaw held past it, so its answer came after the error.  It is an acknowledged Seal:
+    # it must be in the image, whole, like every other (D92) -- never excused as "after the error".
+    ha = a.get("held_acked_seal")
+    if ha is not None:
+        if held != "seal.thawing" or infl_op != "seal":
+            fails.append(f"harness: a held Seal's acknowledgement (lsn {ha}) recorded at {held}; only seal.thawing has one")
+        elif ha not in listed:
+            fails.append(f"1 (seal.thawing): the held Seal lsn {ha} was acknowledged and is not listed after rebirth")
+        elif listed[ha].get("rows", {}) != m["parent_now"]:
+            fails.append(f"1 (seal.thawing): the acknowledged held Seal lsn {ha} holds {listed[ha].get('rows')}, "
+                         f"promised {m['parent_now']}")
+        else:
+            notes.append(f"the held Seal lsn {ha}, answered after the error, was durable before it")
     # 1b (D92, D93 (i)): acknowledged writes after the last retained Seal are discarded by the reset, and named
     # — as blocks of the Vessel's filesystem.  The Chronicle count in the reset line does not name them: a
     # SQLite write adds no Chronicle record, and the Warden appends housekeeping after a Seal anyway
@@ -397,6 +412,14 @@ def selftest():
         ("hold fail: seal.recorded, the held Seal listed whole", "seal.recorded", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
         ("hold pass: seal.frozen, in-flight Seal absent", "seal.frozen", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0}, 0),
         ("hold fail: seal.frozen, the held Seal listed whole", "seal.frozen", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
+        # Bite 2: seal.thawing.  The held Seal may land or not; once answered (under error,
+        # after it) it is acknowledged, so it must be there, whole.
+        ("hold pass: seal.thawing, in-flight Seal landed whole", "seal.thawing", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 0),
+        ("hold pass: seal.thawing, in-flight Seal absent", "seal.thawing", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0}, 0),
+        ("hold pass: seal.thawing, the answered Seal there whole", "seal.thawing", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "held_acked_seal": 9}, 0),
+        ("hold fail: seal.thawing, the answered Seal lost", "seal.thawing", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0, "held_acked_seal": 9}, 1),
+        ("hold fail: seal.thawing, the answered Seal not whole", "seal.thawing", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 3})], "report": B, "resume_turn": 1, "held_acked_seal": 9}, 1),
+        ("hold fail: an answered held Seal at seal.frozen (harness)", "seal.frozen", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0, "held_acked_seal": 9}, 1),
         ("hold pass: fork.branched, no child ran", "fork.branched", [W(1), SL(9, 1)], ("fork", {}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 0),
         ("hold fail: fork.branched, the held child ran", "fork.branched", [W(1), SL(9, 1)], ("fork", {}), {"seals": [S(9, {"1": 8})], "forks": ["c"], "report": B, "resume_turn": 1}, 1),
         ("hold pass: compact.written, the old log reopened", "compact.written", [W(1), SL(9, 1)], None, {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1, "log_inode": {"before": 12, "after": 12}}, 0),
