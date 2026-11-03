@@ -1199,25 +1199,23 @@ PY
 }
 
 # ── the timing steps, measured ((t-2), 2026-11-03) ────────────────────
-# Each on a stack as its rounds use, each Seal timed with bash's own clock
-# ($EPOCHREALTIME, no fork) from the op's send returning to its reply being
-# there -- the sweep's own clock: a timing round sleeps its delay from the
-# same instant and asks the same file.  Replies are polled at 1 ms here
-# (t-e; the agent polls its op file every 2 ms).  The step is a quarter of
-# the median, whole ms, never under 2 (t-a).  The delay's floor, what
-# `nap 0` takes, is measured beside it: before (t-d) every delay went
-# through a python start-up first.
-quarter() { # quarter NAME US... -> "STEP p50 … (min …, max …, N NAME)" on stdout
-    python3 -I - "$@" <<'PY'
-import sys
-name, us = sys.argv[1], sorted(int(u) for u in sys.argv[2:])
-p50 = (us[len(us) // 2 - 1] + us[len(us) // 2]) / 2
-print(max(2, int(p50 / 4000)), f"p50 {p50 / 1000:.1f} ms (min {us[0] / 1000:.1f}, max {us[-1] / 1000:.1f}, {len(us)} {name})")
-PY
+# Each on a stack as its rounds use, and each by the round's own rule
+# (t-g): a pass sends the Seal, sleeps D and looks at the reply once --
+# exactly a timing point -- for D = 0, 2, 4, ... until the reply is there;
+# that D is the Seal as a round sees it.  Five passes, the median T, the
+# step T/4 in whole ms, never under 2 (t-a).  Nothing polls beside a Seal:
+# the first measurement timed twelve Seals with a 1 ms poll loop and read
+# 27-35 ms where the rounds then found their replies by 14 (taso-test,
+# 2026-11-03, MISSED 92 of 220).  The delay's floor, what `nap 0` takes,
+# is measured beside it: before (t-d) every delay went through a python
+# start-up first.
+MEASURE_PASSES=5; MEASURE_MAX_MS=200
+find_t() { # find_t -> T_MS: the median over the passes of PASS_T; "" if one pass never saw the reply
+    local -a ts; mapfile -t ts < <(printf '%s\n' "$@" | sort -n); T_MS=${ts[${#ts[@]} / 2]}
 }
 measure_lone() { # measure_lone -> STEP_MS, STEP_HOW; the line on stdout (HARNESS: measured nothing); files in $R
-    # One Vessel, `write seal` twelve times: the Seal a timing round's single Vessel makes.
-    local subject P i t0 floor; local -a us=()
+    # One Vessel, `write seal` as the round sends it: the Seal a timing round's single Vessel makes.
+    local subject P pass d t0 floor T_MS; local -a ts=()
     subject="e3-$(date +%s%N | tail -c 9)"
     "$DEVSH" make "$DEVNAME" "$WORK/dev.img" "$SIZE_MIB" >/dev/null || { echo "HARNESS measure: make"; return 1; }
     mkfs.ext4 -q -F "/dev/mapper/$DEVNAME" && mkdir -p "$D" && mount -o errors=remount-ro "/dev/mapper/$DEVNAME" "$D" \
@@ -1226,57 +1224,58 @@ measure_lone() { # measure_lone -> STEP_MS, STEP_HOW; the line on stdout (HARNES
     config "$subject" || { echo "HARNESS measure: config"; return 1; }
     start_stack 1 || { echo "HARNESS measure: taso-blkd did not start"; return 1; }
     wait_agent 120 || { echo "HARNESS measure: no agent came up (see $R/warden-1.err)"; return 1; }; P=$AGENT
-    for i in $(seq 12); do
-        step "$P" write || { echo "HARNESS measure: write $i got no reply: $WHY"; return 1; }
-        send "$P" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
-        t0=${EPOCHREALTIME/./}
-        reply "$P" 120 0.001 || { echo "HARNESS measure: seal $i got no reply: $WHY"; return 1; }
-        [[ -n "$(jget "$REPLY" sealed)" ]] || { echo "HARNESS measure: seal $i was not sealed: $REPLY"; return 1; }
-        us+=("$(( ${EPOCHREALTIME/./} - t0 ))")
+    for pass in $(seq "$MEASURE_PASSES"); do
+        for ((d = 0; d <= MEASURE_MAX_MS; d += 2)); do
+            step "$P" write || { echo "HARNESS measure: pass $pass, write before D=$d got no reply: $WHY"; return 1; }
+            send "$P" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
+            nap "$d"
+            [[ -f /proc/$P/root/tmp/e3/reply.${NEXT[$P]} ]] && ts+=("$d")
+            reply "$P" 120 || { echo "HARNESS measure: pass $pass, the seal at D=$d got no reply: $WHY"; return 1; }
+            [[ -n "$(jget "$REPLY" sealed)" ]] || { echo "HARNESS measure: pass $pass, the seal at D=$d was not sealed: $REPLY"; return 1; }
+            [[ ${#ts[@]} == "$pass" ]] && break
+        done
+        [[ ${#ts[@]} == "$pass" ]] || { echo "HARNESS measure: pass $pass never found the reply by D=$MEASURE_MAX_MS ms"; return 1; }
     done
     t0=${EPOCHREALTIME/./}; nap 0; floor=$(( ${EPOCHREALTIME/./} - t0 ))
     step "$P" exit 30 >/dev/null || true
-    printf '%s\n' "${us[@]}" >"$R/seals-us.txt"
-    read -r STEP_MS STEP_HOW < <(quarter "lone Seals" "${us[@]}")
-    [[ "$STEP_MS" =~ ^[0-9]+$ ]] || { echo "HARNESS measure: no step from the Seals timed (see $R/seals-us.txt)"; return 1; }
-    STEP_HOW="= p50/4 of a lone Seal here: $STEP_HOW; the delay's floor $((floor / 1000)).$((floor % 1000 / 100)) ms"
+    printf '%s\n' "${ts[@]}" >"$R/seal-t-ms.txt"
+    find_t "${ts[@]}"; STEP_MS=$(( T_MS / 4 )); (( STEP_MS >= 2 )) || STEP_MS=2
+    STEP_HOW="= T/4, T = $T_MS ms the delay at which a round first finds a lone Seal's reply (passes: ${ts[*]}; 2 ms steps); the delay's floor $((floor / 1000)).$((floor % 1000 / 100)) ms"
     echo "== the timing step S = $STEP_MS ms $STEP_HOW"
 }
 measure_burst() { # measure_burst -> BSTEP_MS, BSTEP_HOW; the line on stdout (HARNESS: measured nothing); files in $R (t-f)
-    # Two Vessels as a burst round's, the prefix `write seal` each, then six
-    # bursts -- both writes waited for, both Seals sent without waiting --
-    # each timed from the second send returning to the later reply being
-    # there: what a burst's MISSED is judged by.
-    local tag=measure base v i t0 tk="" f0 f1; local -a bsubj BP=() bturn=() bds=() henv=() us=()
+    # Two Vessels as a burst round's, the prefix `write seal` each, then the
+    # burst as the round sends it -- both writes waited for, both Seals sent
+    # without waiting, sleep D, both replies looked at once: what a burst's
+    # MISSED is judged by.
+    local tag=measure base v pass d tk="" T_MS; local -a bsubj BP=() bturn=() bds=() henv=() ts=()
     base="e3-$(date +%s%N | tail -c 9)"; bsubj=("$base-a" "$base-b")
     burst_up || return 1
     for v in 0 1; do
         step "${BP[v]}" "$([[ $v == 0 ]] && echo write || echo "write 2")" || { echo "HARNESS measure: ${bsubj[v]}'s write got no reply: $WHY"; return 1; }
         step "${BP[v]}" seal || { echo "HARNESS measure: ${bsubj[v]}'s seal got no reply: $WHY"; return 1; }
     done
-    for i in $(seq 6); do
-        for v in 0 1; do
-            step "${BP[v]}" "$([[ $v == 0 ]] && echo write || echo "write 2")" || { echo "HARNESS measure: burst $i: ${bsubj[v]}'s write got no reply: $WHY"; return 1; }
+    for pass in $(seq "$MEASURE_PASSES"); do
+        for ((d = 0; d <= MEASURE_MAX_MS; d += 2)); do
+            for v in 0 1; do
+                step "${BP[v]}" "$([[ $v == 0 ]] && echo write || echo "write 2")" || { echo "HARNESS measure: pass $pass, ${bsubj[v]}'s write before D=$d got no reply: $WHY"; return 1; }
+            done
+            send "${BP[0]}" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
+            send "${BP[1]}" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
+            nap "$d"
+            [[ -f /proc/${BP[0]}/root/tmp/e3/reply.${NEXT[${BP[0]}]} && -f /proc/${BP[1]}/root/tmp/e3/reply.${NEXT[${BP[1]}]} ]] && ts+=("$d")
+            for v in 0 1; do
+                reply "${BP[v]}" 120 || { echo "HARNESS measure: pass $pass, ${bsubj[v]}'s seal at D=$d got no reply: $WHY"; return 1; }
+                [[ -n "$(jget "$REPLY" sealed)" ]] || { echo "HARNESS measure: pass $pass, ${bsubj[v]}'s seal at D=$d was not sealed: $REPLY"; return 1; }
+            done
+            [[ ${#ts[@]} == "$pass" ]] && break
         done
-        send "${BP[0]}" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
-        send "${BP[1]}" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
-        t0=${EPOCHREALTIME/./}
-        f0=/proc/${BP[0]}/root/tmp/e3/reply.${NEXT[${BP[0]}]}; f1=/proc/${BP[1]}/root/tmp/e3/reply.${NEXT[${BP[1]}]}
-        while [[ ! -f "$f0" || ! -f "$f1" ]]; do
-            (( ${EPOCHREALTIME/./} - t0 < 120000000 )) || { echo "HARNESS measure: burst $i: no reply in 120 s"; return 1; }
-            sleep 0.001
-        done
-        us+=("$(( ${EPOCHREALTIME/./} - t0 ))")
-        for v in 0 1; do   # taken, as the round takes them (the agent waits for its reply to go)
-            reply "${BP[v]}" 5 || { echo "HARNESS measure: burst $i: ${bsubj[v]}'s reply vanished: $WHY"; return 1; }
-            [[ -n "$(jget "$REPLY" sealed)" ]] || { echo "HARNESS measure: burst $i: ${bsubj[v]}'s seal was not sealed: $REPLY"; return 1; }
-        done
+        [[ ${#ts[@]} == "$pass" ]] || { echo "HARNESS measure: pass $pass never found both replies by D=$MEASURE_MAX_MS ms"; return 1; }
     done
     for v in 0 1; do step "${BP[v]}" exit 30 >/dev/null || true; done
-    printf '%s\n' "${us[@]}" >"$R/bursts-us.txt"
-    read -r BSTEP_MS BSTEP_HOW < <(quarter "bursts of two Seals" "${us[@]}")
-    [[ "$BSTEP_MS" =~ ^[0-9]+$ ]] || { echo "HARNESS measure: no step from the bursts timed (see $R/bursts-us.txt)"; return 1; }
-    BSTEP_HOW="= p50/4 of two Seals together here: $BSTEP_HOW"
+    printf '%s\n' "${ts[@]}" >"$R/burst-t-ms.txt"
+    find_t "${ts[@]}"; BSTEP_MS=$(( T_MS / 4 )); (( BSTEP_MS >= 2 )) || BSTEP_MS=2
+    BSTEP_HOW="= T/4, T = $T_MS ms the delay at which a round first finds both of a burst's replies (passes: ${ts[*]}; 2 ms steps)"
     echo "== the burst step B = $BSTEP_MS ms $BSTEP_HOW"
 }
 
