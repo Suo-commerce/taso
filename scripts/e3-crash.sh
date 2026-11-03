@@ -33,7 +33,12 @@
 #
 # Points: boundary:k (after op k's reply, before op k+1; k = the length is
 # after the last op); timing:k+D (op k sent, the swap D ms later, on `seal`
-# only; MISSED, never covered, if the reply was already there);
+# only; MISSED, never covered, if the reply was already there; D runs over
+# 0, S, 2S, 3S, where the step S is a quarter of the Seal this host makes:
+# `run` measures twelve Seals first, as a round does, and takes S = p50/4,
+# so the four points sit at 0, 1/4, 1/2, 3/4 of the median Seal on any host
+# -- (t-2), 2026-11-03; before it S was 10 ms fixed, and a faster Seal left
+# a fifth of the subset MISSED);
 # hold:NAME (E3-3c: the first stack starts with TASO_E3_HOLD=NAME; the
 # harness arms the hold just before the last op, or before a `compact`
 # sent to taso-blkd after the last op for compact.written, sends it without
@@ -71,8 +76,9 @@
 # $WORK/h, $RUN/run-*, $RUN/{coord,blkb,blkc}.sock, $MNT/b and $MNT/c).
 # Every wait is bounded; a
 # teardown that fails is a HARNESS line, never a pass.  Env: E3_WORK,
-# E3_SIZE_MIB (2048), E3_ROWS (8), E3_STEP_MS (25), KEEP_FAILS (3: images
-# of the newest failing rounds kept).
+# E3_SIZE_MIB (2048), E3_ROWS (8), E3_STEP_MS (the timing step, ms; unset:
+# measured by `run`, 10 for `list` and a `round` by hand), KEEP_FAILS (3:
+# images of the newest failing rounds kept).
 
 set -Eeuo pipefail
 # An unguarded failure says where it was; set -e alone ends the script silently
@@ -86,8 +92,14 @@ MNT=/mnt/e3
 DEVNAME=e3crash
 SIZE_MIB=${E3_SIZE_MIB:-2048}
 ROWS=${E3_ROWS:-8}
-STAGGER_MS=${E3_STAGGER_MS:-10}   # E3-c2: the second Vessel's Seal after the first's, in a staggered burst
-STEP_MS=${E3_STEP_MS:-10}   # a Seal takes ~40 ms on taso-test: 25 put three of four delays past it (111 MISSED of 220)
+# The timing step S: the sweep's delays are 0, S, 2S, 3S; a burst's 0, S/2, S,
+# 2S, 3S, and its stagger (E3-c2: the second Vessel's Seal after the first's)
+# S/2.  Set by hand (E3_STEP_MS), else measured by `run` (measure_step), else
+# 10 for `list` and a `round` by hand.  Before (t-2) it was 10 ms fixed, read
+# off a 40 ms Seal: 25 put three of four delays past it (111 MISSED of 220).
+STEP_MS=${E3_STEP_MS:-}
+STEP_HOW=${E3_STEP_MS:+set by hand (E3_STEP_MS)}
+nap() { sleep "$(($1 / 1000)).$(printf '%03d' "$(($1 % 1000))")"; }   # nap MS: no interpreter on the way (t-d)
 KEEP_FAILS=${KEEP_FAILS:-3}
 DEVSH=$PWD/scripts/e3-device.sh
 ORACLE=$PWD/scripts/e3-oracle.py
@@ -103,8 +115,8 @@ say() { printf '== %s\n' "$*"; }
 oracle() { python3 -I "$ORACLE" "$@"; }
 
 # ── the manifest ──────────────────────────────────────────────────────
-manifest() { # manifest [--subset] -> lines "SEQ|POINT|MODE"
-    python3 -I - "${1:-}" "$STEP_MS" <<'PY'
+manifest() { # manifest [--subset] -> lines "SEQ|POINT|MODE"; the timing points from STEP_MS (10 if unset)
+    python3 -I - "${1:-}" "${STEP_MS:-10}" <<'PY'
 import itertools, sys
 subset, step = sys.argv[1] == "--subset", int(sys.argv[2])
 OPS = ["write", "seal", "fork", "promote", "effect"]
@@ -143,10 +155,12 @@ if not subset:
     print("write effect|takeover:ledger.shipped|drop")
 # E3-c2 (design rev. 2, decided 2026-10-30): two Vessels on one Warden, each
 # `write seal` first, then a burst -- both `write`, then both `seal` without
-# waiting (all: together; stagger: the second STAGGER_MS after the first) --
+# waiting (all: together; stagger: the second S/2 after the first) --
 # cut at a timing point or a hold; in the subset from the start (c-e).
+# The delays in the step's unit, (0, 1/2, 1, 2, 3) S ((t-2), t-b: before it
+# (0, 5, 10, 20, 40) at S = 10, the last past a Seal by arithmetic).
 for shape in ("all", "stagger"):
-    for d in (0, 5, 10, 20, 40):
+    for d in (0, step // 2, step, 2 * step, 3 * step):
         print(f"write seal|burst:{shape}:timing+{d}|drop")
     for name in ("seal.frozen", "seal.recorded", "seal.shipped"):
         for mode in ("drop", "error"):
@@ -167,6 +181,7 @@ PY
 if [[ "${1:-}" == list ]]; then
     m=$(manifest "${2:-}")
     printf '%s\n' "$m"
+    echo "# timing and burst delays at the step S = ${STEP_MS:-10} ms ${STEP_HOW:-(a run measures its own: S = p50/4 of the Seal here)}"
     printf '%s\n' "$m" | python3 -I -c '
 import sys, collections
 rows = [l.strip().split("|") for l in sys.stdin if l.strip()]
@@ -247,8 +262,8 @@ send() { # send PID OP: the op file, whole; no wait
     local n=${NEXT[$1]} dir=/proc/$1/root/tmp/e3
     printf '%s\n' "$2" | nsenter -t "$1" -U -S 0 -G 0 -- sh -c "cat >'$dir/.op.$n' && mv '$dir/.op.$n' '$dir/op.$n'"
 }
-reply() { # reply PID SECONDS -> REPLY, the reply to the last op sent; fails (WHY says) on a timeout or the agent gone
-    local p=$1 n=${NEXT[$1]} deadline=$((SECONDS + $2))
+reply() { # reply PID SECONDS [POLL] -> REPLY, the reply to the last op sent; fails (WHY says) on a timeout or the agent gone
+    local p=$1 n=${NEXT[$1]} deadline=$((SECONDS + $2)) poll=${3:-0.01}
     local f=/proc/$1/root/tmp/e3/reply.$n
     while ((SECONDS < deadline)); do
         # Taken: read, then removed (the agent waits for its last reply to go, E3-3a).
@@ -257,7 +272,7 @@ reply() { # reply PID SECONDS -> REPLY, the reply to the last op sent; fails (WH
         # namespace may be refused while it lives (taso-test, 2026-10-27:
         # every first reply was given up on at 0 s).
         [[ -d /proc/$p ]] || { WHY="the agent (pid $p) is gone"; return 1; }
-        sleep 0.01
+        sleep "$poll"
     done
     WHY="no reply in $2 s (agent pid $p alive)"
     return 1
@@ -646,7 +661,7 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
     [[ -n "$hname" ]] && : >"$RUN/hold/$hname.arm"
     for v in 0 1; do oracle requested "${BO[v]}" seal turn="${bturn[v]}"; done
     send "${BP[0]}" seal || { echo "HARNESS $tag: the op file could not be written"; return; }
-    [[ "$shape" == stagger ]] && sleep "$(python3 -I -c "print($STAGGER_MS / 1000)")"
+    [[ "$shape" == stagger ]] && nap $(( ${STEP_MS:-10} / 2 ))   # (t-2), t-c: an eighth of a Seal into the first's
     send "${BP[1]}" seal || { echo "HARNESS $tag: the op file could not be written"; return; }
     # 4. the point
     if [[ -n "$hname" ]]; then
@@ -658,7 +673,7 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
             oracle acknowledged "${BO[v]}" seal turn="$(jget "$rep" turn)" ${lsn:+seal=$lsn}
         done
     else
-        sleep "$(python3 -I -c "print($delay / 1000)")"
+        nap "$delay"
     fi
     # What was acknowledged is what was read before the swap began (c-a).
     for v in 0 1; do
@@ -951,7 +966,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
         fi
         if [[ "$kind" == timing && $i == "$k" ]]; then
             oracle requested "$O" "$op" turn="$turn"
-            send "$P" "$op"; sleep "$(python3 -I -c "print($delay / 1000)")"
+            send "$P" "$op"; nap "$delay"
             [[ -f /proc/$P/root/tmp/e3/reply.${NEXT[$P]} ]] && missed=--missed
             break
         fi
@@ -1172,6 +1187,48 @@ print(json.dumps({"seals": seals, "forks": forks, "report": report,
 PY
 }
 
+# ── the timing step, measured ((t-2), 2026-11-03) ─────────────────────
+measure_step() { # measure_step -> STEP_MS, STEP_HOW; the line on stdout (HARNESS: measured nothing); files in $R
+    # A stack as a round's (the device, ext4, one Vessel, taso-sim --step),
+    # then `write seal` twelve times, each Seal timed from the op's send
+    # returning to its reply being there -- the sweep's own clock: a timing
+    # round sleeps its delay from the same instant and asks the same file.
+    # The reply is polled at 1 ms here (t-e; the agent polls its op file
+    # every 2 ms), and the clock is bash's own ($EPOCHREALTIME, no fork).
+    # The delay's floor, what `nap 0` takes, is measured beside it: before
+    # (t-d) every delay went through a python start-up first.
+    local subject P i t0 floor; local -a us=()
+    subject="e3-$(date +%s%N | tail -c 9)"
+    "$DEVSH" make "$DEVNAME" "$WORK/dev.img" "$SIZE_MIB" >/dev/null || { echo "HARNESS measure: make"; return 1; }
+    mkfs.ext4 -q -F "/dev/mapper/$DEVNAME" && mkdir -p "$D" && mount -o errors=remount-ro "/dev/mapper/$DEVNAME" "$D" \
+        || { echo "HARNESS measure: mkfs or mount of the device"; return 1; }
+    mkdir -p "$D/store" "$D/state" "$D/spool" "$RUN/run"
+    config "$subject" || { echo "HARNESS measure: config"; return 1; }
+    start_stack 1 || { echo "HARNESS measure: taso-blkd did not start"; return 1; }
+    wait_agent 120 || { echo "HARNESS measure: no agent came up (see $R/warden-1.err)"; return 1; }; P=$AGENT
+    for i in $(seq 12); do
+        step "$P" write || { echo "HARNESS measure: write $i got no reply: $WHY"; return 1; }
+        send "$P" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
+        t0=${EPOCHREALTIME/./}
+        reply "$P" 120 0.001 || { echo "HARNESS measure: seal $i got no reply: $WHY"; return 1; }
+        [[ -n "$(jget "$REPLY" sealed)" ]] || { echo "HARNESS measure: seal $i was not sealed: $REPLY"; return 1; }
+        us+=("$(( ${EPOCHREALTIME/./} - t0 ))")
+    done
+    t0=${EPOCHREALTIME/./}; nap 0; floor=$(( ${EPOCHREALTIME/./} - t0 ))
+    step "$P" exit 30 >/dev/null || true
+    printf '%s\n' "${us[@]}" >"$R/seals-us.txt"
+    read -r STEP_MS STEP_HOW < <(python3 -I - "$floor" "${us[@]}" <<'PY'
+import sys
+floor, us = int(sys.argv[1]), sorted(int(u) for u in sys.argv[2:])
+p50 = (us[len(us) // 2 - 1] + us[len(us) // 2]) / 2
+step = max(2, int(p50 / 4000))   # a quarter of the median Seal, whole ms, never under 2 (t-a)
+print(step, f"= p50/4 of a Seal here: p50 {p50 / 1000:.1f} ms (min {us[0] / 1000:.1f}, max {us[-1] / 1000:.1f}, {len(us)} Seals); the delay's floor {floor / 1000:.1f} ms")
+PY
+    )
+    [[ "$STEP_MS" =~ ^[0-9]+$ ]] || { echo "HARNESS measure: no step from the Seals timed (see $R/seals-us.txt)"; return 1; }
+    echo "== the timing step S = $STEP_MS ms $STEP_HOW"
+}
+
 # ── commands ──────────────────────────────────────────────────────────
 OUT=$WORK/results-$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
@@ -1214,6 +1271,21 @@ case "${1:-}" in
         shift; sub=""; limit=0; only=""
         while (($#)); do case "$1" in --subset) sub=--subset ;; --only) only=$2; shift ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--only KIND] [--limit N]" ;; esac; shift; done
         [[ -z "$only" || "$only" =~ ^(boundary|timing|hold|takeover|burst)$ ]] || die "--only boundary|timing|hold|takeover|burst"
+        # The step first, when a timing or burst round is coming and none was set by hand:
+        # measured, not guessed, and a guess is what it refuses to run 432 rounds on.
+        if [[ -z "$STEP_MS" && ( -z "$only" || "$only" == timing || "$only" == burst ) ]]; then
+            R="$OUT/0000-measure"; mkdir -p "$R"
+            # In this shell, not a $(...): STEP_MS and the stack's PIDs must reach this shell and teardown.
+            trap 'printf "ABORT: line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+            measure_step >"$R/measure.out" 2>>"$R/harness.err" || true
+            trap - ERR
+            teardown >/dev/null 2>&1 || true
+            step_line=$(cat "$R/measure.out")
+            [[ "$step_line" == "== the timing step"* ]] || die "${step_line:-HARNESS measure: no result (see $R/harness.err)}"
+            printf '%s\n' "$step_line" | tee -a "$OUT/results.txt"
+        elif [[ -n "$STEP_MS" ]]; then
+            echo "== the timing step S = $STEP_MS ms $STEP_HOW" | tee -a "$OUT/results.txt"
+        fi
         pick() { manifest "$sub" | { if [[ -n "$only" ]]; then grep -F "|$only:" || true; else cat; fi; }; }
         total=$(pick | wc -l); n=0
         say "$total rounds$( ((limit > 0)) && echo ", the first $limit"); results in $OUT/results.txt"
