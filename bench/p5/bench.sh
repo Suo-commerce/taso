@@ -310,6 +310,14 @@ PY
     fi
     local ok; ok=$(grep -cE "$VESSEL_OK" "$OUT/warden-$r.out" || true)
     echo "warden run $r: exit $rc, $ok of $P Vessels ok, $(awk '{printf "user %.2fs sys %.2fs rss %d KiB", $1, $2, $3}' "$OUT/warden-$r.time")"
+    # The host's disk can stall for minutes (taso-test, 2026-11-03: journald
+    # blocked in writeback, every Seal past the client's timeout, 14 Vessels
+    # left frozen): a row measured across a stall is no row.  The kernel
+    # names a stalled task after 120 s; any such line during the run
+    # discards the row, said here and in the table.
+    local t0 t1; read -r t0 t1 <"$OUT/warden-$r.wall"
+    journalctl -k --since "@${t0%.*}" --until "@$(( ${t1%.*} + 1 ))" --no-pager 2>/dev/null | grep -c "blocked for more than" >"$OUT/warden-$r.stalls" || true
+    [[ "$(cat "$OUT/warden-$r.stalls")" == 0 ]] || echo "STALL: the kernel reported $(cat "$OUT/warden-$r.stalls") task(s) blocked for over 120 s during run $r: this row is discarded"
     grep -vE "$VESSEL_OK" "$OUT/warden-$r.out" | grep -E "^p5-bench-" | head -5 || true
 }
 subject_of() { # subject_of R DSNAME -> the Vessel's subject, from the Warden's "SUBJECT: dataset ..." line
@@ -353,6 +361,10 @@ quiet = p - 1 if noisy else p
 expected_commits = runs * quiet * turns * txns
 expected_turns = runs * quiet * turns
 print(f"# P5 bench — {storage}, P={p}, {host}")
+stalls = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.stalls")))
+if stalls:
+    print(f"**DISCARDED: the kernel reported {stalls} task(s) blocked for over 120 s during this run (the host's disk stalled); the numbers below measure the stall, not Taso.**")
+
 print()
 print(f"- host {host}, kernel {kernel}, taso {commit}; {note}; data at {where}")
 print(f"- durability contract: claude/Taso_finding_p5_a2_facts_2026-10-26.md §1 (this host's row)")
