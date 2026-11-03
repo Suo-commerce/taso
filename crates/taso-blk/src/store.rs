@@ -21,6 +21,13 @@
 //!   it returns: durable when acknowledged.
 //! - Writes after the last flush may be lost in a crash.  A disk may do the
 //!   same, and ext4 is built for it.
+//! - A device's flush ([`Store::flush_for`]) promises what the kernel's
+//!   barrier asks: everything *that branch* completed before it is on the
+//!   medium.  When the branch's last record already lies in a group
+//!   (closed by any branch's Flush), the flush appends nothing and waits
+//!   for that group's sync -- at once if done, joining it if running.  Only
+//!   a branch with records after the last Flush appends one (P5 bite 4,
+//!   `claude/Taso_design_flush_join_2026-11-03.md`).
 //! - [`Store::seal`] appends the Seal and flushes: a Seal is always
 //!   durable, and it stands for every record before it.
 //!
@@ -295,6 +302,9 @@ pub struct Stats {
     pub records: u64,
     /// `fdatasync` calls made by flushes.
     pub syncs: u64,
+    /// Device flushes answered from a group already closed: no record, no
+    /// sync of their own ([`Store::flush_for`]).
+    pub flushes_joined: u64,
     /// Their time: summed, and the longest (µs).  With the [`Syncer`]'s,
     /// what one block-log sync costs (P5, the 50 ms line, bite 3: how much
     /// of a Seal's `seal.log` is the sync and how much waiting for one).
@@ -333,6 +343,13 @@ pub struct Store {
     prev: [u8; HASH],
     stats: Stats,
     poisoned: bool,
+    /// The lsn of each branch's last record (write, discard, fork, name,
+    /// reset, unseal, Seal, drop); absent means nothing since the log was
+    /// opened, when everything was in a group.
+    last_append: HashMap<LayerId, u64>,
+    /// The lsn of the last Flush record appended: the end of the last
+    /// group.  At open, the lsn (replay keeps whole groups only).
+    last_flush: u64,
 }
 
 impl Store {
@@ -372,6 +389,8 @@ impl Store {
                 ..Stats::default()
             },
             poisoned: false,
+            last_append: HashMap::new(),
+            last_flush: 0,
         })
     }
 
@@ -492,6 +511,8 @@ impl Store {
             prev: good_prev,
             stats,
             poisoned: false,
+            last_append: HashMap::new(),
+            last_flush: good_lsn,
         };
         Ok((
             store,
@@ -548,6 +569,7 @@ impl Store {
         self.check()?;
         let id = self.map.fork(seal)?;
         self.append(K_FORK, &seal.get().to_le_bytes())?;
+        self.touched(id);
         Ok(id)
     }
 
@@ -592,6 +614,7 @@ impl Store {
         body.extend_from_slice(data);
         self.stats.write_copy_us += t.elapsed().as_micros() as u64;
         self.append_timed(K_WRITE, &body)?;
+        self.touched(branch);
         if fua {
             self.flush()?;
         }
@@ -607,7 +630,9 @@ impl Store {
         body.extend_from_slice(&branch.get().to_le_bytes());
         body.extend_from_slice(&lba.to_le_bytes());
         body.extend_from_slice(&count.to_le_bytes());
-        self.append(K_DISCARD, &body)
+        self.append(K_DISCARD, &body)?;
+        self.touched(branch);
+        Ok(())
     }
 
     /// Read `buf.len() / BLOCK` blocks from `lba` of `layer`.  Unwritten
@@ -648,7 +673,30 @@ impl Store {
     pub fn flush_pending(&mut self) -> Result<u64, StoreError> {
         self.check()?;
         self.append(K_FLUSH, &[])?;
+        self.last_flush = self.lsn;
         Ok(self.lsn)
+    }
+
+    /// A device's flush for `branch` (the kernel's barrier: everything the
+    /// device completed before it is on the medium).  Returns the sequence
+    /// number to wait for with [`Syncer::durable`], and whether a Flush
+    /// record was appended.  When the branch's last record already lies in
+    /// a group, nothing is appended: the lsn is that group's Flush, durable
+    /// already or being synced by whoever closed it.  Replay keeps whole
+    /// groups, so what this acknowledges is what a replay keeps.
+    pub fn flush_for(&mut self, branch: LayerId) -> Result<(u64, bool), StoreError> {
+        self.check()?;
+        let last = self.last_append.get(&branch).copied().unwrap_or(0);
+        if last <= self.last_flush {
+            self.stats.flushes_joined += 1;
+            return Ok((self.last_flush, false));
+        }
+        Ok((self.flush_pending()?, true))
+    }
+
+    /// `branch` has a record at the current lsn.
+    fn touched(&mut self, branch: LayerId) {
+        self.last_append.insert(branch, self.lsn);
     }
 
     /// Freeze `branch` as a new Seal standing for every record before it.
@@ -695,6 +743,7 @@ impl Store {
         body.extend_from_slice(&branch.get().to_le_bytes());
         body.extend_from_slice(tag);
         self.append(K_SEAL, &body)?;
+        self.touched(branch);
         Ok(seal)
     }
 
@@ -749,7 +798,9 @@ impl Store {
         let mut body = Vec::with_capacity(8 + name.len());
         body.extend_from_slice(&branch.get().to_le_bytes());
         body.extend_from_slice(name.as_bytes());
-        self.append(K_NAME, &body)
+        self.append(K_NAME, &body)?;
+        self.touched(branch);
+        Ok(())
     }
 
     /// Whether `name` could be given to a new branch: valid and not taken.
@@ -780,7 +831,9 @@ impl Store {
         let freed = self.map.drop_branch(branch)?;
         self.meta.set_name(branch, "");
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
-        self.append(K_DROP_BRANCH, &branch.get().to_le_bytes())
+        self.append(K_DROP_BRANCH, &branch.get().to_le_bytes())?;
+        self.touched(branch);
+        Ok(())
     }
 
     /// Reset `branch` to the Seal it stands on: its own blocks become
@@ -796,6 +849,7 @@ impl Store {
         let freed = self.map.reset(branch)?;
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
         self.append(K_RESET, &branch.get().to_le_bytes())?;
+        self.touched(branch);
         Ok(freed.len() as u64)
     }
 
@@ -815,6 +869,7 @@ impl Store {
         }
         self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
         self.append(K_UNSEAL, &branch.get().to_le_bytes())?;
+        self.touched(branch);
         Ok(freed.len() as u64)
     }
 
@@ -2886,6 +2941,85 @@ mod tests {
         drop(s);
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!((rec.cut, read1(&s, b, 7)), (0, 66));
+    }
+
+    /// Bite 4 (design claude/Taso_design_flush_join_2026-11-03.md, f-a): a
+    /// device's flush appends a Flush record only when its branch has
+    /// records past the last group; otherwise it waits for that group.
+    /// And a crash right after a joined flush keeps what it acknowledged:
+    /// the data lies in the group another branch closed.
+    #[test]
+    fn a_device_flush_joins_the_group_another_branch_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let (a, b) = (s.fork(root).unwrap(), s.fork(root).unwrap());
+        let syncer = s.syncer().unwrap();
+        let records0 = s.stats().records;
+        // B writes, A writes, A flushes: A's Flush closes the group that
+        // holds B's write too.
+        s.write(b, 3, &blocks(0xb3, 1), false).unwrap();
+        s.write(a, 5, &blocks(0xa5, 1), false).unwrap();
+        let (lsn_a, appended) = s.flush_for(a).unwrap();
+        assert!(
+            appended,
+            "A has records past the last group: a Flush record"
+        );
+        syncer.durable(lsn_a).unwrap();
+        // B's flush: its write is in A's group.  Nothing appended, the
+        // same lsn to wait for, and it is durable already.
+        let records1 = s.stats().records;
+        let (lsn_b, appended) = s.flush_for(b).unwrap();
+        assert!(!appended, "B's data is in a closed group: no record");
+        assert_eq!((lsn_b, s.stats().records), (lsn_a, records1));
+        assert!(!syncer.durable(lsn_b).unwrap(), "no sync of its own");
+        assert_eq!(s.stats().flushes_joined, 1);
+        // B's second barrier (nothing written since): joins again.
+        assert!(!s.flush_for(b).unwrap().1);
+        assert_eq!(s.stats().flushes_joined, 2);
+        // B writes again: its next flush appends, as before.
+        s.write(b, 4, &blocks(0xb4, 1), false).unwrap();
+        let (lsn_b2, appended) = s.flush_for(b).unwrap();
+        assert!(appended && lsn_b2 > lsn_a);
+        syncer.durable(lsn_b2).unwrap();
+        assert!(s.stats().records > records0 + 4, "two Flush records in all");
+        // The crash: everything acknowledged is in the log's groups.
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.cut, 0);
+        assert_eq!(
+            (read1(&s, b, 3), read1(&s, a, 5), read1(&s, b, 4)),
+            (0xb3, 0xa5, 0xb4)
+        );
+        // After an open everything is grouped: any branch's flush joins.
+        let mut s = s;
+        assert!(!s.flush_for(a).unwrap().1);
+    }
+
+    /// The crash the rule must not make worse: a joined flush acknowledged
+    /// while the group's sync was still to come.  The owner of the group
+    /// asked for the sync; the joiner waits on the same lsn, so nothing
+    /// is acknowledged before the group is on the medium.
+    #[test]
+    fn a_joined_flush_waits_for_the_groups_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let (a, b) = (s.fork(root).unwrap(), s.fork(root).unwrap());
+        let syncer = s.syncer().unwrap();
+        s.write(b, 3, &blocks(0xb3, 1), false).unwrap();
+        s.write(a, 5, &blocks(0xa5, 1), false).unwrap();
+        let (lsn_a, _) = s.flush_for(a).unwrap();
+        // B joins before A's sync has run: its wait runs the sync.
+        let (lsn_b, appended) = s.flush_for(b).unwrap();
+        assert!(!appended && lsn_b == lsn_a);
+        assert!(
+            syncer.durable(lsn_b).unwrap(),
+            "the joiner ran the group's sync"
+        );
+        assert!(!syncer.durable(lsn_a).unwrap(), "A finds it durable");
     }
 
     #[test]

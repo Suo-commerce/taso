@@ -369,6 +369,7 @@ impl Compaction {
         fresh.shared = std::sync::Arc::clone(&store.shared);
         fresh.stats = Stats {
             syncs: store.stats.syncs,
+            flushes_joined: store.stats.flushes_joined,
             write_map_us: store.stats.write_map_us,
             write_copy_us: store.stats.write_copy_us,
             write_hash_us: store.stats.write_hash_us,

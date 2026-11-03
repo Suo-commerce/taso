@@ -1097,7 +1097,7 @@ impl Daemon {
         // (the store's and the Syncer's; P5 bite 3).
         let (sync_us, sync_max_us) = self.sync.sync_time();
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -1118,6 +1118,7 @@ impl Daemon {
             st.syncs + self.sync.syncs(),
             st.sync_us + sync_us,
             st.sync_max_us.max(sync_max_us),
+            st.flushes_joined,
         )
     }
 }
@@ -1371,11 +1372,14 @@ fn handle(
             res
         }
         sys::UBLK_IO_OP_FLUSH => {
+            // The barrier is this device's: a Flush record only when the
+            // branch has records past the last group; else the group's
+            // own sync, joined (store.rs flush_for, P5 bite 4).
             let mut split = Split::default();
             let r = {
                 let mut s = lock_store_timed(store, &mut split);
                 let t = std::time::Instant::now();
-                let r = s.flush_pending();
+                let r = s.flush_for(branch).map(|(lsn, _)| lsn);
                 split.store = t.elapsed();
                 r
             };
