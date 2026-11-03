@@ -92,13 +92,19 @@ MNT=/mnt/e3
 DEVNAME=e3crash
 SIZE_MIB=${E3_SIZE_MIB:-2048}
 ROWS=${E3_ROWS:-8}
-# The timing step S: the sweep's delays are 0, S, 2S, 3S; a burst's 0, S/2, S,
-# 2S, 3S, and its stagger (E3-c2: the second Vessel's Seal after the first's)
-# S/2.  Set by hand (E3_STEP_MS), else measured by `run` (measure_step), else
-# 10 for `list` and a `round` by hand.  Before (t-2) it was 10 ms fixed, read
+# The timing step S: the sweep's delays are 0, S, 2S, 3S, a quarter of a lone
+# Seal each.  The burst's own step B: its delays 0, B/2, B, 2B, 3B and its
+# stagger (E3-c2: the second Vessel's Seal after the first's) B/2 -- two
+# Seals together finish well inside one alone (taso-test 2026-11-03: 37 ms
+# alone, both inside 18 together; they share the group's syncs), so the
+# burst is measured as a burst (t-f).  Each set by hand (E3_STEP_MS,
+# E3_BURST_STEP_MS), else measured by `run` (measure_step), else 10 and 5
+# for `list` and a `round` by hand.  Before (t-2) S was 10 ms fixed, read
 # off a 40 ms Seal: 25 put three of four delays past it (111 MISSED of 220).
 STEP_MS=${E3_STEP_MS:-}
 STEP_HOW=${E3_STEP_MS:+set by hand (E3_STEP_MS)}
+BSTEP_MS=${E3_BURST_STEP_MS:-}
+BSTEP_HOW=${E3_BURST_STEP_MS:+set by hand (E3_BURST_STEP_MS)}
 nap() { sleep "$(($1 / 1000)).$(printf '%03d' "$(($1 % 1000))")"; }   # nap MS: no interpreter on the way (t-d)
 KEEP_FAILS=${KEEP_FAILS:-3}
 DEVSH=$PWD/scripts/e3-device.sh
@@ -115,10 +121,10 @@ say() { printf '== %s\n' "$*"; }
 oracle() { python3 -I "$ORACLE" "$@"; }
 
 # ── the manifest ──────────────────────────────────────────────────────
-manifest() { # manifest [--subset] -> lines "SEQ|POINT|MODE"; the timing points from STEP_MS (10 if unset)
-    python3 -I - "${1:-}" "${STEP_MS:-10}" <<'PY'
+manifest() { # manifest [--subset] -> lines "SEQ|POINT|MODE"; the timing points from STEP_MS and BSTEP_MS (10 and 5 if unset)
+    python3 -I - "${1:-}" "${STEP_MS:-10}" "${BSTEP_MS:-5}" <<'PY'
 import itertools, sys
-subset, step = sys.argv[1] == "--subset", int(sys.argv[2])
+subset, step, bstep = sys.argv[1] == "--subset", int(sys.argv[2]), int(sys.argv[3])
 OPS = ["write", "seal", "fork", "promote", "effect"]
 def valid(seq):
     if seq.count("fork") > 1 or seq.count("promote") > 1:
@@ -155,12 +161,12 @@ if not subset:
     print("write effect|takeover:ledger.shipped|drop")
 # E3-c2 (design rev. 2, decided 2026-10-30): two Vessels on one Warden, each
 # `write seal` first, then a burst -- both `write`, then both `seal` without
-# waiting (all: together; stagger: the second S/2 after the first) --
+# waiting (all: together; stagger: the second B/2 after the first) --
 # cut at a timing point or a hold; in the subset from the start (c-e).
-# The delays in the step's unit, (0, 1/2, 1, 2, 3) S ((t-2), t-b: before it
-# (0, 5, 10, 20, 40) at S = 10, the last past a Seal by arithmetic).
+# The delays in the burst's own unit, (0, 1/2, 1, 2, 3) B ((t-2), t-b and
+# t-f: before, (0, 5, 10, 20, 40) at S = 10, the last past a Seal by arithmetic).
 for shape in ("all", "stagger"):
-    for d in (0, step // 2, step, 2 * step, 3 * step):
+    for d in (0, bstep // 2, bstep, 2 * bstep, 3 * bstep):
         print(f"write seal|burst:{shape}:timing+{d}|drop")
     for name in ("seal.frozen", "seal.recorded", "seal.shipped"):
         for mode in ("drop", "error"):
@@ -181,7 +187,7 @@ PY
 if [[ "${1:-}" == list ]]; then
     m=$(manifest "${2:-}")
     printf '%s\n' "$m"
-    echo "# timing and burst delays at the step S = ${STEP_MS:-10} ms ${STEP_HOW:-(a run measures its own: S = p50/4 of the Seal here)}"
+    echo "# timing delays at the step S = ${STEP_MS:-10} ms ${STEP_HOW:-(a run measures its own: p50/4 of a lone Seal here)}; burst delays at B = ${BSTEP_MS:-5} ms ${BSTEP_HOW:-(a run measures its own: p50/4 of two Seals together)}"
     printf '%s\n' "$m" | python3 -I -c '
 import sys, collections
 rows = [l.strip().split("|") for l in sys.stdin if l.strip()]
@@ -588,8 +594,37 @@ vessel_of() { # vessel_of PID DS... -> the index of the dataset whose device is 
     done
     return 1
 }
+burst_up() { # burst_up: the device, the stack and the two agents of a burst (and of its measurement, t-f).
+             # In the caller's scope: tag, bsubj, tk, henv in; BP, bturn, bds out.  A HARNESS line on stdout and 1 if not.
+    local deadline v i
+    "$DEVSH" make "$DEVNAME" "$WORK/dev.img" "$SIZE_MIB" >/dev/null || { echo "HARNESS $tag: make"; return 1; }
+    mkfs.ext4 -q -F "/dev/mapper/$DEVNAME" && mkdir -p "$D" && mount -o errors=remount-ro "/dev/mapper/$DEVNAME" "$D" \
+        || { echo "HARNESS $tag: mkfs or mount of the device"; return 1; }
+    mkdir -p "$D/store" "$D/state" "$D/spool" "$RUN/run"
+    if [[ -n "$tk" ]]; then
+        # E3-4 x 2: the coordinator and the pack store shared by every node, never on the cut device.
+        coord_up || { echo "HARNESS $tag: taso-coordd did not start (see $R/coordd.err)"; return 1; }
+        config "${bsubj[0]}" "$RUN/w.json" "{\"coordinator\": {\"remote\": \"$COORD_SOCK\"}, \"store\": \"$HDIR/store\", \"also\": {\"subject\": \"${bsubj[1]}\"}}" \
+            || { echo "HARNESS $tag: config"; return 1; }
+    else
+        config "${bsubj[0]}" "$RUN/w.json" "{\"also\": {\"subject\": \"${bsubj[1]}\"}}" || { echo "HARNESS $tag: config"; return 1; }
+    fi
+    start_stack 1 "${henv[@]}" || { echo "HARNESS $tag: taso-blkd did not start"; return 1; }
+    deadline=$((SECONDS + 120))
+    while ((SECONDS < deadline)) && [[ -z "${bds[0]:-}" || -z "${bds[1]:-}" ]]; do
+        for v in 0 1; do bds[v]=$(grep -m1 -o "\] ${bsubj[v]}: dataset .*" "$R/warden-1.err" 2>/dev/null | sed 's/.*: dataset //' || true); done
+        sleep 0.1
+    done
+    [[ -n "${bds[0]:-}" && -n "${bds[1]:-}" ]] || { echo "HARNESS $tag: the Warden named no dataset for both Vessels (see $R/warden-1.err)"; return 1; }
+    for i in 1 2; do
+        wait_agent 120 || { echo "HARNESS $tag: agent $i of 2 did not come up (see $R/warden-1.err)"; return 1; }
+        v=$(vessel_of "$AGENT" "${bds[0]}" "${bds[1]}") || { echo "HARNESS $tag: agent $AGENT is on neither Vessel's device"; return 1; }
+        BP[v]=$AGENT; bturn[v]=$(( $(ready_turn "$AGENT") + 1 ))
+    done
+    [[ -n "${BP[0]:-}" && -n "${BP[1]:-}" ]] || { echo "HARNESS $tag: both agents are on one Vessel"; return 1; }
+}
 burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the merged line on stdout
-    local seq=$1 point=$2 mode=$3 rest shape what hname="" delay=0 base ms v op rep lsn i deadline a out rc tk="" opoint
+    local seq=$1 point=$2 mode=$3 rest shape what hname="" delay=0 base ms v op rep lsn deadline a out rc tk="" opoint
     rest=${point#burst:}; shape=${rest%%:*}; what=${rest#*:}
     case "$what" in
         timing+*) delay=${what#timing+} ;;
@@ -611,31 +646,7 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
         henv=("TASO_E3_HOLD=$hname" "TASO_E3_HOLD_DIR=$RUN/hold")
     fi
     # 1. the device, the stack, the two agents (which is which: by the device under /work)
-    "$DEVSH" make "$DEVNAME" "$WORK/dev.img" "$SIZE_MIB" >/dev/null || { echo "HARNESS $tag: make"; return; }
-    mkfs.ext4 -q -F "/dev/mapper/$DEVNAME" && mkdir -p "$D" && mount -o errors=remount-ro "/dev/mapper/$DEVNAME" "$D" \
-        || { echo "HARNESS $tag: mkfs or mount of the device"; return; }
-    mkdir -p "$D/store" "$D/state" "$D/spool" "$RUN/run"
-    if [[ -n "$tk" ]]; then
-        # E3-4 x 2: the coordinator and the pack store shared by every node, never on the cut device.
-        coord_up || { echo "HARNESS $tag: taso-coordd did not start (see $R/coordd.err)"; return; }
-        config "${bsubj[0]}" "$RUN/w.json" "{\"coordinator\": {\"remote\": \"$COORD_SOCK\"}, \"store\": \"$HDIR/store\", \"also\": {\"subject\": \"${bsubj[1]}\"}}" \
-            || { echo "HARNESS $tag: config"; return; }
-    else
-        config "${bsubj[0]}" "$RUN/w.json" "{\"also\": {\"subject\": \"${bsubj[1]}\"}}" || { echo "HARNESS $tag: config"; return; }
-    fi
-    start_stack 1 "${henv[@]}" || { echo "HARNESS $tag: taso-blkd did not start"; return; }
-    deadline=$((SECONDS + 120))
-    while ((SECONDS < deadline)) && [[ -z "${bds[0]:-}" || -z "${bds[1]:-}" ]]; do
-        for v in 0 1; do bds[v]=$(grep -m1 -o "\] ${bsubj[v]}: dataset .*" "$R/warden-1.err" 2>/dev/null | sed 's/.*: dataset //' || true); done
-        sleep 0.1
-    done
-    [[ -n "${bds[0]:-}" && -n "${bds[1]:-}" ]] || { echo "HARNESS $tag: the Warden named no dataset for both Vessels (see $R/warden-1.err)"; return; }
-    for i in 1 2; do
-        wait_agent 120 || { echo "HARNESS $tag: agent $i of 2 did not come up (see $R/warden-1.err)"; return; }
-        v=$(vessel_of "$AGENT" "${bds[0]}" "${bds[1]}") || { echo "HARNESS $tag: agent $AGENT is on neither Vessel's device"; return; }
-        BP[v]=$AGENT; bturn[v]=$(( $(ready_turn "$AGENT") + 1 ))
-    done
-    [[ -n "${BP[0]:-}" && -n "${BP[1]:-}" ]] || { echo "HARNESS $tag: both agents are on one Vessel"; return; }
+    burst_up || return
     # 2. the prefix, one Vessel after the other, each op waited for
     wr() { [[ ${bwtag[$1]} == 0 ]] && echo write || echo "write ${bwtag[$1]}"; }
     for v in 0 1; do
@@ -661,7 +672,7 @@ burst_round() { # burst_round "SEQ" POINT MODE: round's tag and $R in scope; the
     [[ -n "$hname" ]] && : >"$RUN/hold/$hname.arm"
     for v in 0 1; do oracle requested "${BO[v]}" seal turn="${bturn[v]}"; done
     send "${BP[0]}" seal || { echo "HARNESS $tag: the op file could not be written"; return; }
-    [[ "$shape" == stagger ]] && nap $(( ${STEP_MS:-10} / 2 ))   # (t-2), t-c: an eighth of a Seal into the first's
+    [[ "$shape" == stagger ]] && nap $(( ${BSTEP_MS:-5} / 2 ))   # (t-2), t-c: an eighth of a burst's Seal into the first's
     send "${BP[1]}" seal || { echo "HARNESS $tag: the op file could not be written"; return; }
     # 4. the point
     if [[ -n "$hname" ]]; then
@@ -1187,16 +1198,25 @@ print(json.dumps({"seals": seals, "forks": forks, "report": report,
 PY
 }
 
-# ── the timing step, measured ((t-2), 2026-11-03) ─────────────────────
-measure_step() { # measure_step -> STEP_MS, STEP_HOW; the line on stdout (HARNESS: measured nothing); files in $R
-    # A stack as a round's (the device, ext4, one Vessel, taso-sim --step),
-    # then `write seal` twelve times, each Seal timed from the op's send
-    # returning to its reply being there -- the sweep's own clock: a timing
-    # round sleeps its delay from the same instant and asks the same file.
-    # The reply is polled at 1 ms here (t-e; the agent polls its op file
-    # every 2 ms), and the clock is bash's own ($EPOCHREALTIME, no fork).
-    # The delay's floor, what `nap 0` takes, is measured beside it: before
-    # (t-d) every delay went through a python start-up first.
+# ── the timing steps, measured ((t-2), 2026-11-03) ────────────────────
+# Each on a stack as its rounds use, each Seal timed with bash's own clock
+# ($EPOCHREALTIME, no fork) from the op's send returning to its reply being
+# there -- the sweep's own clock: a timing round sleeps its delay from the
+# same instant and asks the same file.  Replies are polled at 1 ms here
+# (t-e; the agent polls its op file every 2 ms).  The step is a quarter of
+# the median, whole ms, never under 2 (t-a).  The delay's floor, what
+# `nap 0` takes, is measured beside it: before (t-d) every delay went
+# through a python start-up first.
+quarter() { # quarter NAME US... -> "STEP p50 … (min …, max …, N NAME)" on stdout
+    python3 -I - "$@" <<'PY'
+import sys
+name, us = sys.argv[1], sorted(int(u) for u in sys.argv[2:])
+p50 = (us[len(us) // 2 - 1] + us[len(us) // 2]) / 2
+print(max(2, int(p50 / 4000)), f"p50 {p50 / 1000:.1f} ms (min {us[0] / 1000:.1f}, max {us[-1] / 1000:.1f}, {len(us)} {name})")
+PY
+}
+measure_lone() { # measure_lone -> STEP_MS, STEP_HOW; the line on stdout (HARNESS: measured nothing); files in $R
+    # One Vessel, `write seal` twelve times: the Seal a timing round's single Vessel makes.
     local subject P i t0 floor; local -a us=()
     subject="e3-$(date +%s%N | tail -c 9)"
     "$DEVSH" make "$DEVNAME" "$WORK/dev.img" "$SIZE_MIB" >/dev/null || { echo "HARNESS measure: make"; return 1; }
@@ -1217,16 +1237,47 @@ measure_step() { # measure_step -> STEP_MS, STEP_HOW; the line on stdout (HARNES
     t0=${EPOCHREALTIME/./}; nap 0; floor=$(( ${EPOCHREALTIME/./} - t0 ))
     step "$P" exit 30 >/dev/null || true
     printf '%s\n' "${us[@]}" >"$R/seals-us.txt"
-    read -r STEP_MS STEP_HOW < <(python3 -I - "$floor" "${us[@]}" <<'PY'
-import sys
-floor, us = int(sys.argv[1]), sorted(int(u) for u in sys.argv[2:])
-p50 = (us[len(us) // 2 - 1] + us[len(us) // 2]) / 2
-step = max(2, int(p50 / 4000))   # a quarter of the median Seal, whole ms, never under 2 (t-a)
-print(step, f"= p50/4 of a Seal here: p50 {p50 / 1000:.1f} ms (min {us[0] / 1000:.1f}, max {us[-1] / 1000:.1f}, {len(us)} Seals); the delay's floor {floor / 1000:.1f} ms")
-PY
-    )
+    read -r STEP_MS STEP_HOW < <(quarter "lone Seals" "${us[@]}")
     [[ "$STEP_MS" =~ ^[0-9]+$ ]] || { echo "HARNESS measure: no step from the Seals timed (see $R/seals-us.txt)"; return 1; }
+    STEP_HOW="= p50/4 of a lone Seal here: $STEP_HOW; the delay's floor $((floor / 1000)).$((floor % 1000 / 100)) ms"
     echo "== the timing step S = $STEP_MS ms $STEP_HOW"
+}
+measure_burst() { # measure_burst -> BSTEP_MS, BSTEP_HOW; the line on stdout (HARNESS: measured nothing); files in $R (t-f)
+    # Two Vessels as a burst round's, the prefix `write seal` each, then six
+    # bursts -- both writes waited for, both Seals sent without waiting --
+    # each timed from the second send returning to the later reply being
+    # there: what a burst's MISSED is judged by.
+    local tag=measure base v i t0 tk="" f0 f1; local -a bsubj BP=() bturn=() bds=() henv=() us=()
+    base="e3-$(date +%s%N | tail -c 9)"; bsubj=("$base-a" "$base-b")
+    burst_up || return 1
+    for v in 0 1; do
+        step "${BP[v]}" "$([[ $v == 0 ]] && echo write || echo "write 2")" || { echo "HARNESS measure: ${bsubj[v]}'s write got no reply: $WHY"; return 1; }
+        step "${BP[v]}" seal || { echo "HARNESS measure: ${bsubj[v]}'s seal got no reply: $WHY"; return 1; }
+    done
+    for i in $(seq 6); do
+        for v in 0 1; do
+            step "${BP[v]}" "$([[ $v == 0 ]] && echo write || echo "write 2")" || { echo "HARNESS measure: burst $i: ${bsubj[v]}'s write got no reply: $WHY"; return 1; }
+        done
+        send "${BP[0]}" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
+        send "${BP[1]}" seal || { echo "HARNESS measure: the op file could not be written"; return 1; }
+        t0=${EPOCHREALTIME/./}
+        f0=/proc/${BP[0]}/root/tmp/e3/reply.${NEXT[${BP[0]}]}; f1=/proc/${BP[1]}/root/tmp/e3/reply.${NEXT[${BP[1]}]}
+        while [[ ! -f "$f0" || ! -f "$f1" ]]; do
+            (( ${EPOCHREALTIME/./} - t0 < 120000000 )) || { echo "HARNESS measure: burst $i: no reply in 120 s"; return 1; }
+            sleep 0.001
+        done
+        us+=("$(( ${EPOCHREALTIME/./} - t0 ))")
+        for v in 0 1; do   # taken, as the round takes them (the agent waits for its reply to go)
+            reply "${BP[v]}" 5 || { echo "HARNESS measure: burst $i: ${bsubj[v]}'s reply vanished: $WHY"; return 1; }
+            [[ -n "$(jget "$REPLY" sealed)" ]] || { echo "HARNESS measure: burst $i: ${bsubj[v]}'s seal was not sealed: $REPLY"; return 1; }
+        done
+    done
+    for v in 0 1; do step "${BP[v]}" exit 30 >/dev/null || true; done
+    printf '%s\n' "${us[@]}" >"$R/bursts-us.txt"
+    read -r BSTEP_MS BSTEP_HOW < <(quarter "bursts of two Seals" "${us[@]}")
+    [[ "$BSTEP_MS" =~ ^[0-9]+$ ]] || { echo "HARNESS measure: no step from the bursts timed (see $R/bursts-us.txt)"; return 1; }
+    BSTEP_HOW="= p50/4 of two Seals together here: $BSTEP_HOW"
+    echo "== the burst step B = $BSTEP_MS ms $BSTEP_HOW"
 }
 
 # ── commands ──────────────────────────────────────────────────────────
@@ -1271,20 +1322,26 @@ case "${1:-}" in
         shift; sub=""; limit=0; only=""
         while (($#)); do case "$1" in --subset) sub=--subset ;; --only) only=$2; shift ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--only KIND] [--limit N]" ;; esac; shift; done
         [[ -z "$only" || "$only" =~ ^(boundary|timing|hold|takeover|burst)$ ]] || die "--only boundary|timing|hold|takeover|burst"
-        # The step first, when a timing or burst round is coming and none was set by hand:
+        # The steps first, each when its rounds are coming and it was not set by hand:
         # measured, not guessed, and a guess is what it refuses to run 432 rounds on.
-        if [[ -z "$STEP_MS" && ( -z "$only" || "$only" == timing || "$only" == burst ) ]]; then
-            R="$OUT/0000-measure"; mkdir -p "$R"
-            # In this shell, not a $(...): STEP_MS and the stack's PIDs must reach this shell and teardown.
+        measure() { # measure NAME FUNCTION "== prefix": one measurement on its own stack, its line into results.txt
+            R="$OUT/0000-measure-$1"; mkdir -p "$R"
+            # In this shell, not a $(...): the step and the stack's PIDs must reach this shell and teardown.
             trap 'printf "ABORT: line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
-            measure_step >"$R/measure.out" 2>>"$R/harness.err" || true
+            "$2" >"$R/measure.out" 2>>"$R/harness.err" || true
             trap - ERR
             teardown >/dev/null 2>&1 || true
-            step_line=$(cat "$R/measure.out")
-            [[ "$step_line" == "== the timing step"* ]] || die "${step_line:-HARNESS measure: no result (see $R/harness.err)}"
-            printf '%s\n' "$step_line" | tee -a "$OUT/results.txt"
-        elif [[ -n "$STEP_MS" ]]; then
-            echo "== the timing step S = $STEP_MS ms $STEP_HOW" | tee -a "$OUT/results.txt"
+            local line; line=$(cat "$R/measure.out")
+            [[ "$line" == "$3"* ]] || die "${line:-HARNESS measure: no result (see $R/harness.err)}"
+            printf '%s\n' "$line" | tee -a "$OUT/results.txt"
+        }
+        if [[ -z "$only" || "$only" == timing ]]; then
+            if [[ -z "$STEP_MS" ]]; then measure lone measure_lone "== the timing step"
+            else echo "== the timing step S = $STEP_MS ms $STEP_HOW" | tee -a "$OUT/results.txt"; fi
+        fi
+        if [[ -z "$only" || "$only" == burst ]]; then
+            if [[ -z "$BSTEP_MS" ]]; then measure burst measure_burst "== the burst step"
+            else echo "== the burst step B = $BSTEP_MS ms $BSTEP_HOW" | tee -a "$OUT/results.txt"; fi
         fi
         pick() { manifest "$sub" | { if [[ -n "$only" ]]; then grep -F "|$only:" || true; else cat; fi; }; }
         total=$(pick | wc -l); n=0
