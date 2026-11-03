@@ -210,6 +210,9 @@ log_syncs() { # the block log's fdatasyncs so far (taso-blkd stats: the store's 
 log_sync_us() { # those syncs timed, COUNT:TOTAL_US:MAX_US (taso-blkd stats sync_us, bite 3); empty on zfs or an older taso-blkd
     if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^sync_us=//p'; fi
 }
+log_ops() { # the device requests taso-blkd served so far, one "op_NAME=COUNT:TOTAL_US:STORE_US:BYTES" per line (bite 4's probe); empty on zfs
+    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | grep '^op_' | grep -v '^op_wsplit'; fi
+}
 
 # ---- one run: the Warden with P Vessels -------------------------------------------
 run_warden() { # run_warden R
@@ -253,6 +256,7 @@ PY
     bytes_used >"$OUT/warden-$r.bytes0"
     log_syncs >"$OUT/warden-$r.syncs0"
     log_sync_us >"$OUT/warden-$r.syncus0"
+    log_ops >"$OUT/warden-$r.ops0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
     TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$BIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
@@ -269,6 +273,7 @@ PY
     bytes_used >"$OUT/warden-$r.bytes1"
     log_syncs >"$OUT/warden-$r.syncs1"
     log_sync_us >"$OUT/warden-$r.syncus1"
+    log_ops >"$OUT/warden-$r.ops1"
     # What shipped: the local store's bytes and files after this run (the
     # packs every Seal published).  The log's growth counts every version
     # of every block; the packs carry a Seal's live blocks only, so the two
@@ -383,6 +388,29 @@ if storage != "zfs":
             n, us, mx = n + c1 - c0, us + t1 - t0, max(mx, m1)
     if n:
         print(f"- a block log sync: {us / n / 1000:.2f} ms mean over the run's {n}; the longest {mx / 1000:.2f} ms (since taso-blkd started)")
+    # Bite 4's probe: what the Vessels' filesystems asked of taso-blkd in
+    # the run, per Seal -- a freeze is the kernel's write-back (write
+    # requests) and its barriers (flush requests, each a Flush record and a
+    # sync).  Per op: how many per Seal, the mean time inside taso-blkd
+    # (a flush's is mostly waiting for the Syncer), the part under the
+    # store's lock, the bytes.  seal.freeze minus the flushes' and writes'
+    # time per Seal is the kernel's own (write-back submission, the
+    # superblock's barriers, the ublk round trips).
+    def ops(f):
+        return {l.split("=")[0][3:]: [int(x) for x in l.split("=")[1].split(":")] for l in open(f).read().split() if l.startswith("op_")}
+    tot = {}
+    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.ops0"))):
+        a, b = ops(f0), ops(f0[:-1] + "1")
+        for k in b:
+            if k in a:
+                d = [y - x for x, y in zip(a[k], b[k])]
+                tot[k] = [u + v for u, v in zip(tot.get(k, [0, 0, 0, 0]), d)]
+    for k in ("flush", "write", "read", "discard"):
+        c, us, su, by = tot.get(k, [0, 0, 0, 0])
+        if c:
+            print(f"- device {k}{'es' if k == 'flush' else 's'}: {c} in the run, {c / (seals or 1):.2f} per Seal; {us / c / 1000:.2f} ms each in taso-blkd ({su / c / 1000:.2f} under the store's lock)"
+                  + (f", {by / c / 1024:.1f} KiB each" if by else "")
+                  + f"; {us / (seals or 1) / 1000:.1f} ms per Seal")
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
