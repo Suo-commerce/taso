@@ -210,6 +210,9 @@ log_syncs() { # the block log's fdatasyncs so far (taso-blkd stats: the store's 
 log_sync_us() { # those syncs timed, COUNT:TOTAL_US:MAX_US (taso-blkd stats sync_us, bite 3); empty on zfs or an older taso-blkd
     if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^sync_us=//p'; fi
 }
+log_joined() { # device flushes answered from a group already closed (taso-blkd stats flushes_joined, bite 4); empty on zfs or an older taso-blkd
+    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^flushes_joined=//p'; fi
+}
 log_ops() { # the device requests taso-blkd served so far, one "op_NAME=COUNT:TOTAL_US:STORE_US:BYTES" per line (bite 4's probe); empty on zfs
     if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | grep '^op_' | grep -v '^op_wsplit'; fi
 }
@@ -257,6 +260,7 @@ PY
     log_syncs >"$OUT/warden-$r.syncs0"
     log_sync_us >"$OUT/warden-$r.syncus0"
     log_ops >"$OUT/warden-$r.ops0"
+    log_joined >"$OUT/warden-$r.joined0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
     TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$BIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
@@ -274,6 +278,7 @@ PY
     log_syncs >"$OUT/warden-$r.syncs1"
     log_sync_us >"$OUT/warden-$r.syncus1"
     log_ops >"$OUT/warden-$r.ops1"
+    log_joined >"$OUT/warden-$r.joined1"
     # What shipped: the local store's bytes and files after this run (the
     # packs every Seal published).  The log's growth counts every version
     # of every block; the packs carry a Seal's live blocks only, so the two
@@ -411,6 +416,16 @@ if storage != "zfs":
             print(f"- device {k}{'es' if k == 'flush' else 's'}: {c} in the run, {c / (seals or 1):.2f} per Seal; {us / c / 1000:.2f} ms each in taso-blkd ({su / c / 1000:.2f} under the store's lock)"
                   + (f", {by / c / 1024:.1f} KiB each" if by else "")
                   + f"; {us / (seals or 1) / 1000:.1f} ms per Seal")
+    # Bite 4's lever: how many of the flushes appended nothing and waited
+    # for a group another flush had closed (taso-blkd stats flushes_joined).
+    j = 0; have = False
+    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.joined0"))):
+        a, b = (open(f).read().strip() for f in (f0, f0[:-1] + "1"))
+        if a and b:
+            j += int(b) - int(a); have = True
+    fl = tot.get("flush", [0])[0]
+    if have and fl:
+        print(f"- device flushes answered from a group already closed: {j} of {fl}, {100 * j / fl:.0f} %")
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
