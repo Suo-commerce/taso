@@ -25,9 +25,11 @@
 //!   barrier asks: everything *that branch* completed before it is on the
 //!   medium.  When the branch's last record already lies in a group
 //!   (closed by any branch's Flush), the flush appends nothing and waits
-//!   for that group's sync -- at once if done, joining it if running.  Only
-//!   a branch with records after the last Flush appends one (P5 bite 4,
-//!   `claude/Taso_design_flush_join_2026-11-03.md`).
+//!   for **the first group that closed over it** -- at once if done,
+//!   joining its sync if running.  Only a branch with records after the
+//!   last Flush appends one (P5 bite 4, rev. 2:
+//!   `claude/Taso_design_flush_join_2026-11-03.md`; rev. 1 waited for
+//!   the newest group, which under load is never durable yet).
 //! - [`Store::seal`] appends the Seal and flushes: a Seal is always
 //!   durable, and it stands for every record before it.
 //!
@@ -114,7 +116,7 @@
 //! reopened, and reopening rebuilds the map from the log.  A caller can
 //! poison it too ([`Store::poison`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::FileExt;
@@ -343,13 +345,13 @@ pub struct Store {
     prev: [u8; HASH],
     stats: Stats,
     poisoned: bool,
-    /// The lsn of each branch's last record (write, discard, fork, name,
-    /// reset, unseal, Seal, drop); absent means nothing since the log was
-    /// opened, when everything was in a group.
-    last_append: HashMap<LayerId, u64>,
-    /// The lsn of the last Flush record appended: the end of the last
-    /// group.  At open, the lsn (replay keeps whole groups only).
-    last_flush: u64,
+    /// Branches with a record since the last Flush (write, discard, fork,
+    /// name, reset, unseal, Seal, drop): their data is in no group yet.
+    touched: HashSet<LayerId>,
+    /// For a branch not in `touched`, the lsn of the Flush record that
+    /// first closed a group over its last record; absent means nothing
+    /// since the log was opened, when everything was in a group.
+    covered: HashMap<LayerId, u64>,
 }
 
 impl Store {
@@ -389,8 +391,8 @@ impl Store {
                 ..Stats::default()
             },
             poisoned: false,
-            last_append: HashMap::new(),
-            last_flush: 0,
+            touched: HashSet::new(),
+            covered: HashMap::new(),
         })
     }
 
@@ -511,8 +513,8 @@ impl Store {
             prev: good_prev,
             stats,
             poisoned: false,
-            last_append: HashMap::new(),
-            last_flush: good_lsn,
+            touched: HashSet::new(),
+            covered: HashMap::new(),
         };
         Ok((
             store,
@@ -673,7 +675,11 @@ impl Store {
     pub fn flush_pending(&mut self) -> Result<u64, StoreError> {
         self.check()?;
         self.append(K_FLUSH, &[])?;
-        self.last_flush = self.lsn;
+        // This Flush closes a group over every branch touched since the
+        // last one: the first group each of them is in.
+        for b in self.touched.drain() {
+            self.covered.insert(b, self.lsn);
+        }
         Ok(self.lsn)
     }
 
@@ -681,22 +687,24 @@ impl Store {
     /// device completed before it is on the medium).  Returns the sequence
     /// number to wait for with [`Syncer::durable`], and whether a Flush
     /// record was appended.  When the branch's last record already lies in
-    /// a group, nothing is appended: the lsn is that group's Flush, durable
-    /// already or being synced by whoever closed it.  Replay keeps whole
+    /// a group, nothing is appended: the lsn is the Flush that first closed
+    /// a group over it -- not the newest group's, which under load is a
+    /// moment old and never durable yet (rev. 1's mistake, measured
+    /// 2026-11-03: 65 % joined, the freeze unchanged).  Replay keeps whole
     /// groups, so what this acknowledges is what a replay keeps.
     pub fn flush_for(&mut self, branch: LayerId) -> Result<(u64, bool), StoreError> {
         self.check()?;
-        let last = self.last_append.get(&branch).copied().unwrap_or(0);
-        if last <= self.last_flush {
+        if !self.touched.contains(&branch) {
             self.stats.flushes_joined += 1;
-            return Ok((self.last_flush, false));
+            return Ok((self.covered.get(&branch).copied().unwrap_or(0), false));
         }
         Ok((self.flush_pending()?, true))
     }
 
-    /// `branch` has a record at the current lsn.
+    /// `branch` has a record at the current lsn: in no group until the
+    /// next Flush.
     fn touched(&mut self, branch: LayerId) {
-        self.last_append.insert(branch, self.lsn);
+        self.touched.insert(branch);
     }
 
     /// Freeze `branch` as a new Seal standing for every record before it.
@@ -2978,6 +2986,20 @@ mod tests {
         // B's second barrier (nothing written since): joins again.
         assert!(!s.flush_for(b).unwrap().1);
         assert_eq!(s.stats().flushes_joined, 2);
+        // Rev. 2: a joiner waits for the first group over its data, not
+        // the newest.  A later group (A writes and flushes again, its sync
+        // still to come) leaves B's wait at lsn_a, durable already.
+        s.write(a, 6, &blocks(0xa6, 1), false).unwrap();
+        let (lsn_a2, _) = s.flush_for(a).unwrap();
+        assert!(lsn_a2 > lsn_a);
+        let (lsn_b3, appended) = s.flush_for(b).unwrap();
+        assert!(!appended);
+        assert_eq!(
+            lsn_b3, lsn_a,
+            "the first group over B's write, not the newest"
+        );
+        assert!(!syncer.durable(lsn_b3).unwrap(), "durable already: no wait");
+        syncer.durable(lsn_a2).unwrap();
         // B writes again: its next flush appends, as before.
         s.write(b, 4, &blocks(0xb4, 1), false).unwrap();
         let (lsn_b2, appended) = s.flush_for(b).unwrap();
