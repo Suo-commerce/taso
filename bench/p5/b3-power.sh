@@ -47,7 +47,8 @@
 # under $RUN/run; the listener writes ACKED in the laptop's current
 # directory.  Refuses to start if a taso-blkd, taso-wardend or taso-sim
 # already runs.  Env: B3_VESSELS (8), B3_WRITES (3), B3_ROWS (64),
-# B3_ROW_BYTES (1024), B3_PORT (7706), B3_COMPACT_PCT (30); B3_FIRST=DIR for a repeated verify
+# B3_ROW_BYTES (1024), B3_PORT (7706), B3_COMPACT_PCT (30), B3_DURABLE_AT (flush:
+# taso-blkd's --durable-at; give run and verify the same); B3_FIRST=DIR for a repeated verify
 # of the same round: the cut's recovery and the settle lines (line 4) are
 # read from that earlier verify's results, the rebirth that saw the cut.
 # Needs python3 (stdlib only) on
@@ -137,7 +138,9 @@ COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo '?')
 # Seal, so garbage stayed at 3.4 % of the log (taso-p5, 2026-10-31).
 COMPACT_PCT=${B3_COMPACT_PCT:-30}
 [[ "$COMPACT_PCT" =~ ^[0-9]+$ ]] && (( COMPACT_PCT <= 99 )) || die "B3_COMPACT_PCT=$COMPACT_PCT: 0 to 99"
-BLKD_FLAGS=(--checkpoint-mib 64 --compact-pct "$COMPACT_PCT" --compact-min-mib 64)
+DURABLE_AT=${B3_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) die "B3_DURABLE_AT=$DURABLE_AT: flush, fua or seal" ;; esac
+BLKD_FLAGS=(--checkpoint-mib 64 --compact-pct "$COMPACT_PCT" --compact-min-mib 64 --durable-at "$DURABLE_AT")
 for p in taso-blkd taso-wardend taso-sim; do
     ! pgrep -x "$p" >/dev/null || die "a $p is already running (pgrep -x $p): not ours to share"
 done
