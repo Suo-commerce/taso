@@ -542,6 +542,19 @@ impl EffectsConf {
     }
 }
 
+/// `"effects": "dispatch" | "hold"`, or absent (`None`), for a Vessel's
+/// entry and for the node's default alike.
+fn effects_conf(v: Option<&Value>) -> Result<Option<EffectsConf>, ConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(e) => match e.as_str() {
+            Some("dispatch") => Ok(Some(EffectsConf::Dispatch)),
+            Some("hold") => Ok(Some(EffectsConf::Hold)),
+            _ => Err(bad("\"effects\" must be \"dispatch\" or \"hold\"")),
+        },
+    }
+}
+
 /// A Vessel forked from another on this node (fencing review F6 step 3c,
 /// decision D1 of 2026-10-21; config: `"fork": {"parent": "<subject>",
 /// "seal": "last" | <lsn>}`, `seal` defaulting to `"last"`).
@@ -794,6 +807,12 @@ pub struct Config {
     pub source: SourceConf,
     /// The Vessels to run (a static source; empty for any other).
     pub vessels: Vec<VesselConf>,
+    /// The node's default for a Vessel whose entry says nothing about its
+    /// effects (`"effects": "dispatch" | "hold"` at the top level; P5 C1,
+    /// c-e): `taso-ctl init` writes `"hold"`, so a Vessel a stranger adds
+    /// by hand acts outward only once its entry says `"dispatch"`.
+    /// `None`: by origin, as before (a fork holds, a birth dispatches).
+    pub effects: Option<EffectsConf>,
     /// Nominations on this node (P4 §3.1, D58): `"sanction": {"classmap":
     /// "<path>", "allowed_exclude": [<class>, ...]}`; `None`: this node
     /// nominates nothing.
@@ -1388,6 +1407,7 @@ impl Config {
                 "source",
                 "purge",
                 "decider",
+                "effects",
             ],
         )?;
         let warden = field(&v, "warden")?
@@ -1524,14 +1544,7 @@ impl Config {
                             )),
                             Some(_) => return Err(bad("\"template\" must be \"<name>@<version>\" or a template_id (32 hex digits)")),
                         },
-                        effects: match x.get("effects") {
-                            None | Some(Value::Null) => None,
-                            Some(e) => match e.as_str() {
-                                Some("dispatch") => Some(EffectsConf::Dispatch),
-                                Some("hold") => Some(EffectsConf::Hold),
-                                _ => return Err(bad("\"effects\" must be \"dispatch\" or \"hold\"")),
-                            },
-                        },
+                        effects: effects_conf(x.get("effects"))?,
                         promote: match x.get("promote") {
                             None | Some(Value::Null) => None,
                             Some(p) => Some(promote_conf(p)?),
@@ -1645,6 +1658,7 @@ impl Config {
             runtime,
             quiescence,
             source,
+            effects: effects_conf(v.get("effects"))?,
             sanction: match v.get("sanction") {
                 None | Some(Value::Null) => None,
                 Some(s) => {
@@ -4136,9 +4150,9 @@ impl Node {
         }
         let effects_publisher =
             PackPublisher::new(self.packs(id)?, self.coord.clone(), self.config.warden);
-        // Who may release effects: the entry's say, else by origin (a
-        // fork holds).
-        let mode = EffectsConf::mode(vc.effects, &vessel.lineage().origin);
+        // Who may release effects: the entry's say, else the node's
+        // default (c-e), else by origin (a fork holds).
+        let mode = EffectsConf::mode(vc.effects.or(self.config.effects), &vessel.lineage().origin);
         let (mut effects, reconciled) =
             Effects::open(mode, Box::new(effects_publisher), &mut vessel)?;
         self.log(
@@ -5554,6 +5568,37 @@ mod tests {
         // null is no fork, as for "takeover".
         let c = with(|v| v["vessels"][1]["fork"] = Value::Null).unwrap();
         assert_eq!(c.vessels[1].fork, None);
+    }
+
+    /// The node's `"effects"` is the default for an entry that says
+    /// nothing (P5 C1, c-e); an entry's own word wins; a bad value is
+    /// refused as the entry's is.  Shown to fail without the node key.
+    #[test]
+    fn the_nodes_effects_is_the_default_for_entries_that_say_nothing() {
+        use taso_core::record::Origin;
+        let c = Config::parse(GOOD).unwrap();
+        assert_eq!(c.effects, None, "GOOD names no node default");
+        let c = with(|v| v["effects"] = "hold".into()).unwrap();
+        assert_eq!(c.effects, Some(EffectsConf::Hold));
+        // What the Warden applies: the entry's say, else the node's.
+        let entry_says_nothing = c.vessels[0].effects.or(c.effects);
+        assert_eq!(
+            EffectsConf::mode(entry_says_nothing, &Origin::Void),
+            Mode::Hold,
+            "a void-born Vessel holds on a node that holds by default"
+        );
+        let c = with(|v| {
+            v["effects"] = "hold".into();
+            v["vessels"][0]["effects"] = "dispatch".into();
+        })
+        .unwrap();
+        assert_eq!(
+            EffectsConf::mode(c.vessels[0].effects.or(c.effects), &Origin::Void),
+            Mode::Dispatch,
+            "the entry's own word wins"
+        );
+        let e = with(|v| v["effects"] = "send".into()).unwrap_err();
+        assert!(e.0.contains("\"dispatch\" or \"hold\""), "{e}");
     }
 
     /// `"effects"` says whether a Vessel releases or holds; absent (or
