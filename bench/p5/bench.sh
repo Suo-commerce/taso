@@ -213,8 +213,11 @@ log_sync_us() { # those syncs timed, COUNT:TOTAL_US:MAX_US (taso-blkd stats sync
 log_joined() { # device flushes answered from a group already closed (taso-blkd stats flushes_joined, bite 4); empty on zfs or an older taso-blkd
     if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^flushes_joined=//p'; fi
 }
-log_ops() { # the device requests taso-blkd served so far, one "op_NAME=COUNT:TOTAL_US:STORE_US:BYTES" per line (bite 4's probe); empty on zfs
+log_ops() { # the device requests taso-blkd served so far, one "op_NAME=COUNT:TOTAL_US:STORE_US:BYTES[:WAIT_US]" per line (bite 4's probe; the wait for the store's lock since bite 5's); empty on zfs
     if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | grep '^op_' | grep -v '^op_wsplit'; fi
+}
+log_lock() { # every hold of the store's lock by site, "SITE:COUNT:TOTAL_US:MAX_US,..." (taso-blkd stats lock, bite 5's probe); empty on zfs or an older taso-blkd
+    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^lock=//p'; fi
 }
 
 # ---- one run: the Warden with P Vessels -------------------------------------------
@@ -261,6 +264,7 @@ PY
     log_sync_us >"$OUT/warden-$r.syncus0"
     log_ops >"$OUT/warden-$r.ops0"
     log_joined >"$OUT/warden-$r.joined0"
+    log_lock >"$OUT/warden-$r.lock0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
     TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$BIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
@@ -279,6 +283,7 @@ PY
     log_sync_us >"$OUT/warden-$r.syncus1"
     log_ops >"$OUT/warden-$r.ops1"
     log_joined >"$OUT/warden-$r.joined1"
+    log_lock >"$OUT/warden-$r.lock1"
     # What shipped: the local store's bytes and files after this run (the
     # packs every Seal published).  The log's growth counts every version
     # of every block; the packs carry a Seal's live blocks only, so the two
@@ -414,20 +419,46 @@ if storage != "zfs":
     # time per Seal is the kernel's own (write-back submission, the
     # superblock's barriers, the ublk round trips).
     def ops(f):
-        return {l.split("=")[0][3:]: [int(x) for x in l.split("=")[1].split(":")] for l in open(f).read().split() if l.startswith("op_")}
+        # Five fields since bite 5's probe (the wait for the lock); four before: padded.
+        return {l.split("=")[0][3:]: ([int(x) for x in l.split("=")[1].split(":")] + [0] * 5)[:5] for l in open(f).read().split() if l.startswith("op_")}
     tot = {}
     for f0 in sorted(glob.glob(os.path.join(out, "warden-*.ops0"))):
         a, b = ops(f0), ops(f0[:-1] + "1")
         for k in b:
             if k in a:
                 d = [y - x for x, y in zip(a[k], b[k])]
-                tot[k] = [u + v for u, v in zip(tot.get(k, [0, 0, 0, 0]), d)]
-    for k in ("flush", "write", "read", "discard"):
-        c, us, su, by = tot.get(k, [0, 0, 0, 0])
+                tot[k] = [u + v for u, v in zip(tot.get(k, [0] * 5), d)]
+    names = {"flush": "flushes", "write": "writes", "read": "reads", "discard": "discards", "wfua": "FUA writes"}
+    for k in ("flush", "write", "wfua", "read", "discard"):
+        c, us, su, by, wu = tot.get(k, [0] * 5)
         if c:
-            print(f"- device {k}{'es' if k == 'flush' else 's'}: {c} in the run, {c / (seals or 1):.2f} per Seal; {us / c / 1000:.2f} ms each in taso-blkd ({su / c / 1000:.2f} under the store's lock)"
+            print(f"- device {names[k]}: {c} in the run, {c / (seals or 1):.2f} per Seal; {us / c / 1000:.2f} ms each in taso-blkd ({su / c / 1000:.2f} under the store's lock"
+                  + (f", {wu / c / 1000:.2f} waiting for it" if wu else "") + ")"
                   + (f", {by / c / 1024:.1f} KiB each" if by else "")
                   + f"; {us / (seals or 1) / 1000:.1f} ms per Seal")
+    # Bite 5's probe: the wait for the store's lock, summed per Seal across
+    # every request a Seal's turn sends -- a Vessel's queue thread serves
+    # its requests one at a time, so this wait is in series on the Seal --
+    # against the lock's holds, by site, per Seal.  A wait much larger
+    # than the holds is a queue: the lock is busy with others' holds, or
+    # its holder was preempted (taso-test, P=64, 2026-11-03: ~2 ms waited
+    # per request for 10-80 us held).
+    waited = sum(v[4] for v in tot.values())
+    held = {}
+    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.lock0"))):
+        a, b = (dict((e.split(":")[0], [int(x) for x in e.split(":")[1:]]) for e in open(f).read().split(",") if ":" in e) for f in (f0, f0[:-1] + "1"))
+        for k, (c1, t1, m1) in b.items():
+            c0, t0, _ = a.get(k, [0, 0, 0])
+            h = held.setdefault(k, [0, 0, 0]); h[0] += c1 - c0; h[1] += t1 - t0; h[2] = max(h[2], m1)
+    if waited or held:
+        per = seals or 1
+        print(f"- the store's lock, per Seal: waited for {waited / per / 1000:.1f} ms in all by the device requests; held {sum(h[1] for h in held.values()) / per / 1000:.2f} ms in all, by site:")
+        top = sorted(((k, h) for k, h in held.items() if h[0]), key=lambda kh: -kh[1][1])
+        for k, (c, us, mx) in top[:10]:
+            print(f"    - {k}: {us / per / 1000:.2f} ms per Seal ({c / per:.1f} holds of {us / c:.0f} us mean; the longest {mx / 1000:.1f} ms since taso-blkd started)")
+        rest = top[10:]
+        if rest:
+            print(f"    - {len(rest)} more sites: {sum(h[1] for _, h in rest) / per / 1000:.2f} ms per Seal")
     # Bite 4's lever: how many of the flushes appended nothing and waited
     # for a group another flush had closed (taso-blkd stats flushes_joined).
     j = 0; have = False
