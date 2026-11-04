@@ -314,11 +314,16 @@ fn init(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     println!("  {CONFIG} written (effects held by default; no Vessels yet)");
-    // What to do next, and what to know (c-g).
+    // What to do next, and what to know (c-g).  The Warden on a static
+    // config runs the Vessels listed and ends when they are done -- with
+    // none listed it ends at once (found on the first stranger's VM,
+    // 2026-11-04) -- so the Vessel comes first in the order printed.
     println!(
-        "\nStart the block log, then the Warden once `taso-ctl status` says the block log answers:\n\
-         \n  taso-blkd {log} {sock} --size-gib {size}\n  taso-wardend {CONFIG}\n\
-         \nAdd a Vessel to \"vessels\" in {CONFIG} (its entry needs a rootfs: {rootfs}).\n\
+        "\nNext, in this order:\n\
+         \n1. Add a Vessel to \"vessels\" in {CONFIG}. Its entry needs a rootfs: {rootfs}.\n\
+         2. Start the block log:        taso-blkd {log} {sock} --size-gib {size}\n\
+         3. When `taso-ctl status` says the block log answers, start the Warden:  taso-wardend {CONFIG}\n\
+         \x20  The Warden runs the Vessels listed and ends when they are done; with none listed it ends at once.\n\
          \nRead before running an agent:\n\
          - Taso records; it does not police. Its guarantee holds only when every persistent \
          writable device the agent can reach is the Warden's, and every external writable service \
