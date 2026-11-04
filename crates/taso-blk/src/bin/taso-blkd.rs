@@ -6,7 +6,7 @@
 //! ```text
 //!   taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--threads N] [--io-kib N]
 //!             [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N]
-//!             [--durable-at flush|seal]
+//!             [--durable-at flush|fua|seal]
 //! ```
 //!
 //! Opens LOG (creating it if missing; recovery runs and is reported), then
@@ -101,6 +101,14 @@
 //!   either before a durable Seal, which carries it, or after it, where
 //!   the reset discards it anyway.  For any other user of the device it
 //!   breaks the block-device contract; `flush` (the default) keeps it.
+//!   It also narrows D92: an agent's acknowledged `fsync` after the last
+//!   Seal is no longer in the log after a crash, so the Warden cannot name
+//!   it (D93 (i) becomes (iii)).
+//! - **`--durable-at fua`** answers only FUA writes once appended; every
+//!   flush still syncs.  In a Vessel (ext4 without a journal) an agent's
+//!   `fsync` arrives as a flush, and the FUA writes are ext4's superblock
+//!   at freeze and thaw, which no agent is told of: the next flush or the
+//!   Seal's sync carries them (the log is a prefix).  D92 stands.
 //! - Requests of up to `--io-kib` (512 KiB by default): that is the
 //!   largest request (`max_sectors_kb`) and the size of each queue's
 //!   buffer.  The I/O sizes the device reports are 4 KiB, minimum and
@@ -145,7 +153,7 @@ use std::os::fd::FromRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
@@ -402,12 +410,25 @@ const OP_WFUA: usize = 4;
 /// unless set; costs a write per request.
 static OPLOG: Mutex<Option<std::io::BufWriter<File>>> = Mutex::new(None);
 
-/// `--durable-at seal`: device flushes and FUA writes are answered without
-/// a sync (the module docs say when that is right).  Set once in `main`.
-static DURABLE_AT_SEAL: AtomicBool = AtomicBool::new(false);
+/// `--durable-at`: what a device request waits for (the module docs say
+/// when each is right).  Set once in `main`.
+static DURABLE_AT: AtomicU8 = AtomicU8::new(AT_FLUSH);
+const AT_FLUSH: u8 = 0;
+const AT_FUA: u8 = 1;
+const AT_SEAL: u8 = 2;
 
-fn durable_at_seal() -> bool {
-    DURABLE_AT_SEAL.load(Ordering::Relaxed)
+/// A FUA write is answered once appended (`fua`, `seal`).
+fn fua_early() -> bool {
+    DURABLE_AT.load(Ordering::Relaxed) >= AT_FUA
+}
+
+/// A device flush is answered without a sync (`seal`).
+fn flush_early() -> bool {
+    DURABLE_AT.load(Ordering::Relaxed) == AT_SEAL
+}
+
+fn durable_at_name() -> &'static str {
+    ["flush", "fua", "seal"][DURABLE_AT.load(Ordering::Relaxed) as usize]
 }
 /// The three parts of one request, for the op log and the counters.
 #[derive(Clone, Copy, Default)]
@@ -471,7 +492,7 @@ struct Daemon {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N] [--durable-at flush|seal]";
+    let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N] [--durable-at flush|fua|seal]";
     if args.len() < 3 {
         log!("{usage}");
         std::process::exit(64);
@@ -493,10 +514,11 @@ fn main() {
     while let Some(flag) = rest.next() {
         if flag == "--durable-at" {
             match rest.next().map(String::as_str) {
-                Some("flush") => DURABLE_AT_SEAL.store(false, Ordering::Relaxed),
-                Some("seal") => DURABLE_AT_SEAL.store(true, Ordering::Relaxed),
+                Some("flush") => DURABLE_AT.store(AT_FLUSH, Ordering::Relaxed),
+                Some("fua") => DURABLE_AT.store(AT_FUA, Ordering::Relaxed),
+                Some("seal") => DURABLE_AT.store(AT_SEAL, Ordering::Relaxed),
                 _ => {
-                    log!("bad argument {flag}: flush or seal\n{usage}");
+                    log!("bad argument {flag}: flush, fua or seal\n{usage}");
                     std::process::exit(64);
                 }
             }
@@ -557,7 +579,7 @@ fn main() {
         log.display(),
         socket.display(),
         raise_open_files(),
-        if durable_at_seal() { "seal" } else { "flush" }
+        durable_at_name()
     );
 
     let sync = Arc::new(
@@ -1283,7 +1305,7 @@ impl Daemon {
             st.sync_us + sync_us,
             st.sync_max_us.max(sync_max_us),
             st.flushes_joined,
-            if durable_at_seal() { "seal" } else { "flush" },
+            durable_at_name(),
             lock_line,
         )
     }
@@ -1512,9 +1534,9 @@ fn handle(
             }
             split.copy = t.elapsed();
             // FUA: the write's group ended under the lock, synced outside it
-            // (with --durable-at seal: answered once appended, no sync).
+            // (with --durable-at fua or seal: answered once appended, no sync).
             let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
-            let sync_fua = fua && !durable_at_seal();
+            let sync_fua = fua && !fua_early();
             let r = {
                 let mut s = lock_store_timed(store, &mut split, Site::Write);
                 let t = std::time::Instant::now();
@@ -1545,7 +1567,7 @@ fn handle(
             // own sync, joined (store.rs flush_for, P5 bite 4).  With
             // --durable-at seal the completed writes are in the log already
             // and the next Seal's sync carries them: answered at once.
-            if durable_at_seal() {
+            if flush_early() {
                 note_op(OP_FLUSH, started, Split::default(), 0);
                 return 0;
             }
