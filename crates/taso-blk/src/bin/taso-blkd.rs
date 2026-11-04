@@ -881,9 +881,14 @@ impl Daemon {
                     .open(&path)
                     .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
                 let mut w = std::io::BufWriter::new(file);
-                let result = lock_store(&self.store, Site::Export)
-                    .export(to, from, &mut w)
+                // The store is held for the plan only (the checks, the
+                // block list); the blocks are read and the pack written
+                // without it (P5 bite 5: the export held the lock 1.2 ms
+                // a Seal at P=64, the largest holder, taso-test 2026-11-04).
+                let plan = lock_store(&self.store, Site::Export)
+                    .export_plan(to, from)
                     .map_err(store_err);
+                let result = plan.and_then(|p| p.write(&mut w).map_err(store_err));
                 let result = result.and_then(|n| {
                     let f = w.into_inner().map_err(|e| e.to_string())?;
                     f.sync_all().map_err(|e| e.to_string())?;
