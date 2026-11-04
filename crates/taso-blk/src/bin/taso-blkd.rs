@@ -159,16 +159,143 @@ macro_rules! log {
     }};
 }
 
+/// Where the store's lock is taken, for `stats lock=`: every hold is
+/// timed by its site (P5 bite 5's probe, 2026-11-04).  At P=64 on
+/// taso-test a device request waited ~2 ms for a lock the requests
+/// themselves held 10-80 µs, 23 % of the time, with ten threads queued:
+/// a queue that deep needs the lock busy most of the time, so the other
+/// holders -- the Warden's commands, the upkeep, the checkpoints -- are
+/// counted here, each by name.  `Site::N` is the count; `SITES` names
+/// them in the same order (a test checks).
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum Site {
+    Read,
+    Write,
+    Flush,
+    Discard,
+    Poisoned, // serve: is the store poisoned, before and after a command
+    Resolve,  // a command's layer id looked up
+    Root,
+    Name,
+    Find,
+    Seals,
+    Seal,
+    Unseal,
+    Reset,
+    Export,
+    Import,
+    Checkpoint,
+    Names,
+    DropKind,
+    DropBranch,
+    DropSeal,
+    FlushCmd,
+    Branch,
+    Info,
+    Room,
+    CompactBegin,
+    CompactFinish,
+    AttachKind,
+    Stats,
+    Upkeep,
+    UpkeepCheckpoint,
+    Quit,
+    SyncFailed,
+    N,
+}
+const SITES: [&str; Site::N as usize] = [
+    "read",
+    "write",
+    "flush",
+    "discard",
+    "poisoned",
+    "resolve",
+    "root",
+    "name",
+    "find",
+    "seals",
+    "seal",
+    "unseal",
+    "reset",
+    "export",
+    "import",
+    "checkpoint",
+    "names",
+    "drop_kind",
+    "drop_branch",
+    "drop_seal",
+    "flush_cmd",
+    "branch",
+    "info",
+    "room",
+    "compact_begin",
+    "compact_finish",
+    "attach_kind",
+    "stats",
+    "upkeep",
+    "upkeep_checkpoint",
+    "quit",
+    "sync_failed",
+];
+/// One site's holds: how many, their µs summed, the longest.
+#[derive(Default, Clone, Copy)]
+struct Hold {
+    count: u64,
+    total_us: u64,
+    max_us: u64,
+}
+static HELD: Mutex<[Hold; Site::N as usize]> = Mutex::new(
+    [Hold {
+        count: 0,
+        total_us: 0,
+        max_us: 0,
+    }; Site::N as usize],
+);
+
+/// The store, locked, with the hold timed until the guard drops.
+struct Held<'a> {
+    guard: MutexGuard<'a, Store>,
+    site: Site,
+    since: std::time::Instant,
+}
+impl std::ops::Deref for Held<'_> {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.guard
+    }
+}
+impl std::ops::DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut Store {
+        &mut self.guard
+    }
+}
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let us = self.since.elapsed().as_micros() as u64;
+        let mut held = lock(&HELD);
+        let h = &mut held[self.site as usize];
+        h.count += 1;
+        h.total_us += us;
+        h.max_us = h.max_us.max(us);
+    }
+}
+
 /// The store, locked.  If a thread panicked while holding it, the store
 /// is not trusted any more: it is poisoned (every call fails until the log
 /// is reopened, as after a failed append) and the daemon goes on answering,
-/// so `quit` still works.
-fn lock_store(store: &Mutex<Store>) -> MutexGuard<'_, Store> {
-    store.lock().unwrap_or_else(|p| {
+/// so `quit` still works.  The hold is timed under `site`.
+fn lock_store(store: &Mutex<Store>, site: Site) -> Held<'_> {
+    let guard = store.lock().unwrap_or_else(|p| {
         let mut s = p.into_inner();
         s.poison();
         s
-    })
+    });
+    Held {
+        guard,
+        site,
+        since: std::time::Instant::now(),
+    }
 }
 
 /// A plain table, locked, whether or not a thread panicked while holding
@@ -223,29 +350,35 @@ enum Slot {
 }
 
 /// Per-operation time on the device path, for `stats`: how long a request
-/// takes in `handle` altogether, and how much of that inside the store's
-/// lock.  Named by lever 3 of P5 (2026-10-26): 1 MiB of write-back through
-/// a branch took 37 ms with two syncs on taso-p5, and nothing in the store
-/// accounts for it.
+/// takes in `handle` altogether, how much of that inside the store's
+/// lock, and how much waiting for it.  Named by lever 3 of P5
+/// (2026-10-26): 1 MiB of write-back through a branch took 37 ms with two
+/// syncs on taso-p5, and nothing in the store accounts for it.  A FUA
+/// write is counted apart (`op_wfua`): its group ends and syncs at once,
+/// one of a Seal's fresh syncs (the superblock, at the freeze and at the
+/// thaw; bite 5).
 #[derive(Default, Clone, Copy)]
 struct OpTime {
     count: u64,
     total_us: u64,
     store_us: u64,
     bytes: u64,
+    wait_us: u64,
 }
-static OPS: Mutex<[OpTime; 4]> = Mutex::new(
+static OPS: Mutex<[OpTime; 5]> = Mutex::new(
     [OpTime {
         count: 0,
         total_us: 0,
         store_us: 0,
         bytes: 0,
-    }; 4],
+        wait_us: 0,
+    }; 5],
 );
 const OP_READ: usize = 0;
 const OP_WRITE: usize = 1;
 const OP_FLUSH: usize = 2;
 const OP_DISCARD: usize = 3;
+const OP_WFUA: usize = 4;
 /// `TASO_BLKD_OPLOG=path`: one line per device request, `op bytes start_ns
 /// end_ns copy_ns wait_ns store_ns` on CLOCK_MONOTONIC (blktrace's clock),
 /// for the probe of where a request's time goes (blk-trace-freeze.sh).
@@ -264,9 +397,9 @@ struct Split {
     store: std::time::Duration,
 }
 /// The store's lock, with the wait for it measured.
-fn lock_store_timed<'a>(store: &'a Mutex<Store>, split: &mut Split) -> MutexGuard<'a, Store> {
+fn lock_store_timed<'a>(store: &'a Mutex<Store>, split: &mut Split, site: Site) -> Held<'a> {
     let t = std::time::Instant::now();
-    let s = lock_store(store);
+    let s = lock_store(store, site);
     split.wait = t.elapsed();
     s
 }
@@ -287,7 +420,7 @@ fn note_op(op: usize, started: std::time::Instant, split: Split, bytes: u64) {
         let _ = writeln!(
             w,
             "{} {bytes} {start} {end} {} {} {}",
-            ["read", "write", "flush", "discard"][op],
+            ["read", "write", "flush", "discard", "wfua"][op],
             split.copy.as_nanos(),
             split.wait.as_nanos(),
             split.store.as_nanos()
@@ -300,6 +433,7 @@ fn note_op(op: usize, started: std::time::Instant, split: Split, bytes: u64) {
     o.total_us += started.elapsed().as_micros() as u64;
     o.store_us += split.store.as_micros() as u64;
     o.bytes += bytes;
+    o.wait_us += split.wait.as_micros() as u64;
 }
 
 struct Daemon {
@@ -429,7 +563,7 @@ fn main() {
                 d.stop_all();
                 // A clean shutdown loses nothing: end the last group, and
                 // leave a checkpoint so the next start is quick.
-                if let Err(e) = lock_store(&d.store).checkpoint() {
+                if let Err(e) = lock_store(&d.store, Site::Quit).checkpoint() {
                     log!("taso-blkd: final checkpoint: {e}");
                 }
                 let _ = std::fs::remove_file(&socket);
@@ -473,12 +607,12 @@ fn raise_open_files() -> u64 {
 /// Runs for the daemon's life.
 fn upkeep(d: &Daemon) {
     let g = d.geometry;
-    let mut last = lock_store(&d.store).stats().log_bytes;
+    let mut last = lock_store(&d.store, Site::Upkeep).stats().log_bytes;
     // Said once until there is room again, not every 5 s.
     let mut short_of_room = false;
     loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
-        let stats = lock_store(&d.store).stats();
+        let stats = lock_store(&d.store, Site::Upkeep).stats();
         let due = g.compact_pct > 0
             && stats.garbage_bytes >= g.compact_min
             && stats.garbage_bytes * 100 >= stats.log_bytes * g.compact_pct;
@@ -510,13 +644,13 @@ fn upkeep(d: &Daemon) {
                         }
                     }
                     // A compaction leaves a checkpoint of the new log.
-                    last = lock_store(&d.store).stats().log_bytes;
+                    last = lock_store(&d.store, Site::Upkeep).stats().log_bytes;
                     continue;
                 }
             }
         }
         if g.checkpoint_every > 0 && stats.log_bytes.saturating_sub(last) >= g.checkpoint_every {
-            let mut s = lock_store(&d.store);
+            let mut s = lock_store(&d.store, Site::UpkeepCheckpoint);
             match s.checkpoint() {
                 Ok(lsn) => {
                     last = s.stats().log_bytes;
@@ -610,7 +744,7 @@ fn serve(d: &Daemon, conn: UnixStream) -> bool {
             continue;
         }
         let quit = words[0] == "quit";
-        let poisoned_before = lock_store(&d.store).is_poisoned();
+        let poisoned_before = lock_store(&d.store, Site::Poisoned).is_poisoned();
         let answer = match d.command(&words) {
             Ok(a) if a.is_empty() => "ok".to_string(),
             Ok(a) => format!("ok {a}"),
@@ -620,7 +754,7 @@ fn serve(d: &Daemon, conn: UnixStream) -> bool {
                 // but a report that only shows the later refusals ("an
                 // earlier append failed") names nothing (spec rev. 34, D93
                 // class (i); E3's error-mode rounds, taso-test 2026-10-28).
-                if !poisoned_before && lock_store(&d.store).is_poisoned() {
+                if !poisoned_before && lock_store(&d.store, Site::Poisoned).is_poisoned() {
                     log!("taso-blkd: the store is poisoned: {} failed: {e}", words[0]);
                 }
                 format!("err {e}")
@@ -645,10 +779,7 @@ impl Daemon {
         };
         let store_err = |e: taso_blk::store::StoreError| e.to_string();
         match words[0] {
-            "root" => Ok(self
-                .store
-                .lock()
-                .unwrap()
+            "root" => Ok(lock_store(&self.store, Site::Root)
                 .root_seal()
                 .map_err(store_err)?
                 .to_string()),
@@ -665,23 +796,21 @@ impl Daemon {
             "name" => {
                 let branch = layer(1)?;
                 let name = words.get(2).copied().unwrap_or("");
-                self.store
-                    .lock()
-                    .unwrap()
+                lock_store(&self.store, Site::Name)
                     .name(branch, name)
                     .map_err(store_err)?;
                 Ok(String::new())
             }
             "find" => {
                 let name = words.get(1).ok_or("missing name")?;
-                let found = lock_store(&self.store).find(name);
+                let found = lock_store(&self.store, Site::Find).find(name);
                 found
                     .map(|b| b.to_string())
                     .ok_or_else(|| format!("no branch named {name}"))
             }
             "seals" => {
                 let branch = layer(1)?;
-                let s = lock_store(&self.store);
+                let s = lock_store(&self.store, Site::Seals);
                 let list: Vec<String> = s
                     .seals_of(branch)
                     .into_iter()
@@ -702,7 +831,7 @@ impl Daemon {
                 // and the store's mutex is not re-entrant.
                 let branch = layer(1)?;
                 let tag = unhex(words.get(2).copied().unwrap_or(""))?;
-                let (seal, lsn) = lock_store(&self.store)
+                let (seal, lsn) = lock_store(&self.store, Site::Seal)
                     .seal_pending(branch, &tag)
                     .map_err(store_err)?;
                 self.durable(lsn)?;
@@ -716,10 +845,7 @@ impl Daemon {
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
-                let freed = self
-                    .store
-                    .lock()
-                    .unwrap()
+                let freed = lock_store(&self.store, Site::Unseal)
                     .unseal(branch)
                     .map_err(store_err)?;
                 drop(devices);
@@ -733,10 +859,7 @@ impl Daemon {
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
-                let discarded = self
-                    .store
-                    .lock()
-                    .unwrap()
+                let discarded = lock_store(&self.store, Site::Reset)
                     .reset(branch)
                     .map_err(store_err)?;
                 drop(devices);
@@ -758,10 +881,7 @@ impl Daemon {
                     .open(&path)
                     .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
                 let mut w = std::io::BufWriter::new(file);
-                let result = self
-                    .store
-                    .lock()
-                    .unwrap()
+                let result = lock_store(&self.store, Site::Export)
                     .export(to, from, &mut w)
                     .map_err(store_err);
                 let result = result.and_then(|n| {
@@ -785,19 +905,13 @@ impl Daemon {
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
-                let n = self
-                    .store
-                    .lock()
-                    .unwrap()
+                let n = lock_store(&self.store, Site::Import)
                     .import(branch, &mut r)
                     .map_err(store_err)?;
                 drop(devices);
                 Ok(n.to_string())
             }
-            "checkpoint" => Ok(self
-                .store
-                .lock()
-                .unwrap()
+            "checkpoint" => Ok(lock_store(&self.store, Site::Checkpoint)
                 .checkpoint()
                 .map_err(store_err)?
                 .to_string()),
@@ -806,7 +920,7 @@ impl Daemon {
                 Ok(compacted(&self.compact()?))
             }
             "names" => {
-                let names = lock_store(&self.store).names();
+                let names = lock_store(&self.store, Site::Names).names();
                 Ok(names
                     .into_iter()
                     .map(|(n, b)| format!("{n}:{b}"))
@@ -819,27 +933,26 @@ impl Daemon {
             }
             "drop" => {
                 let l = layer(1)?;
-                let kind = self
-                    .store
-                    .lock()
-                    .unwrap()
+                let kind = lock_store(&self.store, Site::DropKind)
                     .map()
                     .kind(l)
                     .map_err(|e| e.to_string())?;
                 if kind == Kind::Branch {
                     let _ = self.detach(l);
-                    self.store
-                        .lock()
-                        .unwrap()
+                    lock_store(&self.store, Site::DropBranch)
                         .drop_branch(l)
                         .map_err(store_err)?;
                 } else {
-                    lock_store(&self.store).drop_seal(l).map_err(store_err)?;
+                    lock_store(&self.store, Site::DropSeal)
+                        .drop_seal(l)
+                        .map_err(store_err)?;
                 }
                 Ok(String::new())
             }
             "flush" => {
-                let lsn = lock_store(&self.store).flush_pending().map_err(store_err)?;
+                let lsn = lock_store(&self.store, Site::FlushCmd)
+                    .flush_pending()
+                    .map_err(store_err)?;
                 self.durable(lsn)?;
                 Ok(lsn.to_string())
             }
@@ -853,7 +966,7 @@ impl Daemon {
     /// first and the store lock is held throughout, so a bad or taken name
     /// makes no branch and appends nothing.
     fn branch(&self, seal: LayerId, name: Option<&str>) -> Result<LayerId, String> {
-        let mut s = lock_store(&self.store);
+        let mut s = lock_store(&self.store, Site::Branch);
         if let Some(n) = name {
             s.check_name(n).map_err(|e| e.to_string())?;
         }
@@ -874,7 +987,7 @@ impl Daemon {
             Some(Slot::Running(d)) => Some(format!("/dev/ublkb{}", d.dev_id)),
             _ => None,
         };
-        let s = lock_store(&self.store);
+        let s = lock_store(&self.store, Site::Info);
         let kind = s.map().kind(l).map_err(|e| e.to_string())?;
         let parent = s.map().parent(l).map_err(|e| e.to_string())?;
         let or_dash = |o: Option<String>| o.unwrap_or_else(|| "-".to_string());
@@ -899,7 +1012,7 @@ impl Daemon {
     /// MiB).  `Err` says how much is wanted and how much there is.
     fn room_to_compact(&self) -> Result<(), String> {
         let (live, path) = {
-            let s = lock_store(&self.store);
+            let s = lock_store(&self.store, Site::Room);
             let st = s.stats();
             (
                 st.log_bytes.saturating_sub(st.garbage_bytes),
@@ -935,7 +1048,9 @@ impl Daemon {
         }
         let _done = Done(&self.compacting);
         let e = |e: taso_blk::store::StoreError| e.to_string();
-        let mut c = lock_store(&self.store).compaction().map_err(e)?;
+        let mut c = lock_store(&self.store, Site::CompactBegin)
+            .compaction()
+            .map_err(e)?;
         c.copy().map_err(e)?;
         // Catch up until a round finds little, so what finish copies with
         // the store held is short.
@@ -944,7 +1059,9 @@ impl Daemon {
                 break;
             }
         }
-        let done = c.finish(&mut lock_store(&self.store)).map_err(e)?;
+        let done = c
+            .finish(&mut lock_store(&self.store, Site::CompactFinish))
+            .map_err(e)?;
         // The store is let go of here; the caller drops `done.old_log`,
         // whose close frees the old file's space and may take a while.
         Ok(done)
@@ -952,15 +1069,12 @@ impl Daemon {
 
     /// The live layer with id number `n`, if any.
     fn find(&self, n: u64) -> Option<LayerId> {
-        lock_store(&self.store).map().live(n)
+        lock_store(&self.store, Site::Resolve).map().live(n)
     }
 
     /// Start a device for `branch`.  Returns its block device path.
     fn attach(&self, branch: LayerId) -> Result<String, String> {
-        if self
-            .store
-            .lock()
-            .unwrap()
+        if lock_store(&self.store, Site::AttachKind)
             .map()
             .kind(branch)
             .map_err(|e| e.to_string())?
@@ -1073,7 +1187,7 @@ impl Daemon {
         // call settling a branch holds the table, and a starting device's
         // first reads (the kernel's) need the store.
         let devices = lock(&self.devices).len();
-        let s = lock_store(&self.store);
+        let s = lock_store(&self.store, Site::Stats);
         let st = s.stats();
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         let field = |k: &str| {
@@ -1085,19 +1199,31 @@ impl Daemon {
                 .to_string()
         };
         let ops = *lock(&OPS);
+        // op_NAME=COUNT:TOTAL_US:STORE_US:BYTES:WAIT_US -- the fifth field,
+        // the wait for the store's lock summed, since bite 5's probe.
         let op = |name: &str, o: OpTime| {
             format!(
-                " {name}={}:{}:{}:{}",
-                o.count, o.total_us, o.store_us, o.bytes
+                " {name}={}:{}:{}:{}:{}",
+                o.count, o.total_us, o.store_us, o.bytes, o.wait_us
             )
         };
         // op_wsplit: where the writes' time under the lock went, µs summed
         // over every write: map, copy, hash, pwrite (store.rs Stats).
         // sync_us: the syncs= above, timed: count, total µs, longest µs
         // (the store's and the Syncer's; P5 bite 3).
+        // lock=SITE:COUNT:TOTAL_US:MAX_US,... -- every hold of the store's
+        // lock by site, the sites that held it at least once (bite 5).
         let (sync_us, sync_max_us) = self.sync.sync_time();
+        let held = *lock(&HELD);
+        let lock_line = SITES
+            .iter()
+            .zip(held.iter())
+            .filter(|(_, h)| h.count > 0)
+            .map(|(name, h)| format!("{name}:{}:{}:{}", h.count, h.total_us, h.max_us))
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={} lock={}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -1111,6 +1237,7 @@ impl Daemon {
             op("op_write", ops[OP_WRITE]),
             op("op_flush", ops[OP_FLUSH]),
             op("op_discard", ops[OP_DISCARD]),
+            op("op_wfua", ops[OP_WFUA]),
             st.write_map_us,
             st.write_copy_us,
             st.write_hash_us,
@@ -1119,6 +1246,7 @@ impl Daemon {
             st.sync_us + sync_us,
             st.sync_max_us.max(sync_max_us),
             st.flushes_joined,
+            lock_line,
         )
     }
 }
@@ -1270,7 +1398,7 @@ fn durable(sync: &Syncer, store: &Mutex<Store>, lsn: u64) -> Result<(), StoreErr
     match sync.durable(lsn) {
         Ok(_) => Ok(()),
         Err(e) => {
-            let mut s = lock_store(store);
+            let mut s = lock_store(store, Site::SyncFailed);
             if !s.is_poisoned() {
                 // The first to learn of it names the error the Syncer kept.
                 let why = sync.failure().unwrap_or_else(|| e.to_string());
@@ -1317,7 +1445,7 @@ fn handle(
             // Bound first: the lock is let go of before any logging.
             let mut split = Split::default();
             let r = {
-                let s = lock_store_timed(store, &mut split);
+                let s = lock_store_timed(store, &mut split, Site::Read);
                 let t = std::time::Instant::now();
                 let r = s.read(branch, lba, &mut buf[..n]);
                 split.store = t.elapsed();
@@ -1348,7 +1476,7 @@ fn handle(
             // FUA: the write's group ended under the lock, synced outside it.
             let fua = iod.op_flags & sys::UBLK_IO_F_FUA != 0;
             let r = {
-                let mut s = lock_store_timed(store, &mut split);
+                let mut s = lock_store_timed(store, &mut split, Site::Write);
                 let t = std::time::Instant::now();
                 let r = s.write(branch, lba, &buf[..n], false).and_then(|()| {
                     if fua {
@@ -1368,7 +1496,7 @@ fn handle(
                 },
                 Err(e) => io(&e),
             };
-            note_op(OP_WRITE, started, split, bytes);
+            note_op(if fua { OP_WFUA } else { OP_WRITE }, started, split, bytes);
             res
         }
         sys::UBLK_IO_OP_FLUSH => {
@@ -1377,7 +1505,7 @@ fn handle(
             // own sync, joined (store.rs flush_for, P5 bite 4).
             let mut split = Split::default();
             let r = {
-                let mut s = lock_store_timed(store, &mut split);
+                let mut s = lock_store_timed(store, &mut split, Site::Flush);
                 let t = std::time::Instant::now();
                 let r = s.flush_for(branch).map(|(lsn, _)| lsn);
                 split.store = t.elapsed();
@@ -1393,7 +1521,7 @@ fn handle(
         sys::UBLK_IO_OP_DISCARD | sys::UBLK_IO_OP_WRITE_ZEROES => {
             let mut split = Split::default();
             let r = {
-                let mut s = lock_store_timed(store, &mut split);
+                let mut s = lock_store_timed(store, &mut split, Site::Discard);
                 let t = std::time::Instant::now();
                 let r = s.discard(branch, lba, bytes / BLOCK);
                 split.store = t.elapsed();
@@ -1407,5 +1535,21 @@ fn handle(
             res
         }
         _ => -libc::EOPNOTSUPP,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Site, SITES};
+
+    /// The names line up with the sites (`SITES` is indexed by `Site as usize`).
+    #[test]
+    fn sites_are_named_in_order() {
+        assert_eq!(SITES[Site::Read as usize], "read");
+        assert_eq!(SITES[Site::Poisoned as usize], "poisoned");
+        assert_eq!(SITES[Site::Seal as usize], "seal");
+        assert_eq!(SITES[Site::CompactFinish as usize], "compact_finish");
+        assert_eq!(SITES[Site::SyncFailed as usize], "sync_failed");
+        assert_eq!(SITES.len(), Site::N as usize);
     }
 }
