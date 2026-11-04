@@ -943,7 +943,9 @@ impl<L: Layers> Chronicle<L> {
     ) -> Result<Sealed, ChronicleError> {
         self.ready()?;
         let _total = crate::timing::span("seal.total");
-        let lsn = self.segment.tail().lsn.next();
+        self.roll_if_full()?;
+        let before = self.segment.tail();
+        let lsn = before.lsn.next();
         let rec = self.next_record(
             Stream::Ctl,
             Payload::Seal(SealRecord {
@@ -956,22 +958,55 @@ impl<L: Layers> Chronicle<L> {
             }),
         );
         let hash = rec.envelope.hash;
-        let snap = crate::timing::span("seal.snapshot");
-        let made = match make {
-            None => self.layers.snapshot(lsn, hash),
-            // A promotion's adoption: nothing frozen to thaw (s-e).
-            Some(make) => make(lsn, hash).map(|()| Thaw::none()),
+        // The record's frame is written and synced into the segment beside
+        // the layer, not after it (P5, the next lever after s-g: on taso-p5
+        // the segment's fsync was 8 ms of a 35 ms Seal at P=64).  What
+        // accepts the Seal is the CAS below, which still waits for both; a
+        // crash before it leaves a frame on disk the coordinator never
+        // accepted, which reopen cuts (`unaccepted_frames`), and at most an
+        // orphan layer, which reopen destroys, as after a crash between the
+        // layer and the CAS before this change.
+        let payload = rec.payload.canon_bytes();
+        let (made, framed) = {
+            let (layers, segment) = (&mut self.layers, &mut self.segment);
+            std::thread::scope(|scope| {
+                let framing = scope.spawn(|| {
+                    let _t = crate::timing::span("seal.frame");
+                    segment.append_batch(&[(&rec.envelope, payload.as_slice())])
+                });
+                let snap = crate::timing::span("seal.snapshot");
+                let made = match make {
+                    None => layers.snapshot(lsn, hash),
+                    // A promotion's adoption: nothing frozen to thaw (s-e).
+                    Some(make) => make(lsn, hash).map(|()| Thaw::none()),
+                };
+                drop(snap);
+                (made, framing.join().expect("the frame's thread panicked"))
+            })
         };
-        drop(snap);
-        let thaw = match made {
-            Ok(thaw) => thaw,
-            Err(e) => {
-                // The layer may exist though the call failed (on the block
-                // log: the Seal made, then refused or failed).  Treated as
-                // any orphan of a failed Seal: destroyed, or the Chronicle
-                // stops (destroying an absent layer is nothing).
+        let thaw = match (made, framed) {
+            (Ok(thaw), Ok(_)) => thaw,
+            (made, framed) => {
+                // Either failed: the frame (if written) is cut, the layer
+                // (if any) is an orphan of a failed Seal, destroyed or the
+                // Chronicle stops (destroying an absent layer is nothing),
+                // and a frozen Vessel thaws as the Thaw is dropped.
+                if framed.is_ok() && self.segment.truncate_to(before.lsn).is_err() {
+                    // The frame is on disk but unaccepted; reopen cuts it.
+                    self.health = Health::Poisoned;
+                }
+                let err = match (made, framed) {
+                    (Err(e), _) => ChronicleError::Layer(e),
+                    // The layer was made: thaw before saying why it failed
+                    // (a failed thaw is the urgent one, as below).
+                    (Ok(thaw), Err(e)) => match thaw.run() {
+                        Err(t) => ChronicleError::Layer(t),
+                        Ok(()) => e.into(),
+                    },
+                    (Ok(_), Ok(_)) => unreachable!("one of the two failed"),
+                };
                 self.drop_orphan(lsn);
-                return Err(ChronicleError::Layer(e));
+                return Err(err);
             }
         };
         // The layer exists.  The thaw (the kernel's, on the Vessel's own
@@ -986,7 +1021,7 @@ impl<L: Layers> Chronicle<L> {
             let checked = check();
             let committed = checked.is_ok().then(|| {
                 taso_core::hold("seal.recorded");
-                self.commit(&rec)
+                self.accept_all(std::slice::from_ref(&rec), std::slice::from_ref(&payload), before)
             });
             (checked, committed, thawing.finish())
         });
@@ -1009,6 +1044,11 @@ impl<L: Layers> Chronicle<L> {
                 })
             }
             (Err(why), _, thawed) => {
+                // The frame was written beside the layer: cut it, as a
+                // refusal would (reopen would, if this fails).
+                if self.segment.truncate_to(before.lsn).is_err() {
+                    self.health = Health::Poisoned;
+                }
                 self.drop_orphan(lsn);
                 // A failed thaw is the urgent one (the Vessel is still
                 // frozen), as it was when the thaw came before the check.
@@ -1292,12 +1332,23 @@ impl<L: Layers> Chronicle<L> {
             .map(|(r, p)| (&r.envelope, p.as_slice()))
             .collect();
         self.segment.append_batch(&frames)?;
+        self.accept_all(recs, &payloads, before)
+    }
+
+    /// The coordinator's CAS for records whose frames are in the segment
+    /// already (from `before` on).  On refusal every one is cut.
+    fn accept_all(
+        &mut self,
+        recs: &[Record],
+        payloads: &[Vec<u8>],
+        before: Position,
+    ) -> Result<ChronicleHead, ChronicleError> {
         let envelopes: Vec<Envelope> = recs.iter().map(|r| r.envelope).collect();
         // The coordinator derives obligations from the Effect records'
         // bytes (P4 spec D33): they go with the CAS.
         let effects: Vec<Vec<u8>> = recs
             .iter()
-            .zip(&payloads)
+            .zip(payloads)
             .filter(|(r, _)| r.envelope.stream == Stream::Effect)
             .map(|(_, p)| p.clone())
             .collect();
