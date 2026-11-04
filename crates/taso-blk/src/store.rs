@@ -905,13 +905,38 @@ impl Store {
 
     /// Write the blocks that make `from` (a Seal below `to`, or the zero
     /// base image if `None`) into the Seal `to`, as an import stream.
-    /// Returns the blocks written.
+    /// Returns the blocks written.  The two steps of [`Store::export_plan`]
+    /// and [`ExportPlan::write`] in one call, the store held throughout.
     pub fn export(
         &self,
         to: LayerId,
         from: Option<LayerId>,
         w: &mut impl io::Write,
     ) -> Result<u64, StoreError> {
+        self.export_plan(to, from)?.write(w)
+    }
+
+    /// Plan the export of `to` from `from` (as [`Store::export`]): the
+    /// checks and the block list, which need the store, and a duplicate
+    /// of the log's descriptor.  The plan is written with
+    /// [`ExportPlan::write`] **without the store**: the reading of the
+    /// blocks and the writing of the stream, the I/O, leave the lock.
+    ///
+    /// Why that is safe (P5 bite 5, 2026-11-04): the log is append-only,
+    /// so a block's bytes at an offset never change; a compaction writes a
+    /// new file and renames it into place, so the old file this
+    /// descriptor holds keeps every byte at every offset until the
+    /// descriptor is closed; a Seal dropped meanwhile frees nothing in
+    /// the file.  What the plan reads is what the store held at planning.
+    /// Measured before: `export` held the store 1.2 ms a Seal at P=64 on
+    /// taso-test, 30 ms at the longest, the largest holder of the lock
+    /// (`claude/Taso_design_freeze_trace_2026-11-03.md`, row 3).
+    pub fn export_plan(
+        &self,
+        to: LayerId,
+        from: Option<LayerId>,
+    ) -> Result<ExportPlan, StoreError> {
+        self.check()?;
         if !matches!(self.map.kind(to)?, Kind::Seal { .. }) {
             return Err(MapError::NotASeal(to).into());
         }
@@ -941,43 +966,10 @@ impl Store {
                 }
             }
         }
-        let mut out = HashingWriter {
-            w,
-            h: blake3::Hasher::new(),
-        };
-        out.put(STREAM_MAGIC)?;
-        let mut buf = vec![0u8; RUN_MAX as usize * BLOCK as usize];
-        let mut it = blocks.iter().peekable();
-        while let Some((&start, &loc)) = it.next() {
-            // A run: consecutive blocks of the same kind, at most RUN_MAX.
-            let data = matches!(loc, Loc::Log(_));
-            let mut count = 1u64;
-            while count < RUN_MAX {
-                match it.peek() {
-                    Some((&lba, &l))
-                        if lba == start + count && matches!(l, Loc::Log(_)) == data =>
-                    {
-                        it.next();
-                        count += 1;
-                    }
-                    _ => break,
-                }
-            }
-            out.put(&[if data { RUN_DATA } else { RUN_ZERO }])?;
-            out.put(&start.to_le_bytes())?;
-            out.put(&(count as u32).to_le_bytes())?;
-            if data {
-                let n = (count * BLOCK) as usize;
-                self.read(to, start, &mut buf[..n])?;
-                out.put(&buf[..n])?;
-            }
-        }
-        out.put(&[0])?;
-        out.put(&(blocks.len() as u64).to_le_bytes())?;
-        let hash = out.h.finalize();
-        out.w.write_all(hash.as_bytes())?;
-        out.w.flush()?;
-        Ok(blocks.len() as u64)
+        Ok(ExportPlan {
+            blocks,
+            file: self.file.try_clone()?,
+        })
     }
 
     /// Apply an export stream to `branch`, which must hold no blocks of its
@@ -1642,6 +1634,71 @@ fn valid_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'))
+}
+
+/// A Seal's export, planned under the store ([`Store::export_plan`]) and
+/// written without it: the block list as the store held it, and a
+/// duplicate of the log's descriptor to read the blocks from.
+pub struct ExportPlan {
+    /// Every block of the export, newest layer's location first.
+    blocks: BTreeMap<u64, Loc>,
+    /// The log at planning time; reads at the plan's offsets stay right
+    /// through a compaction (a new file, renamed over) and a drop.
+    file: File,
+}
+
+impl ExportPlan {
+    /// The blocks the stream will carry.
+    pub fn blocks(&self) -> u64 {
+        self.blocks.len() as u64
+    }
+
+    /// Write the stream.  Returns the blocks written.
+    pub fn write(&self, w: &mut impl io::Write) -> Result<u64, StoreError> {
+        let mut out = HashingWriter {
+            w,
+            h: blake3::Hasher::new(),
+        };
+        out.put(STREAM_MAGIC)?;
+        let mut buf = vec![0u8; RUN_MAX as usize * BLOCK as usize];
+        let mut it = self.blocks.iter().peekable();
+        while let Some((&start, &loc)) = it.next() {
+            // A run: consecutive blocks of the same kind, at most RUN_MAX.
+            let data = matches!(loc, Loc::Log(_));
+            let mut run = vec![loc];
+            while run.len() < RUN_MAX as usize {
+                match it.peek() {
+                    Some((&lba, &l))
+                        if lba == start + run.len() as u64 && matches!(l, Loc::Log(_)) == data =>
+                    {
+                        it.next();
+                        run.push(l);
+                    }
+                    _ => break,
+                }
+            }
+            let count = run.len() as u64;
+            out.put(&[if data { RUN_DATA } else { RUN_ZERO }])?;
+            out.put(&start.to_le_bytes())?;
+            out.put(&(count as u32).to_le_bytes())?;
+            if data {
+                let n = (count * BLOCK) as usize;
+                for (chunk, l) in buf[..n].chunks_mut(BLOCK as usize).zip(&run) {
+                    match *l {
+                        Loc::Log(off) => self.file.read_exact_at(chunk, off)?,
+                        Loc::Zero => chunk.fill(0),
+                    }
+                }
+                out.put(&buf[..n])?;
+            }
+        }
+        out.put(&[0])?;
+        out.put(&(self.blocks.len() as u64).to_le_bytes())?;
+        let hash = out.h.finalize();
+        out.w.write_all(hash.as_bytes())?;
+        out.w.flush()?;
+        Ok(self.blocks.len() as u64)
+    }
 }
 
 /// A writer that hashes what goes through it.
@@ -2386,6 +2443,70 @@ mod tests {
             (image(&b, t2, 16), image(&b, u1, 16)),
             (image(&a, s2, 16), image(&a, c1, 16))
         );
+    }
+
+    /// P5 bite 5: the export's I/O leaves the store's lock.  A plan made
+    /// under the store is written after the log was compacted (a new
+    /// file renamed over the old) and the Seal dropped: the stream must be
+    /// the one the whole export wrote before.  Without a descriptor of its
+    /// own the plan would read its offsets from the compacted file, where
+    /// the blocks sit elsewhere (checked by hand on 2026-11-04: reopening
+    /// the path at write time fails this test).
+    #[test]
+    fn an_export_planned_before_a_compaction_and_a_drop_writes_the_same_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = Store::create(&dir.path().join("a")).unwrap();
+        let ra = a.root_seal().unwrap();
+        let va = a.fork(ra).unwrap();
+        a.write(va, 0, &blocks(1, 3), false).unwrap();
+        a.write(va, 10, &blocks(2, 1), false).unwrap();
+        a.discard(va, 1, 1).unwrap();
+        let s1 = a.seal(va).unwrap();
+        // Garbage ahead of s1's blocks, so the compaction moves them.
+        a.write(va, 0, &blocks(3, 3), false).unwrap();
+        a.write(va, 10, &blocks(4, 1), false).unwrap();
+        let s2 = a.seal(va).unwrap();
+        let whole = export_bytes(&a, s1, None);
+        let incremental = export_bytes(&a, s2, Some(s1));
+
+        let plan = a.export_plan(s1, None).unwrap();
+        let plan2 = a.export_plan(s2, Some(s1)).unwrap();
+        assert_eq!(plan.blocks(), 3);
+        let mut c = a.compaction().unwrap();
+        c.copy().unwrap();
+        let done = c.finish(&mut a).unwrap();
+        drop(done);
+        // The log is a new file now, and s1's blocks sit at new offsets.
+        a.write(va, 20, &blocks(5, 1), false).unwrap();
+        a.flush().unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(plan.write(&mut out).unwrap(), 3);
+        assert_eq!(out, whole, "the plan reads the log it was made on");
+        let mut out2 = Vec::new();
+        plan2.write(&mut out2).unwrap();
+        assert_eq!(out2, incremental);
+
+        // And after its Seal is gone: a Seal with no child, planned, then dropped.
+        a.write(va, 30, &blocks(6, 2), false).unwrap();
+        let s3 = a.seal(va).unwrap();
+        let since2 = export_bytes(&a, s3, Some(s2));
+        let plan3 = a.export_plan(s3, Some(s2)).unwrap();
+        a.drop_branch(va).unwrap(); // the branch stood on s3
+        a.drop_seal(s3).unwrap();
+        let mut out3 = Vec::new();
+        assert_eq!(plan3.write(&mut out3).unwrap(), 3); // blocks 20, 30, 31 since s2
+        assert_eq!(
+            out3, since2,
+            "the dropped Seal's blocks are still in the file"
+        );
+        // The compacted store still exports s2 whole, and the same way.
+        assert_eq!(export_bytes(&a, s2, None), {
+            let p = a.export_plan(s2, None).unwrap();
+            let mut o = Vec::new();
+            p.write(&mut o).unwrap();
+            o
+        });
     }
 
     #[test]
