@@ -5,6 +5,7 @@
 //! ```text
 //! taso-ctl init [--data DIR] [--size-gib N] [--rootfs DIR] [--force]
 //! taso-ctl status [<warden-config>]
+//! taso-ctl demo [--config PATH]
 //! taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>
 //! ```
 //!
@@ -38,6 +39,18 @@
 //!
 //! Reads the config, asks the block log `stats`, and says what runs.
 //!
+//! # `demo`
+//!
+//! Adds the demo Vessel to the config and starts nothing (P5 C3, K-d: the
+//! Vessel entry only): subject `demo`, uid slot 1, one fork slot (2), its
+//! agent `taso-sim` from the demo-agent image (Dockerfile target
+//! `agent-demo`), 20 turns of small SQLite transactions at
+//! `synchronous=normal` and one fork whose child seals on its own.  The
+//! node's rootfs must be set (the unpacked image: `init --rootfs DIR`).
+//! The new config is parsed as the Warden would before it is written, and
+//! written whole to a temporary file renamed over the old one.  Run again
+//! it says "already there" and changes nothing.
+//!
 //! # `explain`
 //!
 //! Rebuilds every decision about a Vessel, a Template or a Candidate from
@@ -53,8 +66,9 @@
 //!
 //! 0 done (`explain`: every check held; `status`: the block log answers);
 //! 1 it could not be done (`explain`: no such id, the coordinator or the
-//! store unreachable; `status`: the block log does not answer; `init`: a
-//! write failed); 2 a bad command line or configuration; 3 `init`
+//! store unreachable; `status`: the block log does not answer; `init`,
+//! `demo`: a write failed); 2 a bad command line or configuration (`demo`:
+//! no config, or no rootfs in it); 3 `init`
 //! refused the host; 4 `explain`ed, a check failed (something changed
 //! after it was accepted).
 
@@ -71,6 +85,7 @@ use taso_warden::explain::{explain, Subject};
 
 const USAGE: &str = "usage: taso-ctl init [--data DIR] [--size-gib N] [--rootfs DIR] [--force]
        taso-ctl status [<warden-config>]
+       taso-ctl demo [--config PATH]
        taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>";
 
 const CONFIG: &str = "/etc/taso/warden.json";
@@ -91,6 +106,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("init") => init(&args[1..]),
         Some("status") => status(args.get(1).map(String::as_str)),
+        Some("demo") => demo(&args[1..]),
         Some(_) if args.len() == 3 && args[1] == "explain" => explain_cmd(&args[0], &args[2]),
         Some(_) => usage("unknown command"),
         None => usage("a command is needed"),
@@ -568,6 +584,105 @@ fn explain_cmd(cfg: &str, id: &str) -> ExitCode {
     }
 }
 
+// ── demo ──────────────────────────────────────────────────────────────
+
+/// The demo Vessel's subject, and its namespace (32 hex: any fixed value;
+/// the id is derived from both).
+const DEMO_SUBJECT: &str = "demo";
+const DEMO_NAMESPACE: &str = "de0de0de0de0de0de0de0de0de0de0de";
+
+/// The demo Vessel's entry: `taso-sim` turns and one fork (K-d).
+fn demo_entry() -> serde_json::Value {
+    json!({
+        "namespace": DEMO_NAMESPACE,
+        "subject": DEMO_SUBJECT,
+        "uid_slot": 1,
+        "forks": {"slots": [2]},
+        "runtime": {"args": [
+            "/usr/bin/taso-sim", "--turns", "20", "--txns", "4", "--rows", "8",
+            "--row-bytes", "256", "--synchronous", "normal", "--forks", "1",
+            "--stats", "/work/sim-stats.json",
+        ]},
+    })
+}
+
+/// The config with the demo Vessel added, checked as the Warden reads it;
+/// `Ok(None)`: it is there already.  `Err`: why not, and what to do.
+fn add_demo(text: &str) -> Result<Option<String>, String> {
+    let mut v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
+    let rootfs = v
+        .pointer("/runtime/rootfs")
+        .and_then(|r| r.as_str())
+        .map(str::to_owned);
+    if rootfs.is_none() {
+        return Err(
+            "the config names no rootfs for the agents: unpack the demo-agent image \
+                    (README, Install on one machine) and run `taso-ctl init --rootfs DIR --force`"
+                .into(),
+        );
+    }
+    let vessels = v
+        .get_mut("vessels")
+        .and_then(|x| x.as_array_mut())
+        .ok_or("the config has no \"vessels\" list")?;
+    if vessels
+        .iter()
+        .any(|e| e.get("subject").and_then(|s| s.as_str()) == Some(DEMO_SUBJECT))
+    {
+        return Ok(None);
+    }
+    vessels.push(demo_entry());
+    let out = serde_json::to_string_pretty(&v).expect("a JSON value prints") + "\n";
+    Config::parse(&out).map_err(|e| format!("the Warden would refuse it: {e}"))?;
+    Ok(Some(out))
+}
+
+fn demo(args: &[String]) -> ExitCode {
+    let path = match args {
+        [] => PathBuf::from(CONFIG),
+        [flag, p] if flag == "--config" => PathBuf::from(p),
+        _ => return usage("demo takes only --config PATH"),
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "taso-ctl demo: {}: {e} (run `taso-ctl init` first)",
+                path.display()
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let out = match add_demo(&text) {
+        Ok(Some(out)) => out,
+        Ok(None) => {
+            println!(
+                "taso-ctl demo: the demo Vessel is already in {}: nothing changed.",
+                path.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+        Err(why) => {
+            eprintln!("taso-ctl demo: {}: {why}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    // Whole or not at all: a temporary file beside it, renamed over it.
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, &out).and_then(|()| std::fs::rename(&tmp, &path)) {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("taso-ctl demo: {}: {e}", path.display());
+        return ExitCode::from(1);
+    }
+    println!(
+        "taso-ctl demo: the demo Vessel added to {} (subject \"{DEMO_SUBJECT}\": 20 turns, one fork). \
+         Start the block log, then the Warden, as `taso-ctl init` printed.",
+        path.display()
+    );
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +719,40 @@ mod tests {
         assert!(init_args(&["--bogus".into()]).is_err());
         let a = init_args(&["--data".into(), "/srv/taso".into(), "--force".into()]).unwrap();
         assert!(a.force && a.data == Path::new("/srv/taso") && a.size_gib == 64);
+    }
+
+    /// `demo` adds one entry the Warden accepts, refuses a config with no
+    /// rootfs, and changes nothing the second time (K-d).
+    #[test]
+    fn demo_adds_one_entry_the_warden_accepts() {
+        let mut a = InitArgs {
+            data: PathBuf::from("/var/lib/taso"),
+            size_gib: 64,
+            rootfs: None,
+            force: false,
+        };
+        let err = add_demo(&init_config(&a, true)).unwrap_err();
+        assert!(err.contains("--rootfs"), "{err}");
+        a.rootfs = Some(PathBuf::from("/var/lib/taso/agent"));
+        let out = add_demo(&init_config(&a, true)).unwrap().expect("added");
+        let c = Config::parse(&out).unwrap();
+        assert_eq!(c.vessels.len(), 1);
+        let v = &c.vessels[0];
+        assert_eq!((v.subject.as_str(), v.uid_slot), (DEMO_SUBJECT, 1));
+        assert_eq!(v.forks.as_ref().map(|f| f.slots.clone()), Some(vec![2]));
+        let args = v
+            .runtime
+            .as_ref()
+            .and_then(|r| r.args.as_ref())
+            .expect("its own command line");
+        assert_eq!(args[0], "/usr/bin/taso-sim");
+        assert!(args.windows(2).any(|w| w == ["--forks", "1"]));
+        assert_eq!(add_demo(&out).unwrap(), None, "already there");
+    }
+
+    #[test]
+    fn demo_refuses_what_is_not_a_config() {
+        assert!(add_demo("not json").is_err());
+        assert!(add_demo(r#"{"runtime": {"rootfs": "/srv/a"}}"#).is_err());
     }
 }
