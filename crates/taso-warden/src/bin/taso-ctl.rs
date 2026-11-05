@@ -281,7 +281,8 @@ fn init(args: &[String]) -> ExitCode {
     // The config first, as the Warden would read it: nothing is written
     // to the host before the config it is for is known to be accepted.
     let socket = PathBuf::from(RUN).join("blk.sock");
-    let text = init_config(&a, Path::new(LANDLOCK).exists());
+    let landlock = shim_in(a.rootfs.as_deref());
+    let text = init_config(&a, landlock);
     if let Err(e) = Config::parse(&text) {
         eprintln!("taso-ctl init: the config it would write is refused by the Warden: {e}");
         return ExitCode::from(1);
@@ -329,7 +330,14 @@ fn init(args: &[String]) -> ExitCode {
         eprintln!("taso-ctl init: {CONFIG}: {e}");
         return ExitCode::from(1);
     }
-    println!("  {CONFIG} written (effects held by default; no Vessels yet)");
+    println!(
+        "  {CONFIG} written (effects held by default; Landlock {}; no Vessels yet)",
+        if landlock {
+            "on: the shim is in the rootfs"
+        } else {
+            "off: no shim at usr/lib/taso/landlock in a rootfs"
+        }
+    );
     // What to do next, and what to know (c-g).  The Warden on a static
     // config runs the Vessels listed and ends when they are done -- with
     // none listed it ends at once (found on the first stranger's VM,
@@ -359,6 +367,15 @@ fn init(args: &[String]) -> ExitCode {
         },
     );
     ExitCode::SUCCESS
+}
+
+/// Whether the agents' rootfs carries the Landlock shim at [`LANDLOCK`]:
+/// the shim runs inside the agent's container, so it is looked for there,
+/// not on the host (the demo-agent image carries it; before 2026-11-05
+/// `init` looked on the host, and a host without it wrote a config
+/// without Landlock for an image that had it).  No rootfs: no shim known.
+fn shim_in(rootfs: Option<&Path>) -> bool {
+    rootfs.is_some_and(|r| r.join(LANDLOCK.trim_start_matches('/')).is_file())
 }
 
 /// The single-node config `init` writes (c-d): the local coordinator, the
@@ -754,5 +771,20 @@ mod tests {
     fn demo_refuses_what_is_not_a_config() {
         assert!(add_demo("not json").is_err());
         assert!(add_demo(r#"{"runtime": {"rootfs": "/srv/a"}}"#).is_err());
+    }
+
+    /// The shim is looked for inside the rootfs, never on the host.
+    #[test]
+    fn the_landlock_shim_is_looked_for_in_the_rootfs() {
+        assert!(!shim_in(None));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!shim_in(Some(dir.path())), "an empty rootfs has no shim");
+        let shim = dir.path().join("usr/lib/taso/landlock");
+        std::fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        std::fs::create_dir(&shim).unwrap();
+        assert!(!shim_in(Some(dir.path())), "a directory is not the shim");
+        std::fs::remove_dir(&shim).unwrap();
+        std::fs::write(&shim, b"").unwrap();
+        assert!(shim_in(Some(dir.path())));
     }
 }
