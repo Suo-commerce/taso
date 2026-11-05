@@ -130,6 +130,23 @@ fn segment_name(base: Lsn) -> String {
     format!("{SEGMENT_PREFIX}{:020}", base.get())
 }
 
+/// E3's `seal.framed` is this process's hold and the harness has armed it
+/// (`taso_core::hold`'s rule: `TASO_E3_HOLD=seal.framed` and
+/// `<TASO_E3_HOLD_DIR>/seal.framed.arm`).  The environment is read once; off,
+/// every Seal after the first pays one load and one compare.
+fn framed_hold_armed() -> bool {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let name = std::env::var("TASO_E3_HOLD").ok()?;
+        (name == "seal.framed").then(|| {
+            std::env::var_os("TASO_E3_HOLD_DIR")
+                .map_or_else(|| PathBuf::from("/run/taso-e3"), PathBuf::from)
+        })
+    })
+    .as_ref()
+    .is_some_and(|dir| dir.join("seal.framed.arm").exists())
+}
+
 /// File name of the lock that keeps a second process out.
 const LOCK_FILE: &str = "LOCK";
 
@@ -969,20 +986,34 @@ impl<L: Layers> Chronicle<L> {
         let payload = rec.payload.canon_bytes();
         let (made, framed) = {
             let (layers, segment) = (&mut self.layers, &mut self.segment);
-            std::thread::scope(|scope| {
-                let framing = scope.spawn(|| {
-                    let _t = crate::timing::span("seal.frame");
-                    segment.append_batch(&[(&rec.envelope, payload.as_slice())])
-                });
-                let snap = crate::timing::span("seal.snapshot");
-                let made = match make {
+            let frame = [(&rec.envelope, payload.as_slice())];
+            let mut write_frame = move || {
+                let _t = crate::timing::span("seal.frame");
+                segment.append_batch(&frame)
+            };
+            let make_layer = move || {
+                let _t = crate::timing::span("seal.snapshot");
+                match make {
                     None => layers.snapshot(lsn, hash),
                     // A promotion's adoption: nothing frozen to thaw (s-e).
                     Some(make) => make(lsn, hash).map(|()| Thaw::none()),
-                };
-                drop(snap);
-                (made, framing.join().expect("the frame's thread panicked"))
-            })
+                }
+            };
+            if framed_hold_armed() {
+                // E3 only (seal.framed): in order, so the cut finds the frame
+                // synced and no layer yet, every time.  Never on a bench.
+                let framed = write_frame();
+                if framed.is_ok() {
+                    taso_core::hold("seal.framed");
+                }
+                (make_layer(), framed)
+            } else {
+                std::thread::scope(|scope| {
+                    let framing = scope.spawn(write_frame);
+                    let made = make_layer();
+                    (made, framing.join().expect("the frame's thread panicked"))
+                })
+            }
         };
         let thaw = match (made, framed) {
             (Ok(thaw), Ok(_)) => thaw,
@@ -1021,7 +1052,11 @@ impl<L: Layers> Chronicle<L> {
             let checked = check();
             let committed = checked.is_ok().then(|| {
                 taso_core::hold("seal.recorded");
-                self.accept_all(std::slice::from_ref(&rec), std::slice::from_ref(&payload), before)
+                self.accept_all(
+                    std::slice::from_ref(&rec),
+                    std::slice::from_ref(&payload),
+                    before,
+                )
             });
             (checked, committed, thawing.finish())
         });
