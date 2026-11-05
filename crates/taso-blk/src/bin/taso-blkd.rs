@@ -100,15 +100,20 @@
 //!   record ends it, `store.rs`), so a write the device answered early is
 //!   either before a durable Seal, which carries it, or after it, where
 //!   the reset discards it anyway.  For any other user of the device it
-//!   breaks the block-device contract; `flush` (the default) keeps it.
+//!   breaks the block-device contract; `flush` keeps it.
 //!   It also narrows D92: an agent's acknowledged `fsync` after the last
 //!   Seal is no longer in the log after a crash, so the Warden cannot name
 //!   it (D93 (i) becomes (iii)).
-//! - **`--durable-at fua`** answers only FUA writes once appended; every
+//! - **`--durable-at fua`**, **the default** (Jarmo, 2026-11-06, D&D-3:
+//!   one production configuration, the mode E3 and B3's four power cuts
+//!   passed), answers only FUA writes once appended; every
 //!   flush still syncs.  In a Vessel (ext4 without a journal) an agent's
 //!   `fsync` arrives as a flush, and the FUA writes are ext4's superblock
 //!   at freeze and thaw, which no agent is told of: the next flush or the
 //!   Seal's sync carries them (the log is a prefix).  D92 stands.
+//! - **`--durable-at flush`**, the default until 2026-11-06, answers a FUA
+//!   write and a flush only after a sync: the block-device contract for
+//!   any user of the device, not only the Warden.
 //! - Requests of up to `--io-kib` (512 KiB by default): that is the
 //!   largest request (`max_sectors_kb`) and the size of each queue's
 //!   buffer.  The I/O sizes the device reports are 4 KiB, minimum and
@@ -411,8 +416,8 @@ const OP_WFUA: usize = 4;
 static OPLOG: Mutex<Option<std::io::BufWriter<File>>> = Mutex::new(None);
 
 /// `--durable-at`: what a device request waits for (the module docs say
-/// when each is right).  Set once in `main`.
-static DURABLE_AT: AtomicU8 = AtomicU8::new(AT_FLUSH);
+/// when each is right); `fua` unless set.  Set once in `main`.
+static DURABLE_AT: AtomicU8 = AtomicU8::new(AT_FUA);
 const AT_FLUSH: u8 = 0;
 const AT_FUA: u8 = 1;
 const AT_SEAL: u8 = 2;

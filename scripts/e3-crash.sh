@@ -79,7 +79,7 @@
 # E3_SIZE_MIB (2048), E3_ROWS (8), E3_STEP_MS (the timing step, ms; unset:
 # measured by `run`, 10 for `list` and a `round` by hand), KEEP_FAILS (3:
 # images of the newest failing rounds kept), E3_DURABLE_AT (flush|fua|seal,
-# default flush: every taso-blkd of the run, first, reborn and the takeover
+# default fua, taso-blkd's own since 2026-11-06: every taso-blkd of the run, first, reborn and the takeover
 # nodes alike, starts with --durable-at this; the results say which).
 
 set -Eeuo pipefail
@@ -108,8 +108,9 @@ STEP_HOW=${E3_STEP_MS:+set by hand (E3_STEP_MS)}
 BSTEP_MS=${E3_BURST_STEP_MS:-}
 BSTEP_HOW=${E3_BURST_STEP_MS:+set by hand (E3_BURST_STEP_MS)}
 # When taso-blkd answers a write (P5, the 50 ms line; D92 kept): before
-# p5-durable-at every round ran under flush, the only mode there was.
-DURABLE_AT=${E3_DURABLE_AT:-flush}
+# p5-durable-at every round ran under flush, the only mode there was;
+# fua, the default since 2026-11-06 (D&D-3), passed the subset on 11-05.
+DURABLE_AT=${E3_DURABLE_AT:-fua}
 case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "E3_DURABLE_AT is flush, fua or seal, not '$DURABLE_AT'" >&2; exit 2 ;; esac
 nap() { sleep "$(($1 / 1000)).$(printf '%03d' "$(($1 % 1000))")"; }   # nap MS: no interpreter on the way (t-d)
 KEEP_FAILS=${KEEP_FAILS:-3}

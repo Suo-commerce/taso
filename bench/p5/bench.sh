@@ -39,7 +39,7 @@
 #        exit, so its samples are read there; a dataset not mounted is
 #        attached read-only through taso-blkd (find, attach, mount -o ro).
 #
-# DURABLE_AT=flush|fua|seal (blk only; default flush): taso-blkd's
+# DURABLE_AT=flush|fua|seal (blk only; default fua, taso-blkd's own since 2026-11-06): taso-blkd's
 # --durable-at.  fua answers FUA writes without a sync; seal answers device
 # flushes and FUA writes without one, so only the Seal syncs
 # (claude/Taso_design_syncs_2026-11-04.md, s-g).  The
@@ -97,7 +97,7 @@ RUNS=${4:-1}
 TXNS=${TXNS:-4}; ROWS=${ROWS:-8}; ROW_BYTES=${ROW_BYTES:-512}; SYNC=${SYNC:-normal}
 LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
 BIG_MIB=${BIG_MIB:-0}; NOISY=${NOISY:-0}; MEM_MIB=${MEM_MIB:-256}
-DURABLE_AT=${DURABLE_AT:-flush}
+DURABLE_AT=${DURABLE_AT:-fua}
 case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "DURABLE_AT is flush, fua or seal, not '$DURABLE_AT'" >&2; exit 2 ;; esac
 [[ "$MEM_MIB" =~ ^[1-9][0-9]*$ ]] || { echo "MEM_MIB=$MEM_MIB: a whole number of MiB" >&2; exit 64; }
 NOISY_TXNS=${NOISY_TXNS:-64}; NOISY_ROWS=${NOISY_ROWS:-256}; NOISY_ROW_BYTES=${NOISY_ROW_BYTES:-4096}
@@ -110,7 +110,7 @@ DIR=$(readlink -f /var/lib/taso-blk)/p5-bench
 BLK_SOCK=/run/taso-p5-bench-blk.sock
 MNT=/mnt/p5-bench
 STAMP=$(date +%Y%m%d-%H%M%S)
-if [[ "${1:-}" == blk && "$DURABLE_AT" != flush ]]; then TAG=blk-$DURABLE_AT; else TAG=${1:-}; fi
+if [[ "${1:-}" == blk && "$DURABLE_AT" != fua ]]; then TAG=blk-$DURABLE_AT; else TAG=${1:-}; fi
 OUT=${OUT:-/root/taso-p5-bench-$TAG-$STAMP}
 RUN=$STAMP-$$
 export VESSEL_OK=' 0 publish failures, [0-9]+ segments pruned, 0 prune failures, agent ok$'
