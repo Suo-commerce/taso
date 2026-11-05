@@ -36,6 +36,11 @@
 #       line 4  acknowledged writes after turn R => the Warden's line for the
 #               Vessel says "reset to the Seal" with blocks discarded (D93 (i))
 #       line 5  one more write and Seal acknowledged after the rebirth
+#     A Vessel's lines 1-4 are written to $OUT/graded.txt and its name to
+#     $WORK/b3-driven before its line 5 runs; a later verify of the round
+#     does not grade a Vessel in b3-driven again (HARNESS, quoting the
+#     earlier grade).  The database is read from a copy opened read-only,
+#     after listing the reborn /work (db-v<i>/ls-work.txt).
 #     Recorded, not graded: taso-blkd's recovered line, its checkpoints and
 #     compactions, the in-flight Seal (R minus the last acknowledged).
 #     PASS only if every line holds on every Vessel; a driver or setup
@@ -380,6 +385,23 @@ if first:
     lines.append(f"recovery and settle lines from the first rebirth after the cut: {first}")
 lines.append(f"taso-blkd after the cut: {rec[0] if first and rec else rec[-1] if rec else '(no recovered line: a fresh log?)'}")
 lines.append(f"before the cut (as much of taso-blkd's log as survived): {len(re.findall(r'checkpoint at record', run_blkd))} checkpoint(s), {len(re.findall(r'compacted:', run_blkd))} compaction(s)")
+# Line 5 drives a Vessel past the cut (a write and a Seal after it), so a
+# later verify of the same round finds the post-cut Seal, not the cut's
+# (fua-r1, 2026-11-04: an interrupted verify's line 5 on v0, then graded
+# FAIL by the repeated one).  Before its line 5 a Vessel's grade of lines
+# 1-4 goes to $OUT/graded.txt and its name to $WORK/b3-driven, both synced;
+# a verify finding a Vessel in b3-driven does not grade it again: HARNESS,
+# with the grade written before that line 5.
+def durable_line(path, line):
+    new = not os.path.exists(path)
+    with open(path, "a") as f:
+        f.write(line + "\n"); f.flush(); os.fsync(f.fileno())
+    if new:
+        fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY); os.fsync(fd); os.close(fd)
+driven = {}
+if os.path.exists(work + "/b3-driven"):
+    for l in open(work + "/b3-driven"):
+        if l.strip(): v, d = l.split(maxsplit=1); driven[v] = d.strip()
 for i in range(p):
     x = w["vessels"].get(str(i), {"writes": {}, "seal_requested": 0, "seal_acked": 0, "errors": []})
     a_s, q_s = x["seal_acked"], x["seal_requested"]
@@ -388,6 +410,17 @@ for i in range(p):
     fails, notes = [], []
     if x["errors"]:
         notes.append(f"driver errors before the cut: {x['errors'][:2]}")
+    if subj in driven:
+        was = driven[subj]
+        verdict = max(verdict, 2)
+        lines.append(f"HARNESS v{i}: the verify in {was} already ran its line 5 (a write and a Seal after the cut): not graded again")
+        got = [l.rstrip() for l in open(was + "/graded.txt")] if os.path.exists(was + "/graded.txt") else []
+        lines += ["        its grade there, before line 5: " + l for l in got if l.startswith(f"v{i}:")] \
+            or ["        no grade was written there before line 5"]
+        if i in found:
+            try: Agent(found[i]).step("exit", 30)
+            except RuntimeError: pass
+        continue
     if i not in found:
         # Not a harness fault: a Vessel the Warden cannot reopen after the
         # cut is the failure B3 looks for (the F2 lesson: a Vessel nobody
@@ -407,13 +440,23 @@ for i in range(p):
     # /proc/<pid>/root, SQLite refused (taso-p5, 2026-10-31: "unable to
     # open database file" on all eight).  The agent is idle between ops,
     # so the database and its WAL are copied whole; the -shm is rebuilt.
+    # The copy is opened read-only: closing the last read-write connection
+    # checkpoints the WAL into state.db and deletes it, which is what every
+    # earlier copy showed (item 2, 2026-11-05, reproduced off the host).
+    # What the reborn /work held is listed first, into ls-work.txt.
     src_db, cp_dir = f"/proc/{a.pid}/root/work/state.db", f"{outdir}/db-v{i}"
     try:
         os.makedirs(cp_dir, exist_ok=True)
+        wd = os.path.dirname(src_db)
+        with open(f"{cp_dir}/ls-work.txt", "w") as f:
+            for n in sorted(os.listdir(wd)):
+                st = os.lstat(f"{wd}/{n}"); f.write(f"{st.st_size:>12} {n}\n")
+        wal = os.path.getsize(src_db + "-wal") if os.path.exists(src_db + "-wal") else None
+        notes.append(f"reborn /work: state.db {os.path.getsize(src_db)} B, -wal {'absent' if wal is None else f'{wal} B'}")
         for sfx in ("", "-wal"):
             if os.path.exists(src_db + sfx):
                 shutil.copyfile(src_db + sfx, f"{cp_dir}/state.db{sfx}")
-        db = sqlite3.connect(f"{cp_dir}/state.db", timeout=30)
+        db = sqlite3.connect(f"file:{cp_dir}/state.db?mode=ro", uri=True, timeout=30)
         have = dict(db.execute("SELECT turn, count(*) FROM events GROUP BY turn").fetchall())
         db.close()
     except (OSError, sqlite3.Error) as e:
@@ -431,7 +474,9 @@ for i in range(p):
     m = re.search(r"reset to the Seal at lsn \d+: .*?(\d+) block\(s\) of the Vessel's filesystem discarded", sl)
     if after and not (m and int(m.group(1)) > 0):
         fails.append(f"4: {after} acknowledged write(s) after turn {R}, not named: {sl}")
-    # 5: life
+    # 5: life -- after lines 1-4 are on disk and the Vessel is marked driven
+    durable_line(outdir + "/graded.txt", f"v{i}: resumed after turn {R}; lines 1-4 " + ("; ".join(fails) if fails else "hold"))
+    durable_line(work + "/b3-driven", f"{subj} {outdir}")
     try:
         r = a.step("write")
         ok_w = acked("write", r)
