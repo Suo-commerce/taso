@@ -1270,6 +1270,7 @@ impl Daemon {
         // over every write: map, copy, hash, pwrite (store.rs Stats).
         // sync_us: the syncs= above, timed: count, total µs, longest µs
         // (the store's and the Syncer's; P5 bite 3).
+        // writebacks: waiters that started the log's writeback (s-b).
         // lock=SITE:COUNT:TOTAL_US:MAX_US,... -- every hold of the store's
         // lock by site, the sites that held it at least once (bite 5).
         let (sync_us, sync_max_us) = self.sync.sync_time();
@@ -1282,7 +1283,7 @@ impl Daemon {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={} durable_at={} lock={}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={} writebacks={} durable_at={} lock={}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -1305,6 +1306,7 @@ impl Daemon {
             st.sync_us + sync_us,
             st.sync_max_us.max(sync_max_us),
             st.flushes_joined,
+            self.sync.writebacks(),
             durable_at_name(),
             lock_line,
         )

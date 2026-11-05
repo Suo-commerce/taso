@@ -1762,6 +1762,14 @@ impl Read for ReadAt<'_> {
 /// the sync serialised every Vessel's Seal and every device flush behind
 /// one disk operation at a time (taso-p5, P=64, 2026-10-26: `seal.log`
 /// 690 ms p50 for a 1 ms fsync).
+///
+/// **Write-behind** (P5 s-b): the first caller that finds a sync running
+/// which does not cover it, so it must wait for the next one, first asks
+/// the kernel to start writing
+/// the log's dirty pages ([`start_writeback`]: starts the write, waits for
+/// nothing), once per running sync.  The next `fdatasync` then finds most
+/// of its data on its way to the drive.  Nothing else changes: the append,
+/// the store's lock, what a sync promises.
 pub struct Syncer {
     file: Arc<LogFile>,
     state: std::sync::Mutex<SyncState>,
@@ -1776,6 +1784,12 @@ struct SyncState {
     durable: u64,
     /// A sync is running, for everything requested when it started.
     syncing: bool,
+    /// What the running sync covers: everything up to here.
+    upto: u64,
+    /// A waiter has started the writeback during the running sync.
+    kicked: bool,
+    /// Writebacks started (s-b), for the stats line.
+    kicks: u64,
     /// A sync failed: nothing after `durable` will ever be.
     failed: bool,
     /// How that sync failed (kept, so the first caller to learn of it can
@@ -1820,11 +1834,24 @@ impl Syncer {
                 return Ok(led);
             }
             if st.syncing {
+                if !st.kicked && lsn > st.upto {
+                    // Write-behind, for data the running sync does not
+                    // carry: once per running sync, outside the state's
+                    // lock (the call may block on a busy queue).
+                    st.kicked = true;
+                    st.kicks += 1;
+                    drop(st);
+                    start_writeback(&self.file.get());
+                    st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    continue;
+                }
                 st = self.done.wait(st).unwrap_or_else(PoisonError::into_inner);
                 continue;
             }
             let upto = st.requested;
             st.syncing = true;
+            st.upto = upto;
+            st.kicked = false;
             drop(st);
             let t = std::time::Instant::now();
             let r = self.file.get().sync_data();
@@ -1878,6 +1905,31 @@ impl Syncer {
     pub fn sync_time(&self) -> (u64, u64) {
         let st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         (st.sync_us, st.sync_max_us)
+    }
+
+    /// Writebacks started by waiters so far (s-b).
+    pub fn writebacks(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .kicks
+    }
+}
+
+/// Ask the kernel to start writing the whole file's dirty pages
+/// (`sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE)`): it waits for
+/// nothing and promises nothing -- durability is still the `fdatasync`'s.
+/// A failure is ignored for the same reason: the next sync reports it.
+///
+/// The crate's one exception to `deny(unsafe_code)` (lib.rs); the test
+/// `one_unsafe_exception_in_the_crate` keeps it the only one.
+#[allow(unsafe_code)]
+fn start_writeback(file: &File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a plain syscall on a descriptor this File owns and keeps open
+    // for the call; no pointer is passed.
+    unsafe {
+        libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
     }
 }
 
@@ -3498,5 +3550,103 @@ mod tests {
         assert!(!sync.durable(1).unwrap());
         assert_eq!(sync.syncs(), syncs);
         assert_eq!(sync.sync_time(), (total, max), "no sync, no time");
+    }
+    #[test]
+    fn waiters_start_the_writeback_once_per_running_sync() {
+        // s-b: a sync is "running" (the state says so, held by the test);
+        // four callers arrive and must wait.  The first starts the
+        // writeback, the rest only wait: one per running sync.  When the
+        // test ends the sync, one of them leads the next sync, which
+        // resets the mark, and every caller is answered durable.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&dir.path().join("log")).unwrap();
+        let sync = std::sync::Arc::new(store.syncer().unwrap());
+        let root = store.root_seal().unwrap();
+        let b = store.fork(root).unwrap();
+        store.write(b, 0, &[7u8; BLOCK as usize], false).unwrap();
+        let lsn = store.flush_pending().unwrap();
+        sync.state.lock().unwrap().syncing = true;
+        let callers: Vec<_> = (0..4)
+            .map(|_| {
+                let sync = sync.clone();
+                std::thread::spawn(move || sync.durable(lsn).unwrap())
+            })
+            .collect();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while sync.writebacks() == 0 && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(sync.writebacks(), 1, "one writeback per running sync");
+        {
+            let mut st = sync.state.lock().unwrap();
+            st.syncing = false;
+        }
+        sync.done.notify_all();
+        let led: usize = callers
+            .into_iter()
+            .map(|c| c.join().unwrap() as usize)
+            .sum();
+        assert_eq!(led, 1, "one of them ran the next sync for all four");
+        assert!(
+            !sync.state.lock().unwrap().kicked,
+            "the sync's start cleared the mark"
+        );
+        assert_eq!(
+            sync.writebacks(),
+            1,
+            "no waiter met a running sync after it"
+        );
+    }
+
+    #[test]
+    fn one_unsafe_exception_in_the_crate() {
+        // lib.rs denies unsafe code with one named exception,
+        // `start_writeback` (s-b); any other allow fails here.  The
+        // daemon (src/bin) is its own crate and not counted.
+        fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    if !p.ends_with("bin") {
+                        walk(&p, out);
+                    }
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push((p.clone(), std::fs::read_to_string(&p).unwrap()));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        // Spelled in two parts so this test does not count itself.
+        let needle = ["allow(", "unsafe_code)"].concat();
+        let found: Vec<String> = files
+            .iter()
+            .flat_map(|(p, t)| {
+                let lines: Vec<&str> = t.lines().collect();
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.contains(&needle) && !l.trim_start().starts_with("//"))
+                    .map(|(i, l)| {
+                        let next = lines.get(i + 1).map_or("", |n| n.trim());
+                        format!("{}: {} / {}", p.display(), l.trim(), next)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "allows of unsafe code: {found:#?}");
+        assert!(
+            found[0].contains("store.rs") && found[0].contains("fn start_writeback("),
+            "{found:#?}"
+        );
+        let lib = &files.iter().find(|(p, _)| p.ends_with("lib.rs")).unwrap().1;
+        assert!(
+            lib.contains("#![deny(unsafe_code)]"),
+            "lib.rs denies unsafe code"
+        );
     }
 }

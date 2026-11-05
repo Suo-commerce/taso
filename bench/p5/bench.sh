@@ -223,6 +223,9 @@ log_sync_us() { # those syncs timed, COUNT:TOTAL_US:MAX_US (taso-blkd stats sync
 log_joined() { # device flushes answered from a group already closed (taso-blkd stats flushes_joined, bite 4); empty on zfs or an older taso-blkd
     if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^flushes_joined=//p'; fi
 }
+log_writebacks() { # writebacks started by waiters on a running sync (taso-blkd stats writebacks, s-b); empty on zfs or an older taso-blkd
+    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^writebacks=//p'; fi
+}
 log_ops() { # the device requests taso-blkd served so far, one "op_NAME=COUNT:TOTAL_US:STORE_US:BYTES[:WAIT_US]" per line (bite 4's probe; the wait for the store's lock since bite 5's); empty on zfs
     if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | grep '^op_' | grep -v '^op_wsplit'; fi
 }
@@ -274,6 +277,7 @@ PY
     log_sync_us >"$OUT/warden-$r.syncus0"
     log_ops >"$OUT/warden-$r.ops0"
     log_joined >"$OUT/warden-$r.joined0"
+    log_writebacks >"$OUT/warden-$r.wb0"
     log_lock >"$OUT/warden-$r.lock0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
@@ -293,6 +297,7 @@ PY
     log_sync_us >"$OUT/warden-$r.syncus1"
     log_ops >"$OUT/warden-$r.ops1"
     log_joined >"$OUT/warden-$r.joined1"
+    log_writebacks >"$OUT/warden-$r.wb1"
     log_lock >"$OUT/warden-$r.lock1"
     # What shipped: the local store's bytes and files after this run (the
     # packs every Seal published).  The log's growth counts every version
@@ -479,6 +484,15 @@ if storage != "zfs":
     fl = tot.get("flush", [0])[0]
     if have and fl:
         print(f"- device flushes answered from a group already closed: {j} of {fl}, {100 * j / fl:.0f} %")
+    # s-b: writebacks started by a flush or Seal that found a sync running
+    # which did not cover it (taso-blkd stats writebacks); absent before s-b.
+    wb = 0; have = False
+    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.wb0"))):
+        a, b = (open(f).read().strip() for f in (f0, f0[:-1] + "1"))
+        if a and b:
+            wb += int(b) - int(a); have = True
+    if have:
+        print(f"- write-behind: {wb} writebacks started by waiters, {wb / (seals or 1):.2f} per Seal")
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")

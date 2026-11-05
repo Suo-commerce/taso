@@ -13,7 +13,10 @@
 //! Not wired into the Warden.  Judged against the spike's pass and kill
 //! criteria; deleted if a kill criterion is hit.
 
-#![forbid(unsafe_code)]
+// One named exception: `store::start_writeback`, the `sync_file_range` call
+// std and rustix do not wrap (P5 s-b, write-behind).  The test
+// `store::tests::one_unsafe_exception_in_the_crate` fails on any other.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod client;
