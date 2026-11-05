@@ -39,7 +39,9 @@ the reborn Warden opened the Vessel, "not_run" its own word why not):
 At a hold the point is exact, so three windows are graded exactly
 (E3-3c's open item, accepted 2026-10-28; D96): `seal.recorded` and `seal.frozen`, the Seal
 held before its record was committed is never listed after rebirth (its
-layer destroyed at open); `fork.branched`, the child held before its
+layer destroyed at open); `seal.framed` (p5-durable-at, 7b86d7e), the
+same for a Seal held with its frame synced and no layer yet (the frame
+cut at open, `unaccepted_frames`); `fork.branched`, the child held before its
 Lineage record is never run; `compact.written`, the log taso-blkd reopens
 is the one from before the held compaction (same inode: the rename never
 happened).  `seal.thawing` (bite 2, 2026-11-02) holds a Seal's thaw while
@@ -207,7 +209,7 @@ def check(r, a):
             extra.pop(hit[0])
     for l, s in extra.items():
         rows = s.get("rows", {})
-        if held in ("seal.recorded", "seal.frozen") and infl_op == "seal":
+        if held in ("seal.framed", "seal.recorded", "seal.frozen") and infl_op == "seal":
             fails.append(f"2 ({held}): Seal lsn {l} is listed, but it was held before its record was "
                          "committed: its layer must be destroyed at open (D96, orphan)")
             continue
@@ -412,6 +414,8 @@ def selftest():
         ("hold fail: seal.recorded, the held Seal listed whole", "seal.recorded", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
         ("hold pass: seal.frozen, in-flight Seal absent", "seal.frozen", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0}, 0),
         ("hold fail: seal.frozen, the held Seal listed whole", "seal.frozen", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
+        ("hold pass: seal.framed, in-flight Seal absent", "seal.framed", [W(1)], ("seal", {"turn": 1}), {"seals": [], "report": RESET, "resume_turn": 0}, 0),
+        ("hold fail: seal.framed, the held Seal listed whole", "seal.framed", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 1),
         # Bite 2: seal.thawing.  The held Seal may land or not; once answered (under error,
         # after it) it is acknowledged, so it must be there, whole.
         ("hold pass: seal.thawing, in-flight Seal landed whole", "seal.thawing", [W(1)], ("seal", {"turn": 1}), {"seals": [S(9, {"1": 8})], "report": B, "resume_turn": 1}, 0),

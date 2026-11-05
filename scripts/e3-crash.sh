@@ -78,7 +78,9 @@
 # teardown that fails is a HARNESS line, never a pass.  Env: E3_WORK,
 # E3_SIZE_MIB (2048), E3_ROWS (8), E3_STEP_MS (the timing step, ms; unset:
 # measured by `run`, 10 for `list` and a `round` by hand), KEEP_FAILS (3:
-# images of the newest failing rounds kept).
+# images of the newest failing rounds kept), E3_DURABLE_AT (flush|fua|seal,
+# default flush: every taso-blkd of the run, first, reborn and the takeover
+# nodes alike, starts with --durable-at this; the results say which).
 
 set -Eeuo pipefail
 # An unguarded failure says where it was; set -e alone ends the script silently
@@ -105,6 +107,10 @@ STEP_MS=${E3_STEP_MS:-}
 STEP_HOW=${E3_STEP_MS:+set by hand (E3_STEP_MS)}
 BSTEP_MS=${E3_BURST_STEP_MS:-}
 BSTEP_HOW=${E3_BURST_STEP_MS:+set by hand (E3_BURST_STEP_MS)}
+# When taso-blkd answers a write (P5, the 50 ms line; D92 kept): before
+# p5-durable-at every round ran under flush, the only mode there was.
+DURABLE_AT=${E3_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "E3_DURABLE_AT is flush, fua or seal, not '$DURABLE_AT'" >&2; exit 2 ;; esac
 nap() { sleep "$(($1 / 1000)).$(printf '%03d' "$(($1 % 1000))")"; }   # nap MS: no interpreter on the way (t-d)
 KEEP_FAILS=${KEEP_FAILS:-3}
 DEVSH=$PWD/scripts/e3-device.sh
@@ -175,7 +181,10 @@ for shape in ("all", "stagger"):
 print("write seal|burst:all:takeover|drop")
 print("write seal|burst:all:takeover+seal.shipped|drop")
 # E3-3c: one round per hold site and mode, the shortest sequence reaching it
-for name, s in (("seal.recorded", "write seal"), ("seal.frozen", "write seal"), ("seal.thawing", "write seal"),
+# seal.framed (p5-durable-at, 7b86d7e): the Seal's frame synced into the
+# segment, its layer not yet made -- reopen must cut the frame.
+for name, s in (("seal.framed", "write seal"),
+                ("seal.recorded", "write seal"), ("seal.frozen", "write seal"), ("seal.thawing", "write seal"),
                 ("seal.shipped", "write seal"),
                 ("ledger.shipped", "write effect"), ("fork.branched", "write seal fork"),
                 ("compact.written", "write seal")):
@@ -368,7 +377,7 @@ start_stack() { # start_stack TAG [VAR=VALUE ...]: taso-blkd and the Warden on $
     # new one to *answer*, not for the file (taso-test 2026-10-28: six rounds
     # lost that race, "taso-blkd socket: Connection refused").
     rm -f "$SOCK"
-    env "${@:2}" "$BIN/taso-blkd" "$D/blk.log" "$SOCK" 2>>"$R/blkd-$1.err" & BLKD_PID=$!
+    env "${@:2}" "$BIN/taso-blkd" "$D/blk.log" "$SOCK" --durable-at "$DURABLE_AT" 2>>"$R/blkd-$1.err" & BLKD_PID=$!
     local i; for i in $(seq 600); do blk_raw stats >/dev/null 2>&1 && break; sleep 0.1; done
     blk_raw stats >/dev/null 2>&1 || return 1
     env "${@:2}" "$BIN/taso-wardend" "$RUN/w.json" >"$R/warden-$1.out" 2>"$R/warden-$1.err" & WARDEN_PID=$!
@@ -396,7 +405,7 @@ PY
 start_node() { # start_node TAG CONFIG BLKLOG SOCKET: another node's taso-blkd and Warden -> NODE_W; logs $R/*-TAG.*
     local SOCK=$4 i
     rm -f "$SOCK"; mkdir -p "$(dirname "$3")"
-    "$BIN/taso-blkd" "$3" "$SOCK" 2>>"$R/blkd-$1.err" & TK_PIDS+=($!)
+    "$BIN/taso-blkd" "$3" "$SOCK" --durable-at "$DURABLE_AT" 2>>"$R/blkd-$1.err" & TK_PIDS+=($!)
     for i in $(seq 600); do blk_raw stats >/dev/null 2>&1 && break; sleep 0.1; done
     blk_raw stats >/dev/null 2>&1 || return 1
     "$BIN/taso-wardend" "$2" >"$R/warden-$1.out" 2>"$R/warden-$1.err" & NODE_W=$!; TK_PIDS+=("$NODE_W")
@@ -1315,12 +1324,14 @@ run_one() { # run_one N "SEQ" POINT MODE
 case "${1:-}" in
     round)
         [[ $# == 4 ]] || die "round \"SEQ\" POINT MODE"
-        say "one round; results in $OUT"
+        say "one round, taso-blkd durable at $DURABLE_AT; results in $OUT"
+        mkdir -p "$OUT"; echo "== taso-blkd durable at $DURABLE_AT" >>"$OUT/results.txt"
         run_one 1 "$2" "$3" "$4" ;;
     run)
         shift; sub=""; limit=0; only=""
         while (($#)); do case "$1" in --subset) sub=--subset ;; --only) only=$2; shift ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--only KIND] [--limit N]" ;; esac; shift; done
         [[ -z "$only" || "$only" =~ ^(boundary|timing|hold|takeover|burst)$ ]] || die "--only boundary|timing|hold|takeover|burst"
+        mkdir -p "$OUT"; echo "== taso-blkd durable at $DURABLE_AT" | tee -a "$OUT/results.txt"
         # The steps first, each when its rounds are coming and it was not set by hand:
         # measured, not guessed, and a guess is what it refuses to run 432 rounds on.
         measure() { # measure NAME FUNCTION "== prefix": one measurement on its own stack, its line into results.txt
