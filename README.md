@@ -28,10 +28,26 @@ cargo build --release -p taso-warden --bin taso-ctl --bin taso-wardend -p taso-b
 About two minutes on four cores. The binaries are
 `target/release/taso-ctl`, `taso-blkd` and `taso-wardend`.
 
+**The demo agent.** A Vessel runs its agent from a root filesystem: an
+unpacked image. The demo's agent is `taso-sim` (SQLite turns, and a
+fork it asks for), built as the image `taso-agent-demo` and unpacked
+into a directory. Docker is needed for these two steps only (`apt
+install -y docker.io docker-buildx`); the Warden never uses it.
+
+```
+docker build -f deploy/docker/Dockerfile --target agent-demo -t taso-agent-demo .
+mkdir -p /var/lib/taso/agent
+docker create --name taso-agent-demo taso-agent-demo
+docker export taso-agent-demo | tar -x -C /var/lib/taso/agent
+```
+
+The build compiles the agent inside the image's own Ubuntu 26.04, so it
+takes a few minutes; the unpacked directory is about 115 MB.
+
 **Set the host up:**
 
 ```
-target/release/taso-ctl init
+target/release/taso-ctl init --rootfs /var/lib/taso/agent
 ```
 
 It checks the host first and writes nothing before every check has
@@ -54,15 +70,25 @@ units, if you want them, are yours too.
 
 **Run:**
 
-1. Add a Vessel to `"vessels"` in `/etc/taso/warden.json`. Its entry
-   needs a root filesystem for the agent (an unpacked OCI image), either
-   as the node's `"runtime": {"rootfs": …}` or on the entry.
+1. Add a Vessel to `"vessels"` in `/etc/taso/warden.json`. For the demo,
+   `target/release/taso-ctl demo` adds one and starts nothing: the
+   Vessel `demo`, its agent `taso-sim` for 20 turns and then one fork,
+   whose child `demo-fork-2` runs 20 turns of its own. Your own Vessel's
+   entry needs a root filesystem for its agent (an unpacked OCI image),
+   either as the node's `"runtime": {"rootfs": …}` or on the entry.
 2. Start the block log: `taso-blkd /var/lib/taso/blk.log
    /run/taso/blk.sock --size-gib 64`.
 3. When `taso-ctl status` says the block log answers, start the Warden:
    `taso-wardend /etc/taso/warden.json`. On a static config the Warden
    runs the Vessels listed and ends when they are done; with none
    listed it ends at once.
+
+The demo takes under a minute. The Warden's standard output ends with a
+line per Vessel, both `agent ok`: `demo` with 21 Seals published (its
+birth Seal and one per turn) and `demo-fork-2` with 21 of its own (its
+birth at the parent's turn 20, then its turns); its standard error says
+what happened in order — the birth, the fork "on its agent's request",
+the child's `/work` idmapped over its parent's files. Then it ends.
 
 `taso-ctl status` says what runs; `taso-ctl /etc/taso/warden.json
 explain <id>` rebuilds every decision about a Vessel, a Template or a
