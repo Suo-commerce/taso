@@ -3,6 +3,7 @@
 #
 #   docker build -f deploy/docker/Dockerfile --target wardend -t taso-wardend .
 #   docker build -f deploy/docker/Dockerfile --target coordd  -t taso-coordd  .
+#   docker build -f deploy/docker/Dockerfile --target agent-demo -t taso-agent-demo .
 #
 # Targets
 #
@@ -21,6 +22,16 @@
 #   coordd    taso-coordd alone.  It serves a Unix socket; mount the
 #             directory holding it where the Wardens can reach it.  Over a
 #             network it needs authentication first (fencing review, F3).
+#   agent-demo  the demo agent's root filesystem (P5 C3, D4-4): taso-sim
+#             (SQLite turns over the Field, SQLite bundled) and the Landlock
+#             shim at /usr/lib/taso/landlock, on Ubuntu 26.04 (K-b).  Not
+#             run by docker: it is unpacked into a directory the Warden runs
+#             agents from (README, "Install on one machine"; K-c):
+#               docker create --name taso-agent-demo taso-agent-demo
+#               docker export taso-agent-demo | tar -x -C /var/lib/taso/agent
+#             The Warden binds the Vessel's filesystem at /work and the
+#             Field's socket at /run/taso/field.sock; both are made here as
+#             the mount points (the bench's rootfs, bench/p5/bench.sh).
 #
 # The build stage uses the same base as the runtime stages, so the binaries
 # link the same glibc they run with (they need only libc and libgcc_s).
@@ -45,10 +56,11 @@ COPY . .
 # image), so the binaries are copied out in the same step.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p taso-warden -p taso-landlock --bins \
+    cargo build --release --locked -p taso-warden -p taso-landlock -p taso-sim --bins \
  && mkdir -p /out \
  && cp target/release/taso-wardend target/release/taso-coordd \
-       target/release/taso-logcheck target/release/taso-landlock /out/
+       target/release/taso-logcheck target/release/taso-landlock \
+       target/release/taso-sim /out/
 
 # ── taso-wardend ──────────────────────────────────────────────────────
 
@@ -84,3 +96,17 @@ COPY --from=builder /out/taso-coordd /usr/local/bin/
 VOLUME ["/var/lib/taso", "/run/taso"]
 ENTRYPOINT ["/usr/local/bin/taso-coordd"]
 CMD ["/var/lib/taso/coord.redb", "/run/taso/coord.sock"]
+
+# ── agent-demo ────────────────────────────────────────────────────────
+
+FROM ${BASE} AS agent-demo
+LABEL org.opencontainers.image.title="taso-agent-demo" \
+      org.opencontainers.image.source="https://github.com/Suo-commerce/taso" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=builder /out/taso-sim /usr/bin/taso-sim
+COPY --from=builder /out/taso-landlock /usr/lib/taso/landlock
+# The mount points the Warden binds into an agent: the Vessel's filesystem
+# at /work, the Field's socket (a file to bind over) at /run/taso.
+RUN mkdir -p /work /run/taso && : > /run/taso/field.sock
+# Never started by docker; `docker create` needs a command to name.
+CMD ["/usr/bin/taso-sim"]
