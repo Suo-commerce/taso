@@ -62,8 +62,13 @@
 //!    a restart on this node starts from exactly what a rebirth elsewhere
 //!    would: what a crashed turn wrote after its last Seal is discarded.
 //!    This is safe only because nothing is writing: the startup sweep
-//!    removed every old container, and on ZFS an open file does not stop
-//!    a rollback (measured 2026-10-17).  If the last Seal's layer is
+//!    removed every old container (with its mount namespace, where the
+//!    Vessel's files are bound and where the host's unmount would not
+//!    see them), and a run's own container is deleted when it ends.  The
+//!    block log's rollback unmounts the dataset first and refuses,
+//!    changing nothing, if anything on the host still holds it open (the
+//!    unmount fails busy); the start then stops with that error.  If the
+//!    last Seal's layer is
 //!    missing, the rollback goes to the newest Seal that has one and a
 //!    warning says so.  A failed rollback stops the start.
 //! 3. **Publish what is not yet published**: the last Seal, if a crash
@@ -141,6 +146,7 @@ use serde_json::Value;
 use taso_core::envelope::{ChronicleId, Epoch, Lsn};
 use taso_core::record::{vessel_id, Namespace, TurnId, Verdict};
 
+use crate::blk::{BlkLayers, BlkPool, BlkSend};
 use crate::chronicle::Layers;
 use crate::chronicle::{Claim, LayerError, Recovery};
 use crate::coordinator::{Coord, CoordError};
@@ -156,8 +162,8 @@ use crate::s3::{S3Config, S3Store};
 use crate::segment::Position;
 use crate::ship::{LocalStore, SharedStore};
 use crate::source::{Held, Requested};
+use crate::storage::Holdings;
 use crate::storage::{Dataset, Snapshot};
-use crate::storage::{Holdings, Storage, StorageLayers, StorageSend};
 use crate::template::{TemplateError, TemplateLayers};
 use crate::vessel::{
     Ensured, Host, Pool, ReadLog, SealAt, TemplateBirth, Vessel, VesselError, BIRTH_TURN,
@@ -436,8 +442,9 @@ pub struct VesselConf {
     /// `host_uid_base + n·65536 ..+65536`.  No two Vessels on a node share
     /// one, so one Vessel's processes cannot touch another's files or
     /// signal its processes.  A Vessel born from the void owns its
-    /// dataset's files with host ids in this range and `zfs send` keeps
-    /// them, so it keeps its slot on every node it runs on.  A fork in
+    /// dataset's files with host ids in this range and the shipped stream
+    /// keeps them (it carries blocks, not files), so it keeps its slot on
+    /// every node it runs on.  A fork in
     /// another slot runs over its lineage's files through an idmapped mount
     /// (F6): its files stay in that range, and its slot is this entry's.
     pub uid_slot: u32,
@@ -785,10 +792,8 @@ pub struct Config {
     pub root: Dataset,
     /// Parent of every Vessel's Warden state (outside `root`).
     pub state_dir: PathBuf,
-    /// Batch Seal snapshots ([`crate::snapbatch`]; ZFS only).
-    pub batched_snapshots: bool,
-    /// Where the Vessels live: `"zfs"` (the default) or
-    /// `{"blk": {"socket": ..., "mounts": ..., "spool": ...}}`.
+    /// Where the Vessels live: the block log,
+    /// `{"blk": {"socket": ..., "mounts": ..., "spool": ...}}` (required).
     pub storage: StorageConf,
     /// Where packs are kept: a directory (`"store": "/path"`) or Garage
     /// (`"store": {"s3": {...}}`).
@@ -913,67 +918,48 @@ pub struct CandidateConf {
     pub exclude: std::collections::BTreeSet<PathClass>,
 }
 
-/// Where a node's Vessels live.  The config says which (`"storage"`);
-/// there is no default, so a Warden never assumes an engine.  The block
-/// log is Taso's storage; ZFS stays while the tests and the gates still
-/// run on it.
+/// Where a node's Vessels live: the block log served by `taso-blkd`
+/// (`"storage": {"blk": {...}}`).  Required: a Warden never assumes where
+/// its Vessels are.  Any other value is refused, a retired storage's
+/// included (V4b).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StorageConf {
-    /// ZFS datasets under `root` (`"storage": "zfs"`).
-    Zfs,
-    /// The block log served by `taso-blkd` (`"storage": {"blk": {...}}`).
-    Blk {
-        /// The daemon's control socket.
-        socket: PathBuf,
-        /// Datasets are mounted under it (`<mounts>/<dataset>`).
-        mounts: PathBuf,
-        /// Where shipped streams pass through files (shared with the
-        /// daemon, on this host).
-        spool: PathBuf,
-    },
+pub struct StorageConf {
+    /// The daemon's control socket.
+    pub socket: PathBuf,
+    /// Datasets are mounted under it (`<mounts>/<dataset>`).
+    pub mounts: PathBuf,
+    /// Where shipped streams pass through files (shared with the daemon,
+    /// on this host).
+    pub spool: PathBuf,
 }
 
 impl StorageConf {
-    /// The storage this configuration names (`batched`: ZFS Seal batching).
-    pub fn open(&self, batched: bool) -> crate::storage::Storage {
-        match self {
-            Self::Zfs => {
-                let z = crate::zfs::Zfs::cli();
-                crate::storage::Storage::Zfs(if batched { z.batched() } else { z })
-            }
-            Self::Blk {
-                socket,
-                mounts,
-                spool,
-            } => crate::storage::Storage::Blk(crate::blk::BlkPool::new(socket, mounts, spool)),
-        }
+    /// The block log this configuration names.
+    pub fn open(&self) -> crate::blk::BlkPool {
+        crate::blk::BlkPool::new(&self.socket, &self.mounts, &self.spool)
     }
 }
 
+const STORAGE_SHAPE: &str = "{\"blk\": {\"socket\", \"mounts\", \"spool\"}}";
+
 fn storage_conf(v: &Value) -> Result<StorageConf, ConfigError> {
-    match v.get("storage") {
-        None => Err(bad(
-            "\"storage\" is required: \"zfs\", or {\"blk\": {\"socket\", \"mounts\", \"spool\"}}",
-        )),
-        Some(Value::String(s)) if s == "zfs" => Ok(StorageConf::Zfs),
-        Some(o @ Value::Object(m)) if m.contains_key("blk") => {
-            only_keys(o, "storage", &["blk"])?;
-            let b = &m["blk"];
-            only_keys(b, "storage.blk", &["socket", "mounts", "spool"])?;
-            let mounts = abs_path(b, "mounts")?;
-            if mounts == Path::new("/") {
-                return Err(bad("\"storage.blk.mounts\" must not be /"));
-            }
-            Ok(StorageConf::Blk {
-                socket: abs_path(b, "socket")?,
-                mounts,
-                spool: abs_path(b, "spool")?,
-            })
-        }
-        Some(_) => Err(bad(
-            "\"storage\" must be \"zfs\" or {\"blk\": {\"socket\", \"mounts\", \"spool\"}}",
-        )),
+    let o = match v.get("storage") {
+        None => return Err(bad(format!("\"storage\" is required: {STORAGE_SHAPE}"))),
+        Some(o @ Value::Object(m)) if m.contains_key("blk") => o,
+        Some(_) => return Err(bad(format!("\"storage\" must be {STORAGE_SHAPE}"))),
+    };
+    only_keys(o, "storage", &["blk"])?;
+    let b = &o["blk"];
+    only_keys(b, "storage.blk", &["socket", "mounts", "spool"])?;
+    let mounts = abs_path(b, "mounts")?;
+    if mounts == Path::new("/") {
+        return Err(bad("\"storage.blk.mounts\" must not be /"));
     }
+    Ok(StorageConf {
+        socket: abs_path(b, "socket")?,
+        mounts,
+        spool: abs_path(b, "spool")?,
+    })
 }
 
 /// A bad configuration: where and why.
@@ -1400,7 +1386,6 @@ impl Config {
                 "state_dir",
                 "runtime",
                 "quiescence",
-                "batched_snapshots",
                 "sanction",
                 "vessels",
                 "source",
@@ -1647,7 +1632,6 @@ impl Config {
             coordinator,
             root,
             state_dir: abs_path(&v, "state_dir")?,
-            batched_snapshots: bool_or(&v, "batched_snapshots", true)?,
             storage: storage_conf(&v)?,
             store: StoreConf::parse_in(&v)?,
             prefix: string_or(&v, "prefix", "vessels")?,
@@ -1836,8 +1820,8 @@ fn id_hex(id: ChronicleId) -> String {
 /// Publishes each Seal as it is taken: finds its layer (one lookup, never
 /// the whole list) and runs [`Vessel::publish_seal`].
 pub struct SealPublisher {
-    storage: Storage,
-    packs: Packs<SharedStore, StorageSend>,
+    storage: BlkPool,
+    packs: Packs<SharedStore, BlkSend>,
     /// The parent's Seal snapshot, for a Vessel forked from one whose
     /// first `fs` section is not shipped yet: that section is incremental
     /// from it.  Cleared once a section is shipped (later Seals are
@@ -1863,7 +1847,7 @@ impl SealPublisher {
     /// anchor were brought up to date).
     pub fn publish(
         &mut self,
-        vessel: &mut Vessel<StorageLayers>,
+        vessel: &mut Vessel<BlkLayers>,
         seal: Position,
     ) -> Result<bool, String> {
         let snap = self
@@ -1879,12 +1863,8 @@ impl SealPublisher {
     }
 }
 
-impl AfterSeal<StorageLayers> for SealPublisher {
-    fn after_seal(
-        &mut self,
-        vessel: &mut Vessel<StorageLayers>,
-        seal: Position,
-    ) -> Result<(), String> {
+impl AfterSeal<BlkLayers> for SealPublisher {
+    fn after_seal(&mut self, vessel: &mut Vessel<BlkLayers>, seal: Position) -> Result<(), String> {
         self.publish(vessel, seal)?;
         self.published += 1;
         // What is shipped need not stay on local disk.  A failed prune
@@ -1918,10 +1898,10 @@ struct NodeNominations<'n, 's, 'e> {
     verif: &'n std::cell::RefCell<Verifications<'s, 'e>>,
 }
 
-impl crate::field::Nominations<StorageLayers> for NodeNominations<'_, '_, '_> {
+impl crate::field::Nominations<BlkLayers> for NodeNominations<'_, '_, '_> {
     fn nominate(
         &mut self,
-        vessel: &mut Vessel<StorageLayers>,
+        vessel: &mut Vessel<BlkLayers>,
         seal: Option<u64>,
         exclude: &[String],
     ) -> NominateResult {
@@ -1962,8 +1942,8 @@ struct NodeTick<'n, 's, 'e> {
     jobs: std::sync::mpsc::Receiver<Job>,
 }
 
-impl crate::field::Tick<StorageLayers> for NodeTick<'_, '_, '_> {
-    fn tick(&mut self, vessel: &mut Vessel<StorageLayers>) {
+impl crate::field::Tick<BlkLayers> for NodeTick<'_, '_, '_> {
+    fn tick(&mut self, vessel: &mut Vessel<BlkLayers>) {
         self.verif.borrow_mut().tick(vessel);
         while let Ok(job) = self.jobs.try_recv() {
             let verdict = matches!(job, Job::Verdict(..));
@@ -2187,7 +2167,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
         self.wake = None;
     }
 
-    fn tick(&mut self, vessel: &mut Vessel<StorageLayers>) {
+    fn tick(&mut self, vessel: &mut Vessel<BlkLayers>) {
         while let Ok(d) = self.rx.try_recv() {
             self.done(vessel, d);
         }
@@ -2203,7 +2183,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
 
     /// Start an attempt of every open Candidate never attempted, while
     /// slots are free.
-    fn launch(&mut self, vessel: &mut Vessel<StorageLayers>) {
+    fn launch(&mut self, vessel: &mut Vessel<BlkLayers>) {
         self.looked = Some(std::time::Instant::now());
         self.want = false;
         let at = self.node.attempts();
@@ -2296,7 +2276,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
         }
     }
 
-    fn done(&mut self, vessel: &mut Vessel<StorageLayers>, d: Done) {
+    fn done(&mut self, vessel: &mut Vessel<BlkLayers>, d: Done) {
         self.running.remove(d.started.candidate_id.as_bytes());
         self.node.release_verifier_slot();
         self.want();
@@ -2352,7 +2332,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
     }
 
     /// Wait for the attempts still running and finish them.
-    fn drain(&mut self, vessel: &mut Vessel<StorageLayers>) {
+    fn drain(&mut self, vessel: &mut Vessel<BlkLayers>) {
         // A Candidate nominated just before the agent exited may not have
         // been looked at by a tick yet: launched now (D68, D82), so a run
         // ends with every attempt it could start finished.
@@ -2375,12 +2355,8 @@ impl<'s, 'e> Verifications<'s, 'e> {
 /// before its container is killed (C7).
 const PROMOTED_GRACE: Duration = Duration::from_secs(2);
 
-impl Branches<StorageLayers> for NodeBranches<'_> {
-    fn fork(
-        &mut self,
-        vessel: &Vessel<StorageLayers>,
-        at: SealAt,
-    ) -> Result<(String, u64), String> {
+impl Branches<BlkLayers> for NodeBranches<'_> {
+    fn fork(&mut self, vessel: &Vessel<BlkLayers>, at: SealAt) -> Result<(String, u64), String> {
         let Some(forks) = &self.vc.forks else {
             return Err(format!(
                 "{:?} may not fork: its entry gives no uid slots for forks",
@@ -2439,11 +2415,7 @@ impl Branches<StorageLayers> for NodeBranches<'_> {
         Ok((name, seal.get()))
     }
 
-    fn child_log(
-        &mut self,
-        vessel: &Vessel<StorageLayers>,
-        child: &str,
-    ) -> Result<ReadLog, String> {
+    fn child_log(&mut self, vessel: &Vessel<BlkLayers>, child: &str) -> Result<ReadLog, String> {
         let id = vessel_id(vessel.namespace(), child.as_bytes());
         self.node
             .host()
@@ -2471,7 +2443,7 @@ impl Branches<StorageLayers> for NodeBranches<'_> {
     }
 }
 
-fn has_fs_shipped(vessel: &Vessel<StorageLayers>) -> Result<bool, DaemonError> {
+fn has_fs_shipped(vessel: &Vessel<BlkLayers>) -> Result<bool, DaemonError> {
     let frames = vessel
         .chronicle()
         .frames()
@@ -2523,7 +2495,7 @@ pub struct Settled {
     /// The Seal the state was rolled back to, if any had a layer.
     pub rolled_back_to: Option<Position>,
     /// Blocks of the Vessel's filesystem the rollback discarded, where the
-    /// store counts them (the block log); `None` on ZFS.  The agent's own
+    /// store counts them (the block log); `None` where it cannot.  The agent's own
     /// writes after the Seal are here and nowhere else (D93 class (i)).
     pub discarded_blocks: Option<u64>,
     /// The last Seal in the log.
@@ -2744,8 +2716,8 @@ pub fn sweep_stale<R: RuncRunner>(runc: &Runc<R>) -> io::Result<Swept> {
 
 /// What the node's pool holds of each Vessel under `root`, for
 /// [`crate::source::Guard::seeded`]: for every `v-<id>` dataset, the uid
-/// slots whose ranges own files in it (`zfs userspace`, mounted or not;
-/// on the block log, a walk of the mounted file system), and its parent
+/// slots whose ranges own files in it (a walk of its mounted file
+/// system), and its parent
 /// from the Lineage record of its local Chronicle under `state_dir`
 /// ([`crate::vessel::lineage_in`]; F6: a fork's files are its lineage's).
 /// A log that cannot be read gives a warning and no parent: that can only
@@ -2900,9 +2872,8 @@ pub struct Node {
     pub config: Config,
     /// The coordinator.
     pub coord: Arc<dyn Coord>,
-    /// Where the Vessels live: ZFS (batched or not; clones share the
-    /// batch) or the block log.
-    pub storage: Storage,
+    /// Where the Vessels live: the block log.
+    pub storage: BlkPool,
     /// The store (opened from `config.store`).
     pub store: SharedStore,
     /// The run directory, held for the node's lifetime.
@@ -2918,7 +2889,7 @@ pub struct Node {
     started: std::sync::Mutex<std::collections::BTreeSet<[u8; 16]>>,
     /// Template layers on this node (P4 §5.6), if `runtime.template_slot`
     /// is set.
-    layers: Option<TemplateLayers<Storage, StorageSend>>,
+    layers: Option<TemplateLayers<BlkPool, BlkSend>>,
     /// A failpoint of a Template birth to stop at ([`BIRTH_FAILPOINTS`];
     /// tests on a node, `TASO_FAILPOINT`).
     failpoint: Option<&'static str>,
@@ -3021,7 +2992,7 @@ impl Node {
     /// ([`check_state_generation`]), sweeps containers a dead
     /// incarnation left in its runc root (see "Starting" in the module
     /// docs), then opens the store.  Each error says which step failed.
-    pub fn new(config: Config, coord: Arc<dyn Coord>, storage: Storage) -> std::io::Result<Self> {
+    pub fn new(config: Config, coord: Arc<dyn Coord>, storage: BlkPool) -> std::io::Result<Self> {
         let ctx = |what: &'static str| {
             move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"))
         };
@@ -3250,7 +3221,7 @@ impl Node {
     fn settle_attempts(
         &self,
         vc: &VesselConf,
-        vessel: &mut Vessel<StorageLayers>,
+        vessel: &mut Vessel<BlkLayers>,
     ) -> Result<(), DaemonError> {
         self.settle_attempts_with(vessel, &|m| self.log(vc, m))
     }
@@ -3258,7 +3229,7 @@ impl Node {
     /// [`Node::settle_attempts`] logging through `log`.
     fn settle_attempts_with(
         &self,
-        vessel: &mut Vessel<StorageLayers>,
+        vessel: &mut Vessel<BlkLayers>,
         log: &dyn Fn(String),
     ) -> Result<(), DaemonError> {
         let at = self.attempts();
@@ -3342,7 +3313,7 @@ impl Node {
     /// The restart rule (§5.3 step 6): finish every accepted commit of
     /// `vessel` without its `SanctionCompleted`.  What does not finish
     /// stays committed and is logged; the next open tries again.
-    fn finish_sanctions(&self, vessel: &mut Vessel<StorageLayers>, log: &dyn Fn(String)) {
+    fn finish_sanctions(&self, vessel: &mut Vessel<BlkLayers>, log: &dyn Fn(String)) {
         let fin = self.finisher();
         let commits = match fin.unfinished(vessel) {
             Ok(c) => c,
@@ -3656,7 +3627,7 @@ impl Node {
 
     /// Do a decider job on `vessel` (its session's thread, or an open of
     /// the decider's).
-    fn do_job(&self, vessel: &mut Vessel<StorageLayers>, job: Job) {
+    fn do_job(&self, vessel: &mut Vessel<BlkLayers>, job: Job) {
         match job {
             Job::Pending(tx) => {
                 let r = vessel
@@ -3783,7 +3754,7 @@ impl Node {
     fn nominate(
         &self,
         vc: &VesselConf,
-        vessel: &mut Vessel<StorageLayers>,
+        vessel: &mut Vessel<BlkLayers>,
         seal: Option<Lsn>,
         exclude: std::collections::BTreeSet<PathClass>,
         by: NominatedBy,
@@ -3846,7 +3817,7 @@ impl Node {
         &self,
         vc: &VesselConf,
         t: &TemplateRef,
-    ) -> Result<Vessel<StorageLayers>, DaemonError> {
+    ) -> Result<Vessel<BlkLayers>, DaemonError> {
         let layers = self.layers.as_ref().ok_or_else(|| {
             DaemonError::Refused("a Template birth needs runtime.template_slot".into())
         })?;
@@ -3918,7 +3889,7 @@ impl Node {
         self.run_lock.path()
     }
 
-    fn host(&self) -> Host<Storage> {
+    fn host(&self) -> Host<BlkPool> {
         Host {
             coord: self.coord.clone(),
             pool: Clone::clone(&self.storage),
@@ -3928,7 +3899,7 @@ impl Node {
         }
     }
 
-    fn packs(&self, id: ChronicleId) -> Result<Packs<SharedStore, StorageSend>, DaemonError> {
+    fn packs(&self, id: ChronicleId) -> Result<Packs<SharedStore, BlkSend>, DaemonError> {
         Packs::new(
             self.store.clone(),
             self.storage.sender(),
@@ -3947,10 +3918,7 @@ impl Node {
     }
 
     /// Find, open or rebirth the Vessel (step 1).
-    fn start(
-        &self,
-        vc: &VesselConf,
-    ) -> Result<(Vessel<StorageLayers>, Start, Verdict), DaemonError> {
+    fn start(&self, vc: &VesselConf) -> Result<(Vessel<BlkLayers>, Start, Verdict), DaemonError> {
         let host = self.host();
         let id = vc.id();
         // A purged Vessel is never started again (§6.5).
@@ -4036,7 +4004,7 @@ impl Node {
             }
             Start::Rebirth => {
                 // A Template-born Vessel: its layer received here first
-                // (§5.6), the one settled for this node's storage kind.
+                // (§5.6), the one settled for the Template.
                 let layer = |t: ChronicleId, key: taso_core::envelope::HashVal| {
                     let layers = self.layers.as_ref().ok_or_else(|| {
                         VesselError::LocalState(
@@ -4051,7 +4019,7 @@ impl Node {
                     }
                     if l.layer_key != key {
                         return Err(VesselError::LocalState(format!(
-                            "its Lineage names layer {key} of Template {}, but this node's storage kind has layer {}: a Vessel is not reborn across storage kinds",
+                            "its Lineage names layer {key} of Template {}, but the layer settled for it is {}: a Vessel is not reborn over another layer",
                             id_hex(t),
                             l.layer_key
                         )));
@@ -4116,7 +4084,7 @@ impl Node {
 
     /// The parent's Seal snapshot, for a forked Vessel with no `fs`
     /// section shipped yet.
-    fn origin(&self, vessel: &Vessel<StorageLayers>) -> Result<Option<Snapshot>, DaemonError> {
+    fn origin(&self, vessel: &Vessel<BlkLayers>) -> Result<Option<Snapshot>, DaemonError> {
         if has_fs_shipped(vessel)? {
             return Ok(None);
         }
@@ -4740,7 +4708,6 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zfs::{Runner, Zfs, ZfsError};
 
     // ── Settling the state ──────────────────────────────────────────
 
@@ -4995,7 +4962,7 @@ mod tests {
     /// A run directory released while another thread spawns processes may
     /// still be held for a moment by a child between fork and exec;
     /// claiming it again must not be refused for that (found on taso-test
-    /// 2026-10-23: the node tests run in parallel, spawning runc and zfs,
+    /// 2026-10-23: the node tests run in parallel, spawning processes,
     /// and a second Node of one test was refused its own run directory).
     #[test]
     fn a_run_dir_released_while_processes_spawn_is_claimed_again() {
@@ -5049,7 +5016,8 @@ mod tests {
         let coord: Arc<dyn Coord> =
             Arc::new(crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap());
         let _held = claim_run_dir(&run).unwrap();
-        let e = Node::new(config, coord, Storage::Zfs(Zfs::cli()))
+        let pool = BlkPool::new("/nonexistent/blk.sock", &store, tmp.path().join("spool"));
+        let e = Node::new(config, coord, pool)
             .err()
             .expect("a held run directory is refused");
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
@@ -5125,7 +5093,7 @@ mod tests {
         "warden": 1,
         "coordinator": { "local": "/var/lib/taso/coord.redb", "serve": "/run/taso/coord.sock" },
         "root": "tank/vessel",
-        "storage": "zfs",
+        "storage": { "blk": { "socket": "/run/taso-blk.sock", "mounts": "/srv/taso", "spool": "/var/lib/taso-blk/spool" } },
         "state_dir": "/var/lib/taso/state",
         "store": "/srv/taso/store",
         "run_dir": "/run/taso",
@@ -5421,7 +5389,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("store")).unwrap();
         let store: SharedStore = Arc::new(LocalStore::new(dir.path().join("store")));
         let tb = vessel_id(ns(1), b"tb");
-        let packs = Packs::new(store, Storage::Zfs(Zfs::cli()).sender(), "p", tb).unwrap();
+        let packs = Packs::new(store, crate::ship::NoSend, "p", tb).unwrap();
         let birth = TemplateBirth {
             template_id: t,
             layer_key: key,
@@ -5603,24 +5571,24 @@ mod tests {
         );
     }
 
+    /// V4b (V-c (ii)): the block log is the one storage.  The retired
+    /// storage's value is refused like any other, and so is its
+    /// `batched_snapshots` key, so an old config stops at parse instead
+    /// of running on the wrong storage.
     #[test]
-    fn storage_is_zfs_or_the_block_log() {
+    fn storage_is_the_block_log_and_zfs_is_refused() {
         let with = |storage: Value| {
             let mut v: Value = serde_json::from_str(GOOD).unwrap();
             v["storage"] = storage;
             Config::parse(&v.to_string())
         };
-        assert_eq!(
-            with(serde_json::json!("zfs")).unwrap().storage,
-            StorageConf::Zfs
-        );
-        let blk = serde_json::json!({"blk": {"socket": "/run/taso-blk.sock", "mounts": "/srv/taso", "spool": "/var/lib/taso-blk/spool"}});
+        let blk = serde_json::json!({"blk": {"socket": "/run/b.sock", "mounts": "/srv/b", "spool": "/var/lib/b"}});
         assert_eq!(
             with(blk).unwrap().storage,
-            StorageConf::Blk {
-                socket: "/run/taso-blk.sock".into(),
-                mounts: "/srv/taso".into(),
-                spool: "/var/lib/taso-blk/spool".into()
+            StorageConf {
+                socket: "/run/b.sock".into(),
+                mounts: "/srv/b".into(),
+                spool: "/var/lib/b".into()
             }
         );
         let mut none: Value = serde_json::from_str(GOOD).unwrap();
@@ -5628,10 +5596,14 @@ mod tests {
         let e = Config::parse(&none.to_string()).unwrap_err().to_string();
         assert!(
             e.contains("\"storage\" is required"),
-            "no default engine: {e}"
+            "no default storage: {e}"
         );
+        let e = with(serde_json::json!("zfs")).unwrap_err().to_string();
+        assert!(e.contains("\"storage\" must be {\"blk\""), "{e}");
         for bad in [
+            serde_json::json!("blk"),
             serde_json::json!("btrfs"),
+            serde_json::json!({"zfs": {}}),
             serde_json::json!({"blk": {"socket": "/s", "mounts": "/", "spool": "/p"}}),
             serde_json::json!({"blk": {"socket": "s", "mounts": "/m", "spool": "/p"}}),
             serde_json::json!({"blk": {"socket": "/s", "mounts": "/m"}}),
@@ -5639,6 +5611,15 @@ mod tests {
             serde_json::json!({"blk": {}, "zfs": {}}),
         ] {
             assert!(with(bad.clone()).is_err(), "{bad}");
+        }
+        for batched in [true, false] {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            v["batched_snapshots"] = batched.into();
+            let e = Config::parse(&v.to_string()).unwrap_err().to_string();
+            assert!(
+                e.contains("unknown key \"batched_snapshots\""),
+                "{batched}: {e}"
+            );
         }
     }
 
@@ -5653,8 +5634,7 @@ mod tests {
                 serve: Some("/run/taso/coord.sock".into())
             }
         );
-        assert!(c.batched_snapshots, "batched by default");
-        assert_eq!(c.storage, StorageConf::Zfs, "ZFS by default");
+        assert_eq!(c.storage.mounts, Path::new("/srv/taso"));
         assert_eq!(c.prefix, "vessels");
         assert_eq!(
             c.runtime.landlock_shim.as_deref(),
@@ -6634,105 +6614,6 @@ mod tests {
         }
     }
 
-    /// A zfs runner answering `list` and `userspace` from a table.
-    struct ZfsTable(BTreeMap<String, String>);
-    impl Runner for ZfsTable {
-        fn run(&self, args: &[String]) -> Result<crate::zfs::Output, ZfsError> {
-            let key = format!("{} {}", args[0], args.last().unwrap());
-            let out = |stdout: &str| crate::zfs::Output {
-                success: true,
-                code: Some(0),
-                stdout: stdout.into(),
-                stderr: String::new(),
-            };
-            self.0
-                .get(&key)
-                .map(|s| out(s))
-                .ok_or_else(|| ZfsError::Spawn(format!("unexpected: {key}")))
-        }
-        fn run_input(
-            &self,
-            _: &[String],
-            _: &mut dyn std::io::Read,
-        ) -> Result<crate::zfs::Output, ZfsError> {
-            unreachable!()
-        }
-    }
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn the_pool_says_which_slots_own_each_vessels_files() {
-        let (a, b, c) = ("aa".repeat(16), "bb".repeat(16), "cc".repeat(16));
-        let pool = ZfsTable(
-            [
-                (
-                    "list t/v".to_string(),
-                    format!("t/v\nt/v/v-{a}\nt/v/v-{b}\nt/v/v-{c}\nt/v/scratch\nt/v/v-XYZ\n"),
-                ),
-                (format!("userspace t/v/v-{a}"), "0\n265536\n265537\n".into()),
-                // No local Lineage for any: each is asked whether it is a
-                // clone of a Template's layer (it is not).
-                (
-                    format!("list t/v/v-{a}"),
-                    format!("t/v/v-{a}\t/t/v/v-{a}\t-\t-\n"),
-                ),
-                (
-                    format!("list t/v/v-{b}"),
-                    format!("t/v/v-{b}\t/t/v/v-{b}\t-\t-\n"),
-                ),
-                (
-                    format!("list t/v/v-{c}"),
-                    format!("t/v/v-{c}\t/t/v/v-{c}\t-\t-\n"),
-                ),
-                (format!("userspace t/v/v-{b}"), "0\n".into()),
-                (
-                    format!("userspace t/v/v-{c}"),
-                    "331072\n265536\n1000\n".into(),
-                ),
-            ]
-            .into(),
-        );
-        let no_state = tempfile::tempdir().unwrap();
-        let (held, warnings) = held_on(
-            &Zfs::with_runner(pool),
-            &Dataset::new("t/v").unwrap(),
-            200_000,
-            None,
-            no_state.path(),
-        )
-        .unwrap();
-        assert!(
-            held.iter().all(|h| h.parent.is_none()),
-            "no local logs: no parents"
-        );
-        let got: Vec<(u8, Vec<u32>)> = held
-            .iter()
-            .map(|h| (h.key[0], h.slots.iter().copied().collect()))
-            .collect();
-        assert_eq!(
-            got,
-            vec![(0xaa, vec![1]), (0xbb, vec![]), (0xcc, vec![1, 2])]
-        );
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("scratch is not a Vessel")));
-        assert!(warnings.iter().any(|w| w.contains("v-XYZ is not a Vessel")));
-        assert!(warnings
-            .iter()
-            .any(|w| w.contains("uid 1000, below host_uid_base")));
-        // A pool that cannot be read is an error, never "nothing held".
-        let broken = ZfsTable([("list t/v".to_string(), format!("t/v\nt/v/v-{a}\n"))].into());
-        assert!(held_on(
-            &Zfs::with_runner(broken),
-            &Dataset::new("t/v").unwrap(),
-            200_000,
-            None,
-            no_state.path(),
-        )
-        .is_err());
-    }
-
     /// Holdings from a table: datasets and the uids owning files in each.
     struct HoldTable(Vec<(Dataset, Vec<u32>)>);
     impl Holdings for HoldTable {
@@ -6763,6 +6644,83 @@ mod tests {
         }
         fn origin(&self, ds: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
             Ok(self.1.iter().find(|(d, _)| d == ds).map(|(_, o)| o.clone()))
+        }
+    }
+
+    #[test]
+    fn the_pool_says_which_slots_own_each_vessels_files() {
+        let (a, b, c) = ("aa".repeat(16), "bb".repeat(16), "cc".repeat(16));
+        let ds = |n: &str| Dataset::new(&format!("t/v/{n}")).unwrap();
+        let pool = HoldTable(vec![
+            (ds(&format!("v-{a}")), vec![0, 265536, 265537]),
+            (ds(&format!("v-{b}")), vec![0]),
+            (ds(&format!("v-{c}")), vec![331072, 265536, 1000]),
+            (ds("scratch"), vec![]),
+            (ds("v-XYZ"), vec![]),
+        ]);
+        let no_state = tempfile::tempdir().unwrap();
+        let (held, warnings) = held_on(
+            &pool,
+            &Dataset::new("t/v").unwrap(),
+            200_000,
+            None,
+            no_state.path(),
+        )
+        .unwrap();
+        assert!(
+            held.iter().all(|h| h.parent.is_none()),
+            "no local logs: no parents"
+        );
+        let got: Vec<(u8, Vec<u32>)> = held
+            .iter()
+            .map(|h| (h.key[0], h.slots.iter().copied().collect()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(0xaa, vec![1]), (0xbb, vec![]), (0xcc, vec![1, 2])]
+        );
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("scratch is not a Vessel")));
+        assert!(warnings.iter().any(|w| w.contains("v-XYZ is not a Vessel")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("uid 1000, below host_uid_base")));
+
+        // A pool that cannot be read is an error, never "nothing held":
+        // neither its list nor one dataset's owners.
+        struct Unreadable {
+            list: bool,
+        }
+        impl Holdings for Unreadable {
+            fn children(&self, _: &Dataset) -> Result<Vec<Dataset>, LayerError> {
+                if self.list {
+                    return Err("the pool cannot be listed".into());
+                }
+                Ok(vec![
+                    Dataset::new(&format!("t/v/v-{}", "aa".repeat(16))).unwrap()
+                ])
+            }
+            fn owner_uids(
+                &self,
+                _: &Dataset,
+            ) -> Result<std::collections::BTreeSet<u32>, LayerError> {
+                Err("the walk failed".into())
+            }
+            fn origin(&self, _: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
+                Ok(None)
+            }
+        }
+        for list in [true, false] {
+            assert!(held_on(
+                &Unreadable { list },
+                &Dataset::new("t/v").unwrap(),
+                200_000,
+                None,
+                no_state.path(),
+            )
+            .is_err());
         }
     }
 
