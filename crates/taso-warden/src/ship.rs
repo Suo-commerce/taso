@@ -40,6 +40,11 @@ pub trait ObjectStore {
     /// keys that start with `prefix/`), at any depth, in byte order.
     /// Objects still being written are not listed.
     fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
+    /// As [`ObjectStore::list`], with when each object was last written:
+    /// its age, for the reclaimer's grace period (`store.orphan_grace`).
+    /// A put again makes it new.  Every store says, none by default: a
+    /// reclaimer that cannot tell an object's age must not guess it.
+    fn list_times(&self, prefix: &str) -> io::Result<Vec<(String, std::time::SystemTime)>>;
     /// Remove the object under `key`.  `Ok(true)` if it was there and is
     /// gone, `Ok(false)` if there was nothing to remove: a retry after a
     /// crash is a no-op (P4 spec §6.4).  Durable when it returns.
@@ -73,6 +78,9 @@ impl<T: ObjectStore + ?Sized> ObjectStore for std::sync::Arc<T> {
     }
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
         (**self).list(prefix)
+    }
+    fn list_times(&self, prefix: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+        (**self).list_times(prefix)
     }
     fn delete(&self, key: &str) -> io::Result<bool> {
         (**self).delete(key)
@@ -114,6 +122,42 @@ impl LocalStore {
     /// A store rooted at `root`, which must exist.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
+    }
+
+    /// Every object under `prefix` as (key, its file), in key order.
+    fn walk(&self, prefix: &str) -> io::Result<Vec<(String, PathBuf)>> {
+        let root = self.path(prefix)?;
+        let mut keys = Vec::new();
+        // (directory, its key)
+        let mut todo = vec![(root, prefix.to_string())];
+        while let Some((dir, key)) = todo.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if name.starts_with(TMP_PREFIX) {
+                    continue;
+                }
+                let child = format!("{key}/{name}");
+                if !valid_key(&child) {
+                    continue; // not something put() could have made
+                }
+                let ty = entry.file_type()?;
+                if ty.is_dir() {
+                    todo.push((entry.path(), child));
+                } else if ty.is_file() {
+                    keys.push((child, entry.path()));
+                }
+            }
+        }
+        keys.sort();
+        Ok(keys)
     }
 
     fn path(&self, key: &str) -> io::Result<PathBuf> {
@@ -159,38 +203,22 @@ impl ObjectStore for LocalStore {
     }
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
-        let root = self.path(prefix)?;
-        let mut keys = Vec::new();
-        // (directory, its key)
-        let mut todo = vec![(root, prefix.to_string())];
-        while let Some((dir, key)) = todo.pop() {
-            let entries = match fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+        Ok(self.walk(prefix)?.into_iter().map(|(k, _)| k).collect())
+    }
+
+    /// The file's modification time: a put writes a new file and renames
+    /// it into place, so a put again makes it new.
+    fn list_times(&self, prefix: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+        let mut out = Vec::new();
+        for (key, path) in self.walk(prefix)? {
+            match fs::metadata(&path) {
+                Ok(m) => out.push((key, m.modified()?)),
+                // Deleted since the walk saw it: not listed.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
-            };
-            for entry in entries {
-                let entry = entry?;
-                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                    continue;
-                };
-                if name.starts_with(TMP_PREFIX) {
-                    continue;
-                }
-                let child = format!("{key}/{name}");
-                if !valid_key(&child) {
-                    continue; // not something put() could have made
-                }
-                let ty = entry.file_type()?;
-                if ty.is_dir() {
-                    todo.push((entry.path(), child));
-                } else if ty.is_file() {
-                    keys.push(child);
-                }
             }
         }
-        keys.sort();
-        Ok(keys)
+        Ok(out)
     }
 
     /// Unlink the file, then fsync its directory so the removal survives a
@@ -258,6 +286,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path());
         assert!(store.put("../escape", &mut &b"x"[..]).is_err());
+    }
+
+    /// Review fix 2a: the local store lists every object with when it was
+    /// last written; a put again makes it new.
+    #[test]
+    fn list_times_gives_each_object_its_last_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("p/obj/a", &mut &b"1"[..]).unwrap();
+        store.put("p/obj/b/c", &mut &b"2"[..]).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(86_400);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("p/obj/a"))
+            .unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        let got = store.list_times("p/obj").unwrap();
+        let keys: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["p/obj/a", "p/obj/b/c"], "the keys list() gives");
+        assert_eq!(got[0].1, old);
+        assert!(got[1].1 > old);
+        store.put("p/obj/a", &mut &b"1"[..]).unwrap();
+        assert!(
+            store.list_times("p/obj").unwrap()[0].1 > old,
+            "put again: new"
+        );
+        assert!(store.list_times("p/none").unwrap().is_empty());
     }
 
     #[test]
@@ -404,6 +460,9 @@ mod tests {
                 Ok(false)
             }
             fn list(&self, _: &str) -> io::Result<Vec<String>> {
+                Ok(vec![])
+            }
+            fn list_times(&self, _: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
                 Ok(vec![])
             }
         }
