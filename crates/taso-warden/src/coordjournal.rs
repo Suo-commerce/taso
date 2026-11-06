@@ -795,6 +795,10 @@ pub(crate) fn put_transient(o: &mut Canon, t: &Transient) {
         Transient::Pending { submission } => {
             o.tag(2).fixed(submission.as_bytes());
         }
+        Transient::Quarantined(obj) => {
+            o.tag(3);
+            put_object(o, obj);
+        }
     }
 }
 
@@ -816,10 +820,7 @@ pub(crate) fn put_final(o: &mut Canon, f: &Final) {
             o.tag(4);
             put_object(o, obj);
         }
-        Final::Quarantined(obj) => {
-            o.tag(5);
-            put_object(o, obj);
-        }
+        // Tag 5, a quarantined hold, is a transient refusal since R2a.
         Final::NoSuchObject(obj) => {
             o.tag(6);
             put_object(o, obj);
@@ -947,6 +948,7 @@ pub(crate) fn get_transient(r: &mut Rd<'_>) -> Result<Transient, JournalError> {
         2 => Transient::Pending {
             submission: HashVal::from_bytes(r.fixed()?),
         },
+        3 => Transient::Quarantined(get_object(r)?),
         _ => return Err(JournalError("bad transient tag")),
     })
 }
@@ -958,7 +960,6 @@ pub(crate) fn get_final(r: &mut Rd<'_>) -> Result<Final, JournalError> {
         2 => Final::NotAnnounced,
         3 => Final::Predicate(rule_name(r)?),
         4 => Final::Claimed(get_object(r)?),
-        5 => Final::Quarantined(get_object(r)?),
         6 => Final::NoSuchObject(get_object(r)?),
         7 => Final::Cancelled,
         8 => Final::Expired,
@@ -1197,6 +1198,39 @@ mod tests {
                 pinned: false,
             },
         ]
+    }
+
+    /// Every refusal an answer can carry round-trips; R2a's quarantined
+    /// hold is a transient one (tag 3), and the final tag it had (5) is
+    /// no longer read.
+    #[test]
+    fn every_refusal_round_trips_and_a_quarantine_is_for_now() {
+        use taso_core::coordlog::{Answer, Final, Transient};
+        let obj = ObjectId::content(HashVal::from_bytes([7; 32]));
+        let answers = [
+            Answer::Refused(Transient::NotReadable),
+            Answer::Refused(Transient::Pending {
+                submission: HashVal::from_bytes([2; 32]),
+            }),
+            Answer::Refused(Transient::Quarantined(obj.clone())),
+            Answer::FinalRefused(Final::Conflict),
+            Answer::FinalRefused(Final::StaleEpoch),
+            Answer::FinalRefused(Final::NotAnnounced),
+            Answer::FinalRefused(Final::Predicate("held".into())),
+            Answer::FinalRefused(Final::Claimed(obj.clone())),
+            Answer::FinalRefused(Final::NoSuchObject(obj.clone())),
+            Answer::FinalRefused(Final::Cancelled),
+            Answer::FinalRefused(Final::Expired),
+        ];
+        for a in answers {
+            let mut o = Canon::new();
+            put_answer(&mut o, &a);
+            assert_eq!(get_answer(&mut Rd::new(o.as_bytes())).unwrap(), a);
+        }
+        let mut old = Canon::new();
+        old.tag(3).tag(5);
+        put_object(&mut old, &obj);
+        assert!(get_answer(&mut Rd::new(old.as_bytes())).is_err());
     }
 
     #[test]
