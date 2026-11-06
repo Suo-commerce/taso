@@ -43,7 +43,15 @@
 #   /dev/ublkb* devices its taso-blkd creates
 # Prints the report; also saved to /var/lib/taso-blk/freeze-report.txt.
 
+# The daemon runs --durable-at flush (PROBE_DURABLE_AT overrides): the ext4 here has
+# a journal, and fua (taso-blkd's default since 2026-11-06) keeps the
+# block-device contract only for the Warden's journal-less ext4 (spec rev.
+# 38, D&D F (a); blk-crash.sh's K1, 2026-11-06).  Its journal-on row
+# counts barriers as flush answers them; under fua that row would differ.
+
 set -euo pipefail
+DURABLE_AT=${PROBE_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "PROBE_DURABLE_AT=$DURABLE_AT: flush, fua or seal" >&2; exit 2 ;; esac
 
 DIR=/var/lib/taso-blk
 LOG=$DIR/freeze.log
@@ -156,7 +164,7 @@ cargo build -q --release -p taso-blk
 : >"$REPORT"
 out "blk-freeze-probe $(date -Is); $(hostname); kernel $(uname -r); taso $(git rev-parse --short HEAD 2>/dev/null || echo ?); N=$N"
 rm -f "$LOG" "$ERR" "$LOG.ckpt"
-"$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 2>>"$ERR" &
+"$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --durable-at "$DURABLE_AT" 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || die "taso-blkd socket did not appear; see $ERR"
