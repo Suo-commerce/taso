@@ -28,7 +28,14 @@
 # on a machine without device-mapper); PROBE_BLKD=path runs that daemon
 # instead of building one; PROBE_NO_UBLK=1 skips the ublk module check.
 
+# The daemon runs --durable-at flush (THIN_DURABLE_AT overrides): the ext4 here has
+# a journal, and fua (taso-blkd's default since 2026-11-06) keeps the
+# block-device contract only for the Warden's journal-less ext4 (spec rev.
+# 38, D&D F (a); blk-crash.sh's K1, 2026-11-06).
+
 set -euo pipefail
+DURABLE_AT=${THIN_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "THIN_DURABLE_AT=$DURABLE_AT: flush, fua or seal" >&2; exit 2 ;; esac
 
 DIR=/var/lib/taso-blk
 LOG=$DIR/probe.log
@@ -183,7 +190,7 @@ out "blk-thin-probe $(date -Is); kernel $(uname -r); taso $(git rev-parse --shor
 out "generic/347 stack: data ${DATA_SECTORS} sectors (500 MiB), blocks ${CLUSTER} sectors (512 KiB), volume ${VIRT_SECTORS} sectors, metadata ${META_SECTORS} sectors at ${META_OFFSET}"
 
 rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock"
-"$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 2>>"$ERR" &
+"$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --durable-at "$DURABLE_AT" 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || die "daemon socket did not appear; see $ERR"
