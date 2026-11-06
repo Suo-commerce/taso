@@ -14,14 +14,13 @@
 # (a) report: for every disk, the kernel's queue flags (write_cache, fua),
 #     the NVMe controller's write-cache feature as the drive reports it
 #     (nvme get-feature 0x06: whether the volatile cache is enabled), id-ctrl
-#     (model, firmware, vwc, FDP), zoned; ZFS's sync property on taso/vessel;
-#     ext4's mount options on /var/lib/taso; the virtualisation.  Nothing
+#     (model, firmware, vwc, FDP), zoned; ext4's mount options on
+#     /var/lib/taso; the virtualisation.  Nothing
 #     here proves a flush reaches the medium: it is what the stack claims.
 #
 # (b) flush: 1000 times, a 4 KiB write to one file followed by fdatasync,
-#     on ext4 on taso-blk (/var/lib/taso/facts) and on taso/vessel
-#     (/taso/vessel/facts), and the same with O_DSYNC (the FUA path on
-#     ext4); p50/p90/p99/max in microseconds.  On a drive with a volatile
+#     on ext4 on taso-blk (/var/lib/taso/facts), and the same with O_DSYNC
+#     (the FUA path on ext4); p50/p90/p99/max in microseconds.  On a drive with a volatile
 #     cache and no power-loss protection a flush costs milliseconds; a
 #     flush answered in tens of microseconds is a flush that did not reach
 #     the medium, or a drive with power-loss protection (A2 writes down
@@ -86,11 +85,10 @@
 #
 # (c) the cut, the real measurement.  writer (host) listens on PORT
 #     (default 7705) and, once the listener (laptop) has connected, appends
-#     16-byte records (seq, ~seq) in four streams, each its own thread and
+#     16-byte records (seq, ~seq) in three streams, each its own thread and
 #     file under its directory:
 #        ext4-fdatasync   /var/lib/taso/facts   write, fdatasync, then ack
 #        ext4-odsync      /var/lib/taso/facts   O_DSYNC write, then ack
-#        zfs-fdatasync    /taso/vessel/facts    write, fdatasync, then ack
 #        ext4-nosync      /var/lib/taso/facts   write to the page cache, ack
 #     and sends "stream seq" to the listener after each ack.  The listener
 #     records the last acknowledged seq per stream in ACKED (default
@@ -119,7 +117,7 @@
 #     named.  Each stream's file is removed by writer at start; verify
 #     removes nothing.
 #
-# Touches, and nothing else: /var/lib/taso/facts/ and /taso/vessel/facts/
+# Touches, and nothing else: /var/lib/taso/facts/
 # (created; files flush-*.bin and stream-*.bin); the listener writes ACKED
 # in the laptop's current directory.  Needs python3 (stdlib only) on both
 # sides; nvme-cli on the host for (a).  Port PORT must be reachable from
@@ -130,7 +128,6 @@ set -euo pipefail
 
 mode=${1:-}; shift || true
 EXT4_DIR=${EXT4_DIR:-/var/lib/taso/facts}
-ZFS_DIR=${ZFS_DIR:-/taso/vessel/facts}
 PORT=7705
 die() { printf 'REFUSED: %s\n' "$*" >&2; exit 1; }
 q() { cat "/sys/block/$1/queue/$2" 2>/dev/null || echo -; }
@@ -154,22 +151,14 @@ report)
     journalctl -k --no-pager -o cat 2>/dev/null | grep -iE 'nvme|write cache|fua' | head -20 | sed 's/^/   /' || true
     echo "== filesystems"
     if mountpoint -q /var/lib/taso; then echo "   /var/lib/taso: $(findmnt -no SOURCE,FSTYPE,OPTIONS /var/lib/taso)"; else echo "   /var/lib/taso: not a mount point"; fi
-    if command -v zfs >/dev/null && zfs list taso/vessel >/dev/null 2>&1; then
-        echo "   taso/vessel: $(zfs get -H -o property,value sync,compression,atime,recordsize taso/vessel | tr '\t' '=' | tr '\n' ' ')"
-        echo "   pool taso: $(zpool status -P taso | awk '/\/dev\//{print $1; exit}') ashift=$(zpool get -H -o value ashift taso)"
-    else
-        echo "   taso/vessel: none"
-    fi
     echo "   tmp: TMPDIR=${TMPDIR:-unset}, /tmp is $(findmnt -no FSTYPE /tmp 2>/dev/null || echo '(root fs)')"
     ;;
 
 # ---- (b) flush ----------------------------------------------------------------
 flush)
     [[ $EUID -eq 0 ]] || die "run as root"
-    for d in "$EXT4_DIR" "$ZFS_DIR"; do
-        if [[ -d "$(dirname "$d")" ]]; then mkdir -p "$d"; else echo "skip $d: $(dirname "$d") is not here"; fi
-    done
-    python3 - "$EXT4_DIR" "$ZFS_DIR" <<'PY'
+    if [[ -d "$(dirname "$EXT4_DIR")" ]]; then mkdir -p "$EXT4_DIR"; else echo "skip $EXT4_DIR: $(dirname "$EXT4_DIR") is not here"; fi
+    python3 - "$EXT4_DIR" <<'PY'
 import os, sys, time
 N = 1000
 def pct(xs, p): xs = sorted(xs); return xs[min(len(xs) - 1, int(p * len(xs)))]
@@ -184,7 +173,7 @@ def run(path, flags, label, sync):
         lat.append((time.perf_counter_ns() - t) // 1000)
     os.close(fd); os.unlink(path)
     print("  %-28s p50 %7d  p90 %7d  p99 %7d  max %7d  us  (n=%d)" % (label, pct(lat, .5), pct(lat, .9), pct(lat, .99), max(lat), N))
-for d, name in ((sys.argv[1], "ext4 on taso-blk"), (sys.argv[2], "zfs taso/vessel")):
+for d, name in ((sys.argv[1], "ext4 on taso-blk"),):
     if not os.path.isdir(d):
         continue
     print("== %s (%s)" % (name, d))
@@ -311,13 +300,10 @@ writer)
     PORT=${1:-$PORT}
     [[ -d "$(dirname "$EXT4_DIR")" ]] || die "$(dirname "$EXT4_DIR") is not here (A1's setup makes it)"
     mkdir -p "$EXT4_DIR"
-    [[ -d "$(dirname "$ZFS_DIR")" ]] && mkdir -p "$ZFS_DIR" || echo "no $(dirname "$ZFS_DIR"): the zfs stream is skipped"
-    python3 - "$PORT" "$EXT4_DIR" "$ZFS_DIR" <<'PY'
+    python3 - "$PORT" "$EXT4_DIR" <<'PY'
 import os, socket, struct, sys, threading, time
-port, ext4, zfs = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+port, ext4 = int(sys.argv[1]), sys.argv[2]
 streams = [("ext4-fdatasync", ext4, 0, True), ("ext4-odsync", ext4, os.O_DSYNC, False), ("ext4-nosync", ext4, 0, False)]
-if os.path.isdir(zfs):
-    streams.insert(2, ("zfs-fdatasync", zfs, 0, True))
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("0.0.0.0", port)); srv.listen(1)
 print("writer: listening on %d; start the listener on the laptop: scripts/p5-facts.sh listener <this host>:%d" % (port, port), flush=True)
@@ -404,16 +390,16 @@ PY
 verify)
     [[ $EUID -eq 0 ]] || die "run as root"
     ACKED=${1:-}; [[ -f "$ACKED" ]] || die "usage: $0 verify ACKED  (the listener's file, copied from the laptop)"
-    python3 - "$ACKED" "$EXT4_DIR" "$ZFS_DIR" <<'PY'
+    python3 - "$ACKED" "$EXT4_DIR" <<'PY'
 import os, struct, sys
-acked_path, ext4, zfs = sys.argv[1:4]
+acked_path, ext4 = sys.argv[1:3]
 acked = {}
 for ln in open(acked_path):
     if ln.startswith("#") or not ln.strip(): continue
     k, v = ln.split(); acked[k] = int(v)
 print("verify: %s" % open(acked_path).readline().strip())
 bad = 0
-for name, d in (("ext4-fdatasync", ext4), ("ext4-odsync", ext4), ("zfs-fdatasync", zfs), ("ext4-nosync", ext4)):
+for name, d in (("ext4-fdatasync", ext4), ("ext4-odsync", ext4), ("ext4-nosync", ext4)):
     path = os.path.join(d, "stream-%s.bin" % name)
     if name not in acked:
         continue
