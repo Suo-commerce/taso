@@ -793,8 +793,60 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
 /// §4.1.7: the walk equals the manifest entry for entry (reserved entries
 /// are verified by the walk itself, not listed).  The one comparison
 /// Template, attempt and genesis share.
+///
+/// `Structural` is the transform's label (§4.1 step 2), which no walk
+/// gives: where `want` says `Structural`, the walked entry must be a
+/// directory equal in every field but `class`, and `want` must keep an
+/// entry below it that is not `Structural` (so it is legitimately kept).
+/// Every other entry is compared exactly.
 pub(crate) fn same_entries(walked: &Manifest, want: &Manifest) -> bool {
-    walked.complete() && walked.unsupported.is_empty() && walked.entries == want.entries
+    use crate::classify::Kind;
+    use taso_core::contract::PathClass::Structural;
+    if !walked.complete()
+        || !walked.unsupported.is_empty()
+        || walked.entries.len() != want.entries.len()
+    {
+        return false;
+    }
+    // The directories a kept, non-Structural entry needs (only if asked).
+    let mut needed = std::collections::BTreeSet::<&[u8]>::new();
+    if want.entries.iter().any(|e| e.class == Structural) {
+        for e in want.entries.iter().filter(|e| e.class != Structural) {
+            let p = e.path.as_slice();
+            let mut i = p.len();
+            while let Some(j) = p[..i].iter().rposition(|&b| b == b'/') {
+                needed.insert(&p[..j]);
+                i = j;
+            }
+        }
+    }
+    walked.entries.iter().zip(&want.entries).all(|(w, e)| {
+        if e.class != Structural {
+            return w == e;
+        }
+        // Exhaustive: a new field must be decided here.
+        let crate::classify::Entry {
+            path,
+            kind,
+            content,
+            size,
+            mode,
+            uid_slot,
+            gid_slot,
+            mtime,
+            class: _,
+        } = w;
+        e.kind == Kind::Dir
+            && *kind == Kind::Dir
+            && *path == e.path
+            && *content == e.content
+            && *size == e.size
+            && *mode == e.mode
+            && *uid_slot == e.uid_slot
+            && *gid_slot == e.gid_slot
+            && *mtime == e.mtime
+            && needed.contains(e.path.as_slice())
+    })
 }
 
 /// What the manifest does not describe is given to the range, as the
@@ -2058,6 +2110,23 @@ mod tests {
         Packs<SharedStore, Bytes>,
         taso_core::contract::Candidate,
     ) {
+        nominated_tree(c, subject, verifier, vconf, map, &[])
+    }
+
+    /// [`nominated_with`], the Seal also holding `extra` (path, bytes).
+    fn nominated_tree(
+        c: &Cluster,
+        subject: &[u8],
+        verifier: ChronicleId,
+        vconf: &[u8],
+        map: &str,
+        extra: &[(&str, &str)],
+    ) -> (
+        Host<crate::vessel::tests::FakePool>,
+        FV,
+        Packs<SharedStore, Bytes>,
+        taso_core::contract::Candidate,
+    ) {
         let host = Host {
             coord: c.coord.clone(),
             pool: crate::vessel::tests::FakePool::default(),
@@ -2088,6 +2157,11 @@ mod tests {
         let tree = c.dir.path().join(format!("seal-{}", hex(subject)));
         std::fs::create_dir_all(tree.join("app")).unwrap();
         std::fs::write(tree.join("app/main.py"), "print(1)\n").unwrap();
+        for (p, bytes) in extra {
+            let p = tree.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, bytes).unwrap();
+        }
         let st = Command::new("chown")
             .args(["-hR", &format!("{0}:{0}", BASE + SLOT)])
             .arg(&tree)
@@ -2407,6 +2481,139 @@ mod tests {
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("print(1)\n"), "{text}");
         assert!(text.contains("Read-only file system"), "{text}");
+        at.finish(&mut v, &packs, &st, o, out).unwrap();
+        assert!(attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id).unwrap());
+    }
+
+    /// `same_entries` with a `Structural` entry: only `class` is let go,
+    /// and only for a directory a kept, non-Structural entry needs.
+    #[test]
+    fn a_structural_entry_matches_its_directory_and_nothing_else() {
+        use crate::classify::{Content, Entry, Kind, Mtime};
+        let entry = |path: &str, kind: Kind, class: PathClass| Entry {
+            path: path.as_bytes().to_vec(),
+            kind,
+            content: match kind {
+                Kind::File => Content::Blake3(HashVal::from_bytes([1; 32])),
+                _ => Content::None,
+            },
+            size: 0,
+            mode: 0o750,
+            uid_slot: 1,
+            gid_slot: 1,
+            mtime: Mtime {
+                secs: 1_600_000_000,
+                nsec: 0,
+            },
+            class,
+        };
+        let manifest = |entries: Vec<Entry>| Manifest {
+            classmap_key: HashVal::from_bytes([0; 32]),
+            root_entries: 1,
+            total_bytes: 0,
+            incomplete: None,
+            entries,
+            unsupported: Vec::new(),
+        };
+        let want = manifest(vec![
+            entry("build", Kind::Dir, PathClass::Structural),
+            entry("build/keep.rs", Kind::File, PathClass::Source),
+        ]);
+        let walked = manifest(vec![
+            entry("build", Kind::Dir, PathClass::Scratch),
+            entry("build/keep.rs", Kind::File, PathClass::Source),
+        ]);
+        assert!(same_entries(&walked, &want), "the restore walks equal");
+        // Any other field differing is still a mismatch.
+        let mut w = walked.clone();
+        w.entries[0].mode = 0o755;
+        assert!(!same_entries(&w, &want), "mode");
+        let mut w = walked.clone();
+        w.entries[0].mtime.secs += 1;
+        assert!(!same_entries(&w, &want), "mtime");
+        // The walk found a file where the manifest keeps a directory.
+        let mut w = walked.clone();
+        w.entries[0] = entry("build", Kind::File, PathClass::Scratch);
+        assert!(!same_entries(&w, &want), "a file is not Structural");
+        // A Structural entry with no kept, non-Structural entry below it.
+        let lone = manifest(vec![
+            entry("build", Kind::Dir, PathClass::Structural),
+            entry("buildx", Kind::File, PathClass::Source),
+        ]);
+        let lone_walked = manifest(vec![
+            entry("build", Kind::Dir, PathClass::Scratch),
+            entry("buildx", Kind::File, PathClass::Source),
+        ]);
+        assert!(!same_entries(&lone_walked, &lone), "nothing kept below");
+        // Only Structural children below it: still not legitimately kept.
+        let chain = manifest(vec![
+            entry("a", Kind::Dir, PathClass::Structural),
+            entry("a/b", Kind::Dir, PathClass::Structural),
+        ]);
+        let chain_walked = manifest(vec![
+            entry("a", Kind::Dir, PathClass::Scratch),
+            entry("a/b", Kind::Dir, PathClass::Scratch),
+        ]);
+        assert!(!same_entries(&chain_walked, &chain), "Structural only");
+        // Outside Structural, `class` still counts.
+        let mut w = walked.clone();
+        w.entries[1].class = PathClass::Artifact;
+        assert!(!same_entries(&w, &want), "a kept entry's class");
+        // An entry more or less.
+        let mut w = walked.clone();
+        w.entries.pop();
+        assert!(!same_entries(&w, &want), "an entry missing");
+    }
+
+    /// §4.1 steps 2 and 7: an excluded directory kept for a kept child is
+    /// `Structural` in the output manifest, which no classification walk
+    /// gives; the restore still walks to that manifest and the verifier
+    /// runs on it (the kept child there, the dropped sibling not).
+    #[test]
+    #[ignore = "needs root, runc and user namespaces"]
+    fn a_candidate_with_a_structural_directory_restores_and_runs() {
+        let c = Cluster::new();
+        let vt = c.dir.path().join("verifier");
+        verifier_tree(&vt);
+        let verifier = c.template_from(&vt);
+        let node = c.node(1, StorageKind::Zfs);
+        let (limits, reserved) = (Limits::default(), Reserved::defaults());
+        let run = run_with(&c, &node, &limits, &reserved);
+        let map = "version = 1\n[[rule]]\nglob = \"**\"\nclass = \"Source\"\n[[rule]]\nglob = \"build/\"\nclass = \"Scratch\"\n[[rule]]\nglob = \"build/keep.rs\"\nclass = \"Source\"\n";
+        let script = b"version = 1\nentry = [\"/bin/sh\", \"-c\", \"cat /candidate/build/keep.rs; if [ -e /candidate/build/out.o ]; then exit 7; fi; exit 0\"]\n";
+        let (_h, mut v, packs, cand) = nominated_tree(
+            &c,
+            b"a",
+            verifier,
+            script,
+            map,
+            &[("build/keep.rs", "fn kept() {}\n"), ("build/out.o", "junk")],
+        );
+        // The output manifest: `build` Structural, its Scratch file dropped.
+        let path = crate::coordstore::object_key_path(
+            PREFIX,
+            ObjectKind::Manifest,
+            cand.output_manifest_key,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        c.store
+            .get(&path)
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        let out_m = Manifest::decode(&bytes).unwrap();
+        let class_of = |p: &[u8]| out_m.entries.iter().find(|e| e.path == p).map(|e| e.class);
+        assert_eq!(class_of(b"build"), Some(PathClass::Structural));
+        assert_eq!(class_of(b"build/keep.rs"), Some(PathClass::Source));
+        assert_eq!(class_of(b"build/out.o"), None);
+        let at = attempts(&c);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert_eq!(o, VOutcome::Exit { code: 0 }, "{text}");
+        assert!(text.contains("fn kept() {}\n"), "{text}");
         at.finish(&mut v, &packs, &st, o, out).unwrap();
         assert!(attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id).unwrap());
     }
