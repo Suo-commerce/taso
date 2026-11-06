@@ -93,7 +93,7 @@ cleanup() {
         (blk quit) >/dev/null 2>&1 || kill "$DAEMON_PID"
         wait "$DAEMON_PID" 2>/dev/null
     fi
-    rm -f "$LOG" "$LOG.ckpt"
+    rm -f "$LOG" "$LOG.ckpt" "$LOG.lock"
     rmdir "$MNT" 2>/dev/null
     exit "$rc"
 }
@@ -163,7 +163,7 @@ out "blk-contract $(date -Is); kernel $(uname -r); taso $(git rev-parse --short 
 
 # ---- ours --------------------------------------------------------------------
 if [[ "$NO_UBLK" != 1 ]]; then
-    rm -f "$LOG" "$ERR" "$LOG.ckpt"
+    rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock"
     "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 2>>"$ERR" &
     DAEMON_PID=$!
     for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
