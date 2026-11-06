@@ -275,7 +275,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use taso_core::contract::{ContractRecord, NominationRefusal, NominationRefused, SealRef};
+    use taso_core::contract::{
+        ContractRecord, NominationRefused, SealRef, VerifierRequirement, WalkRefusal,
+        TRANSFORM_VERSION,
+    };
     use taso_core::coordlog::ClaimAuthority;
     use taso_core::envelope::{ChronicleId, Lsn};
 
@@ -322,8 +325,10 @@ mod tests {
         (ch, Packs::new(w.store.clone(), NoSend, PREFIX, c).unwrap())
     }
 
-    /// A diagnostic record (no predicate): the NominationRefused row.
-    fn refused(c: ChronicleId, reason: NominationRefusal) -> ContractRecord {
+    /// A record whose row holds nothing and checks only the Chronicle and
+    /// a content-decided reason: the NominationRefused row.  Two reasons
+    /// for one Candidate share its logical id.
+    fn refused(c: ChronicleId, reason: WalkRefusal) -> ContractRecord {
         ContractRecord::NominationRefused(NominationRefused {
             chronicle: c,
             seal: SealRef {
@@ -331,8 +336,15 @@ mod tests {
                 hash: HashVal::from_bytes([4; 32]),
             },
             exclude: BTreeSet::new(),
+            transform_version: TRANSFORM_VERSION,
+            classmap_key: HashVal::from_bytes([0x5C; 32]),
+            requirement: VerifierRequirement {
+                template: ChronicleId::from_bytes([0x5A; 16]),
+                vconf_key: HashVal::from_bytes([0x5B; 32]),
+                version: 1,
+            },
             reason,
-            input_manifest_key: None,
+            input_manifest_key: HashVal::from_bytes([0x5D; 32]),
         })
     }
 
@@ -340,7 +352,7 @@ mod tests {
     fn a_record_in_the_log_is_shipped_and_accepted_once() {
         let w = world();
         let (mut ch, packs) = chron(&w, 1, 1);
-        let rec = refused(ch.id(), NominationRefusal::SealNotAccepted);
+        let rec = refused(ch.id(), WalkRefusal::UnknownPaths);
         let mut attempt = 0;
         // Not in the log yet: refused before anything is shipped.
         assert!(matches!(
@@ -396,8 +408,8 @@ mod tests {
     fn another_record_accepted_first_is_the_answer() {
         let w = world();
         let (mut ch, packs) = chron(&w, 1, 1);
-        let first = refused(ch.id(), NominationRefusal::SealNotAccepted);
-        let second = refused(ch.id(), NominationRefusal::BadExclude);
+        let first = refused(ch.id(), WalkRefusal::UnknownPaths);
+        let second = refused(ch.id(), WalkRefusal::Unsupported);
         assert_eq!(
             first.logical_id(),
             second.logical_id(),
@@ -437,7 +449,7 @@ mod tests {
     fn a_fenced_epoch_is_refused_stale() {
         let w = world();
         let (mut ch, packs) = chron(&w, 1, 1);
-        let rec = refused(ch.id(), NominationRefusal::SealNotAccepted);
+        let rec = refused(ch.id(), WalkRefusal::UnknownPaths);
         ch.append(Stream::Ctl, Payload::Contract(Box::new(rec.clone())))
             .unwrap();
         // Another Warden takes the Chronicle over before the submission.
