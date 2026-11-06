@@ -5,7 +5,7 @@
 # judged and added here.
 
 [graph]
-targets = ["x86_64-unknown-linux-gnu"]   # Taso runs on Linux only (ublk, ZFS, runc)
+targets = ["x86_64-unknown-linux-gnu"]   # Taso runs on Linux only (ublk, runc)
 all-features = true
 
 [advisories]
