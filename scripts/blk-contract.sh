@@ -38,7 +38,15 @@
 # ublk, to try the script); CONTRACT_BLKD=path runs that daemon instead of
 # building one.
 
+# The daemon runs --durable-at flush (CONTRACT_DURABLE_AT overrides): the ext4 here has
+# a journal, and fua (taso-blkd's default since 2026-11-06) keeps the
+# block-device contract only for the Warden's journal-less ext4 (spec rev.
+# 38, D&D F (a); blk-crash.sh's K1, 2026-11-06).  C4 counts the daemon's syncs
+# over 100 fsyncs: under fua a journal commit makes none, and C4 fails.
+
 set -euo pipefail
+DURABLE_AT=${CONTRACT_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "CONTRACT_DURABLE_AT=$DURABLE_AT: flush, fua or seal" >&2; exit 2 ;; esac
 
 DIR=/var/lib/taso-blk
 LOG=$DIR/contract.log
@@ -164,7 +172,7 @@ out "blk-contract $(date -Is); kernel $(uname -r); taso $(git rev-parse --short 
 # ---- ours --------------------------------------------------------------------
 if [[ "$NO_UBLK" != 1 ]]; then
     rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock"
-    "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 2>>"$ERR" &
+    "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --durable-at "$DURABLE_AT" 2>>"$ERR" &
     DAEMON_PID=$!
     for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
     [[ -S "$SOCK" ]] || die "daemon socket did not appear; see $ERR"
