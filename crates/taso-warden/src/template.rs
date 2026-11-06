@@ -1492,12 +1492,12 @@ mod tests {
         // A third node receives the same layer: one per Template (D52).
         let z = c.node(3).ensure(c.t0).unwrap();
         assert_eq!(c.shipped().unwrap().layer_key, z.layer_key);
-        let wc3 = c
+        // Receiving ships nothing: node 3 needed no Warden Chronicle.
+        assert!(c
             .coord
             .query_chronicle(warden_chronicle(WardenId::new(3)))
             .unwrap()
-            .unwrap();
-        assert_eq!(wc3.accepted.len(), 1, "node 3 shipped the ZFS layer");
+            .is_none_or(|v| v.accepted.is_empty()));
     }
 
     #[test]
@@ -1736,17 +1736,20 @@ mod tests {
         let n1 = c.node(1);
         let l = n1.ensure(c.t0).unwrap();
         present(&c, &n1, &l);
-        // Another Warden holding warden 5's Chronicle stops warden 5.
-        c.coord
+        // Another Warden holding warden 5's Chronicle stops warden 5 when
+        // it must build (no layer shipped yet: a fresh cluster), since a
+        // build ships through the Warden Chronicle.
+        let c2 = Cluster::new();
+        c2.coord
             .claim_chronicle(
                 warden_chronicle(WardenId::new(5)),
                 WardenId::new(6),
                 ClaimAuthority::Vessel,
             )
             .unwrap();
-        let n5 = c.node(5);
+        let n5 = c2.node(5);
         assert!(matches!(
-            n5.ensure(c.t0),
+            n5.ensure(c2.t0),
             Err(TemplateError::WardenHeldElsewhere { holder }) if holder == WardenId::new(6)
         ));
     }
