@@ -183,8 +183,9 @@ fn vessels_on_real_devices() {
 
     // An orphan layer past the head, as a crash between a layer and its
     // record leaves one.  The parent's branch stands on it, so the reopen
-    // unseals it from under the current state (F1): the layer goes, the
-    // files written since s1 stay until the rollback below.
+    // unseals it from under the current state (F1): the layer goes with
+    // the branch's own blocks, so the files read as s1 again.  Nothing
+    // sealed is lost: what was written since s1 never was.
     let id = v.id();
     let ds = v.dataset().clone();
     let orphan = v.tail().lsn.next();
@@ -205,10 +206,8 @@ fn vessels_on_real_devices() {
         [(birth.lsn, birth.hash), (s1.lsn, s1.hash)],
         "the orphan is gone"
     );
-    assert_eq!(
-        std::fs::read(mp.join("note")).unwrap(),
-        b"changed after the seal"
-    );
+    assert_eq!(std::fs::read(mp.join("note")).unwrap(), b"sealed");
+    assert!(!mp.join("later").exists());
     let dev = host.pool.ensure_mounted(v.dataset()).unwrap();
     assert_eq!(
         host.pool.ensure_mounted(v.dataset()).unwrap(),
