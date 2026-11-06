@@ -806,6 +806,10 @@ pub struct Config {
     pub store: StoreConf,
     /// Key prefix in the store.
     pub prefix: String,
+    /// `store.orphan_grace` (`"orphan_grace_seconds"`, default 24 h, at
+    /// least 1 h): how old an unheld content object must be before the
+    /// reclaimer claims it ([`crate::reclaim`]).
+    pub orphan_grace: Duration,
     /// Sockets, bundles and runc state.
     pub run_dir: PathBuf,
     /// How Vessels run.
@@ -966,6 +970,23 @@ fn storage_conf(v: &Value) -> Result<StorageConf, ConfigError> {
         mounts,
         spool: abs_path(b, "spool")?,
     })
+}
+
+/// The shortest `store.orphan_grace`: an hour.  A writer puts an object
+/// and holds it within seconds; the grace only keeps the reclaimer from
+/// racing a writer that is slow (the coordinator orders a claim and a hold
+/// either way, §2.4).
+pub const MIN_ORPHAN_GRACE: Duration = Duration::from_secs(3600);
+
+fn orphan_grace(v: &Value) -> Result<Duration, ConfigError> {
+    match opt_u64(v, "orphan_grace_seconds")? {
+        None => Ok(crate::reclaim::ORPHAN_GRACE),
+        Some(s) if Duration::from_secs(s) >= MIN_ORPHAN_GRACE => Ok(Duration::from_secs(s)),
+        Some(s) => Err(bad(format!(
+            "\"orphan_grace_seconds\" must be at least {}, not {s}",
+            MIN_ORPHAN_GRACE.as_secs()
+        ))),
+    }
 }
 
 /// A bad configuration: where and why.
@@ -1392,6 +1413,7 @@ impl Config {
                 "state_dir",
                 "runtime",
                 "quiescence",
+                "orphan_grace_seconds",
                 "sanction",
                 "vessels",
                 "source",
@@ -1661,6 +1683,7 @@ impl Config {
             storage: storage_conf(&v)?,
             store: StoreConf::parse_in(&v)?,
             prefix: string_or(&v, "prefix", "vessels")?,
+            orphan_grace: orphan_grace(&v)?,
             run_dir: abs_path(&v, "run_dir")?,
             decider: decider_conf(v.get("decider"), &abs_path(&v, "run_dir")?)?,
             purge: purge_conf(v.get("purge"))?,
@@ -3663,6 +3686,40 @@ impl Node {
                 Ok(now)
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// One reclaimer pass ([`crate::reclaim`]): what it did is logged.
+    pub fn reclaim_pass(&self) {
+        let r = crate::reclaim::Reclaimer {
+            coord: self.coord.clone(),
+            store: self.store.clone(),
+            prefix: self.config.prefix.clone(),
+            warden: self.config.warden,
+            state_dir: self.config.state_dir.clone(),
+            grace: self.config.orphan_grace,
+        };
+        let w = self.config.warden.get();
+        match r.pass(std::time::SystemTime::now()) {
+            Ok(p) => {
+                if !p.reclaimed.is_empty() || !p.failed.is_empty() || p.refused > 0 {
+                    eprintln!(
+                        "taso-wardend[{w}] reclaim: {} looked at, {} young, {} reclaimed, {} refused (held, claimed or quarantined), {} failed",
+                        p.looked,
+                        p.young,
+                        p.reclaimed.len(),
+                        p.refused,
+                        p.failed.len()
+                    );
+                }
+                for (k, o) in &p.reclaimed {
+                    eprintln!("taso-wardend[{w}] reclaim: {k} {o:?}");
+                }
+                for f in &p.failed {
+                    eprintln!("taso-wardend[{w}] reclaim: {f}; tried again at the next pass");
+                }
+            }
+            Err(e) => eprintln!("taso-wardend[{w}] reclaim: pass stopped: {e}"),
         }
     }
 
@@ -6054,6 +6111,31 @@ mod tests {
                 "{batched}: {e}"
             );
         }
+    }
+
+    /// `store.orphan_grace`: 24 h unless set, at least an hour.
+    #[test]
+    fn the_orphan_grace_is_a_day_or_at_least_an_hour() {
+        let with = |s: Option<u64>| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            if let Some(s) = s {
+                v["orphan_grace_seconds"] = s.into();
+            }
+            Config::parse(&v.to_string())
+        };
+        assert_eq!(
+            with(None).unwrap().orphan_grace,
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            with(Some(3600)).unwrap().orphan_grace,
+            Duration::from_secs(3600)
+        );
+        let e = with(Some(3599)).unwrap_err().to_string();
+        assert!(
+            e.contains("\"orphan_grace_seconds\" must be at least 3600"),
+            "{e}"
+        );
     }
 
     /// R2a: the quarantine is set on a local coordinator, within its
