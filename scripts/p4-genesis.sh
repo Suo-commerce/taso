@@ -2,14 +2,10 @@
 # p4-genesis.sh: taso-genesis on real storage (P4 file 4c; spec rev. 14 §7,
 # D40-D48).
 #
-#   scripts/p4-genesis.sh zfs     (as root, from the repository root; not
+#   scripts/p4-genesis.sh blk     (as root, from the repository root; not
 #                                  through sudo, which drops cargo from PATH)
-#   scripts/p4-genesis.sh blk
 #
-# zfs: Vessel roots are new datasets under $P4G_ZFS_PARENT (default
-#      tasotest/vessel): p4g-n1 .. p4g-n4.  They must not exist; they are
-#      destroyed at the end (only these four, with everything under them).
-# blk: a fresh taso-blkd on its own log; datasets p4g/n1 .. p4g/n4 in it.
+# A fresh taso-blkd on its own log; datasets p4g/n1 .. p4g/n4 in it.
 #
 # Each run has its own coordinator (taso-coordd with --store-config), store,
 # state directories and Warden configs (warden ids 1-4, one "node" each, all
@@ -18,9 +14,8 @@
 # Touches, and nothing else:
 #   /var/lib/taso-p4g/<mode>                 (removed at start, kept after)
 #   /run/taso-p4g-<mode>-coord.sock
-#   zfs: $P4G_ZFS_PARENT/p4g-n1 .. p4g-n4    (created, destroyed at the end)
-#   blk: /run/taso-p4g-blk.sock, /mnt/p4g and mounts under it (unmounted at
-#        the end), the /dev/ublkb* devices taso-blkd creates for this run
+#   /run/taso-p4g-blk.sock, /mnt/p4g and mounts under it (unmounted at
+#   the end), the /dev/ublkb* devices taso-blkd creates for this run
 #
 # Every case prints its prediction before it runs, then PASS or FAIL.
 # Exit 0 only if every case passed.
@@ -28,11 +23,10 @@
 set -euo pipefail
 
 MODE=${1:-}
-[[ "$MODE" == zfs || "$MODE" == blk ]] || { echo "usage: $0 zfs|blk" >&2; exit 2; }
+[[ "$MODE" == blk ]] || { echo "usage: $0 blk" >&2; exit 2; }
 
 W=/var/lib/taso-p4g/$MODE
 SOCK=/run/taso-p4g-$MODE-coord.sock
-PARENT=${P4G_ZFS_PARENT:-tasotest/vessel}
 BLK_SOCK=/run/taso-p4g-blk.sock
 MNT=/mnt/p4g
 G=target/release/taso-genesis
@@ -44,7 +38,6 @@ SLOT=65536
 
 COORD_PID=
 BLKD_PID=
-ZFS_MADE=()
 PASS=0
 FAIL=0
 
@@ -52,7 +45,7 @@ say() { printf '\n== %s\n' "$*"; }
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 
 root_of() { # node -> its root dataset
-    if [[ $MODE == zfs ]]; then echo "$PARENT/p4g-n$1"; else echo "p4g/n$1"; fi
+    echo "p4g/n$1"
 }
 
 mounts_under() {
@@ -78,23 +71,17 @@ cleanup() {
     if [[ -n "$COORD_PID" ]] && kill -0 "$COORD_PID" 2>/dev/null; then
         kill "$COORD_PID"; wait "$COORD_PID" 2>/dev/null
     fi
-    if [[ $MODE == zfs ]]; then
-        for ds in "${ZFS_MADE[@]}"; do
-            zfs destroy -r "$ds" || echo "WARNING: could not destroy $ds"
-        done
-    else
-        while read -r m; do
-            [[ -n "$m" ]] || continue
-            fsfreeze -u "$m" 2>/dev/null
-            umount "$m" || umount -l "$m"
-        done < <(mounts_under)
-        if [[ -n "$BLKD_PID" ]] && kill -0 "$BLKD_PID" 2>/dev/null; then
-            blk quit >/dev/null 2>&1 || kill "$BLKD_PID"
-            wait "$BLKD_PID" 2>/dev/null
-        fi
-        left=$(mounts_under | wc -l)
-        [[ "$left" -eq 0 ]] || echo "WARNING: $left mounts left under $MNT"
+    while read -r m; do
+        [[ -n "$m" ]] || continue
+        fsfreeze -u "$m" 2>/dev/null
+        umount "$m" || umount -l "$m"
+    done < <(mounts_under)
+    if [[ -n "$BLKD_PID" ]] && kill -0 "$BLKD_PID" 2>/dev/null; then
+        blk quit >/dev/null 2>&1 || kill "$BLKD_PID"
+        wait "$BLKD_PID" 2>/dev/null
     fi
+    left=$(mounts_under | wc -l)
+    [[ "$left" -eq 0 ]] || echo "WARNING: $left mounts left under $MNT"
     rm -f "$SOCK"
     exit "$rc"
 }
@@ -105,44 +92,27 @@ trap cleanup EXIT
 [[ $EUID -eq 0 ]] || die "run as root"
 [[ -f Cargo.toml && -d crates/taso-warden ]] || die "run from the repository root"
 [[ ! -S "$SOCK" ]] || die "$SOCK exists: another run's coordinator? (pgrep -x taso-coordd)"
-if [[ $MODE == zfs ]]; then
-    zfs list -H -o name "$PARENT" >/dev/null || die "no dataset $PARENT (set P4G_ZFS_PARENT)"
-    for n in 1 2 3 4; do
-        if zfs list -H -o name "$(root_of $n)" >/dev/null 2>&1; then
-            die "$(root_of $n) exists (left by a previous run?): zfs destroy -r $(root_of $n)"
-        fi
-    done
-else
-    modprobe ublk_drv
-    [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
-    [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
-    mkdir -p "$MNT"
-    [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
-fi
+modprobe ublk_drv
+[[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
+[[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
+mkdir -p "$MNT"
+[[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 
 say "building"
 cargo build -q --release -p taso-warden --bin taso-genesis --bin taso-coordd --bin taso-logcheck
-[[ $MODE == blk ]] && cargo build -q --release -p taso-blk
+cargo build -q --release -p taso-blk
 
 rm -rf "$W"
 mkdir -p "$W/store" "$W/src"
 
 # ── Storage, coordinator, node configs ──────────────────────────────
 
-if [[ $MODE == zfs ]]; then
-    for n in 1 2 3 4; do
-        zfs create "$(root_of $n)"
-        ZFS_MADE+=("$(root_of $n)")
-    done
-    STORAGE='"zfs"'
-else
-    "$BLKD" "$W/blk.log" "$BLK_SOCK" 2>>"$W/blkd.err" &
-    BLKD_PID=$!
-    for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
-    [[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $W/blkd.err"
-    mkdir -p "$W/spool"
-    STORAGE="{\"blk\": {\"socket\": \"$BLK_SOCK\", \"mounts\": \"$MNT\", \"spool\": \"$W/spool\"}}"
-fi
+"$BLKD" "$W/blk.log" "$BLK_SOCK" 2>>"$W/blkd.err" &
+BLKD_PID=$!
+for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
+[[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $W/blkd.err"
+mkdir -p "$W/spool"
+STORAGE="{\"blk\": {\"socket\": \"$BLK_SOCK\", \"mounts\": \"$MNT\", \"spool\": \"$W/spool\"}}"
 
 printf '{"store": "%s", "prefix": "p4g"}\n' "$W/store" >"$W/store.json"
 "$COORDD" "$W/coord.redb" "$SOCK" --store-config "$W/store.json" 2>>"$W/coordd.err" &
@@ -282,14 +252,10 @@ print(" ".join(f["kind"] for f in v["frames"]))'
 
 # Scratch datasets left on the storage, and Seal views.
 scratches() {
-    if [[ $MODE == zfs ]]; then
-        zfs list -H -o name -r "${ZFS_MADE[@]}" | grep -c '/genesis-' || true
-    else
-        blk names | tr ' ' '\n' | grep -c '/genesis-' || true
-    fi
+    blk names | tr ' ' '\n' | grep -c '/genesis-' || true
 }
 views() {
-    if [[ $MODE == zfs ]]; then echo 0; else blk names | tr ' ' '\n' | grep -c '\.view-' || true; fi
+    blk names | tr ' ' '\n' | grep -c '\.view-' || true
 }
 
 # ── 1. A directory becomes a Template ───────────────────────────────
@@ -425,53 +391,36 @@ make_seal() {
     ds="$(root_of 1)/$name"
     local hash
     hash=$(printf '05%.0s' $(seq 32))
-    if [[ $MODE == zfs ]]; then
-        zfs create "$ds"
-        dir=$(zfs get -H -o value mountpoint "$ds")
-        tree "$dir" "$((BASE + 2 * SLOT))"
-        chown "$owner:$owner" "$dir"
-        settle "$dir"
-        zfs snapshot -o "taso:seal=$hash" "$ds@taso-seal-$(printf '%020d' 5)"
-    else
-        local rootseal branch dev
-        rootseal=$(blk root | cut -d' ' -f2)
-        read -r _ branch dev < <(blk fork "$rootseal" "$ds")
-        mkfs.ext4 -q -F -E nodiscard "$dev"
-        dir="$MNT/$ds"
-        mkdir -p "$dir"
-        mount -o discard "$dev" "$dir"
-        tree "$dir" "$((BASE + 2 * SLOT))"
-        chown "$owner:$owner" "$dir"
-        [[ "$lf" == - ]] || chown "$lf:$lf" "$dir/lost+found"
-        settle "$dir"
-        sync
-        umount "$dir"
-        blk detach "$branch" >/dev/null
-        blk seal "$branch" "0500000000000000$hash" >/dev/null
-    fi
+    local rootseal branch dev
+    rootseal=$(blk root | cut -d' ' -f2)
+    read -r _ branch dev < <(blk fork "$rootseal" "$ds")
+    mkfs.ext4 -q -F -E nodiscard "$dev"
+    dir="$MNT/$ds"
+    mkdir -p "$dir"
+    mount -o discard "$dev" "$dir"
+    tree "$dir" "$((BASE + 2 * SLOT))"
+    chown "$owner:$owner" "$dir"
+    [[ "$lf" == - ]] || chown "$lf:$lf" "$dir/lost+found"
+    settle "$dir"
+    sync
+    umount "$dir"
+    blk detach "$branch" >/dev/null
+    blk seal "$branch" "0500000000000000$hash" >/dev/null
     echo "$ds"
 }
 
 say "8. a Vessel's Seal (predict below per storage)"
 SB=$((BASE + 2 * SLOT))
-if [[ $MODE == zfs ]]; then
-    echo "   predict: top dir owned by a slot base: exit 0, and the source artifact is the directory's of case 1 (same files, slots 0); top dir 0:0: exit 1, base cannot be told"
-    DS=$(make_seal v-seal "$SB" -)
-    g 8-seal 1 -- --from "$DS@5" "${GENRUN[@]}"
-    expect "Seal: exit 0, ready" bash -c "[[ $RC == 0 && '$(jf 8-seal outcome)' == ready ]]"
-    expect "Seal: source_key = case 1's" is "$(jf 8-seal source_key)" "$SRC1"
-else
-    echo "   predict: lost+found left 0:0 as ext4 makes it (as the P3 runtime leaves it today): exit 3, ReservedMismatch (finding);"
-    echo "            lost+found chowned to the slot base too: exit 0, ready; top dir 0:0: exit 1, base cannot be told"
-    DS=$(make_seal v-seal "$SB" -)
-    g 8-seal 1 -- --from "$DS@5" "${GENRUN[@]}"
-    expect "Seal, lost+found 0:0: exit 3, ReservedMismatch" \
-        bash -c "[[ $RC == 3 && '$(jf 8-seal reason)' == ReservedMismatch ]]"
-    DS=$(make_seal v-seal-lf "$SB" "$SB")
-    g 8-seal-lf 1 -- --from "$DS@5" "${GENRUN[@]}"
-    expect "Seal, lost+found at the slot base: exit 0, ready" \
-        bash -c "[[ $RC == 0 && '$(jf 8-seal-lf outcome)' == ready ]]"
-fi
+echo "   predict: lost+found left 0:0 as ext4 makes it (as the P3 runtime leaves it today): exit 3, ReservedMismatch (finding);"
+echo "            lost+found chowned to the slot base too: exit 0, ready; top dir 0:0: exit 1, base cannot be told"
+DS=$(make_seal v-seal "$SB" -)
+g 8-seal 1 -- --from "$DS@5" "${GENRUN[@]}"
+expect "Seal, lost+found 0:0: exit 3, ReservedMismatch" \
+    bash -c "[[ $RC == 3 && '$(jf 8-seal reason)' == ReservedMismatch ]]"
+DS=$(make_seal v-seal-lf "$SB" "$SB")
+g 8-seal-lf 1 -- --from "$DS@5" "${GENRUN[@]}"
+expect "Seal, lost+found at the slot base: exit 0, ready" \
+    bash -c "[[ $RC == 0 && '$(jf 8-seal-lf outcome)' == ready ]]"
 DS=$(make_seal v-fresh 0 -)
 g 8-fresh 1 -- --from "$DS@5" "${GENRUN[@]}"
 expect "Seal with top dir 0:0: exit 1, base cannot be told" \
