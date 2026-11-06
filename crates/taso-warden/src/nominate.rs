@@ -11,8 +11,9 @@
 //!    id refuses `Closed`; an accepted one answers `Nominated` to the same
 //!    kind of request and refuses `Duplicate` to another; an accepted
 //!    refusal for this Seal and exclusion answers it again.
-//! 2. **Warden-local limits** (D62): open Candidates per Vessel, the
-//!    minimum interval, concurrent walks.  Over one: `Retry`.
+//! 2. **The verifier Template** must be ready (review fix N2a), and
+//!    **Warden-local limits** (D62): open Candidates per Vessel, the
+//!    minimum interval, concurrent walks.  Otherwise: `Retry`.
 //! 3. **Walk** the Seal's read-only view (§8) and put the input manifest.
 //!    Refused on an incomplete walk, an unsupported entry (a reserved
 //!    mismatch named as such) or an `Unknown` path.
@@ -392,6 +393,20 @@ impl Nominator {
             self.accepted_id(ContractRecord::NominationRefused(probe).logical_id())?
         {
             return Ok(Answer::Refused(r.reason));
+        }
+
+        // The verifier Template must be ready (review fix N2a): a
+        // Candidate naming one that is not could never start an attempt,
+        // and would stay open where policy never sees it.  Nothing is
+        // recorded: it may yet be registered.
+        if !matches!(
+            self.accepted(LogicalKey::Template(ask.verifier))?,
+            Some(ContractRecord::TemplateReady(_))
+        ) {
+            return Ok(Answer::Retry(format!(
+                "the verifier Template {} is not a ready Template",
+                hex(ask.verifier.as_bytes())
+            )));
         }
 
         // 2. Warden-local limits.
@@ -956,6 +971,8 @@ class = \"Scratch\"
         coord: Arc<Coordinator>,
         host: Host<FakePool>,
         tree: PathBuf,
+        /// A ready Template, the verifier every [`ask`] names.
+        verifier: ChronicleId,
     }
 
     fn world() -> World {
@@ -980,13 +997,16 @@ class = \"Scratch\"
             warden: WardenId::new(1),
         };
         let tree = dir.path().join("seal");
-        World {
+        let mut w = World {
             dir,
             store,
             coord,
             host,
             tree,
-        }
+            verifier: ChronicleId::from_bytes([0; 16]),
+        };
+        w.verifier = ready_template(&w);
+        w
     }
 
     /// The Seal's files: a source tree, a scratch directory and file, an
@@ -1031,11 +1051,53 @@ class = \"Scratch\"
         c
     }
 
-    fn ask(by: NominatedBy) -> Ask {
+    /// A ready Template by genesis of a small tree, for an `Ask` to name
+    /// as its verifier (review fix N2a: nomination checks it is ready).
+    fn ready_template(w: &World) -> ChronicleId {
+        use crate::genesis::{self, tests::DirPool, Genesis, Outcome, Request, Source};
+        let src = w.dir.path().join("verifier-src");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("bin/check"), "#!/bin/sh\n").unwrap();
+        let pool = w.dir.path().join("gpool");
+        std::fs::create_dir_all(&pool).unwrap();
+        let g = Genesis {
+            pool: DirPool::new(&pool),
+            store: w.store.clone(),
+            prefix: PREFIX.into(),
+            coord: w.coord.clone(),
+            warden: WardenId::new(100),
+            state_dir: w.dir.path().join("gstate"),
+            root: Dataset::new("tank/taso").unwrap(),
+            host_uid_base: BASE,
+            limits: Limits::default(),
+            reserved: Reserved::defaults(),
+            failpoint: genesis::no_failpoints(),
+        };
+        let r = g
+            .run(&Request {
+                source: Source::Dir(src),
+                classmap: MAP.as_bytes().to_vec(),
+                authority: taso_core::record::Authority {
+                    actor: "jarmo".into(),
+                    reason: "a verifier".into(),
+                },
+                hook_waiver: None,
+                best_effort: true,
+                peer: taso_core::contract::Peer { uid: 0, pid: 1 },
+            })
+            .unwrap();
+        let Outcome::Ready { template_id, .. } = r.outcome else {
+            panic!("{:?}", r.outcome)
+        };
+        template_id
+    }
+
+    /// An ask naming `w`'s ready verifier Template.
+    fn ask(w: &World, by: NominatedBy) -> Ask {
         Ask {
             seal: None,
             exclude: [PathClass::Scratch].into(),
-            verifier: ChronicleId::from_bytes([0x99; 16]),
+            verifier: w.verifier,
             vconf: b"entry = [\"/bin/check\"]\n".to_vec(),
             version: 1,
             by,
@@ -1116,7 +1178,7 @@ class = \"Scratch\"
         let n = nominator(&w, conf());
         let (mut v, packs) = vessel(&w, b"a", true);
         let a = n
-            .nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+            .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
             .unwrap();
         let Answer::Nominated(cid) = a else {
             panic!("{a:?}")
@@ -1159,17 +1221,27 @@ class = \"Scratch\"
         }
         // The same request again: the same answer, nothing appended.
         let again = n
-            .nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+            .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
             .unwrap();
         assert_eq!(again, Answer::Nominated(cid));
         assert_eq!(contracts(&v).len(), 1);
         // Another kind of request for the same id: Duplicate, recorded once.
         let dup = n
-            .nominate(&mut v, &packs, &ask(NominatedBy::Config), &view(&w.tree))
+            .nominate(
+                &mut v,
+                &packs,
+                &ask(&w, NominatedBy::Config),
+                &view(&w.tree),
+            )
             .unwrap();
         assert_eq!(dup, Answer::Refused(NominationRefusal::Duplicate));
         let dup2 = n
-            .nominate(&mut v, &packs, &ask(NominatedBy::Config), &view(&w.tree))
+            .nominate(
+                &mut v,
+                &packs,
+                &ask(&w, NominatedBy::Config),
+                &view(&w.tree),
+            )
             .unwrap();
         assert_eq!(dup2, dup);
         assert_eq!(contracts(&v).len(), 2);
@@ -1182,7 +1254,7 @@ class = \"Scratch\"
         let n = nominator(&w, conf());
         let (mut v, packs) = vessel(&w, b"a", false);
         let a = n
-            .nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+            .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
             .unwrap();
         assert!(
             matches!(a, Answer::Retry(ref why) if why.contains("not shipped")),
@@ -1192,7 +1264,7 @@ class = \"Scratch\"
         // A record that is not a Seal: refused for good, and an lsn with
         // nothing: refused, nothing to record.
         // A refusal waits too while the newest Seal is not shipped.
-        let mut a = ask(NominatedBy::Agent);
+        let mut a = ask(&w, NominatedBy::Agent);
         a.seal = Some(Lsn::new(1)); // the Lineage
         assert!(matches!(
             n.nominate(&mut v, &packs, &a, &view(&w.tree)).unwrap(),
@@ -1237,7 +1309,7 @@ class = \"Scratch\"
         let n = nominator(&w, c);
         let (mut v, packs) = vessel(&w, b"a", true);
         let a = n
-            .nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+            .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
             .unwrap();
         assert_eq!(
             a,
@@ -1251,7 +1323,7 @@ class = \"Scratch\"
             "the walk is kept for diagnosis"
         );
         // An exclusion outside the allowed set.
-        let mut bad = ask(NominatedBy::Agent);
+        let mut bad = ask(&w, NominatedBy::Agent);
         bad.exclude = [PathClass::Source].into();
         assert_eq!(
             n.nominate(&mut v, &packs, &bad, &view(&w.tree)).unwrap(),
@@ -1273,12 +1345,12 @@ class = \"Scratch\"
         let n = nominator(&w, conf());
         let (mut v, packs) = vessel(&w, b"a", true);
         assert_eq!(
-            n.nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+            n.nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
                 .unwrap(),
             Answer::Refused(NominationRefusal::Walk(WalkRefusal::DanglingByExclusion))
         );
         // Without the exclusion it is kept and nominates.
-        let mut all = ask(NominatedBy::Agent);
+        let mut all = ask(&w, NominatedBy::Agent);
         all.exclude = BTreeSet::new();
         assert!(matches!(
             n.nominate(&mut v, &packs, &all, &view(&w.tree)).unwrap(),
@@ -1286,11 +1358,57 @@ class = \"Scratch\"
         ));
     }
 
+    /// Review fix N2a: a verifier Template that is not ready answers
+    /// `Retry` and records nothing (no Candidate, no refusal); once it is
+    /// ready, the same ask nominates.
+    #[test]
+    fn an_unknown_verifier_template_answers_retry_and_records_nothing() {
+        let w = world();
+        make_tree(&w.tree);
+        let n = nominator(&w, conf());
+        let (mut v, packs) = vessel(&w, b"a", true);
+        let before = contracts(&v);
+        let mut unknown = ask(&w, NominatedBy::Agent);
+        unknown.verifier = ChronicleId::from_bytes([0x99; 16]);
+        let a = n
+            .nominate(&mut v, &packs, &unknown, &view(&w.tree))
+            .unwrap();
+        let Answer::Retry(why) = a else {
+            panic!("{a:?}")
+        };
+        assert!(why.contains("not a ready Template"), "{why}");
+        assert_eq!(contracts(&v), before, "nothing appended");
+        let objects = |kind: &str| {
+            std::fs::read_dir(
+                w.dir
+                    .path()
+                    .join("store")
+                    .join(PREFIX)
+                    .join("obj")
+                    .join(kind),
+            )
+            .map_or(0, |d| d.count())
+        };
+        assert_eq!(objects("vconf"), 0, "nothing put for it");
+        // A real Template: the same Vessel nominates.
+        assert!(matches!(
+            n.nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
+                .unwrap(),
+            Answer::Nominated(_)
+        ));
+    }
+
     #[test]
     fn every_failpoint_leaves_nothing_accepted_and_the_retry_is_the_same() {
+        let artifacts = |w: &World| {
+            std::fs::read_dir(w.dir.path().join("store").join(PREFIX).join("obj/artifact"))
+                .map_or(0, |d| d.count())
+        };
         for fp in FAILPOINTS {
             let w = world();
             make_tree(&w.tree);
+            // The verifier Template's own artifact is there already.
+            let before = artifacts(&w);
             let mut n = nominator(&w, conf());
             n.failpoint = Box::new(move |p| {
                 if p == fp {
@@ -1301,7 +1419,7 @@ class = \"Scratch\"
             });
             let (mut v, packs) = vessel(&w, b"a", true);
             let e = n
-                .nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+                .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
                 .unwrap_err();
             assert!(
                 matches!(e, NominateError::Failpoint(p) if p == fp),
@@ -1313,18 +1431,14 @@ class = \"Scratch\"
             drop(v);
             let (mut v, _) = w.host.open(id).unwrap();
             let a = n
-                .nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+                .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
                 .unwrap();
             let Answer::Nominated(cid) = a else {
                 panic!("{fp}: {a:?}")
             };
             let c = candidate(&w, cid);
-            // One artifact in the store: the retry put the same one.
-            let arts =
-                std::fs::read_dir(w.dir.path().join("store").join(PREFIX).join("obj/artifact"))
-                    .unwrap()
-                    .count();
-            assert_eq!(arts, 1, "{fp}");
+            // One artifact more in the store: the retry put the same one.
+            assert_eq!(artifacts(&w), before + 1, "{fp}");
             assert!(w
                 .coord
                 .query_chronicle(id)
@@ -1344,11 +1458,11 @@ class = \"Scratch\"
         let n = nominator(&w, c);
         let (mut v, packs) = vessel(&w, b"a", true);
         assert!(matches!(
-            n.nominate(&mut v, &packs, &ask(NominatedBy::Agent), &view(&w.tree))
+            n.nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
                 .unwrap(),
             Answer::Nominated(_)
         ));
-        let mut other = ask(NominatedBy::Agent);
+        let mut other = ask(&w, NominatedBy::Agent);
         other.exclude = BTreeSet::new();
         let a = n.nominate(&mut v, &packs, &other, &view(&w.tree)).unwrap();
         assert!(
@@ -1366,7 +1480,12 @@ class = \"Scratch\"
             Answer::Nominated(_)
         ));
         let a = n
-            .nominate(&mut v2, &packs2, &ask(NominatedBy::Agent), &view(&w.tree))
+            .nominate(
+                &mut v2,
+                &packs2,
+                &ask(&w, NominatedBy::Agent),
+                &view(&w.tree),
+            )
             .unwrap();
         assert!(
             matches!(a, Answer::Retry(ref why) if why.contains("min_interval")),
@@ -1445,6 +1564,19 @@ class = \"Scratch\"
             let mut i = input.clone();
             i.entries.push(e("m", Symlink, Source, Some(t)));
             assert!(transform(&i, &ex).is_err(), "{t}");
+        }
+        // A chain whose final target the exclusion drops (review N1): a
+        // kept link to a dropped link, and a kept link to a kept link
+        // into a dropped file.
+        for (l2_class, l2_target) in [(Scratch, "a/keep.py"), (Source, "b/y")] {
+            let mut i = input.clone();
+            i.entries.push(e("l1", Symlink, Source, Some("l2")));
+            i.entries.push(e("l2", Symlink, l2_class, Some(l2_target)));
+            i.entries.sort_by(|a, b| a.path.cmp(&b.path));
+            assert!(
+                transform(&i, &ex).is_err(),
+                "l2 {l2_class:?} -> {l2_target}"
+            );
         }
         // A link that was dangling already, or at the root, is not the
         // exclusion's doing.

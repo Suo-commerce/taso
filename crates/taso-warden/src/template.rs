@@ -2353,19 +2353,71 @@ mod tests {
         assert!(at2.interrupt_open(&mut v2, &packs).unwrap().is_empty());
     }
 
+    /// Review fix N2a, end to end: a nomination naming a Template that is
+    /// not ready answers `Retry`, and no Candidate exists afterwards (the
+    /// Candidate that could never start an attempt is not made).  The
+    /// coordinator's own refusal of such a start stays in `coordlog`.
     #[test]
-    fn a_start_naming_no_ready_template_is_refused() {
+    fn a_nomination_naming_no_ready_template_answers_retry() {
         let c = Cluster::new();
         let nobody = ChronicleId::from_bytes([0x42; 16]);
-        let (_h, mut v, packs, cand) = nominated(&c, b"a", nobody, VCONF);
-        let e = attempts(&c).start(&mut v, &packs, &cand).unwrap_err();
-        assert!(
-            matches!(
-                &e,
-                AttemptError::Submit(crate::submit::SubmitError::Refused(Final::Predicate(_)))
-            ),
-            "{e}"
+        let host = Host {
+            coord: c.coord.clone(),
+            pool: crate::vessel::tests::FakePool::default(),
+            root: Dataset::new("tank/vessels").unwrap(),
+            state_dir: c.dir.path().join("vstate-nobody"),
+            warden: WardenId::new(1),
+        };
+        let (mut v, _) = host.ensure(NS, b"a").unwrap();
+        let packs = Packs::new(c.store.clone(), Bytes, PREFIX, v.id()).unwrap();
+        v.append(Stream::Fs, Payload::Raw(vec![1; 8])).unwrap();
+        let s = v
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                Lsn::new(0),
+                TurnId::new(1),
+            )
+            .unwrap()
+            .seal;
+        let snap = crate::storage::Snapshot {
+            dataset: v.dataset().clone(),
+            seal: s.lsn,
+            guid: crate::vessel::tests::fake_guid(s.lsn),
+            seal_hash: Some(s.hash),
+        };
+        v.publish_seal(&packs, &snap, None).unwrap();
+        let tree = c.dir.path().join("seal-nobody");
+        std::fs::create_dir_all(tree.join("app")).unwrap();
+        std::fs::write(tree.join("app/main.py"), "print(1)\n").unwrap();
+        let mut conf = SanctionConf::new(MAP.as_bytes().to_vec()).unwrap();
+        conf.min_interval = Duration::ZERO;
+        let n = Nominator::new(
+            c.store.clone(),
+            PREFIX,
+            c.coord.clone(),
+            WardenId::new(1),
+            BASE,
+            c.dir.path().join("ntmp"),
+            conf,
         );
+        let ask = Ask {
+            seal: None,
+            exclude: [PathClass::Scratch].into(),
+            verifier: nobody,
+            vconf: VCONF.to_vec(),
+            version: 1,
+            by: NominatedBy::Agent,
+        };
+        let t = tree.clone();
+        let a = n
+            .nominate(&mut v, &packs, &ask, &move |_| {
+                Ok(SealView::new(t.clone(), None))
+            })
+            .unwrap();
+        assert!(matches!(a, Answer::Retry(_)), "{a:?}");
+        // Nothing to attempt: no Candidate was made.
+        assert!(attempts(&c).to_attempt(&v).unwrap().is_empty());
     }
 
     fn run_with<'a>(

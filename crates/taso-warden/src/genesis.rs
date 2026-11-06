@@ -1165,7 +1165,7 @@ fn kind(r: &ContractRecord) -> &'static str {
 // ── Plumbing ────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
@@ -1198,14 +1198,14 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct DirPool {
+    pub(crate) struct DirPool {
         root: PathBuf,
         state: Arc<Mutex<DirState>>,
         mangle: bool,
     }
 
     impl DirPool {
-        fn new(root: &Path) -> Self {
+        pub(crate) fn new(root: &Path) -> Self {
             Self {
                 root: root.to_path_buf(),
                 state: Arc::default(),
@@ -1225,7 +1225,7 @@ mod tests {
         }
     }
 
-    struct DirLayers {
+    pub(crate) struct DirLayers {
         data: PathBuf,
         snaps: PathBuf,
         mangle: bool,
