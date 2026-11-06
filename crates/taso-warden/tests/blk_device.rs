@@ -1,5 +1,6 @@
 //! `BlkPool` on real devices: the Warden's Vessels on `taso-blkd`, ublk,
-//! ext4 and real mounts (birth, Seal, forks, reopen, rollback), and
+//! ext4 and real mounts (birth, Seal, forks, an orphan layer removed at
+//! reopen, rollback), and
 //! rebirth on a second node from shipped packs.  Needs root, ublk and two
 //! running daemons (node A and node B), so it is ignored by default;
 //! `scripts/blk-warden-test.sh` starts them on fresh logs and runs it:
@@ -180,11 +181,34 @@ fn vessels_on_real_devices() {
     assert_eq!(std::fs::read(smp.join("note")).unwrap(), b"sealed");
     assert!(!smp.join("child-only").exists());
 
-    // Reopen the parent: lineage and layer checks pass on real layers.
+    // An orphan layer past the head, as a crash between a layer and its
+    // record leaves one.  The parent's branch stands on it, so the reopen
+    // unseals it from under the current state (F1): the layer goes, the
+    // files written since s1 stay until the rollback below.
     let id = v.id();
+    let ds = v.dataset().clone();
+    let orphan = v.tail().lsn.next();
     drop((v, child, second));
-    let (mut v, _) = host.open(id).unwrap();
+    host.pool
+        .layers(&ds)
+        .snapshot(orphan, taso_core::envelope::HashVal::from_bytes([0xAB; 32]))
+        .unwrap()
+        .run()
+        .unwrap();
+
+    // Reopen the parent: lineage and layer checks pass on real layers.
+    let (mut v, r) = host.open(id).unwrap();
+    assert_eq!(r.orphan_layers, vec![orphan]);
     assert_eq!(v.last_seal(), Some(s1));
+    assert_eq!(
+        host.pool.layers(v.dataset()).list().unwrap(),
+        [(birth.lsn, birth.hash), (s1.lsn, s1.hash)],
+        "the orphan is gone"
+    );
+    assert_eq!(
+        std::fs::read(mp.join("note")).unwrap(),
+        b"changed after the seal"
+    );
     let dev = host.pool.ensure_mounted(v.dataset()).unwrap();
     assert_eq!(
         host.pool.ensure_mounted(v.dataset()).unwrap(),

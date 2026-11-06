@@ -28,9 +28,9 @@
 //! which recovery recognises exactly: its lsn is past the head, or the
 //! accepted record at its lsn has another hash.
 //!
-//! In Phase 1 the Seal's `layer` is its own lsn, because that is what
-//! names the snapshot.  The ZFS guid cannot go into the record: the
-//! record's hash is fixed before the snapshot exists.
+//! The Seal's `layer` is its own lsn, because that is what names the
+//! layer.  The store's own id for it cannot go into the record: the
+//! record's hash is fixed before the layer exists.
 //!
 //! # Open
 //!
@@ -112,8 +112,6 @@ impl fmt::Display for Claim {
         }
     }
 }
-use crate::storage::Dataset;
-use crate::zfs::{Cli, Runner, Zfs};
 
 /// File name of the first segment of a Chronicle (base lsn 0).
 const SEGMENT_FILE: &str = "seg-00000000000000000000";
@@ -156,8 +154,8 @@ const LOCK_FILE: &str = "LOCK";
 pub type LayerError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What a [`Layers::snapshot`] leaves to do once it has made the layer:
-/// the thaw of a frozen Vessel (the block log), or nothing (ZFS, whose
-/// snapshot freezes nothing).  The Chronicle runs it beside the Seal
+/// the thaw of a frozen Vessel (the block log), or nothing (a store that
+/// freezes nothing, such as the records-only one or a test's).  The Chronicle runs it beside the Seal
 /// record's commit and answers the Seal only once both are done (P5, the
 /// 50 ms line, bite 2: `claude/Taso_design_seal_overlap_2026-11-02.md`).
 ///
@@ -226,8 +224,8 @@ impl Thawing<'_> {
     }
 }
 
-/// Where Seal layers live: ZFS snapshots in Phase 1 (Btrfs is the
-/// fallback; v1.0 §3).
+/// Where Seal layers live: the block log's layers
+/// ([`crate::blk::BlkLayers`]).
 ///
 /// Only layers Taso made and bound to a record hash are reported; anything
 /// else on the dataset is ignored, never destroyed.
@@ -261,8 +259,8 @@ pub trait Layers {
     fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError>;
     /// How many blocks of the filesystem the last [`Layers::rollback`]
     /// discarded, where the store can count them (the block log: the
-    /// branch's own blocks below the Seal); `None` where it cannot (ZFS)
-    /// or before any rollback.  The Warden names it after a reset (spec
+    /// branch's own blocks below the Seal); `None` where it cannot (the
+    /// records-only store, a test's) or before any rollback.  The Warden names it after a reset (spec
     /// rev. 33, D93 class (i)): an agent's write adds no Chronicle record,
     /// so this count is the only word on it.
     fn discarded_blocks(&self) -> Option<u64> {
@@ -294,54 +292,6 @@ impl Layers for NoLayers {
             lsn.get()
         )
         .into())
-    }
-}
-
-/// [`Layers`] over a ZFS dataset.
-#[derive(Clone, Debug)]
-pub struct ZfsLayers<R: Runner = Cli> {
-    zfs: Zfs<R>,
-    dataset: Dataset,
-}
-
-impl<R: Runner> ZfsLayers<R> {
-    /// Layers of `dataset`, driven by `zfs`.
-    pub fn new(zfs: Zfs<R>, dataset: Dataset) -> Self {
-        Self { zfs, dataset }
-    }
-
-    /// The dataset.
-    pub fn dataset(&self) -> &Dataset {
-        &self.dataset
-    }
-}
-
-impl<R: Runner> Layers for ZfsLayers<R> {
-    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError> {
-        // A ZFS snapshot is atomic and freezes nothing: no thaw.
-        self.zfs.snapshot(&self.dataset, lsn, hash)?;
-        Ok(Thaw::none())
-    }
-
-    fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-        Ok(self
-            .zfs
-            .list(&self.dataset)?
-            .into_iter()
-            .filter_map(|s| s.seal_hash.map(|h| (s.seal, h)))
-            .collect())
-    }
-
-    fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
-        if let Some(snap) = self.zfs.get(&self.dataset, lsn)? {
-            self.zfs.destroy(&snap)?;
-        }
-        Ok(())
-    }
-
-    fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
-        self.zfs.rollback(&self.dataset, lsn, hash)?;
-        Ok(())
     }
 }
 
@@ -1420,7 +1370,7 @@ const LOCK_WAIT: Duration = Duration::from_millis(500);
 /// Take an exclusive lock on `dir/LOCK`, held for the Chronicle's life.
 ///
 /// The lock (`flock`) belongs to the open file, not the process.  When
-/// any thread spawns a process (`zfs`, `runc`), the child holds copies of
+/// any thread spawns a process (`runc`, `mount`), the child holds copies of
 /// every open file from the fork until it execs; all of them are
 /// close-on-exec, so that hold ends within microseconds to milliseconds.
 /// A lock dropped in that window still looks held, and a Vessel reopened
@@ -1705,7 +1655,7 @@ mod tests {
             self.snaps.borrow_mut().remove(&lsn);
             Ok(())
         }
-        /// Like `zfs rollback`: the layer must be there with this hash,
+        /// Like the block log's rollback: the layer must be there with this hash,
         /// and nothing later may exist.
         fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
             let s = self.snaps.borrow();
@@ -2227,48 +2177,6 @@ mod tests {
             Err(ChronicleError::Fenced)
         ));
         assert!(e.layers.rolled_back.borrow().is_empty());
-    }
-
-    /// ZFS layers roll back with `zfs rollback` on the Seal's snapshot,
-    /// after checking its binding.
-    #[test]
-    fn zfs_layers_roll_back_with_zfs() {
-        struct Rec(
-            Rc<RefCell<Vec<Vec<String>>>>,
-            RefCell<Vec<crate::zfs::Output>>,
-        );
-        impl Runner for Rec {
-            fn run(&self, args: &[String]) -> Result<crate::zfs::Output, crate::zfs::ZfsError> {
-                self.0.borrow_mut().push(args.to_vec());
-                Ok(self.1.borrow_mut().remove(0))
-            }
-            fn run_input(
-                &self,
-                _: &[String],
-                _: &mut dyn std::io::Read,
-            ) -> Result<crate::zfs::Output, crate::zfs::ZfsError> {
-                unreachable!()
-            }
-        }
-        let ok = |stdout: &str| crate::zfs::Output {
-            success: true,
-            code: Some(0),
-            stdout: stdout.into(),
-            stderr: String::new(),
-        };
-        let ds = Dataset::new("tasotest/vessel/v").unwrap();
-        let name = ds.seal_snapshot(Lsn::new(4));
-        let h = HashVal::from_bytes([4; 32]);
-        let calls = Rc::new(RefCell::new(vec![]));
-        let rec = Rec(
-            calls.clone(),
-            RefCell::new(vec![ok(&format!("{name}\t845\t17\t{h}\n")), ok("")]),
-        );
-        let mut layers = ZfsLayers::new(Zfs::with_runner(rec), ds);
-        layers.rollback(Lsn::new(4), h).unwrap();
-        let calls = calls.borrow().clone();
-        assert_eq!(calls.last().unwrap(), &vec!["rollback".to_string(), name]);
-        assert_eq!(calls.len(), 2, "get, then rollback: {calls:?}");
     }
 
     /// The records-only store refuses a snapshot and a rollback in its own
@@ -3578,98 +3486,5 @@ mod tests {
         assert!(matches!(seal(&mut a, 1), Err(ChronicleError::Fenced)));
         assert!(layers_a.snaps().is_empty());
         assert_eq!(b.append(Stream::Fs, raw(2)).unwrap().lsn, Lsn::new(2));
-    }
-
-    // ── on a real pool ──────────────────────────────────────────────
-
-    mod node {
-        use super::*;
-        use std::process::Command;
-
-        struct Scratch {
-            ds: Dataset,
-            mountpoint: PathBuf,
-        }
-
-        fn zfs_cmd(args: &[&str]) -> String {
-            let out = Command::new("zfs").args(args).output().expect("run zfs");
-            assert!(
-                out.status.success(),
-                "zfs {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr),
-            );
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        }
-
-        impl Scratch {
-            fn new(test: &str) -> Self {
-                let base = std::env::var("TASO_ZFS_DATASET")
-                    .expect("set TASO_ZFS_DATASET to a dataset these tests may use");
-                let name = format!("{base}/c-{test}-{}", std::process::id());
-                zfs_cmd(&["create", &name]);
-                let mountpoint = PathBuf::from(
-                    zfs_cmd(&["get", "-H", "-o", "value", "mountpoint", &name]).trim(),
-                );
-                Self {
-                    ds: Dataset::new(&name).unwrap(),
-                    mountpoint,
-                }
-            }
-        }
-
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                let _ = Command::new("zfs")
-                    .args(["destroy", "-r", self.ds.as_str()])
-                    .status();
-            }
-        }
-
-        #[test]
-        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
-        fn seal_and_recover_on_zfs() {
-            let s = Scratch::new("seal");
-            let root = tempfile::tempdir().unwrap();
-            let coord = Arc::new(Coordinator::open(root.path().join("coord.redb")).unwrap());
-            let layers = ZfsLayers::new(Zfs::cli(), s.ds.clone());
-
-            let (mut c, _) =
-                Chronicle::create(root.path(), coord.clone(), cid(), A, layers).unwrap();
-            std::fs::write(s.mountpoint.join("a.txt"), b"one").unwrap();
-            c.append(Stream::Fs, raw(1)).unwrap();
-            let s1 = seal(&mut c, 1).unwrap();
-            std::fs::write(s.mountpoint.join("a.txt"), b"two").unwrap();
-            c.append(Stream::Fs, raw(2)).unwrap();
-            let s2 = seal(&mut c, 2).unwrap();
-            assert_eq!(
-                c.layers().list().unwrap(),
-                vec![(s1.seal.lsn, s1.seal.hash), (s2.seal.lsn, s2.seal.hash)]
-            );
-            // The first Seal froze the first contents.
-            let snap = s.mountpoint.join(format!(
-                ".zfs/snapshot/taso-seal-{:020}/a.txt",
-                s1.seal.lsn.get()
-            ));
-            assert_eq!(std::fs::read(snap).unwrap(), b"one");
-            let tail = c.tail();
-            drop(c);
-
-            // An orphan past the head, as a crash after `zfs snapshot`.
-            Zfs::cli()
-                .snapshot(&s.ds, tail.lsn.next(), HashVal::from_bytes([0xAB; 32]))
-                .unwrap();
-
-            let layers = ZfsLayers::new(Zfs::cli(), s.ds.clone());
-            let (c, r) = {
-                let cl = claim(&*coord, A);
-                Chronicle::open_as(root.path(), coord, cid(), A, layers, cl)
-            }
-            .unwrap();
-            assert_eq!(r.orphan_layers, vec![tail.lsn.next()]);
-            assert_eq!(r.last_seal, Some(s2.seal));
-            assert_eq!(c.layers().list().unwrap().len(), 2);
-            eprintln!("recovered: {r:?}");
-        }
     }
 }
