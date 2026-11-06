@@ -28,6 +28,10 @@
 #   9  the three verify failpoints                stop; the next start
 #                                                 closes or starts it
 #  10  no /candidate dataset is left              none under the root
+#  11  release test N5 (review 2): both verifier   s3's attempt started by the
+#      slots busy, s3 nominates and its agent      waiting list in the same
+#      exits, a slot comes free                    Warden life (no restart),
+#                                                  while the keeper still runs
 #
 # Touches, and nothing else:
 #   /var/lib/taso-p4v/<mode>                 (removed at start, kept after)
@@ -486,6 +490,58 @@ expect "the new attempt: finished Exit { code: 0 }" is "$(finished 9c-again fc)"
 
 say "10. no attempt's /candidate dataset is left (predict: none under node 1's root)"
 expect "no a- datasets" is "$(candidates_left)" 0
+
+# ── 11. Release test N5: the waiting list ──────────────────────────
+
+# s1 and s2 take both verifier slots (each verifier sleeps 25 s); s3's
+# agent nominates a few seconds later and exits, so its run cannot start
+# its attempt and hands it to the waiting list; q, the keeper, runs about
+# a minute and nominates nothing, so the Warden is still running its
+# Vessels when a slot comes free.  The worker logs "opened here to run its
+# verifier (D88, N5a)" when it takes s3; the watcher records whether q's
+# run had ended by then (its end is a line on the daemon's stdout).
+say "11. release test N5: both slots busy, s3 nominates and its agent exits, then a slot comes free (predict: exit 0; s1 and s2 finished 'Exit { code: 0 }'; s3 opened by the waiting list once, while q still runs, and finished 'Exit { code: 0 }')"
+vconf s1 'exec /bin/sleep 25'
+vconf s2 'exec /bin/sleep 25'
+vconf s3 'exit 0'
+vconf q 'exit 0'
+runtime_json() { # runtime_json TURNS SLEEP_MS [NOMINATE]
+    python3 - "$@" <<'PY'
+import json, sys
+args = ["/usr/bin/taso-sim", "--turns", sys.argv[1], "--txns", "2", "--rows", "4",
+        "--turn-sleep-ms", sys.argv[2], "--stats", "/work/sim-stats.json"]
+if len(sys.argv) > 3:
+    args += ["--nominate", sys.argv[3]]
+print('"runtime": ' + json.dumps({"args": args}))
+PY
+}
+config 1 "$W/n5.json" \
+    "$(vessel s1 13 "$(runtime_json 1 50 Scratch)")" \
+    "$(vessel s2 14 "$(runtime_json 1 50 Scratch)")" \
+    "$(vessel s3 15 "$(runtime_json 4 1000 Scratch)")" \
+    "$(vessel q 16 "$(runtime_json 60 1000)")"
+rm -f "$W/out/11-n5.watch"
+(
+    for _ in $(seq 1800); do
+        if grep -q '\] s3: opened here to run its verifier' "$W/out/11-n5.err" 2>/dev/null; then
+            if grep -q '^q: ' "$W/out/11-n5.out" 2>/dev/null; then echo "after q" >"$W/out/11-n5.watch"
+            else echo "while q runs" >"$W/out/11-n5.watch"; fi
+            exit 0
+        fi
+        sleep 0.2
+    done
+    echo "never" >"$W/out/11-n5.watch"
+) &
+WATCH_PID=$!
+wardend 11-n5 1 "$W/n5.json"
+wait "$WATCH_PID" 2>/dev/null || true
+expect "exit 0" is "$RC" 0
+expect "s1 finished Exit { code: 0 }" is "$(finished 11-n5 s1)" "Exit { code: 0 }"
+expect "s2 finished Exit { code: 0 }" is "$(finished 11-n5 s2)" "Exit { code: 0 }"
+expect "s3 opened by the waiting list once" is "$(count 11-n5.err '\] s3: opened here to run its verifier')" 1
+expect "s3 opened while q still runs (no restart, not the end's settle)" is "$(cat "$W/out/11-n5.watch" 2>/dev/null)" "while q runs"
+expect "s3 finished Exit { code: 0 }" is "$(finished 11-n5 s3)" "Exit { code: 0 }"
+expect "no a- datasets left" is "$(candidates_left)" 0
 
 # ── Result ──────────────────────────────────────────────────────────
 
