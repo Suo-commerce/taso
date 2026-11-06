@@ -135,7 +135,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use taso_core::envelope::{ChronicleId, Epoch, Lsn};
@@ -2105,6 +2105,39 @@ struct Done {
     result: Result<(taso_core::contract::Outcome, Vec<u8>), crate::attempt::Stopped>,
 }
 
+/// How long the next attempt of a Candidate waits after its attempts
+/// ended `Interrupted` in this Warden's life (review fix B-a): after the
+/// first, the second and the third.  A short outage then does not use up
+/// D88's reruns in seconds.
+const RERUN_WAITS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(25 * 60),
+];
+
+/// The rerun waits of this Warden's life (B-a), by Candidate: how many of
+/// its attempts ended `Interrupted` here, and when the next may start.
+/// In memory only: the Warden's own start reruns at once (D88).
+#[derive(Default)]
+struct Reruns(std::sync::Mutex<std::collections::BTreeMap<[u8; 32], (usize, Instant)>>);
+
+impl Reruns {
+    /// An attempt of `candidate` ended `Interrupted` at `now`.
+    fn interrupted(&self, candidate: [u8; 32], now: Instant) {
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let e = m.entry(candidate).or_insert((0, now));
+        let wait = RERUN_WAITS[e.0.min(RERUN_WAITS.len() - 1)];
+        *e = (e.0 + 1, now + wait);
+    }
+
+    /// When the next attempt of `candidate` may start, if it must wait
+    /// past `now`.
+    fn not_before(&self, candidate: [u8; 32], now: Instant) -> Option<Instant> {
+        let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(&candidate).map(|e| e.1).filter(|t| *t > now)
+    }
+}
+
 /// A run's verification attempts (D68): started on the session's
 /// thread, run on threads of `scope`, finished on the session's thread.
 struct Verifications<'s, 'e> {
@@ -2121,6 +2154,8 @@ struct Verifications<'s, 'e> {
     want: bool,
     /// When it last looked.
     looked: Option<std::time::Instant>,
+    /// Not before then: every Candidate it found waits for a rerun (B-a).
+    wake: Option<Instant>,
 }
 
 impl<'s, 'e> Verifications<'s, 'e> {
@@ -2135,6 +2170,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
             running: Default::default(),
             want: true,
             looked: None,
+            wake: None,
         }
     }
 
@@ -2149,6 +2185,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
     fn want(&mut self) {
         self.want = true;
         self.looked = None;
+        self.wake = None;
     }
 
     fn tick(&mut self, vessel: &mut Vessel<StorageLayers>) {
@@ -2158,7 +2195,8 @@ impl<'s, 'e> Verifications<'s, 'e> {
         // At most once a second while waiting for a slot.
         let due = self
             .looked
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+            && self.wake.is_none_or(|t| Instant::now() >= t);
         if self.want && due {
             self.launch(vessel);
         }
@@ -2184,12 +2222,27 @@ impl<'s, 'e> Verifications<'s, 'e> {
                 return;
             }
         };
+        self.wake = None;
         for cand in todo {
             if self.running.contains(cand.candidate_id.as_bytes()) {
                 continue;
             }
+            // Its last attempt ended Interrupted here: it waits (B-a).
+            if let Some(t) = self
+                .node
+                .reruns
+                .not_before(*cand.candidate_id.as_bytes(), Instant::now())
+            {
+                self.want = true;
+                self.wake = Some(self.wake.map_or(t, |w| w.min(t)));
+                continue;
+            }
             if !self.node.take_verifier_slot() {
-                self.want = true; // later, when a slot frees
+                // Later, when a slot frees: looked for each second (a
+                // slot another Vessel frees is not told here), whatever
+                // waits for a rerun.
+                self.want = true;
+                self.wake = None;
                 return;
             }
             let st = match at.start(vessel, &packs, &cand) {
@@ -2272,6 +2325,16 @@ impl<'s, 'e> Verifications<'s, 'e> {
                                 output.len()
                             ),
                         );
+                        if outcome == taso_core::contract::Outcome::Interrupted {
+                            self.node.reruns.interrupted(
+                                *d.started.candidate_id.as_bytes(),
+                                Instant::now(),
+                            );
+                            self.log(format_args!(
+                                "attempt {id}: {}",
+                                String::from_utf8_lossy(&output)
+                            ));
+                        }
                         if let Err(e) = crate::attempt::destroy_candidate(
                             &self.node.storage,
                             &self.node.config.root,
@@ -2865,6 +2928,8 @@ pub struct Node {
     /// Verification attempts running on this node, of at most
     /// `warden.max_concurrent_verifiers` (D68).
     verifier_slots: std::sync::Mutex<usize>,
+    /// The rerun waits of attempts ended `Interrupted` here (B-a).
+    reruns: Reruns,
     /// The node's verifier limits (`verifier.*`, §11.1).
     verifier_limits: crate::verify::VerifierLimits,
     /// A failpoint of an attempt or a verdict to stop at (D70, §10.2
@@ -2989,6 +3054,7 @@ impl Node {
             failpoint: None,
             nominator,
             verifier_slots: std::sync::Mutex::new(0),
+            reruns: Reruns::default(),
             verifier_limits: crate::verify::VerifierLimits::default(),
             attempt_failpoint: crate::attempt::no_failpoints(),
             decide_slots: Default::default(),
@@ -3666,6 +3732,14 @@ impl Node {
             return NominateResult::NoVerifier;
         };
         let retry = |why: String| NominateResult::Retry { why };
+        // A verifier runs on its Template's layer: a node with no layers
+        // could only end every attempt LaunchFailed, deciding Candidates
+        // by its own setup (review fix T-a).  Nothing is made here.
+        if self.layers.is_none() {
+            return retry(
+                "this node runs no verifiers: runtime.template_slot is not set".to_string(),
+            );
+        }
         let verifier = match self.resolve_template(&vf.template) {
             Ok((t, _)) => t,
             Err(e) => return retry(format!("the verifier Template: {e}")),
@@ -4768,6 +4842,30 @@ mod tests {
             refuse_selinux(&gone).is_err(),
             "no sysfs: cannot tell, refused"
         );
+    }
+
+    /// Review fix B-a: after an attempt ends Interrupted here, the next
+    /// waits 1, 5, then 25 minutes (and 25 after that); a Candidate never
+    /// interrupted here does not wait.
+    #[test]
+    fn reruns_wait_one_five_then_twenty_five_minutes() {
+        let r = Reruns::default();
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let t0 = Instant::now();
+        assert_eq!(r.not_before(a, t0), None);
+        let mut now = t0;
+        for minutes in [1u64, 5, 25, 25] {
+            r.interrupted(a, now);
+            let wait = Duration::from_secs(minutes * 60);
+            assert_eq!(r.not_before(a, now), Some(now + wait), "{minutes}");
+            assert_eq!(
+                r.not_before(a, now + wait - Duration::from_secs(1)),
+                Some(now + wait)
+            );
+            assert_eq!(r.not_before(a, now + wait), None, "due at {minutes}");
+            now += wait;
+        }
+        assert_eq!(r.not_before(b, now), None, "another Candidate");
     }
 
     #[test]
