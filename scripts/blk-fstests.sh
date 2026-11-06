@@ -391,7 +391,7 @@ mkdir -p "$DIR" "$MNT"
 [[ ! -e "$LOOP_TEST_IMG" && ! -e "$LOOP_SCRATCH_IMG" ]] || die "loop images from an earlier run exist in $DIR (losetup -a; then remove them)"
 # The previous run's log is this script's own, and no daemon holds it (the
 # socket check above): removed before the space check, not after.
-rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.compact" "$LOG.compact.ckpt"
+rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock" "$LOG.compact" "$LOG.compact.ckpt"
 free=$(free_gib)
 [[ "$free" -ge "$MIN_FREE" ]] || die "only $free GiB free under $DIR (want $MIN_FREE; FST_MIN_FREE_GIB overrides)"
 
@@ -412,7 +412,7 @@ if [[ -z "${FST_BLKD:-}" ]]; then
 fi
 [[ -x "$BLKD" ]] || die "no daemon at $BLKD"
 
-rm -f "$LOG" "$ERR" "$LOG.ckpt"
+rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock"
 start_daemon
 ROOT=$(blk root)
 
