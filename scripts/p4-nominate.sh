@@ -19,13 +19,25 @@
 #   1  T(0) from a directory                       taso-genesis, ready
 #   2  the agent nominates its newest Seal         Nominated, held
 #   3  again after two more turns                  a second Candidate
-#   4  the same Seal by the "candidate" entry      Duplicate (another kind)
-#      and with another exclusion                  Nominated
-#   5  an exclusion outside the allowed set        refused BadExclude
-#   6  node 2's map: everything Unknown            refused Walk(UnknownPaths)
+#   4  the same Seal by the "candidate" entry      Duplicate (another kind),
+#      and with another exclusion                  answered, not recorded; Nominated
+#   5  an exclusion outside the allowed set        refused BadExclude, not recorded
+#   6  node 2's map: everything Unknown            refused Walk(UnknownPaths),
+#                                                  recorded once (content decides it)
 #   7  the five nominate failpoints                stop, nothing accepted;
 #                                                  the rerun is Nominated
 #   8  a "candidate" without "verifier"            the config is refused
+#   9  release test N1: a link through a link      taso-genesis refused (exit 3,
+#      (a -> ., b -> a/..)                         Unsupported); a chain
+#      a chain l1 -> l2 -> scratch/f, Scratch      l1 -> l2 -> scratch/f nominated
+#      dropped, from a Template-born Vessel        dropping Scratch: refused
+#                                                  Walk(DanglingByExclusion)
+#  10  release test N2a: a verifier Template id    Retry naming it; nothing
+#      that is not a ready Template                accepted; no attempt
+#
+# Since review fix 4a (V4b's break) only a refusal the content decides
+# (Walk) is recorded, keyed by the candidate id; Duplicate, Closed,
+# BadExclude and SealNotAccepted are answered and leave nothing.
 #
 # Touches, and nothing else:
 #   /var/lib/taso-p4n/<mode>                 (removed at start, kept after)
@@ -381,11 +393,11 @@ L3=$(last_seal 1 "$N1")
 # ── 4. The entry's candidate ────────────────────────────────────────
 
 config 1 "$W/n1-cand.json" "$(vessel n1 1 "\"candidate\": {\"seal\": $L3, \"exclude\": [\"Scratch\"]}, $(sim 1)")"
-say "4. n1's entry nominates the Seal at lsn $L3 dropping Scratch, the one its agent nominated (predict: 'Refused { reason: \"Duplicate\" }', recorded once; then without the exclusion: Nominated, a third Candidate)"
+say "4. n1's entry nominates the Seal at lsn $L3 dropping Scratch, the one its agent nominated (predict: 'Refused { reason: \"Duplicate\" }', answered and not recorded (review fix 4a); then without the exclusion: Nominated, a third Candidate)"
 wardend 4-dup 1 "$W/n1-cand.json"
 expect "exit 0" is "$RC" 0
 expect "the entry's nomination refused Duplicate" is "$(answers 4-dup n1 Config)" 'Refused { reason: "Duplicate" }'
-expect "accepted: two Candidates with their attempts, and the refusal" is "$(coordlog_of 1 "$N1" | cut -d' ' -f1)" 7
+expect "accepted: two Candidates with their attempts, no refusal" is "$(coordlog_of 1 "$N1" | cut -d' ' -f1)" 6
 config 1 "$W/n1-all.json" "$(vessel n1 1 "\"candidate\": {\"seal\": $L3, \"exclude\": []}, $(sim 1)")"
 wardend 4-all 1 "$W/n1-all.json"
 expect "exit 0" is "$RC" 0
@@ -395,20 +407,22 @@ expect "Nominated, a third Candidate" bash -c "[[ '$C4' =~ ^[0-9a-f]{64}$ && '$C
 # ── 5. An exclusion outside the allowed set ─────────────────────────
 
 config 1 "$W/n2.json" "$(vessel n2 2 "$(sim "$TURNS" Source Source)")"
-say "5. n2's agent asks to drop Source, twice (predict: exit 0; 'Refused { reason: \"BadExclude\" }' both times; one record accepted)"
+say "5. n2's agent asks to drop Source, twice (predict: exit 0; 'Refused { reason: \"BadExclude\" }' both times; nothing accepted: it depends on the node's allowed_exclude, so it is answered, not recorded (review fix 4a))"
 wardend 5-n2 1 "$W/n2.json"
 expect "exit 0" is "$RC" 0
 expect "refused BadExclude twice" is "$(answers 5-n2 n2 Agent | grep -c '^Refused { reason: "BadExclude" }$')" 2
 DS=$(dataset_of 5-n2 n2)
-expect "one record accepted (the refusal)" is "$(coordlog_of 1 "${DS##*/v-}" | cut -d' ' -f1)" 1
+expect "nothing accepted" is "$(coordlog_of 1 "${DS##*/v-}" | cut -d' ' -f1)" 0
 
 # ── 6. Node 2's map ─────────────────────────────────────────────────
 
 config 2 "$W/u.json" "$(vessel u 3 "$(sim "$TURNS" Scratch)")"
-say "6. on node 2, whose map names nothing the agent writes (predict: exit 0; 'Refused { reason: \"Walk(UnknownPaths)\" }')"
+say "6. on node 2, whose map names nothing the agent writes (predict: exit 0; 'Refused { reason: \"Walk(UnknownPaths)\" }', recorded once: the content decides it)"
 wardend 6-u 2 "$W/u.json"
 expect "exit 0" is "$RC" 0
 expect "refused Walk(UnknownPaths)" is "$(answers 6-u u Agent)" 'Refused { reason: "Walk(UnknownPaths)" }'
+DS=$(dataset_of 6-u u)
+expect "one record accepted (the Walk refusal)" is "$(coordlog_of 2 "${DS##*/v-}" | cut -d' ' -f1)" 1
 
 # ── 7. Failpoints ───────────────────────────────────────────────────
 
@@ -439,6 +453,50 @@ say "8. a \"candidate\" entry without \"verifier\" (predict: the config is refus
 wardend 8-bad 1 "$W/bad.json"
 expect "exit 2" is "$RC" 2
 expect "the refusal names what it needs" is "$(count 8-bad.err 'needs its "verifier"')" 1
+
+# ── 9. Release test N1: symlinks ───────────────────────────────────
+
+say "9. release test N1 (review 2, N1a): a tree with a -> . and b -> a/.. (b reaches the root's parent) (predict: taso-genesis exit 3, refused Unsupported: b is a link through a link, OutOfTreeLink)"
+tree "$W/src/links"
+ln -s . "$W/src/links/a"
+ln -s a/.. "$W/src/links/b"
+find "$W/src/links" -maxdepth 1 -type l -exec touch -h -d @1700000000 {} +
+touch -d @1600000000 "$W/src/links"
+RC=0
+"$BIN/taso-genesis" "$W/genesis1.json" --from "$W/src/links" --best-effort --classmap "$W/map.toml" \
+    --actor p4n --reason "release test N1" >"$W/out/9-links.json" 2>"$W/out/9-links.err" || RC=$?
+expect "taso-genesis exit 3 (refused)" is "$RC" 3
+expect "refused Unsupported" is "$(python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v.get("outcome"), v.get("reason"))' "$W/out/9-links.json" 2>/dev/null)" "refused Unsupported"
+
+say "9. the chain l1 -> l2 -> scratch/f in a Template, then a Vessel born from it nominating its newest Seal dropping Scratch (predict: genesis ready; the Vessel exit 0; 'Refused { reason: \"Walk(DanglingByExclusion)\" }', recorded once; no Candidate)"
+tree "$W/src/chain"
+mkdir -p "$W/src/chain/scratch"
+printf 'tmp\n' >"$W/src/chain/scratch/f"
+ln -s scratch/f "$W/src/chain/l2"
+ln -s l2 "$W/src/chain/l1"
+chown -R 0:0 "$W/src/chain"; chmod 755 "$W/src/chain/scratch"; chmod 644 "$W/src/chain/scratch/f"
+find "$W/src/chain" -mindepth 1 ! -type d -exec touch -h -d @1700000000 {} +
+find "$W/src/chain" -depth -type d -exec touch -d @1600000000 {} +
+TL=$(genesis 9-chain "$W/src/chain" || true)
+expect "the chain's Template ready" bash -c "[[ '$TL' =~ ^[0-9a-f]{32}$ ]]"
+config 1 "$W/l.json" "$(vessel l 30 "\"template\": \"$TL\", $(sim "$TURNS" Scratch)")"
+wardend 9-l 1 "$W/l.json"
+expect "exit 0" is "$RC" 0
+expect "refused Walk(DanglingByExclusion)" is "$(answers 9-l l Agent)" 'Refused { reason: "Walk(DanglingByExclusion)" }'
+DS=$(dataset_of 9-l l)
+expect "one record accepted (the Walk refusal)" is "$(coordlog_of 1 "${DS##*/v-}" | cut -d' ' -f1)" 1
+
+# ── 10. Release test N2a: an unknown verifier Template ──────────────
+
+NOT_T=0123456789abcdef0123456789abcdef
+config 1 "$W/z.json" "$(printf '{"subject": "z", "uid_slot": 31, "verifier": {"template": "%s", "config": "%s", "version": 1}, %s}' "$NOT_T" "$W/vconf.toml" "$(sim "$TURNS" Scratch)")"
+say "10. release test N2a (review 2): z's verifier names $NOT_T, no Template (predict: exit 0; 'Retry' saying it is not a ready Template; nothing accepted; no attempt)"
+wardend 10-z 1 "$W/z.json"
+expect "exit 0" is "$RC" 0
+expect "Retry: not a ready Template" is "$(answers 10-z z Agent | grep -c "^Retry.*$NOT_T is not a ready Template")" 1
+DS=$(dataset_of 10-z z)
+expect "nothing accepted" is "$(coordlog_of 1 "${DS##*/v-}" | cut -d' ' -f1)" 0
+expect "no attempt" is "$(count 10-z.err '\] z: attempt ')" 0
 
 # ── Result ──────────────────────────────────────────────────────────
 
