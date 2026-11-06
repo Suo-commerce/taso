@@ -1,6 +1,10 @@
-//! The daemon end to end on one machine (needs root, runc and a ZFS pool:
-//! set TASO_ZFS_DATASET).  Two "nodes" share the coordinator, the store
-//! and the pool, each with its own root dataset and state directory:
+//! The daemon end to end on one machine, on the block log (needs root,
+//! runc, ublk and two running `taso-blkd`; `scripts/blk-warden-test.sh`
+//! starts them on fresh logs and runs this file after `blk_device`, with
+//! `TASO_BLK_SOCKET`, `TASO_BLK_SOCKET_B` and `TASO_BLK_MOUNTS` set).
+//! "Nodes" share the coordinator and the store, each with its own root
+//! dataset and state directory; node B has its own `taso-blkd` (its own
+//! log), the others share node A's:
 //!
 //! 1. node A: the Vessel is born and takes its birth Seal, the agent runs
 //!    5 turns, each sealed and published (6 Seals published);
@@ -19,14 +23,15 @@ use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use taso_warden::chronicle::Layers;
 use taso_warden::coordinator::{Coord, Coordinator};
 use taso_warden::daemon::{
     Config, DaemonError, ForksConf, Node, Report, Restart, Start, Stop, VesselConf,
 };
 use taso_warden::source::{Guard, SourceError, StaticSource, VesselSource, WithRequested};
-use taso_warden::storage::Storage;
+use taso_warden::storage::Dataset;
 use taso_warden::supervisor::{Event, Supervisor, Timing};
-use taso_warden::zfs::Zfs;
+use taso_warden::vessel::Pool;
 
 const SIM: &str = env!("CARGO_BIN_EXE_taso-sim");
 
@@ -49,13 +54,65 @@ fn rootfs(root: &Path) {
     }
 }
 
-struct Cleanup(String);
-impl Drop for Cleanup {
+/// An environment variable the script sets, as a path.
+fn env_path(k: &str) -> PathBuf {
+    std::env::var_os(k)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| panic!("{k} is not set; see the file's header"))
+}
+
+/// A root for one test's nodes, new on every run so runs never meet on
+/// the daemons' logs; and a guard that unmounts what was mounted under it
+/// when the test ends, also when it fails (other tests' mounts are not
+/// touched).
+fn base(test: &str) -> (String, Unmount) {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let base = format!("node/{test}-{}-{millis}", std::process::id());
+    let mounts = env_path("TASO_BLK_MOUNTS");
+    assert!(
+        mounts.is_absolute() && mounts != Path::new("/"),
+        "TASO_BLK_MOUNTS must be an absolute directory other than /"
+    );
+    let guard = Unmount(mounts.join(&base));
+    (base, guard)
+}
+
+/// Unmounts everything under its directory when dropped.
+struct Unmount(PathBuf);
+impl Drop for Unmount {
     fn drop(&mut self) {
-        let _ = Command::new("zfs")
-            .args(["destroy", "-R", &self.0])
-            .status();
+        let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
+            return;
+        };
+        let root = format!("{}/", self.0.display());
+        let mut points: Vec<String> = info
+            .lines()
+            .filter_map(|l| l.split(' ').nth(4))
+            .filter(|p| p.starts_with(&root))
+            .map(str::to_string)
+            .collect();
+        points.sort_by_key(|p| std::cmp::Reverse(p.len())); // innermost first
+        for p in points {
+            let _ = Command::new("fsfreeze").arg("-u").arg(&p).output(); // never leave one frozen
+            let _ = Command::new("umount").arg(&p).status();
+        }
     }
+}
+
+/// A node from its config, on the block log the config names.
+fn node_of(config: Config, coord: Arc<dyn Coord>) -> Node {
+    let pool = config.storage.open();
+    Node::new(config, coord, pool).unwrap()
+}
+
+/// Where `dataset` is mounted on `node` (mounted now if it is not).
+fn mounted(node: &Node, dataset: &str) -> PathBuf {
+    let ds = Dataset::new(dataset).unwrap();
+    node.storage.ensure_mounted(&ds).unwrap();
+    node.storage.mountpoint(&ds)
 }
 
 /// `takeover`: the ownership to take over, `(holder, epoch)` as read from
@@ -86,7 +143,11 @@ fn config_with(
     let v = json!({
         "warden": warden,
         "coordinator": { "local": tmp.join("coord.redb") },
-        "storage": "zfs",
+        "storage": { "blk": {
+            "socket": env_path(if node == "b" { "TASO_BLK_SOCKET_B" } else { "TASO_BLK_SOCKET" }),
+            "mounts": env_path("TASO_BLK_MOUNTS"),
+            "spool": tmp.join(node).join("spool"),
+        } },
         "root": format!("{base}/{node}"),
         "state_dir": tmp.join(node).join("state"),
         "store": tmp.join("store"),
@@ -107,12 +168,7 @@ fn config_with(
 fn mount(node: &Node) -> PathBuf {
     let id = node.config.vessels[0].id();
     let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    let ds = format!("{}/v-{hex}", node.config.root);
-    let mount = Command::new("zfs")
-        .args(["get", "-H", "-o", "value", "mountpoint", &ds])
-        .output()
-        .unwrap();
-    PathBuf::from(String::from_utf8(mount.stdout).unwrap().trim())
+    mounted(node, &format!("{}/v-{hex}", node.config.root))
 }
 
 fn stats(node: &Node) -> Value {
@@ -132,33 +188,19 @@ fn stats(node: &Node) -> Value {
 }
 
 #[test]
-#[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
+#[ignore = "needs root, runc, ublk and two running taso-blkd; run scripts/blk-warden-test.sh"]
 fn born_reopened_reborn_elsewhere_and_refused() {
-    let base = format!(
-        "{}/daemon-{}",
-        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
-        std::process::id()
-    );
-    for ds in [base.clone(), format!("{base}/a"), format!("{base}/b")] {
-        assert!(Command::new("zfs")
-            .args(["create", &ds])
-            .status()
-            .unwrap()
-            .success());
-    }
-    let _c = Cleanup(base.clone());
+    let (base, _unmount) = base("daemon");
     let tmp = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     rootfs(&tmp.path().join("rootfs"));
     let coord: Arc<dyn Coord> = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
     let node = |name: &str, warden: u64, takeover: Option<(u64, u64)>| {
-        Node::new(
+        node_of(
             config(tmp.path(), &base, name, warden, takeover),
             coord.clone(),
-            Storage::Zfs(Zfs::cli().batched()),
         )
-        .unwrap()
     };
 
     // 1. Born on A.
@@ -304,12 +346,12 @@ fn taso_sim_processes() -> usize {
     String::from_utf8_lossy(&out.stdout).lines().count()
 }
 
-fn snapshots(dataset: &str) -> usize {
-    let out = Command::new("zfs")
-        .args(["list", "-H", "-t", "snapshot", "-o", "name", "-r", dataset])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).lines().count()
+/// The Seal layers `dataset` has on `node`.
+fn seals(node: &Node, dataset: &str) -> usize {
+    node.storage
+        .layers(&Dataset::new(dataset).unwrap())
+        .list()
+        .map_or(0, |l| l.len())
 }
 
 fn wait_until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
@@ -323,7 +365,7 @@ fn wait_until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
     }
 }
 
-/// W1 on real ZFS and runc, one node:
+/// W1 on the block log and runc, one node:
 ///
 /// 1. a slow agent is stopped mid-run by removing its Vessel from the
 ///    source: its container is gone at once, the run reports `stopped`;
@@ -336,21 +378,9 @@ fn wait_until(what: &str, secs: u64, mut cond: impl FnMut() -> bool) {
 ///    removed, a run going is stopped (one waiting out its backoff is
 ///    dropped) and it is never started again.
 #[test]
-#[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
+#[ignore = "needs root, runc, ublk and two running taso-blkd; run scripts/blk-warden-test.sh"]
 fn supervisor_stops_relists_and_restarts_on_a_real_node() {
-    let base = format!(
-        "{}/w1-{}",
-        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
-        std::process::id()
-    );
-    for ds in [base.clone(), format!("{base}/a")] {
-        assert!(Command::new("zfs")
-            .args(["create", &ds])
-            .status()
-            .unwrap()
-            .success());
-    }
-    let _c = Cleanup(base.clone());
+    let (base, _unmount) = base("w1");
     let tmp = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -366,17 +396,13 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
         "--rows",
         "1",
     ];
-    let node = Arc::new(
-        Node::new(
-            // Its own Vessel (and so its own runc container id and cgroup):
-            // the tests of this file run in parallel, and one container id
-            // in two of them is refused by runc ("cgroup is not empty").
-            config_with(tmp.path(), &base, "a", 1, None, "sim-2", &sim),
-            coord,
-            Storage::Zfs(Zfs::cli().batched()),
-        )
-        .unwrap(),
-    );
+    let node = Arc::new(node_of(
+        // Its own Vessel (and so its own runc container id and cgroup):
+        // the tests of this file may run in parallel, and one container
+        // id in two of them is refused by runc ("cgroup is not empty").
+        config_with(tmp.path(), &base, "a", 1, None, "sim-2", &sim),
+        coord,
+    ));
     let vessel = node.config.vessels[0].clone();
     let with = |restart: Restart| VesselConf {
         fork: None,
@@ -450,7 +476,7 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     // 1. Run, then remove mid-run: stopped at once.
     source.push(vec![with(Restart::Never)]);
     wait_until("3 sealed turns (birth Seal + 3 snapshots)", 60, || {
-        snapshots(&dataset) >= 4
+        seals(&node, &dataset) >= 4
     });
     assert_eq!(taso_sim_processes(), 1, "the agent runs");
     let asked = std::time::Instant::now();
@@ -568,17 +594,12 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
 fn stats_of(node: &Node, subject: &str) -> Value {
     let id = taso_core::record::vessel_id(node.config.vessels[0].namespace, subject.as_bytes());
     let hex: String = id.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-    let ds = format!("{}/v-{hex}", node.config.root);
-    let out = Command::new("zfs")
-        .args(["get", "-H", "-o", "value", "mountpoint", &ds])
-        .output()
-        .unwrap();
-    let mount = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+    let mount = mounted(node, &format!("{}/v-{hex}", node.config.root));
     serde_json::from_str(&std::fs::read_to_string(mount.join("sim-stats.json")).unwrap())
         .unwrap_or_else(|e| panic!("{subject}'s stats: {e}"))
 }
 
-/// D1 on real ZFS and runc, one node, the daemon's own source path
+/// D1 on the block log and runc, one node, the daemon's own source path
 /// (`WithRequested` over the config's list):
 ///
 /// 1. the parent (slot 3, `"forks": {"slots": [4, 5]}`) runs 2 turns and
@@ -592,21 +613,9 @@ fn stats_of(node: &Node, subject: &str) -> Value {
 ///    parent again and adopts fork-4's files first (C7): the agent resumes
 ///    after fork-4's last turn, on fork-4's database.
 #[test]
-#[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
+#[ignore = "needs root, runc, ublk and two running taso-blkd; run scripts/blk-warden-test.sh"]
 fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
-    let base = format!(
-        "{}/d1-{}",
-        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
-        std::process::id()
-    );
-    for ds in [base.clone(), format!("{base}/a")] {
-        assert!(Command::new("zfs")
-            .args(["create", &ds])
-            .status()
-            .unwrap()
-            .success());
-    }
-    let _c = Cleanup(base.clone());
+    let (base, _unmount) = base("d1");
     let tmp = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -615,7 +624,7 @@ fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
     let node = |sim: &[&str]| {
         let mut c = config_with(tmp.path(), &base, "a", 1, None, "sim-3", sim);
         c.vessels[0].forks = Some(Box::new(ForksConf { slots: vec![4, 5] }));
-        Arc::new(Node::new(c, coord.clone(), Storage::Zfs(Zfs::cli().batched())).unwrap())
+        Arc::new(node_of(c, coord.clone()))
     };
     let (c4, c5) = ("sim-3-fork-4", "sim-3-fork-5");
 
@@ -758,8 +767,8 @@ fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
 
 // ── P3 close-out C6: parent before child; forks are node-bound ─────────
 
-/// A parent and its fork (a config entry) taken over together, on real
-/// ZFS: the supervisor starts the parent first, so the parent is reborn
+/// A parent and its fork (a config entry) taken over together, on the
+/// block log: the supervisor starts the parent first, so the parent is reborn
 /// here before its fork's rebirth needs the parent's Seal; the fork moved
 /// alone is refused, naming the missing Seal, and fences nobody.
 ///
@@ -770,28 +779,11 @@ fn forks_asked_for_over_the_field_hold_and_one_is_promoted() {
 /// 3. node B, both, taking both over: both reborn and both agents run,
 ///    the parent's run started first.
 #[test]
-#[ignore = "needs root, runc and a ZFS pool: set TASO_ZFS_DATASET"]
+#[ignore = "needs root, runc, ublk and two running taso-blkd; run scripts/blk-warden-test.sh"]
 fn a_parent_is_reborn_before_its_fork_and_a_fork_alone_is_refused() {
     use taso_warden::daemon::{ForkConf, TakeOver};
     use taso_warden::vessel::SealAt;
-    let base = format!(
-        "{}/c6-{}",
-        std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET"),
-        std::process::id()
-    );
-    for ds in [
-        base.clone(),
-        format!("{base}/a"),
-        format!("{base}/b"),
-        format!("{base}/c"),
-    ] {
-        assert!(Command::new("zfs")
-            .args(["create", &ds])
-            .status()
-            .unwrap()
-            .success());
-    }
-    let _c = Cleanup(base.clone());
+    let (base, _unmount) = base("c6");
     let tmp = tempfile::tempdir().unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -829,7 +821,7 @@ fn a_parent_is_reborn_before_its_fork_and_a_fork_alone_is_refused() {
             }
         }
         c.vessels = list;
-        Arc::new(Node::new(c, coord.clone(), Storage::Zfs(Zfs::cli().batched())).unwrap())
+        Arc::new(node_of(c, coord.clone()))
     };
     let run_all = |n: &Arc<Node>| {
         let mut source = StaticSource::new(n.config.vessels.clone());
