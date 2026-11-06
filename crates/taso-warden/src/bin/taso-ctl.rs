@@ -77,9 +77,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use serde_json::json;
-use taso_warden::coordinator::{Coord, Coordinator, LogConfig};
+use taso_warden::coordinator::{Coord, Coordinator};
 use taso_warden::coordsrv::RemoteCoord;
-use taso_warden::coordstore::CoordStore;
 use taso_warden::daemon::{Config, CoordConf};
 use taso_warden::explain::{explain, Subject};
 
@@ -562,12 +561,17 @@ fn explain_cmd(cfg: &str, id: &str) -> ExitCode {
     };
     let coord: Arc<dyn Coord> = match &config.coordinator {
         CoordConf::Remote { socket } => Arc::new(RemoteCoord::new(socket)),
-        CoordConf::Local { path, .. } => match Coordinator::open_with(
+        CoordConf::Local {
             path,
-            LogConfig {
-                store: Arc::new(CoordStore::new(store.clone(), &config.prefix)),
-                ..LogConfig::default()
-            },
+            deleted_quarantine,
+            ..
+        } => match Coordinator::open_with(
+            path,
+            taso_warden::coordinator::reading_store(
+                store.clone(),
+                &config.prefix,
+                *deleted_quarantine,
+            ),
         ) {
             Ok(c) => Arc::new(c),
             Err(e) => {

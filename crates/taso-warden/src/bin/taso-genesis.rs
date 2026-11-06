@@ -62,9 +62,8 @@ use taso_core::envelope::{ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, 
 use taso_core::model::{Ownership, WardenId};
 use taso_core::record::Authority;
 use taso_warden::classify::{Limits, Reserved};
-use taso_warden::coordinator::{Coord, CoordError, Coordinator, LogConfig};
+use taso_warden::coordinator::{Coord, CoordError, Coordinator};
 use taso_warden::coordsrv::RemoteCoord;
-use taso_warden::coordstore::CoordStore;
 use taso_warden::daemon::{refuse_selinux, Config, CoordConf};
 use taso_warden::genesis::{Failpoint, Genesis, GenesisError, Outcome, Report, Request, Source};
 use taso_warden::segment::Position;
@@ -204,13 +203,18 @@ fn build(
         // The Warden's own coordinator file: only while its daemon is not
         // running (redb locks the file).  The log reads the store, as
         // taso-coordd's does with --store-config.
-        CoordConf::Local { path, .. } => Arc::new(
+        CoordConf::Local {
+            path,
+            deleted_quarantine,
+            ..
+        } => Arc::new(
             Coordinator::open_with(
                 path,
-                LogConfig {
-                    store: Arc::new(CoordStore::new(store.clone(), &config.prefix)),
-                    ..LogConfig::default()
-                },
+                taso_warden::coordinator::reading_store(
+                    store.clone(),
+                    &config.prefix,
+                    *deleted_quarantine,
+                ),
             )
             .map_err(|e| format!("coordinator {}: {e}", path.display()))?,
         ),
