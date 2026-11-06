@@ -10,6 +10,14 @@
 #
 #   sudo scripts/blk-crash.sh [ROUNDS] [path/to/taso-blkd]   (default 10, target/release/taso-blkd)
 #
+# The daemon runs --durable-at flush (BLK_CRASH_DURABLE_AT overrides): this
+# is the block-device contract for any filesystem, and the one here has a
+# journal.  Under fua (taso-blkd's default since 2026-11-06, right for the
+# Warden's journal-less ext4 only) a journal's commit block is a FUA write
+# answered before any sync, so an fsync can return for a transaction the
+# next crash cuts: taso-test 2026-11-06, f7_513 lost, 4153 bytes cut (one
+# block and its record) -- the mode's documented limit, not a store fault.
+#
 # Touches, and nothing else:
 #   /var/lib/taso-blk/crash.log, crash.err, crash.manifest, crash-helper.py
 #                                            (removed at start, kept after)
@@ -36,6 +44,7 @@ set -euo pipefail
 
 ROUNDS=${1:-10}
 BLKD=${2:-target/release/taso-blkd}
+DURABLE_AT=${BLK_CRASH_DURABLE_AT:-flush}
 DIR=/var/lib/taso-blk
 LOG=$DIR/crash.log
 ERR=$DIR/crash.err
@@ -71,7 +80,7 @@ print(s.makefile().readline().strip())
 
 start_daemon() {
     rm -f "$SOCK"    # a killed daemon leaves its socket; wait for the new one
-    "$BLKD" "$LOG" "$SOCK" 2>>"$ERR" &
+    "$BLKD" "$LOG" "$SOCK" --durable-at "$DURABLE_AT" 2>>"$ERR" &
     DAEMON_PID=$!
     for _ in $(seq 100); do
         [[ -S "$SOCK" ]] && return 0
