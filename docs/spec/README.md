@@ -5,12 +5,19 @@ The documents the code cites. Module docs refer to them as "v0.4 §n" and
 
 | Document | Status | What it is |
 |---|---|---|
-| [v1.0-build-plan.md](v1.0-build-plan.md) | Frozen for implementation | Phases, gates, Phase 1 architecture (runc + ZFS), Template genesis, crates |
+| [v1.0-build-plan.md](v1.0-build-plan.md) | Frozen for implementation | Phases, gates, Phase 1 architecture (runc + ZFS; ZFS removed in P5 V4b, 2026-11: the block log is the storage), Template genesis, crates |
 | [v0.4-primitives.md](v0.4-primitives.md) | Normative for the primitives (v1.0 §2) | Template, Vessel, Field, Chronicle, Warden, Seal, effect ledger, Navigator, rebirth and fencing |
 | [phase4-blocklog-plan.md](phase4-blocklog-plan.md) | Plan, gated | The Chronicle block log; supersedes v1.0 §6 and amends v1.0 §1 and §3 (its §9) |
 
 Precedence when they disagree: the Phase 4 plan's §9 amendments, then
 v1.0, then v0.4 for anything v1.0 does not restate.
+
+**ZFS is removed** (P5 V4b, 2026-11-06; the P4 contracts spec rev. 37,
+D98). Phase 1's storage was ZFS; every node now runs the block log, and the
+Warden's configuration names only it. Where the text below, v1.0 or the
+Phase 4 plan names ZFS (`zfs send`, snapshots, channel programs, pools), it
+records how Phase 1 was built and why; it is history, not the code's
+behaviour. The last tree with ZFS is the tag `last-with-zfs`.
 
 ## Where the code goes beyond or differs from the specs
 
