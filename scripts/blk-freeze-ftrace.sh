@@ -74,7 +74,7 @@ cleanup() {
     mountpoint -q "$MNT" && { fsfreeze -u "$MNT" 2>/dev/null; umount "$MNT"; }
     [[ -n "$LOOP" ]] && losetup -d "$LOOP"; rm -f "$IMG"
     if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then (blk quit) >/dev/null 2>&1 || kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; fi
-    rm -f "$LOG" "$LOG.ckpt"; rmdir "$MNT" 2>/dev/null
+    rm -f "$LOG" "$LOG.ckpt" "$LOG.lock"; rmdir "$MNT" 2>/dev/null
     exit "$rc"
 }
 trap cleanup EXIT
@@ -131,7 +131,7 @@ PY
 
 if [[ -n "$RCU" ]]; then echo "$RCU" >/sys/kernel/rcu_expedited; fi
 echo "rcu_expedited=$(cat /sys/kernel/rcu_expedited 2>/dev/null || echo none) (was ${RCU_WAS:-none}); $(nproc) CPUs"
-rm -f "$LOG" "$ERR" "$LOG.ckpt"
+rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock"
 "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
