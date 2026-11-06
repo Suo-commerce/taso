@@ -218,20 +218,17 @@ fn main() -> ExitCode {
     };
     let request = match ask {
         Ask::Pending => {
-            return match call(&mut c, &Request::Pending) {
-                Ok(Reply::Pending { items }) => {
+            // Every page (review fix N3b-a).
+            return match c.pending_all() {
+                Ok(items) => {
                     print(json!({"pending": items.iter().map(item_json).collect::<Vec<_>>()}));
                     ExitCode::SUCCESS
-                }
-                Ok(other) => {
-                    print(json!({"error": format!("unexpected reply {other:?}")}));
-                    ExitCode::from(1)
                 }
                 Err(e) => {
                     print(json!({"error": e}));
                     ExitCode::from(1)
                 }
-            }
+            };
         }
         Ask::Resend(r) => *r,
         Ask::Verdict {
@@ -276,12 +273,9 @@ fn bound(
     cid: HashVal,
     attempt: HashVal,
 ) -> Result<VerdictRequest, ExitCode> {
-    let items = match call(c, &Request::Pending) {
-        Ok(Reply::Pending { items }) => items,
-        Ok(other) => {
-            print(json!({"error": format!("unexpected reply {other:?}")}));
-            return Err(ExitCode::from(1));
-        }
+    // Every page: the Candidate may be on any of them (review fix N3b-a).
+    let items = match c.pending_all() {
+        Ok(items) => items,
         Err(e) => {
             print(json!({"error": e}));
             return Err(ExitCode::from(1));
