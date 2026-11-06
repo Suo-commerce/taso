@@ -827,7 +827,8 @@ mod tests {
         use std::sync::Arc;
         use taso_core::canon::Canonical;
         use taso_core::contract::{
-            submission_id, ContractRecord, NominationRefusal, NominationRefused, SealRef,
+            submission_id, ContractRecord, NominationRefused, SealRef, VerifierRequirement,
+            WalkRefusal, TRANSFORM_VERSION,
         };
         use taso_core::coordlog::{Answer, Head, Submitted};
         use taso_core::envelope::{BranchId, ChronicleId, Epoch, HashVal};
@@ -929,8 +930,15 @@ mod tests {
                     hash: HashVal::from_bytes(*blake3::hash(&i.to_le_bytes()).as_bytes()),
                 },
                 exclude: BTreeSet::new(),
-                reason: NominationRefusal::SealNotAccepted,
-                input_manifest_key: None,
+                transform_version: TRANSFORM_VERSION,
+                classmap_key: HashVal::from_bytes([0x5C; 32]),
+                requirement: VerifierRequirement {
+                    template: ChronicleId::from_bytes([0x5A; 16]),
+                    vconf_key: HashVal::from_bytes([0x5B; 32]),
+                    version: 1,
+                },
+                reason: WalkRefusal::UnknownPaths,
+                input_manifest_key: HashVal::from_bytes([0x5D; 32]),
             });
             let r = next(
                 &mut seg,
