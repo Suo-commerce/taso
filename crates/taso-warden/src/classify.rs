@@ -22,6 +22,7 @@
 //! `0ba877a0a48af8e26a3bc0ae68ac3f6b542db701f8701239fffa7b787a5e9912`
 //! (D51, the date range, from file 5-0; the rest unchanged since rev. 12).
 
+use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::fmt;
 use std::io::{self, Read};
@@ -718,6 +719,8 @@ struct Walker<'a> {
     deadline: Instant,
     entries: Vec<Entry>,
     unsupported: Vec<(Vec<u8>, Unsupported)>,
+    /// Every symlink the walk met, described or not (review fix N1a).
+    symlinks: BTreeSet<Vec<u8>>,
     total: u64,
     /// The exact length [`Manifest::bytes`] would have now.
     size: u64,
@@ -749,11 +752,26 @@ pub fn walk(
         deadline: Instant::now() + limits.max_walk,
         entries: Vec::new(),
         unsupported: Vec::new(),
+        symlinks: BTreeSet::new(),
         total: 0,
         size: HEADER,
         stop: None,
     };
     let root_entries = w.dir(&fd, &[], 1)?;
+    // Review fix N1a: a link whose target runs through another link is
+    // not contained, whatever its text says.  One pass: the test is
+    // whether a path is a symlink on disk, not whether it was kept.
+    let symlinks = std::mem::take(&mut w.symlinks);
+    let mut through = Vec::new();
+    w.entries.retain(|e| match (e.kind, &e.content) {
+        (Kind::Symlink, Content::Target(t)) if through_link(&e.path, t, &symlinks) => {
+            through.push(e.path.clone());
+            false
+        }
+        _ => true,
+    });
+    w.unsupported
+        .extend(through.into_iter().map(|p| (p, Unsupported::OutOfTreeLink)));
     w.entries.sort_by(|a, b| a.path.cmp(&b.path));
     w.unsupported.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(Manifest {
@@ -812,6 +830,30 @@ fn in_tree(link_dir: &[u8], target: &[u8]) -> bool {
         }
     }
     true
+}
+
+/// Whether resolving `target` from the link at `link` passes through a
+/// symlink: an intermediate component of the lexically resolved path is
+/// in `symlinks`.  With none, the lexical path is the one the kernel
+/// follows; the final component may be a link (checked as itself).
+fn through_link(link: &[u8], target: &[u8], symlinks: &BTreeSet<Vec<u8>>) -> bool {
+    let mut stack: Vec<&[u8]> = link.split(|&b| b == b'/').collect();
+    stack.pop(); // the link's own name
+    let comps: Vec<&[u8]> = target
+        .split(|&b| b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+        .collect();
+    for (i, c) in comps.iter().enumerate() {
+        if *c == b".." {
+            stack.pop();
+        } else {
+            stack.push(c);
+        }
+        if i + 1 < comps.len() && !stack.is_empty() && symlinks.contains(&stack.join(&b'/')) {
+            return true;
+        }
+    }
+    false
 }
 
 impl Walker<'_> {
@@ -994,6 +1036,7 @@ impl Walker<'_> {
                 self.push(e);
             }
             FileType::Symlink => {
+                self.symlinks.insert(path.clone());
                 let target = match readlinkat(dir, cname.as_c_str(), Vec::new()) {
                     Ok(t) => t.into_bytes(),
                     Err(_) => return self.unsupported(path, Unsupported::Unreadable),
@@ -1073,6 +1116,7 @@ impl Walker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -1339,6 +1383,67 @@ class = "Hook"
         assert!(un.contains(&(&b"src/twin.rs"[..], Unsupported::HardLink)));
         assert!(m.entries.iter().all(|e| e.path != b"src/main.rs"));
         assert_eq!(m.counts().unsupported, 5);
+    }
+
+    /// Review fix N1a: a target's text staying inside the root is not
+    /// containment when the path runs through another symlink (the kernel
+    /// follows it).  Each link is refused if an intermediate component of
+    /// its resolved target is a symlink -- one the walk kept or one it
+    /// listed as unsupported.  The final component may be a symlink (that
+    /// link is checked itself); cycles and in-tree links to nothing stay.
+    #[test]
+    fn a_link_through_another_link_is_out_of_tree() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        fs::create_dir_all(p.join("dir/sub")).unwrap();
+        fs::write(p.join("dir/file"), b"x").unwrap();
+        // The review's pair: `b` reaches the root's parent.
+        symlink(".", p.join("a")).unwrap();
+        symlink("a/..", p.join("b")).unwrap();
+        // Through a link the walk already refuses.
+        symlink("/etc", p.join("x")).unwrap();
+        symlink("x/passwd", p.join("y")).unwrap();
+        // Deeper: through a link to a directory, from inside a directory.
+        symlink("../dir", p.join("dir/sub/up")).unwrap();
+        symlink("up/file", p.join("dir/sub/via")).unwrap();
+        // Allowed: a link to a link, a cycle, a link to nothing, and `..`
+        // through real directories.
+        symlink("dir/file", p.join("l2")).unwrap();
+        symlink("l2", p.join("l1")).unwrap();
+        symlink("q", p.join("p")).unwrap();
+        symlink("p", p.join("q")).unwrap();
+        symlink("nothing/here", p.join("dangling")).unwrap();
+        symlink("../file", p.join("dir/sub/plain")).unwrap();
+        let m = walk_it(p);
+        let out: BTreeSet<&[u8]> = m
+            .unsupported
+            .iter()
+            .filter(|(_, u)| *u == Unsupported::OutOfTreeLink)
+            .map(|(p, _)| p.as_slice())
+            .collect();
+        let want: BTreeSet<&[u8]> = [&b"b"[..], &b"x"[..], &b"y"[..], &b"dir/sub/via"[..]]
+            .into_iter()
+            .collect();
+        assert_eq!(out, want);
+        let kept: BTreeSet<&[u8]> = m
+            .entries
+            .iter()
+            .filter(|e| e.kind == Kind::Symlink)
+            .map(|e| e.path.as_slice())
+            .collect();
+        for l in [
+            &b"a"[..],
+            b"dir/sub/up",
+            b"l1",
+            b"l2",
+            b"p",
+            b"q",
+            b"dangling",
+            b"dir/sub/plain",
+        ] {
+            assert!(kept.contains(l), "{}", String::from_utf8_lossy(l));
+        }
+        assert!(kept.is_disjoint(&out), "a refused link is not described");
     }
 
     #[test]
