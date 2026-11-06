@@ -36,14 +36,17 @@
 //!    with slot base 0 (D43), its layer is taken at a synthetic lsn 1, and
 //!    the sealed view is walked and compared entry for entry (§4.1.7).  A
 //!    restore that fails as it runs is an error (the next run starts on a
-//!    fresh scratch); a completed restore whose walk differs is
-//!    `GenesisRefused { MaterialisationMismatch }` (D45).
+//!    fresh scratch); a completed restore whose walk differs -- a walk
+//!    stopped by a limit, a filesystem that cannot hold an entry exactly,
+//!    something else writing there -- is this node's fault, not the
+//!    source's: an error too, nothing recorded (review M-a, replacing
+//!    D45's `GenesisRefused { MaterialisationMismatch }`).
 //! 6. **Artifact** (§7 step 5).  The sealed view is exported with the
 //!    output manifest and put; with nothing excluded it is the source
 //!    artifact's bytes again, the same object.
 //! 7. **Publish** (§7 step 6).  `TemplateReady { born_from: Genesis }`.
-//! 8. **Cleanup** (§7 step 7, D45).  After `TemplateReady`, or after a
-//!    `GenesisRefused` once a scratch existed: the record
+//! 8. **Cleanup** (§7 step 7, D45).  After `TemplateReady` (a refusal
+//!    comes before any scratch): the record
 //!    `GenesisCleanedUp { scratch_guid }` is written to the local log
 //!    first, then the scratch is destroyed by that guid, then the record is
 //!    accepted, so a run interrupted between the two still names the guid.
@@ -228,6 +231,16 @@ pub enum GenesisError {
     Pool(LayerError),
     /// A new dataset has no mountpoint to restore into.
     NoMountpoint(Dataset),
+    /// The source restored into the scratch does not walk to its manifest
+    /// on this node (review M-a): this node's fault or a bug, not the
+    /// source's, so nothing is recorded; the genesis stays started and
+    /// is run again (here once the node is right, or on another node).
+    Materialisation {
+        /// The scratch, left for the next run to destroy.
+        scratch: Dataset,
+        /// Why the walk is not the manifest.
+        why: String,
+    },
     /// The coordinator failed or refused.
     Coord(CoordError),
     /// The local log failed.
@@ -277,6 +290,11 @@ impl fmt::Display for GenesisError {
             Self::Integrity(p) => write!(f, "store integrity: {p} does not hash to its key"),
             Self::Pool(e) => write!(f, "pool: {e}"),
             Self::NoMountpoint(d) => write!(f, "{d} has no mountpoint"),
+            Self::Materialisation { scratch, why } => write!(
+                f,
+                "the source restored into {scratch} does not walk to its manifest on this \
+                 node ({why}): nothing is recorded; run the genesis again"
+            ),
             Self::Coord(e) => write!(f, "coordinator: {e}"),
             Self::Chronicle(e) => write!(f, "log: {e}"),
             Self::Pack(e) => write!(f, "packs: {e}"),
@@ -609,10 +627,9 @@ impl<P: Pool> Genesis<P> {
         // What is already decided, if anything.
         let decided = match (&ready, &refused) {
             (Some(ContractRecord::TemplateReady(t)), _) => Some((ready_outcome(t), true)),
-            (_, Some(ContractRecord::GenesisRefused(r))) => Some((
-                refused_outcome(r),
-                r.reason == WalkRefusal::MaterialisationMismatch,
-            )),
+            // A refusal is the judge's, before any scratch: nothing to
+            // clean up (review M-a: a mismatch is never recorded).
+            (_, Some(ContractRecord::GenesisRefused(r))) => Some((refused_outcome(r), false)),
             (None, None) => None,
             _ => {
                 return Err(GenesisError::Inconsistent(
@@ -677,10 +694,8 @@ impl<P: Pool> Genesis<P> {
                 &scratch,
                 notes,
             )?;
-            if let Outcome::Refused { reason, .. } = &outcome {
-                if *reason != WalkRefusal::MaterialisationMismatch {
-                    return Ok((outcome, false));
-                }
+            if let Outcome::Refused { .. } = &outcome {
+                return Ok((outcome, false));
             }
             // 8.
             self.cleanup(&mut run, gid, &scratch)?;
@@ -873,7 +888,13 @@ impl<P: Pool> Genesis<P> {
         (self.failpoint)("genesis.after_materialise")?;
         if !same_entries(&walked, &output) {
             drop(view);
-            return self.refuse(run, gid, WalkRefusal::MaterialisationMismatch, input_key);
+            return Err(GenesisError::Materialisation {
+                scratch: scratch.clone(),
+                why: match walked.incomplete {
+                    Some(i) => format!("the walk stopped: {i:?}"),
+                    None => "an entry differs".into(),
+                },
+            });
         }
 
         // 6. The artifact, from the sealed output.
@@ -1863,29 +1884,38 @@ class = "Scratch"
         );
     }
 
+    /// Review M-a: a restore whose walk differs is this node's fault: an
+    /// error, nothing but `GenesisStarted` recorded, and the same node,
+    /// once right, runs it again from a fresh scratch to a Template.
     #[test]
-    fn a_restore_whose_walk_differs_is_refused_and_its_scratch_cleaned_up() {
+    fn a_restore_whose_walk_differs_is_an_error_and_runs_again() {
         let c = Cluster::new();
         good_tree(&c.src(), 0);
         let mut g = c.node(1);
         g.pool.mangle = true;
-        let r = g.run(&dir_request(&c)).unwrap();
-        assert_eq!(refused(&r), WalkRefusal::MaterialisationMismatch);
-        assert!(r.cleaned);
-        assert_eq!(
-            records(&c, r.genesis_id),
-            ["GenesisStarted", "GenesisRefused", "GenesisCleanedUp"]
+        let e = g.run(&dir_request(&c)).unwrap_err();
+        assert!(
+            matches!(&e, GenesisError::Materialisation { why, .. } if why.contains("differs")),
+            "{e}"
         );
-        let s = g.pool.state.lock().unwrap();
-        assert!(s.guids.is_empty());
-        let Some(ContractRecord::GenesisCleanedUp(cl)) =
-            accepted(&c, LogicalKey::GenesisCleaned(r.genesis_id))
-        else {
-            panic!()
-        };
-        assert_eq!(cl.scratch_guid, Some(s.destroyed[0].1));
-        // Nothing was registered: no Template.
-        assert!(accepted(&c, LogicalKey::Template(r.genesis_id)).is_none());
+        let gid = reference().0;
+        assert_eq!(records(&c, gid), ["GenesisStarted"], "nothing refused");
+        // The node is put right: the same request makes the Template, the
+        // scratch the failed run left destroyed first.
+        g.pool.mangle = false;
+        let r = g.run(&dir_request(&c)).unwrap();
+        assert_eq!(ready(&r).0, gid);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("an interrupted run left")),
+            "{:?}",
+            r.notes
+        );
+        assert_eq!(
+            records(&c, gid),
+            ["GenesisStarted", "TemplateReady", "GenesisCleanedUp"]
+        );
     }
 
     // ── A Vessel's Seal (D44) ───────────────────────────────────────
@@ -2486,31 +2516,27 @@ class = "Scratch"
         }
     }
 
+    /// Review M-a: a genesis whose node failed to materialise it, and
+    /// was then lost, is resumed by id on another node and completes.
     #[test]
-    fn a_refused_genesis_is_cleaned_up_by_id() {
+    fn a_genesis_that_failed_to_materialise_is_resumed_elsewhere() {
         let c = Cluster::new();
         good_tree(&c.src(), 0);
         let mut a = c.node(1);
         a.pool.mangle = true;
-        a.failpoint = fail_at("genesis.before_cleanup");
-        assert!(a.run(&dir_request(&c)).is_err());
-        let Some((_, Submitted::Contract(ContractRecord::GenesisRefused(r)))) = c
-            .coord
-            .query_logical(logical_id(&LogicalKey::GenesisRefused(reference().0)))
-            .unwrap()
-        else {
-            panic!("refused")
-        };
+        assert!(matches!(
+            a.run(&dir_request(&c)),
+            Err(GenesisError::Materialisation { .. })
+        ));
         drop(a);
         c.lose(1);
         std::fs::remove_dir_all(c.src()).unwrap();
-        let b = c.node(2);
-        let rep = b.resume(r.genesis_id).unwrap();
-        assert_eq!(refused(&rep), WalkRefusal::MaterialisationMismatch);
-        assert!(rep.cleaned);
+        let gid = reference().0;
+        let rep = c.node(2).resume(gid).unwrap();
+        assert_eq!(ready(&rep).0, gid);
         assert_eq!(
-            records(&c, r.genesis_id),
-            ["GenesisStarted", "GenesisRefused", "GenesisCleanedUp"]
+            records(&c, gid),
+            ["GenesisStarted", "TemplateReady", "GenesisCleanedUp"]
         );
     }
 
