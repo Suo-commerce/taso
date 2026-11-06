@@ -190,6 +190,12 @@ fn build(
     failpoint: Option<String>,
     lose_reply: Option<String>,
 ) -> Result<Genesis<taso_warden::blk::BlkPool>, String> {
+    // The Warden's state directory is this node's, and a genesis writes
+    // its own Chronicle into it: it is checked and marked with the
+    // generation as the Warden does at its start, so whichever runs first
+    // marks it and the other finds it its own (V4b, review fix N4a).
+    taso_warden::daemon::check_state_generation(&config.state_dir)
+        .map_err(|e| format!("the state directory: {e}"))?;
     let store = config
         .store
         .open()
