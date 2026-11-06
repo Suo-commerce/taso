@@ -198,8 +198,21 @@ impl ObjectStore for LocalStore {
         }
     }
 
+    /// False only if nothing is there (NotFound, as `get` reads it); any
+    /// other error is said, and something there that is not a file is an
+    /// error: an unreadable object is never "absent" (audit 2026-11-06,
+    /// finding 4: `is_file()` turned every error into false).
     fn exists(&self, key: &str) -> io::Result<bool> {
-        Ok(self.path(key)?.is_file())
+        let path = self.path(key)?;
+        match fs::metadata(&path) {
+            Ok(m) if m.is_file() => Ok(true),
+            Ok(_) => Err(io::Error::other(format!(
+                "{}: there, but not an object file",
+                path.display()
+            ))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
@@ -471,5 +484,27 @@ mod tests {
             shared.delete("a").unwrap_err().kind(),
             io::ErrorKind::Unsupported
         );
+    }
+
+    /// Audit 2026-11-06, finding 4: `exists` says false only for an
+    /// object that is not there.  Any other answer of the file system
+    /// (ELOOP here; EIO, EACCES alike) is an error, as `get` says it, and
+    /// something there that is not a file is an error too, never "absent".
+    #[test]
+    fn exists_is_false_only_for_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
+        std::fs::create_dir_all(dir.path().join("a/dir")).unwrap();
+        std::fs::write(dir.path().join("a/file"), b"x").unwrap();
+        let store = LocalStore::new(dir.path());
+        assert!(store.get("loop/object").is_err());
+        assert!(
+            store.exists("loop/object").is_err(),
+            "ELOOP is not an absent object"
+        );
+        assert!(store.exists("a/dir").is_err(), "a directory is not an object");
+        assert!(store.exists("a/file").unwrap());
+        assert!(!store.exists("a/none").unwrap());
+        assert!(!store.exists("b/none").unwrap(), "its directory missing too");
     }
 }
