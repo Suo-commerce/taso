@@ -208,12 +208,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // An interrupted verifier is run again at the Warden's own start
-    // (P4 §3.4, D88), beside the Vessels' runs.
-    let relaunch = {
+    // The verifiers' waiting list (P4 §3.4, D88, N5a): filled with every
+    // local Vessel at the start, then fed by runs that end with an attempt
+    // they could not start; its worker opens a Vessel for its attempts
+    // whenever a slot is free, beside the Vessels' runs.
+    node.queue_local_vessels();
+    {
         let node = node.clone();
-        std::thread::spawn(move || node.relaunch_pass())
-    };
+        std::thread::spawn(move || node.run_attempt_queue());
+    }
     // Purge at TTL (P4 §6.7, D81): a pass at start, then every
     // `purge.recheck_seconds`.
     let ttl_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -279,7 +282,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let _ = relaunch.join();
+    // The waiting list: at a finite source's end, what is due finishes;
+    // when asked to stop, only what is under way does.  What waits is the
+    // next start's.
+    node.settle_attempt_queue(!shutdown.requested());
     decider.stop();
     if let Some(t) = ttl {
         ttl_stop.store(true, std::sync::atomic::Ordering::SeqCst);
