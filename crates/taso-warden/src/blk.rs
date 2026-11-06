@@ -457,6 +457,11 @@ fn conn<'a, D: Blkd>(maker: &Maker<D>, shared: &'a Mutex<D>) -> Conn<'a, D> {
     }
 }
 
+/// The Seal views this process holds, by view name: how many users each
+/// has and its branch (review fix G-a).  Shared by every clone of a pool,
+/// so by every user in one Warden.
+type Views = Arc<Mutex<BTreeMap<String, (usize, LayerId)>>>;
+
 /// Vessel datasets as named branches of a block log.
 pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
     blkd: Arc<Mutex<D>>,
@@ -464,6 +469,7 @@ pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
     mounts: Arc<M>,
     mount_root: PathBuf,
     spool: PathBuf,
+    views: Views,
 }
 
 impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
@@ -474,6 +480,7 @@ impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
             mounts: self.mounts.clone(),
             mount_root: self.mount_root.clone(),
             spool: self.spool.clone(),
+            views: self.views.clone(),
         }
     }
 }
@@ -506,6 +513,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             mounts: Arc::new(mounts),
             mount_root: mount_root.into(),
             spool: spool.into(),
+            views: Arc::default(),
         }
     }
 
@@ -647,6 +655,40 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             parent,
         }))
     }
+}
+
+/// What dropping one user's view does (review fix G-a): one user
+/// fewer; the last takes the view down, under the views lock.
+fn release_view<D: Blkd + 'static, M: Mounts + 'static>(
+    pool: &BlkPool<D, M>,
+    name: String,
+    at: PathBuf,
+) -> Box<dyn FnOnce()> {
+    let (blkd, maker, mounts, views) = (
+        pool.blkd.clone(),
+        pool.maker.clone(),
+        pool.mounts.clone(),
+        pool.views.clone(),
+    );
+    Box::new(move || {
+        let mut views = views.lock().unwrap_or_else(|e| e.into_inner());
+        let v = match views.get_mut(&name) {
+            Some((users, _)) if *users > 1 => {
+                *users -= 1;
+                return;
+            }
+            Some((_, v)) => *v,
+            None => return,
+        };
+        views.remove(&name);
+        let mut d = match fresh(&maker) {
+            Some(d) => Conn::Own(d),
+            None => Conn::Shared(blkd.lock().unwrap_or_else(|e| e.into_inner())),
+        };
+        if let Err(e) = take_down(&mut *d, &*mounts, v, &at) {
+            eprintln!("taso: leaving a Seal view behind at {}: {e}", at.display());
+        }
+    })
 }
 
 /// Unmount `mp` if branch `b`'s device is mounted there, detach `b`, and
@@ -802,9 +844,29 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     /// read-only under `<mount root>/.views/`; dropping the view unmounts
     /// it, detaches it and drops the branch.  A view left behind by a
     /// crash (same name) is taken down first.
+    ///
+    /// One view per Seal in this process, shared (review fix G-a): a Seal
+    /// is immutable, so every user may read the same mount, and the last
+    /// to drop it takes it down.  Before, the second user took the first's
+    /// view for a crash's and unmounted it under a running verifier (two
+    /// attempts on one verifier Template: SIGBUS, exit 135, recorded as a
+    /// result about the files; taso-test, p4-verify.sh case 11,
+    /// 2026-11-06).  The views lock is held while a view is made or taken
+    /// down, so a user never finds one half made or half gone; a name
+    /// found in the block log but not in this process's count is a
+    /// crash's.
     fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
         let name = format!("{}.view-{}", dataset.as_str(), lsn.get());
         let dir = self.mount_root.join(".views").join(&name);
+        let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((users, _)) = views.get_mut(&name) {
+            *users += 1;
+            drop(views);
+            return Ok(SealView::new(
+                dir.clone(),
+                Some(release_view(self, name, dir)),
+            ));
+        }
         let mut d = conn(&self.maker, &self.blkd);
         let b = d
             .find(dataset.as_str())?
@@ -826,23 +888,11 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             return Err(e);
         }
         drop(d);
-        let (blkd, maker, mounts, at) = (
-            self.blkd.clone(),
-            self.maker.clone(),
-            self.mounts.clone(),
-            dir.clone(),
-        );
+        views.insert(name.clone(), (1, v));
+        drop(views);
         Ok(SealView::new(
-            dir,
-            Some(Box::new(move || {
-                let mut d = match fresh(&maker) {
-                    Some(d) => Conn::Own(d),
-                    None => Conn::Shared(blkd.lock().unwrap_or_else(|e| e.into_inner())),
-                };
-                if let Err(e) = take_down(&mut *d, &*mounts, v, &at) {
-                    eprintln!("taso: leaving a Seal view behind at {}: {e}", at.display());
-                }
-            })),
+            dir.clone(),
+            Some(release_view(self, name, dir)),
         ))
     }
 
@@ -2323,6 +2373,15 @@ mod tests {
         assert!(d.info(vb).is_err());
     }
 
+    /// The same daemon and mounts as `p`, as a new Warden process sees
+    /// them after a crash: no view counted (review fix G-a).
+    fn after_a_crash(p: &TestPool) -> TestPool {
+        BlkPool {
+            views: Arc::default(),
+            ..Clone::clone(p)
+        }
+    }
+
     #[test]
     fn a_view_left_by_a_crash_is_taken_down_first() {
         let p = pool();
@@ -2334,12 +2393,68 @@ mod tests {
             .run()
             .unwrap();
         std::mem::forget(p.seal_view(&a, Lsn::new(3)).unwrap());
+        let p = after_a_crash(&p);
         calls(&p);
         let view = p.seal_view(&a, Lsn::new(3)).unwrap();
         let c = calls(&p);
         assert_eq!(c[0], "umount /mnt/taso/.views/tank/v-a.view-3", "{c:?}");
         assert!(c[1].starts_with("mount-ro "));
         drop(view);
+    }
+
+    /// Review fix G-a: two users of one Seal's view at once (two verifier
+    /// attempts on one verifier Template, p4-verify.sh case 11).  Before
+    /// the fix the second took the first's view for a crash's: it
+    /// unmounted it under the first (SIGBUS in a running verifier) and
+    /// then failed, its branch name taken.
+    #[test]
+    fn two_users_of_one_seal_share_its_view_and_the_last_takes_it_down() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap()
+            .run()
+            .unwrap();
+        calls(&p);
+        let first = p.seal_view(&a, Lsn::new(3)).unwrap();
+        assert_eq!(calls(&p).len(), 1, "one mount");
+        // A clone is how the Warden's users hold the pool.
+        let second = Clone::clone(&p).seal_view(&a, Lsn::new(3)).unwrap();
+        assert_eq!(second.path(), first.path());
+        assert_eq!(
+            calls(&p),
+            Vec::<String>::new(),
+            "shared: no umount, no second mount"
+        );
+        drop(first);
+        assert_eq!(calls(&p), Vec::<String>::new(), "the second still reads it");
+        assert!(
+            p.blkd
+                .lock()
+                .unwrap()
+                .find("tank/v-a.view-3")
+                .unwrap()
+                .is_some(),
+            "its branch stays"
+        );
+        let third = p.seal_view(&a, Lsn::new(3)).unwrap();
+        drop(second);
+        drop(third);
+        assert_eq!(calls(&p), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
+        assert_eq!(
+            p.blkd.lock().unwrap().find("tank/v-a.view-3").unwrap(),
+            None,
+            "the last user dropped the branch"
+        );
+        // And a new view is made again from nothing.
+        drop(p.seal_view(&a, Lsn::new(3)).unwrap());
+        let c = calls(&p);
+        assert!(
+            c[0].starts_with("mount-ro ") && c[1].starts_with("umount "),
+            "{c:?}"
+        );
     }
 
     #[test]
