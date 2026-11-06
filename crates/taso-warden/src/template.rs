@@ -206,7 +206,7 @@ impl From<SubmitError> for TemplateError {
             }
             SubmitError::Refused(r) => Self::Refused(r),
             SubmitError::NotAccepted(t) => Self::NotAccepted(t),
-            SubmitError::Inconsistent(why) => Self::Inconsistent(why.into()),
+            SubmitError::Inconsistent(why) => Self::Inconsistent(why),
             SubmitError::Stopped(p) => Self::Failpoint(p),
         }
     }
