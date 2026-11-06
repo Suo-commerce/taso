@@ -20,7 +20,14 @@
 # BLK_SMOKE_NO_UBLK=1 skips the ublk module check; it exists to test this
 # script with a stand-in daemon on a machine without ublk.
 
+# The daemon runs --durable-at flush (SMOKE_DURABLE_AT overrides): the ext4 here has
+# a journal, and fua (taso-blkd's default since 2026-11-06) keeps the
+# block-device contract only for the Warden's journal-less ext4 (spec rev.
+# 38, D&D F (a); blk-crash.sh's K1, 2026-11-06).
+
 set -euo pipefail
+DURABLE_AT=${SMOKE_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "SMOKE_DURABLE_AT=$DURABLE_AT: flush, fua or seal" >&2; exit 2 ;; esac
 
 BLKD=${1:-target/release/taso-blkd}
 DIR=/var/lib/taso-blk
@@ -63,7 +70,7 @@ print(s.makefile().readline().strip())
 }
 
 start_daemon() {
-    "$BLKD" "$LOG" "$SOCK" 2>>"$ERR" &
+    "$BLKD" "$LOG" "$SOCK" --durable-at "$DURABLE_AT" 2>>"$ERR" &
     DAEMON_PID=$!
     for _ in $(seq 50); do
         [[ -S "$SOCK" ]] && return 0
