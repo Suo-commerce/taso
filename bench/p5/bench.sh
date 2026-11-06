@@ -257,7 +257,6 @@ json.dump({
     "store": "$DIR/store",
     "prefix": "vessels",
     "run_dir": "$DIR/run/w-%s" % r,
-    "batched_snapshots": "$BATCHED" == "1",
     "runtime": {
         "rootfs": "$ROOTFS",
         "host_uid_base": 200000,

@@ -347,7 +347,6 @@ cfg = {
     "warden": 1, "coordinator": {"local": d + "/coord.redb"}, "root": "e3/r",
     "storage": {"blk": {"socket": sock, "mounts": mnt, "spool": d + "/spool"}},
     "state_dir": d + "/state", "store": d + "/store", "prefix": "vessels", "run_dir": run + "/run",
-    "batched_snapshots": True,
     "runtime": {"rootfs": rootfs, "host_uid_base": 200000, "landlock_shim": "/usr/lib/taso/landlock",
                 "args": ["/usr/bin/taso-sim", "--step", "/tmp/e3", "--rows", rows, "--row-bytes", "512",
                          "--synchronous", "full", "--db", "/work/state.db", "--stats", "/work/sim-stats.json"],

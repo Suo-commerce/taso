@@ -264,7 +264,6 @@ json.dump({
     "warden": 1, "coordinator": {"local": work + "/coord.redb"}, "root": "b3/w",
     "storage": {"blk": {"socket": sock, "mounts": mnt, "spool": work + "/spool"}},
     "state_dir": work + "/state", "store": work + "/store", "prefix": "vessels", "run_dir": run + "/run",
-    "batched_snapshots": True,
     "runtime": {"rootfs": rootfs, "host_uid_base": 200000, "landlock_shim": "/usr/lib/taso/landlock",
                 "args": ["/usr/bin/taso-sim", "--step", "/tmp/b3", "--rows", rows, "--row-bytes", row_bytes,
                          "--synchronous", "full", "--db", "/work/state.db", "--stats", "/work/sim-stats.json"],
