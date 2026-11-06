@@ -306,6 +306,40 @@ impl DeciderClient {
         }
     }
 
+    /// Every pending Candidate, read page by page (review fix N3b-a):
+    /// `Pending { after }` with the last id of each page until a page says
+    /// no more.  A Warden whose pages do not move forward (an empty page,
+    /// or one that does not start after `after`, while it says more) is an
+    /// error, never a loop.
+    pub fn pending_all(&mut self) -> Result<Vec<PendingItem>, String> {
+        let mut all: Vec<PendingItem> = Vec::new();
+        let mut after = None;
+        loop {
+            let (items, more) = match self
+                .call(&Request::Pending { after })
+                .map_err(|e| e.to_string())?
+            {
+                Reply::Pending { items, more } => (items, more),
+                Reply::Error { message } => return Err(message),
+                other => return Err(format!("unexpected reply {other:?}")),
+            };
+            let first = items.first().map(|i| *i.candidate.candidate_id.as_bytes());
+            let forward = match (first, after) {
+                (Some(f), Some(a)) => f > *a.as_bytes(),
+                (Some(_), None) => true,
+                (None, _) => !more,
+            };
+            if !forward {
+                return Err("the Warden's Pending pages do not move forward".into());
+            }
+            after = items.last().map(|i| i.candidate.candidate_id).or(after);
+            all.extend(items);
+            if !more {
+                return Ok(all);
+            }
+        }
+    }
+
     /// Send `req`, read the reply.
     pub fn call(&mut self, req: &Request) -> io::Result<Reply> {
         frame::write_frame(&mut self.s, &req.encode()).map_err(frame_io)?;
@@ -544,5 +578,18 @@ mod tests {
         }
         assert_eq!(pages, [64, 36]);
         assert_eq!(seen, (1..=100u8).collect::<Vec<_>>());
+        // The client's own reader gives the same, all of it.
+        let all = c.pending_all().unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|i| i.candidate.candidate_id.as_bytes()[0])
+                .collect::<Vec<_>>(),
+            (1..=100u8).collect::<Vec<_>>()
+        );
+        // A node that fails: its error, as before.
+        let dir2 = tempfile::tempdir().unwrap();
+        let (_srv2, _f2, conf2) = server(dir2.path(), 8);
+        let mut c2 = DeciderClient::connect(&conf2.socket).unwrap();
+        assert_eq!(c2.pending_all().unwrap_err(), "no Vessels here");
     }
 }
