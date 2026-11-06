@@ -1,6 +1,6 @@
 [package]
 name = "taso-warden"
-description = "Taso Warden: the daemon side. Phase 1 starts with the ZFS driver (a Seal is a snapshot)."
+description = "Taso Warden: the daemon side, over the block log (a Vessel is a branch, a Seal a layer)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
