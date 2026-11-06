@@ -189,7 +189,7 @@ fn build(
     config: &Config,
     failpoint: Option<String>,
     lose_reply: Option<String>,
-) -> Result<Genesis<taso_warden::storage::Storage>, String> {
+) -> Result<Genesis<taso_warden::blk::BlkPool>, String> {
     let store = config
         .store
         .open()
@@ -228,7 +228,7 @@ fn build(
         None => taso_warden::genesis::no_failpoints(),
     };
     Ok(Genesis {
-        pool: config.storage.open(false),
+        pool: config.storage.open(),
         store,
         prefix: config.prefix.clone(),
         coord,

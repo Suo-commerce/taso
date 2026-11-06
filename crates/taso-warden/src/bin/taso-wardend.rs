@@ -51,7 +51,7 @@
 //! A second signal exits at once, which is a crash.
 //!
 //! The signals are blocked in every thread from the start of `main` and
-//! taken by one thread with `sigwait`; programs the daemon runs (runc, zfs)
+//! taken by one thread with `sigwait`; programs the daemon runs (runc, mount)
 //! start with the default signal mask (std resets it in the child).
 //!
 //! Exit status: 0 if every Vessel's last run had its agent exit
@@ -169,11 +169,11 @@ fn main() -> ExitCode {
         }
         CoordConf::Remote { socket } => Arc::new(RemoteCoord::new(socket)),
     };
-    let storage = config.storage.open(config.batched_snapshots);
+    let storage = config.storage.open();
     eprintln!(
-        "taso-wardend[{}]: storage {}",
+        "taso-wardend[{}]: storage blk ({})",
         config.warden.get(),
-        storage.kind()
+        config.storage.socket.display()
     );
     let failpoint = std::env::var("TASO_FAILPOINT").ok();
     let node = match Node::new(config, coord, storage)
@@ -597,7 +597,7 @@ mod tests {
     use std::time::Duration;
 
     /// The stop signals are blocked in the daemon, but a program it runs
-    /// (runc, zfs) must start with them unblocked: a SIGTERM sent to it
+    /// (runc, mount) must start with them unblocked: a SIGTERM sent to it
     /// ends it.
     #[test]
     fn children_start_with_the_signals_unblocked() {
