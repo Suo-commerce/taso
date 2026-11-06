@@ -2,8 +2,8 @@
 //! D39; file 4a).
 //!
 //! An artifact is what a Template's layer, a Candidate's output and a
-//! genesis source are: the files of a tree, not a storage image, so any
-//! node restores it whatever its storage (ZFS or the block log).
+//! genesis source are: the files of a tree, not a storage image, so it
+//! does not depend on how a node stores its Vessels.
 //!
 //! ```text
 //! magic "TASOART\0" (8) · version u32 = 1 · manifest (u64 length · its canonical bytes, §8)
