@@ -525,7 +525,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     }
 
     /// The Seal layer of `dataset` at `lsn`, as the publisher wants it
-    /// (the shape of a ZFS snapshot), or `None` if there is none.
+    /// (as a [`Snapshot`]), or `None` if there is none.
     pub fn snapshot(&self, dataset: &Dataset, lsn: Lsn) -> Result<Option<Snapshot>, LayerError> {
         let mut d = conn(&self.maker, &self.blkd);
         let Some(b) = d.find(dataset.as_str())? else {
@@ -555,7 +555,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     }
 
     /// The uids owning files in `dataset` (it is mounted for the walk if
-    /// it is not).  What `zfs userspace` answers for ZFS.
+    /// it is not).
     pub fn owner_uids(
         &self,
         dataset: &Dataset,
