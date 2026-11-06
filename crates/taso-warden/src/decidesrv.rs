@@ -7,12 +7,19 @@
 //! `max_connections` connections at once (one more is answered `Error`
 //! and closed). Messages: [`taso_core::decider`].
 //!
-//! A connection says `Hello { version: 1 }` first, once. A malformed or
+//! A connection says `Hello { version }` first, once (version 2:
+//! `Pending` in pages; a peer speaking another version is answered
+//! `Error` and closed). A malformed or
 //! out-of-order request, an unknown version, or a `Verdict` whose
 //! `request_id` is not the one its peer's uid, `op_kind = Verdict` and its
 //! body derive, is answered `Error` and the connection is closed: nothing
 //! is recorded. What a [`Decide`] cannot do (it failed) is answered
 //! `Error` and the connection stays open.
+//!
+//! `Pending { after }` is answered with one page (review fix N3b-a): the
+//! node's pending Candidates, cut by [`taso_core::decider::page`].  Each
+//! page asks the node again, so a Candidate decided between two pages is
+//! simply not on the next one.
 //!
 //! Normative reference: `Taso_spec_p4_contracts` rev. 22, BLAKE3
 //! `f3a54561505ebef478c43426273d79c789ec60dc74d0ff9c74ae0455720bde46`.
@@ -251,8 +258,11 @@ fn serve_conn(d: &dyn Decide, mut s: UnixStream, peer: Peer, max_frame: u32) {
             ),
             Ok(_) if !hello => (err("Hello comes first"), true),
             Ok(Request::Hello { .. }) => (err("Hello comes once"), true),
-            Ok(Request::Pending) => match d.pending() {
-                Ok(items) => (Reply::Pending { items }, false),
+            Ok(Request::Pending { after }) => match d.pending() {
+                Ok(all) => {
+                    let (items, more) = taso_core::decider::page(all, after);
+                    (Reply::Pending { items, more }, false)
+                }
                 Err(e) => (err(e), false),
             },
             Ok(Request::Verdict { request }) if !request.id_matches(peer) => (
@@ -320,14 +330,20 @@ mod tests {
     use taso_core::contract::{request_id, Decision, OpKind, Refusal};
     use taso_core::envelope::HashVal;
 
+    mod support {
+        include!("../tests/support/pending.rs");
+    }
+
     #[derive(Default)]
     struct Fake {
         seen: Mutex<Vec<(VerdictRequest, Peer)>>,
+        /// What `pending` gives; `None`: it fails.
+        items: Option<Vec<PendingItem>>,
     }
 
     impl Decide for Fake {
         fn pending(&self) -> Result<Vec<PendingItem>, String> {
-            Err("no Vessels here".into())
+            self.items.clone().ok_or_else(|| "no Vessels here".into())
         }
         fn verdict(&self, r: &VerdictRequest, peer: Peer) -> Result<VerdictAnswer, String> {
             lock(&self.seen).push((r.clone(), peer));
@@ -367,12 +383,20 @@ mod tests {
     }
 
     fn server(dir: &Path, max_conns: usize) -> (DeciderServer, Arc<Fake>, DeciderConf) {
+        server_with(dir, max_conns, Fake::default())
+    }
+
+    fn server_with(
+        dir: &Path,
+        max_conns: usize,
+        fake: Fake,
+    ) -> (DeciderServer, Arc<Fake>, DeciderConf) {
         let conf = DeciderConf {
             socket: dir.join("d").join("decide.sock"),
             max_frame_bytes: 4096,
             max_connections: max_conns,
         };
-        let fake = Arc::new(Fake::default());
+        let fake = Arc::new(fake);
         (
             DeciderServer::spawn(&conf, fake.clone()).unwrap(),
             fake,
@@ -389,7 +413,7 @@ mod tests {
         assert_eq!(mode(&conf.socket), 0o600);
         let mut c = DeciderClient::connect(&conf.socket).unwrap();
         assert!(matches!(
-            c.call(&Request::Pending).unwrap(),
+            c.call(&Request::Pending { after: None }).unwrap(),
             Reply::Error { message } if message == "no Vessels here"
         ));
         let r = request(me());
@@ -433,14 +457,14 @@ mod tests {
             let closed = frame::read_frame(&mut s).unwrap().is_none();
             (r, closed)
         };
-        // Not Hello first; a version not spoken.
+        // Not Hello first; a version not spoken (1, before pages).
         assert!(matches!(
-            raw(&Request::Pending),
+            raw(&Request::Pending { after: None }),
             (Reply::Error { .. }, true)
         ));
         assert!(matches!(
-            raw(&Request::Hello { version: 2 }),
-            (Reply::Error { .. }, true)
+            raw(&Request::Hello { version: 1 }),
+            (Reply::Error { message }, true) if message.contains("version 1 is not spoken")
         ));
         // Hello twice.
         let mut c = DeciderClient::connect(&conf.socket).unwrap();
@@ -485,5 +509,40 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(5));
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Review fix N3b-a: 100 pending Candidates come in two pages, 64
+    /// then 36, each once and in id order; the last says no more.
+    #[test]
+    fn pending_is_answered_page_by_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let items: Vec<PendingItem> = (1..=100u8)
+            .rev()
+            .map(|n| support::item(n, support::clean(1), &[]))
+            .collect();
+        let (_srv, _fake, conf) = server_with(
+            dir.path(),
+            8,
+            Fake {
+                items: Some(items),
+                ..Fake::default()
+            },
+        );
+        let mut c = DeciderClient::connect(&conf.socket).unwrap();
+        let (mut seen, mut after, mut pages) = (Vec::new(), None, Vec::new());
+        loop {
+            let Reply::Pending { items, more } = c.call(&Request::Pending { after }).unwrap()
+            else {
+                panic!()
+            };
+            pages.push(items.len());
+            after = items.last().map(|i| i.candidate.candidate_id);
+            seen.extend(items.iter().map(|i| i.candidate.candidate_id.as_bytes()[0]));
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(pages, [64, 36]);
+        assert_eq!(seen, (1..=100u8).collect::<Vec<_>>());
     }
 }
