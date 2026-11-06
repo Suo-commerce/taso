@@ -3530,6 +3530,31 @@ mod tests {
             .contains("no track record"));
     }
 
+    /// E1: a store that cannot be read fails the checks it decides, and
+    /// each says the store could not be read, never only that an object
+    /// is missing or a record not carried.
+    #[test]
+    fn explain_names_a_store_it_could_not_read() {
+        let c = Cluster::new();
+        let (_h, v, _packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let down: SharedStore = Arc::new(Down(c.store.clone()));
+        let e = explain(c.coord.as_ref(), &down, PREFIX, Subject::Chronicle(v.id())).unwrap();
+        let failed: Vec<&str> = e.failed().iter().map(|k| k.what.as_str()).collect();
+        assert!(!failed.is_empty());
+        for w in &failed {
+            assert!(
+                w.contains("(the store could not be read: "),
+                "{w}: every failed check names the outage"
+            );
+        }
+        for kind in ["carried:", "content:"] {
+            assert!(
+                failed.iter().any(|w| w.starts_with(kind)),
+                "{kind}: {failed:?}"
+            );
+        }
+    }
+
     #[test]
     fn explain_fails_its_checks_on_what_was_changed_after_acceptance() {
         let c = Cluster::new();
