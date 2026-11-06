@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Check the agent's SQLite database inside one Seal (gate-p2, gate-p2-blk).
+"""Check the agent's SQLite database inside one Seal (gate-p2-blk, f6-fork-blk).
 
-    dbcheck.py <dataset>@<snapshot> <sealed turn> <txns per turn> <rows per txn>
-    dbcheck.py <directory>          <sealed turn> <txns per turn> <rows per txn>
+    dbcheck.py <directory> <sealed turn> <txns per turn> <rows per txn>
 
-The first form is a ZFS snapshot (read through .zfs/snapshot); the second
-any directory holding the Seal's files, such as a block-log Seal forked to
-a branch and mounted read-only.  An argument naming an existing directory
-is the second form; anything else must be <dataset>@<snapshot>.
+<directory> holds the Seal's files, such as a block-log Seal forked to a
+branch and mounted read-only.  (The snapshot form went with V4b.)
 
 The Seal's state.db (and its -wal, if any) are copied to a temporary
 directory and opened there, so SQLite applies the WAL exactly as the agent
@@ -21,7 +18,6 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
 import tempfile
 
@@ -30,12 +26,7 @@ def seal_dir(arg):
     """The directory holding the Seal's files, and how it was named."""
     if os.path.isdir(arg):
         return arg, {"directory": arg}
-    if "@" not in arg:
-        raise SystemExit(f"dbcheck.py: {arg} is neither a directory nor <dataset>@<snapshot>")
-    ds, name = arg.split("@", 1)
-    mount = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint", ds],
-                           check=True, capture_output=True, text=True).stdout.strip()
-    return os.path.join(mount, ".zfs", "snapshot", name), {"snapshot": arg}
+    raise SystemExit(f"dbcheck.py: {arg} is not a directory")
 
 
 def check(src, turn, txns, rows):
