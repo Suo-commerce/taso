@@ -4,8 +4,12 @@
 # Starts two taso-blkd on fresh logs (node A and node B), runs the ignored
 # tests in crates/taso-warden/tests/blk_device.rs against them (Vessels
 # born, sealed, forked, reopened and rolled back on ublk devices with ext4;
-# a Vessel and its fork reborn on node B from shipped packs), then stops
-# the daemons.
+# an orphan layer removed at reopen; succession; a Vessel and its fork
+# reborn on node B from shipped packs), then the daemon end to end in
+# crates/taso-sim/tests/daemon_on_node.rs (runc agents: born, reopened,
+# reborn on node B and refused; the supervisor; forks over the Field and a
+# promotion; a parent reborn before its fork), then stops the daemons.
+# Needs runc for the second part.
 #
 #   sudo scripts/blk-warden-test.sh            (from the repository root)
 #
@@ -86,6 +90,8 @@ mkdir -p "$DIR" "$MNT"
 say "building"
 cargo build -q --release -p taso-blk
 cargo test -q -p taso-warden --test blk_device --no-run
+cargo test -q -p taso-sim --test daemon_on_node --no-run
+command -v runc >/dev/null || die "runc is missing (daemon_on_node runs agents)"
 
 rm -f "$LOG" "$ERR" "$LOG_B" "$ERR_B"
 "$BLKD" "$LOG" "$SOCK" 2>>"$ERR" &
@@ -98,11 +104,17 @@ for _ in $(seq 100); do [[ -S "$SOCK" && -S "$SOCK_B" ]] && break; sleep 0.1; do
 say "node A: taso-blkd on $SOCK (log $LOG); node B: $SOCK_B (log $LOG_B); mounts under $MNT"
 
 status=0
+say "blk_device: the Warden's pool on real devices"
 TASO_BLK_SOCKET=$SOCK TASO_BLK_SOCKET_B=$SOCK_B TASO_BLK_MOUNTS=$MNT \
     cargo test -q -p taso-warden --test blk_device -- --ignored --test-threads=1 || status=$?
+if [[ $status -eq 0 ]]; then
+    say "daemon_on_node: the daemon end to end with runc agents"
+    TASO_BLK_SOCKET=$SOCK TASO_BLK_SOCKET_B=$SOCK_B TASO_BLK_MOUNTS=$MNT \
+        cargo test -q -p taso-sim --test daemon_on_node -- --ignored --test-threads=1 || status=$?
+fi
 
 if [[ $status -eq 0 ]]; then
-    echo "BLKPOOL PASS: Vessels born, sealed, forked, reopened and rolled back on real devices; reborn on node B from packs"
+    echo "BLKPOOL PASS: Vessels born, sealed, forked, reopened, rolled back and succeeded on real devices; reborn on node B from packs; the daemon end to end with runc agents"
 else
     echo "BLKPOOL FAIL (test exit $status; daemon logs: $ERR, $ERR_B)"
     exit 1
