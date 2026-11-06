@@ -503,9 +503,10 @@ pub fn check_rootfs(rootfs: &Path) -> Vec<String> {
 /// creates are then owned by its range, never by host root.
 ///
 /// Only if the dataset is this Vessel's.  The top directory's owner is a
-/// durable mark of whose it is: it travels with the dataset (`zfs send`
-/// keeps owners), so it holds across Warden restarts and nodes, where the
-/// source guard's memory does not.  Accepted:
+/// durable mark of whose it is: it travels with the dataset (the shipped
+/// stream carries blocks, owners with them), so it holds across Warden
+/// restarts and nodes, where the source guard's memory does not.
+/// Accepted:
 /// - owned by host root (uid and gid 0): a fresh dataset, never prepared
 ///   (also one rolled back to its birth Seal, which froze it fresh);
 /// - owned by exactly `host_uid_base` (uid and gid): prepared before for
@@ -623,7 +624,7 @@ pub const LOST_FOUND: &str = "lost+found";
 /// one left at host `0:0` makes every walk of the Vessel's Seals refuse it
 /// `ReservedMismatch` (found by `scripts/p4-genesis.sh blk`).  Only the
 /// directory itself changes, and only from exactly `0:0`: anything else —
-/// absent (ZFS), another owner, not a directory (a symlink is never
+/// absent (removed), another owner, not a directory (a symlink is never
 /// followed) — is left as it is, for the walk to judge.
 fn own_lost_found(work: &Path, range: u32) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -1709,7 +1710,7 @@ mod tests {
         assert!(work_dir_range(dir.path(), CHILD, None).is_err());
         assert_eq!(owner(&lf), (0, 0));
 
-        // No lost+found (ZFS): nothing to do.
+        // No lost+found (removed by an agent): nothing to do.
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::chown(dir.path(), Some(0), Some(0)).unwrap();
         assert_eq!(work_dir_range(dir.path(), CHILD, None).unwrap(), CHILD);
