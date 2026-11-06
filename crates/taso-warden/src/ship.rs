@@ -3,9 +3,9 @@
 //!
 //! An [`ObjectStore`] keeps objects by key: [`LocalStore`] in a local
 //! directory (atomic: temp file, fsync, rename, fsync the directory), and
-//! Garage (S3) later behind the same trait.  A [`Sender`] produces the ZFS
-//! send stream of a Seal snapshot, full or incremental; [`ZfsSend`] runs
-//! `zfs send`.
+//! Garage (S3) ([`crate::s3`]) behind the same trait.  A [`Sender`]
+//! produces the `fs` stream of a Seal, full or incremental; the block
+//! log's is [`crate::blk::BlkSend`].
 //!
 //! What is shipped, and how it is laid out in the store, is
 //! [`crate::pack`]: one pack object per shipment, carrying the log and,
@@ -16,7 +16,6 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use taso_core::envelope::Lsn;
@@ -214,9 +213,10 @@ impl ObjectStore for LocalStore {
 
 /// Produces send streams.
 pub trait Sender {
-    /// The stream of `dataset@<to>`, incremental from the snapshot `from`
-    /// (a full snapshot name: an earlier Seal of `dataset`, or the parent
-    /// Seal snapshot `dataset` is a clone of) if given, else full.  The
+    /// The stream of `dataset`'s Seal at `to`, incremental from the Seal
+    /// named `from` (a full Seal name, `<dataset>@taso-seal-<lsn>`: an
+    /// earlier Seal of `dataset`, or the parent's Seal `dataset` is a
+    /// clone of) if given, else full.  The
     /// reader fails, rather than ends, if the stream is incomplete.
     fn send(&self, dataset: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream>;
 }
@@ -234,79 +234,6 @@ impl Sender for NoSend {
             io::ErrorKind::Unsupported,
             "a records-only Chronicle ships no fs stream",
         ))
-    }
-}
-
-/// [`Sender`] running `zfs send`.
-#[derive(Clone, Debug)]
-pub struct ZfsSend {
-    program: PathBuf,
-}
-
-impl Default for ZfsSend {
-    fn default() -> Self {
-        Self {
-            program: PathBuf::from("zfs"),
-        }
-    }
-}
-
-impl Sender for ZfsSend {
-    fn send(&self, dataset: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream> {
-        let mut cmd = Command::new(&self.program);
-        cmd.arg("send");
-        if let Some(f) = from {
-            cmd.arg("-i").arg(f);
-        }
-        cmd.arg(dataset.seal_snapshot(to));
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let stdout = child.stdout.take().expect("piped");
-        Ok(Box::new(ChildReader {
-            child: Some(child),
-            stdout,
-        }))
-    }
-}
-
-/// A child's stdout that turns a non-zero exit into a read error at the
-/// end, so a failed `zfs send` is never mistaken for a short stream.
-struct ChildReader {
-    child: Option<Child>,
-    stdout: ChildStdout,
-}
-
-impl Read for ChildReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.stdout.read(buf)?;
-        if n == 0 {
-            if let Some(mut child) = self.child.take() {
-                let mut err = String::new();
-                if let Some(mut e) = child.stderr.take() {
-                    let _ = e.read_to_string(&mut err);
-                }
-                let status = child.wait()?;
-                if !status.success() {
-                    return Err(io::Error::other(format!(
-                        "zfs send failed ({status}): {}",
-                        err.trim()
-                    )));
-                }
-            }
-        }
-        Ok(n)
-    }
-}
-
-impl Drop for ChildReader {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
     }
 }
 
