@@ -25,9 +25,12 @@
 //! 6. **The Candidate**, with its facts (D63), appended to the Vessel's
 //!    log and accepted through it ([`crate::submit`]).
 //!
-//! A refusal (§3.1's reasons) is a `NominationRefused`, appended and
-//! accepted the same way; it holds nothing and is one per Seal and
-//! exclusion.  Every step before the accept leaves nothing accepted, and
+//! A walk refused for good -- one the content decides (review fixes 4a,
+//! W) -- is a `NominationRefused` keyed by the Candidate id, appended and
+//! accepted the same way; it holds nothing.  Every other refusal is
+//! answered and not recorded: the log or the node's settings already say
+//! it, or (a limit, the clock, an unreadable file) asking later can go
+//! otherwise, answered `Retry`.  Every step before the accept leaves nothing accepted, and
 //! a retry derives the same `candidate_id` and puts the same objects
 //! (artifacts are deterministic, D39).
 //!
@@ -340,15 +343,15 @@ impl Nominator {
         let Some((seal, record)) = find_seal(&frames, ask.seal)? else {
             return Ok(Answer::Refused(NominationRefusal::SealNotAccepted));
         };
-        let refuse = |vessel: &mut Vessel<L>, reason, input: Option<HashVal>| {
-            self.refuse(vessel, packs, seal, &ask.exclude, reason, input)
-        };
+        // Refused, nothing recorded: the log or the node's settings already
+        // say it (review fix 4a: only a walk refusal is recorded).
+        let refused = |reason| Ok(Answer::Refused(reason));
         let Some(record) = record else {
-            // A record at that lsn, not a Seal: refused for good.
-            return refuse(vessel, NominationRefusal::SealNotAccepted, None);
+            // A record at that lsn, not a Seal.
+            return refused(NominationRefusal::SealNotAccepted);
         };
         if self.coord.head(id)?.lsn < seal.lsn {
-            return refuse(vessel, NominationRefusal::SealNotAccepted, None);
+            return refused(NominationRefusal::SealNotAccepted);
         }
         let shipped = self.coord.shipped(id)?;
         if shipped.lsn < seal.lsn {
@@ -359,7 +362,7 @@ impl Nominator {
             )));
         }
         if !ask.exclude.is_subset(&self.conf.allowed_exclude) {
-            return refuse(vessel, NominationRefusal::BadExclude, None);
+            return refused(NominationRefusal::BadExclude);
         }
 
         // 1. The answer already in the log.
@@ -373,27 +376,32 @@ impl Nominator {
             &requirement,
         );
         if self.accepted(LogicalKey::CandidateClose(cid))?.is_some() {
-            return refuse(vessel, NominationRefusal::Closed, None);
+            return refused(NominationRefusal::Closed);
         }
         if let Some(ContractRecord::Candidate(c)) = self.accepted(LogicalKey::Candidate(cid))? {
             return if same_kind(&c.nominated_by, &ask.by) {
                 Ok(Answer::Nominated(cid))
             } else {
-                refuse(vessel, NominationRefusal::Duplicate, None)
+                refused(NominationRefusal::Duplicate)
             };
         }
-        let probe = NominationRefused {
+        // A walk refusal recorded for this very Candidate id: the files and
+        // the map are the same, so the walk would be refused again.
+        if let Some(ContractRecord::NominationRefused(r)) =
+            self.accepted(LogicalKey::NominationRefused(cid))?
+        {
+            return refused(NominationRefusal::Walk(r.reason));
+        }
+        let walk_refused = |reason, input_manifest_key| NominationRefused {
             chronicle: id,
             seal,
             exclude: ask.exclude.clone(),
-            reason: NominationRefusal::SealNotAccepted,
-            input_manifest_key: None,
+            transform_version: TRANSFORM_VERSION,
+            classmap_key: self.conf.classmap.key(),
+            requirement,
+            reason,
+            input_manifest_key,
         };
-        if let Some(ContractRecord::NominationRefused(r)) =
-            self.accepted_id(ContractRecord::NominationRefused(probe).logical_id())?
-        {
-            return Ok(Answer::Refused(r.reason));
-        }
 
         // The verifier Template must be ready (review fix N2a): a
         // Candidate naming one that is not could never start an attempt,
@@ -458,15 +466,16 @@ impl Nominator {
         self.put_content(ObjectKind::Manifest, input_key, &mut &input.bytes()[..])?;
         (self.failpoint)("nominate.after_input_manifest")?;
         if let Some(w) = walk_refusal(&input) {
-            return refuse(vessel, NominationRefusal::Walk(w), Some(input_key));
+            return self.refuse_walk(vessel, packs, walk_refused(w, input_key), &input);
         }
 
         // 4. Transform.
         let Ok(output) = transform(&input, &ask.exclude) else {
-            return refuse(
+            return self.refuse_walk(
                 vessel,
-                NominationRefusal::Walk(WalkRefusal::DanglingByExclusion),
-                Some(input_key),
+                packs,
+                walk_refused(WalkRefusal::DanglingByExclusion, input_key),
+                &input,
             );
         };
         let output_key = output.key();
@@ -553,7 +562,7 @@ impl Nominator {
                 if same_kind(&c.nominated_by, &ask.by) {
                     Ok(Answer::Nominated(cid))
                 } else {
-                    refuse(vessel, NominationRefusal::Duplicate, None)
+                    Ok(Answer::Refused(NominationRefusal::Duplicate))
                 }
             }
             Ok(other) => Err(NominateError::Submit(SubmitError::Inconsistent(format!(
@@ -564,30 +573,45 @@ impl Nominator {
         }
     }
 
-    /// Record a refusal: a `NominationRefused`, appended to the Vessel's
-    /// log and accepted (or the one already accepted for this Seal and
-    /// exclusion, whose reason is then the answer).
-    fn refuse<L: Layers, X: Sender>(
+    /// A walk refused (review fixes 4a, W).  Recorded, as a
+    /// `NominationRefused` keyed by the Candidate id, only if the content
+    /// decides it ([`WalkRefusal::decided_by_content`], and no entry was
+    /// unreadable): then the same request is answered from the record and
+    /// never walked again, while a changed map, requirement or rule makes
+    /// another id and walks.  Otherwise -- a limit or the clock stopped
+    /// the walk, `fs.reserved`, a file that could not be read -- asking
+    /// later can go otherwise: `Retry`, nothing recorded.
+    fn refuse_walk<L: Layers, X: Sender>(
         &self,
         vessel: &mut Vessel<L>,
         packs: &Packs<SharedStore, X>,
-        seal: SealRef,
-        exclude: &BTreeSet<PathClass>,
-        reason: NominationRefusal,
-        input_manifest_key: Option<HashVal>,
+        refused: NominationRefused,
+        walked: &Manifest,
     ) -> Result<Answer, NominateError> {
+        let unreadable = walked
+            .unsupported
+            .iter()
+            .any(|(_, u)| *u == Unsupported::Unreadable);
+        if !refused.reason.decided_by_content()
+            || (refused.reason == WalkRefusal::Unsupported && unreadable)
+        {
+            return Ok(Answer::Retry(format!(
+                "the walk was refused for now ({:?}{}): nothing in the files decides it, \
+                 so nothing is recorded; ask again",
+                refused.reason,
+                if unreadable {
+                    ", an entry could not be read"
+                } else {
+                    ""
+                }
+            )));
+        }
         if let Some(why) = self.unshippable(vessel)? {
             return Ok(Answer::Retry(why));
         }
-        let rec = ContractRecord::NominationRefused(NominationRefused {
-            chronicle: vessel.id(),
-            seal,
-            exclude: exclude.clone(),
-            reason,
-            input_manifest_key,
-        });
+        let rec = ContractRecord::NominationRefused(refused);
         if let Some(ContractRecord::NominationRefused(r)) = self.accepted_id(rec.logical_id())? {
-            return Ok(Answer::Refused(r.reason));
+            return Ok(Answer::Refused(NominationRefusal::Walk(r.reason)));
         }
         vessel.append_contract(rec.clone())?;
         let mut attempt = *vessel.attempt_mut();
@@ -602,7 +626,7 @@ impl Nominator {
         *vessel.attempt_mut() = attempt;
         match got? {
             Submitted::Contract(ContractRecord::NominationRefused(r)) => {
-                Ok(Answer::Refused(r.reason))
+                Ok(Answer::Refused(NominationRefusal::Walk(r.reason)))
             }
             other => Err(NominateError::Submit(SubmitError::Inconsistent(format!(
                 "a refusal's logical id holds {other:?}"
@@ -1225,7 +1249,8 @@ class = \"Scratch\"
             .unwrap();
         assert_eq!(again, Answer::Nominated(cid));
         assert_eq!(contracts(&v).len(), 1);
-        // Another kind of request for the same id: Duplicate, recorded once.
+        // Another kind of request for the same id: Duplicate, answered from
+        // the log and not recorded (review fix 4a).
         let dup = n
             .nominate(
                 &mut v,
@@ -1244,7 +1269,7 @@ class = \"Scratch\"
             )
             .unwrap();
         assert_eq!(dup2, dup);
-        assert_eq!(contracts(&v).len(), 2);
+        assert_eq!(contracts(&v).len(), 1, "only the Candidate");
     }
 
     #[test]
@@ -1261,18 +1286,15 @@ class = \"Scratch\"
             "{a:?}"
         );
         assert!(contracts(&v).is_empty());
-        // A record that is not a Seal: refused for good, and an lsn with
-        // nothing: refused, nothing to record.
-        // A refusal waits too while the newest Seal is not shipped.
+        // A record that is not a Seal, and an lsn with nothing: refused,
+        // and never recorded (review fix 4a), shipped or not.
         let mut a = ask(&w, NominatedBy::Agent);
         a.seal = Some(Lsn::new(1)); // the Lineage
-        assert!(matches!(
+        assert_eq!(
             n.nominate(&mut v, &packs, &a, &view(&w.tree)).unwrap(),
-            Answer::Retry(ref why) if why.contains("nothing can be recorded")
-        ));
+            Answer::Refused(NominationRefusal::SealNotAccepted)
+        );
         assert!(contracts(&v).is_empty());
-        // Shipped: a record that is not a Seal is refused for good, and
-        // an lsn with nothing is refused, with nothing to record.
         let s = v.last_seal().unwrap();
         let snap = Snapshot {
             dataset: v.dataset().clone(),
@@ -1285,17 +1307,21 @@ class = \"Scratch\"
             n.nominate(&mut v, &packs, &a, &view(&w.tree)).unwrap(),
             Answer::Refused(NominationRefusal::SealNotAccepted)
         );
-        assert_eq!(contracts(&v).len(), 1);
         a.seal = Some(Lsn::new(999));
         assert_eq!(
             n.nominate(&mut v, &packs, &a, &view(&w.tree)).unwrap(),
             Answer::Refused(NominationRefusal::SealNotAccepted)
         );
-        assert_eq!(contracts(&v).len(), 1);
+        assert!(contracts(&v).is_empty());
     }
 
+    /// Review fix 4a: a walk the content refuses is recorded once, under
+    /// the Candidate id, and the same request is answered from it without
+    /// walking; once the operator fixes the classification map, the request
+    /// is another Candidate id and walks again.  Other refusals are not
+    /// recorded.
     #[test]
-    fn refusals_are_recorded_once_per_seal_and_exclusion() {
+    fn a_walk_refusal_is_recorded_by_candidate_id_and_a_fixed_map_walks_again() {
         let w = world();
         make_tree(&w.tree);
         std::fs::write(w.tree.join("odd"), "?").unwrap();
@@ -1306,34 +1332,81 @@ class = \"Scratch\"
         )
         .unwrap();
         c.min_interval = Duration::ZERO;
+        let narrow = c.classmap.key();
         let n = nominator(&w, c);
+        let (mut v, packs) = vessel(&w, b"a", true);
+        let unknown = Answer::Refused(NominationRefusal::Walk(WalkRefusal::UnknownPaths));
+        let a = n
+            .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
+            .unwrap();
+        assert_eq!(a, unknown);
+        let Some(ContractRecord::NominationRefused(r)) = contracts(&v).pop() else {
+            panic!()
+        };
+        assert_eq!(r.classmap_key, narrow);
+        assert_eq!(
+            w.coord
+                .query_logical(logical_id(&LogicalKey::NominationRefused(r.candidate_id())))
+                .unwrap()
+                .map(|(_, rec)| rec.digest()),
+            Some(Submitted::Contract(ContractRecord::NominationRefused(r.clone())).digest()),
+            "recorded under the Candidate id"
+        );
+        // Asked again: answered from the record, nothing walked (the
+        // Seal's view is never opened) or added.
+        let never = |_: Lsn| -> Result<SealView, LayerError> { Err("walked again".into()) };
+        assert_eq!(
+            n.nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &never)
+                .unwrap(),
+            unknown
+        );
+        assert_eq!(contracts(&v).len(), 1);
+        // An exclusion outside the allowed set: refused, never recorded.
+        let mut bad = ask(&w, NominatedBy::Agent);
+        bad.exclude = [PathClass::Source].into();
+        for _ in 0..2 {
+            assert_eq!(
+                n.nominate(&mut v, &packs, &bad, &view(&w.tree)).unwrap(),
+                Answer::Refused(NominationRefusal::BadExclude)
+            );
+        }
+        assert_eq!(contracts(&v).len(), 1);
+        // The operator fixes the map (a catch-all): another Candidate id,
+        // walked again, and nominated.
+        let fixed = nominator(&w, conf());
+        assert!(matches!(
+            fixed
+                .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
+                .unwrap(),
+            Answer::Nominated(_)
+        ));
+    }
+
+    /// Review W: a walk a limit stopped is not about the files: `Retry`,
+    /// nothing recorded; with room, the same request nominates.
+    #[test]
+    fn an_incomplete_walk_answers_retry_and_records_nothing() {
+        let w = world();
+        make_tree(&w.tree);
+        let mut tight = conf();
+        tight.limits.max_entries = 2;
+        let n = nominator(&w, tight);
         let (mut v, packs) = vessel(&w, b"a", true);
         let a = n
             .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
             .unwrap();
-        assert_eq!(
-            a,
-            Answer::Refused(NominationRefusal::Walk(WalkRefusal::UnknownPaths))
-        );
-        let Some(ContractRecord::NominationRefused(r)) = contracts(&v).pop() else {
-            panic!()
-        };
         assert!(
-            r.input_manifest_key.is_some(),
-            "the walk is kept for diagnosis"
+            matches!(a, Answer::Retry(ref why) if why.contains("IncompleteWalk")),
+            "{a:?}"
         );
-        // An exclusion outside the allowed set.
-        let mut bad = ask(&w, NominatedBy::Agent);
-        bad.exclude = [PathClass::Source].into();
-        assert_eq!(
-            n.nominate(&mut v, &packs, &bad, &view(&w.tree)).unwrap(),
-            Answer::Refused(NominationRefusal::BadExclude)
-        );
-        assert_eq!(
-            n.nominate(&mut v, &packs, &bad, &view(&w.tree)).unwrap(),
-            Answer::Refused(NominationRefusal::BadExclude)
-        );
-        assert_eq!(contracts(&v).len(), 2);
+        assert!(contracts(&v).is_empty(), "nothing recorded");
+        let roomy = nominator(&w, conf());
+        assert!(matches!(
+            roomy
+                .nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
+                .unwrap(),
+            Answer::Nominated(_)
+        ));
     }
 
     #[test]
