@@ -194,6 +194,10 @@ pub enum Transient {
         /// That submission.
         submission: HashVal,
     },
+    /// An object to hold was deleted within the quarantine window: held
+    /// again once the window has passed (review fix R2a: content objects
+    /// are shared, so a key reclaimed is put and held again by others).
+    Quarantined(ObjectId),
 }
 
 /// Why a submission can never be accepted (§0.1: says nothing about its
@@ -211,8 +215,6 @@ pub enum Final {
     Predicate(Cow<'static, str>),
     /// An object to hold is claimed for deletion.
     Claimed(ObjectId),
-    /// An object to hold was deleted within the quarantine window.
-    Quarantined(ObjectId),
     /// An object to hold is not in the store.
     NoSuchObject(ObjectId),
     /// Cancelled by its Warden.
@@ -404,6 +406,9 @@ pub struct CoordLog {
     holds: BTreeMap<H32, Hold>,
     claims: BTreeMap<ObjectId, ClaimBy>,
     quarantine: BTreeMap<ObjectId, u64>,
+    /// Reclaims completed, by content key (review fix 2a): the next one's
+    /// number.
+    reclaims: BTreeMap<H32, u64>,
     cands: BTreeMap<H32, Cand>,
     attempts: BTreeMap<H32, Attempt>,
     live: Vec<(C16, C16, Live)>,
@@ -427,6 +432,8 @@ struct Effects {
 }
 
 enum Change {
+    /// A reclaim of the key completed.
+    ReclaimDone(H32),
     CandOpen(Box<Candidate>),
     CandClose(H32),
     CandCommitting(H32),
@@ -456,6 +463,8 @@ enum Change {
 enum Stop {
     Final(Final),
     Unreadable,
+    /// An object to hold is quarantined: for now.
+    Quarantined(ObjectId),
 }
 
 impl From<Final> for Stop {
@@ -515,6 +524,7 @@ impl CoordLog {
             genesis: BTreeMap::new(),
             purges: BTreeMap::new(),
             names: BTreeMap::new(),
+            reclaims: BTreeMap::new(),
         }
     }
 
@@ -806,6 +816,7 @@ impl CoordLog {
             Err(Stop::Final(f)) => return self.finalize(chronicle, s, f),
             // As step 5: the pending submission stays; the Warden retries it.
             Err(Stop::Unreadable) => return Answer::Refused(Transient::NotReadable),
+            Err(Stop::Quarantined(o)) => return Answer::Refused(Transient::Quarantined(o)),
         };
         // 8. Append.
         self.log.push(Entry {
@@ -1522,18 +1533,30 @@ impl CoordLog {
                     "neither TemplateReady nor GenesisRefused",
                 )?;
             }
-            ContractRecord::ReclaimClaimed { object_key } => {
+            // Review fix 2a: every reclaim of a key has its number, the
+            // count of its reclaims completed, so the n-th is its own
+            // operation and a stale retry of an earlier one finds it done.
+            ContractRecord::ReclaimClaimed { object_key, n } => {
                 let o = ObjectId::content(*object_key);
+                need(
+                    *n == self.reclaims_done(object_key),
+                    "not the key's next reclaim",
+                )?;
                 need(!self.holds.values().any(|h| h.object == o), "held")?;
                 need(!self.claims.contains_key(&o), "claimed")?;
                 need(!self.quarantined(&o, _now), "quarantined")?;
                 fx.claims.push((o, ClaimBy::Reclaim));
             }
-            ContractRecord::ReclaimComplete { object_key, .. } => {
+            ContractRecord::ReclaimComplete { object_key, n, .. } => {
                 let o = ObjectId::content(*object_key);
-                need(self.claims.get(&o) == Some(&ClaimBy::Reclaim), "no claim")?;
+                need(
+                    *n == self.reclaims_done(object_key)
+                        && self.claims.get(&o) == Some(&ClaimBy::Reclaim),
+                    "no open claim with this number",
+                )?;
                 gone(store.lookup(&o), "not deleted")?;
                 fx.resolve_claims.push(o);
+                fx.changes.push(Change::ReclaimDone(*object_key.as_bytes()));
             }
             // D49: any Chronicle with a current epoch may submit it; the row
             // admits only a ready Template and the next version of the name.
@@ -1633,6 +1656,11 @@ impl CoordLog {
             .any(|a| a.started.candidate_id == *candidate && a.finished.is_none())
     }
 
+    /// How many reclaims of content `key` completed: the next one's number.
+    fn reclaims_done(&self, key: &HashVal) -> u64 {
+        self.reclaims.get(key.as_bytes()).copied().unwrap_or(0)
+    }
+
     fn quarantined(&self, o: &ObjectId, now: u64) -> bool {
         self.quarantine.get(o).is_some_and(|&until| now < until)
     }
@@ -1646,7 +1674,7 @@ impl CoordLog {
                 return Err(Final::Claimed(o.clone()).into());
             }
             if self.quarantined(o, now) {
-                return Err(Final::Quarantined(o.clone()).into());
+                return Err(Stop::Quarantined(o.clone()));
             }
             match store.lookup(o) {
                 Lookup::Found(()) => {}
@@ -1793,6 +1821,7 @@ impl CoordLog {
                         ps.ended = true;
                     }
                 }
+                Change::ReclaimDone(k) => *self.reclaims.entry(k).or_default() += 1,
             }
         }
     }
@@ -2523,6 +2552,7 @@ mod tests {
             op,
             ContractRecord::ReclaimClaimed {
                 object_key: f.k.artifact_key,
+                n: 0,
             },
         );
         assert_eq!(
@@ -2534,7 +2564,8 @@ mod tests {
             w.refused(
                 op,
                 ContractRecord::ReclaimClaimed {
-                    object_key: h(0x30)
+                    object_key: h(0x30),
+                    n: 0,
                 }
             ),
             Final::Predicate("held".into()),
@@ -2546,6 +2577,7 @@ mod tests {
             op,
             ContractRecord::ReclaimComplete {
                 object_key: f.k.artifact_key,
+                n: 0,
                 outcome: crate::contract::ReclaimOutcome::Deleted,
             },
         );
@@ -2553,9 +2585,94 @@ mod tests {
         let mut k2 = f.k.clone();
         k2.nominated_at = Lsn::new(99);
         assert_eq!(
-            w.refused(f.v, ContractRecord::Candidate(Box::new(k2))),
-            Final::Quarantined(ObjectId::content(f.k.artifact_key))
+            w.submit(
+                f.v,
+                Submitted::Contract(ContractRecord::Candidate(Box::new(k2)))
+            ),
+            Answer::Refused(Transient::Quarantined(ObjectId::content(f.k.artifact_key))),
+            "for now (R2a)"
         );
+    }
+
+    /// Review fix 2a, the reviewers' trace: a key reclaimed, put and held
+    /// again, released, is reclaimed again as reclaim 1.  The number must
+    /// be the next one; a completion must name the open claim's; a stale
+    /// retry of reclaim 0 finds it done, so a deleter that checks its claim
+    /// is still open deletes nothing.  R2a: a hold within the quarantine
+    /// is refused for now, then accepted once it has passed.
+    #[test]
+    fn trace_a_key_is_reclaimed_again_after_it_was_held_again() {
+        use crate::contract::{logical_id, LogicalKey, ReclaimOutcome};
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let op = cid(0xEE);
+        w.log.claim_chronicle(op, ClaimAuthority::Vessel).unwrap();
+        let key = f.k.artifact_key;
+        let o = ObjectId::content(key);
+        let claim = |n| ContractRecord::ReclaimClaimed { object_key: key, n };
+        let done = |n| ContractRecord::ReclaimComplete {
+            object_key: key,
+            n,
+            outcome: ReclaimOutcome::Deleted,
+        };
+
+        // Reclaim 0.
+        assert_eq!(
+            w.refused(op, claim(1)),
+            Final::Predicate("not the key's next reclaim".into())
+        );
+        w.ok(op, claim(0));
+        store.del(&o);
+        assert_eq!(
+            w.refused(op, done(1)),
+            Final::Predicate("no open claim with this number".into())
+        );
+        w.ok(op, done(0));
+        assert!(!w.log.is_claimed(&o));
+        assert_eq!(
+            w.refused(op, claim(2)),
+            Final::Predicate("not the key's next reclaim".into())
+        );
+
+        // Put again: within the quarantine a hold waits; after it, held.
+        store.put(o.clone());
+        let cand = || Submitted::Contract(ContractRecord::Candidate(Box::new(f.k.clone())));
+        assert_eq!(
+            w.submit(f.v, cand()),
+            Answer::Refused(Transient::Quarantined(o.clone()))
+        );
+        w.now += cfg().deleted_quarantine;
+        assert!(matches!(w.submit(f.v, cand()), Answer::Accepted { .. }));
+        assert_eq!(w.refused(op, claim(1)), Final::Predicate("held".into()));
+        // A stale retry of reclaim 0: its completion is in the log.
+        assert!(w
+            .log
+            .query_logical(logical_id(&LogicalKey::ReclaimDone(key, 0)))
+            .is_some());
+
+        // Released: reclaim 1.
+        w.ok(
+            f.v,
+            ContractRecord::CandidateClosed(CandidateClosed {
+                candidate_id: f.k.candidate_id,
+                how: CloseKind::Cancelled { authority: auth() },
+            }),
+        );
+        w.ok(op, claim(1));
+        assert!(w.log.is_claimed(&o));
+        store.del(&o);
+        w.ok(op, done(1));
+        assert!(!w.log.is_claimed(&o));
+        assert!(w
+            .log
+            .query_logical(logical_id(&LogicalKey::Reclaim(key, 1)))
+            .is_some());
     }
 
     /// Several holds of one Chronicle on K are released together; an
@@ -2872,12 +2989,14 @@ mod tests {
             op,
             ContractRecord::ReclaimClaimed {
                 object_key: h(0x99),
+                n: 0,
             },
         );
         store.del(&k);
         store.unreadable.borrow_mut().insert(k.clone());
         let done = ContractRecord::ReclaimComplete {
             object_key: h(0x99),
+            n: 0,
             outcome: crate::contract::ReclaimOutcome::Deleted,
         };
         w.not_readable(op, 1, &done);
