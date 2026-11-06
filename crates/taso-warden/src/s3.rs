@@ -256,6 +256,62 @@ fn success(
     Err(io::Error::other(format!("{what}: HTTP {code} {code_text}")))
 }
 
+impl S3Store {
+    /// Every key under `prefix` with its raw `LastModified`, in key order,
+    /// through every page of `ListObjectsV2`.
+    fn list_pages(&self, prefix: &str) -> io::Result<Vec<(String, Option<String>)>> {
+        if !valid_key(prefix) {
+            return Err(bad_key(prefix));
+        }
+        let dir = format!("{prefix}/");
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0u32;
+        loop {
+            // An endpoint that repeats its continuation token, or never
+            // runs out of them, would keep this loop going through
+            // requests that each succeed; both are errors here, never a
+            // listing cut short and handed back as complete.
+            pages += 1;
+            if pages > MAX_LIST_PAGES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("list {prefix}: more than {MAX_LIST_PAGES} pages; the endpoint does not finish"),
+                ));
+            }
+            let mut query = vec![("list-type", "2"), ("prefix", dir.as_str())];
+            if let Some(t) = &token {
+                query.push(("continuation-token", t.as_str()));
+            }
+            let path = format!("/{}", self.config.bucket);
+            let what = format!("list {prefix}");
+            let req = self.request("GET", &path, &query, EMPTY_SHA256, &[]);
+            let body = success(&what, self.send(&what, req, ())?)?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{what}: {e}")))?;
+            let page = parse_list(&body)?;
+            keys.extend(
+                page.keys
+                    .into_iter()
+                    .filter(|(k, _)| k.starts_with(&dir) && valid_key(k)),
+            );
+            match page.next {
+                Some(t) if token.as_deref() == Some(t.as_str()) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("list {prefix}: the endpoint repeated its continuation token; the listing does not advance"),
+                    ));
+                }
+                Some(t) => token = Some(t),
+                None => break,
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+}
+
 impl ObjectStore for S3Store {
     fn put(&self, key: &str, data: &mut dyn Read) -> io::Result<u64> {
         if !valid_key(key) {
@@ -301,55 +357,29 @@ impl ObjectStore for S3Store {
     }
 
     fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
-        if !valid_key(prefix) {
-            return Err(bad_key(prefix));
-        }
-        let dir = format!("{prefix}/");
-        let mut keys = Vec::new();
-        let mut token: Option<String> = None;
-        let mut pages = 0u32;
-        loop {
-            // An endpoint that repeats its continuation token, or never
-            // runs out of them, would keep this loop going through
-            // requests that each succeed; both are errors here, never a
-            // listing cut short and handed back as complete.
-            pages += 1;
-            if pages > MAX_LIST_PAGES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("list {prefix}: more than {MAX_LIST_PAGES} pages; the endpoint does not finish"),
-                ));
-            }
-            let mut query = vec![("list-type", "2"), ("prefix", dir.as_str())];
-            if let Some(t) = &token {
-                query.push(("continuation-token", t.as_str()));
-            }
-            let path = format!("/{}", self.config.bucket);
-            let what = format!("list {prefix}");
-            let req = self.request("GET", &path, &query, EMPTY_SHA256, &[]);
-            let body = success(&what, self.send(&what, req, ())?)?
-                .body_mut()
-                .read_to_string()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{what}: {e}")))?;
-            let page = parse_list(&body)?;
-            keys.extend(
-                page.keys
-                    .into_iter()
-                    .filter(|k| k.starts_with(&dir) && valid_key(k)),
-            );
-            match page.next {
-                Some(t) if token.as_deref() == Some(t.as_str()) => {
-                    return Err(io::Error::new(
+        Ok(self
+            .list_pages(prefix)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect())
+    }
+
+    /// Each entry's `LastModified` (a PUT again makes it new).  An entry
+    /// without one, or one that does not parse, fails the listing: an age
+    /// is never guessed.
+    fn list_times(&self, prefix: &str) -> io::Result<Vec<(String, SystemTime)>> {
+        self.list_pages(prefix)?
+            .into_iter()
+            .map(|(k, t)| {
+                let at = t.as_deref().and_then(parse_last_modified).ok_or_else(|| {
+                    io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("list {prefix}: the endpoint repeated its continuation token; the listing does not advance"),
-                    ));
-                }
-                Some(t) => token = Some(t),
-                None => break,
-            }
-        }
-        keys.sort();
-        Ok(keys)
+                        format!("list {prefix}: {k} has no LastModified the Warden reads ({t:?})"),
+                    )
+                })?;
+                Ok((k, at))
+            })
+            .collect()
     }
 
     /// HEAD, then DELETE.  S3 answers a DELETE of a missing key with 204
@@ -379,7 +409,8 @@ impl ObjectStore for S3Store {
 // ── ListObjectsV2 ───────────────────────────────────────────────────
 
 struct Page {
-    keys: Vec<String>,
+    /// Each key, with its `LastModified` as given.
+    keys: Vec<(String, Option<String>)>,
     next: Option<String>,
 }
 
@@ -418,7 +449,8 @@ fn parse_list(body: &str) -> io::Result<Page> {
         let key = between(item, "<Key>", "</Key>").ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "a <Contents> without <Key>")
         })?;
-        keys.push(xml_unescape(key));
+        let modified = between(item, "<LastModified>", "</LastModified>").map(str::to_string);
+        keys.push((xml_unescape(key), modified));
         rest = &tail[end..];
     }
     let truncated = between(body, "<IsTruncated>", "</IsTruncated>") == Some("true");
@@ -539,6 +571,50 @@ fn amz_date(t: SystemTime) -> String {
         rem % 3600 / 60,
         rem % 60
     )
+}
+
+/// A `LastModified` of `ListObjectsV2`: `YYYY-MM-DDTHH:MM:SS[.fraction]Z`
+/// in UTC (S3 and Garage), to the second.  Anything else is `None`.
+fn parse_last_modified(s: &str) -> Option<SystemTime> {
+    let b = s.as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let d = b.get(r)?;
+        if d.is_empty() || !d.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(d).ok()?.parse().ok()
+    };
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || *b.last()? != b'Z'
+    {
+        return None;
+    }
+    match &b[19..b.len() - 1] {
+        [] => {}
+        [b'.', frac @ ..] if !frac.is_empty() && frac.iter().all(u8::is_ascii_digit) => {}
+        _ => return None,
+    }
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 from a civil date (Howard Hinnant's algorithm),
+    // the inverse of amz_date's.
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hh * 3600 + mm * 60 + ss;
+    UNIX_EPOCH.checked_add(std::time::Duration::from_secs(u64::try_from(secs).ok()?))
 }
 
 /// The `Authorization` header for a request.  `headers` are lowercase
@@ -664,12 +740,21 @@ pub(crate) mod tests {
     fn list_pages_parse() {
         let page = parse_list(
             "<?xml version=\"1.0\"?><ListBucketResult><IsTruncated>true</IsTruncated>\
-             <Contents><Key>v/a/pack/1</Key><Size>3</Size></Contents>\
+             <Contents><Key>v/a/pack/1</Key><LastModified>2026-11-06T10:00:00.000Z</LastModified><Size>3</Size></Contents>\
              <Contents><Key>v/a/pack/2</Key></Contents>\
              <NextContinuationToken>tok&amp;en</NextContinuationToken></ListBucketResult>",
         )
         .unwrap();
-        assert_eq!(page.keys, vec!["v/a/pack/1", "v/a/pack/2"]);
+        assert_eq!(
+            page.keys,
+            vec![
+                (
+                    "v/a/pack/1".to_string(),
+                    Some("2026-11-06T10:00:00.000Z".to_string())
+                ),
+                ("v/a/pack/2".to_string(), None)
+            ]
+        );
         assert_eq!(page.next.as_deref(), Some("tok&en"));
         let last =
             parse_list("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>")
@@ -684,6 +769,46 @@ pub(crate) mod tests {
             "<ListBucketResult><Contents><Size>1</Size></Contents></ListBucketResult>"
         )
         .is_err());
+    }
+
+    /// The reclaimer's ages (review fix 2a): `LastModified` read to the
+    /// second, as amz_date writes the same instants; anything else is no
+    /// age at all, never a guessed one.
+    #[test]
+    fn last_modified_is_read_to_the_second_or_not_at_all() {
+        for secs in [0u64, 951_782_400, 1_762_423_200, 4_102_444_799] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs);
+            let a = amz_date(t); // YYYYMMDDTHHMMSSZ
+            let iso = format!(
+                "{}-{}-{}T{}:{}:{}.123Z",
+                &a[0..4],
+                &a[4..6],
+                &a[6..8],
+                &a[9..11],
+                &a[11..13],
+                &a[13..15]
+            );
+            assert_eq!(parse_last_modified(&iso), Some(t), "{iso}");
+            assert_eq!(parse_last_modified(&iso.replace(".123", "")), Some(t));
+        }
+        assert_eq!(
+            parse_last_modified("2026-11-06T10:00:00Z"),
+            Some(UNIX_EPOCH + Duration::from_secs(1_793_959_200))
+        );
+        for bad in [
+            "",
+            "2026-11-06",
+            "2026-11-06T10:00:00",
+            "2026-11-06 10:00:00Z",
+            "2026-13-06T10:00:00Z",
+            "2026-11-06T24:00:00Z",
+            "2026-11-06T10:00:00.Z",
+            "2026-11-06T10:00:00+00:00",
+            "Thu, 06 Nov 2026 10:00:00 GMT",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert_eq!(parse_last_modified(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -978,6 +1103,19 @@ class H(http.server.BaseHTTPRequestHandler):
             .unwrap();
         assert_eq!(a, "again");
         assert_eq!(store.list(&dir).unwrap(), vec![k("a"), k("sub/b")]);
+        // Every entry has an age the Warden reads, from Garage's clock: a
+        // minute's skew either way is allowed (review fix 2a).
+        let now = SystemTime::now();
+        for (key, at) in store.list_times(&dir).unwrap() {
+            let skew = at
+                .duration_since(now)
+                .or_else(|_| now.duration_since(at))
+                .unwrap();
+            assert!(
+                skew < Duration::from_secs(60),
+                "{key}: {at:?} against {now:?}"
+            );
+        }
         // More keys than one page (Garage pages at 1000).
         for i in 0..1005 {
             store
