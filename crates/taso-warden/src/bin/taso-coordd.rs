@@ -22,6 +22,13 @@
 //! reads the store through it ([`taso_warden::coordstore`], P4 spec §0.4,
 //! D35, D36).  Without it the log can read nothing, so every contract
 //! accept is refused `NotReadable`; ownership and appends work as before.
+//!
+//! The same file may set `"deleted_quarantine_seconds"`: how long after a
+//! reclaim or a purge deletes an object a new hold on it waits (default
+//! 3600, at least 60, at most 30 days; see
+//! [`taso_warden::coordinator::DELETED_QUARANTINE`]).  It is fixed when the
+//! coordinator's database is made: a later start with another value is
+//! refused, naming the one it was made with.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -30,7 +37,6 @@ use std::sync::Arc;
 use taso_core::model::WardenId;
 use taso_warden::coordinator::{Coord, Coordinator, LogConfig};
 use taso_warden::coordsrv::{Server, ServerOptions};
-use taso_warden::coordstore::CoordStore;
 use taso_warden::daemon::StoreConf;
 
 const USAGE: &str = "usage: taso-coordd <coord.redb> <socket> [--peer UID=WARDEN]... \
@@ -45,20 +51,32 @@ struct Args {
     store_config: Option<String>,
 }
 
-/// What `--store-config` names: the Wardens' store and prefix.
+/// What `--store-config` names: the Wardens' store and prefix, and the
+/// quarantine.
 #[derive(Debug, PartialEq, Eq)]
 struct StoreSpec {
     store: StoreConf,
     prefix: String,
+    deleted_quarantine: u64,
 }
 
 /// Read a `--store-config` file's text.
 fn store_spec(text: &str) -> Result<StoreSpec, String> {
     let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let obj = v.as_object().ok_or("must be a JSON object")?;
-    if let Some(k) = obj.keys().find(|k| *k != "store" && *k != "prefix") {
+    if let Some(k) = obj
+        .keys()
+        .find(|k| !["store", "prefix", "deleted_quarantine_seconds"].contains(&k.as_str()))
+    {
         return Err(format!("unknown key {k:?}"));
     }
+    let deleted_quarantine = match obj.get("deleted_quarantine_seconds") {
+        None => taso_warden::coordinator::DELETED_QUARANTINE,
+        Some(v) => taso_warden::coordinator::deleted_quarantine(
+            v.as_u64()
+                .ok_or("\"deleted_quarantine_seconds\" must be a non-negative integer")?,
+        )?,
+    };
     let prefix = match obj.get("prefix") {
         None => "vessels".to_string(),
         Some(serde_json::Value::String(p)) => p.clone(),
@@ -67,6 +85,7 @@ fn store_spec(text: &str) -> Result<StoreSpec, String> {
     Ok(StoreSpec {
         store: StoreConf::parse_in(&v).map_err(|e| e.to_string())?,
         prefix,
+        deleted_quarantine,
     })
 }
 
@@ -193,8 +212,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            config.store = Arc::new(CoordStore::new(store, &spec.prefix));
-            format!("reads the store under {:?}", spec.prefix)
+            config = taso_warden::coordinator::reading_store(
+                store,
+                &spec.prefix,
+                spec.deleted_quarantine,
+            );
+            format!(
+                "reads the store under {:?}; quarantine {} s",
+                spec.prefix, spec.deleted_quarantine
+            )
         }
     };
     let coord: Arc<dyn Coord> = match Coordinator::open_with(&db, config) {
@@ -317,9 +343,14 @@ mod tests {
             store_spec(r#"{"store": "/srv/taso/store"}"#).unwrap(),
             StoreSpec {
                 store: StoreConf::Local("/srv/taso/store".into()),
-                prefix: "vessels".into()
+                prefix: "vessels".into(),
+                deleted_quarantine: taso_warden::coordinator::DELETED_QUARANTINE,
             }
         );
+        let q = store_spec(r#"{"store": "/s", "deleted_quarantine_seconds": 600}"#).unwrap();
+        assert_eq!(q.deleted_quarantine, 600);
+        let e = store_spec(r#"{"store": "/s", "deleted_quarantine_seconds": 5}"#).unwrap_err();
+        assert!(e.contains("store.deleted_quarantine must be"), "{e}");
         let s3 = store_spec(
             r#"{"store": {"s3": {"endpoint": "http://127.0.0.1:3900", "bucket": "taso",
                 "access_key_id": "GK1", "secret_key_file": "/root/s3.secret"}},
