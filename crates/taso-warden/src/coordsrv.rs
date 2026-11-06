@@ -2496,30 +2496,32 @@ mod tests {
         ]
     }
 
+    use taso_core::coordlog::{Lookup, ObjectId};
+
     /// A store that has everything: every accept is readable.
     struct Everything;
     impl taso_core::coordlog::StoreView for Everything {
         fn carries(&self, _: ChronicleId, _: &str, _: HashVal) -> bool {
             true
         }
-        fn exists(&self, _: &taso_core::coordlog::ObjectId) -> bool {
-            true
+        fn lookup(&self, _: &ObjectId) -> Lookup<()> {
+            Lookup::Found(())
         }
-        fn inventory(&self, _: HashVal) -> Option<taso_core::contract::Inventory> {
-            None
+        fn lookup_inventory(&self, _: HashVal) -> Lookup<taso_core::contract::Inventory> {
+            Lookup::NotFound
         }
         fn fs_packs(&self, _: ChronicleId) -> Option<Vec<taso_core::contract::InventoryItem>> {
             Some(Vec::new())
         }
-        fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<taso_core::coordlog::ObjectId> {
-            Vec::new()
+        fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Lookup<Vec<ObjectId>> {
+            Lookup::Found(Vec::new())
         }
-        fn verify_replacement(
+        fn lookup_replacement(
             &self,
             _: ChronicleId,
             _: &taso_core::contract::InventoryItem,
-        ) -> Option<HashVal> {
-            None
+        ) -> Lookup<HashVal> {
+            Lookup::NotFound
         }
     }
 

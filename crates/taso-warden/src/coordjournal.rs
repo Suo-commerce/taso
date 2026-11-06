@@ -27,8 +27,8 @@ use std::fmt;
 use taso_core::canon::{Canon, Canonical};
 use taso_core::contract::{ContractRecord, Inventory, InventoryItem};
 use taso_core::coordlog::{
-    Answer, ChronicleView, ClaimAuthority, ClaimError, CoordLog, Final, Head, ObjectId, StoreView,
-    SubmissionStatus, Submitted, Transient,
+    Answer, ChronicleView, ClaimAuthority, ClaimError, CoordLog, Final, Head, Lookup, ObjectId,
+    StoreView, SubmissionStatus, Submitted, Transient,
 };
 use taso_core::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use taso_core::record::Payload;
@@ -305,6 +305,17 @@ const CALL_FS_PACKS: u8 = 3;
 const CALL_SEAL_CLOSURE: u8 = 4;
 const CALL_VERIFY_REPLACEMENT: u8 = 5;
 
+// The answers keep the encodings an older journal has (0 not found, 1
+// found; a closure's count), so it replays as recorded; review fix 5a
+// adds a third answer to each:
+/// An unreadable lookup, inventory or replacement (after tags 0 and 1).
+const UNREADABLE: u8 = 2;
+/// A closure the store holds no lineage for (a count no closure can
+/// have).
+const CLOSURE_NOT_FOUND: u64 = u64::MAX;
+/// A closure that could not be read.
+const CLOSURE_UNREADABLE: u64 = u64::MAX - 1;
+
 /// A [`StoreView`] that answers from `inner` and records each call and
 /// its answer.
 pub struct Recorder<'a> {
@@ -335,20 +346,25 @@ impl StoreView for Recorder<'_> {
         o.bool(a);
         a
     }
-    fn exists(&self, object: &ObjectId) -> bool {
-        let a = self.inner.exists(object);
+    fn lookup(&self, object: &ObjectId) -> Lookup<()> {
+        let a = self.inner.lookup(object);
         let mut o = self.out.borrow_mut();
         call_exists(&mut o, object);
-        o.bool(a);
+        o.tag(match a {
+            Lookup::NotFound => 0,
+            Lookup::Found(()) => 1,
+            Lookup::Unreadable => UNREADABLE,
+        });
         a
     }
-    fn inventory(&self, key: HashVal) -> Option<Inventory> {
-        let a = self.inner.inventory(key);
+    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+        let a = self.inner.lookup_inventory(key);
         let mut o = self.out.borrow_mut();
         call_inventory(&mut o, key);
         match &a {
-            None => o.tag(0),
-            Some(inv) => o.tag(1).bytes(&inv.bytes()),
+            Lookup::NotFound => o.tag(0),
+            Lookup::Found(inv) => o.tag(1).bytes(&inv.bytes()),
+            Lookup::Unreadable => o.tag(UNREADABLE),
         };
         a
     }
@@ -369,23 +385,34 @@ impl StoreView for Recorder<'_> {
         }
         a
     }
-    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Vec<ObjectId> {
+    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Lookup<Vec<ObjectId>> {
         let a = self.inner.seal_closure(chronicle, seal);
         let mut o = self.out.borrow_mut();
         call_seal_closure(&mut o, chronicle, seal);
-        o.u64(a.len() as u64);
-        for obj in &a {
-            put_object(&mut o, obj);
+        match &a {
+            Lookup::Found(objects) => {
+                o.u64(objects.len() as u64);
+                for obj in objects {
+                    put_object(&mut o, obj);
+                }
+            }
+            Lookup::NotFound => {
+                o.u64(CLOSURE_NOT_FOUND);
+            }
+            Lookup::Unreadable => {
+                o.u64(CLOSURE_UNREADABLE);
+            }
         }
         a
     }
-    fn verify_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Option<HashVal> {
-        let a = self.inner.verify_replacement(chronicle, item);
+    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
+        let a = self.inner.lookup_replacement(chronicle, item);
         let mut o = self.out.borrow_mut();
         call_verify_replacement(&mut o, chronicle, item);
         match &a {
-            None => o.tag(0),
-            Some(h) => o.tag(1).fixed(h.as_bytes()),
+            Lookup::NotFound => o.tag(0),
+            Lookup::Found(h) => o.tag(1).fixed(h.as_bytes()),
+            Lookup::Unreadable => o.tag(UNREADABLE),
         };
         a
     }
@@ -492,22 +519,29 @@ impl StoreView for Replayer<'_> {
         call_carries(&mut c, chronicle, name, digest);
         self.expect(c, |r| r.bool()).unwrap_or(false)
     }
-    fn exists(&self, object: &ObjectId) -> bool {
+    fn lookup(&self, object: &ObjectId) -> Lookup<()> {
         let mut c = Canon::new();
         call_exists(&mut c, object);
-        self.expect(c, |r| r.bool()).unwrap_or(false)
+        self.expect(c, |r| match r.u8()? {
+            0 => Ok(Lookup::NotFound),
+            1 => Ok(Lookup::Found(())),
+            UNREADABLE => Ok(Lookup::Unreadable),
+            _ => Err(JournalError("bad lookup tag")),
+        })
+        .unwrap_or(Lookup::Unreadable)
     }
-    fn inventory(&self, key: HashVal) -> Option<Inventory> {
+    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
         let mut c = Canon::new();
         call_inventory(&mut c, key);
         self.expect(c, |r| match r.u8()? {
-            0 => Ok(None),
+            0 => Ok(Lookup::NotFound),
             1 => Inventory::decode(&r.bytes()?)
-                .map(Some)
+                .map(Lookup::Found)
                 .map_err(|_| JournalError("bad inventory")),
-            _ => Err(JournalError("bad option tag")),
+            UNREADABLE => Ok(Lookup::Unreadable),
+            _ => Err(JournalError("bad lookup tag")),
         })
-        .flatten()
+        .unwrap_or(Lookup::Unreadable)
     }
     fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>> {
         let mut c = Canon::new();
@@ -525,24 +559,30 @@ impl StoreView for Replayer<'_> {
         })
         .flatten()
     }
-    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Vec<ObjectId> {
+    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Lookup<Vec<ObjectId>> {
         let mut c = Canon::new();
         call_seal_closure(&mut c, chronicle, seal);
-        self.expect(c, |r| {
-            let n = r.count()?;
-            (0..n).map(|_| get_object(r)).collect()
+        self.expect(c, |r| match r.u64()? {
+            CLOSURE_NOT_FOUND => Ok(Lookup::NotFound),
+            CLOSURE_UNREADABLE => Ok(Lookup::Unreadable),
+            n if n > (r.b.len() - r.pos) as u64 => Err(JournalError("truncated")),
+            n => (0..n)
+                .map(|_| get_object(r))
+                .collect::<Result<_, _>>()
+                .map(Lookup::Found),
         })
-        .unwrap_or_default()
+        .unwrap_or(Lookup::Unreadable)
     }
-    fn verify_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Option<HashVal> {
+    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
         let mut c = Canon::new();
         call_verify_replacement(&mut c, chronicle, item);
         self.expect(c, |r| match r.u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(HashVal::from_bytes(r.fixed()?))),
-            _ => Err(JournalError("bad option tag")),
+            0 => Ok(Lookup::NotFound),
+            1 => Ok(Lookup::Found(HashVal::from_bytes(r.fixed()?))),
+            UNREADABLE => Ok(Lookup::Unreadable),
+            _ => Err(JournalError("bad lookup tag")),
         })
-        .flatten()
+        .unwrap_or(Lookup::Unreadable)
     }
 }
 
@@ -1217,51 +1257,123 @@ mod tests {
 
     /// A store that answers yes to everything, with one inventory item.
     struct Yes;
+    /// Chronicle 8's objects are not found, Chronicle 9's unreadable.
+    fn answer<T>(ch: ChronicleId, v: T) -> Lookup<T> {
+        if ch == c(8) {
+            Lookup::NotFound
+        } else if ch == c(9) {
+            Lookup::Unreadable
+        } else {
+            Lookup::Found(v)
+        }
+    }
     impl StoreView for Yes {
         fn carries(&self, _: ChronicleId, _: &str, _: HashVal) -> bool {
             true
         }
-        fn exists(&self, _: &ObjectId) -> bool {
-            true
+        fn lookup(&self, o: &ObjectId) -> Lookup<()> {
+            match o {
+                ObjectId::Pack(ch, _) => answer(ChronicleId::from_bytes(*ch), ()),
+                ObjectId::Content(_) => Lookup::Found(()),
+            }
         }
-        fn inventory(&self, _: HashVal) -> Option<Inventory> {
-            Some(Inventory::new(vec![]).unwrap())
+        fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+            match key.as_bytes()[0] {
+                8 => Lookup::NotFound,
+                9 => Lookup::Unreadable,
+                _ => Lookup::Found(Inventory::new(vec![]).unwrap()),
+            }
         }
         fn fs_packs(&self, ch: ChronicleId) -> Option<Vec<InventoryItem>> {
             // Chronicle 7 cannot be listed; the rest list to nothing.
             (ch != c(7)).then(Vec::new)
         }
-        fn seal_closure(&self, ch: ChronicleId, _: Lsn) -> Vec<ObjectId> {
-            vec![
-                ObjectId::pack(ch, "b"),
-                ObjectId::content(h(1)),
-                ObjectId::pack(ch, "a"),
-            ]
+        fn seal_closure(&self, ch: ChronicleId, _: Lsn) -> Lookup<Vec<ObjectId>> {
+            answer(
+                ch,
+                vec![
+                    ObjectId::pack(ch, "b"),
+                    ObjectId::content(h(1)),
+                    ObjectId::pack(ch, "a"),
+                ],
+            )
         }
-        fn verify_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Option<HashVal> {
-            Some(h(9))
+        fn lookup_replacement(&self, ch: ChronicleId, _: &InventoryItem) -> Lookup<HashVal> {
+            answer(ch, h(9))
+        }
+    }
+
+    fn item() -> InventoryItem {
+        InventoryItem {
+            pack: taso_core::contract::PackRef {
+                name: "p".into(),
+                digest: h(1),
+            },
+            sections: vec![Lsn::new(2)],
+            log_digest: h(3),
+            frames: taso_core::contract::FrameRange {
+                first: Lsn::new(1),
+                last: Lsn::new(2),
+            },
+            form: taso_core::contract::ReplacementForm::LogOnly,
         }
     }
 
     #[test]
     fn a_recording_replays_exactly_and_refuses_another_call() {
+        let inv = Inventory::new(vec![]).unwrap();
         let rec = Recorder::new(&Yes);
         assert!(rec.carries(c(1), "p", h(2)));
-        assert!(rec.exists(&ObjectId::content(h(3))));
-        assert_eq!(rec.inventory(h(4)), Some(Inventory::new(vec![]).unwrap()));
-        let closure = rec.seal_closure(c(1), Lsn::new(5));
+        assert_eq!(rec.lookup(&ObjectId::content(h(3))), Lookup::Found(()));
+        assert_eq!(rec.lookup_inventory(h(4)), Lookup::Found(inv.clone()));
+        let Lookup::Found(closure) = rec.seal_closure(c(1), Lsn::new(5)) else {
+            panic!()
+        };
         assert_eq!(closure.len(), 3);
         assert_eq!(rec.fs_packs(c(1)), Some(Vec::new()));
         assert_eq!(rec.fs_packs(c(7)), None, "unlistable is recorded as such");
+        // Review fix 5a: all three answers of every lookup.
+        for (ch, want) in [
+            (c(1), Lookup::Found(())),
+            (c(8), Lookup::NotFound),
+            (c(9), Lookup::Unreadable),
+        ] {
+            assert_eq!(rec.lookup(&ObjectId::pack(ch, "x")), want);
+        }
+        assert_eq!(rec.lookup_inventory(h(8)), Lookup::NotFound);
+        assert_eq!(rec.lookup_inventory(h(9)), Lookup::Unreadable);
+        assert_eq!(rec.seal_closure(c(8), Lsn::new(5)), Lookup::NotFound);
+        assert_eq!(rec.seal_closure(c(9), Lsn::new(5)), Lookup::Unreadable);
+        for ch in [1, 8, 9] {
+            rec.lookup_replacement(c(ch), &item());
+        }
         let bytes = rec.into_bytes();
 
         let rep = Replayer::new(&bytes);
         assert!(rep.carries(c(1), "p", h(2)));
-        assert!(rep.exists(&ObjectId::content(h(3))));
-        assert_eq!(rep.inventory(h(4)), Some(Inventory::new(vec![]).unwrap()));
-        assert_eq!(rep.seal_closure(c(1), Lsn::new(5)), closure, "order kept");
+        assert_eq!(rep.lookup(&ObjectId::content(h(3))), Lookup::Found(()));
+        assert_eq!(rep.lookup_inventory(h(4)), Lookup::Found(inv));
+        assert_eq!(
+            rep.seal_closure(c(1), Lsn::new(5)),
+            Lookup::Found(closure),
+            "order kept"
+        );
         assert_eq!(rep.fs_packs(c(1)), Some(Vec::new()));
         assert_eq!(rep.fs_packs(c(7)), None, "and replays as such");
+        for (ch, want) in [
+            (c(1), Lookup::Found(())),
+            (c(8), Lookup::NotFound),
+            (c(9), Lookup::Unreadable),
+        ] {
+            assert_eq!(rep.lookup(&ObjectId::pack(ch, "x")), want);
+        }
+        assert_eq!(rep.lookup_inventory(h(8)), Lookup::NotFound);
+        assert_eq!(rep.lookup_inventory(h(9)), Lookup::Unreadable);
+        assert_eq!(rep.seal_closure(c(8), Lsn::new(5)), Lookup::NotFound);
+        assert_eq!(rep.seal_closure(c(9), Lsn::new(5)), Lookup::Unreadable);
+        assert_eq!(rep.lookup_replacement(c(1), &item()), Lookup::Found(h(9)));
+        assert_eq!(rep.lookup_replacement(c(8), &item()), Lookup::NotFound);
+        assert_eq!(rep.lookup_replacement(c(9), &item()), Lookup::Unreadable);
         assert!(!rep.diverged.get());
         assert_eq!(rep.pos.get(), bytes.len());
 
@@ -1269,9 +1381,40 @@ mod tests {
         let rep = Replayer::new(&bytes);
         assert!(!rep.carries(c(1), "q", h(2)));
         assert!(rep.diverged.get());
-        // Asked past the end: diverged.
+        // Asked past the end: diverged, and never "not found".
         let rep = Replayer::new(&[]);
-        assert!(!rep.exists(&ObjectId::content(h(3))));
+        assert_eq!(rep.lookup(&ObjectId::content(h(3))), Lookup::Unreadable);
         assert!(rep.diverged.get());
+    }
+
+    /// A journal written before review fix 5a (yes/no answers, a closure
+    /// as a plain list) replays as it was recorded.
+    #[test]
+    fn an_older_recording_replays_unchanged() {
+        let mut o = Canon::new();
+        call_exists(&mut o, &ObjectId::content(h(3)));
+        o.bool(true);
+        call_exists(&mut o, &ObjectId::content(h(4)));
+        o.bool(false);
+        call_inventory(&mut o, h(5));
+        o.tag(0);
+        call_seal_closure(&mut o, c(1), Lsn::new(5));
+        o.u64(1);
+        put_object(&mut o, &ObjectId::pack(c(1), "unreadable"));
+        call_verify_replacement(&mut o, c(1), &item());
+        o.tag(1).fixed(h(9).as_bytes());
+        let bytes = o.into_bytes();
+        let rep = Replayer::new(&bytes);
+        assert_eq!(rep.lookup(&ObjectId::content(h(3))), Lookup::Found(()));
+        assert_eq!(rep.lookup(&ObjectId::content(h(4))), Lookup::NotFound);
+        assert_eq!(rep.lookup_inventory(h(5)), Lookup::NotFound);
+        assert_eq!(
+            rep.seal_closure(c(1), Lsn::new(5)),
+            Lookup::Found(vec![ObjectId::pack(c(1), "unreadable")]),
+            "the old marker replays as the list it was"
+        );
+        assert_eq!(rep.lookup_replacement(c(1), &item()), Lookup::Found(h(9)));
+        assert!(!rep.diverged.get());
+        assert_eq!(rep.pos.get(), bytes.len());
     }
 }

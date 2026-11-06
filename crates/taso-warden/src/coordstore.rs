@@ -8,34 +8,38 @@
 //!
 //! - **`carries`** reads the pack's header and log, verified against the
 //!   log digest, on every accept, and looks for the record by digest.
-//! - **`exists`** verifies an object the first time it is asked about it
+//! - **`lookup`** verifies an object the first time it is asked about it
 //!   — a content object read whole and its key recomputed under its
 //!   kind's domain; a pack's header and log — and after that, until this
 //!   process ends, only checks it is still there (D36).
-//! - **`inventory`** reads the inventory object and checks its key.
+//! - **`lookup_inventory`** reads the inventory object and checks its key.
 //! - **`fs_packs`** reads every fs-bearing pack of the Chronicle whole,
 //!   trailer included ([`Packs::inventory_item`]); purges are rare.
 //! - **`seal_closure`** lists the packs restoring a Seal needs, with its
 //!   parent's closure for a fork or a succession (§2.1), from pack names
 //!   and the Lineage record.
-//! - **`verify_replacement`** is [`Packs::verify_replacement`].
+//! - **`lookup_replacement`** is [`Packs::verify_replacement`].
 //!
-//! A store error answers "no" (not readable, not there): the coordinator
-//! refuses rather than guesses, and the caller may submit again.
+//! Every read has three answers (review fix 5a): found and verified, the
+//! store's own not-found, or unreadable.  Unreadable is any other store
+//! error (a timeout, a permission, an outage) or bytes that do not verify
+//! (a store-integrity fault, logged as one).  It is never taken as an
+//! absence: the coordinator refuses for now and the Warden retries.
 //!
 //! Normative reference: `Taso_spec_p4_contracts` rev. 12, BLAKE3
 //! `37c75f30580bf3edd79674be38702d7893af413813bbfe6d4585231e9477144a`.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use taso_core::contract::{object_key, Inventory, InventoryItem, ObjectKind};
-use taso_core::coordlog::{ObjectId, StoreView, Submitted};
+use taso_core::coordlog::{Lookup, ObjectId, StoreView, Submitted};
 use taso_core::envelope::{ChronicleId, HashVal, Lsn};
 use taso_core::record::{Origin, Payload};
 
-use crate::pack::{name_bounds, Packs};
+use crate::pack::{name_bounds, PackError, Packs};
 use crate::ship::{NoSend, ObjectStore};
 
 /// The content-addressed kinds, in the order the coordinator looks for a
@@ -76,11 +80,6 @@ pub fn object_key_path(prefix: &str, kind: ObjectKind, key: HashVal) -> Option<S
 /// How deep a closure follows parents before it gives up (fail closed).
 const MAX_LINEAGE_DEPTH: usize = 64;
 
-/// The name a closure reports for what it could not read: no pack has it,
-/// so a hold on it fails and the accept is refused (fail closed: a
-/// closure is never silently smaller than it should be).
-const UNREADABLE: &str = "unreadable";
-
 /// The coordinator's view of an object store.
 pub struct CoordStore {
     store: Arc<dyn ObjectStore + Send + Sync>,
@@ -120,76 +119,98 @@ impl CoordStore {
     }
 
     /// Read a content object whole and check its key under `kind`.
-    /// `Some(true)` verified, `Some(false)` there but wrong (an integrity
-    /// fault), `None` not there or not readable.
-    fn verify_content(&self, kind: ObjectKind, key: HashVal) -> Option<bool> {
-        let path = object_key_path(&self.prefix, kind, key)?;
-        let mut r = self.store.get(&path).ok()??;
+    fn verify_content(&self, kind: ObjectKind, key: HashVal) -> Lookup<()> {
+        let Some(path) = object_key_path(&self.prefix, kind, key) else {
+            return Lookup::NotFound;
+        };
+        let mut r = match self.store.get(&path) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Lookup::NotFound,
+            Err(e) => return failed(&path, e, false),
+        };
         let mut h = blake3::Hasher::new_derive_key(kind.prefix());
-        let mut buf = vec![0u8; 1 << 16];
-        loop {
-            match r.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    h.update(&buf[..n]);
-                }
-                Err(_) => return None,
-            }
+        if let Err(e) = std::io::copy(&mut r, &mut h) {
+            return failed(&path, e, false);
         }
-        let ok = h.finalize().as_bytes() == key.as_bytes();
-        if !ok {
-            eprintln!("taso-coordd: store integrity: {path} does not hash to its key");
+        if h.finalize().as_bytes() != key.as_bytes() {
+            return failed(&path, "does not hash to its key", true);
         }
-        Some(ok)
+        Lookup::Found(())
     }
 
-    fn content_exists(&self, key: HashVal) -> bool {
+    fn content_lookup(&self, key: HashVal) -> Lookup<()> {
         let o = ObjectId::content(key);
         if let Some(Some(kind)) = self.known(&o) {
-            return object_key_path(&self.prefix, kind, key)
-                .is_some_and(|p| self.store.exists(&p).unwrap_or(false));
+            let Some(path) = object_key_path(&self.prefix, kind, key) else {
+                return Lookup::NotFound;
+            };
+            return match self.store.exists(&path) {
+                Ok(true) => Lookup::Found(()),
+                Ok(false) => Lookup::NotFound,
+                Err(e) => failed(&path, e, false),
+            };
         }
-        // The kind is the key's domain: at most one kind holds it.
+        // The kind is the key's domain: at most one kind holds it.  Gone
+        // only if every kind answered not-found.
+        let mut unreadable = false;
         for kind in CONTENT_KINDS {
             match self.verify_content(kind, key) {
-                Some(true) => {
+                Lookup::Found(()) => {
                     self.remember(o, Some(kind));
-                    return true;
+                    return Lookup::Found(());
                 }
-                Some(false) => return false,
-                None => {}
+                Lookup::NotFound => {}
+                Lookup::Unreadable => unreadable = true,
             }
         }
-        false
+        if unreadable {
+            Lookup::Unreadable
+        } else {
+            Lookup::NotFound
+        }
     }
 
-    fn pack_exists(&self, c: ChronicleId, name: &str) -> bool {
+    fn pack_lookup(&self, c: ChronicleId, name: &str) -> Lookup<()> {
         let o = ObjectId::pack(c, name);
         let Some(packs) = self.packs(c) else {
-            return false;
+            return Lookup::Unreadable;
         };
         if self.known(&o).is_some() {
-            return packs.has_pack(name).unwrap_or(false);
+            return match packs.has_pack(name) {
+                Ok(true) => Lookup::Found(()),
+                Ok(false) => Lookup::NotFound,
+                Err(e) => pack_failed(name, e),
+            };
         }
         match packs.read_pack_log(name) {
             Ok(Some(_)) => {
                 self.remember(o, None);
-                true
+                Lookup::Found(())
             }
-            _ => false,
+            Ok(None) => Lookup::NotFound,
+            Err(e) => pack_failed(name, e),
         }
     }
 
-    fn closure(&self, c: ChronicleId, seal: Lsn, depth: usize, out: &mut Vec<ObjectId>) {
-        let unreadable = |out: &mut Vec<ObjectId>| out.push(ObjectId::pack(c, UNREADABLE));
+    /// Push the closure of `c` at `seal` onto `out`: `Found` when it is
+    /// complete.
+    fn closure(
+        &self,
+        c: ChronicleId,
+        seal: Lsn,
+        depth: usize,
+        out: &mut Vec<ObjectId>,
+    ) -> Lookup<()> {
         if depth > MAX_LINEAGE_DEPTH {
-            return unreadable(out);
+            eprintln!("taso-coordd: the lineage of {c:?} is deeper than {MAX_LINEAGE_DEPTH}");
+            return Lookup::NotFound;
         }
         let Some(packs) = self.packs(c) else {
-            return unreadable(out);
+            return Lookup::Unreadable;
         };
-        let Ok(names) = packs.pack_names() else {
-            return unreadable(out);
+        let names = match packs.pack_names() {
+            Ok(n) => n,
+            Err(e) => return pack_failed(&format!("the packs of {c:?}"), e),
         };
         let mut first = None;
         for name in names {
@@ -205,25 +226,54 @@ impl CoordStore {
         }
         // A parent is named by the Lineage record, lsn 1, in the pack that
         // starts at genesis.  A Chronicle whose lsn 1 is another record (a
-        // Template's) has no parent; one whose lsn 1 cannot be read is
-        // reported unreadable.
-        let first = first
-            .and_then(|n| packs.read_pack_log(&n).ok().flatten())
-            .and_then(|(_, frames)| frames.into_iter().next())
-            .and_then(|f| Payload::decode(&f.payload).ok());
-        match first {
-            Some(Payload::Lineage(l)) => match l.origin {
-                Origin::Void => {}
+        // Template's) has no parent.  No such pack: no such lineage.
+        let Some(first) = first else {
+            return Lookup::NotFound;
+        };
+        let frames = match packs.read_pack_log(&first) {
+            Ok(Some((_, frames))) => frames,
+            Ok(None) => return Lookup::NotFound,
+            Err(e) => return pack_failed(&first, e),
+        };
+        match frames.first().map(|f| Payload::decode(&f.payload)) {
+            Some(Ok(Payload::Lineage(l))) => match l.origin {
+                Origin::Void => Lookup::Found(()),
                 Origin::Fork { parent } | Origin::Succession { parent, .. } => {
                     self.closure(parent.chronicle, parent.seal, depth + 1, out)
                 }
                 // A Template-born Vessel's closure ends at its layer object
                 // (P4 spec rev. 16 §2.1, D54).
-                Origin::Template { layer_key, .. } => out.push(ObjectId::content(layer_key)),
+                Origin::Template { layer_key, .. } => {
+                    out.push(ObjectId::content(layer_key));
+                    Lookup::Found(())
+                }
             },
-            Some(_) => {}
-            None => unreadable(out),
+            Some(Ok(_)) => Lookup::Found(()),
+            // A verified log whose lsn 1 does not decode.
+            Some(Err(_)) | None => failed(&first, "its lsn 1 is no record", true),
         }
+    }
+}
+
+/// A read that failed: logged, and never taken as an absence.  `integrity`
+/// marks bytes that are there and do not verify (a store-integrity fault,
+/// review fix 5a: refused for now, never "lost" or "deleted").
+fn failed<T>(what: &str, why: impl fmt::Display, integrity: bool) -> Lookup<T> {
+    if integrity {
+        eprintln!("taso-coordd: store integrity: {what}: {why}");
+    } else {
+        eprintln!("taso-coordd: store read failed: {what}: {why}");
+    }
+    Lookup::Unreadable
+}
+
+/// A pack read's error, as a lookup answers it.  A name that is no pack
+/// name names nothing the store can hold: not found.
+fn pack_failed<T>(what: &str, e: PackError) -> Lookup<T> {
+    match e {
+        PackError::BadKey(_) => Lookup::NotFound,
+        PackError::Corrupt { .. } | PackError::Conflict { .. } => failed(what, e, true),
+        e => failed(what, e, false),
     }
 }
 
@@ -245,22 +295,37 @@ impl StoreView for CoordStore {
         })
     }
 
-    fn exists(&self, object: &ObjectId) -> bool {
+    fn lookup(&self, object: &ObjectId) -> Lookup<()> {
         match object {
-            ObjectId::Content(k) => self.content_exists(HashVal::from_bytes(*k)),
-            ObjectId::Pack(c, name) => self.pack_exists(ChronicleId::from_bytes(*c), name),
+            ObjectId::Content(k) => self.content_lookup(HashVal::from_bytes(*k)),
+            ObjectId::Pack(c, name) => self.pack_lookup(ChronicleId::from_bytes(*c), name),
         }
     }
 
-    fn inventory(&self, key: HashVal) -> Option<Inventory> {
-        let path = object_key_path(&self.prefix, ObjectKind::Inventory, key)?;
+    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+        let Some(path) = object_key_path(&self.prefix, ObjectKind::Inventory, key) else {
+            return Lookup::NotFound;
+        };
+        let mut r = match self.store.get(&path) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Lookup::NotFound,
+            Err(e) => return failed(&path, e, false),
+        };
         let mut bytes = Vec::new();
-        self.store.get(&path).ok()??.read_to_end(&mut bytes).ok()?;
-        if object_key(ObjectKind::Inventory, &bytes) != key {
-            eprintln!("taso-coordd: store integrity: {path} does not hash to its key");
-            return None;
+        if let Err(e) = r.read_to_end(&mut bytes) {
+            return failed(&path, e, false);
         }
-        Inventory::decode(&bytes).ok()
+        if object_key(ObjectKind::Inventory, &bytes) != key {
+            return failed(&path, "does not hash to its key", true);
+        }
+        match Inventory::decode(&bytes) {
+            Ok(inv) => Lookup::Found(inv),
+            // Verified bytes that are no inventory never become one.
+            Err(_) => {
+                eprintln!("taso-coordd: {path} is not an inventory");
+                Lookup::NotFound
+            }
+        }
     }
 
     fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>> {
@@ -288,17 +353,27 @@ impl StoreView for CoordStore {
         Some(out)
     }
 
-    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Vec<ObjectId> {
+    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Lookup<Vec<ObjectId>> {
         let mut out = Vec::new();
-        self.closure(chronicle, seal, 0, &mut out);
-        out
+        match self.closure(chronicle, seal, 0, &mut out) {
+            Lookup::Found(()) => Lookup::Found(out),
+            Lookup::NotFound => Lookup::NotFound,
+            Lookup::Unreadable => Lookup::Unreadable,
+        }
     }
 
-    fn verify_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Option<HashVal> {
-        self.packs(chronicle)?
-            .verify_replacement(item)
-            .ok()
-            .flatten()
+    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
+        let Some(packs) = self.packs(chronicle) else {
+            return Lookup::Unreadable;
+        };
+        match packs.verify_replacement(item) {
+            Ok(Some(h)) => Lookup::Found(h),
+            Ok(None) => Lookup::NotFound,
+            // No replacement can exist for this item (a tombstone form,
+            // which no writer builds).
+            Err(PackError::Refused(_)) => Lookup::NotFound,
+            Err(e) => pack_failed(&item.pack.name, e),
+        }
     }
 }
 
@@ -527,24 +602,32 @@ mod tests {
         assert!(path.starts_with("taso/obj/manifest/") && path.len() == 18 + 64);
         let cs = CoordStore::new(w.store.clone(), PREFIX);
         let o = ObjectId::content(key);
-        assert!(!cs.exists(&o), "not there");
+        assert_eq!(cs.lookup(&o), Lookup::NotFound, "not there");
         w.store.put(&path, &mut &bytes[..]).unwrap();
-        assert!(cs.exists(&o), "found under its kind, verified");
+        assert_eq!(
+            cs.lookup(&o),
+            Lookup::Found(()),
+            "found under its kind, verified"
+        );
         // Bytes that do not hash to the key, under the right path.
         let wrong = object_key(ObjectKind::Manifest, b"other");
         let wrong_path = object_key_path(PREFIX, ObjectKind::Manifest, wrong).unwrap();
         w.store.put(&wrong_path, &mut &bytes[..]).unwrap();
-        assert!(
-            !cs.exists(&ObjectId::content(wrong)),
-            "an integrity fault is no"
+        assert_eq!(
+            cs.lookup(&ObjectId::content(wrong)),
+            Lookup::Unreadable,
+            "an integrity fault is never an absence"
         );
         // Once verified, only presence is checked (D36) ...
         std::fs::write(file_of(&w, &path), b"tampered").unwrap();
-        assert!(cs.exists(&o));
+        assert_eq!(cs.lookup(&o), Lookup::Found(()));
         // ... a new process verifies again.
-        assert!(!CoordStore::new(w.store.clone(), PREFIX).exists(&o));
+        assert_eq!(
+            CoordStore::new(w.store.clone(), PREFIX).lookup(&o),
+            Lookup::Unreadable
+        );
         w.store.delete(&path).unwrap();
-        assert!(!cs.exists(&o), "gone is gone");
+        assert_eq!(cs.lookup(&o), Lookup::NotFound, "gone is gone");
     }
 
     #[test]
@@ -553,20 +636,32 @@ mod tests {
         let cs = CoordStore::new(w.store.clone(), PREFIX);
         let c = w.parent.id;
         let names = w.parent.packs.pack_names().unwrap();
-        assert!(names.iter().all(|n| cs.exists(&ObjectId::pack(c, n))));
-        assert!(!cs.exists(&ObjectId::pack(
-            c,
-            "00000000000000000009-00000000000000000008-00000000000000000000"
-        )));
-        assert!(!cs.exists(&ObjectId::pack(c, UNREADABLE)));
-        // A pack whose log is damaged before its first check does not exist.
+        assert!(names
+            .iter()
+            .all(|n| cs.lookup(&ObjectId::pack(c, n)) == Lookup::Found(())));
+        assert_eq!(
+            cs.lookup(&ObjectId::pack(
+                c,
+                "00000000000000000009-00000000000000000008-00000000000000000000"
+            )),
+            Lookup::NotFound
+        );
+        assert_eq!(
+            cs.lookup(&ObjectId::pack(c, "no-pack-name")),
+            Lookup::NotFound
+        );
+        // A pack whose log is damaged before its first check: an integrity
+        // fault, never an absence.
         let fresh = CoordStore::new(w.store.clone(), PREFIX);
         let hex: String = c.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
         let path = file_of(&w, &format!("{PREFIX}/{hex}/pack/{}", names[0]));
         let mut b = std::fs::read(&path).unwrap();
         b[300] ^= 1;
         std::fs::write(&path, &b).unwrap();
-        assert!(!fresh.exists(&ObjectId::pack(c, &names[0])));
+        assert_eq!(
+            fresh.lookup(&ObjectId::pack(c, &names[0])),
+            Lookup::Unreadable
+        );
     }
 
     #[test]
@@ -578,11 +673,15 @@ mod tests {
         assert_eq!(items[0].sections, vec![w.seal]);
         let inv = Inventory::new(items).unwrap();
         let key = inv.key();
-        assert_eq!(cs.inventory(key), None);
+        assert_eq!(cs.lookup_inventory(key), Lookup::NotFound);
         let path = object_key_path(PREFIX, ObjectKind::Inventory, key).unwrap();
         w.store.put(&path, &mut &inv.bytes()[..]).unwrap();
-        assert_eq!(cs.inventory(key), Some(inv));
-        assert_eq!(cs.inventory(h(3)), None);
+        assert_eq!(cs.lookup_inventory(key), Lookup::Found(inv));
+        assert_eq!(cs.lookup_inventory(h(3)), Lookup::NotFound);
+        // Bytes under the key that do not hash to it.
+        let other = object_key_path(PREFIX, ObjectKind::Inventory, h(4)).unwrap();
+        w.store.put(&other, &mut &b"x"[..]).unwrap();
+        assert_eq!(cs.lookup_inventory(h(4)), Lookup::Unreadable);
     }
 
     /// A pack that cannot be inspected is not left out of the answer: there
@@ -610,9 +709,16 @@ mod tests {
         let w = world();
         let cs = CoordStore::new(w.store.clone(), PREFIX);
         let item = cs.fs_packs(w.parent.id).unwrap().pop().unwrap();
-        assert_eq!(cs.verify_replacement(w.parent.id, &item), None);
+        assert_eq!(cs.lookup_replacement(w.parent.id, &item), Lookup::NotFound);
         let d = w.parent.packs.install_replacement(&item).unwrap();
-        assert_eq!(cs.verify_replacement(w.parent.id, &item), Some(d));
+        assert_eq!(cs.lookup_replacement(w.parent.id, &item), Lookup::Found(d));
+        // A replacement that does not match its item: an integrity fault.
+        let mut other = item.clone();
+        other.log_digest = h(7);
+        assert_eq!(
+            cs.lookup_replacement(w.parent.id, &other),
+            Lookup::Unreadable
+        );
     }
 
     #[test]
@@ -620,7 +726,9 @@ mod tests {
         let w = world();
         let cs = CoordStore::new(w.store.clone(), PREFIX);
         let p = w.parent.id;
-        let parent_closure = cs.seal_closure(p, w.seal);
+        let Lookup::Found(parent_closure) = cs.seal_closure(p, w.seal) else {
+            panic!()
+        };
         let names = w.parent.packs.pack_names().unwrap();
         // Every pack whose log starts before the Seal, or whose fs ends
         // at or before it.
@@ -646,7 +754,9 @@ mod tests {
         );
         fork.push(Stream::Fs, Payload::Raw(vec![9]));
         fork.ship();
-        let closure = cs.seal_closure(f, Lsn::new(100));
+        let Lookup::Found(closure) = cs.seal_closure(f, Lsn::new(100)) else {
+            panic!()
+        };
         let own: Vec<_> = closure
             .iter()
             .filter(|o| matches!(o, ObjectId::Pack(c, _) if *c == *f.as_bytes()))
@@ -656,14 +766,110 @@ mod tests {
             parent_closure.iter().all(|o| closure.contains(o)),
             "the parent's closure"
         );
-        assert!(closure.iter().all(|o| cs.exists(o)));
-        // A Chronicle whose first pack is unreadable: the closure names
-        // something that does not exist, so a hold on it fails.
+        assert!(closure.iter().all(|o| cs.lookup(o) == Lookup::Found(())));
+        // A Chronicle the store holds no packs of: no such lineage.
         let g = ChronicleId::from_bytes([0xC3; 16]);
-        assert_eq!(
-            cs.seal_closure(g, Lsn::new(5)),
-            vec![ObjectId::pack(g, UNREADABLE)]
-        );
+        assert_eq!(cs.seal_closure(g, Lsn::new(5)), Lookup::NotFound);
+    }
+
+    /// A store whose reads fail with `kind` while `on`: a timeout, a
+    /// permission refused, an outage.  Writes pass.
+    struct Failing {
+        inner: Arc<dyn ObjectStore + Send + Sync>,
+        on: std::sync::atomic::AtomicBool,
+        kind: io::ErrorKind,
+    }
+    impl Failing {
+        fn fail<T>(&self) -> io::Result<Option<T>> {
+            if self.on.load(std::sync::atomic::Ordering::Relaxed) {
+                Err(io::Error::new(self.kind, "the store failed"))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+    impl ObjectStore for Failing {
+        fn put(&self, key: &str, data: &mut dyn Read) -> io::Result<u64> {
+            self.inner.put(key, data)
+        }
+        fn get(&self, key: &str) -> io::Result<Option<ByteStream>> {
+            self.fail::<()>()?;
+            self.inner.get(key)
+        }
+        fn exists(&self, key: &str) -> io::Result<bool> {
+            self.fail::<()>()?;
+            self.inner.exists(key)
+        }
+        fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+            self.fail::<()>()?;
+            self.inner.list(prefix)
+        }
+    }
+
+    /// Review fix 5a: a timeout and a permission failure are each
+    /// `Unreadable` for every read, before and after an object's first
+    /// check -- never the store's not-found.  (Integrity faults: the
+    /// content, pack, inventory and replacement tests above.)
+    #[test]
+    fn a_failed_read_is_never_not_found() {
+        for kind in [io::ErrorKind::TimedOut, io::ErrorKind::PermissionDenied] {
+            let dir = tempfile::tempdir().unwrap();
+            let failing = Arc::new(Failing {
+                inner: Arc::new(LocalStore::new(dir.path().join("bucket"))),
+                on: false.into(),
+                kind,
+            });
+            let store: Arc<dyn ObjectStore + Send + Sync> = failing.clone();
+            let w = world_on(dir, store.clone(), PREFIX);
+            let cs = CoordStore::new(store, PREFIX);
+            let c = w.parent.id;
+            let pack = ObjectId::pack(c, &w.parent.packs.pack_names().unwrap()[0]);
+            let bytes = b"a manifest".to_vec();
+            let key = object_key(ObjectKind::Manifest, &bytes);
+            let path = object_key_path(PREFIX, ObjectKind::Manifest, key).unwrap();
+            w.store.put(&path, &mut &bytes[..]).unwrap();
+            let item = cs.fs_packs(c).unwrap().pop().unwrap();
+            let checked = ObjectId::content(key);
+            assert_eq!(cs.lookup(&checked), Lookup::Found(()));
+            failing.on.store(true, std::sync::atomic::Ordering::Relaxed);
+            for (what, got) in [
+                ("checked content", cs.lookup(&checked)),
+                ("unchecked content", cs.lookup(&ObjectId::content(h(5)))),
+                ("a pack", cs.lookup(&pack)),
+                (
+                    "a missing pack",
+                    cs.lookup(&ObjectId::pack(
+                        c,
+                        "00000000000000000009-00000000000000000008-00000000000000000000",
+                    )),
+                ),
+            ] {
+                assert_eq!(got, Lookup::Unreadable, "{kind:?}: {what}");
+            }
+            assert_eq!(cs.lookup_inventory(h(3)), Lookup::Unreadable, "{kind:?}");
+            assert_eq!(
+                cs.lookup_replacement(c, &item),
+                Lookup::Unreadable,
+                "{kind:?}"
+            );
+            assert_eq!(cs.seal_closure(c, w.seal), Lookup::Unreadable, "{kind:?}");
+            assert_eq!(cs.fs_packs(c), None, "{kind:?}");
+            assert!(!cs.carries(c, &pack_name(&pack), contract().digest()));
+            // The store answers again: the same reads answer for real.
+            failing
+                .on
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(cs.lookup(&checked), Lookup::Found(()));
+            assert_eq!(cs.lookup(&ObjectId::content(h(5))), Lookup::NotFound);
+            assert_eq!(cs.lookup_replacement(c, &item), Lookup::NotFound);
+        }
+    }
+
+    fn pack_name(o: &ObjectId) -> String {
+        match o {
+            ObjectId::Pack(_, n) => n.clone(),
+            ObjectId::Content(_) => panic!(),
+        }
     }
 
     /// The same reads against a real Garage: set TASO_S3_ENDPOINT,
@@ -698,20 +904,24 @@ mod tests {
         let c = w.parent.id;
         let names = w.parent.packs.pack_names().unwrap();
         assert!(cs.carries(c, names.last().unwrap(), contract().digest()));
-        assert!(names.iter().all(|n| cs.exists(&ObjectId::pack(c, n))));
+        let found = |o: &ObjectId| cs.lookup(o) == Lookup::Found(());
+        assert!(names.iter().all(|n| found(&ObjectId::pack(c, n))));
         let item = cs.fs_packs(c).unwrap().pop().unwrap();
         assert_eq!(item.sections, vec![w.seal]);
-        let closure = cs.seal_closure(c, w.seal);
-        assert!(!closure.is_empty() && closure.iter().all(|o| cs.exists(o)));
+        let Lookup::Found(closure) = cs.seal_closure(c, w.seal) else {
+            panic!()
+        };
+        assert!(!closure.is_empty() && closure.iter().all(found));
         let bytes = format!("a classmap {nanos}").into_bytes();
         let key = object_key(ObjectKind::Classmap, &bytes);
         let path = object_key_path(&prefix, ObjectKind::Classmap, key).unwrap();
-        assert!(!cs.exists(&ObjectId::content(key)));
+        // A real store's not-found (a 404) is the one absence.
+        assert_eq!(cs.lookup(&ObjectId::content(key)), Lookup::NotFound);
         store.put(&path, &mut &bytes[..]).unwrap();
-        assert!(cs.exists(&ObjectId::content(key)));
-        assert_eq!(cs.verify_replacement(c, &item), None);
+        assert!(found(&ObjectId::content(key)));
+        assert_eq!(cs.lookup_replacement(c, &item), Lookup::NotFound);
         let d = w.parent.packs.install_replacement(&item).unwrap();
-        assert_eq!(cs.verify_replacement(c, &item), Some(d));
+        assert_eq!(cs.lookup_replacement(c, &item), Lookup::Found(d));
         // Leave the bucket as found: only this run's prefix.
         for k in store.list(&prefix).unwrap() {
             store.delete(&k).unwrap();

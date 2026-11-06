@@ -97,52 +97,27 @@ pub enum Lookup<T> {
 /// The coordinator never trusts a Warden's word for these.
 pub trait StoreView {
     /// The pack `name` of `chronicle` is readable, verifies, and carries a
-    /// record with this digest.
+    /// record with this digest.  `false` refuses for now (§1.2 step 5).
     fn carries(&self, chronicle: ChronicleId, name: &str, digest: HashVal) -> bool;
-    /// The object is in the store and verifies.
-    fn exists(&self, object: &ObjectId) -> bool;
-    /// The inventory object under `key`, if readable.
-    fn inventory(&self, key: HashVal) -> Option<Inventory>;
+    /// The object: in the store and verifying, not found, or unreadable.
+    fn lookup(&self, object: &ObjectId) -> Lookup<()>;
+    /// The inventory object under `key`.  One that verifies and does not
+    /// decode can never be an inventory: `NotFound`.
+    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory>;
     /// Every fs-bearing pack of `chronicle`, as inventory items; `None`
-    /// when the store could not list them all or inspect one of them.  A
-    /// short list is never an answer: a purge computed from one would end
-    /// `PurgeComplete` with packs left behind.
+    /// when the store could not list them all or inspect one of them (a
+    /// failed read).  A short list is never an answer: a purge computed
+    /// from one would end `PurgeComplete` with packs left behind.
     fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>>;
-    /// The objects needed to restore `chronicle` at Seal `seal`.
-    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Vec<ObjectId>;
-    /// The trailer digest of `item`'s replacement if it is in the store
-    /// and matches the item (as `Packs::verify_replacement`).
-    fn verify_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Option<HashVal>;
-
-    // The rows read through these three.  Their defaults answer from the
-    // yes/no methods above (a failed read looks absent there); a view
-    // that can tell a failure from a not-found answers them itself.
-    // (Review fix 5a, step 1: the yes/no methods go in step 4.)
-
-    /// [`exists`](Self::exists), with a failed read kept apart.
-    fn lookup(&self, object: &ObjectId) -> Lookup<()> {
-        if self.exists(object) {
-            Lookup::Found(())
-        } else {
-            Lookup::NotFound
-        }
-    }
-    /// [`inventory`](Self::inventory), with a failed read kept apart.
-    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
-        match self.inventory(key) {
-            Some(inv) => Lookup::Found(inv),
-            None => Lookup::NotFound,
-        }
-    }
-    /// [`verify_replacement`](Self::verify_replacement), with a failed
-    /// read kept apart.  A replacement that is there and does not match
-    /// its item is an integrity fault: `Unreadable`.
-    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
-        match self.verify_replacement(chronicle, item) {
-            Some(h) => Lookup::Found(h),
-            None => Lookup::NotFound,
-        }
-    }
+    /// The objects needed to restore `chronicle` at Seal `seal`, its
+    /// parents' included.  `NotFound` when the store holds no such
+    /// lineage (or it is deeper than a closure follows), `Unreadable`
+    /// when a read failed: never a closure smaller than it should be.
+    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Lookup<Vec<ObjectId>>;
+    /// The trailer digest of `item`'s replacement (as
+    /// `Packs::verify_replacement`).  A replacement that is there and
+    /// does not match its item is an integrity fault: `Unreadable`.
+    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal>;
 }
 
 // ── Submissions and answers ─────────────────────────────────────────
@@ -1075,7 +1050,10 @@ impl CoordLog {
                     !self.chrons.get(&p).is_some_and(|x| x.retired),
                     "parent retired",
                 )?;
-                for o in store.seal_closure(parent.chronicle, parent.seal) {
+                for o in found(
+                    store.seal_closure(parent.chronicle, parent.seal),
+                    "no closure for the parent Seal",
+                )? {
                     fx.holds.push((o, c));
                 }
                 if !self.templates.contains_key(&p) {
@@ -1101,7 +1079,10 @@ impl CoordLog {
                 ] {
                     fx.holds.push((ObjectId::content(key), c));
                 }
-                for o in store.seal_closure(chronicle, k.seal.lsn) {
+                for o in found(
+                    store.seal_closure(chronicle, k.seal.lsn),
+                    "no closure for the Seal",
+                )? {
                     fx.holds.push((o, c));
                 }
                 fx.changes.push(Change::CandOpen(k.clone()));
@@ -1899,6 +1880,15 @@ mod tests {
         }
     }
 
+    impl Store {
+        fn exists(&self, o: &ObjectId) -> bool {
+            self.objects.borrow().contains(o)
+        }
+        fn fails(&self, o: &ObjectId) -> bool {
+            self.unreadable.borrow().contains(o)
+        }
+    }
+
     impl StoreView for Store {
         fn carries(&self, c: ChronicleId, name: &str, d: HashVal) -> bool {
             self.carried
@@ -1906,11 +1896,23 @@ mod tests {
                 .get(&(*c.as_bytes(), name.into()))
                 .is_some_and(|s| s.contains(d.as_bytes()))
         }
-        fn exists(&self, o: &ObjectId) -> bool {
-            self.objects.borrow().contains(o)
+        fn lookup(&self, o: &ObjectId) -> Lookup<()> {
+            if self.fails(o) {
+                Lookup::Unreadable
+            } else if self.exists(o) {
+                Lookup::Found(())
+            } else {
+                Lookup::NotFound
+            }
         }
-        fn inventory(&self, key: HashVal) -> Option<Inventory> {
-            self.inventories.borrow().get(key.as_bytes()).cloned()
+        fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+            if self.fails(&ObjectId::content(key)) {
+                return Lookup::Unreadable;
+            }
+            match self.inventories.borrow().get(key.as_bytes()) {
+                Some(inv) => Lookup::Found(inv.clone()),
+                None => Lookup::NotFound,
+            }
         }
         fn fs_packs(&self, c: ChronicleId) -> Option<Vec<InventoryItem>> {
             if self.unlistable.borrow().contains(c.as_bytes()) {
@@ -1927,48 +1929,31 @@ mod tests {
                 .collect();
             Some(v)
         }
-        fn seal_closure(&self, c: ChronicleId, _seal: Lsn) -> Vec<ObjectId> {
-            self.closure
-                .borrow()
-                .get(c.as_bytes())
-                .cloned()
-                .unwrap_or_default()
-        }
-        fn verify_replacement(&self, c: ChronicleId, item: &InventoryItem) -> Option<HashVal> {
-            let name = replacement_name(&item.pack.name)?;
-            if !self.exists(&ObjectId::pack(c, &name)) {
-                return None;
-            }
-            self.replacements
-                .borrow()
-                .get(&(*c.as_bytes(), name))
-                .copied()
-        }
-        fn lookup(&self, o: &ObjectId) -> Lookup<()> {
-            if self.unreadable.borrow().contains(o) {
-                Lookup::Unreadable
-            } else if self.exists(o) {
-                Lookup::Found(())
-            } else {
-                Lookup::NotFound
-            }
-        }
-        fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
-            if self.unreadable.borrow().contains(&ObjectId::content(key)) {
+        fn seal_closure(&self, c: ChronicleId, _seal: Lsn) -> Lookup<Vec<ObjectId>> {
+            if self.unlistable.borrow().contains(c.as_bytes()) {
                 return Lookup::Unreadable;
             }
-            match self.inventory(key) {
-                Some(inv) => Lookup::Found(inv),
-                None => Lookup::NotFound,
-            }
+            Lookup::Found(
+                self.closure
+                    .borrow()
+                    .get(c.as_bytes())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
         }
         fn lookup_replacement(&self, c: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
-            let name = replacement_name(&item.pack.name).unwrap_or_default();
-            if self.unreadable.borrow().contains(&ObjectId::pack(c, &name)) {
+            let Some(name) = replacement_name(&item.pack.name) else {
+                return Lookup::NotFound;
+            };
+            let o = ObjectId::pack(c, &name);
+            if self.fails(&o) {
                 return Lookup::Unreadable;
             }
-            match self.verify_replacement(c, item) {
-                Some(h) => Lookup::Found(h),
+            if !self.exists(&o) {
+                return Lookup::NotFound;
+            }
+            match self.replacements.borrow().get(&(*c.as_bytes(), name)) {
+                Some(h) => Lookup::Found(*h),
                 None => Lookup::NotFound,
             }
         }
@@ -2869,6 +2854,10 @@ mod tests {
         let cand = ContractRecord::Candidate(Box::new(f.k.clone()));
         w.not_readable(f.v, 1, &cand);
         store.unreadable.borrow_mut().clear();
+        // Its Seal's closure cannot be read: refused for now as well.
+        store.unlistable.borrow_mut().insert(*f.v.as_bytes());
+        w.not_readable(f.v, 1, &cand);
+        store.unlistable.borrow_mut().clear();
         w.retried_ok(f.v, 1, &cand);
         // A reclaim of an unheld object; its deletion not yet confirmed.
         let op = cid(0xEE);

@@ -56,8 +56,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, Table, TableDefinition};
 use taso_core::contract::{Inventory, InventoryItem};
 use taso_core::coordlog::{
-    self, Answer, ChronicleView, ClaimAuthority, ClaimError, CoordLog, Head, ObjectId, StoreView,
-    SubmissionStatus, Submitted,
+    self, Answer, ChronicleView, ClaimAuthority, ClaimError, CoordLog, Head, Lookup, ObjectId,
+    StoreView, SubmissionStatus, Submitted,
 };
 use taso_core::envelope::{
     payload_hash, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream,
@@ -809,20 +809,20 @@ impl StoreView for NoStore {
     fn carries(&self, _: ChronicleId, _: &str, _: HashVal) -> bool {
         false
     }
-    fn exists(&self, _: &ObjectId) -> bool {
-        false
+    fn lookup(&self, _: &ObjectId) -> Lookup<()> {
+        Lookup::NotFound
     }
-    fn inventory(&self, _: HashVal) -> Option<Inventory> {
-        None
+    fn lookup_inventory(&self, _: HashVal) -> Lookup<Inventory> {
+        Lookup::NotFound
     }
     fn fs_packs(&self, _: ChronicleId) -> Option<Vec<InventoryItem>> {
         Some(Vec::new())
     }
-    fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<ObjectId> {
-        Vec::new()
+    fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Lookup<Vec<ObjectId>> {
+        Lookup::Found(Vec::new())
     }
-    fn verify_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Option<HashVal> {
-        None
+    fn lookup_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Lookup<HashVal> {
+        Lookup::NotFound
     }
 }
 
@@ -2876,20 +2876,24 @@ mod log_tests {
                 *digest.as_bytes(),
             ))
         }
-        fn exists(&self, o: &ObjectId) -> bool {
-            self.objects.lock().unwrap().contains(o)
+        fn lookup(&self, o: &ObjectId) -> Lookup<()> {
+            if self.objects.lock().unwrap().contains(o) {
+                Lookup::Found(())
+            } else {
+                Lookup::NotFound
+            }
         }
-        fn inventory(&self, _: HashVal) -> Option<Inventory> {
-            None
+        fn lookup_inventory(&self, _: HashVal) -> Lookup<Inventory> {
+            Lookup::NotFound
         }
         fn fs_packs(&self, _: ChronicleId) -> Option<Vec<InventoryItem>> {
             Some(Vec::new())
         }
-        fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Vec<ObjectId> {
-            Vec::new()
+        fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Lookup<Vec<ObjectId>> {
+            Lookup::Found(Vec::new())
         }
-        fn verify_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Option<HashVal> {
-            None
+        fn lookup_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Lookup<HashVal> {
+            Lookup::NotFound
         }
     }
 
