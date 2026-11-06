@@ -569,6 +569,15 @@ impl Nominator {
                 "the Candidate's logical id holds {other:?}"
             )))),
             Err(SubmitError::Coord(_)) => Ok(Answer::Pending(cid)),
+            // Refused for now and cancelled: nothing decided (R2a: an
+            // object it holds was reclaimed within the quarantine, and
+            // is held once that has passed).
+            Err(SubmitError::NotAccepted(t)) => Ok(Answer::Retry(match t {
+                taso_core::coordlog::Transient::Quarantined(o) => {
+                    format!("{o:?} was reclaimed within the store's quarantine; ask again later")
+                }
+                t => format!("the Candidate was not accepted for now: {t:?}"),
+            })),
             Err(e) => Err(e.into()),
         }
     }
