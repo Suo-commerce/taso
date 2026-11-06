@@ -85,6 +85,14 @@
 # FST_COMPACT_PCT=0 for one without compaction); the verdict then says
 # partial.
 #
+# The daemon runs --durable-at flush (FST_DURABLE_AT overrides): this is
+# the block-device contract for any filesystem, and xfstests' ext4 has a
+# journal.  Under fua (taso-blkd's default since 2026-11-06, right for the
+# Warden's journal-less ext4 only) a journal's commit block is a FUA write
+# answered before any sync, so the crash and shutdown tests would test a
+# device that does not keep the contract (spec rev. 38, D&D F (a); the
+# same limit blk-crash.sh found, K1, 2026-11-06).
+#
 # FST_NO_UBLK=1 skips the ublk module check, and FST_BLKD=path runs that
 # daemon instead of building one (both to try the script's own paths with a
 # stand-in daemon on a machine without ublk).
@@ -108,6 +116,8 @@ MIN_FREE=${FST_MIN_FREE_GIB:-20}
 COMPACT_PCT=${FST_COMPACT_PCT:-25}
 IO_KIB=${FST_IO_KIB:-}
 COMPACT_MIN=${FST_COMPACT_MIN_MIB:-256}
+DURABLE_AT=${FST_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "FST_DURABLE_AT=$DURABLE_AT: flush, fua or seal" >&2; exit 2 ;; esac
 STOP_FREE=${FST_STOP_FREE_GIB:-5}
 
 say() { printf '== %s\n' "$*"; }
@@ -231,7 +241,8 @@ blk() {
 
 start_daemon() {
     "$BLKD" "$LOG" "$SOCK" --size-gib "$SIZE_GIB" ${IO_KIB:+--io-kib "$IO_KIB"} \
-        --compact-pct "$COMPACT_PCT" --compact-min-mib "$COMPACT_MIN" 2>>"$ERR" &
+        --compact-pct "$COMPACT_PCT" --compact-min-mib "$COMPACT_MIN" \
+        --durable-at "$DURABLE_AT" 2>>"$ERR" &
     DAEMON_PID=$!
     for _ in $(seq 100); do
         [[ -S "$SOCK" ]] && return 0
@@ -404,6 +415,7 @@ mkdir -p "$RES"
     echo "tests: ${TESTS[*]}; devices ${SIZE_GIB} GiB; $free GiB free at start"
     echo "automatic compaction at ${COMPACT_PCT}% garbage and ${COMPACT_MIN} MiB (0%: off)"
     echo "device I/O size ${IO_KIB:-daemon default} KiB; mkfs options for xfstests: ${FST_MKFS_OPTIONS:-none}"
+    echo "durable at $DURABLE_AT"
 } | tee "$RES/summary.txt"
 
 if [[ -z "${FST_BLKD:-}" ]]; then
