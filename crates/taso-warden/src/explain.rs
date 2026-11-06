@@ -144,10 +144,26 @@ impl Ctx<'_> {
             self.check(format!("intact: record at log position {pos}"), intact);
             // A purged pack's frames are in its log-only replacement
             // (§6.2, D25): the record is carried there.
+            // A store that cannot be read says so: no proof of anything
+            // (E1).
+            let mut unreadable = None;
             let read = match packs.read_pack_log(&e.pack) {
                 Ok(Some(x)) => Some(x),
-                _ => taso_core::contract::replacement_name(&e.pack)
-                    .and_then(|r| packs.read_pack_log(&r).ok().flatten()),
+                first => {
+                    if let Err(err) = first {
+                        unreadable = Some(err.to_string());
+                    }
+                    match taso_core::contract::replacement_name(&e.pack)
+                        .map(|r| packs.read_pack_log(&r))
+                    {
+                        Some(Ok(Some(x))) => Some(x),
+                        Some(Err(err)) => {
+                            unreadable = Some(err.to_string());
+                            None
+                        }
+                        _ => None,
+                    }
+                }
             };
             let carried = match read {
                 Some((_, frames)) => frames.iter().any(|f| match Payload::decode(&f.payload) {
@@ -164,27 +180,61 @@ impl Ctx<'_> {
                 }),
                 None => false,
             };
-            self.check(
-                format!("carried: record at log position {pos} by pack {}", e.pack),
-                carried,
-            );
+            let what = format!("carried: record at log position {pos} by pack {}", e.pack);
+            match (carried, unreadable) {
+                (false, Some(err)) => self.check(
+                    format!("{what} (the store could not be read: {err})"),
+                    false,
+                ),
+                _ => self.check(what, carried),
+            }
             out.push(e);
         }
         Ok(Some(out))
     }
 
     /// Whether the content object `key` of `kind` is in the store and
-    /// hashes to its key.
+    /// hashes to its key, or else was reclaimed: an object every hold on
+    /// which has ended may be deleted by a reclaim, and then its deletion
+    /// is in the log (C4).  A store that cannot be read says so: that is
+    /// no proof the object is gone (E1).
     fn content(&mut self, kind: ObjectKind, key: HashVal, of: &str) {
         let path = object_key_path(self.prefix, kind, key).expect("a content kind");
-        let ok = match self.store.get(&path) {
+        let what = format!("content: {of} {path}");
+        match self.store.get(&path) {
             Ok(Some(mut r)) => {
                 let mut h = blake3::Hasher::new_derive_key(kind.prefix());
-                std::io::copy(&mut r, &mut h).is_ok() && h.finalize().as_bytes() == key.as_bytes()
+                let ok = std::io::copy(&mut r, &mut h).is_ok()
+                    && h.finalize().as_bytes() == key.as_bytes();
+                self.check(what, ok);
             }
-            _ => false,
-        };
-        self.check(format!("content: {of} {path}"), ok);
+            Ok(None) => match self.reclaimed(key) {
+                Ok(Some(pos)) => self.check(
+                    format!("{what} (reclaimed: its deletion is at log position {pos})"),
+                    true,
+                ),
+                Ok(None) => self.check(what, false),
+                Err(e) => self.check(format!("{what} (absent; the coordinator: {e})"), false),
+            },
+            Err(e) => self.check(format!("{what} (the store could not be read: {e})"), false),
+        }
+    }
+
+    /// The log position of the last completed reclaim of content `key`,
+    /// if any (reclaims are numbered from 0, review fix 2a).
+    fn reclaimed(&self, key: HashVal) -> Result<Option<u64>, String> {
+        let mut last = None;
+        for n in 0.. {
+            match self
+                .coord
+                .query_logical(logical_id(&LogicalKey::ReclaimDone(key, n)))
+                .map_err(|e| e.to_string())?
+            {
+                Some((pos, _)) => last = Some(pos),
+                None => return Ok(last),
+            }
+        }
+        Ok(last)
     }
 }
 
