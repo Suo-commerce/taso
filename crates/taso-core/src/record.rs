@@ -1728,9 +1728,11 @@ mod tests {
         vec![
             Payload::Contract(Box::new(ContractRecord::ReclaimClaimed {
                 object_key: HashVal::from_bytes([0xE0; 32]),
+                n: 0,
             })),
             Payload::Contract(Box::new(ContractRecord::ReclaimComplete {
                 object_key: HashVal::from_bytes([0xE0; 32]),
+                n: 0,
                 outcome: ReclaimOutcome::Absent,
             })),
             Payload::Contract(Box::new(ContractRecord::SanctionCompleted {
@@ -1767,8 +1769,8 @@ mod tests {
     }
 
     const PINS_CONTRACT: [&str; 3] = [
-        "aa28dd78f22460398ad7e73dedf7ae6bf08ef3a98759b4fe6c96598e77a35d2a",
-        "761c04378b93bcdc86bff19701bd204e44b6e07d7d89d930cbf3575d0bfdfdab",
+        "fbf532299e1fbf956df57c8918511a8097916f44524e85d6dd5713c33d4c6dd6",
+        "2952e858a1e7d6bea22c41b6a4d0ed7e4a7b6f8dac56a2778935d24bbcb3aa18",
         "e54dff3e751d20933a39c1b90dab35432577a23e2620b6f7d9485e5fb493f9dd",
     ];
 
