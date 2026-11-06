@@ -841,16 +841,25 @@ pub struct LogConfig {
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
+/// `store.deleted_quarantine`, in seconds (review fix R2a).
+pub const DELETED_QUARANTINE: u64 = 3600;
+
 impl Default for LogConfig {
     /// No store (nothing is readable: every accept is `NotReadable`),
-    /// `announce.ttl` 10 min, `store.deleted_quarantine` 7 d, the system
+    /// `announce.ttl` 10 min, `store.deleted_quarantine` 1 h, the system
     /// clock.
+    ///
+    /// The quarantine outlasts any delete still in flight after its claim
+    /// is resolved: a store request times out after 30 s (`S3Store`), a
+    /// local delete is synchronous.  It was 7 d; content objects are
+    /// shared by content, so a key reclaimed is soon put and held again,
+    /// and those holds wait it out (review fix R2a).
     fn default() -> Self {
         Self {
             store: Arc::new(NoStore),
             timing: coordlog::Config {
                 announce_ttl: 600,
-                deleted_quarantine: 7 * 24 * 3600,
+                deleted_quarantine: DELETED_QUARANTINE,
             },
             clock: Arc::new(|| {
                 std::time::SystemTime::now()
