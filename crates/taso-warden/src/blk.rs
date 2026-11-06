@@ -1,9 +1,8 @@
-//! The block log as a Warden storage backend (adoption step 4 of the plan
-//! `Taso_plan_blk_adoption_2026-10-18`).
+//! The block log as the Warden's storage (adopted in step 4 of the plan
+//! `Taso_plan_blk_adoption_2026-10-18`; the only storage since V4b).
 //!
 //! [`BlkPool`] and [`BlkLayers`] implement [`Pool`] and [`Layers`] over
-//! `taso-blkd`, the way [`crate::zfs::Zfs`] does over ZFS.  Nothing above
-//! the two traits changes: a Vessel's dataset is a named branch, a Seal
+//! `taso-blkd`.  A Vessel's dataset is a named branch, a Seal
 //! layer is a block-log Seal tagged with the Seal record's lsn and hash,
 //! and a fork is a branch of that Seal.
 //!
@@ -27,13 +26,13 @@
 //!
 //! # Origin and parent without extra state
 //!
-//! ZFS keeps a clone's origin (`source@taso-seal-<lsn>`) and `taso:parent`.
-//! Here both are read from the store: walk the branch's parents past the
+//! A clone's origin (`source@taso-seal-<lsn>`) and parent hash are read
+//! from the store, not kept beside it: walk the branch's parents past the
 //! Seals the branch made itself; the first Seal that another branch made is
 //! the clone's origin, and its tag holds the parent hash.  A walk that ends
 //! at a root Seal means a void birth.  A dataset name that ends up there
-//! comes from the origin branch's name, so the origin must still exist (as
-//! with ZFS, where the origin dataset cannot be destroyed under a clone).
+//! comes from the origin branch's name, so the origin must still exist (a
+//! dataset is not destroyed while a clone stands on one of its layers).
 //!
 //! # Freezing
 //!
@@ -87,8 +86,8 @@ pub fn untag(t: &[u8]) -> Option<(Lsn, HashVal)> {
 }
 
 /// The guid of the Seal layer bound to (`lsn`, `hash`): the same on every
-/// node, since it depends on the binding only (ZFS's guid is the same on
-/// every node a snapshot is received on; the Warden checks it).
+/// node, since it depends on the binding only (the Warden checks it on
+/// every receive).
 pub fn guid(lsn: Lsn, hash: HashVal) -> u64 {
     let mut h = blake3::Hasher::new();
     h.update(b"taso-blk seal guid v1");
@@ -2108,7 +2107,7 @@ mod tests {
     }
 
     #[test]
-    fn clones_carry_origin_and_parent_like_zfs() {
+    fn clones_carry_origin_and_parent() {
         let p = pool();
         let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
         p.create(&a).unwrap();
