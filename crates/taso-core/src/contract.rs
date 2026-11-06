@@ -1687,6 +1687,10 @@ const TAG_NOMINATION_REFUSED: u8 = 23;
 /// The tag of a `LayerShipped` without a storage kind (V4b).  Tag 22, the
 /// shape with one, is retired.
 const TAG_LAYER_SHIPPED: u8 = 24;
+/// The tags of the two reclaim records with their number (review fix 2a).
+/// Tags 17 and 18, the shapes without it, are retired.
+const TAG_RECLAIM_CLAIMED: u8 = 25;
+const TAG_RECLAIM_COMPLETE: u8 = 26;
 
 /// A P4 contract record.  Tags are fixed; a new kind is a new tag, and a
 /// record's shape that changes takes a new tag, the old one retired and
@@ -1729,15 +1733,23 @@ pub enum ContractRecord {
     GenesisStarted(Box<GenesisStarted>),
     /// Tag 16.
     GenesisRefused(GenesisRefused),
-    /// An orphan is claimed for deletion (tag 17; coordinator-side).
+    /// An orphan is claimed for deletion (tag 25): the key's reclaim
+    /// number `n`, the count of its reclaims already completed, so every
+    /// reclaim of a key is its own operation (review fix 2a).
     ReclaimClaimed {
-        /// The object.
+        /// The object (a content object; a pack is deleted only by its
+        /// purge).
         object_key: HashVal,
+        /// Reclaims of this key completed before this one.
+        n: u64,
     },
-    /// A reclaim claim is resolved; the key is quarantined (tag 18).
+    /// The reclaim `n` of a key is resolved; the key is quarantined
+    /// (tag 26).
     ReclaimComplete {
         /// The object.
         object_key: HashVal,
+        /// The claim's number.
+        n: u64,
         /// How it ended.
         outcome: ReclaimOutcome,
     },
@@ -1771,8 +1783,8 @@ impl ContractRecord {
             Self::PurgeDamaged(p) => LogicalKey::PurgeEnd(p.chronicle),
             Self::GenesisStarted(g) => LogicalKey::Genesis(g.genesis_id),
             Self::GenesisRefused(g) => LogicalKey::GenesisRefused(g.genesis_id),
-            Self::ReclaimClaimed { object_key } => LogicalKey::Reclaim(*object_key),
-            Self::ReclaimComplete { object_key, .. } => LogicalKey::ReclaimDone(*object_key),
+            Self::ReclaimClaimed { object_key, n } => LogicalKey::Reclaim(*object_key, *n),
+            Self::ReclaimComplete { object_key, n, .. } => LogicalKey::ReclaimDone(*object_key, *n),
             Self::NominationRefused(n) => LogicalKey::NominationRefused(n.candidate_id()),
             Self::GenesisCleanedUp(g) => LogicalKey::GenesisCleaned(g.genesis_id),
             Self::TemplateNamed(t) => LogicalKey::TemplateName(t.name.clone(), t.version),
@@ -1866,16 +1878,19 @@ impl Canonical for ContractRecord {
                 out.tag(16);
                 r.canon(out);
             }
-            Self::ReclaimClaimed { object_key } => {
-                out.tag(17);
+            Self::ReclaimClaimed { object_key, n } => {
+                out.tag(TAG_RECLAIM_CLAIMED);
                 object_key.canon(out);
+                out.u64(*n);
             }
             Self::ReclaimComplete {
                 object_key,
+                n,
                 outcome,
             } => {
-                out.tag(18);
+                out.tag(TAG_RECLAIM_COMPLETE);
                 object_key.canon(out);
+                out.u64(*n);
                 outcome.canon(out);
             }
             Self::NominationRefused(r) => {
@@ -1936,10 +1951,10 @@ pub enum LogicalKey {
     Genesis(ChronicleId),
     /// `GenesisRefused`: `genesis_id ‖ "refused"` (tag 14).
     GenesisRefused(ChronicleId),
-    /// `ReclaimClaimed`: `"reclaim" ‖ object_key` (tag 15).
-    Reclaim(HashVal),
-    /// `ReclaimComplete`: `"reclaim" ‖ object_key ‖ "done"` (tag 16).
-    ReclaimDone(HashVal),
+    /// `ReclaimClaimed`: `"reclaim" ‖ object_key ‖ n` (tag 15).
+    Reclaim(HashVal, u64),
+    /// `ReclaimComplete`: `"reclaim" ‖ object_key ‖ n ‖ "done"` (tag 16).
+    ReclaimDone(HashVal, u64),
     /// `Birth` (a fork's Lineage record): `chronicle ‖ "birth"` (tag 17).
     Birth(ChronicleId),
     /// `NominationRefused`: `candidate_id ‖ "refused"` (tag 18; D23,
@@ -2014,13 +2029,15 @@ impl Canonical for LogicalKey {
                 out.tag(14);
                 c.canon(out);
             }
-            Self::Reclaim(h) => {
+            Self::Reclaim(h, n) => {
                 out.tag(15);
                 h.canon(out);
+                out.u64(*n);
             }
-            Self::ReclaimDone(h) => {
+            Self::ReclaimDone(h, n) => {
                 out.tag(16);
                 h.canon(out);
+                out.u64(*n);
             }
             Self::Birth(c) => {
                 out.tag(17);
@@ -2639,13 +2656,13 @@ impl<'a> Reader<'a> {
                 reason: self.walk_refusal()?,
                 input_manifest_key: self.option(Self::hash)?,
             }),
-            (_, 17) => ContractRecord::ReclaimClaimed {
-                object_key: self.hash()?,
-            },
-            (_, 18) => ContractRecord::ReclaimComplete {
-                object_key: self.hash()?,
-                outcome: self.reclaim_outcome()?,
-            },
+            (at, t @ (17 | 18)) => {
+                return Self::bad(
+                    at,
+                    "retired record: a reclaim without its number (before review fix 2a)",
+                    t,
+                )
+            }
             (at, 19) => {
                 return Self::bad(
                     at,
@@ -2670,6 +2687,15 @@ impl<'a> Reader<'a> {
                     22,
                 )
             }
+            (_, TAG_RECLAIM_CLAIMED) => ContractRecord::ReclaimClaimed {
+                object_key: self.hash()?,
+                n: self.u64()?,
+            },
+            (_, TAG_RECLAIM_COMPLETE) => ContractRecord::ReclaimComplete {
+                object_key: self.hash()?,
+                n: self.u64()?,
+                outcome: self.reclaim_outcome()?,
+            },
             (_, TAG_NOMINATION_REFUSED) => ContractRecord::NominationRefused(NominationRefused {
                 chronicle: self.chronicle()?,
                 seal: self.seal_ref()?,
@@ -2977,9 +3003,11 @@ pub(crate) mod tests {
             }),
             ContractRecord::ReclaimClaimed {
                 object_key: h(0xE0),
+                n: 3,
             },
             ContractRecord::ReclaimComplete {
                 object_key: h(0xE0),
+                n: 3,
                 outcome: ReclaimOutcome::Deleted,
             },
             ContractRecord::NominationRefused(nomination_refused(WalkRefusal::UnknownPaths)),
@@ -3085,10 +3113,18 @@ pub(crate) mod tests {
     #[test]
     fn every_record_round_trips_and_tags_are_in_order() {
         // Tag 9 is reserved (the former PurgeDeferred, D85); 19 and 22
-        // are retired shapes, their records now 23 and 24 (V4b).
+        // are retired shapes, their records now 23 and 24 (V4b); 17 and
+        // 18 too, now 25 and 26 (review fix 2a).
         let tags: Vec<u8> = (0..=8)
-            .chain(10..=18)
-            .chain([TAG_NOMINATION_REFUSED, 20, 21, TAG_LAYER_SHIPPED])
+            .chain(10..=16)
+            .chain([
+                TAG_RECLAIM_CLAIMED,
+                TAG_RECLAIM_COMPLETE,
+                TAG_NOMINATION_REFUSED,
+                20,
+                21,
+                TAG_LAYER_SHIPPED,
+            ])
             .collect();
         let records = every_record();
         assert_eq!(records.len(), tags.len());
@@ -3113,7 +3149,7 @@ pub(crate) mod tests {
             Err(DecodeError::Truncated { .. })
         ));
         assert!(matches!(
-            ContractRecord::decode(&[25]),
+            ContractRecord::decode(&[27]),
             Err(DecodeError::BadTag { .. })
         ));
     }
@@ -3359,9 +3395,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// V4b and review fix 4a: a record in a retired shape (tag 22, a
-    /// `LayerShipped` with a storage kind; tag 19, a `NominationRefused`
-    /// keyed by Seal and exclusion) is refused by name, never misread.
+    /// V4b and review fixes 4a and 2a: a record in a retired shape (tag
+    /// 22, a `LayerShipped` with a storage kind; tag 19, a
+    /// `NominationRefused` keyed by Seal and exclusion; tags 17 and 18, a
+    /// reclaim without its number) is refused by name, never misread.
     #[test]
     fn a_retired_record_shape_is_refused_by_name() {
         // The old LayerShipped's bytes: tag 22, template, kind 1, key, guid.
@@ -3376,6 +3413,14 @@ pub(crate) mod tests {
             e.to_string().contains("LayerShipped with a storage kind"),
             "{e}"
         );
+        // The old reclaim records: tag 17 or 18, then the key.
+        for tag in [17, 18] {
+            let mut old = Canon::new();
+            old.tag(tag);
+            h(0xE0).canon(&mut old);
+            let e = ContractRecord::decode(old.as_bytes()).unwrap_err();
+            assert!(e.to_string().contains("reclaim without its number"), "{e}");
+        }
         // The old NominationRefused: tag 19, then its fields.
         let mut old = Canon::new();
         old.tag(19);
@@ -3392,8 +3437,9 @@ pub(crate) mod tests {
     /// Digests of every record kind, in tag order.  A change here is a
     /// format change: bump the domain or add a tag, never edit a pin.
     /// (V4b's break: `NominationRefused` and `LayerShipped` took new tags,
-    /// so their two pins and `Layer`'s logical id are new; nothing else
-    /// moved.)
+    /// so their two pins and `Layer`'s logical id are new; review fix 2a:
+    /// the two reclaim records took new tags with their number, so their
+    /// two pins are new; nothing else moved.)
     #[test]
     fn record_digests_are_pinned() {
         let got: Vec<String> = every_record()
@@ -3453,8 +3499,8 @@ pub(crate) mod tests {
         "717041ba8ca2cf3b31e182daad281330e750fce94fc95a8f4b2f2875d9e41172",
         "82c11cad087ed0120e35e321b57cbc2c2c267b4f73b225d462ba82fdba83d540",
         "8d72712c39d3fe9683075fea0a4c47b51684631c5db7f5ad1b1fede5529210ef",
-        "4d820c377642a1bcbcd67bf235dcfa8ad964b5cd4a45017a22f970376e44ea41",
-        "7bc1209031258d3bdb68e1f7ad43245b8fc10bfe4c28d3135489bb12047bc6a5",
+        "6debf0dd9b81a819f1df184bf86bf169458455a5ecb374dc4f76069799a3cb0d",
+        "bd1e9115ffd12600e7ee367b1a722ce6bce294a55eb228273fd58dee0c4f2488",
         "eab264d4c766d5f25bf10fd505f3c525b8b71f32ef21957faf46d9c1ba5f14c8",
         "81568db9b33f001502c0cf7993a2c50cb65ca6df2a1e58c1669a91a802187a7f",
         "95d6743ed38bd728132cccc0a8d38ba1ce439ad9d8bd288a85896ecb9d0dee06",
@@ -3764,7 +3810,10 @@ pub(crate) mod tests {
                     reason: WalkRefusal::ALL[w],
                     input_manifest_key: (w % 2 == 0).then_some(a),
                 }),
-                7 => ContractRecord::ReclaimClaimed { object_key: a },
+                7 => ContractRecord::ReclaimClaimed {
+                    object_key: a,
+                    n: m,
+                },
                 8 => ContractRecord::NominationRefused(NominationRefused {
                     chronicle: c,
                     seal: SealRef {
@@ -3802,6 +3851,7 @@ pub(crate) mod tests {
                 }),
                 _ => ContractRecord::ReclaimComplete {
                     object_key: a,
+                    n,
                     outcome: if m % 2 == 0 {
                         ReclaimOutcome::Deleted
                     } else {
