@@ -30,8 +30,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
     hold_id, replacement_name, valid_template_name, BornFrom, Candidate, CloseKind, ContractRecord,
-    Decision, Inventory, InventoryItem, LogicalKey, PurgeBlocker, StorageKind,
-    VerificationFinished, VerificationStarted, RECORD_DOMAIN,
+    Decision, Inventory, InventoryItem, LogicalKey, PurgeBlocker, VerificationFinished,
+    VerificationStarted, RECORD_DOMAIN,
 };
 use crate::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use crate::record::{LineageRecord, Origin, Payload};
@@ -1089,6 +1089,12 @@ impl CoordLog {
             }
             ContractRecord::NominationRefused(n) => {
                 need(n.chronicle == chronicle, "not this Chronicle's record")?;
+                // Only what the content decides is recorded for good
+                // (review W, 4a): never a limit, the clock or the node.
+                need(
+                    n.reason.decided_by_content(),
+                    "a refusal the content does not decide",
+                )?;
             }
             ContractRecord::VerificationStarted(st) => {
                 let k =
@@ -1580,15 +1586,13 @@ impl CoordLog {
             self.templates.contains_key(template.as_bytes()),
             "no ready Template",
         )?;
-        let shipped = [StorageKind::Zfs, StorageKind::Blk].into_iter().any(|k| {
-            matches!(
-                self.entry(&LogicalKey::Layer(template, k)),
-                Some((_, e)) if matches!(
-                    &e.record,
-                    Submitted::Contract(ContractRecord::LayerShipped(l)) if l.layer_key == layer_key
-                )
+        let shipped = matches!(
+            self.entry(&LogicalKey::Layer(template)),
+            Some((_, e)) if matches!(
+                &e.record,
+                Submitted::Contract(ContractRecord::LayerShipped(l)) if l.layer_key == layer_key
             )
-        });
+        );
         need(shipped, "not a shipped layer of this Template")?;
         if let Some(a) = asked {
             let names = matches!(
@@ -3003,12 +3007,12 @@ mod tests {
         w.ok(t0, cleaned(t0));
     }
 
-    /// D52, D54: one layer per Template and storage kind, held by the
-    /// Template; a Template-born Vessel's Birth holds its layer, checks the
+    /// D52, D54: one layer per Template (one storage since V4b), held by
+    /// the Template; a Template-born Vessel's Birth holds its layer, checks the
     /// name it was asked by, and adds no liveness dependency.
     #[test]
     fn template_births_hold_one_shipped_layer() {
-        use crate::contract::{LayerShipped, StorageKind, TemplateNamed};
+        use crate::contract::{LayerShipped, TemplateNamed};
         use crate::record::TemplateAsked;
         let store = Store::default();
         let mut log = CoordLog::new(cfg());
@@ -3018,14 +3022,13 @@ mod tests {
             now: 100,
         };
         let t0 = genesis_t0(&mut w);
-        let (zfs_layer, blk_layer, stray) = (h(0x1A), h(0x1B), h(0x1C));
-        for k in [zfs_layer, blk_layer, stray] {
+        let (layer, stray) = (h(0x1A), h(0x1C));
+        for k in [layer, stray] {
             store.put(ObjectId::content(k));
         }
-        let shipped = |storage, layer_key| {
+        let shipped = |layer_key| {
             ContractRecord::LayerShipped(LayerShipped {
                 template_id: t0,
-                storage,
                 layer_key,
                 guid: 7,
             })
@@ -3039,8 +3042,7 @@ mod tests {
                 v,
                 ContractRecord::LayerShipped(LayerShipped {
                     template_id: v,
-                    storage: StorageKind::Zfs,
-                    layer_key: zfs_layer,
+                    layer_key: layer,
                     guid: 7
                 })
             ),
@@ -3048,19 +3050,14 @@ mod tests {
         ));
         // An object that is not in the store is not held.
         assert!(matches!(
-            w.refused(v, shipped(StorageKind::Zfs, h(0x1D))),
+            w.refused(v, shipped(h(0x1D))),
             Final::NoSuchObject(_)
         ));
-        w.ok(v, shipped(StorageKind::Zfs, zfs_layer));
-        // One per kind: a second builder's stream conflicts; the other kind
-        // has its own.
+        w.ok(v, shipped(layer));
+        // One per Template: a second builder's stream conflicts.
+        assert_eq!(w.refused(v, shipped(stray)), Final::Conflict);
         assert_eq!(
-            w.refused(v, shipped(StorageKind::Zfs, stray)),
-            Final::Conflict
-        );
-        w.ok(v, shipped(StorageKind::Blk, blk_layer));
-        assert_eq!(
-            w.log.holders(&ObjectId::content(zfs_layer)),
+            w.log.holders(&ObjectId::content(layer)),
             vec![t0],
             "held by the Template, not by the Vessel that shipped it"
         );
@@ -3088,7 +3085,7 @@ mod tests {
             version: 1,
         });
         assert!(matches!(
-            w.submit(v, birth(v, zfs_layer, asked.clone())),
+            w.submit(v, birth(v, layer, asked.clone())),
             Answer::FinalRefused(Final::Predicate(_))
         ));
         let op = cid(0x0B);
@@ -3103,7 +3100,7 @@ mod tests {
             }),
         );
         assert!(matches!(
-            w.submit(v, birth(v, zfs_layer, asked)),
+            w.submit(v, birth(v, layer, asked)),
             Answer::Accepted { .. }
         ));
         // Ten Vessels from T0: ten holds on one layer, and the Template's.
@@ -3111,18 +3108,70 @@ mod tests {
             let c = cid(0xC0 + i);
             w.log.claim_chronicle(c, ClaimAuthority::Vessel).unwrap();
             assert!(matches!(
-                w.submit(c, birth(c, zfs_layer, None)),
+                w.submit(c, birth(c, layer, None)),
                 Answer::Accepted { .. }
             ));
         }
-        let holders = w.log.holders(&ObjectId::content(zfs_layer));
+        let holders = w.log.holders(&ObjectId::content(layer));
         assert_eq!(holders.len(), 11);
         assert!(holders.contains(&t0) && holders.contains(&v));
         // No liveness dependency: a Vessel born from T0 retires freely, and
         // its purge releases only its own hold.
         let (pc, _) = purge_inventory(&mut w, v);
         w.ok(v, ContractRecord::PurgeCommitted(pc));
-        assert_eq!(w.log.holders(&ObjectId::content(zfs_layer)).len(), 10);
+        assert_eq!(w.log.holders(&ObjectId::content(layer)).len(), 10);
+    }
+
+    /// Review W and 4a: the coordinator records a refusal only if the
+    /// content decides it -- a limit, the clock or the node never stops a
+    /// Seal for good -- and keys it by the Candidate id.
+    #[test]
+    fn only_a_refusal_the_content_decides_is_recorded() {
+        use crate::contract::{NominationRefused, WalkRefusal};
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let refused = |reason| NominationRefused {
+            chronicle: f.v,
+            seal: f.k.seal,
+            exclude: f.k.exclude.clone(),
+            transform_version: f.k.transform_version,
+            classmap_key: f.k.classmap_key,
+            requirement: f.k.requirement,
+            reason,
+            input_manifest_key: f.k.input_manifest_key,
+        };
+        for reason in [
+            WalkRefusal::IncompleteWalk,
+            WalkRefusal::ReservedMismatch,
+            WalkRefusal::MaterialisationMismatch,
+        ] {
+            assert_eq!(
+                w.refused(f.v, ContractRecord::NominationRefused(refused(reason))),
+                Final::Predicate("a refusal the content does not decide".into()),
+                "{reason:?}"
+            );
+        }
+        let r = refused(WalkRefusal::UnknownPaths);
+        assert_eq!(
+            r.candidate_id(),
+            f.k.candidate_id,
+            "the key is the Candidate's id"
+        );
+        w.ok(f.v, ContractRecord::NominationRefused(r.clone()));
+        // Another reason for the same Candidate id: the key is taken.
+        assert_eq!(
+            w.refused(
+                f.v,
+                ContractRecord::NominationRefused(refused(WalkRefusal::DanglingByExclusion))
+            ),
+            Final::Conflict
+        );
     }
 
     /// D49: an operator names ready Templates `name@version`, versions in
