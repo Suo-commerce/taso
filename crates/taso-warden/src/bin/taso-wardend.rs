@@ -80,6 +80,9 @@ use taso_warden::supervisor::{Event, Supervisor, Timing};
 
 /// How long one request to the API server may take.
 const KUBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The reclaimer's first pass after the start, then its interval.
+const RECLAIM_FIRST: Duration = Duration::from_secs(5 * 60);
+const RECLAIM_EVERY: Duration = Duration::from_secs(3600);
 /// How often the status writer writes.
 const STATUS_TICK: Duration = Duration::from_secs(1);
 
@@ -230,6 +233,20 @@ fn main() -> ExitCode {
         let node = node.clone();
         std::thread::spawn(move || node.relaunch_pass())
     };
+    // The reclaimer (P4 §2.3, §2.4): a pass five minutes after the start,
+    // then every hour, for the Warden's life.  Not joined: a pass cut by
+    // the Warden's end leaves at most a claim open, which the next pass
+    // finishes from the Warden's own log.
+    {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(RECLAIM_FIRST);
+            loop {
+                node.reclaim_pass();
+                std::thread::sleep(RECLAIM_EVERY);
+            }
+        });
+    }
     // Purge at TTL (P4 §6.7, D81): a pass at start, then every
     // `purge.recheck_seconds`.
     let ttl_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
