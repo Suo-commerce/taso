@@ -518,6 +518,100 @@ mod tests {
         );
     }
 
+    /// The reclaimer on a real Garage bucket (an ignored test, as
+    /// s3.rs's): ages from Garage's own `LastModified`, the deletes and the
+    /// coordinator's not-found checks through S3.  A young object is left,
+    /// the same object later reclaimed; put again, refused within the
+    /// quarantine, then reclaimed as reclaim 1.  Everything it put is
+    /// deleted at the end.
+    ///
+    /// ```text
+    /// TASO_S3_ENDPOINT=http://127.0.0.1:3900 TASO_S3_BUCKET=... TASO_S3_KEY_ID=... \
+    ///   TASO_S3_SECRET=... cargo test -p taso-warden --lib reclaim_on_garage -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a Garage bucket: set TASO_S3_*"]
+    fn reclaim_on_garage() {
+        use crate::s3::{S3Config, S3Store};
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let s3 = S3Store::new(
+            S3Config {
+                endpoint: var("TASO_S3_ENDPOINT"),
+                region: std::env::var("TASO_S3_REGION").unwrap_or_else(|_| "garage".into()),
+                bucket: var("TASO_S3_BUCKET"),
+                access_key_id: var("TASO_S3_KEY_ID"),
+                secret_key: var("TASO_S3_SECRET"),
+                ca_file: std::env::var_os("TASO_S3_CA").map(Into::into),
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let store: SharedStore = Arc::new(s3);
+        let millis = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = format!("reclaim-{}-{millis}", std::process::id());
+        // Everything under the prefix is deleted at the end, also on a
+        // failure.
+        struct Sweep(SharedStore, String);
+        impl Drop for Sweep {
+            fn drop(&mut self) {
+                for k in self.0.list(&self.1).unwrap_or_default() {
+                    let _ = self.0.delete(&k);
+                }
+            }
+        }
+        let _sweep = Sweep(store.clone(), prefix.clone());
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(AtomicU64::new(T0));
+        let mut config = reading_store(store.clone(), &prefix, QUARANTINE);
+        let c = clock.clone();
+        config.clock = Arc::new(move || c.load(Ordering::SeqCst));
+        let coord: Arc<dyn Coord> =
+            Arc::new(Coordinator::open_with(dir.path().join("coord.redb"), config).unwrap());
+        let r = Reclaimer {
+            coord: coord.clone(),
+            store: store.clone(),
+            prefix: prefix.clone(),
+            warden: WardenId::new(1),
+            state_dir: dir.path().join("state"),
+            grace: HOUR,
+        };
+        let bytes = b"reclaimed on garage";
+        let k = HashVal::from_bytes(blake3::derive_key(ObjectKind::Manifest.prefix(), bytes));
+        let path = object_key_path(&prefix, ObjectKind::Manifest, k).unwrap();
+        let done = |n| {
+            coord
+                .query_logical(logical_id(&LogicalKey::ReclaimDone(k, n)))
+                .unwrap()
+                .is_some()
+        };
+        store.put(&path, &mut &bytes[..]).unwrap();
+
+        // Just put: young by Garage's clock (a minute of skew allowed).
+        let p = r.pass(SystemTime::now() + Duration::from_secs(60)).unwrap();
+        assert_eq!((p.looked, p.young, p.reclaimed.len()), (1, 1, 0), "{p:?}");
+        // Two hours on: old, reclaimed.
+        let later = || SystemTime::now() + 2 * HOUR;
+        let p = r.pass(later()).unwrap();
+        assert_eq!(p.reclaimed, vec![(k, ReclaimOutcome::Deleted)], "{p:?}");
+        assert!(p.failed.is_empty(), "{:?}", p.failed);
+        assert!(!store.exists(&path).unwrap() && done(0));
+
+        // Put again: within the quarantine, refused and kept.
+        store.put(&path, &mut &bytes[..]).unwrap();
+        let p = r.pass(later()).unwrap();
+        assert_eq!((p.refused, p.reclaimed.len()), (1, 0), "{p:?}");
+        assert!(store.exists(&path).unwrap());
+        // After it: reclaim 1.
+        clock.fetch_add(QUARANTINE, Ordering::SeqCst);
+        let p = r.pass(later()).unwrap();
+        assert_eq!(p.reclaimed, vec![(k, ReclaimOutcome::Deleted)], "{p:?}");
+        assert!(!store.exists(&path).unwrap() && done(1));
+    }
+
     #[test]
     fn content_paths_name_their_key() {
         let k = HashVal::from_bytes([0xAB; 32]);
