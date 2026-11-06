@@ -26,13 +26,12 @@ kernel and the filesystem underneath, so the numbers mean the same for any
 implementation built on them.
 
 Usage (as root; ROOT must be an empty or missing directory on the
-filesystem under test, e.g. a ZFS dataset or an XFS mount with reflink=1):
+filesystem under test, e.g. an XFS mount with reflink=1, Btrfs or ext4):
 
     scripts/branch-bench.py ROOT [--branches 1000] [--files 2000]
         [--size 65536] [--big 1024] [--json OUT]
 
 Examples:
-    scripts/branch-bench.py /tasotest/branch-bench           # ZFS on taso-test
     scripts/branch-bench.py /mnt/xfs/branch-bench --big 0    # no big file
 
 Everything it creates is under ROOT and is removed at the end, also on
@@ -90,8 +89,8 @@ def disk_used(path):
 
 
 def fstype(path):
-    """The filesystem type, mount point and source (device, or ZFS dataset)
-    of the mount holding path, from /proc/self/mountinfo."""
+    """The filesystem type, mount point and source of the mount holding
+    path, from /proc/self/mountinfo."""
     path = os.path.realpath(path)
     best, kind, source = "", "?", "?"
     with open("/proc/self/mountinfo") as f:
@@ -103,48 +102,11 @@ def fstype(path):
     return kind, best, source
 
 
-class Disk:
-    """Bytes physically used, as the filesystem can tell.
-
-    statvfs is right where shared extents are counted once (XFS, Btrfs,
-    ext4).  On ZFS it is not: a dataset's used space counts every clone of a
-    block again (measured 2026-10-18: 1000 clones of a 1 GiB file showed
-    1 TB used on a pool with 3.6 GiB free).  There the pool's ALLOCATED is
-    the physical figure, after `zpool sync` so frees and writes have landed;
-    BCLONEUSED / BCLONESAVED say what block cloning shares.
-    """
-
-    def __init__(self, root, kind, source):
-        self.root, self.pool = root, None
-        if kind == "zfs":
-            self.pool = source.split("/")[0]
-
-    def _zpool(self, *props):
-        import subprocess
-        subprocess.run(["zpool", "sync", self.pool], check=True)
-        out = subprocess.run(["zpool", "get", "-Hp", "-o", "property,value", ",".join(props), self.pool],
-                             check=True, capture_output=True, text=True).stdout
-        vals = {}
-        for line in out.splitlines():
-            k, v = line.split("\t")
-            vals[k] = int(v) if v.isdigit() else None  # "-": not on this pool
-        return vals
-
-    def used(self):
-        """Physical bytes used: pool ALLOCATED on ZFS, statvfs elsewhere."""
-        if self.pool:
-            return self._zpool("allocated")["allocated"]
-        return disk_used(self.root)
-
-    def logical(self):
-        """What statvfs says (on ZFS: counts every clone)."""
-        return disk_used(self.root)
-
-    def clones(self):
-        """ZFS block-cloning counters, or None elsewhere."""
-        if not self.pool:
-            return None
-        return self._zpool("bcloneused", "bclonesaved")
+# Filesystems whose statvfs counts a shared extent once, so "disk used"
+# is the physical figure.  Elsewhere (a pool-based filesystem whose dataset
+# view counts every clone again, measured 2026-10-18) the bench refuses
+# rather than report a wrong number.
+HONEST_STATVFS = {"xfs", "btrfs", "ext4", "ext3", "tmpfs"}
 
 
 def stats(samples):
@@ -328,7 +290,7 @@ def preflight(root, args):
     base = args.files * args.size + (args.big << 20)
     if clones:
         # Each branch: one small file copied up (its size) and one CoW unit
-        # of the big file.  1 MiB covers ZFS's largest common recordsize
+        # of the big file.  1 MiB covers the largest common CoW unit
         # (measured on XFS: 196 KiB per branch).  Flatten clones: ~free.
         per_branch = args.size + (1 << 20)
         need = base + args.branches * per_branch + (64 << 20)
@@ -342,7 +304,7 @@ def preflight(root, args):
             f"refusing: worst case {need / 2**30:.1f} GiB, {free / 2**30:.1f} GiB free on {root}"
             f" (reflink {'works' if clones else 'NOT available'}: each branch's write"
             f" {'clones' if clones else 'copies the whole file'}).  Use --big 0, fewer"
-            f" --branches, or a filesystem with reflinks (XFS reflink=1, Btrfs, ZFS block cloning).")
+            f" --branches, or a filesystem with reflinks (XFS reflink=1, Btrfs).")
     return clones
 
 
@@ -359,23 +321,25 @@ def run(args):
             os.rmdir(root)
         raise
     kind, mnt, source = fstype(root)
-    disk = Disk(root, kind, source)
+    if kind not in HONEST_STATVFS:
+        sys.exit(f"refusing: {kind} at {mnt}: its statvfs may count a shared block once per clone, "
+                 f"so the disk figures would be wrong; use one of {sorted(HONEST_STATVFS)}")
     base = os.path.join(root, "base")
     br = os.path.join(root, "br")
     mounted = []
     result = {
         "host": platform.node(), "kernel": platform.release(), "root": root,
-        "fstype": kind, "mount": mnt, "source": source, "zfs_pool": disk.pool, "reflink": clones, "branches": args.branches, "files": args.files,
+        "fstype": kind, "mount": mnt, "source": source, "reflink": clones, "branches": args.branches, "files": args.files,
         "size": args.size, "big_mib": args.big, "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     try:
         t = time.perf_counter()
         build_base(base, args.files, args.size, args.big)
         result["base_build_s"] = time.perf_counter() - t
-        result["base_bytes"] = disk.used()
+        result["base_bytes"] = disk_used(root)
 
         slab0, avail0 = meminfo_kib("Slab"), meminfo_kib("MemAvailable")
-        disk0, logical0, clones0 = disk.used(), disk.logical(), disk.clones()
+        disk0 = disk_used(root)
         fork = []
         for b in range(args.branches):
             u, w, m = (os.path.join(br, str(b), x) for x in "uwm")
@@ -410,16 +374,16 @@ def run(args):
                     os.fsync(f.fileno())
                 write_big.append(time.perf_counter() - t)
         os.sync()
-        disk1, logical1, clones1 = disk.used(), disk.logical(), disk.clones()
+        disk1 = disk_used(root)
 
         # Flatten branch 0 after one more change: a deletion (a whiteout).
         m0 = mounted[0]
         os.unlink(os.path.join(m0, small_path(2 % args.files)))
-        before = disk.used()
+        before = disk_used(root)
         t = time.perf_counter()
         counts = flatten(m0, os.path.join(br, "0", "u"), base, os.path.join(root, "seal1"))
         result["flatten"] = {"s": time.perf_counter() - t, "cloned": counts.cloned,
-                             "copied": counts.copied, "extra_bytes": disk.used() - before}
+                             "copied": counts.copied, "extra_bytes": disk_used(root) - before}
         result["flatten"]["identical"] = tree_digest(m0) == tree_digest(os.path.join(root, "seal1"))
 
         discard = []
@@ -436,8 +400,6 @@ def run(args):
             "discard": stats(discard),
             "slab_kib_delta": slab1 - slab0, "mem_available_kib_delta": avail0 - avail1,
             "disk_bytes_for_writes": disk1 - disk0,
-            "logical_bytes_for_writes": logical1 - logical0,
-            "zfs_clones_before": clones0, "zfs_clones_after": clones1,
         })
     finally:
         for m in reversed(mounted):
@@ -463,15 +425,7 @@ def report(r):
     print(f"  kernel memory for {n} live branches: slab +{r['slab_kib_delta'] / 1024:.1f} MiB,"
           f" available -{r['mem_available_kib_delta'] / 1024:.1f} MiB")
     d = r["disk_bytes_for_writes"]
-    what = f"zpool {r['zfs_pool']} ALLOCATED" if r["zfs_pool"] else "statvfs"
-    print(f"  disk used by the writes of all branches: {d / 2**20:.1f} MiB ({d / n / 1024:.0f} KiB per branch) [{what}]")
-    if r["zfs_pool"]:
-        lg = r["logical_bytes_for_writes"]
-        print(f"    dataset view (counts every clone): {lg / 2**20:.1f} MiB")
-        a, b = r["zfs_clones_before"], r["zfs_clones_after"]
-        if a and b and a.get("bclonesaved") is not None and b.get("bclonesaved") is not None:
-            print(f"    block cloning: bcloneused +{(b['bcloneused'] - a['bcloneused']) / 2**20:.1f} MiB,"
-                  f" bclonesaved +{(b['bclonesaved'] - a['bclonesaved']) / 2**20:.1f} MiB")
+    print(f"  disk used by the writes of all branches: {d / 2**20:.1f} MiB ({d / n / 1024:.0f} KiB per branch) [statvfs]")
     f = r["flatten"]
     print(f"  flatten one branch: {f['s']:.3f} s, {f['cloned']} cloned, {f['copied']} copied,"
           f" {f['extra_bytes'] / 2**20:.2f} MiB extra disk, identical to its view: {f['identical']}")
