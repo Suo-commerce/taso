@@ -143,7 +143,11 @@ use crate::ship::{valid_key, ByteStream, ObjectStore, Sender};
 use crate::storage::Snapshot;
 
 const MAGIC: [u8; 8] = *b"TASOPAK\0";
-const VERSION: u8 = 1;
+/// The pack header's version.  2 since V4b's format break (review fix
+/// N4a): the records a pack carries changed shape, so a pack of version 1
+/// is refused at its first read -- by rebirth before it fences anyone --
+/// and an old Warden refuses a new pack the same way.
+const VERSION: u8 = 2;
 const LOG_DOMAIN: &str = "taso.pack.log.v1";
 /// Derive-key domain of an inventory item's `log_digest`: the frames of a
 /// pack as stored (`[payload len · envelope · payload]` each), without the
@@ -458,7 +462,11 @@ impl PackHeader {
             return Err("wrong magic");
         }
         if b[8] != VERSION {
-            return Err("unknown version");
+            return Err(if b[8] < VERSION {
+                "pack version 1: from before V4b's format break (this Warden reads 2)"
+            } else {
+                "a newer pack version than this Warden reads (2)"
+            });
         }
         let chronicle = ChronicleId::from_bytes(b[9..25].try_into().expect("16 bytes"));
         let base = get_pos(&b[25..65]);
@@ -2551,9 +2559,15 @@ mod tests {
         let mut b = hs[0].encode();
         b[0] ^= 1;
         assert!(PackHeader::decode(&b).is_err(), "magic");
+        // Review fix N4a: a pack from before the break is refused by name.
         let mut b = hs[0].encode();
-        b[8] = 2;
-        assert!(PackHeader::decode(&b).is_err(), "version");
+        b[8] = 1;
+        assert_eq!(
+            PackHeader::decode(&b),
+            Err("pack version 1: from before V4b's format break (this Warden reads 2)")
+        );
+        b[8] = 3;
+        assert!(PackHeader::decode(&b).is_err(), "a newer version");
         let empty = PackHeader {
             chronicle: ID,
             base: p(5),
