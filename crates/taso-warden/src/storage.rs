@@ -1,87 +1,18 @@
-//! Where a node keeps its Vessels: ZFS or the block log, chosen per node
-//! by the configuration (`"storage"`).
-//!
-//! [`Storage`] implements [`Pool`], [`StorageLayers`] implements
-//! [`Layers`] and [`StorageSend`] implements [`Sender`], each by passing
-//! the call to the one the node uses.  The daemon holds a `Storage`, so
-//! nothing above it knows which one it is.
-//!
-//! The types both engines speak in -- [`Dataset`], [`Snapshot`],
-//! [`DatasetInfo`], [`CloneBase`] and the Seal snapshot naming -- live
-//! here, so neither engine depends on the other's module.
+//! The names and shapes a node's storage speaks in -- [`Dataset`],
+//! [`Snapshot`], [`DatasetInfo`], [`CloneBase`] and the Seal snapshot
+//! naming -- and what the start-up scan of uid slots reads
+//! ([`Holdings`]).  The storage itself is the block log ([`crate::blk`]):
+//! the daemon holds its pool, layers and sender directly.
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io;
 use std::path::PathBuf;
 
 use taso_core::envelope::{HashVal, Lsn};
 
-use crate::blk::{BlkLayers, BlkPool, BlkSend};
-use crate::chronicle::{LayerError, Layers, Thaw, ZfsLayers};
-use crate::ship::{ByteStream, Sender, ZfsSend};
-use crate::vessel::{Pool, SealView};
-use crate::zfs::{Cli, Zfs};
-
-/// A node's storage.
-#[derive(Clone)]
-pub enum Storage {
-    /// ZFS: a Vessel is a dataset, a Seal a snapshot.
-    Zfs(Zfs<Cli>),
-    /// The block log: a Vessel is a named branch, a Seal a block-log Seal.
-    Blk(BlkPool),
-}
-
-/// The Seal layers of one dataset, in either storage.
-pub enum StorageLayers {
-    /// ZFS snapshots.
-    Zfs(ZfsLayers<Cli>),
-    /// Block-log Seals.
-    Blk(BlkLayers),
-}
-
-/// The send streams of either storage.
-pub enum StorageSend {
-    /// `zfs send`.
-    Zfs(ZfsSend),
-    /// `taso-blkd export`.
-    Blk(BlkSend),
-}
-
-impl Storage {
-    /// Which storage this is, for logs.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            Self::Zfs(_) => "zfs",
-            Self::Blk(_) => "blk",
-        }
-    }
-
-    /// The [`Sender`] for this storage's Seals.
-    pub fn sender(&self) -> StorageSend {
-        match self {
-            Self::Zfs(_) => StorageSend::Zfs(ZfsSend::default()),
-            Self::Blk(p) => StorageSend::Blk(p.sender()),
-        }
-    }
-
-    /// The Seal layer of `dataset` at `lsn`, in the shape the publisher
-    /// wants; `None` if there is none.
-    pub fn snapshot(&self, dataset: &Dataset, lsn: Lsn) -> Result<Option<Snapshot>, LayerError> {
-        match self {
-            Self::Zfs(z) => Ok(z.get(dataset, lsn)?),
-            Self::Blk(p) => p.snapshot(dataset, lsn),
-        }
-    }
-
-    /// Mount `dataset` if it is not (a reborn one is received unmounted).
-    pub fn ensure_mounted(&self, dataset: &Dataset) -> Result<(), LayerError> {
-        match self {
-            Self::Zfs(z) => Ok(z.ensure_mounted(dataset)?),
-            Self::Blk(p) => p.ensure_mounted(dataset).map(|_| ()),
-        }
-    }
-}
+use crate::blk::{BlkPool, Blkd, Mounts};
+use crate::chronicle::LayerError;
+use crate::vessel::Pool;
 
 /// What the start-up scan of uid slots reads from a pool
 /// ([`crate::daemon::held_on`]).
@@ -96,181 +27,15 @@ pub trait Holdings {
     fn origin(&self, dataset: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError>;
 }
 
-impl<R: crate::zfs::Runner> Holdings for Zfs<R> {
+impl<D: Blkd + 'static, M: Mounts + 'static> Holdings for BlkPool<D, M> {
     fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, LayerError> {
-        Ok(Zfs::children(self, root)?)
+        BlkPool::children(self, root)
     }
     fn owner_uids(&self, dataset: &Dataset) -> Result<BTreeSet<u32>, LayerError> {
-        Ok(Zfs::owner_uids(self, dataset)?)
-    }
-    fn origin(&self, dataset: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
-        Ok(self.dataset_info(dataset)?.and_then(|i| i.origin_seal()))
-    }
-}
-
-impl Holdings for Storage {
-    fn children(&self, root: &Dataset) -> Result<Vec<Dataset>, LayerError> {
-        match self {
-            Self::Zfs(z) => Holdings::children(z, root),
-            Self::Blk(p) => p.children(root),
-        }
-    }
-    fn owner_uids(&self, dataset: &Dataset) -> Result<BTreeSet<u32>, LayerError> {
-        match self {
-            Self::Zfs(z) => Holdings::owner_uids(z, dataset),
-            Self::Blk(p) => p.owner_uids(dataset),
-        }
+        BlkPool::owner_uids(self, dataset)
     }
     fn origin(&self, dataset: &Dataset) -> Result<Option<(Dataset, Lsn)>, LayerError> {
         Ok(Pool::info(self, dataset)?.and_then(|i| i.origin_seal()))
-    }
-}
-
-impl Pool for Storage {
-    type Layers = StorageLayers;
-
-    fn create(&self, dataset: &Dataset) -> Result<DatasetInfo, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::create(z, dataset),
-            Self::Blk(p) => p.create(dataset),
-        }
-    }
-
-    fn clone(
-        &self,
-        source: &Dataset,
-        seal: Lsn,
-        seal_hash: HashVal,
-        target: &Dataset,
-    ) -> Result<DatasetInfo, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::clone(z, source, seal, seal_hash, target),
-            Self::Blk(p) => Pool::clone(p, source, seal, seal_hash, target),
-        }
-    }
-
-    fn info(&self, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::info(z, dataset),
-            Self::Blk(p) => p.info(dataset),
-        }
-    }
-
-    fn layers(&self, dataset: &Dataset) -> StorageLayers {
-        match self {
-            Self::Zfs(z) => StorageLayers::Zfs(Pool::layers(z, dataset)),
-            Self::Blk(p) => StorageLayers::Blk(p.layers(dataset)),
-        }
-    }
-
-    fn receive(
-        &self,
-        dataset: &Dataset,
-        from: Option<(Lsn, HashVal)>,
-        to: (Lsn, HashVal),
-        stream: &mut dyn io::Read,
-    ) -> Result<u64, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::receive(z, dataset, from, to, stream),
-            Self::Blk(p) => p.receive(dataset, from, to, stream),
-        }
-    }
-
-    fn adopt(
-        &self,
-        dataset: &Dataset,
-        base: (Lsn, HashVal),
-        to: (Lsn, HashVal),
-        child: &Dataset,
-        child_seal: Lsn,
-        sender: &dyn crate::ship::Sender,
-    ) -> Result<u64, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::adopt(z, dataset, base, to, child, child_seal, sender),
-            Self::Blk(p) => p.adopt(dataset, base, to, child, child_seal, sender),
-        }
-    }
-
-    fn receive_clone(
-        &self,
-        dataset: &Dataset,
-        base: &CloneBase,
-        to: (Lsn, HashVal),
-        stream: &mut dyn io::Read,
-    ) -> Result<u64, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::receive_clone(z, dataset, base, to, stream),
-            Self::Blk(p) => p.receive_clone(dataset, base, to, stream),
-        }
-    }
-
-    fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::seal_view(z, dataset, lsn),
-            Self::Blk(p) => p.seal_view(dataset, lsn),
-        }
-    }
-
-    fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::guid(z, dataset),
-            Self::Blk(p) => p.guid(dataset),
-        }
-    }
-
-    fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
-        match self {
-            Self::Zfs(z) => Pool::destroy(z, dataset, guid),
-            Self::Blk(p) => Pool::destroy(p, dataset, guid),
-        }
-    }
-}
-
-impl Layers for StorageLayers {
-    fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError> {
-        match self {
-            Self::Zfs(l) => l.snapshot(lsn, hash),
-            Self::Blk(l) => l.snapshot(lsn, hash),
-        }
-    }
-    fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-        match self {
-            Self::Zfs(l) => l.list(),
-            Self::Blk(l) => l.list(),
-        }
-    }
-    fn destroy(&mut self, lsn: Lsn) -> Result<(), LayerError> {
-        match self {
-            Self::Zfs(l) => l.destroy(lsn),
-            Self::Blk(l) => l.destroy(lsn),
-        }
-    }
-    fn destroy_orphan(&mut self, lsn: Lsn) -> Result<(), LayerError> {
-        match self {
-            Self::Zfs(l) => l.destroy_orphan(lsn),
-            Self::Blk(l) => l.destroy_orphan(lsn),
-        }
-    }
-    fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
-        match self {
-            Self::Zfs(l) => l.rollback(lsn, hash),
-            Self::Blk(l) => l.rollback(lsn, hash),
-        }
-    }
-    fn discarded_blocks(&self) -> Option<u64> {
-        match self {
-            Self::Zfs(l) => l.discarded_blocks(),
-            Self::Blk(l) => l.discarded_blocks(),
-        }
-    }
-}
-
-impl Sender for StorageSend {
-    fn send(&self, dataset: &Dataset, from: Option<&str>, to: Lsn) -> io::Result<ByteStream> {
-        match self {
-            Self::Zfs(s) => s.send(dataset, from, to),
-            Self::Blk(s) => s.send(dataset, from, to),
-        }
     }
 }
 
@@ -282,8 +47,8 @@ pub const SNAP_PREFIX: &str = "taso-seal-";
 /// Digits in the lsn part of a snapshot name (`u64::MAX` has 20).
 const LSN_DIGITS: usize = 20;
 
-/// ZFS limits a full name to 255 bytes (`ZFS_MAX_DATASET_NAME_LEN` − 1);
-/// the block log keeps the same bound so names mean the same on both.
+/// A full Seal name is at most 255 bytes: the bound Taso's names were
+/// made under, kept so every name ever made stays valid.
 const MAX_FULL_NAME: usize = 255;
 
 /// Longest dataset name that still leaves room for `@taso-seal-<20 digits>`.
@@ -309,12 +74,12 @@ impl fmt::Display for InvalidName {
 impl std::error::Error for InvalidName {}
 
 /// A validated dataset name, e.g. `tasotest/vessel`: the name a Vessel's
-/// storage goes by on either engine (a ZFS dataset, a block-log branch).
+/// storage goes by (a block-log branch).
 ///
 /// Components are separated by `/` and may contain only ASCII letters,
 /// digits and `_ - . :`.  The pool (first component) starts with a
-/// letter.  The name is short enough that every Seal snapshot of it fits
-/// ZFS's 255-byte limit.
+/// letter.  The name is short enough that every Seal name of it fits the
+/// 255-byte bound.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Dataset(String);
 
@@ -391,18 +156,17 @@ pub(crate) fn parse_snap_name(snap: &str) -> Option<Lsn> {
 
 // ── Snapshot ───────────────────────────────────────────────────────
 
-/// A Seal layer as the engine reports it: a ZFS snapshot, or a block-log
-/// Seal described in the same terms.
+/// A Seal layer as the block log reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     /// The dataset it belongs to.
     pub dataset: Dataset,
     /// The Seal record's lsn, from the name.
     pub seal: Lsn,
-    /// The engine's stable id for it (ZFS's guid; the block log derives
-    /// one from the Seal); the same on every node it was received on.
+    /// Its stable id (the block log derives one from the Seal); the same
+    /// on every node it was received on.
     pub guid: u64,
-    /// The `taso:seal` property, or `None` if it is unset (made by hand).
+    /// The Seal record hash the layer is bound to, or `None` if unbound.
     pub seal_hash: Option<HashVal>,
 }
 
@@ -418,11 +182,11 @@ impl Snapshot {
 pub struct DatasetInfo {
     /// The dataset.
     pub dataset: Dataset,
-    /// Where it is mounted; `None` for `none`, `legacy` or `-`.
+    /// Where it is mounted; `None` if it is not.
     pub mountpoint: Option<PathBuf>,
     /// The snapshot it was cloned from (full name), if it is a clone.
     pub origin: Option<String>,
-    /// The `taso:parent` property: the Seal record it was forked from.
+    /// The Seal record it was forked from (its parent), if a fork.
     pub parent: Option<HashVal>,
 }
 
@@ -514,7 +278,7 @@ mod tests {
             "manual",
             "taso-seal-1",
             "taso-seal-0000000000000000000x",
-            "zfs-auto-snap_hourly",
+            "auto-snap_hourly",
         ] {
             assert_eq!(parse_snap_name(snap), None, "{snap}");
         }
