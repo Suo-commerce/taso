@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # bench/p5/bench.sh: the P5 harness, first piece (Taso_plan_p5 §3 B1, H0's
 # first question: work per durable byte).  The same workload through
-# taso-wardend on either storage, one machine, one table.
+# taso-wardend on the block log, one machine, one table.
 #
-#   sudo bench/p5/bench.sh zfs [P] [TURNS] [RUNS]     (from the repository root)
-#   sudo bench/p5/bench.sh blk [P] [TURNS] [RUNS]
+#   sudo bench/p5/bench.sh blk [P] [TURNS] [RUNS]     (from the repository root)
+#
+# "blk" is the only storage since V4b (the ZFS half was cut, 2026-11-06); it
+# stays an argument so the rows run before then read the same.
 #
 # Defaults P=1, TURNS=10, RUNS=1: the smallest run that proves the harness
 # measures what it says.  The §3 rows are the same script at P=8 and P=64.
 #
-# The workload is gate-p1's (the Phase 1 gate): P Vessels, each running
-# taso-sim under runc — SQLite in WAL mode on the Vessel's dataset, TXNS
+# The workload is the Phase 1 gate's (gate-p1, now deleted): P Vessels, each
+# running taso-sim under runc — SQLite in WAL mode on the Vessel's dataset, TXNS
 # transactions of ROWS rows of ROW_BYTES per turn, a quiescent TurnEnd per
 # turn at which the Warden seals and publishes.  What is measured, per
 # Vessel and pooled:
@@ -30,22 +32,19 @@
 # plus the raw samples beside it.  Nothing is compared or judged here: the
 # storage rule (§3) is applied to the tables by hand, in the plan.
 #
-# Storage:
-#   zfs  Vessel roots are new datasets under $TASO_ZFS_DATASET (default
-#        taso/vessel, A1's; tasotest/vessel on taso-test), destroyed after.
-#   blk  a fresh taso-blkd on its own log under $DIR (which A1 puts on the
-#        measured drive through /var/lib/taso-blk), mounts under /mnt/p5-bench,
-#        stopped after.  The Warden leaves each Vessel mounted under $MNT at
-#        exit, so its samples are read there; a dataset not mounted is
-#        attached read-only through taso-blkd (find, attach, mount -o ro).
+# Storage: a fresh taso-blkd on its own log under $DIR (which A1 puts on the
+# measured drive through /var/lib/taso-blk), mounts under /mnt/p5-bench,
+# stopped after.  The Warden leaves each Vessel mounted under $MNT at exit,
+# so its samples are read there; a dataset not mounted is attached
+# read-only through taso-blkd (find, attach, mount -o ro).
 #
-# DURABLE_AT=flush|fua|seal (blk only; default fua, taso-blkd's own since 2026-11-06): taso-blkd's
+# DURABLE_AT=flush|fua|seal (default fua, taso-blkd's own since 2026-11-06): taso-blkd's
 # --durable-at.  fua answers FUA writes without a sync; seal answers device
 # flushes and FUA writes without one, so only the Seal syncs
 # (claude/Taso_design_syncs_2026-11-04.md, s-g).  The
 # table's host line and the output folder's name say which was measured.
 # Both: an in-process coordinator (redb) and a local pack store under $DIR,
-# as gate-p1 with HUB=0 — the coordinator and the store are not what is
+# as gate-p1 had with HUB=0 — the coordinator and the store are not what is
 # measured here.
 #
 # FORKS=N (default 0) is the fork storm (M5): with P=1, the Vessel asks N
@@ -53,8 +52,8 @@
 # Warden makes a child per ask (uid slots 2..N+1), each child runs the
 # agent for its own TURNS turns, sealing each.  Measured on top: fork.total
 # (the Warden's fork_from_log, per fork), the forks the Warden logged, the
-# storage's bytes before and after the run (block log: taso-blkd's
-# log_bytes; zfs: the base dataset's used) and so bytes per branch, and
+# block log's bytes before and after the run (taso-blkd's log_bytes) and
+# so bytes per branch, and
 # the children's commit and turn-pause samples apart from the parent's:
 # the parent's are "one alive", the children's "N alive".
 #
@@ -77,15 +76,14 @@
 # seal and publish spans pool every Vessel (they carry no Vessel).
 #
 # Environment (gate-p1's): TXNS (4) ROWS (8) ROW_BYTES (512) SYNC (normal)
-# LANDLOCK (1) BATCHED (1) TASO_ZFS_DATASET; OUT (results directory,
-# default /root/taso-p5-bench-<storage>-<time>, kept); KEEP=1 keeps the
-# work directory and datasets.
+# LANDLOCK (1); OUT (results directory, default
+# /root/taso-p5-bench-blk[-DURABLE_AT]-<time>, kept); KEEP=1 keeps the work
+# directory and the log.
 #
 # Touches, and nothing else: $DIR = /var/lib/taso-blk/p5-bench, resolved (removed at
-# start, removed at the end unless KEEP), $OUT, the datasets or the log
-# above, /run/taso-p5-bench-blk.sock, /mnt/p5-bench, runc containers under
+# start, removed at the end unless KEEP), $OUT, the log above, /run/taso-p5-bench-blk.sock, /mnt/p5-bench, runc containers under
 # $DIR/run.  Needs root, cargo in PATH (run as root, not through sudo
-# without -i), runc, python3, and zfs or ublk.
+# without -i), runc, python3 and ublk.
 
 set -euo pipefail
 
@@ -93,9 +91,9 @@ STORAGE=${1:-}
 P=${2:-1}
 TURNS=${3:-10}
 RUNS=${4:-1}
-[[ "$STORAGE" == zfs || "$STORAGE" == blk ]] || { echo "usage: $0 zfs|blk [P] [TURNS] [RUNS]" >&2; exit 64; }
+[[ "$STORAGE" == blk ]] || { echo "usage: $0 blk [P] [TURNS] [RUNS]" >&2; exit 64; }
 TXNS=${TXNS:-4}; ROWS=${ROWS:-8}; ROW_BYTES=${ROW_BYTES:-512}; SYNC=${SYNC:-normal}
-LANDLOCK=${LANDLOCK:-1}; BATCHED=${BATCHED:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
+LANDLOCK=${LANDLOCK:-1}; KEEP=${KEEP:-0}; FORKS=${FORKS:-0}
 BIG_MIB=${BIG_MIB:-0}; NOISY=${NOISY:-0}; MEM_MIB=${MEM_MIB:-256}
 DURABLE_AT=${DURABLE_AT:-fua}
 case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "DURABLE_AT is flush, fua or seal, not '$DURABLE_AT'" >&2; exit 2 ;; esac
@@ -103,21 +101,20 @@ case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "DURABLE_AT is flush, fua or se
 NOISY_TXNS=${NOISY_TXNS:-64}; NOISY_ROWS=${NOISY_ROWS:-256}; NOISY_ROW_BYTES=${NOISY_ROW_BYTES:-4096}
 [[ "$FORKS" == 0 || "$P" == 1 ]] || { echo "FORKS needs P=1 (one parent, N children)" >&2; exit 64; }
 [[ "$NOISY" == 0 || "$P" -ge 2 ]] || { echo "NOISY needs P >= 2 (one neighbour, P-1 others)" >&2; exit 64; }
-ZFS_PARENT=${TASO_ZFS_DATASET:-taso/vessel}
 # The real path: runc refuses a rootfs reached through a symlink, and A1
 # makes /var/lib/taso-blk one (taso-p5, 2026-10-26: "invalid rootfs").
 DIR=$(readlink -f /var/lib/taso-blk)/p5-bench
 BLK_SOCK=/run/taso-p5-bench-blk.sock
 MNT=/mnt/p5-bench
 STAMP=$(date +%Y%m%d-%H%M%S)
-if [[ "${1:-}" == blk && "$DURABLE_AT" != fua ]]; then TAG=blk-$DURABLE_AT; else TAG=${1:-}; fi
+if [[ "$DURABLE_AT" != fua ]]; then TAG=blk-$DURABLE_AT; else TAG=blk; fi
 OUT=${OUT:-/root/taso-p5-bench-$TAG-$STAMP}
 RUN=$STAMP-$$
 export VESSEL_OK=' 0 publish failures, [0-9]+ segments pruned, 0 prune failures, agent ok$'
 
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 say() { printf '== %s\n' "$*"; }
-BLKD_PID=; ZFS_BASE=
+BLKD_PID=
 
 mounts_under() {
     awk -v root="$MNT" '$5 == root || index($5, root "/") == 1 { print length($5), $5 }' /proc/self/mountinfo | sort -rn | cut -d' ' -f2-
@@ -149,9 +146,8 @@ cleanup() {
     while read -r m; do [[ -n "$m" ]] && { fsfreeze -u "$m" 2>/dev/null; umount "$m" || umount -l "$m"; }; done < <(mounts_under)
     if [[ -n "$BLKD_PID" ]] && kill -0 "$BLKD_PID" 2>/dev/null; then (blk quit) >/dev/null 2>&1 || kill "$BLKD_PID"; wait "$BLKD_PID" 2>/dev/null; fi
     if [[ "$KEEP" = 1 ]]; then
-        echo "kept: $DIR${ZFS_BASE:+, dataset $ZFS_BASE}"
+        echo "kept: $DIR"
     else
-        [[ -z "$ZFS_BASE" ]] || zfs destroy -R "$ZFS_BASE" 2>/dev/null
         rm -rf "$DIR"
     fi
     exit "$rc"
@@ -162,25 +158,17 @@ trap cleanup EXIT
 [[ $EUID -eq 0 ]] || die "run as root"
 [[ -f Cargo.toml && -d crates/taso-warden && -d bench/p5 ]] || die "run from the repository root"
 for t in runc ldd python3 cargo; do command -v "$t" >/dev/null || die "$t is missing"; done
-if [[ "$STORAGE" == zfs ]]; then
-    command -v zfs >/dev/null || die "zfs is missing"
-    zfs list -H -o name "$ZFS_PARENT" >/dev/null 2>&1 || die "no dataset $ZFS_PARENT (set TASO_ZFS_DATASET)"
-else
-    modprobe ublk_drv; [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
-    [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's block log? (pgrep -x taso-blkd)"
-    mkdir -p "$MNT"; [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
-fi
+modprobe ublk_drv; [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
+[[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's block log? (pgrep -x taso-blkd)"
+mkdir -p "$MNT"; [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 [[ -d /var/lib/taso-blk ]] || mkdir -p /var/lib/taso-blk
 [[ "$(findmnt -no FSTYPE -T /var/lib/taso-blk)" != tmpfs ]] || die "/var/lib/taso-blk is on tmpfs"
-HOST_NOTE="/var/lib/taso-blk on $(findmnt -no SOURCE,FSTYPE -T /var/lib/taso-blk)"
-[[ "$STORAGE" == blk ]] && HOST_NOTE="$HOST_NOTE, durable at $DURABLE_AT"
+HOST_NOTE="/var/lib/taso-blk on $(findmnt -no SOURCE,FSTYPE -T /var/lib/taso-blk), durable at $DURABLE_AT"
 
 say "building (release)"
-cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock
-[[ "$STORAGE" == zfs ]] || cargo build --release -q -p taso-blk
+cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock -p taso-blk
 BIN=$PWD/target/release
-for b in taso-wardend taso-sim taso-landlock; do [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"; done
-[[ "$STORAGE" == zfs || -x "$BIN/taso-blkd" ]] || die "$BIN/taso-blkd was not built"
+for b in taso-wardend taso-sim taso-landlock taso-blkd; do [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"; done
 
 rm -rf "$DIR"; mkdir -p "$DIR/store" "$DIR/state" "$DIR/run" "$OUT"; chmod 755 "$DIR"
 
@@ -194,47 +182,41 @@ copy_with_libs "$BIN/taso-sim" /usr/bin/taso-sim
 copy_with_libs "$BIN/taso-landlock" /usr/lib/taso/landlock
 mkdir -p "$ROOTFS"/{proc,dev,sys,tmp,work,run/taso}; : >"$ROOTFS/run/taso/field.sock"
 
-# the storage
-if [[ "$STORAGE" == zfs ]]; then
-    ZFS_BASE="$ZFS_PARENT/p5-bench-$$"
-    zfs create "$ZFS_BASE"
-    STORAGE_JSON='"zfs"'
-else
-    "$BIN/taso-blkd" "$DIR/blk.log" "$BLK_SOCK" --durable-at "$DURABLE_AT" 2>>"$DIR/blkd.err" &
-    BLKD_PID=$!
-    for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
-    [[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $DIR/blkd.err"
-    mkdir -p "$DIR/spool"
-    STORAGE_JSON=$(printf '{"blk": {"socket": "%s", "mounts": "%s", "spool": "%s"}}' "$BLK_SOCK" "$MNT" "$DIR/spool")
-fi
+# the storage: the block log
+"$BIN/taso-blkd" "$DIR/blk.log" "$BLK_SOCK" --durable-at "$DURABLE_AT" 2>>"$DIR/blkd.err" &
+BLKD_PID=$!
+for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
+[[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $DIR/blkd.err"
+mkdir -p "$DIR/spool"
+STORAGE_JSON=$(printf '{"blk": {"socket": "%s", "mounts": "%s", "spool": "%s"}}' "$BLK_SOCK" "$MNT" "$DIR/spool")
 SIM_ARGS="--turns $TURNS --txns $TXNS --rows $ROWS --row-bytes $ROW_BYTES --synchronous $SYNC"
 [[ "$FORKS" == 0 ]] || SIM_ARGS="$SIM_ARGS --forks $FORKS"
 [[ "$BIG_MIB" == 0 ]] || SIM_ARGS="$SIM_ARGS --big-file-mib $BIG_MIB --first-write-samples /work/first-write"
 NOISY_ARGS="--turns $TURNS --txns $NOISY_TXNS --rows $NOISY_ROWS --row-bytes $NOISY_ROW_BYTES --synchronous $SYNC"
-bytes_used() { # the storage's bytes now
-    if [[ "$STORAGE" == zfs ]]; then zfs list -Hp -o used "$ZFS_BASE"; else blk stats | tr ' ' '\n' | sed -n 's/^log_bytes=//p'; fi
+bytes_used() { # the block log's bytes now
+    blk stats | tr ' ' '\n' | sed -n 's/^log_bytes=//p'
 }
-log_syncs() { # the block log's fdatasyncs so far (taso-blkd stats: the store's and the Syncer's); 0 on zfs
-    if [[ "$STORAGE" == zfs ]]; then echo 0; else blk stats | tr ' ' '\n' | sed -n 's/^syncs=//p'; fi
+log_syncs() { # the block log's fdatasyncs so far (taso-blkd stats: the store's and the Syncer's)
+    blk stats | tr ' ' '\n' | sed -n 's/^syncs=//p'
 }
-log_sync_us() { # those syncs timed, COUNT:TOTAL_US:MAX_US (taso-blkd stats sync_us, bite 3); empty on zfs or an older taso-blkd
-    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^sync_us=//p'; fi
+log_sync_us() { # those syncs timed, COUNT:TOTAL_US:MAX_US (taso-blkd stats sync_us, bite 3); empty on an older taso-blkd
+    blk stats | tr ' ' '\n' | sed -n 's/^sync_us=//p'
 }
-log_joined() { # device flushes answered from a group already closed (taso-blkd stats flushes_joined, bite 4); empty on zfs or an older taso-blkd
-    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^flushes_joined=//p'; fi
+log_joined() { # device flushes answered from a group already closed (taso-blkd stats flushes_joined, bite 4); empty on an older taso-blkd
+    blk stats | tr ' ' '\n' | sed -n 's/^flushes_joined=//p'
 }
-log_ops() { # the device requests taso-blkd served so far, one "op_NAME=COUNT:TOTAL_US:STORE_US:BYTES[:WAIT_US]" per line (bite 4's probe; the wait for the store's lock since bite 5's); empty on zfs
-    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | grep '^op_' | grep -v '^op_wsplit'; fi
+log_ops() { # the device requests taso-blkd served so far, one "op_NAME=COUNT:TOTAL_US:STORE_US:BYTES[:WAIT_US]" per line (bite 4's probe; the wait for the store's lock since bite 5's)
+    blk stats | tr ' ' '\n' | grep '^op_' | grep -v '^op_wsplit'
 }
-log_lock() { # every hold of the store's lock by site, "SITE:COUNT:TOTAL_US:MAX_US,..." (taso-blkd stats lock, bite 5's probe); empty on zfs or an older taso-blkd
-    if [[ "$STORAGE" == zfs ]]; then echo; else blk stats | tr ' ' '\n' | sed -n 's/^lock=//p'; fi
+log_lock() { # every hold of the store's lock by site, "SITE:COUNT:TOTAL_US:MAX_US,..." (taso-blkd stats lock, bite 5's probe); empty on an older taso-blkd
+    blk stats | tr ' ' '\n' | sed -n 's/^lock=//p'
 }
 
 # ---- one run: the Warden with P Vessels -------------------------------------------
 run_warden() { # run_warden R
     local r=$1
     local root cfg="$DIR/w-$r.json" rc=0
-    if [[ "$STORAGE" == zfs ]]; then root="$ZFS_BASE/w-$r"; zfs create "$root"; else root="p5bench/w$r"; fi
+    root="p5bench/w$r"
     python3 - "$cfg" "$r" "$root" <<PY
 import json, sys
 cfg, r, root = sys.argv[1:4]
@@ -302,26 +284,20 @@ PY
     find "$DIR/store" -type f | wc -l >"$OUT/warden-$r.packfiles"
     grep -c 'forked "' "$OUT/warden-$r.err" >"$OUT/warden-$r.forked" || true
     # the samples each Vessel wrote to its /work
-    if [[ "$STORAGE" == zfs ]]; then
-        for ds in $(zfs list -H -o name -d 1 "$root" | tail -n +2); do
-            collect "$(zfs get -H -o value mountpoint "$ds")" "$r" "$(subject_of "$r" "${ds##*/}")"
-        done
-    else
-        local ds branch dev at="$MNT/.p5-read"
-        mkdir -p "$at"
-        for ds in $(grep -o "\] p5-bench-$RUN-r$r-v[0-9a-z-]*: dataset [^ ]*\$" "$OUT/warden-$r.err" | sed 's/.*: dataset //' | sort -u); do
-            if mountpoint -q "$MNT/$ds"; then   # the Warden leaves the Vessel mounted at exit
-                collect "$MNT/$ds" "$r" "$(subject_of "$r" "${ds##*/}")"; continue
-            fi
-            branch=$(blk find "$ds"); read -r dev whose <<<"$(blk_device "$branch")"
-            for _ in $(seq 50); do [[ -b "$dev" ]] && break; sleep 0.1; done
-            [[ -b "$dev" ]] || die "device $dev for $ds did not appear"
-            mount -o ro "$dev" "$at"
-            collect "$at" "$r" "$(subject_of "$r" "${ds##*/}")"
-            umount "$at"; [[ "$whose" == theirs ]] || blk detach "$branch" >/dev/null
-        done
-        rmdir "$at"
-    fi
+    local ds branch dev whose at="$MNT/.p5-read"
+    mkdir -p "$at"
+    for ds in $(grep -o "\] p5-bench-$RUN-r$r-v[0-9a-z-]*: dataset [^ ]*\$" "$OUT/warden-$r.err" | sed 's/.*: dataset //' | sort -u); do
+        if mountpoint -q "$MNT/$ds"; then   # the Warden leaves the Vessel mounted at exit
+            collect "$MNT/$ds" "$r" "$(subject_of "$r" "${ds##*/}")"; continue
+        fi
+        branch=$(blk find "$ds"); read -r dev whose <<<"$(blk_device "$branch")"
+        for _ in $(seq 50); do [[ -b "$dev" ]] && break; sleep 0.1; done
+        [[ -b "$dev" ]] || die "device $dev for $ds did not appear"
+        mount -o ro "$dev" "$at"
+        collect "$at" "$r" "$(subject_of "$r" "${ds##*/}")"
+        umount "$at"; [[ "$whose" == theirs ]] || blk detach "$branch" >/dev/null
+    done
+    rmdir "$at"
     local ok; ok=$(grep -cE "$VESSEL_OK" "$OUT/warden-$r.out" || true)
     echo "warden run $r: exit $rc, $ok of $P Vessels ok, $(awk '{printf "user %.2fs sys %.2fs rss %d KiB", $1, $2, $3}' "$OUT/warden-$r.time")"
     # The host's disk can stall for minutes (taso-test, 2026-11-03: journald
@@ -346,17 +322,17 @@ collect() { # collect MOUNT R SUBJECT: a child's samples (SUBJECT has -fork-), t
     return 0
 }
 
-say "$STORAGE$([[ "$STORAGE" == blk ]] && echo " (durable at $DURABLE_AT)"): $RUNS run(s) x P=$P, $TURNS turns of $TXNS txns x $ROWS rows x $ROW_BYTES B, synchronous=$SYNC, landlock=$LANDLOCK, batched=$BATCHED"
+say "blk (durable at $DURABLE_AT): $RUNS run(s) x P=$P, $TURNS turns of $TXNS txns x $ROWS rows x $ROW_BYTES B, synchronous=$SYNC, landlock=$LANDLOCK"
 : >"$OUT/commit.samples"; : >"$OUT/turn.samples"; : >"$OUT/commit-children.samples"; : >"$OUT/turn-children.samples"
 : >"$OUT/commit-noisy.samples"; : >"$OUT/turn-noisy.samples"; : >"$OUT/first-write.samples"; : >"$OUT/first-write-children.samples"
 for r in $(seq 1 "$RUNS"); do run_warden "$r"; done
 
 # ---- the table -----------------------------------------------------------------
-python3 - "$OUT" "$STORAGE" "$RUNS" "$P" "$TURNS" "$TXNS" "$ROWS" "$ROW_BYTES" "$SYNC" "$LANDLOCK" "$BATCHED" \
-    "$(hostname)" "$(uname -r)" "$(git rev-parse --short HEAD 2>/dev/null || echo ?)" "$HOST_NOTE" "${ZFS_BASE:-$DIR/blk.log}" "$FORKS" \
+python3 - "$OUT" "$STORAGE" "$RUNS" "$P" "$TURNS" "$TXNS" "$ROWS" "$ROW_BYTES" "$SYNC" "$LANDLOCK" \
+    "$(hostname)" "$(uname -r)" "$(git rev-parse --short HEAD 2>/dev/null || echo ?)" "$HOST_NOTE" "$DIR/blk.log" "$FORKS" \
     "$BIG_MIB" "$NOISY" "$NOISY_TXNS x $NOISY_ROWS rows x $NOISY_ROW_BYTES B" <<'PY' | tee "$OUT/table.md"
 import glob, os, re, sys
-out, storage, runs, p, turns, txns, rows, row_bytes, sync, landlock, batched, host, kernel, commit, note, where, forks, big_mib, noisy, noisy_load = sys.argv[1:]
+out, storage, runs, p, turns, txns, rows, row_bytes, sync, landlock, host, kernel, commit, note, where, forks, big_mib, noisy, noisy_load = sys.argv[1:]
 runs, p, turns, txns, forks, big_mib, noisy = int(runs), int(p), int(turns), int(txns), int(forks), int(big_mib), noisy == "1"
 def q(v, x):
     v = sorted(v)
@@ -382,7 +358,7 @@ if stalls:
 print()
 print(f"- host {host}, kernel {kernel}, taso {commit}; {note}; data at {where}")
 print(f"- durability contract: claude/Taso_finding_p5_a2_facts_2026-10-26.md §1 (this host's row)")
-print(f"- workload: gate-p1's taso-sim, {runs} run(s) x P={p}, {turns} turns of {txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}, batched={batched}; in-process coordinator, local store")
+print(f"- workload: gate-p1's taso-sim, {runs} run(s) x P={p}, {turns} turns of {txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}; in-process coordinator, local store")
 if noisy:
     print(f"- noisy neighbour: v0 of {p}, {turns} turns of {noisy_load} unsynced; the other {p - 1} as above (\"parent\" rows below are theirs)")
 if big_mib:
@@ -394,90 +370,89 @@ if forks:
     b0 = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.bytes0")))
     b1 = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.bytes1")))
     print(f"- fork storm: {forks} asked per run, {forked} forked (Warden log); children commits {len(cc)}, children turns {len(ct)}")
-    print(f"- storage bytes: {b0} before, {b1} after: {(b1 - b0) / 1024:.0f} KiB for the run, {(b1 - b0) / 1024 / (forked or 1):.1f} KiB per branch (the children's own turns included)")
+    print(f"- block log bytes: {b0} before, {b1} after: {(b1 - b0) / 1024:.0f} KiB for the run, {(b1 - b0) / 1024 / (forked or 1):.1f} KiB per branch (the children's own turns included)")
 pb = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.packbytes")))
 pf = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.packfiles")))
 seals = len(spans.get("seal.total", []))
 print(f"- packs shipped: {pb / 1024:.0f} KiB in {pf} files for {seals} Seals: {pb / 1024 / (seals or 1):.1f} KiB per Seal" + (f", {pb / 1024 / (forked or 1):.1f} KiB per branch" if forks else ""))
-if storage != "zfs":
-    # Design 2's measurement (Taso_design_round_2026-10-30, r-a): how many
-    # of the block log's fdatasyncs a Seal costs once the Syncer has merged
-    # what overlapped.  Alone a Seal pays 3 (the freeze's two barriers and
-    # its own).  Every sync of the Warden's run is counted -- the births
-    # (mkfs, mount, Birth Seal) and device flushes between Seals included --
-    # so read it between rows of the same shape, not as a Seal's own cost.
-    y0 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs0")))
-    y1 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs1")))
-    print(f"- block log syncs: {y1 - y0} in the run for {seals} Seals: {(y1 - y0) / (seals or 1):.2f} per Seal (births included; a lone Seal pays 3)")
-    # Bite 3: what one of those syncs costs (taso-blkd times each fdatasync):
-    # the mean over the run's syncs, and the longest since taso-blkd started.
-    n = us = mx = 0
-    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.syncus0"))):
-        a, b = (open(f).read().strip() for f in (f0, f0[:-1] + "1"))
-        if a and b:
-            (c0, t0, _), (c1, t1, m1) = (map(int, x.split(":")) for x in (a, b))
-            n, us, mx = n + c1 - c0, us + t1 - t0, max(mx, m1)
-    if n:
-        print(f"- a block log sync: {us / n / 1000:.2f} ms mean over the run's {n}; the longest {mx / 1000:.2f} ms (since taso-blkd started)")
-    # Bite 4's probe: what the Vessels' filesystems asked of taso-blkd in
-    # the run, per Seal -- a freeze is the kernel's write-back (write
-    # requests) and its barriers (flush requests, each a Flush record and a
-    # sync).  Per op: how many per Seal, the mean time inside taso-blkd
-    # (a flush's is mostly waiting for the Syncer), the part under the
-    # store's lock, the bytes.  seal.freeze minus the flushes' and writes'
-    # time per Seal is the kernel's own (write-back submission, the
-    # superblock's barriers, the ublk round trips).
-    def ops(f):
-        # Five fields since bite 5's probe (the wait for the lock); four before: padded.
-        return {l.split("=")[0][3:]: ([int(x) for x in l.split("=")[1].split(":")] + [0] * 5)[:5] for l in open(f).read().split() if l.startswith("op_")}
-    tot = {}
-    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.ops0"))):
-        a, b = ops(f0), ops(f0[:-1] + "1")
-        for k in b:
-            if k in a:
-                d = [y - x for x, y in zip(a[k], b[k])]
-                tot[k] = [u + v for u, v in zip(tot.get(k, [0] * 5), d)]
-    names = {"flush": "flushes", "write": "writes", "read": "reads", "discard": "discards", "wfua": "FUA writes"}
-    for k in ("flush", "write", "wfua", "read", "discard"):
-        c, us, su, by, wu = tot.get(k, [0] * 5)
-        if c:
-            print(f"- device {names[k]}: {c} in the run, {c / (seals or 1):.2f} per Seal; {us / c / 1000:.2f} ms each in taso-blkd ({su / c / 1000:.2f} under the store's lock"
-                  + (f", {wu / c / 1000:.2f} waiting for it" if wu else "") + ")"
-                  + (f", {by / c / 1024:.1f} KiB each" if by else "")
-                  + f"; {us / (seals or 1) / 1000:.1f} ms per Seal")
-    # Bite 5's probe: the wait for the store's lock, summed per Seal across
-    # every request a Seal's turn sends -- a Vessel's queue thread serves
-    # its requests one at a time, so this wait is in series on the Seal --
-    # against the lock's holds, by site, per Seal.  A wait much larger
-    # than the holds is a queue: the lock is busy with others' holds, or
-    # its holder was preempted (taso-test, P=64, 2026-11-03: ~2 ms waited
-    # per request for 10-80 us held).
-    waited = sum(v[4] for v in tot.values())
-    held = {}
-    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.lock0"))):
-        a, b = (dict((e.split(":")[0], [int(x) for x in e.split(":")[1:]]) for e in open(f).read().split(",") if ":" in e) for f in (f0, f0[:-1] + "1"))
-        for k, (c1, t1, m1) in b.items():
-            c0, t0, _ = a.get(k, [0, 0, 0])
-            h = held.setdefault(k, [0, 0, 0]); h[0] += c1 - c0; h[1] += t1 - t0; h[2] = max(h[2], m1)
-    if waited or held:
-        per = seals or 1
-        print(f"- the store's lock, per Seal: waited for {waited / per / 1000:.1f} ms in all by the device requests; held {sum(h[1] for h in held.values()) / per / 1000:.2f} ms in all, by site:")
-        top = sorted(((k, h) for k, h in held.items() if h[0]), key=lambda kh: -kh[1][1])
-        for k, (c, us, mx) in top[:10]:
-            print(f"    - {k}: {us / per / 1000:.2f} ms per Seal ({c / per:.1f} holds of {us / c:.0f} us mean; the longest {mx / 1000:.1f} ms since taso-blkd started)")
-        rest = top[10:]
-        if rest:
-            print(f"    - {len(rest)} more sites: {sum(h[1] for _, h in rest) / per / 1000:.2f} ms per Seal")
-    # Bite 4's lever: how many of the flushes appended nothing and waited
-    # for a group another flush had closed (taso-blkd stats flushes_joined).
-    j = 0; have = False
-    for f0 in sorted(glob.glob(os.path.join(out, "warden-*.joined0"))):
-        a, b = (open(f).read().strip() for f in (f0, f0[:-1] + "1"))
-        if a and b:
-            j += int(b) - int(a); have = True
-    fl = tot.get("flush", [0])[0]
-    if have and fl:
-        print(f"- device flushes answered from a group already closed: {j} of {fl}, {100 * j / fl:.0f} %")
+# Design 2's measurement (Taso_design_round_2026-10-30, r-a): how many
+# of the block log's fdatasyncs a Seal costs once the Syncer has merged
+# what overlapped.  Alone a Seal pays 3 (the freeze's two barriers and
+# its own).  Every sync of the Warden's run is counted -- the births
+# (mkfs, mount, Birth Seal) and device flushes between Seals included --
+# so read it between rows of the same shape, not as a Seal's own cost.
+y0 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs0")))
+y1 = sum(int(open(f).read() or 0) for f in glob.glob(os.path.join(out, "warden-*.syncs1")))
+print(f"- block log syncs: {y1 - y0} in the run for {seals} Seals: {(y1 - y0) / (seals or 1):.2f} per Seal (births included; a lone Seal pays 3)")
+# Bite 3: what one of those syncs costs (taso-blkd times each fdatasync):
+# the mean over the run's syncs, and the longest since taso-blkd started.
+n = us = mx = 0
+for f0 in sorted(glob.glob(os.path.join(out, "warden-*.syncus0"))):
+    a, b = (open(f).read().strip() for f in (f0, f0[:-1] + "1"))
+    if a and b:
+        (c0, t0, _), (c1, t1, m1) = (map(int, x.split(":")) for x in (a, b))
+        n, us, mx = n + c1 - c0, us + t1 - t0, max(mx, m1)
+if n:
+    print(f"- a block log sync: {us / n / 1000:.2f} ms mean over the run's {n}; the longest {mx / 1000:.2f} ms (since taso-blkd started)")
+# Bite 4's probe: what the Vessels' filesystems asked of taso-blkd in
+# the run, per Seal -- a freeze is the kernel's write-back (write
+# requests) and its barriers (flush requests, each a Flush record and a
+# sync).  Per op: how many per Seal, the mean time inside taso-blkd
+# (a flush's is mostly waiting for the Syncer), the part under the
+# store's lock, the bytes.  seal.freeze minus the flushes' and writes'
+# time per Seal is the kernel's own (write-back submission, the
+# superblock's barriers, the ublk round trips).
+def ops(f):
+    # Five fields since bite 5's probe (the wait for the lock); four before: padded.
+    return {l.split("=")[0][3:]: ([int(x) for x in l.split("=")[1].split(":")] + [0] * 5)[:5] for l in open(f).read().split() if l.startswith("op_")}
+tot = {}
+for f0 in sorted(glob.glob(os.path.join(out, "warden-*.ops0"))):
+    a, b = ops(f0), ops(f0[:-1] + "1")
+    for k in b:
+        if k in a:
+            d = [y - x for x, y in zip(a[k], b[k])]
+            tot[k] = [u + v for u, v in zip(tot.get(k, [0] * 5), d)]
+names = {"flush": "flushes", "write": "writes", "read": "reads", "discard": "discards", "wfua": "FUA writes"}
+for k in ("flush", "write", "wfua", "read", "discard"):
+    c, us, su, by, wu = tot.get(k, [0] * 5)
+    if c:
+        print(f"- device {names[k]}: {c} in the run, {c / (seals or 1):.2f} per Seal; {us / c / 1000:.2f} ms each in taso-blkd ({su / c / 1000:.2f} under the store's lock"
+              + (f", {wu / c / 1000:.2f} waiting for it" if wu else "") + ")"
+              + (f", {by / c / 1024:.1f} KiB each" if by else "")
+              + f"; {us / (seals or 1) / 1000:.1f} ms per Seal")
+# Bite 5's probe: the wait for the store's lock, summed per Seal across
+# every request a Seal's turn sends -- a Vessel's queue thread serves
+# its requests one at a time, so this wait is in series on the Seal --
+# against the lock's holds, by site, per Seal.  A wait much larger
+# than the holds is a queue: the lock is busy with others' holds, or
+# its holder was preempted (taso-test, P=64, 2026-11-03: ~2 ms waited
+# per request for 10-80 us held).
+waited = sum(v[4] for v in tot.values())
+held = {}
+for f0 in sorted(glob.glob(os.path.join(out, "warden-*.lock0"))):
+    a, b = (dict((e.split(":")[0], [int(x) for x in e.split(":")[1:]]) for e in open(f).read().split(",") if ":" in e) for f in (f0, f0[:-1] + "1"))
+    for k, (c1, t1, m1) in b.items():
+        c0, t0, _ = a.get(k, [0, 0, 0])
+        h = held.setdefault(k, [0, 0, 0]); h[0] += c1 - c0; h[1] += t1 - t0; h[2] = max(h[2], m1)
+if waited or held:
+    per = seals or 1
+    print(f"- the store's lock, per Seal: waited for {waited / per / 1000:.1f} ms in all by the device requests; held {sum(h[1] for h in held.values()) / per / 1000:.2f} ms in all, by site:")
+    top = sorted(((k, h) for k, h in held.items() if h[0]), key=lambda kh: -kh[1][1])
+    for k, (c, us, mx) in top[:10]:
+        print(f"    - {k}: {us / per / 1000:.2f} ms per Seal ({c / per:.1f} holds of {us / c:.0f} us mean; the longest {mx / 1000:.1f} ms since taso-blkd started)")
+    rest = top[10:]
+    if rest:
+        print(f"    - {len(rest)} more sites: {sum(h[1] for _, h in rest) / per / 1000:.2f} ms per Seal")
+# Bite 4's lever: how many of the flushes appended nothing and waited
+# for a group another flush had closed (taso-blkd stats flushes_joined).
+j = 0; have = False
+for f0 in sorted(glob.glob(os.path.join(out, "warden-*.joined0"))):
+    a, b = (open(f).read().strip() for f in (f0, f0[:-1] + "1"))
+    if a and b:
+        j += int(b) - int(a); have = True
+fl = tot.get("flush", [0])[0]
+if have and fl:
+    print(f"- device flushes answered from a group already closed: {j} of {fl}, {100 * j / fl:.0f} %")
 print()
 print(f"| what | n | p50 ms | p95 ms | p99 ms | max ms |")
 print(f"| --- | ---: | ---: | ---: | ---: | ---: |")
