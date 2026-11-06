@@ -2095,8 +2095,9 @@ const RERUN_WAITS: [Duration; 3] = [
 ];
 
 /// The rerun waits of this Warden's life (B-a), by Candidate: how many of
-/// its attempts ended `Interrupted` here, and when the next may start.
-/// In memory only: the Warden's own start reruns at once (D88).
+/// its attempts ended `Interrupted` here (or could not start for a reason
+/// that may pass, N5a), and when the next may start.  In memory only: the
+/// Warden's own start reruns at once (D88).
 #[derive(Default)]
 struct Reruns(std::sync::Mutex<std::collections::BTreeMap<[u8; 32], (usize, Instant)>>);
 
@@ -2114,6 +2115,206 @@ impl Reruns {
     fn not_before(&self, candidate: [u8; 32], now: Instant) -> Option<Instant> {
         let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
         m.get(&candidate).map(|e| e.1).filter(|t| *t > now)
+    }
+}
+
+/// What an attempt's thread answers if it panicked: the attempt stays
+/// open, as at a failpoint, and the next open closes it `Interrupted`
+/// (D69).
+const ATTEMPT_PANICKED: &str = "the attempt's thread panicked";
+
+/// Whether an attempt that could not start may start later by itself:
+/// not a final refusal and not a failpoint (N5a; a store or coordinator
+/// outage passes).
+fn start_retries(e: &crate::attempt::AttemptError) -> bool {
+    use crate::attempt::AttemptError as A;
+    use crate::submit::SubmitError as S;
+    !matches!(
+        e,
+        A::Failpoint(_) | A::Submit(S::Refused(_) | S::Stopped(_))
+    )
+}
+
+// ── The node's verifier slots and waiting list (D68, N5a) ───────────
+
+/// How long a waiting Vessel that could not be looked at (a transient
+/// failure) waits before it is looked at again.
+const QUEUE_RETRY: Duration = Duration::from_secs(30);
+/// How long a waiting Vessel that the decider or a run has open waits.
+const QUEUE_BUSY: Duration = Duration::from_secs(1);
+/// The longest the list's worker sleeps without being woken.
+const QUEUE_TICK: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct QueueState {
+    /// Slots taken.
+    used: usize,
+    /// The next arrival's number.
+    next: u64,
+    /// Vessels with an attempt to start, by id: arrival, not before.
+    waiting: std::collections::BTreeMap<[u8; 16], (u64, Instant)>,
+    /// Vessels the worker took, being worked on.
+    taken: std::collections::BTreeSet<[u8; 16]>,
+    /// Something changed since the worker last looked.
+    poked: bool,
+    /// The Warden is ending: nothing more is taken.
+    stopping: bool,
+}
+
+/// The node's verifier slots (D68) and its waiting list (N5a): Vessels
+/// with an open Candidate to attempt that no running session will start
+/// (their run ended, or the Warden started).  Every freed slot looks at
+/// the list; a Vessel taken from it is opened for its attempts as the
+/// decider opens one (D74).  Slots and list share one lock, so a slot
+/// given back is never missed by the worker.
+pub(crate) struct Verifiers {
+    max: usize,
+    state: std::sync::Mutex<QueueState>,
+    cv: std::sync::Condvar,
+}
+
+/// A verifier slot, given back when dropped: by the attempt's thread
+/// however it ends, a panic included (review fixes B1, B2).
+pub(crate) struct VerifierSlot(Arc<Verifiers>);
+
+impl Drop for VerifierSlot {
+    fn drop(&mut self) {
+        self.0.give_back();
+    }
+}
+
+impl Verifiers {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            state: Default::default(),
+            cv: Default::default(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn poke(&self, mut s: std::sync::MutexGuard<'_, QueueState>) {
+        s.poked = true;
+        drop(s);
+        self.cv.notify_all();
+    }
+
+    /// A free slot, if any.
+    fn take(self: &Arc<Self>) -> Option<VerifierSlot> {
+        let mut s = self.lock();
+        if s.used >= self.max {
+            return None;
+        }
+        s.used += 1;
+        Some(VerifierSlot(self.clone()))
+    }
+
+    fn give_back(&self) {
+        let mut s = self.lock();
+        s.used = s.used.saturating_sub(1);
+        self.poke(s);
+    }
+
+    /// Put Vessel `id` on the list, looked at from `not_before`.  Already
+    /// there, it keeps its place and the earlier time.
+    fn add(&self, id: [u8; 16], not_before: Instant) {
+        let mut s = self.lock();
+        Self::insert(&mut s, id, not_before);
+        self.poke(s);
+    }
+
+    fn insert(s: &mut QueueState, id: [u8; 16], not_before: Instant) {
+        let next = s.next;
+        match s.waiting.entry(id) {
+            std::collections::btree_map::Entry::Occupied(mut e) => {
+                let t = &mut e.get_mut().1;
+                *t = (*t).min(not_before);
+            }
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert((next, not_before));
+                s.next += 1;
+            }
+        }
+    }
+
+    /// The Vessel that has waited longest among those due at `now` and
+    /// not being worked on, with a slot for it; `None` if there is no free
+    /// slot, nothing is due, or the Warden is ending.
+    fn next(self: &Arc<Self>, now: Instant) -> Option<([u8; 16], VerifierSlot)> {
+        let mut s = self.lock();
+        if s.stopping || s.used >= self.max {
+            return None;
+        }
+        let id = s
+            .waiting
+            .iter()
+            .filter(|(id, (_, t))| *t <= now && !s.taken.contains(*id))
+            .min_by_key(|(_, (n, _))| *n)
+            .map(|(id, _)| *id)?;
+        s.waiting.remove(&id);
+        s.taken.insert(id);
+        s.used += 1;
+        Some((id, VerifierSlot(self.clone())))
+    }
+
+    /// The worker is done with `id`: back on the list at `again`, if set.
+    fn done(&self, id: [u8; 16], again: Option<Instant>) {
+        let mut s = self.lock();
+        s.taken.remove(&id);
+        if let Some(t) = again {
+            Self::insert(&mut s, id, t);
+        }
+        self.poke(s);
+    }
+
+    /// Sleep until something changes or the next waiting Vessel is due
+    /// (at most [`QUEUE_TICK`]).
+    fn wait(&self, now: Instant) {
+        let mut s = self.lock();
+        if !s.poked {
+            let due = s
+                .waiting
+                .values()
+                .map(|(_, t)| t.saturating_duration_since(now))
+                .min()
+                .unwrap_or(QUEUE_TICK);
+            let timeout = due.clamp(Duration::from_millis(10), QUEUE_TICK);
+            s = self
+                .cv
+                .wait_timeout(s, timeout)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        s.poked = false;
+    }
+
+    /// At the Warden's end: wait until nothing is being worked on (and,
+    /// with `due`, nothing due could start), then take nothing more.  What
+    /// waits for later stays for the next start.
+    fn settle(&self, due: bool) {
+        let mut s = self.lock();
+        if !due {
+            s.stopping = true;
+        }
+        loop {
+            let now = Instant::now();
+            let ready = !s.stopping
+                && s.waiting
+                    .iter()
+                    .any(|(id, (_, t))| *t <= now && !s.taken.contains(id));
+            if s.taken.is_empty() && !(ready && s.used < self.max) {
+                s.stopping = true;
+                return;
+            }
+            s = self
+                .cv
+                .wait_timeout(s, Duration::from_millis(200))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 }
 
@@ -2135,6 +2336,8 @@ struct Verifications<'s, 'e> {
     looked: Option<std::time::Instant>,
     /// Not before then: every Candidate it found waits for a rerun (B-a).
     wake: Option<Instant>,
+    /// A slot taken for it before it ran (the waiting list's).
+    slot: Option<VerifierSlot>,
 }
 
 impl<'s, 'e> Verifications<'s, 'e> {
@@ -2150,7 +2353,19 @@ impl<'s, 'e> Verifications<'s, 'e> {
             want: true,
             looked: None,
             wake: None,
+            slot: None,
         }
+    }
+
+    /// With a slot already taken for its first attempt.
+    fn with_slot(mut self, slot: VerifierSlot) -> Self {
+        self.slot = Some(slot);
+        self
+    }
+
+    /// When what it could not start may start: `None` if nothing is left.
+    fn left(&self) -> Option<Instant> {
+        self.want.then(|| self.wake.unwrap_or_else(Instant::now))
     }
 
     fn log(&self, msg: impl fmt::Display) {
@@ -2216,22 +2431,34 @@ impl<'s, 'e> Verifications<'s, 'e> {
                 self.wake = Some(self.wake.map_or(t, |w| w.min(t)));
                 continue;
             }
-            if !self.node.take_verifier_slot() {
+            let Some(slot) = self.slot.take().or_else(|| self.node.verifiers.take()) else {
                 // Later, when a slot frees: looked for each second (a
                 // slot another Vessel frees is not told here), whatever
                 // waits for a rerun.
                 self.want = true;
                 self.wake = None;
                 return;
-            }
+            };
             let st = match at.start(vessel, &packs, &cand) {
                 Ok(st) => st,
                 Err(e) => {
-                    self.node.release_verifier_slot();
+                    drop(slot);
                     self.log(format_args!(
                         "Candidate {}: its attempt was not started: {e}",
                         cand.candidate_id
                     ));
+                    // A cause that may pass is tried again, after the
+                    // rerun waits (N5a); a final refusal or a failpoint
+                    // is not.
+                    if start_retries(&e) {
+                        let now = Instant::now();
+                        let id = *cand.candidate_id.as_bytes();
+                        self.node.reruns.interrupted(id, now);
+                        if let Some(t) = self.node.reruns.not_before(id, now) {
+                            self.want = true;
+                            self.wake = Some(self.wake.map_or(t, |w| w.min(t)));
+                        }
+                    }
                     continue;
                 }
             };
@@ -2242,7 +2469,11 @@ impl<'s, 'e> Verifications<'s, 'e> {
             self.running.insert(*cand.candidate_id.as_bytes());
             let (node, tx) = (self.node, self.tx.clone());
             self.scope.spawn(move || {
-                let result = match &node.layers {
+                // However the run ends, its slot is given back and the
+                // session hears of it (B1, B2): a panic is an attempt
+                // stopped, left open for the next open to close.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match &node.layers {
                     None => Ok((
                         taso_core::contract::Outcome::LaunchFailed,
                         b"a verifier runs on its Template's layer: runtime.template_slot is not set"
@@ -2267,7 +2498,10 @@ impl<'s, 'e> Verifications<'s, 'e> {
                         }
                         .run(&st, &cand)
                     }
-                };
+                }
+                }))
+                .unwrap_or(Err(crate::attempt::Stopped(ATTEMPT_PANICKED)));
+                drop(slot);
                 let _ = tx.send(Done {
                     started: st,
                     result,
@@ -2277,11 +2511,14 @@ impl<'s, 'e> Verifications<'s, 'e> {
     }
 
     fn done(&mut self, vessel: &mut Vessel<BlkLayers>, d: Done) {
+        // Its slot was given back by its thread.
         self.running.remove(d.started.candidate_id.as_bytes());
-        self.node.release_verifier_slot();
         self.want();
         let id = d.started.attempt_id;
         match d.result {
+            Err(crate::attempt::Stopped(ATTEMPT_PANICKED)) => self.log(format_args!(
+                "attempt {id}: {ATTEMPT_PANICKED}; it stays open until the next open closes it"
+            )),
             Err(crate::attempt::Stopped(p)) => self.log(format_args!(
                     "attempt {id}: stopped at failpoint {p}; it stays open until the next start closes it"
                 ),
@@ -2895,9 +3132,9 @@ pub struct Node {
     failpoint: Option<&'static str>,
     /// Nominations on this node (P4 §3.1), if `"sanction"` is set.
     nominator: Option<crate::nominate::Nominator>,
-    /// Verification attempts running on this node, of at most
-    /// `warden.max_concurrent_verifiers` (D68).
-    verifier_slots: std::sync::Mutex<usize>,
+    /// The verifier slots, at most `warden.max_concurrent_verifiers`
+    /// (D68), and the Vessels waiting for one (N5a).
+    verifiers: Arc<Verifiers>,
     /// The rerun waits of attempts ended `Interrupted` here (B-a).
     reruns: Reruns,
     /// The node's verifier limits (`verifier.*`, §11.1).
@@ -3084,7 +3321,7 @@ impl Node {
             layers,
             failpoint: None,
             nominator,
-            verifier_slots: std::sync::Mutex::new(0),
+            verifiers: Verifiers::new(MAX_CONCURRENT_VERIFIERS),
             reruns: Reruns::default(),
             verifier_limits: crate::verify::VerifierLimits::default(),
             attempt_failpoint: crate::attempt::no_failpoints(),
@@ -3191,28 +3428,6 @@ impl Node {
             warden: self.config.warden,
             failpoint: self.attempt_failpoint.clone(),
         }
-    }
-
-    /// Take a verifier slot of this node, if one is free (D68).
-    fn take_verifier_slot(&self) -> bool {
-        let mut n = self
-            .verifier_slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if *n < MAX_CONCURRENT_VERIFIERS {
-            *n += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn release_verifier_slot(&self) {
-        let mut n = self
-            .verifier_slots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *n = n.saturating_sub(1);
     }
 
     /// At an open (D69): every open attempt of `vessel` closed
@@ -3491,82 +3706,148 @@ impl Node {
         }
     }
 
-    /// At the Warden's own start (D88, D90): every Vessel whose local log
-    /// is here, which this Warden holds and which is not running, and
-    /// which has an open Candidate to attempt (never attempted, or every
-    /// attempt interrupted, fewer than three), is opened here as for a
-    /// verdict (a new epoch; open attempts closed `Interrupted`, D69), its
-    /// verifier run and its attempt finished, and closed again.  A running
-    /// Vessel's own session runs it.  Nothing waits for the agent or the
-    /// TTL.
-    pub fn relaunch_pass(&self) {
-        let at = self.attempts();
-        let vessels = match self.local_vessels() {
-            Ok(v) => v,
+    /// At the Warden's own start (D88, D90; N5a): every Vessel whose local
+    /// log is here goes on the waiting list, looked at at once.  The
+    /// list's worker ([`Node::run_attempt_queue`]) opens those with an
+    /// attempt to start.
+    pub fn queue_local_vessels(&self) {
+        match self.local_vessels() {
+            Ok(vessels) => {
+                let now = Instant::now();
+                for id in vessels {
+                    self.verifiers.add(*id.as_bytes(), now);
+                }
+            }
+            Err(e) => eprintln!(
+                "taso-wardend[{}] the verifiers' waiting list is not filled at start: {e}",
+                self.config.warden.get()
+            ),
+        }
+    }
+
+    /// The waiting list's worker (N5a), for the Warden's life: whenever a
+    /// slot is free and a waiting Vessel is due, that Vessel is looked at
+    /// on its own thread ([`Node::attempt_waiting`]), with the slot taken
+    /// for it.  Woken by every slot given back and every Vessel added.
+    pub fn run_attempt_queue(self: Arc<Self>) {
+        loop {
+            while let Some((id, slot)) = self.verifiers.next(Instant::now()) {
+                let node = self.clone();
+                std::thread::spawn(move || {
+                    let cid = ChronicleId::from_bytes(id);
+                    let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        node.attempt_waiting(cid, slot)
+                    }))
+                    .unwrap_or_else(|_| {
+                        eprintln!(
+                            "taso-wardend[{}] {}: the verifiers' waiting list: a panic; looked at again later",
+                            node.config.warden.get(),
+                            id_hex(cid)
+                        );
+                        Some(Instant::now() + QUEUE_RETRY)
+                    });
+                    node.verifiers.done(id, again);
+                });
+            }
+            self.verifiers.wait(Instant::now());
+        }
+    }
+
+    /// At the Warden's end: the waiting list's work under way finishes,
+    /// and with `due`, what is due too (a finite source's end; not when
+    /// asked to stop); then nothing more is taken.  What waits for later
+    /// is the next start's.
+    pub fn settle_attempt_queue(&self, due: bool) {
+        self.verifiers.settle(due);
+    }
+
+    /// One waiting Vessel, with a slot taken for it (N5a): if this Warden
+    /// holds it here, it is not retired, not running and has an open
+    /// Candidate to attempt that waits for no rerun, it is opened here as
+    /// for a verdict (D74: a new epoch; open attempts closed
+    /// `Interrupted`, D69), its attempts run and finished, and it is
+    /// closed again.  Everything before the open reads only its local log
+    /// and the coordinator.  The answer is when to look at it again, or
+    /// `None` if nothing is left for the list.
+    fn attempt_waiting(&self, id: ChronicleId, slot: VerifierSlot) -> Option<Instant> {
+        let later = || Some(Instant::now() + QUEUE_RETRY);
+        // Its name in this Warden's log: the config's subject, if any.
+        let label = self
+            .config
+            .vessels
+            .iter()
+            .find(|vc| vc.id() == id)
+            .map_or_else(|| id_hex(id), |vc| vc.subject.clone());
+        let log = |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
+        if !self.host().dir_for(id).exists() {
+            return None;
+        }
+        match self.coord.ownership(id) {
+            Ok(o) if o.holder == self.config.warden => {}
+            Ok(_) => return None,
             Err(e) => {
-                eprintln!(
-                    "taso-wardend[{}] relaunch pass skipped: {e}",
-                    self.config.warden.get()
-                );
-                return;
+                log(format!("verifier: coordinator: {e}"));
+                return later();
+            }
+        }
+        match self.coord.query_chronicle(id) {
+            Ok(Some(v)) if !v.retired => {}
+            Ok(_) => return None,
+            Err(e) => {
+                log(format!("verifier: coordinator: {e}"));
+                return later();
+            }
+        }
+        let frames = match crate::chronicle::read_log(&self.host().dir_for(id)) {
+            Ok(f) => f,
+            Err(e) => {
+                log(format!("verifier: reading its log: {e}"));
+                return later();
             }
         };
-        for id in vessels {
-            // Its name in this Warden's log: the config's subject, if any.
-            let label = self
-                .config
-                .vessels
-                .iter()
-                .find(|vc| vc.id() == id)
-                .map_or_else(|| id_hex(id), |vc| vc.subject.clone());
-            let log =
-                |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
-            if self.mine_here(id).is_err() {
-                continue;
+        let todo = match self.attempts().to_attempt_in(&frames, true) {
+            Ok(t) => t,
+            Err(e) => {
+                log(format!("verifier: listing Candidates to verify: {e}"));
+                return later();
             }
-            match self.coord.query_chronicle(id) {
-                Ok(Some(v)) if !v.retired => {}
-                _ => continue,
-            }
-            let frames = match crate::chronicle::read_log(&self.host().dir_for(id)) {
-                Ok(f) => f,
-                Err(e) => {
-                    log(format!("verifier: reading its log: {e}"));
-                    continue;
-                }
-            };
-            match at.to_attempt_in(&frames, true) {
-                Ok(t) if !t.is_empty() => {}
-                Ok(_) => continue,
-                Err(e) => {
-                    log(format!("verifier: listing Candidates to verify: {e}"));
-                    continue;
-                }
-            }
-            let _slot = match self.hold_for_decider(*id.as_bytes()) {
-                Ok(s) => s,
-                Err(Some(_)) => continue, // running: its session runs it
-                Err(None) => continue,    // busy: its next start runs it
-            };
-            let (mut vessel, _) = match self.host().open(id) {
-                Ok(v) => v,
-                Err(e) => {
-                    log(format!("verifier: opening it: {e}"));
-                    continue;
-                }
-            };
-            log("opened here to run its verifier again (D88)".into());
-            if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
-                log(format!("verifier: {e}"));
-                continue;
-            }
-            self.finish_sanctions(&mut vessel, &log);
-            std::thread::scope(|scope| {
-                let mut v = Verifications::new(scope, self, label.clone());
-                v.launch(&mut vessel);
-                v.drain(&mut vessel);
-            });
+        };
+        if todo.is_empty() {
+            return None;
         }
+        // Every one waits for a rerun (B-a): nothing to open for yet.
+        let now = Instant::now();
+        let waits: Option<Vec<Instant>> = todo
+            .iter()
+            .map(|c| self.reruns.not_before(*c.candidate_id.as_bytes(), now))
+            .collect();
+        if let Some(t) = waits.and_then(|w| w.into_iter().min()) {
+            return Some(t);
+        }
+        let _hold = match self.hold_for_decider(*id.as_bytes()) {
+            Ok(s) => s,
+            Err(Some(_)) => return None, // running: its session runs it
+            Err(None) => return Some(now + QUEUE_BUSY), // the decider or a start has it
+        };
+        let (mut vessel, _) = match self.host().open(id) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("verifier: opening it: {e}"));
+                return later();
+            }
+        };
+        log("opened here to run its verifier (D88, N5a)".into());
+        if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
+            log(format!("verifier: {e}"));
+            return later();
+        }
+        self.finish_sanctions(&mut vessel, &log);
+        std::thread::scope(|scope| {
+            let mut v = Verifications::new(scope, self, label.clone()).with_slot(slot);
+            v.launch(&mut vessel);
+            v.drain(&mut vessel);
+            v.left()
+        })
     }
 
     /// Why Vessel `id` is to be purged now, or `None` (D81).
@@ -4624,7 +4905,7 @@ impl Node {
                 if let Some(w) = watch {
                     session = session.with_watch(w);
                 }
-                serve_vessel(
+                let served = serve_vessel(
                     &mut session,
                     &socket,
                     &sender,
@@ -4647,7 +4928,7 @@ impl Node {
                         ),
                     },
                 )
-                .map_err(io("serving the sockets"))?;
+                .map_err(io("serving the sockets"));
                 let (failures, last) = session.after_seal_failures();
                 let last = last.map(str::to_string);
                 drop(session);
@@ -4655,9 +4936,16 @@ impl Node {
                 // `NotHere` (its sender is gone with the ticker).
                 self.slots().insert(*id.as_bytes(), DSlot::Busy);
                 drop(ticker);
-                // The agent is done: the attempts still running finish
-                // before the run returns.
-                verif.borrow_mut().drain(&mut vessel);
+                // The agent is done (or serving failed): the attempts still
+                // running finish before the run returns, so none is left
+                // open by an error here (B1).  What could not start goes
+                // on the node's waiting list (N5a).
+                let mut verif = verif.borrow_mut();
+                verif.drain(&mut vessel);
+                if let Some(t) = verif.left() {
+                    self.verifiers.add(*id.as_bytes(), t);
+                }
+                served?;
                 Ok((failures, last))
             },
         )?;
@@ -4903,6 +5191,110 @@ mod tests {
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("lost+found")).unwrap();
         check_state_generation(&root).unwrap();
+    }
+
+    /// B1, B2: a slot is given back when its holder ends, a panicking
+    /// thread included; and the worker hears of it at once.
+    #[test]
+    fn a_verifier_slot_is_given_back_by_a_panicking_thread() {
+        let v = Verifiers::new(2);
+        let (a, b) = (v.take().unwrap(), v.take().unwrap());
+        assert!(v.take().is_none(), "both slots taken");
+        let t = std::thread::spawn(move || {
+            let _held = a;
+            panic!("an attempt's thread panics");
+        });
+        assert!(t.join().is_err());
+        v.wait(Instant::now() + Duration::from_secs(3600));
+        let c = v.take().expect("the panicking thread's slot is back");
+        assert!(v.take().is_none());
+        drop((b, c));
+        assert!(v.take().is_some() && v.take().is_some());
+    }
+
+    /// N5a: the waiting list gives the Vessel that has waited longest
+    /// among those due and not being worked on, only with a free slot; a
+    /// Vessel added again keeps its place and the earlier time; one given
+    /// back goes to the end.
+    #[test]
+    fn the_waiting_list_takes_the_longest_waiting_due_vessel_with_a_slot() {
+        let v = Verifiers::new(2);
+        let t0 = Instant::now();
+        let (a, b, c, d) = ([1u8; 16], [2u8; 16], [3u8; 16], [4u8; 16]);
+        v.add(c, t0 + Duration::from_secs(10));
+        v.add(a, t0 + Duration::from_secs(5));
+        v.add(b, t0);
+        v.add(a, t0); // again: its place (after c), the earlier time
+        let (got, sa) = v.next(t0).unwrap();
+        assert_eq!(got, a, "a came before b");
+        let (got, sb) = v.next(t0).unwrap();
+        assert_eq!(got, b);
+        assert!(v.next(t0).is_none(), "no free slot");
+        drop(sb);
+        assert!(v.next(t0).is_none(), "c is not due yet");
+        // b is being worked on: added again, it is not given twice.
+        v.add(b, t0);
+        assert!(v.next(t0 + Duration::from_secs(9)).is_none());
+        v.done(b, None);
+        let (got, sb) = v.next(t0).unwrap();
+        assert_eq!(got, b, "added while taken: waiting once done");
+        // a goes back to the end of the list, due in a second.
+        v.done(a, Some(t0 + Duration::from_secs(1)));
+        drop(sa);
+        v.add(d, t0);
+        let ten = t0 + Duration::from_secs(10);
+        let (got, sc) = v.next(ten).unwrap();
+        assert_eq!(got, c, "c waited longest");
+        assert!(v.next(ten).is_none(), "both slots: b's and c's");
+        drop((sb, sc));
+        let order: Vec<[u8; 16]> = std::iter::from_fn(|| v.next(ten).map(|(id, _)| id)).collect();
+        assert_eq!(order, [a, d], "a was given back before d came");
+    }
+
+    /// N5a: at the Warden's end, what is due finishes before nothing more
+    /// is taken; asked to stop, only what is under way does.
+    #[test]
+    fn the_waiting_list_settles_due_work_or_stops_at_once() {
+        let v = Verifiers::new(2);
+        v.add([1; 16], Instant::now());
+        let worker = {
+            let v = v.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                let (id, slot) = v.next(Instant::now()).unwrap();
+                drop(slot);
+                v.done(id, None);
+            })
+        };
+        v.settle(true);
+        worker.join().unwrap();
+        assert!(v.lock().waiting.is_empty(), "the due Vessel was worked on");
+        assert!(v.next(Instant::now()).is_none(), "nothing taken after");
+
+        let v = Verifiers::new(2);
+        v.add([1; 16], Instant::now());
+        v.settle(false);
+        assert!(v.next(Instant::now()).is_none(), "stopped: not taken");
+        assert_eq!(v.lock().waiting.len(), 1, "left for the next start");
+    }
+
+    /// N5a: an attempt that could not start is tried again by itself
+    /// unless it was refused for good or stopped at a failpoint.
+    #[test]
+    fn only_a_start_failure_that_may_pass_is_tried_again() {
+        use crate::attempt::AttemptError as A;
+        use crate::submit::SubmitError as S;
+        assert!(start_retries(&A::Submit(S::NotInLog)));
+        assert!(start_retries(&A::Submit(S::Pack(
+            crate::pack::PackError::Io(std::io::Error::other("store down"))
+        ))));
+        assert!(!start_retries(&A::Failpoint(
+            "verify.before_started_accept"
+        )));
+        assert!(!start_retries(&A::Submit(S::Stopped("x"))));
+        assert!(!start_retries(&A::Submit(S::Refused(
+            taso_core::coordlog::Final::StaleEpoch
+        ))));
     }
 
     /// Review fix B-a: after an attempt ends Interrupted here, the next
