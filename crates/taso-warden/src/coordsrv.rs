@@ -31,7 +31,7 @@
 //! the other.
 //!
 //! ```text
-//! request  version 1 (1) · op (1) · fields
+//! request  version 2 (1) · op (1) · fields
 //!   1 register   chronicle (16) · holder (8)
 //!   2 append     warden (8) · envelope (137, as in a segment frame)
 //!   3 transfer   chronicle (16) · new_holder (8)
@@ -85,7 +85,10 @@
 //! queries are open to any mapped peer.  `set_retention_pin` is an
 //! operator's call and is not on the wire.
 //!
-//! Operations 6, 7 and 8 were added to version 1 before any server ran
+//! Version 2 (V4b's format break, review fix N4a) changed no layout
+//! here: the records an `accept` carries changed shape, so a peer of
+//! version 1 is refused at its first request rather than misread.  Before
+//! that: operations 6, 7 and 8 were added to version 1 before any server ran
 //! outside a test.  A batch holds at most 4096 envelopes.  Refusal reasons
 //! 11 (`NotYou`: claimed (8) · peer (8)) and 12 (`UnknownPeer`: uid (4))
 //! were added with the peer map, below; operation 9 and refusal 13
@@ -164,7 +167,11 @@ use taso_core::coordlog::{
     Answer, ChronicleView, ClaimAuthority, ClaimError, Head, SubmissionStatus, Submitted,
 };
 
-const WIRE_V1: u8 = 1;
+/// The protocol version every request starts with.  2 since V4b's format
+/// break (review fix N4a): an old Warden and a new coordinator, or the
+/// other way round, refuse each other at the first request, before
+/// anything is written.
+const WIRE_VERSION: u8 = 2;
 
 const OP_REGISTER: u8 = 1;
 const OP_APPEND: u8 = 2;
@@ -488,7 +495,7 @@ impl<'a> In<'a> {
 impl Request {
     fn encode(&self) -> Vec<u8> {
         let mut o = Out(Vec::with_capacity(2 + 8 + 137));
-        o.u8(WIRE_V1);
+        o.u8(WIRE_VERSION);
         match self {
             Self::Register { chronicle, holder } => o
                 .u8(OP_REGISTER)
@@ -645,8 +652,11 @@ impl Request {
 
     fn decode(body: &[u8]) -> Result<Self, Malformed> {
         let mut i = In { b: body };
-        if i.u8()? != WIRE_V1 {
-            return Err(Malformed("unknown protocol version"));
+        if i.u8()? != WIRE_VERSION {
+            return Err(Malformed(
+                "another protocol version: this coordinator speaks version 2 \
+                 (since V4b's format break; 1 is older)",
+            ));
         }
         let op = i.u8()?;
         let req = match op {
@@ -2206,9 +2216,11 @@ mod tests {
             let mut extra = b.clone();
             extra.push(0);
             assert!(Request::decode(&extra).is_err(), "trailing {r:?}");
-            let mut v2 = b.clone();
-            v2[0] = 2;
-            assert!(Request::decode(&v2).is_err(), "version {r:?}");
+            for other in [1, 3] {
+                let mut v = b.clone();
+                v[0] = other;
+                assert!(Request::decode(&v).is_err(), "version {other} {r:?}");
+            }
         }
         let mut bad_stream = reqs[1].encode();
         bad_stream[2 + 8 + 32] = 9; // the envelope's stream byte
@@ -2216,10 +2228,10 @@ mod tests {
             Request::decode(&bad_stream),
             Err(Malformed("unknown stream"))
         );
-        assert!(Request::decode(&[WIRE_V1, 99]).is_err());
+        assert!(Request::decode(&[WIRE_VERSION, 99]).is_err());
         assert!(Request::decode(&[]).is_err());
         // A batch larger than MAX_BATCH is malformed before it is read.
-        let mut huge = vec![WIRE_V1, OP_APPEND_BATCH];
+        let mut huge = vec![WIRE_VERSION, OP_APPEND_BATCH];
         huge.extend_from_slice(&A.get().to_be_bytes());
         huge.extend_from_slice(&(MAX_BATCH + 1).to_be_bytes());
         assert_eq!(Request::decode(&huge), Err(Malformed("batch too large")));
@@ -2287,6 +2299,32 @@ mod tests {
         s.write_all(&u32::MAX.to_be_bytes()).unwrap();
         assert_eq!(read_frame(&mut s).unwrap().unwrap()[0], ST_BAD);
 
+        let after = c.ownership(chron(1)).unwrap();
+        assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
+    }
+
+    /// Review fix N4a: a Warden from before the break (protocol version 1)
+    /// is answered "bad", naming the version spoken, and closed at its
+    /// first request; nothing is written.
+    #[test]
+    fn an_old_warden_is_refused_at_its_first_request() {
+        let e = Env::new();
+        let c = e.client();
+        c.register(chron(1), A).unwrap();
+        let before = c.ownership(chron(1)).unwrap();
+        let mut s = UnixStream::connect(e.sock()).unwrap();
+        let mut req = Request::Transfer {
+            chronicle: chron(1),
+            new_holder: B,
+        }
+        .encode();
+        req[0] = 1;
+        write_frame(&mut s, &req).unwrap();
+        let reply = read_frame(&mut s).unwrap().unwrap();
+        assert_eq!(reply[0], ST_BAD);
+        let text = String::from_utf8_lossy(&reply[1..]);
+        assert!(text.contains("speaks version 2"), "{text}");
+        assert_eq!(read_frame(&mut s).unwrap(), None, "closed");
         let after = c.ownership(chron(1)).unwrap();
         assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
     }
