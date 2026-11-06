@@ -57,7 +57,7 @@
 //!
 //! - A Seal may carry a **tag**: up to [`MAX_TAG`] opaque bytes, written in
 //!   its `Seal` record.  The Warden puts its own Seal record's lsn and hash
-//!   there, as ZFS keeps them in a snapshot property.
+//!   there.
 //! - The store remembers which branch each Seal was made from (its
 //!   **origin**), so [`Store::seals_of`] lists a dataset's own layers.
 //! - A branch may have a **name** (a `Name` record): the dataset name.
