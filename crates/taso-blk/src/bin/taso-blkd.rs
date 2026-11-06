@@ -184,6 +184,124 @@ macro_rules! log {
     }};
 }
 
+/// Every write to stdout and stderr succeeds, whoever makes it (review fix
+/// H-a).  [`log!`] never panics, but a library's `eprintln!` does on a
+/// failed write: libublk prints with it (66 places), and on taso-test
+/// (2026-11-06) its "device reload json failed", for a leftover device
+/// at the start's reap, panicked the daemon before its socket opened when
+/// stderr could not be written (`client_daemon.rs`, /dev/full).  So the
+/// process's own fds 1 and 2 are pipes, and a thread per stream copies
+/// what comes in to the real stream, ignoring a failed write: the line is
+/// lost, the process goes on, as `log!` promises.  [`drained_exit`] puts
+/// the real streams back and lets the copies finish before the process
+/// ends, so the last lines are not lost.
+mod streams {
+    use std::sync::Mutex;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    /// Per stream: its fd, the real stream (a dup) and its copier.
+    static GUARDED: Mutex<Vec<(i32, i32, JoinHandle<()>)>> = Mutex::new(Vec::new());
+
+    /// Put a pipe in front of fds 1 and 2.  A stream that cannot be
+    /// guarded stays as it is.
+    pub fn guard() {
+        let mut g = GUARDED.lock().unwrap_or_else(|e| e.into_inner());
+        for fd in [1, 2] {
+            // SAFETY: plain fd calls on fds this process owns; every fd
+            // made here is closed on each failure path.
+            unsafe {
+                let real = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3);
+                if real < 0 {
+                    continue;
+                }
+                let mut p = [0i32; 2];
+                if libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+                    libc::close(real);
+                    continue;
+                }
+                if libc::dup2(p[1], fd) < 0 {
+                    libc::close(p[0]);
+                    libc::close(p[1]);
+                    libc::close(real);
+                    continue;
+                }
+                libc::close(p[1]);
+                let r = p[0];
+                let copier = std::thread::Builder::new()
+                    .name(format!("taso-blkd fd {fd}"))
+                    .spawn(move || copy(r, real));
+                match copier {
+                    Ok(h) => g.push((fd, real, h)),
+                    Err(_) => {
+                        // No copier: the real stream back, as it was.
+                        libc::dup2(real, fd);
+                        libc::close(r);
+                        libc::close(real);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copy `r` to `real` until `r` ends; a failed write drops the bytes.
+    fn copy(r: i32, real: i32) {
+        let mut buf = [0u8; 8192];
+        loop {
+            // SAFETY: `buf` is ours and as long as said.
+            let n = unsafe { libc::read(r, buf.as_mut_ptr().cast(), buf.len()) };
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            let mut off = 0usize;
+            while off < n as usize {
+                // SAFETY: as above, within the bytes read.
+                let w = unsafe { libc::write(real, buf[off..].as_ptr().cast(), n as usize - off) };
+                if w > 0 {
+                    off += w as usize;
+                } else if w < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                } else {
+                    break; // lost, as log! promises
+                }
+            }
+        }
+        // SAFETY: both are this copier's.
+        unsafe {
+            libc::close(r);
+            libc::close(real);
+        }
+    }
+
+    /// The real streams back, the copies finished (at most a second: a
+    /// child holding a pipe would keep it open), then exit.
+    pub fn drained_exit(code: i32) -> ! {
+        let guarded = std::mem::take(&mut *GUARDED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut copiers = Vec::new();
+        for (fd, real, h) in guarded {
+            // SAFETY: `real` is open until its copier ends; dup2 closes
+            // the pipe's write end on `fd`, so the copier sees the end.
+            unsafe {
+                libc::dup2(real, fd);
+            }
+            copiers.push(h);
+        }
+        let until = Instant::now() + Duration::from_secs(1);
+        while copiers.iter().any(|h| !h.is_finished()) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::process::exit(code)
+    }
+}
+
 /// Where the store's lock is taken, for `stats lock=`: every hold is
 /// timed by its site (P5 bite 5's probe, 2026-11-04).  At P=64 on
 /// taso-test a device request waited ~2 ms for a lock the requests
@@ -548,6 +666,9 @@ fn main() {
         }
     }
 
+    // From here on libraries may print (libublk); no write may panic.
+    streams::guard();
+
     let store = if log.exists() {
         match Store::open(&log) {
             Ok((s, rec)) => {
@@ -627,7 +748,7 @@ fn main() {
                 }
                 let _ = std::fs::remove_file(&socket);
                 log!("taso-blkd: quit");
-                std::process::exit(0);
+                streams::drained_exit(0);
             }
         });
     }
@@ -788,7 +909,7 @@ fn unhex(s: &str) -> Result<Vec<u8>, String> {
 
 fn fail(msg: &str) -> ! {
     log!("taso-blkd: {msg}");
-    std::process::exit(1);
+    streams::drained_exit(1);
 }
 
 /// Serve one control connection.  `true` if it asked the daemon to quit.
@@ -1624,5 +1745,43 @@ mod tests {
         assert_eq!(SITES[Site::CompactFinish as usize], "compact_finish");
         assert_eq!(SITES[Site::SyncFailed as usize], "sync_failed");
         assert_eq!(SITES.len(), Site::N as usize);
+    }
+}
+
+/// Review fix H-a.  The test runs itself again as a child whose stderr is
+/// /dev/full: the child guards its streams, then writes with `eprintln!`,
+/// as libublk does.  Unguarded, that write fails and `eprintln!` panics
+/// (exit 101); guarded, the line is dropped and the child exits 0.
+#[cfg(test)]
+mod streams_test {
+    const CHILD: &str = "TASO_BLKD_STREAMS_TEST_CHILD";
+    const NAME: &str = "streams_test::a_librarys_eprintln_survives_a_stderr_that_cannot_be_written";
+
+    #[test]
+    fn a_librarys_eprintln_survives_a_stderr_that_cannot_be_written() {
+        if std::env::var_os(CHILD).is_some() {
+            let full = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            // SAFETY: points this child's fd 2 at /dev/full.
+            unsafe {
+                libc::dup2(std::os::fd::AsRawFd::as_raw_fd(&full), 2);
+            }
+            super::streams::guard();
+            eprintln!("device reload json failed");
+            super::streams::drained_exit(0);
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "the child's eprintln! to /dev/full must not panic it"
+        );
     }
 }
