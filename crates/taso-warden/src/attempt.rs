@@ -15,8 +15,11 @@
 //! the verifier Template's layer as the read-only root (D65), the
 //! artifact restored into `<root>/a-<attempt_id hex>`, checked against
 //! the output manifest and sealed (D66), the container run with its
-//! output captured and its limits enforced (D67).  Anything that keeps it
-//! from starting ends it `LaunchFailed`, with the reason as its output.
+//! output captured and its limits enforced (D67).  What keeps it from
+//! starting ends it with the reason as its output: `LaunchFailed` for a
+//! cause in the Candidate's content (a result about the files), and
+//! `Interrupted` for one on this node or in the store now, so D88 runs it
+//! again (review fix L-a).
 //! [`destroy_candidate`] removes the `/candidate` dataset once the
 //! attempt's `VerificationFinished` is accepted (D66).
 //!
@@ -453,9 +456,29 @@ pub struct AttemptRun<'a, P: Pool, X: Sender> {
 #[derive(Debug)]
 pub struct Stopped(pub &'static str);
 
+/// Why a verifier did not start (review fix L-a), with the reason.
+#[derive(Debug)]
+enum Failure {
+    /// Something in the Candidate's own content: the vconf, the
+    /// verifier Template's tree, the archive, a held object gone or
+    /// wrong.  A result about the files: `LaunchFailed`.
+    Candidate(String),
+    /// This node or the store, now: the layer, a store read, a
+    /// dataset, the bundle, runc.  No result: `Interrupted`, run again.
+    /// When in doubt, a cause is this: a wrong guess costs a bounded
+    /// rerun, the other way a Candidate decided by an outage.
+    Node(String),
+}
+
 impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
     /// Run `started` (an attempt of `candidate`): how it ended and its
     /// output.  `Err` only for a failpoint (the attempt stays open).
+    ///
+    /// What keeps the verifier from starting (review fix L-a): a cause in
+    /// the Candidate's own content ends it `LaunchFailed`, a result about
+    /// the files; a cause on this node or in the store now ends it
+    /// `Interrupted`, no result, so D88 runs it again (at most
+    /// [`MAX_INTERRUPTED`] times).  The reason is the output either way.
     pub fn run(
         &self,
         started: &VerificationStarted,
@@ -463,7 +486,8 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
     ) -> Result<(Outcome, Vec<u8>), Stopped> {
         match self.prepare_and_run(started, candidate) {
             Ok(r) => r,
-            Err(why) => Ok((Outcome::LaunchFailed, why.into_bytes())),
+            Err(Failure::Candidate(why)) => Ok((Outcome::LaunchFailed, why.into_bytes())),
+            Err(Failure::Node(why)) => Ok((Outcome::Interrupted, why.into_bytes())),
         }
     }
 
@@ -471,42 +495,45 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
         &self,
         st: &VerificationStarted,
         candidate: &Candidate,
-    ) -> Result<Result<(Outcome, Vec<u8>), Stopped>, String> {
-        // The vconf (D64).
+    ) -> Result<Result<(Outcome, Vec<u8>), Stopped>, Failure> {
+        let node = |why: String| Failure::Node(why);
+        // The vconf (D64): one that does not parse is the Candidate's.
         let vconf = Vconf::parse(
             &self.object(ObjectKind::Vconf, st.requirement.vconf_key)?,
             &self.limits,
-        )?;
-        // The root: the verifier Template's layer here (D65).
+        )
+        .map_err(Failure::Candidate)?;
+        // The root: the verifier Template's layer here (D65).  Built or
+        // received now: a failure is this node's or the store's.
         let layer = self
             .layers
             .ensure(st.requirement.template)
-            .map_err(|e| format!("the verifier Template's layer: {e}"))?;
+            .map_err(|e| node(format!("the verifier Template's layer: {e}")))?;
         let root_view = self
             .pool
             .seal_view(&layer.dataset, LAYER_LSN)
-            .map_err(|e| format!("the verifier Template's layer: {e}"))?;
+            .map_err(|e| node(format!("the verifier Template's layer: {e}")))?;
         for d in VERIFIER_DIRS {
             if !root_view.path().join(d).is_dir() {
-                return Err(format!(
+                return Err(Failure::Candidate(format!(
                     "the verifier Template has no /{d} to mount on (it needs /{})",
                     VERIFIER_DIRS.join(", /")
-                ));
+                )));
             }
         }
         // /candidate (D66).
         let base = self.layers.template_base;
         let ds = candidate_dataset(self.root, st.attempt_id);
-        if let Some(g) = self.pool.guid(&ds).map_err(|e| e.to_string())? {
-            self.pool.destroy(&ds, g).map_err(|e| e.to_string())?;
+        if let Some(g) = self.pool.guid(&ds).map_err(|e| node(e.to_string()))? {
+            self.pool.destroy(&ds, g).map_err(|e| node(e.to_string()))?;
         }
         let info = self
             .pool
             .create(&ds)
-            .map_err(|e| format!("making {ds}: {e}"))?;
+            .map_err(|e| node(format!("making {ds}: {e}")))?;
         let mount = info
             .mountpoint
-            .ok_or_else(|| format!("{ds} has no mountpoint"))?;
+            .ok_or_else(|| node(format!("{ds} has no mountpoint")))?;
         let owner = Owner {
             uid_base: base,
             gid_base: base,
@@ -514,28 +541,40 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
         {
             let mut r = self.reader(ObjectKind::Artifact, st.artifact_key)?;
             artifact::restore(&mut r, &mount, owner, self.reserved, Some(st.artifact_key))
-                .map_err(|e| format!("restoring the Candidate: {e}"))?;
+                .map_err(|e| {
+                    let why = format!("restoring the Candidate: {e}");
+                    match e {
+                        // Reading the store or writing the dataset failed;
+                        // a dataset left non-empty is this node's too.
+                        artifact::ArtifactError::Io(_)
+                        | artifact::ArtifactError::TargetNotEmpty(_) => Failure::Node(why),
+                        // The archive itself is wrong.
+                        _ => Failure::Candidate(why),
+                    }
+                })?;
         }
-        own_top(&mount, base).map_err(|e| format!("owning {}: {e}", mount.display()))?;
+        own_top(&mount, base).map_err(|e| node(format!("owning {}: {e}", mount.display())))?;
         let map = Classmap::parse(&self.object(ObjectKind::Classmap, candidate.classmap_key)?)
-            .map_err(|e| format!("the Candidate's classification map: {e}"))?;
+            .map_err(|e| Failure::Candidate(format!("the Candidate's classification map: {e}")))?;
         let want =
             Manifest::decode(&self.object(ObjectKind::Manifest, candidate.output_manifest_key)?)
-                .map_err(|e| format!("the Candidate's output manifest: {e}"))?;
+                .map_err(|e| Failure::Candidate(format!("the Candidate's output manifest: {e}")))?;
         let walked = classify::walk(&mount, &map, owner, self.walk_limits, self.reserved)
-            .map_err(|e| format!("walking the restored Candidate: {e}"))?;
+            .map_err(|e| node(format!("walking the restored Candidate: {e}")))?;
         if !same_entries(&walked, &want) {
-            return Err("the restored Candidate does not walk to its output manifest".into());
+            return Err(Failure::Candidate(
+                "the restored Candidate does not walk to its output manifest".into(),
+            ));
         }
         self.pool
             .layers(&ds)
             .snapshot(CANDIDATE_LSN, st.artifact_key)
             .and_then(crate::chronicle::Thaw::run)
-            .map_err(|e| format!("sealing {ds}: {e}"))?;
+            .map_err(|e| node(format!("sealing {ds}: {e}")))?;
         let cand_view = self
             .pool
             .seal_view(&ds, CANDIDATE_LSN)
-            .map_err(|e| format!("the sealed Candidate: {e}"))?;
+            .map_err(|e| node(format!("the sealed Candidate: {e}")))?;
         // The container (D65, D67).
         let id = format!("verify-{}", &hex(st.attempt_id.as_bytes())[..24]);
         let bundle = self.run_dir.join("verify").join(&id);
@@ -554,7 +593,7 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
                 pids: 256,
             },
         )
-        .map_err(|e| format!("the verifier's bundle: {e:?}"))?;
+        .map_err(|e| node(format!("the verifier's bundle: {e:?}")))?;
         let runc_root = self.run_dir.join("runc");
         let runc = |args: &[&str]| {
             Command::new("runc")
@@ -604,28 +643,32 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
         drop(root_view);
         match result {
             Ok((ended, out)) => Ok(Ok((outcome_of(ended), out))),
-            Err(e) => Err(format!("running the verifier: {e}")),
+            Err(e) => Err(node(format!("running the verifier: {e}"))),
         }
     }
 
-    fn reader(&self, kind: ObjectKind, key: HashVal) -> Result<crate::ship::ByteStream, String> {
+    /// An object the attempt holds.  A store that fails is this node's
+    /// (review fix L-a, as 5a: a failed read is never an absence); one
+    /// the store says is not there, or whose bytes are not its key's,
+    /// cannot come back: the Candidate's.
+    fn reader(&self, kind: ObjectKind, key: HashVal) -> Result<crate::ship::ByteStream, Failure> {
         let path = object_key_path(self.prefix, kind, key).expect("a content kind");
         self.store
             .get(&path)
-            .map_err(|e| format!("{path}: {e}"))?
-            .ok_or_else(|| format!("{path} is not in the store"))
+            .map_err(|e| Failure::Node(format!("{path}: {e}")))?
+            .ok_or_else(|| Failure::Candidate(format!("{path} is not in the store")))
     }
 
-    fn object(&self, kind: ObjectKind, key: HashVal) -> Result<Vec<u8>, String> {
+    fn object(&self, kind: ObjectKind, key: HashVal) -> Result<Vec<u8>, Failure> {
         let mut b = Vec::new();
         self.reader(kind, key)?
             .read_to_end(&mut b)
-            .map_err(|e| format!("reading a {kind:?} object: {e}"))?;
+            .map_err(|e| Failure::Node(format!("reading a {kind:?} object: {e}")))?;
         let got = taso_core::contract::object_key(kind, &b);
         if got != key {
-            return Err(format!(
+            return Err(Failure::Candidate(format!(
                 "the {kind:?} object {key} does not have its key's bytes"
-            ));
+            )));
         }
         Ok(b)
     }

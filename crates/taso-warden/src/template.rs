@@ -2465,6 +2465,68 @@ mod tests {
         assert!(!attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id).unwrap());
     }
 
+    /// A store whose reads fail (an outage, a timeout); writes pass.
+    struct Down(SharedStore);
+    impl ObjectStore for Down {
+        fn put(&self, key: &str, data: &mut dyn Read) -> io::Result<u64> {
+            self.0.put(key, data)
+        }
+        fn get(&self, _: &str) -> io::Result<Option<ByteStream>> {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the store timed out",
+            ))
+        }
+        fn exists(&self, _: &str) -> io::Result<bool> {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the store timed out",
+            ))
+        }
+        fn list(&self, _: &str) -> io::Result<Vec<String>> {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the store timed out",
+            ))
+        }
+    }
+
+    /// Review fix L-a: a store that fails while an attempt prepares is no
+    /// result about the files -- `Interrupted`, and D88 attempts the
+    /// Candidate again; a held object the store says is not there is the
+    /// Candidate's -- `LaunchFailed`.
+    #[test]
+    fn a_node_side_failure_ends_an_attempt_interrupted_and_it_runs_again() {
+        let c = Cluster::new();
+        let node = c.node(1, StorageKind::Zfs);
+        let (limits, reserved) = (Limits::default(), Reserved::defaults());
+        let down: SharedStore = Arc::new(Down(c.store.clone()));
+        let mut run = run_with(&c, &node, &limits, &reserved);
+        run.store = &down;
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", c.t0, VCONF);
+        let at = attempts(&c);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        let text = String::from_utf8(out.clone()).unwrap();
+        assert_eq!(o, VOutcome::Interrupted, "{text}");
+        assert!(text.contains("timed out"), "{text}");
+        at.finish(&mut v, &packs, &st, o, out).unwrap();
+        assert_eq!(
+            at.to_attempt(&v).unwrap(),
+            vec![cand.clone()],
+            "attempted again (D88)"
+        );
+        // The vconf gone from the store: it cannot come back.
+        let path = object_key_path(PREFIX, ObjectKind::Vconf, cand.requirement.vconf_key).unwrap();
+        c.store.delete(&path).unwrap();
+        let run = run_with(&c, &node, &limits, &reserved);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(o, VOutcome::LaunchFailed, "{text}");
+        assert!(text.contains("is not in the store"), "{text}");
+    }
+
     /// A verifier image: the host's `sh` and `cat` with their libraries,
     /// and the mount targets.
     fn verifier_tree(at: &Path) {
