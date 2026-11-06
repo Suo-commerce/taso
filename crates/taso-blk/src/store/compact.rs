@@ -376,8 +376,12 @@ impl Compaction {
             write_pwrite_us: store.stats.write_pwrite_us,
             ..fresh.stats
         };
-        let old = std::mem::replace(store, fresh);
+        let mut old = std::mem::replace(store, fresh);
+        // The log's lock stays with the store: the new one takes it, the
+        // old one the temporary name's, released as it is dropped here.
+        std::mem::swap(&mut store.lock, &mut old.lock);
         let old_log = OldLog(vec![old.file, self.old.try_clone()?]);
+        let _ = remove_if_there(&super::lock_path(&self.temp));
         // The rename is durable only once the directory is: a failed sync
         // here is the store's device failing, answered as a failed sync is
         // anywhere in the store (poisoned, an error), never `ok` (F3,
