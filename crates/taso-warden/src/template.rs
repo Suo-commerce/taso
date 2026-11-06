@@ -4,17 +4,16 @@
 //! A Vessel born from a Template is a clone of the Template's **layer**:
 //! the dataset `<root>/t-<template_id hex>`, whose Seal layer at lsn 1 is
 //! bound to `layer_key`.  Its later Seals ship as increments on that layer,
-//! so every node of a storage kind must hold the very same layer: one
-//! storage stream, the `layer` object `layer_key`, accepted once per
-//! Template and storage kind by `LayerShipped` (D52).
+//! so every node must hold the very same layer: one storage stream, the
+//! `layer` object `layer_key`, accepted once per Template by
+//! `LayerShipped` (D52).
 //!
 //! [`TemplateLayers::ensure`] makes the layer present and checked on this
 //! node, in an order that a retry of the same call finishes from any
 //! crash:
 //!
-//! 1. **Accepted?**  If a `LayerShipped` for the Template and this storage
-//!    kind is accepted, the layer is **settled**: receive it (step 3) and
-//!    stop.
+//! 1. **Accepted?**  If a `LayerShipped` for the Template is accepted,
+//!    the layer is **settled**: receive it (step 3) and stop.
 //! 2. **Build** (no `LayerShipped` yet).  A `LayerShipped` this node
 //!    prepared earlier and never had accepted, or a layer it received and
 //!    checked but never shipped, is reused if its object is in the store.
@@ -1252,7 +1251,7 @@ mod tests {
     /// A Seal's full stream: `tar` of its copy, sorted by name.
     /// The pool's root, and a label written into every stream's tar volume
     /// header (ignored on extract): each node's builds differ by it, as two
-    /// real builds' streams do (ZFS guids and txgs; ext4 allocation).
+    /// real builds' streams do (ext4 allocation, the block log's ids).
     struct DirSend(PathBuf, String);
 
     impl Sender for DirSend {
