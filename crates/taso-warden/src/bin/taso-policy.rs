@@ -5,7 +5,8 @@
 //! taso-policy <warden-config> <policy.toml> [--once] [--dry-run] [--interval-secs <n>]
 //! ```
 //!
-//! Each pass lists the pending Candidates (`Pending`, D73), decides each
+//! Each pass lists the pending Candidates (`Pending`, D73, read page by
+//! page), decides each
 //! on its newest finished attempt by the policy ([`taso_warden::policy`]),
 //! and sends that verdict: `authority = { actor: <policy actor>, reason:
 //! "rule <name>" | "default" }`, `policy_digest` = the policy file's
@@ -95,11 +96,8 @@ fn answer_fields(v: &mut Value, a: &VerdictAnswer) {
 /// One pass: `Err` if the socket could not be used.
 fn pass(n: u64, socket: &std::path::Path, policy: &Policy, dry: bool) -> Result<(), String> {
     let mut c = DeciderClient::connect(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
-    let items = match c.call(&Request::Pending).map_err(|e| e.to_string())? {
-        Reply::Pending { items } => items,
-        Reply::Error { message } => return Err(message),
-        other => return Err(format!("unexpected reply {other:?}")),
-    };
+    // Every page (review fix N3b-a): a pass sees every pending Candidate.
+    let items = c.pending_all()?;
     let uid = rustix::process::getuid().as_raw();
     let mut sent = 0;
     for item in &items {
