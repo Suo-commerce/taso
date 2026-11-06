@@ -39,6 +39,7 @@ pub mod policy;
 pub mod purge;
 pub mod quiesce;
 pub mod rebirth;
+pub mod reclaim;
 pub mod runtime;
 pub mod s3;
 pub mod segment;
