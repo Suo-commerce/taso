@@ -77,7 +77,11 @@ pub const GENESIS_DOMAIN: &str = "taso.genesis.v1";
 /// Domain of [`request_id`].
 pub const REQUEST_DOMAIN: &str = "taso.request.v1";
 
-/// The transformation of §4.1 this code implements.
+/// The rules this code walks (§8) and transforms (§4.1) by.  Raised
+/// whenever either changes, so a changed rule derives new candidate ids
+/// and no refusal recorded under the old rules answers for the new
+/// (review W).  1: the rules as of V4b's format break (review fix N1a's
+/// symlink rule included); nothing older is read.
 pub const TRANSFORM_VERSION: u32 = 1;
 
 // ── Objects ─────────────────────────────────────────────────────────
@@ -744,6 +748,25 @@ pub enum WalkRefusal {
 }
 
 impl WalkRefusal {
+    /// Whether the content alone decides it (review W): the Seal's files,
+    /// the classification map, the exclusion and the rules, all in the
+    /// candidate id, so it is as true later as now and may be recorded
+    /// for good.  Not: a limit or the clock stopping the walk
+    /// (`IncompleteWalk`), the node's `fs.reserved` (`ReservedMismatch`),
+    /// a materialisation on this node (`MaterialisationMismatch`).  An
+    /// `Unsupported` entry counts only when no entry was unreadable: the
+    /// caller, which sees the manifest, decides that.
+    pub fn decided_by_content(self) -> bool {
+        match self {
+            Self::SecretPaths
+            | Self::HookNotWaived
+            | Self::UnknownPaths
+            | Self::Unsupported
+            | Self::DanglingByExclusion => true,
+            Self::IncompleteWalk | Self::ReservedMismatch | Self::MaterialisationMismatch => false,
+        }
+    }
+
     const ALL: [Self; 8] = [
         Self::SecretPaths,
         Self::HookNotWaived,
@@ -1439,7 +1462,9 @@ impl Canonical for GenesisRefused {
     }
 }
 
-/// Why a nomination made no Candidate (§3.1).
+/// Why a nomination made no Candidate (§3.1): the Warden's answer.  Never
+/// stored: only a walk refusal the content decides is recorded, as
+/// [`NominationRefused`] (review fix 4a).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NominationRefusal {
     /// The walk or the materialisation refused the tree (tag 0).
@@ -1463,40 +1488,12 @@ pub enum NominationRefusal {
     },
 }
 
-impl Canonical for NominationRefusal {
-    fn canon(&self, out: &mut Canon) {
-        match self {
-            Self::Walk(w) => {
-                out.tag(0);
-                w.canon(out);
-            }
-            Self::SealNotAccepted => {
-                out.tag(1);
-            }
-            Self::NotThisVessel => {
-                out.tag(2);
-            }
-            Self::BadExclude => {
-                out.tag(3);
-            }
-            Self::Duplicate => {
-                out.tag(4);
-            }
-            Self::Closed => {
-                out.tag(5);
-            }
-            Self::NoChange => {
-                out.tag(6);
-            }
-            Self::Quota { key } => {
-                out.tag(7).str(key);
-            }
-        }
-    }
-}
-
-/// A nomination was refused (§3.1; logical id by D23).  For
-/// diagnosis: it holds nothing and is not a Candidate.
+/// A nomination's walk was refused for good (§3.1; review fix 4a): the
+/// one refusal recorded, keyed by the `candidate_id` the nomination
+/// derives, so a changed classification map, requirement or rule
+/// (`transform_version`) walks again.  Only a refusal the content decides
+/// ([`WalkRefusal::decided_by_content`]); every other refusal is answered
+/// and not recorded.  It holds nothing and is not a Candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NominationRefused {
     /// The Vessel.
@@ -1505,10 +1502,30 @@ pub struct NominationRefused {
     pub seal: SealRef,
     /// The exclusion asked for.
     pub exclude: BTreeSet<PathClass>,
+    /// The rules walked by ([`TRANSFORM_VERSION`]).
+    pub transform_version: u32,
+    /// The classification map walked with.
+    pub classmap_key: HashVal,
+    /// The verifier requirement asked for.
+    pub requirement: VerifierRequirement,
     /// Why.
-    pub reason: NominationRefusal,
-    /// The walk's manifest, if the walk ran.
-    pub input_manifest_key: Option<HashVal>,
+    pub reason: WalkRefusal,
+    /// The walk's manifest.
+    pub input_manifest_key: HashVal,
+}
+
+impl NominationRefused {
+    /// The Candidate id the refused nomination derives (§3.2): its key.
+    pub fn candidate_id(&self) -> HashVal {
+        candidate_id(
+            self.chronicle,
+            self.seal.hash,
+            &self.exclude,
+            self.classmap_key,
+            self.transform_version,
+            &self.requirement,
+        )
+    }
 }
 
 impl Canonical for NominationRefused {
@@ -1516,8 +1533,11 @@ impl Canonical for NominationRefused {
         self.chronicle.canon(out);
         self.seal.canon(out);
         out.set(self.exclude.iter());
+        out.u32(self.transform_version);
+        self.classmap_key.canon(out);
+        self.requirement.canon(out);
         self.reason.canon(out);
-        out.option(self.input_manifest_key.as_ref());
+        self.input_manifest_key.canon(out);
     }
 }
 
@@ -1561,37 +1581,13 @@ impl Canonical for TemplateNamed {
     }
 }
 
-/// Which storage a layer stream is for (§5.6, D52): tags `Zfs 0, Blk 1`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum StorageKind {
-    /// ZFS (`zfs send`).
-    Zfs,
-    /// The block log (`taso-blkd export`).
-    Blk,
-}
-
-impl StorageKind {
-    /// Its tag.
-    pub fn tag(self) -> u8 {
-        self as u8
-    }
-}
-
-impl Canonical for StorageKind {
-    fn canon(&self, out: &mut Canon) {
-        out.tag(*self as u8);
-    }
-}
-
-/// A Template's layer for one storage kind is shipped (§5.6, D52): every
-/// node of that kind receives the `layer` object and binds its layer Seal
-/// (lsn 1) to `layer_key`.
+/// A Template's layer is shipped (§5.6, D52; one storage since V4b):
+/// every node receives the `layer` object and binds its layer Seal (lsn
+/// 1) to `layer_key`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LayerShipped {
     /// The Template.
     pub template_id: ChronicleId,
-    /// The storage kind the stream is for.
-    pub storage: StorageKind,
     /// The `layer` object's content key: also the layer Seal's binding.
     pub layer_key: HashVal,
     /// The layer Seal's guid as every node receives it.
@@ -1601,7 +1597,6 @@ pub struct LayerShipped {
 impl Canonical for LayerShipped {
     fn canon(&self, out: &mut Canon) {
         self.template_id.canon(out);
-        self.storage.canon(out);
         self.layer_key.canon(out);
         out.u64(self.guid);
     }
@@ -1684,15 +1679,18 @@ impl TemplateRef {
     }
 }
 
-/// The exclusion set as a bitmask, one bit per [`PathClass`] tag: a
-/// fixed-size stand-in for the set inside a [`LogicalKey`].
-pub fn exclude_mask(exclude: &BTreeSet<PathClass>) -> u8 {
-    exclude.iter().fold(0u8, |m, c| m | (1 << (*c as u8)))
-}
-
 // ── The record enum ─────────────────────────────────────────────────
 
-/// A P4 contract record.  Tags are fixed; a new kind is a new tag.
+/// The tag of a `NominationRefused` keyed by its Candidate id (review fix
+/// 4a).  Tag 19, the shape keyed by Seal and exclusion, is retired.
+const TAG_NOMINATION_REFUSED: u8 = 23;
+/// The tag of a `LayerShipped` without a storage kind (V4b).  Tag 22, the
+/// shape with one, is retired.
+const TAG_LAYER_SHIPPED: u8 = 24;
+
+/// A P4 contract record.  Tags are fixed; a new kind is a new tag, and a
+/// record's shape that changes takes a new tag, the old one retired and
+/// refused by name (19 and 22 since V4b).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContractRecord {
     /// Tag 0.
@@ -1775,12 +1773,10 @@ impl ContractRecord {
             Self::GenesisRefused(g) => LogicalKey::GenesisRefused(g.genesis_id),
             Self::ReclaimClaimed { object_key } => LogicalKey::Reclaim(*object_key),
             Self::ReclaimComplete { object_key, .. } => LogicalKey::ReclaimDone(*object_key),
-            Self::NominationRefused(n) => {
-                LogicalKey::NominationRefused(n.chronicle, n.seal.hash, exclude_mask(&n.exclude))
-            }
+            Self::NominationRefused(n) => LogicalKey::NominationRefused(n.candidate_id()),
             Self::GenesisCleanedUp(g) => LogicalKey::GenesisCleaned(g.genesis_id),
             Self::TemplateNamed(t) => LogicalKey::TemplateName(t.name.clone(), t.version),
-            Self::LayerShipped(l) => LogicalKey::Layer(l.template_id, l.storage),
+            Self::LayerShipped(l) => LogicalKey::Layer(l.template_id),
         }
     }
 
@@ -1883,7 +1879,7 @@ impl Canonical for ContractRecord {
                 outcome.canon(out);
             }
             Self::NominationRefused(r) => {
-                out.tag(19);
+                out.tag(TAG_NOMINATION_REFUSED);
                 r.canon(out);
             }
             Self::GenesisCleanedUp(r) => {
@@ -1895,7 +1891,7 @@ impl Canonical for ContractRecord {
                 r.canon(out);
             }
             Self::LayerShipped(r) => {
-                out.tag(22);
+                out.tag(TAG_LAYER_SHIPPED);
                 r.canon(out);
             }
         }
@@ -1946,15 +1942,15 @@ pub enum LogicalKey {
     ReclaimDone(HashVal),
     /// `Birth` (a fork's Lineage record): `chronicle ‖ "birth"` (tag 17).
     Birth(ChronicleId),
-    /// `NominationRefused`: `chronicle ‖ seal ‖ exclude ‖ "refused"`
-    /// (tag 18; D23).  `exclude` as [`exclude_mask`].
-    NominationRefused(ChronicleId, HashVal, u8),
+    /// `NominationRefused`: `candidate_id ‖ "refused"` (tag 18; D23,
+    /// review fix 4a).
+    NominationRefused(HashVal),
     /// `GenesisCleanedUp`: `genesis_id ‖ "cleaned"` (tag 19; D23).
     GenesisCleaned(ChronicleId),
     /// `TemplateNamed`: `name ‖ version` (tag 20; D49).
     TemplateName(String, u32),
-    /// `LayerShipped`: `template_id ‖ storage` (tag 21; D52).
-    Layer(ChronicleId, StorageKind),
+    /// `LayerShipped`: `template_id` (tag 21; D52, one storage since V4b).
+    Layer(ChronicleId),
 }
 
 impl Canonical for LogicalKey {
@@ -2030,11 +2026,9 @@ impl Canonical for LogicalKey {
                 out.tag(17);
                 c.canon(out);
             }
-            Self::NominationRefused(c, h, m) => {
+            Self::NominationRefused(cid) => {
                 out.tag(18);
-                c.canon(out);
-                h.canon(out);
-                out.u8(*m);
+                cid.canon(out);
             }
             Self::GenesisCleaned(c) => {
                 out.tag(19);
@@ -2043,10 +2037,9 @@ impl Canonical for LogicalKey {
             Self::TemplateName(name, version) => {
                 out.tag(20).str(name).u32(*version);
             }
-            Self::Layer(t, k) => {
+            Self::Layer(t) => {
                 out.tag(21);
                 t.canon(out);
-                k.canon(out);
             }
         }
     }
@@ -2480,22 +2473,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    pub(crate) fn nomination_refusal(&mut self) -> R<NominationRefusal> {
-        match self.tag()? {
-            (_, 0) => Ok(NominationRefusal::Walk(self.walk_refusal()?)),
-            (_, 1) => Ok(NominationRefusal::SealNotAccepted),
-            (_, 2) => Ok(NominationRefusal::NotThisVessel),
-            (_, 3) => Ok(NominationRefusal::BadExclude),
-            (_, 4) => Ok(NominationRefusal::Duplicate),
-            (_, 5) => Ok(NominationRefusal::Closed),
-            (_, 6) => Ok(NominationRefusal::NoChange),
-            (_, 7) => Ok(NominationRefusal::Quota {
-                key: self.string()?,
-            }),
-            (at, t) => Self::bad(at, "nomination refusal", t),
-        }
-    }
-
     pub(crate) fn pack_ref(&mut self) -> R<PackRef> {
         Ok(PackRef {
             name: self.string()?,
@@ -2669,13 +2646,13 @@ impl<'a> Reader<'a> {
                 object_key: self.hash()?,
                 outcome: self.reclaim_outcome()?,
             },
-            (_, 19) => ContractRecord::NominationRefused(NominationRefused {
-                chronicle: self.chronicle()?,
-                seal: self.seal_ref()?,
-                exclude: self.class_set()?,
-                reason: self.nomination_refusal()?,
-                input_manifest_key: self.option(Self::hash)?,
-            }),
+            (at, 19) => {
+                return Self::bad(
+                    at,
+                    "retired record: a NominationRefused keyed by Seal and exclusion (before V4b)",
+                    19,
+                )
+            }
             (_, 20) => ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
                 genesis_id: self.chronicle()?,
                 scratch_guid: self.option(Self::u64)?,
@@ -2686,13 +2663,25 @@ impl<'a> Reader<'a> {
                 template_id: self.chronicle()?,
                 authority: self.authority()?,
             }),
-            (_, 22) => ContractRecord::LayerShipped(LayerShipped {
+            (at, 22) => {
+                return Self::bad(
+                    at,
+                    "retired record: a LayerShipped with a storage kind (before V4b)",
+                    22,
+                )
+            }
+            (_, TAG_NOMINATION_REFUSED) => ContractRecord::NominationRefused(NominationRefused {
+                chronicle: self.chronicle()?,
+                seal: self.seal_ref()?,
+                exclude: self.class_set()?,
+                transform_version: self.u32()?,
+                classmap_key: self.hash()?,
+                requirement: self.requirement()?,
+                reason: self.walk_refusal()?,
+                input_manifest_key: self.hash()?,
+            }),
+            (_, TAG_LAYER_SHIPPED) => ContractRecord::LayerShipped(LayerShipped {
                 template_id: self.chronicle()?,
-                storage: match self.tag()? {
-                    (_, 0) => StorageKind::Zfs,
-                    (_, 1) => StorageKind::Blk,
-                    (at, t) => return Self::bad(at, "storage kind", t),
-                },
                 layer_key: self.hash()?,
                 guid: self.u64()?,
             }),
@@ -2993,9 +2982,7 @@ pub(crate) mod tests {
                 object_key: h(0xE0),
                 outcome: ReclaimOutcome::Deleted,
             },
-            ContractRecord::NominationRefused(nomination_refused(NominationRefusal::Walk(
-                WalkRefusal::UnknownPaths,
-            ))),
+            ContractRecord::NominationRefused(nomination_refused(WalkRefusal::UnknownPaths)),
             ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
                 genesis_id: genesis().genesis_id,
                 scratch_guid: Some(0xC1EA),
@@ -3003,7 +2990,6 @@ pub(crate) mod tests {
             ContractRecord::TemplateNamed(named()),
             ContractRecord::LayerShipped(LayerShipped {
                 template_id: genesis().genesis_id,
-                storage: StorageKind::Blk,
                 layer_key: h(0x1A),
                 guid: 0x1A1A,
             }),
@@ -3019,7 +3005,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn nomination_refused(reason: NominationRefusal) -> NominationRefused {
+    fn nomination_refused(reason: WalkRefusal) -> NominationRefused {
         NominationRefused {
             chronicle: cid(1),
             seal: SealRef {
@@ -3027,8 +3013,11 @@ pub(crate) mod tests {
                 hash: h(2),
             },
             exclude: scratch(),
+            transform_version: TRANSFORM_VERSION,
+            classmap_key: h(3),
+            requirement: req(),
             reason,
-            input_manifest_key: Some(h(4)),
+            input_manifest_key: h(4),
         }
     }
 
@@ -3095,11 +3084,17 @@ pub(crate) mod tests {
 
     #[test]
     fn every_record_round_trips_and_tags_are_in_order() {
-        for (i, r) in every_record().into_iter().enumerate() {
+        // Tag 9 is reserved (the former PurgeDeferred, D85); 19 and 22
+        // are retired shapes, their records now 23 and 24 (V4b).
+        let tags: Vec<u8> = (0..=8)
+            .chain(10..=18)
+            .chain([TAG_NOMINATION_REFUSED, 20, 21, TAG_LAYER_SHIPPED])
+            .collect();
+        let records = every_record();
+        assert_eq!(records.len(), tags.len());
+        for (r, tag) in records.into_iter().zip(tags) {
             let b = r.canon_bytes();
-            // Tag 9 is reserved (the former PurgeDeferred, D85).
-            let tag = if i < 9 { i } else { i + 1 };
-            assert_eq!(b[0] as usize, tag, "tag of {r:?}");
+            assert_eq!(b[0], tag, "tag of {r:?}");
             assert_eq!(ContractRecord::decode(&b).unwrap(), r);
         }
     }
@@ -3118,7 +3113,7 @@ pub(crate) mod tests {
             Err(DecodeError::Truncated { .. })
         ));
         assert!(matches!(
-            ContractRecord::decode(&[23]),
+            ContractRecord::decode(&[25]),
             Err(DecodeError::BadTag { .. })
         ));
     }
@@ -3312,27 +3307,93 @@ pub(crate) mod tests {
         assert_eq!(replacement_name(&format!("{}-x", pname(14, 9, 12))), None);
     }
 
+    /// Review fix 4a: a refusal is keyed by the Candidate id its
+    /// nomination derives -- the same Seal and exclusion with another
+    /// classification map, requirement or rule version is another key
+    /// (it walks again); the reason is not part of the key.
     #[test]
-    fn a_seal_and_exclusion_have_one_refusal_logical_id() {
-        let a = ContractRecord::NominationRefused(nomination_refused(NominationRefusal::Duplicate));
-        let b = ContractRecord::NominationRefused(nomination_refused(NominationRefusal::Quota {
-            key: "store.max_pending_artifacts".into(),
-        }));
-        assert_eq!(a.logical_id(), b.logical_id());
-        assert_ne!(a.digest(), b.digest());
-        let mut other = nomination_refused(NominationRefusal::Duplicate);
-        other.exclude.insert(PathClass::Artifact);
-        assert_ne!(
-            ContractRecord::NominationRefused(other).logical_id(),
-            a.logical_id()
+    fn a_refusal_is_keyed_by_its_candidate_id() {
+        let a = nomination_refused(WalkRefusal::UnknownPaths);
+        assert_eq!(
+            a.candidate_id(),
+            candidate_id(cid(1), h(2), &scratch(), h(3), TRANSFORM_VERSION, &req())
         );
-        assert_eq!(exclude_mask(&scratch()), 1 << 4);
+        let key = |n: &NominationRefused| ContractRecord::NominationRefused(n.clone()).logical_id();
+        assert_eq!(
+            key(&a),
+            logical_id(&LogicalKey::NominationRefused(a.candidate_id()))
+        );
+        let mut b = a.clone();
+        b.reason = WalkRefusal::DanglingByExclusion;
+        assert_eq!(key(&a), key(&b), "the reason is not in the key");
+        for change in [
+            (|n: &mut NominationRefused| n.classmap_key = h(9)) as fn(&mut NominationRefused),
+            |n| n.requirement.version += 1,
+            |n| n.transform_version += 1,
+            |n| {
+                n.exclude.insert(PathClass::Artifact);
+            },
+        ] {
+            let mut other = a.clone();
+            change(&mut other);
+            assert_ne!(key(&other), key(&a));
+        }
+    }
+
+    /// Review W: only what the content decides is recorded for good.
+    #[test]
+    fn only_content_decided_walk_refusals_are_for_good() {
+        let kept: Vec<WalkRefusal> = WalkRefusal::ALL
+            .into_iter()
+            .filter(|w| w.decided_by_content())
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                WalkRefusal::SecretPaths,
+                WalkRefusal::HookNotWaived,
+                WalkRefusal::UnknownPaths,
+                WalkRefusal::Unsupported,
+                WalkRefusal::DanglingByExclusion,
+            ]
+        );
+    }
+
+    /// V4b and review fix 4a: a record in a retired shape (tag 22, a
+    /// `LayerShipped` with a storage kind; tag 19, a `NominationRefused`
+    /// keyed by Seal and exclusion) is refused by name, never misread.
+    #[test]
+    fn a_retired_record_shape_is_refused_by_name() {
+        // The old LayerShipped's bytes: tag 22, template, kind 1, key, guid.
+        let mut old = Canon::new();
+        old.tag(22);
+        cid(1).canon(&mut old);
+        old.tag(1);
+        h(0x1A).canon(&mut old);
+        old.u64(0x1A1A);
+        let e = ContractRecord::decode(old.as_bytes()).unwrap_err();
+        assert!(
+            e.to_string().contains("LayerShipped with a storage kind"),
+            "{e}"
+        );
+        // The old NominationRefused: tag 19, then its fields.
+        let mut old = Canon::new();
+        old.tag(19);
+        cid(1).canon(&mut old);
+        let e = ContractRecord::decode(old.as_bytes()).unwrap_err();
+        assert!(
+            e.to_string().contains("NominationRefused keyed by Seal"),
+            "{e}"
+        );
     }
 
     // ── pins ────────────────────────────────────────────────────────
 
     /// Digests of every record kind, in tag order.  A change here is a
     /// format change: bump the domain or add a tag, never edit a pin.
+    /// (V4b's break: `NominationRefused` and `LayerShipped` took new tags,
+    /// so their two pins and `Layer`'s logical id are new; nothing else
+    /// moved.)
     #[test]
     fn record_digests_are_pinned() {
         let got: Vec<String> = every_record()
@@ -3369,7 +3430,7 @@ pub(crate) mod tests {
             claim_id(7, h(6)).to_string(),
             logical_id(&LogicalKey::Birth(cid(1))).to_string(),
             logical_id(&LogicalKey::TemplateName("acme-base".into(), 3)).to_string(),
-            logical_id(&LogicalKey::Layer(cid(1), StorageKind::Zfs)).to_string(),
+            logical_id(&LogicalKey::Layer(cid(1))).to_string(),
         ];
         assert_eq!(got, PINS_DERIVED);
     }
@@ -3394,10 +3455,10 @@ pub(crate) mod tests {
         "8d72712c39d3fe9683075fea0a4c47b51684631c5db7f5ad1b1fede5529210ef",
         "4d820c377642a1bcbcd67bf235dcfa8ad964b5cd4a45017a22f970376e44ea41",
         "7bc1209031258d3bdb68e1f7ad43245b8fc10bfe4c28d3135489bb12047bc6a5",
-        "9de7174a6d7d5362a88b620704dbeff81314ae846ad53bc5373b663caae60133",
+        "eab264d4c766d5f25bf10fd505f3c525b8b71f32ef21957faf46d9c1ba5f14c8",
         "81568db9b33f001502c0cf7993a2c50cb65ca6df2a1e58c1669a91a802187a7f",
         "95d6743ed38bd728132cccc0a8d38ba1ce439ad9d8bd288a85896ecb9d0dee06",
-        "d0228c5960f0423907f98c700b66fab66ef270acbc4b64ddf1b9b5dac58ec953",
+        "614ee3ad12e4562650237590c80e404134e5d41b3f00415c115dab021138e8ee",
     ];
     const PINS_DERIVED: [&str; 13] = [
         "f6091f83116ec7fcb319e5f951fe6b5c709360d89baa30307925bd36d6a59e05",
@@ -3412,7 +3473,7 @@ pub(crate) mod tests {
         "9faafa3b90f351a8a5f09e29101835caf9be58e1371ac1fc7c23a661b59afac0",
         "ca48e4f67689a85d431715b63a5e113e1beddd76e68cc20153b4bb7b46f8665a",
         "5186a5ddb051af1a5cd2e410c9cd31fb2783300f048881f4efc06a62abbe0a07",
-        "354f9819a77dee54227171b93fa37e7d46cabd7d2ebd436c969d0582cd723c88",
+        "fb30ed1b58166fd99d2a21fd23d6b0488feb4d2b40aa2e496d1fb60d35e230aa",
     ];
 
     // ── property tests ──────────────────────────────────────────────
@@ -3711,12 +3772,15 @@ pub(crate) mod tests {
                         hash: a,
                     },
                     exclude: [PathClass::ALL[w]].into_iter().collect(),
-                    reason: if m % 2 == 0 {
-                        NominationRefusal::Walk(WalkRefusal::ALL[w])
-                    } else {
-                        NominationRefusal::Quota { key: s }
+                    transform_version: m as u32,
+                    classmap_key: b,
+                    requirement: VerifierRequirement {
+                        template: c,
+                        vconf_key: a,
+                        version: n as u32,
                     },
-                    input_manifest_key: (n % 2 == 0).then_some(b),
+                    reason: WalkRefusal::ALL[w],
+                    input_manifest_key: b,
                 }),
                 9 => ContractRecord::GenesisCleanedUp(GenesisCleanedUp {
                     genesis_id: c,
@@ -3724,11 +3788,6 @@ pub(crate) mod tests {
                 }),
                 11 => ContractRecord::LayerShipped(LayerShipped {
                     template_id: c,
-                    storage: if m % 2 == 0 {
-                        StorageKind::Zfs
-                    } else {
-                        StorageKind::Blk
-                    },
                     layer_key: a,
                     guid: n,
                 }),
