@@ -208,6 +208,14 @@ pub enum CoordError {
     /// The coordinator log's journal does not decode or does not replay to
     /// the answers it recorded.
     Journal(JournalError),
+    /// The configured `store.deleted_quarantine` is not the one this
+    /// database was made with ([`check_quarantine`]).  Nothing changed.
+    QuarantineChanged {
+        /// The database's, in seconds.
+        made_with: u64,
+        /// The configured one, in seconds.
+        configured: u64,
+    },
 }
 
 /// What was wrong with an `Effect` record's bytes ([`CoordError::EffectPayload`]).
@@ -254,9 +262,11 @@ impl CoordError {
     /// until it is classified.
     pub fn outcome_unknown(&self) -> bool {
         match self {
-            Self::Corrupt { .. } | Self::Storage(_) | Self::Unavailable(_) | Self::Journal(_) => {
-                true
-            }
+            Self::Corrupt { .. }
+            | Self::Storage(_)
+            | Self::Unavailable(_)
+            | Self::Journal(_)
+            | Self::QuarantineChanged { .. } => true,
             Self::UnknownChronicle(_)
             | Self::AlreadyRegistered(_)
             | Self::BadHash { .. }
@@ -353,6 +363,15 @@ impl fmt::Display for CoordError {
             ),
             Self::Claim(e) => write!(f, "claim refused: {e:?}"),
             Self::Journal(e) => write!(f, "{e}"),
+            Self::QuarantineChanged {
+                made_with,
+                configured,
+            } => write!(
+                f,
+                "store.deleted_quarantine is {configured} s, but this coordinator's database \
+                 was made with {made_with} s: it is fixed for a database's life (its journal \
+                 replays to the answers it gave), so configure {made_with} s again"
+            ),
         }
     }
 }
@@ -715,8 +734,10 @@ const JOURNAL: TableDefinition<u64, &[u8]> = TableDefinition::new("taso.coordina
 /// The database's format generation, beside the journal (review fix
 /// N4a).
 const META: TableDefinition<&str, u32> = TableDefinition::new("taso.coordinator.meta");
-/// The one key of [`META`].
+/// [`META`]'s keys: the generation, and the quarantine (seconds) the
+/// database was made with.
 const GENERATION_KEY: &str = "generation";
+const QUARANTINE_KEY: &str = "deleted_quarantine";
 /// The coordinator state's generation: 2 since V4b's format break (the
 /// records the journal holds changed shape).
 pub const GENERATION: u32 = 2;
@@ -769,6 +790,41 @@ fn check_generation(db: &Database) -> Result<(), CoordError> {
     {
         let mut t = w.open_table(META).map_err(storage)?;
         t.insert(GENERATION_KEY, GENERATION).map_err(storage)?;
+    }
+    w.commit().map_err(storage)
+}
+
+/// Check `db`'s `store.deleted_quarantine` against the configured one
+/// (`secs`).  The coordinator log's answers depend on it (a hold within a
+/// quarantine waits), and its journal replays to the answers it gave, so it
+/// is fixed for the database's life: recorded beside the generation the
+/// first time (a new database, or one made before it was recorded), and
+/// any other value refused after, with nothing written.
+fn check_quarantine(db: &Database, secs: u64) -> Result<(), CoordError> {
+    {
+        let r = db.begin_read().map_err(storage)?;
+        let t = r.open_table(META).map_err(storage)?;
+        if let Some(v) = t.get(QUARANTINE_KEY).map_err(storage)? {
+            let made_with = u64::from(v.value());
+            return if made_with == secs {
+                Ok(())
+            } else {
+                Err(CoordError::QuarantineChanged {
+                    made_with,
+                    configured: secs,
+                })
+            };
+        }
+    }
+    let v = u32::try_from(secs).map_err(|_| CoordError::QuarantineChanged {
+        made_with: 0,
+        configured: secs,
+    })?;
+    let mut w = db.begin_write().map_err(storage)?;
+    w.set_durability(Durability::Immediate).map_err(storage)?;
+    {
+        let mut t = w.open_table(META).map_err(storage)?;
+        t.insert(QUARANTINE_KEY, v).map_err(storage)?;
     }
     w.commit().map_err(storage)
 }
@@ -841,19 +897,54 @@ pub struct LogConfig {
     pub clock: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
-/// `store.deleted_quarantine`, in seconds (review fix R2a).
+/// `store.deleted_quarantine`'s default, in seconds (review fix R2a): how
+/// long after a reclaim or a purge resolves its claim on an object no new
+/// hold on that object is accepted (a hold waits: it is refused for now).
+/// It must outlast any delete still in flight after the claim resolved: a
+/// Warden's store request times out after 30 s (`S3Store`), a local
+/// delete is synchronous.  Configurable within
+/// [`MIN_DELETED_QUARANTINE`]..=[`MAX_DELETED_QUARANTINE`]
+/// ([`deleted_quarantine`]); fixed for a coordinator database's life.
 pub const DELETED_QUARANTINE: u64 = 3600;
+/// The shortest `store.deleted_quarantine`: twice a store request's timeout.
+pub const MIN_DELETED_QUARANTINE: u64 = 60;
+/// The longest `store.deleted_quarantine`: 30 days.
+pub const MAX_DELETED_QUARANTINE: u64 = 30 * 24 * 3600;
+
+/// A configured `store.deleted_quarantine`, checked against its bounds.
+pub fn deleted_quarantine(secs: u64) -> Result<u64, String> {
+    if (MIN_DELETED_QUARANTINE..=MAX_DELETED_QUARANTINE).contains(&secs) {
+        Ok(secs)
+    } else {
+        Err(format!(
+            "store.deleted_quarantine must be {MIN_DELETED_QUARANTINE}..={MAX_DELETED_QUARANTINE} \
+             seconds (it must outlast a delete still in flight: a store request times out \
+             after 30 s), not {secs}"
+        ))
+    }
+}
+
+/// The coordinator log's configuration for a node's own coordinator: the
+/// Wardens' store under `prefix`, and the quarantine `quarantine` (L1:
+/// without the store every contract accept would be refused
+/// `NotReadable`).
+pub fn reading_store(store: crate::ship::SharedStore, prefix: &str, quarantine: u64) -> LogConfig {
+    let mut c = LogConfig {
+        store: Arc::new(crate::coordstore::CoordStore::new(store, prefix)),
+        ..LogConfig::default()
+    };
+    c.timing.deleted_quarantine = quarantine;
+    c
+}
 
 impl Default for LogConfig {
     /// No store (nothing is readable: every accept is `NotReadable`),
     /// `announce.ttl` 10 min, `store.deleted_quarantine` 1 h, the system
     /// clock.
     ///
-    /// The quarantine outlasts any delete still in flight after its claim
-    /// is resolved: a store request times out after 30 s (`S3Store`), a
-    /// local delete is synchronous.  It was 7 d; content objects are
-    /// shared by content, so a key reclaimed is soon put and held again,
-    /// and those holds wait it out (review fix R2a).
+    /// The quarantine was 7 d; content objects are shared by content, so a
+    /// key reclaimed is soon put and held again, and those holds wait it
+    /// out ([`DELETED_QUARANTINE`], review fix R2a).
     fn default() -> Self {
         Self {
             store: Arc::new(NoStore),
@@ -925,6 +1016,7 @@ impl Coordinator {
     pub fn open_with(path: impl AsRef<Path>, config: LogConfig) -> Result<Self, CoordError> {
         let db = Database::create(path).map_err(storage)?;
         check_generation(&db)?;
+        check_quarantine(&db, config.timing.deleted_quarantine)?;
         let coord = Self {
             db,
             queue: Mutex::default(),
@@ -3374,6 +3466,38 @@ mod log_tests {
         );
         coord.append_batch_with(A, &e, &fx).unwrap();
         assert!(coord.obligations(c).unwrap().is_empty());
+    }
+
+    /// R2a: the quarantine is recorded when the database is made (or first
+    /// opened since it was recorded at all) and fixed after: the journal
+    /// replays to the answers it gave under it.  Another value is refused
+    /// at open, naming both, with nothing written.
+    #[test]
+    fn the_quarantine_is_fixed_for_a_databases_life() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let with = |secs: u64| {
+            let mut c = config(store.clone(), 1_000);
+            c.timing.deleted_quarantine = secs;
+            Coordinator::open_with(&path, c)
+        };
+        let coord = with(600).unwrap();
+        coord.register(chron(1), A).unwrap();
+        drop(coord);
+        drop(with(600).unwrap());
+        match with(3600) {
+            Err(
+                e @ CoordError::QuarantineChanged {
+                    made_with: 600,
+                    configured: 3600,
+                },
+            ) => assert!(e.to_string().contains("configure 600 s again"), "{e}"),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("another quarantine opened the database"),
+        }
+        let coord = with(600).unwrap();
+        assert!(coord.ownership(chron(1)).is_ok(), "nothing changed");
     }
 
     /// Review fix N4a: a new database is marked and opens again; one
