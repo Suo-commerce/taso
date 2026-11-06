@@ -16,7 +16,7 @@
 //! - **From the void** (the default): an empty dataset, `Origin::Void`.
 //!   [`Host::ensure`] opens the Vessel if the coordinator knows it and
 //!   births it from the void otherwise.
-//! - **Fork**: `zfs clone` from an accepted Seal of a parent in the same
+//! - **Fork**: a clone of an accepted Seal of a parent in the same
 //!   namespace, `Origin::Fork`.
 //! - **Succession**: an operator moves a Vessel's state to another
 //!   identity.  Deliberately hard: refused without an actor and a reason,
@@ -71,21 +71,18 @@ use taso_core::record::{
     PromotionRecord, StreamCut, SuccessionRecord, TemplateAsked, TurnId, Verdict,
 };
 
-use crate::chronicle::{
-    Chronicle, ChronicleError, Claim, LayerError, Layers, Recovery, Sealed, ZfsLayers,
-};
+use crate::chronicle::{Chronicle, ChronicleError, Claim, LayerError, Layers, Recovery, Sealed};
 use crate::coordinator::{Coord, CoordError};
 use crate::pack::{PackError, Packs};
 use crate::segment::{Frame, Position};
 use crate::ship::{ObjectStore, Sender};
 use crate::storage::{CloneBase, Dataset, DatasetInfo, Snapshot};
 use crate::template::LAYER_LSN;
-use crate::zfs::{Runner, Zfs};
 use taso_core::record::FsShippedRecord;
 
 // ── Pool ────────────────────────────────────────────────────────────
 
-/// Where Vessel datasets live: ZFS in Phase 1.
+/// Where Vessel datasets live: the block log ([`crate::blk::BlkPool`]).
 pub trait Pool {
     /// The layer store of one dataset.
     type Layers: Layers;
@@ -121,11 +118,9 @@ pub trait Pool {
     /// newest Seal layer `base`, what the fork `child` is at its Seal
     /// `child_seal` (a fork of `dataset` at `base`), as `dataset`'s Seal
     /// layer `to`, bound to its hash.  What was written after `base` is
-    /// discarded.  How is the pool's: the block log imports the fork's
-    /// increment from `base` (made with `sender`); ZFS, which cannot
-    /// receive a clone's increment into its origin, copies the fork's
-    /// changes ([`Zfs::adopt_copy`]).  Calling it again for a layer
-    /// already there binds it and returns.  Returns the layer's guid.
+    /// discarded.  The block log imports the fork's increment from `base`
+    /// (made with `sender`).  Calling it again for a layer already there
+    /// binds it and returns.  Returns the layer's guid.
     fn adopt(
         &self,
         dataset: &Dataset,
@@ -147,12 +142,12 @@ pub trait Pool {
     ) -> Result<u64, LayerError>;
     /// The files of `dataset`'s Seal layer `lsn`, read-only, for as long
     /// as the view lives (P4 spec rev. 12 §7, D39, D40: genesis reads a
-    /// Vessel's Seal and its own sealed output this way).  ZFS: the
-    /// snapshot's directory; the block log: a throwaway branch of the Seal
-    /// mounted read-only, gone when the view is dropped.
+    /// Vessel's Seal and its own sealed output this way).  The block log:
+    /// a throwaway branch of the Seal mounted read-only, gone when the
+    /// view is dropped.
     fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError>;
     /// An identity of `dataset` that a later dataset of the same name does
-    /// not share (ZFS: its `guid`; the block log: its branch's id).  `None`
+    /// not share (the block log: its branch's id).  `None`
     /// if there is no such dataset.
     fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError>;
     /// Destroy `dataset` and its own Seal layers, only if it is still the
@@ -194,90 +189,6 @@ impl std::fmt::Debug for SealView {
         f.debug_struct("SealView")
             .field("path", &self.path)
             .finish()
-    }
-}
-
-impl<R: Runner + Clone> Pool for Zfs<R> {
-    type Layers = ZfsLayers<R>;
-
-    fn create(&self, dataset: &Dataset) -> Result<DatasetInfo, LayerError> {
-        Ok(Zfs::create(self, dataset)?)
-    }
-
-    fn clone(
-        &self,
-        source: &Dataset,
-        seal: Lsn,
-        seal_hash: HashVal,
-        target: &Dataset,
-    ) -> Result<DatasetInfo, LayerError> {
-        Ok(Zfs::clone(self, source, seal, seal_hash, target)?)
-    }
-
-    fn info(&self, dataset: &Dataset) -> Result<Option<DatasetInfo>, LayerError> {
-        Ok(self.dataset_info(dataset)?)
-    }
-
-    fn layers(&self, dataset: &Dataset) -> ZfsLayers<R> {
-        ZfsLayers::new(Clone::clone(self), dataset.clone())
-    }
-
-    fn receive(
-        &self,
-        dataset: &Dataset,
-        from: Option<(Lsn, HashVal)>,
-        to: (Lsn, HashVal),
-        stream: &mut dyn std::io::Read,
-    ) -> Result<u64, LayerError> {
-        Ok(Zfs::receive(self, dataset, from, to, stream)?.guid)
-    }
-
-    fn adopt(
-        &self,
-        dataset: &Dataset,
-        base: (Lsn, HashVal),
-        to: (Lsn, HashVal),
-        child: &Dataset,
-        child_seal: Lsn,
-        _sender: &dyn Sender,
-    ) -> Result<u64, LayerError> {
-        Ok(Zfs::adopt_copy(self, dataset, base, to, child, child_seal)?.guid)
-    }
-
-    fn receive_clone(
-        &self,
-        dataset: &Dataset,
-        base: &CloneBase,
-        to: (Lsn, HashVal),
-        stream: &mut dyn std::io::Read,
-    ) -> Result<u64, LayerError> {
-        Ok(Zfs::receive_clone(self, dataset, base, to, stream)?.guid)
-    }
-
-    /// The snapshot's own directory (`.zfs/snapshot/<name>`): ZFS
-    /// snapshots are read-only, so there is nothing to give back.
-    fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
-        if self.get(dataset, lsn)?.is_none() {
-            return Err(format!("no Seal layer {}", dataset.seal_snapshot(lsn)).into());
-        }
-        self.ensure_mounted(dataset)?;
-        let mp = self
-            .dataset_info(dataset)?
-            .and_then(|i| i.mountpoint)
-            .ok_or_else(|| format!("{dataset} has no mountpoint"))?;
-        Ok(SealView::new(
-            mp.join(".zfs/snapshot")
-                .join(crate::storage::snap_name(lsn)),
-            None,
-        ))
-    }
-
-    fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
-        Ok(Zfs::guid(self, dataset)?)
-    }
-
-    fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
-        Ok(Zfs::destroy_dataset(self, dataset, guid)?)
     }
 }
 
@@ -2057,8 +1968,8 @@ pub(crate) mod tests {
         pub(crate) rolled_back: Vec<Lsn>,
     }
 
-    /// A Seal snapshot's guid in the fake pool: the same wherever it was
-    /// taken or received, as with ZFS.
+    /// A Seal layer's guid in the fake pool: the same wherever it was
+    /// taken or received.
     pub(crate) fn fake_guid(seal: Lsn) -> u64 {
         1000 + seal.get()
     }
@@ -2303,7 +2214,7 @@ pub(crate) mod tests {
             Ok(crate::chronicle::Thaw::none())
         }
         fn list(&self) -> Result<Vec<(Lsn, HashVal)>, LayerError> {
-            // As `zfs list`: a dataset that does not exist is an error.
+            // As the block log's list: a dataset that does not exist is an error.
             let p = self.pool.0.borrow();
             let d = p
                 .get(&self.ds)
@@ -2316,7 +2227,7 @@ pub(crate) mod tests {
             }
             Ok(())
         }
-        /// Like `zfs rollback`: the layer must be there with this hash,
+        /// Like the block log's rollback: the layer must be there with this hash,
         /// and nothing later may exist.
         fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
             let mut p = self.pool.0.borrow_mut();
@@ -4042,82 +3953,5 @@ pub(crate) mod tests {
             .successor;
         assert_eq!(new.id(), new_id);
         assert!(matches!(new.lineage().origin, Origin::Succession { .. }));
-    }
-
-    // ── on a real pool ──────────────────────────────────────────────
-
-    mod node {
-        use super::*;
-        use crate::zfs::Cli;
-        use std::process::Command;
-
-        #[test]
-        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
-        fn void_birth_fork_and_succession_on_zfs() {
-            let base = std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET");
-            let root = format!("{base}/vs-{}", std::process::id());
-            let zfs = Zfs::<Cli>::cli();
-            Zfs::create(&zfs, &Dataset::new(&root).unwrap()).unwrap();
-            struct Cleanup(String);
-            impl Drop for Cleanup {
-                fn drop(&mut self) {
-                    let _ = Command::new("zfs")
-                        .args(["destroy", "-R", &self.0])
-                        .status();
-                }
-            }
-            let _c = Cleanup(root.clone());
-
-            let tmp = tempfile::tempdir().unwrap();
-            let host = Host {
-                coord: Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap()),
-                pool: zfs,
-                root: Dataset::new(&root).unwrap(),
-                state_dir: tmp.path().join("state"),
-                warden: WardenId::new(1),
-            };
-
-            let (mut v, _) = host.ensure(ns(1), b"user-1").unwrap();
-            let mount = host
-                .pool
-                .dataset_info(v.dataset())
-                .unwrap()
-                .unwrap()
-                .mountpoint
-                .unwrap();
-            std::fs::write(mount.join("notes.txt"), b"mine").unwrap();
-            let s = seal(&mut v);
-
-            let child = host.fork(&v, s, b"user-1-fork").unwrap();
-            let cm = host
-                .pool
-                .dataset_info(child.dataset())
-                .unwrap()
-                .unwrap()
-                .mountpoint
-                .unwrap();
-            assert_eq!(std::fs::read(cm.join("notes.txt")).unwrap(), b"mine");
-            drop(child);
-
-            let Succeeded {
-                successor: new,
-                predecessor: old,
-            } = host.succeed(v, ns(1), b"user-2", auth(), false).unwrap();
-            let nm = host
-                .pool
-                .dataset_info(new.dataset())
-                .unwrap()
-                .unwrap()
-                .mountpoint
-                .unwrap();
-            assert_eq!(std::fs::read(nm.join("notes.txt")).unwrap(), b"mine");
-            let (new_id, old_id) = (new.id(), old.id());
-            drop((new, old));
-
-            let (old, _) = host.open(old_id).unwrap();
-            assert_eq!(old.successor().unwrap().successor, new_id);
-            let (new, _) = host.open(new_id).unwrap();
-            println!("successor lineage: {:?}", new.lineage());
-        }
     }
 }

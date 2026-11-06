@@ -1,6 +1,6 @@
 //! `BlkPool` on real devices: the Warden's Vessels on `taso-blkd`, ublk,
 //! ext4 and real mounts (birth, Seal, forks, an orphan layer removed at
-//! reopen, rollback), and
+//! reopen, rollback, succession), and
 //! rebirth on a second node from shipped packs.  Needs root, ublk and two
 //! running daemons (node A and node B), so it is ignored by default;
 //! `scripts/blk-warden-test.sh` starts them on fresh logs and runs it:
@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use taso_core::envelope::Lsn;
 use taso_core::model::WardenId;
-use taso_core::record::{Namespace, StreamCut, TurnId, Verdict};
+use taso_core::record::{Authority, Namespace, Origin, StreamCut, TurnId, Verdict};
 use taso_warden::blk::BlkPool;
 use taso_warden::chronicle::Layers;
 use taso_warden::coordinator::Coordinator;
@@ -32,7 +32,7 @@ use taso_warden::daemon::StoreConf;
 use taso_warden::pack::Packs;
 use taso_warden::ship::SharedStore;
 use taso_warden::storage::Dataset;
-use taso_warden::vessel::{Host, Pool};
+use taso_warden::vessel::{Host, Pool, Succeeded};
 
 /// The daemon's socket and the mount root, from the environment.
 fn setup() -> (PathBuf, PathBuf) {
@@ -225,6 +225,69 @@ fn vessels_on_real_devices() {
         host.pool.layers(v.dataset()).list().unwrap(),
         [(birth.lsn, birth.hash), (s1.lsn, s1.hash)]
     );
+}
+
+/// Succession on real devices: the successor starts from the
+/// predecessor's last Seal, a fork of it is independent, and both reopen
+/// with the succession in their logs.
+#[test]
+#[ignore = "needs root, ublk and a running taso-blkd; run scripts/blk-warden-test.sh"]
+fn succession_on_real_devices() {
+    let (socket, mounts) = setup();
+    let _unmount = Unmount(mounts.clone());
+    let state = tempfile::tempdir().unwrap();
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let host = Host {
+        coord: Arc::new(Coordinator::open(state.path().join("coord.redb")).unwrap()),
+        pool: BlkPool::new(&socket, &mounts, state.path().join("spool")),
+        root: Dataset::new(&format!("blk/succ-{run}")).unwrap(),
+        state_dir: state.path().join("state"),
+        warden: WardenId::new(1),
+    };
+    let ns = Namespace::from_bytes([8; 16]);
+    let mountpoint = |ds: &Dataset| host.pool.info(ds).unwrap().unwrap().mountpoint.unwrap();
+
+    let (mut v, _) = host.ensure(ns, b"user-1").unwrap();
+    v.seal_birth().unwrap();
+    std::fs::write(mountpoint(v.dataset()).join("notes.txt"), b"mine").unwrap();
+    let s = seal(&mut v, 1);
+
+    let child = host.fork(&v, s, b"user-1-fork").unwrap();
+    assert_eq!(
+        std::fs::read(mountpoint(child.dataset()).join("notes.txt")).unwrap(),
+        b"mine"
+    );
+    drop(child);
+
+    let Succeeded {
+        successor: new,
+        predecessor: old,
+    } = host
+        .succeed(
+            v,
+            ns,
+            b"user-2",
+            Authority {
+                actor: "jarmo".into(),
+                reason: "accounts merged".into(),
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read(mountpoint(new.dataset()).join("notes.txt")).unwrap(),
+        b"mine"
+    );
+    let (new_id, old_id) = (new.id(), old.id());
+    drop((new, old));
+
+    let (old, _) = host.open(old_id).unwrap();
+    assert_eq!(old.successor().unwrap().successor, new_id);
+    let (new, _) = host.open(new_id).unwrap();
+    assert!(matches!(new.lineage().origin, Origin::Succession { .. }));
 }
 
 #[test]
