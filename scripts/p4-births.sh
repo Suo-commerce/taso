@@ -2,14 +2,10 @@
 # p4-births.sh: Vessels born from a Template on real storage, under
 # taso-wardend (P4 file 5h; spec rev. 18 §5.5, §5.6, §10.2, D50-D56).
 #
-#   scripts/p4-births.sh zfs     (as root, from the repository root; not
+#   scripts/p4-births.sh blk     (as root, from the repository root; not
 #                                 through sudo, which drops cargo from PATH)
-#   scripts/p4-births.sh blk
 #
-# zfs: Vessel roots are new datasets under $P4B_ZFS_PARENT (default
-#      tasotest/vessel): p4b-n1, p4b-n2.  They must not exist; they are
-#      destroyed at the end (only these two, with everything under them).
-# blk: a fresh taso-blkd on its own log; datasets p4b/n1, p4b/n2 in it.
+# A fresh taso-blkd on its own log; datasets p4b/n1, p4b/n2 in it.
 #
 # One machine, two "nodes" (Warden 1 and 2): each its own root, state and
 # run directory, sharing one coordinator (taso-coordd --store-config) and
@@ -29,9 +25,8 @@
 # Touches, and nothing else:
 #   /var/lib/taso-p4b/<mode>                 (removed at start, kept after)
 #   /run/taso-p4b-<mode>-coord.sock
-#   zfs: $P4B_ZFS_PARENT/p4b-n1, p4b-n2      (created, destroyed at the end)
-#   blk: /run/taso-p4b-blk.sock, /mnt/p4b and mounts under it (unmounted at
-#        the end), the /dev/ublkb* devices taso-blkd creates for this run
+#   /run/taso-p4b-blk.sock, /mnt/p4b and mounts under it (unmounted at
+#   the end), the /dev/ublkb* devices taso-blkd creates for this run
 #   runc containers under /var/lib/taso-p4b/<mode>/run<n>/runc (deleted)
 #
 # Exit 0 only if every check passed.
@@ -39,11 +34,10 @@
 set -euo pipefail
 
 MODE=${1:-}
-[[ "$MODE" == zfs || "$MODE" == blk ]] || { echo "usage: $0 zfs|blk" >&2; exit 2; }
+[[ "$MODE" == blk ]] || { echo "usage: $0 blk" >&2; exit 2; }
 
 W=/var/lib/taso-p4b/$MODE
 SOCK=/run/taso-p4b-$MODE-coord.sock
-PARENT=${P4B_ZFS_PARENT:-tasotest/vessel}
 BLK_SOCK=/run/taso-p4b-blk.sock
 MNT=/mnt/p4b
 LANDLOCK=${LANDLOCK:-1}
@@ -57,7 +51,6 @@ WARDEN1=cccc13deaa40ef3ac092018c13911028   # Warden 1's Chronicle (D55, pinned)
 
 COORD_PID=
 BLKD_PID=
-ZFS_MADE=()
 PASS=0
 FAIL=0
 
@@ -65,7 +58,7 @@ say() { printf '\n== %s\n' "$*"; }
 die() { printf 'ABORT: %s\n' "$*" >&2; exit 2; }
 
 root_of() { # node -> its root dataset
-    if [[ $MODE == zfs ]]; then echo "$PARENT/p4b-n$1"; else echo "p4b/n$1"; fi
+    echo "p4b/n$1"
 }
 
 mounts_under() {
@@ -98,25 +91,17 @@ cleanup() {
     if [[ -n "$COORD_PID" ]] && kill -0 "$COORD_PID" 2>/dev/null; then
         kill "$COORD_PID"; wait "$COORD_PID" 2>/dev/null
     fi
-    if [[ $MODE == zfs ]]; then
-        for ds in "${ZFS_MADE[@]}"; do
-            # -R: the Vessels are clones of the layer's snapshot, all
-            # inside this root.
-            zfs destroy -R "$ds" || echo "WARNING: could not destroy $ds"
-        done
-    else
-        while read -r m; do
-            [[ -n "$m" ]] || continue
-            fsfreeze -u "$m" 2>/dev/null
-            umount "$m" || umount -l "$m"
-        done < <(mounts_under)
-        if [[ -n "$BLKD_PID" ]] && kill -0 "$BLKD_PID" 2>/dev/null; then
-            blk quit >/dev/null 2>&1 || kill "$BLKD_PID"
-            wait "$BLKD_PID" 2>/dev/null
-        fi
-        left=$(mounts_under | wc -l)
-        [[ "$left" -eq 0 ]] || echo "WARNING: $left mounts left under $MNT"
+    while read -r m; do
+        [[ -n "$m" ]] || continue
+        fsfreeze -u "$m" 2>/dev/null
+        umount "$m" || umount -l "$m"
+    done < <(mounts_under)
+    if [[ -n "$BLKD_PID" ]] && kill -0 "$BLKD_PID" 2>/dev/null; then
+        blk quit >/dev/null 2>&1 || kill "$BLKD_PID"
+        wait "$BLKD_PID" 2>/dev/null
     fi
+    left=$(mounts_under | wc -l)
+    [[ "$left" -eq 0 ]] || echo "WARNING: $left mounts left under $MNT"
     rm -f "$SOCK"
     exit "$rc"
 }
@@ -128,29 +113,20 @@ trap cleanup EXIT
 [[ -f Cargo.toml && -d crates/taso-warden ]] || die "run from the repository root"
 for t in runc ldd python3 cargo; do command -v "$t" >/dev/null || die "$t is missing"; done
 [[ ! -S "$SOCK" ]] || die "$SOCK exists: another run's coordinator? (pgrep -x taso-coordd)"
-if [[ $MODE == zfs ]]; then
-    zfs list -H -o name "$PARENT" >/dev/null || die "no dataset $PARENT (set P4B_ZFS_PARENT)"
-    for n in 1 2; do
-        if zfs list -H -o name "$(root_of $n)" >/dev/null 2>&1; then
-            die "$(root_of $n) exists (left by a previous run?): zfs destroy -R $(root_of $n)"
-        fi
-    done
-else
-    modprobe ublk_drv
-    [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
-    [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
-    mkdir -p "$MNT"
-    [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
-fi
+modprobe ublk_drv
+[[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
+[[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's daemon? (pgrep -x taso-blkd)"
+mkdir -p "$MNT"
+[[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 
 say "building"
 cargo build -q --release -p taso-warden -p taso-sim -p taso-landlock --bins
-[[ $MODE == blk ]] && cargo build -q --release -p taso-blk
+cargo build -q --release -p taso-blk
 BIN=$PWD/target/release
 for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock; do
     [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"
 done
-[[ $MODE == zfs ]] || [[ -x "$BIN/taso-blkd" ]] || die "$BIN/taso-blkd was not built"
+[[ -x "$BIN/taso-blkd" ]] || die "$BIN/taso-blkd was not built"
 
 rm -rf "$W"
 mkdir -p "$W/store" "$W/src" "$W/out"
@@ -170,18 +146,11 @@ mkdir -p "$ROOTFS"/{proc,dev,sys,tmp,work,run/taso}
 
 # ── Storage, coordinator ────────────────────────────────────────────
 
-if [[ $MODE == zfs ]]; then
-    for n in 1 2; do
-        zfs create "$(root_of $n)"
-        ZFS_MADE+=("$(root_of $n)")
-    done
-else
-    "$BIN/taso-blkd" "$W/blk.log" "$BLK_SOCK" 2>>"$W/blkd.err" &
-    BLKD_PID=$!
-    for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
-    [[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $W/blkd.err"
-    mkdir -p "$W/spool"
-fi
+"$BIN/taso-blkd" "$W/blk.log" "$BLK_SOCK" 2>>"$W/blkd.err" &
+BLKD_PID=$!
+for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
+[[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $W/blkd.err"
+mkdir -p "$W/spool"
 
 printf '{"store": "%s", "prefix": "p4b"}\n' "$W/store" >"$W/store.json"
 "$BIN/taso-coordd" "$W/coord.redb" "$SOCK" --store-config "$W/store.json" 2>>"$W/coordd.err" &
@@ -199,8 +168,8 @@ config() {
     python3 - "$node" "$out" "$@" <<PY
 import json, sys
 node, out, entries = int(sys.argv[1]), sys.argv[2], [json.loads(e) for e in sys.argv[3:]]
-storage = "zfs" if "$MODE" == "zfs" else {"blk": {"socket": "$BLK_SOCK", "mounts": "$MNT", "spool": "$W/spool"}}
-root = "$PARENT/p4b-n%d" % node if "$MODE" == "zfs" else "p4b/n%d" % node
+storage = {"blk": {"socket": "$BLK_SOCK", "mounts": "$MNT", "spool": "$W/spool"}}
+root = "p4b/n%d" % node
 json.dump({
     "warden": node,
     "coordinator": {"remote": "$SOCK"},
@@ -366,11 +335,7 @@ print(sum(1 for f in json.load(sys.stdin)["frames"] if f["kind"] == "contract"))
 # Layer datasets (t-) and builds (tb-) under node N's root.
 layers_on() { # layers_on NODE PREFIX
     local r; r=$(root_of "$1")
-    if [[ $MODE == zfs ]]; then
-        zfs list -H -o name -r "$r" | grep -c "^$r/$2-" || true
-    else
-        blk names | tr ' ' '\n' | grep -c "^$r/$2-" || true
-    fi
+    blk names | tr ' ' '\n' | grep -c "^$r/$2-" || true
 }
 
 # The ownership of Vessel ID as node NODE's log check reads it: "holder epoch".
