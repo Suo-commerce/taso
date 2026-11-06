@@ -8,7 +8,7 @@
 //! | Request | tag | Reply | tag |
 //! | --- | --- | --- | --- |
 //! | `Hello { version }` | 0 | `Hello { version }` | 0 |
-//! | `Pending` | 1 | `Pending { items }` | 1 |
+//! | `Pending { after }` | 1 | `Pending { items, more }` | 1 |
 //! | `Verdict { request }` | 2 | `Verdict { answer }` | 2 |
 //! | | | `Error { message }` | 3 |
 //!
@@ -16,16 +16,32 @@
 //! `ClosedNever` 2, `Refused { rule }` 3, `Retry { reason }` 4.  A Retry's
 //! reason: `NotHere { why }` 0, `Pending { why }` 1, `Rule { rule }` 2.  A
 //! rule is the `Refusal` tag of §5.1.
+//!
+//! `Pending` is read in pages (version 2, review fix N3b-a): the pending
+//! Candidates in `candidate_id` order after `after` (from the first when
+//! `None`), at most [`PENDING_PAGE`] of them and about
+//! [`PENDING_PAGE_BYTES`], and `more` while any remain.  A caller reads
+//! until `more` is false, passing the last item's id as `after`, so every
+//! pending Candidate is seen whatever their number.
 
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
     Candidate, Refusal, VerdictRequest, VerificationFinished, VerificationStarted,
 };
 use crate::decode::{DecodeError, Reader};
-use crate::envelope::ChronicleId;
+use crate::envelope::{ChronicleId, HashVal};
 
-/// The protocol version.
-pub const VERSION: u32 = 1;
+/// The protocol version.  2: `Pending` in pages (review fix N3b-a); a
+/// peer speaking 1 is refused at `Hello`.
+pub const VERSION: u32 = 2;
+
+/// The most items in one `Pending` page.
+pub const PENDING_PAGE: usize = 64;
+
+/// A `Pending` page ends early once its items' encoding passes this, so a
+/// reply stays well under the 16 MiB frame whatever an item holds (64
+/// items are about 4.3 MiB today).  A page always holds at least one item.
+pub const PENDING_PAGE_BYTES: usize = 8 << 20;
 
 /// One pending Candidate (D73): the accepted record and its finished
 /// attempts, in the order they started.
@@ -97,8 +113,12 @@ pub enum Request {
         /// [`VERSION`].
         version: u32,
     },
-    /// The pending Candidates (D73).
-    Pending,
+    /// A page of the pending Candidates (D73): those after `after`.
+    Pending {
+        /// The last `candidate_id` of the page before; `None`: from the
+        /// first.
+        after: Option<HashVal>,
+    },
     /// A verdict.
     Verdict {
         /// The request; its `request_id` is checked against the peer.
@@ -114,10 +134,12 @@ pub enum Reply {
         /// [`VERSION`].
         version: u32,
     },
-    /// The pending Candidates.
+    /// A page of the pending Candidates, in `candidate_id` order.
     Pending {
         /// Each one.
         items: Vec<PendingItem>,
+        /// Whether more remain after the last of `items`.
+        more: bool,
     },
     /// The answer to a verdict.
     Verdict {
@@ -129,6 +151,31 @@ pub enum Reply {
         /// Why.
         message: String,
     },
+}
+
+/// One page of `items` (every pending Candidate, any order) after
+/// `after`: sorted by `candidate_id`, at most [`PENDING_PAGE`] items and
+/// about [`PENDING_PAGE_BYTES`] (at least one), and whether more remain.
+/// What a Warden answers `Pending { after }` with.
+pub fn page(mut items: Vec<PendingItem>, after: Option<HashVal>) -> (Vec<PendingItem>, bool) {
+    let id = |i: &PendingItem| *i.candidate.candidate_id.as_bytes();
+    items.retain(|i| after.is_none_or(|a| id(i) > *a.as_bytes()));
+    items.sort_by_key(id);
+    items.dedup_by(|a, b| a.candidate.candidate_id == b.candidate.candidate_id);
+    let mut bytes = 0;
+    let mut n = 0;
+    for i in &items {
+        if n == PENDING_PAGE || (n > 0 && bytes >= PENDING_PAGE_BYTES) {
+            break;
+        }
+        let mut c = Canon::new();
+        i.canon(&mut c);
+        bytes += c.as_bytes().len();
+        n += 1;
+    }
+    let more = items.len() > n;
+    items.truncate(n);
+    (items, more)
 }
 
 impl PendingItem {
@@ -208,8 +255,8 @@ impl Request {
             Self::Hello { version } => {
                 c.tag(0).u32(*version);
             }
-            Self::Pending => {
-                c.tag(1);
+            Self::Pending { after } => {
+                c.tag(1).option(after.as_ref());
             }
             Self::Verdict { request } => {
                 c.tag(2);
@@ -224,7 +271,9 @@ impl Request {
         let mut r = Reader::new(b);
         let v = match r.tag()? {
             (_, 0) => Self::Hello { version: r.u32()? },
-            (_, 1) => Self::Pending,
+            (_, 1) => Self::Pending {
+                after: r.option(Reader::hash)?,
+            },
             (_, 2) => Self::Verdict {
                 request: Box::new(r.verdict_request()?),
             },
@@ -243,8 +292,8 @@ impl Reply {
             Self::Hello { version } => {
                 c.tag(0).u32(*version);
             }
-            Self::Pending { items } => {
-                c.tag(1).seq(items.iter());
+            Self::Pending { items, more } => {
+                c.tag(1).seq(items.iter()).bool(*more);
             }
             Self::Verdict { answer } => {
                 c.tag(2);
@@ -269,6 +318,7 @@ impl Reply {
                         attempts: r.seq(|r| Ok((r.started()?, r.finished()?)))?,
                     })
                 })?,
+                more: r.bool()?,
             },
             (_, 2) => Self::Verdict {
                 answer: answer(&mut r)?,
@@ -309,12 +359,16 @@ mod tests {
     fn every_reply() -> Vec<Reply> {
         let mut v = vec![
             Reply::Hello { version: VERSION },
-            Reply::Pending { items: vec![] },
+            Reply::Pending {
+                items: vec![],
+                more: false,
+            },
             Reply::Pending {
                 items: vec![PendingItem {
                     candidate: candidate(),
                     attempts: vec![(started(), finished()), (started(), finished())],
                 }],
+                more: true,
             },
             Reply::Error {
                 message: "out of order".into(),
@@ -341,14 +395,17 @@ mod tests {
     fn every_message_round_trips_and_decoding_is_strict() {
         let reqs = [
             Request::Hello { version: VERSION },
-            Request::Pending,
+            Request::Pending { after: None },
+            Request::Pending {
+                after: Some(HashVal::from_bytes([9; 32])),
+            },
             Request::Verdict {
                 request: Box::new(verdict_request()),
             },
         ];
-        for (i, q) in reqs.iter().enumerate() {
+        for (q, tag) in reqs.iter().zip([0, 1, 1, 2]) {
             let b = q.encode();
-            assert_eq!(b[0] as usize, i);
+            assert_eq!(b[0], tag);
             assert_eq!(&Request::decode(&b).unwrap(), q);
             let mut t = b.clone();
             t.push(0);
@@ -380,5 +437,80 @@ mod tests {
         assert!(Reply::decode(&[2, 3, 12]).is_err(), "no refusal tag 12");
         assert!(Reply::decode(&[2, 4, 3]).is_err(), "no retry reason tag 3");
         assert!(Reply::decode(&[2, 4, 2, 12]).is_err(), "no refusal tag 12");
+        // Version 1's Pending (no `after`, no `more`) is not version 2's.
+        assert!(Request::decode(&[1]).is_err(), "a v1 Pending request");
+        assert!(
+            Reply::decode(&[1, 0, 0, 0, 0, 0, 0, 0, 0]).is_err(),
+            "a v1 Pending reply"
+        );
+    }
+
+    fn item(id: u8) -> PendingItem {
+        let mut c = candidate();
+        c.candidate_id = HashVal::from_bytes([id; 32]);
+        PendingItem {
+            candidate: c,
+            attempts: vec![(started(), finished())],
+        }
+    }
+
+    /// Review fix N3b-a: 200 pending Candidates, read page by page from
+    /// any order, are each seen once, in id order, in pages of at most
+    /// 64; the last page says no more.
+    #[test]
+    fn pages_cover_every_pending_candidate_once() {
+        let all: Vec<PendingItem> = (0..200u32)
+            .map(|i| {
+                let mut it = item(0);
+                let mut b = [0u8; 32];
+                b[..4].copy_from_slice(&(i.wrapping_mul(2_654_435_761)).to_be_bytes());
+                it.candidate.candidate_id = HashVal::from_bytes(b);
+                it
+            })
+            .collect();
+        let mut seen = Vec::new();
+        let mut after = None;
+        let mut pages = 0;
+        loop {
+            let (got, more) = page(all.clone(), after);
+            pages += 1;
+            assert!(got.len() <= PENDING_PAGE);
+            assert!(!got.is_empty() || !more);
+            seen.extend(got.iter().map(|i| i.candidate.candidate_id));
+            after = got.last().map(|i| i.candidate.candidate_id);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(pages, 4, "64 + 64 + 64 + 8");
+        let mut want: Vec<HashVal> = all.iter().map(|i| i.candidate.candidate_id).collect();
+        want.sort_by_key(|h| *h.as_bytes());
+        assert_eq!(seen, want, "each once, in order");
+        // Nothing pending: one empty page.
+        assert_eq!(page(Vec::new(), None), (Vec::new(), false));
+    }
+
+    /// A page ends early at about PENDING_PAGE_BYTES, never empty.
+    #[test]
+    fn a_page_ends_at_its_byte_bound() {
+        let mut big = item(1);
+        let mut f = big.attempts[0].1.clone();
+        f.output = vec![0; PENDING_PAGE_BYTES / 2];
+        big.attempts[0].1 = f;
+        let items: Vec<PendingItem> = (1..=4u8)
+            .map(|i| {
+                let mut b = big.clone();
+                b.candidate.candidate_id = HashVal::from_bytes([i; 32]);
+                b
+            })
+            .collect();
+        let (got, more) = page(items.clone(), None);
+        assert_eq!(got.len(), 2, "two halves reach the bound");
+        assert!(more);
+        // One item larger than the bound still makes a page.
+        let mut huge = items[0].clone();
+        huge.attempts[0].1.output = vec![0; PENDING_PAGE_BYTES + 1];
+        let (got, more) = page(vec![huge], None);
+        assert_eq!((got.len(), more), (1, false));
     }
 }
