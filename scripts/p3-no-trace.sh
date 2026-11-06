@@ -180,7 +180,7 @@ NS="7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
 config_parent() {
     local subject="$1" out="$2" promote_child="${3:-}"
     python3 - "$subject" "$out" "$promote_child" \
-             "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$BLK_SOCK" "$MNT" <<'PY'
+             "$SOCK" "$ROUND_BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$BLK_SOCK" "$MNT" <<'PY'
 import json, sys
 subject, out, promote_child = sys.argv[1], sys.argv[2], sys.argv[3]
 sock, base, work, rootfs, ns, landlock, blk_sock, mnt = sys.argv[4:12]
@@ -218,7 +218,7 @@ PY
 config_child() {
     local subject="$1" parent="$2" uid_slot="$3" out="$4"
     python3 - "$subject" "$parent" "$uid_slot" "$out" \
-             "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$EFFECTS" "$BLK_SOCK" "$MNT" <<'PY'
+             "$SOCK" "$ROUND_BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$EFFECTS" "$BLK_SOCK" "$MNT" <<'PY'
 import json, sys
 subject, parent, uid_slot, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 sock, base, work, rootfs, ns, landlock, effects, blk_sock, mnt = sys.argv[5:14]
@@ -330,6 +330,11 @@ echo "== $N rounds, $FORKS forks, $EFFECTS effects, $KILLS SIGKILLs"
 for k in $(seq 1 "$N"); do
     echo "-- round $k/$N"
     parent_subj="p3-$RUN-$k-parent"
+    # Each round under its own root: the Warden binds uid slots to the
+    # Vessels it finds under its root, so round k's parent (slot 0) would
+    # be refused next to round k-1's.  On ZFS each round destroyed its
+    # datasets; here they stay in the run's log under their round's root.
+    ROUND_BASE="$BASE/r$k"
 
     # a. Parent: seal one turn, no effects.
     config_parent "$parent_subj" "$WORK/parent-$k.json"
@@ -458,8 +463,8 @@ for k in $(seq 1 "$N"); do
     [ "$sibling_leak" = "1" ] && echo "  FAIL: sibling keys leaked"
     [ "$dup_count" -gt 0 ] && echo "  FAIL: $dup_count duplicate key(s)"
 
-    # This round's datasets stay in the block log (a fresh log per run);
-    # the cleanup at the end unmounts them.
+    # This round's datasets stay in the block log under $ROUND_BASE (a
+    # fresh log per run); the cleanup at the end unmounts them.
 done
 
 # ── global duplicate check ────────────────────────────────────────────
