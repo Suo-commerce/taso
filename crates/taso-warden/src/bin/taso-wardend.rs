@@ -145,8 +145,24 @@ fn main() -> ExitCode {
 
     let mut _server = None;
     let coord: Arc<dyn Coord> = match &config.coordinator {
-        CoordConf::Local { path, serve } => {
-            let c: Arc<dyn Coord> = match Coordinator::open(path) {
+        CoordConf::Local {
+            path,
+            serve,
+            deleted_quarantine,
+        } => {
+            // The log reads the Wardens' store, as taso-coordd's does with
+            // --store-config: without it every contract accept would be
+            // refused NotReadable (L1).
+            let store = match config.store.open() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("taso-wardend: opening the store: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let log =
+                taso_warden::coordinator::reading_store(store, &config.prefix, *deleted_quarantine);
+            let c: Arc<dyn Coord> = match Coordinator::open_with(path, log) {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
                     eprintln!("taso-wardend: coordinator {}: {e}", path.display());
