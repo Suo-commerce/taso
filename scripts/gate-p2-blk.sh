@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# P2 gate on the block log (plan S2, 2026-10-20): the six lines of
-# gate-p2.sh with the Chronicle block log (taso-blkd, ext4 on ublk) as the
-# storage instead of ZFS.  gate-p2.sh is unchanged; this is its sibling.
+# P2 gate on the block log (plan S2, 2026-10-20): the six lines of the P2
+# gate with the Chronicle block log (taso-blkd, ext4 on ublk) as the
+# storage.  The ZFS original (gate-p2.sh) was deleted in V4b.
 #
 #   1. reborn on node B < 30 s p95
 #   2. the last common Seal identical on both nodes: the full export of the
