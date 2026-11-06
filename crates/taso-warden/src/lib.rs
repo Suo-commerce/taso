@@ -1,8 +1,8 @@
 //! Taso Warden.
 //!
 //! The daemon that owns a Vessel's Chronicle, outside the agent's
-//! namespace (v1.0 §8).  Phase 1 starts with the ZFS driver: a Vessel is a
-//! dataset and a Seal is a snapshot (v1.0 §1, P1).
+//! namespace (v1.0 §8).  A Vessel lives on the block log (`taso-blkd`,
+//! [`blk`]): its files are a branch, a Seal is a layer of that branch.
 //!
 //! Normative references: spec v1.0 (build plan) and spec v0.4 (primitives).
 
@@ -13,7 +13,6 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod adoptcopy;
 pub mod artifact;
 pub mod attempt;
 mod bench;
@@ -44,7 +43,6 @@ pub mod runtime;
 pub mod s3;
 pub mod segment;
 pub mod ship;
-pub mod snapbatch;
 pub mod source;
 pub mod source_kube;
 pub mod status_kube;
@@ -57,4 +55,3 @@ pub mod timing;
 pub mod verdict;
 pub mod verify;
 pub mod vessel;
-pub mod zfs;
