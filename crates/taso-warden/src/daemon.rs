@@ -2573,13 +2573,28 @@ impl<'s, 'e> Verifications<'s, 'e> {
         // A Candidate nominated just before the agent exited may not have
         // been looked at by a tick yet: launched now (D68, D82), so a run
         // ends with every attempt it could start finished.
-        while let Ok(d) = self.rx.try_recv() {
-            self.done(vessel, d);
-        }
-        if self.want {
-            self.launch(vessel);
-        }
-        while !self.running.is_empty() {
+        //
+        // An attempt that ends sets `want` (its slot is free), which says
+        // "look again", not "something waits": so after every end the
+        // Candidates are looked at again here, and `want` is left set
+        // only for one that truly could not start (no slot, a rerun's
+        // wait).  Without that last look the run handed itself to the
+        // waiting list after any attempt that ended in the drain, and the
+        // list's open closed an attempt left open (a failpoint, a panic)
+        // as interrupted and ran it again in the same Warden's life — up
+        // to the D88 cap, so the next start had none left (p4-verify 9b,
+        // 2026-11-06).  An attempt left open stays open until the next
+        // start, as before N5a.
+        loop {
+            while let Ok(d) = self.rx.try_recv() {
+                self.done(vessel, d);
+            }
+            if self.want {
+                self.launch(vessel);
+            }
+            if self.running.is_empty() {
+                break;
+            }
             match self.rx.recv() {
                 Ok(d) => self.done(vessel, d),
                 Err(_) => break,
