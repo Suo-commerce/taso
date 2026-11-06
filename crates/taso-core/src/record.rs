@@ -560,7 +560,7 @@ pub enum Origin {
         authority: Authority,
     },
     /// Born from a Template (tag 3; P4 spec rev. 16 §5.6, D54): a clone of
-    /// the Template's layer on this storage kind.  It inherits files,
+    /// the Template's layer.  It inherits files,
     /// never effects (`ledger_pos` is 0), and never goes back into the
     /// Template.
     Template {
@@ -850,7 +850,7 @@ pub enum StreamBase {
     Origin {
         /// The parent Seal.
         parent: ParentSeal,
-        /// The ZFS guid of its snapshot.
+        /// The guid of its Seal layer.
         guid: u64,
     },
 }
@@ -878,13 +878,12 @@ impl Canonical for StreamBase {
 /// The `fs` stream of a Seal was shipped: what it is, and the hash of its
 /// plain bytes (v1.0 §1 P2).
 ///
-/// A ZFS send stream lives outside the hash chain, and the guid it carries
-/// can be forged.  Recording the stream's digest in the Chronicle binds the
-/// dataset to the chain: once this record is under the coordinator's
-/// shipped anchor, rebirth rebuilds a dataset from a stream only if it has
-/// exactly this length and hash.  Appended by the holder after the Seal's
-/// pack is put.  A Phase 1 bridge: in the block log, records carry chunk
-/// hashes and the chain covers the data by construction.
+/// A Seal layer's stream (the block log's export) lives outside the hash
+/// chain, and the guid it carries can be forged.  Recording the stream's
+/// digest in the Chronicle binds the dataset to the chain: once this
+/// record is under the coordinator's shipped anchor, rebirth rebuilds a
+/// dataset from a stream only if it has exactly this length and hash.
+/// Appended by the holder after the Seal's pack is put.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsShippedRecord {
     /// The Seal the stream brings the dataset to.
@@ -893,7 +892,8 @@ pub struct FsShippedRecord {
     pub seal_hash: HashVal,
     /// What it is incremental from.
     pub base: StreamBase,
-    /// The ZFS guid of the Seal's snapshot.
+    /// The guid of the Seal's layer (the block log derives it from the
+    /// Seal's binding, so it is the same on every node).
     pub guid: u64,
     /// The stream's length.
     pub bytes: u64,
