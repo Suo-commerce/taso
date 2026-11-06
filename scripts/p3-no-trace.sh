@@ -29,16 +29,21 @@
 # over the per-Vessel Unix socket; its sender role runs on the host, on
 # the Warden's sender socket, which is never mounted into a Vessel.
 #
-# Usage (root; needs runc, ZFS, cargo, python3):
-#   TASO_ZFS_DATASET=tasotest/vessel scripts/p3-no-trace.sh
+# The Vessels live on the block log: the script starts its own taso-blkd
+# on a fresh log in its work directory, mounts under /mnt/taso-p3-<pid>,
+# and at the end unmounts everything there and stops the daemon (V4b
+# step 4: this was the one gate of claim C1, and it ran on ZFS only).
+#
+# Usage (root; needs runc, ublk, cargo, python3):
+#   scripts/p3-no-trace.sh
 #
 # Environment: N (20)  FORKS (3)  EFFECTS (2)  KILLS (20)  LANDLOCK (1)
-#              OUT (/root/taso-gate-p3-<time>)  KEEP (0)
+#              OUT (/root/taso-gate-p3-<time>)  KEEP (0: 1 keeps the work
+#              directory and its block log)
 
 set -euo pipefail
 trap 'echo "FAILED at line $LINENO (exit $?)" >&2' ERR
 
-: "${TASO_ZFS_DATASET:?set TASO_ZFS_DATASET to a dataset the gate may use}"
 N=${N:-20}
 FORKS=${FORKS:-3}
 EFFECTS=${EFFECTS:-2}
@@ -49,21 +54,43 @@ OUT=${OUT:-/root/taso-gate-p3-$(date +%Y%m%d-%H%M%S)}
 RUN=$(date +%Y%m%d%H%M%S)-$$
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 2; }
-for t in zfs runc ldd python3 cargo; do
+for t in runc ldd python3 cargo; do
     command -v "$t" >/dev/null || { echo "$t is missing" >&2; exit 2; }
 done
 
 cd "$(dirname "$0")/.."
 echo "== building (release)"
-cargo build --release -q -p taso-warden -p taso-landlock
+cargo build --release -q -p taso-warden -p taso-landlock -p taso-blk
 BIN=$PWD/target/release
+modprobe ublk_drv
+[ -c /dev/ublk-control ] || { echo "/dev/ublk-control missing (ublk_drv)" >&2; exit 2; }
 
 mkdir -p "$OUT"
 WORK=$(mktemp -d /var/tmp/taso-p3.XXXXXX)
 chmod 755 "$WORK"
-BASE="$TASO_ZFS_DATASET/gate-p3-$$"
+BASE="p3/gate-$$"
 SOCK=$WORK/coord.sock
+BLK_SOCK=/run/taso-p3-$$-blk.sock
+MNT=/mnt/taso-p3-$$
 RELAY=$PWD/scripts/p3-relay.py
+
+# One taso-blkd command; prints the answer, fails unless it starts "ok".
+blk() {
+    python3 - "$BLK_SOCK" "$@" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX); s.settimeout(120); s.connect(sys.argv[1])
+s.sendall((" ".join(sys.argv[2:]) + "\n").encode())
+line = s.makefile().readline().strip()
+print(line)
+sys.exit(0 if line.startswith("ok") else 1)
+PY
+}
+
+# Mount points under $MNT, innermost first.
+mounts_under() {
+    awk -v root="$MNT" '$5 == root || index($5, root "/") == 1 { print length($5), $5 }' /proc/self/mountinfo \
+        | sort -rn | cut -d' ' -f2-
+}
 
 cleanup() {
     [ -n "${COORD_PID:-}" ] && kill "$COORD_PID" 2>/dev/null || true
@@ -72,10 +99,22 @@ cleanup() {
             runc --root "$WORK/run/runc" delete --force "$c" 2>/dev/null || true
         done
     fi
+    # Every mount the Wardens made, then the block log's daemon.
+    while read -r m; do
+        [ -n "$m" ] || continue
+        fsfreeze -u "$m" 2>/dev/null || true
+        umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+    done < <(mounts_under)
+    if [ -n "${BLKD_PID:-}" ] && kill -0 "$BLKD_PID" 2>/dev/null; then
+        (blk quit) >/dev/null 2>&1 || kill "$BLKD_PID"
+        wait "$BLKD_PID" 2>/dev/null || true
+    fi
+    left=$(mounts_under | wc -l)
+    [ "$left" -eq 0 ] || echo "WARNING: $left mounts left under $MNT"
+    rmdir "$MNT" 2>/dev/null || true
     if [ "$KEEP" = 1 ]; then
-        echo "kept: dataset $BASE, work dir $WORK"
+        echo "kept: work dir $WORK (its block log: $WORK/blk.log)"
     else
-        zfs destroy -R "$BASE" 2>/dev/null || true
         rm -rf "$WORK"
     fi
 }
@@ -116,8 +155,15 @@ done
 mkdir -p "$WORK/bin"
 cp "$BIN/taso-wardend" "$WORK/bin/"
 
-# ── coordinator ───────────────────────────────────────────────────────
-zfs create "$BASE"
+# ── the block log, the coordinator ────────────────────────────────────
+[ ! -S "$BLK_SOCK" ] || { echo "$BLK_SOCK exists: another run's daemon?" >&2; exit 2; }
+mkdir -p "$MNT" "$WORK/spool"
+[ -z "$(mounts_under)" ] || { echo "something is already mounted under $MNT" >&2; exit 2; }
+"$BIN/taso-blkd" "$WORK/blk.log" "$BLK_SOCK" 2>"$OUT/blkd.err" &
+BLKD_PID=$!
+for _ in $(seq 100); do [ -S "$BLK_SOCK" ] && break; sleep 0.1; done
+[ -S "$BLK_SOCK" ] || { echo "taso-blkd did not start; see $OUT/blkd.err" >&2; exit 1; }
+echo "== taso-blkd ready (log $WORK/blk.log, mounts under $MNT)"
 "$BIN/taso-coordd" "$WORK/coord.redb" "$SOCK" 2>"$OUT/coordd.err" &
 COORD_PID=$!
 for _ in $(seq 100); do [ -S "$SOCK" ] && break; sleep 0.05; done
@@ -134,10 +180,10 @@ NS="7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a"
 config_parent() {
     local subject="$1" out="$2" promote_child="${3:-}"
     python3 - "$subject" "$out" "$promote_child" \
-             "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" <<'PY'
+             "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$BLK_SOCK" "$MNT" <<'PY'
 import json, sys
 subject, out, promote_child = sys.argv[1], sys.argv[2], sys.argv[3]
-sock, base, work, rootfs, ns, landlock = sys.argv[4:10]
+sock, base, work, rootfs, ns, landlock, blk_sock, mnt = sys.argv[4:12]
 vessel = {"namespace": ns, "subject": subject, "uid_slot": 0}
 args = ["/usr/bin/python3", "/usr/bin/p3-relay.py", "--role", "agent",
         "--effects", "0", "--turns", "1"]
@@ -156,7 +202,7 @@ if landlock == "1":
 json.dump({
     "warden": 1,
     "coordinator": {"remote": sock},
-    "storage": "zfs",
+    "storage": {"blk": {"socket": blk_sock, "mounts": mnt, "spool": f"{work}/spool"}},
     "root": base,
     "state_dir": f"{work}/state",
     "store": f"{work}/store",
@@ -172,10 +218,10 @@ PY
 config_child() {
     local subject="$1" parent="$2" uid_slot="$3" out="$4"
     python3 - "$subject" "$parent" "$uid_slot" "$out" \
-             "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$EFFECTS" <<'PY'
+             "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$EFFECTS" "$BLK_SOCK" "$MNT" <<'PY'
 import json, sys
 subject, parent, uid_slot, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-sock, base, work, rootfs, ns, landlock, effects = sys.argv[5:12]
+sock, base, work, rootfs, ns, landlock, effects, blk_sock, mnt = sys.argv[5:14]
 rt = {
     "rootfs": rootfs,
     "host_uid_base": 200000,
@@ -189,7 +235,7 @@ if landlock == "1":
 json.dump({
     "warden": 1,
     "coordinator": {"remote": sock},
-    "storage": "zfs",
+    "storage": {"blk": {"socket": blk_sock, "mounts": mnt, "spool": f"{work}/spool"}},
     "root": base,
     "state_dir": f"{work}/state",
     "store": f"{work}/store",
@@ -201,6 +247,18 @@ json.dump({
                  "uid_slot": int(uid_slot)}],
 }, open(out, "w"), indent=1)
 PY
+}
+
+# Where dataset $1 is mounted: <mounts>/<dataset> (the block log's
+# layout), which must be a mount point now: a file read under it is
+# then the dataset's, never the empty directory under it.
+mount_of() {
+    local m="$MNT/$1"
+    if ! mountpoint -q "$m"; then
+        echo "mount_of: $1 is not mounted at $m" >&2
+        return 1
+    fi
+    echo "$m"
 }
 
 vessel_ds() {   # $1 daemon stderr -> the Vessel's dataset
@@ -290,7 +348,7 @@ for k in $(seq 1 "$N"); do
 
     # Read child-0's declared keys (the one we will promote).
     child0_ds=$(vessel_ds "$OUT/child-$k-0.err")
-    child0_mount=$(zfs get -H -o value mountpoint "$child0_ds")
+    child0_mount=$(mount_of "$child0_ds")
     child0_declared="$child0_mount/declared.log"
     if [ ! -f "$child0_declared" ]; then
         echo "  ERROR: child-0's declared.log not found at $child0_declared"
@@ -323,7 +381,10 @@ for k in $(seq 1 "$N"); do
     #    The sender reads Open on the Warden's sender socket, from the
     #    host, while the parent's agent waits for it.
     kill_runc
-    parent_mount=$(zfs get -H -o value mountpoint "$parent_ds")
+    # The SIGKILLs may have stopped a start between its unmount and its
+    # mount: the final start mounts it again, at the same path, before
+    # its agent runs (and waits for sender-done).
+    parent_mount="$MNT/$parent_ds"
     rm -f "$parent_mount/sender-done"
     sender_sock="$WORK/run/senders/${parent_ds##*/v-}.sock"
     parent_keys_file="$OUT/keys-$k.log"
@@ -342,6 +403,7 @@ for k in $(seq 1 "$N"); do
     else
         echo "  no sender socket at $sender_sock"
     fi
+    mountpoint -q "$parent_mount" || echo "  WARNING: the parent is not mounted at $parent_mount"
     touch "$parent_mount/sender-done"
     if ! wait "$PID"; then
         echo "  final start failed:"; tail -20 "$OUT/parent-$k-final.err"
@@ -371,7 +433,7 @@ for k in $(seq 1 "$N"); do
     sibling_leak=0
     for f in $(seq 1 $((FORKS - 1))); do
         cds=$(vessel_ds "$OUT/child-$k-$f.err")
-        cm=$(zfs get -H -o value mountpoint "$cds")
+        cm=$(mount_of "$cds")
         if [ -f "$cm/declared.log" ] && [ "$parent_count" -gt 0 ]; then
             # Any of this sibling's keys in the parent's released set?
             if comm -12 <(sort "$cm/declared.log") <(echo "$parent_keys") | grep -q .; then
@@ -396,12 +458,8 @@ for k in $(seq 1 "$N"); do
     [ "$sibling_leak" = "1" ] && echo "  FAIL: sibling keys leaked"
     [ "$dup_count" -gt 0 ] && echo "  FAIL: $dup_count duplicate key(s)"
 
-    # Clean up this round's datasets for the next round.
-    zfs destroy -R "$parent_ds" 2>/dev/null || true
-    for f in $(seq 0 $((FORKS - 1))); do
-        cds=$(vessel_ds "$OUT/child-$k-$f.err")
-        zfs destroy -R "$cds" 2>/dev/null || true
-    done
+    # This round's datasets stay in the block log (a fresh log per run);
+    # the cleanup at the end unmounts them.
 done
 
 # ── global duplicate check ────────────────────────────────────────────
