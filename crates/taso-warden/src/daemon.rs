@@ -189,6 +189,12 @@ pub enum CoordConf {
         path: PathBuf,
         /// A Unix socket to serve it on.
         serve: Option<PathBuf>,
+        /// `store.deleted_quarantine`, in seconds
+        /// (`"deleted_quarantine_seconds"`, default
+        /// [`crate::coordinator::DELETED_QUARANTINE`]): fixed when the
+        /// coordinator's database is made; a later change is refused at
+        /// open ([`crate::coordinator::CoordError::QuarantineChanged`]).
+        deleted_quarantine: u64,
     },
     /// Behind a Unix socket ([`crate::coordsrv`]).
     Remote {
@@ -1399,7 +1405,11 @@ impl Config {
             .filter(|w| *w > 0)
             .ok_or_else(|| bad("\"warden\" must be a positive integer"))?;
         let c = field(&v, "coordinator")?;
-        only_keys(c, "coordinator", &["local", "remote", "serve"])?;
+        only_keys(
+            c,
+            "coordinator",
+            &["local", "remote", "serve", "deleted_quarantine_seconds"],
+        )?;
         let coordinator = match (c.get("local"), c.get("remote")) {
             (Some(_), None) => CoordConf::Local {
                 path: abs_path(c, "local")?,
@@ -1408,10 +1418,26 @@ impl Config {
                 } else {
                     None
                 },
+                deleted_quarantine: match opt_u64(c, "deleted_quarantine_seconds")? {
+                    None => crate::coordinator::DELETED_QUARANTINE,
+                    Some(s) => crate::coordinator::deleted_quarantine(s).map_err(bad)?,
+                },
             },
-            (None, Some(_)) => CoordConf::Remote {
-                socket: abs_path(c, "remote")?,
-            },
+            // A remote coordinator is configured where it runs
+            // (taso-coordd): what only a local one uses is refused here,
+            // never silently ignored.
+            (None, Some(_)) => {
+                for k in ["serve", "deleted_quarantine_seconds"] {
+                    if c.get(k).is_some() {
+                        return Err(bad(format!(
+                            "\"coordinator.{k}\" is for a local coordinator only"
+                        )));
+                    }
+                }
+                CoordConf::Remote {
+                    socket: abs_path(c, "remote")?,
+                }
+            }
             _ => {
                 return Err(bad(
                     "\"coordinator\" needs exactly one of \"local\" or \"remote\"",
@@ -5623,6 +5649,40 @@ mod tests {
         }
     }
 
+    /// R2a: the quarantine is set on a local coordinator, within its
+    /// bounds; a remote one is configured where it runs, so what only a
+    /// local coordinator uses is refused, never ignored.
+    #[test]
+    fn the_quarantine_is_a_local_coordinators_within_its_bounds() {
+        let with = |c: Value| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            v["coordinator"] = c;
+            Config::parse(&v.to_string())
+        };
+        let q = |c: Config| match c.coordinator {
+            CoordConf::Local {
+                deleted_quarantine, ..
+            } => deleted_quarantine,
+            other => panic!("{other:?}"),
+        };
+        let local = |s: u64| serde_json::json!({"local": "/var/lib/taso/c.redb", "deleted_quarantine_seconds": s});
+        assert_eq!(q(with(local(60)).unwrap()), 60);
+        assert_eq!(q(with(local(30 * 86400)).unwrap()), 30 * 86400);
+        for s in [0, 59, 30 * 86400 + 1] {
+            let e = with(local(s)).unwrap_err().to_string();
+            assert!(e.contains("store.deleted_quarantine must be"), "{s}: {e}");
+        }
+        for (k, val) in [
+            ("serve", serde_json::json!("/run/c.sock")),
+            ("deleted_quarantine_seconds", serde_json::json!(600)),
+        ] {
+            let mut c = serde_json::json!({"remote": "/run/c.sock"});
+            c[k] = val;
+            let e = with(c).unwrap_err().to_string();
+            assert!(e.contains("for a local coordinator only"), "{k}: {e}");
+        }
+    }
+
     #[test]
     fn a_good_config_parses() {
         let c = Config::parse(GOOD).unwrap();
@@ -5631,7 +5691,8 @@ mod tests {
             c.coordinator,
             CoordConf::Local {
                 path: "/var/lib/taso/coord.redb".into(),
-                serve: Some("/run/taso/coord.sock".into())
+                serve: Some("/run/taso/coord.sock".into()),
+                deleted_quarantine: crate::coordinator::DELETED_QUARANTINE,
             }
         );
         assert_eq!(c.storage.mounts, Path::new("/srv/taso"));
