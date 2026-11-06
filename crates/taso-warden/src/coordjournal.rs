@@ -33,28 +33,19 @@ use taso_core::coordlog::{
 use taso_core::envelope::{ChronicleId, Epoch, HashVal, Lsn};
 use taso_core::record::Payload;
 
-/// The op id of the obligation a Chronicle gets if it had records before
-/// the coordinator tracked obligations (D33): its effects were never seen,
-/// so it is treated as having one that never closes — sanction and purge
-/// are refused for it (fail closed).
-pub const LEGACY_OBLIGATION: u64 = u64::MAX;
-
 /// A journalled operation.
 // One at a time, never held in bulk: the size of `Accept` costs nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Op {
     /// Bring the log's epoch for `chronicle` up to the ownership epoch
-    /// (tag 0): claimed as a Vessel if the log does not know it (with the
-    /// legacy obligation if it already had records), then fenced until
-    /// equal.
+    /// (tag 0): claimed as a Vessel if the log does not know it (at its
+    /// registration), then fenced until equal.
     Sync {
         /// The Chronicle.
         chronicle: ChronicleId,
         /// The ownership epoch.
         epoch: Epoch,
-        /// It had records before the log knew it.
-        legacy: bool,
     },
     /// `claim_chronicle` (tag 1).
     Claim {
@@ -153,17 +144,10 @@ pub enum Done {
 /// Run `op` against `log`, reading the store through `store`.
 pub fn apply(log: &mut CoordLog, op: &Op, store: &dyn StoreView) -> Done {
     match op {
-        Op::Sync {
-            chronicle,
-            epoch,
-            legacy,
-        } => {
+        Op::Sync { chronicle, epoch } => {
             if log.epoch(*chronicle).is_none() {
                 log.claim_chronicle(*chronicle, ClaimAuthority::Vessel)
                     .expect("not known, so claimable");
-                if *legacy {
-                    log.note_obligation(*chronicle, LEGACY_OBLIGATION, true);
-                }
             }
             let mut now = log.epoch(*chronicle).expect("known");
             while now < *epoch {
@@ -673,15 +657,8 @@ pub(crate) fn get_submitted(r: &mut Rd<'_>) -> Result<Submitted, JournalError> {
 
 fn put_op(o: &mut Canon, op: &Op) {
     match op {
-        Op::Sync {
-            chronicle,
-            epoch,
-            legacy,
-        } => {
-            o.tag(0)
-                .fixed(chronicle.as_bytes())
-                .u64(epoch.get())
-                .bool(*legacy);
+        Op::Sync { chronicle, epoch } => {
+            o.tag(0).fixed(chronicle.as_bytes()).u64(epoch.get());
         }
         Op::Claim { id, authority } => {
             o.tag(1).fixed(id.as_bytes());
@@ -761,7 +738,6 @@ fn get_op(r: &mut Rd<'_>) -> Result<Op, JournalError> {
         0 => Op::Sync {
             chronicle: chron(r)?,
             epoch: epoch(r)?,
-            legacy: r.bool()?,
         },
         1 => Op::Claim {
             id: chron(r)?,
@@ -1160,7 +1136,6 @@ mod tests {
             Op::Sync {
                 chronicle: c(1),
                 epoch: Epoch::new(3),
-                legacy: true,
             },
             Op::Claim {
                 id: c(2),
@@ -1214,7 +1189,7 @@ mod tests {
             },
             Op::Obligation {
                 chronicle: c(1),
-                op: LEGACY_OBLIGATION,
+                op: u64::MAX,
                 open: true,
             },
             Op::Pin {
