@@ -2484,6 +2484,12 @@ mod tests {
                 "the store timed out",
             ))
         }
+        fn list_times(&self, _: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the store timed out",
+            ))
+        }
     }
 
     /// Review fix L-a: a store that fails while an attempt prepares is no

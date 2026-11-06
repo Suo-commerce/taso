@@ -2991,6 +2991,9 @@ pub(crate) mod tests {
             fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
                 self.inner.list(prefix)
             }
+            fn list_times(&self, prefix: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+                self.inner.list_times(prefix)
+            }
         }
 
         /// Streams that say what they are.
