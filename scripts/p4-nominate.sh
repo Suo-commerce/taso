@@ -484,7 +484,7 @@ wardend 9-l 1 "$W/l.json"
 expect "exit 0" is "$RC" 0
 expect "refused Walk(DanglingByExclusion)" is "$(answers 9-l l Agent)" 'Refused { reason: "Walk(DanglingByExclusion)" }'
 DS=$(dataset_of 9-l l)
-expect "one record accepted (the Walk refusal)" is "$(coordlog_of 1 "${DS##*/v-}" | cut -d' ' -f1)" 1
+expect "two records accepted (its Birth from the Template, D54, and the Walk refusal)" is "$(coordlog_of 1 "${DS##*/v-}" | cut -d' ' -f1)" 2
 
 # ── 10. Release test N2a: an unknown verifier Template ──────────────
 
