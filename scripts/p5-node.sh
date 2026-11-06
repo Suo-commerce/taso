@@ -15,14 +15,14 @@
 # check reads the host and prints the report; it changes nothing and works
 # on any machine (taso-test included).  setup refuses the host unless it is
 # Ubuntu 26.04, the disk is a whole NVMe drive with no partitions, no
-# filesystem or pool signature and no mount, and the commit exists; then
+# filesystem signature and no mount, and the commit exists; then
 # it does, in this order, each step skipped when already done:
 #
 #   1 hostname     taso-p5 (kept over reboots), so a prompt says which
 #                  machine a command runs on
 #   2 packages     apt: git, the C toolchain, pkg-config, libclang-dev
 #                  (libublk's bindings), python3, jq, curl, chrony, runc,
-#                  e2fsprogs, util-linux, fio, zfsutils-linux, nvme-cli,
+#                  e2fsprogs, util-linux, fio, nvme-cli,
 #                  blktrace (the kernel's request trace, blk-trace-freeze.sh)
 #   3 coreutils    GNU coreutils in place of uutils (Ubuntu 25.10 and later
 #                  ship uutils; xfstests and our scripts assume GNU: 271 quick
@@ -36,14 +36,17 @@
 #   4 Rust         rustup stable, minimal profile plus rustfmt (bindgen needs
 #                  it), under /root/.cargo
 #   5 ublk_drv     loaded now and at boot (/etc/modules-load.d/taso-ublk.conf)
-#   6 the disk     GPT with two partitions of equal size on the named NVMe:
-#                    taso-zfs  -> zpool "taso" (ashift 12, lz4, atime off,
-#                                 mountpoint /taso), dataset taso/vessel
+#   6 the disk     GPT with one partition, the whole named NVMe:
 #                    taso-blk  -> ext4, mounted at /var/lib/taso by label
 #                                 (noatime; the block log, the packs, the
 #                                 benchmark scratch, TMPDIR)
-#                  Both storages on one drive: the comparison in §3 is then
-#                  of the storage, not of two drives.  /var/lib/taso-blk is a
+#                  Until V4b (2026-11-06) the drive was split in two halves,
+#                  taso-zfs (a ZFS pool) and taso-blk, so the §3 comparison
+#                  was of the storage, not of two drives; with ZFS removed
+#                  the block log has the whole drive (V-g (i): a different
+#                  ext4 size, so the first table after it says so).  A disk
+#                  with the two halves has partitions, so it is refused as
+#                  not empty: clear it by hand.  /var/lib/taso-blk is a
 #                  bind mount of /var/lib/taso/taso-blk (kept at boot in
 #                  /etc/fstab), so the blk-*.sh scripts land there too.  Not
 #                  a symlink: runc refuses a rootfs reached through one
@@ -61,7 +64,7 @@
 #                  to every CPU; on a host whose work is Vessels, nothing
 #                  measurable.  A1 sets it; taso init will set it and say so.
 #   7 TMPDIR       /var/lib/taso/tmp, exported for root logins with
-#                  TASO_ZFS_DATASET=taso/vessel and cargo's PATH
+#                  cargo's PATH
 #                  (/etc/profile.d/taso-p5.sh): temporary files of tests and
 #                  benchmarks are on the measured NVMe, never on the root
 #                  disk or in RAM
@@ -83,7 +86,7 @@
 # medium is A2's measurement.
 #
 # Rerunning setup on a prepared host is safe: every step checks before it
-# acts, and a disk that already carries exactly our two partitions is
+# acts, and a disk that already carries exactly our one partition is
 # accepted, not reformatted.
 #
 # At the provider's install: give the OS one drive and leave the other
@@ -97,7 +100,6 @@ REPO_URL=${REPO_URL:-https://github.com/Suo-commerce/taso}
 DATA=/var/lib/taso
 REPORT=$DATA/p5-node-report.txt
 HOST=taso-p5
-POOL=taso
 
 mode=${1:-}; shift || true
 DISK=; COMMIT=
@@ -163,21 +165,18 @@ root_disk=$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -1)
 # A disk is empty when it has no partitions, no signature blkid can name,
 # no mount on it or under it, and is not the root disk.
 disk_empty() { # disk_empty /dev/nvmeXn1 -> prints reasons, returns 1 if not empty
-    local d=$1 n reasons=
-    n=$(basename "$d")
+    local d=$1 reasons=
     [[ -z "$(lsblk -no NAME "$d" | tail -n +2)" ]] || reasons+="has partitions; "
     [[ -z "$(blkid -p -o value -s TYPE "$d" 2>/dev/null)" ]] || reasons+="carries a $(blkid -p -o value -s TYPE "$d") signature; "
     [[ -z "$(lsblk -no MOUNTPOINTS "$d" | tr -d '[:space:]')" ]] || reasons+="is mounted; "
-    ! zpool status 2>/dev/null | grep -q "^[[:space:]]*$n" || reasons+="is in a ZFS pool; "
     [[ -z "$reasons" ]] && return 0
     printf '%s' "${reasons%; }"; return 1
 }
-# Our layout, exactly: GPT, two partitions labelled taso-zfs and taso-blk,
-# nothing else.
+# Our layout, exactly: GPT, one partition labelled taso-blk, nothing else.
 disk_is_ours() {
     local d=$1
-    [[ "$(lsblk -no PARTLABEL "$d" | grep -v '^$' | sort | tr '\n' ' ')" == "taso-blk taso-zfs " ]] \
-        && [[ "$(lsblk -no NAME "$d" | tail -n +2 | wc -l)" == 2 ]]
+    [[ "$(lsblk -no PARTLABEL "$d" | grep -v '^$' | tr '\n' ' ')" == "taso-blk " ]] \
+        && [[ "$(lsblk -no NAME "$d" | tail -n +2 | wc -l)" == 1 ]]
 }
 
 # ---- setup --------------------------------------------------------------------
@@ -187,7 +186,7 @@ if [[ "$mode" == setup ]]; then
     [[ -b "$DISK" ]] || die "$DISK is not a block device"
     [[ "$COMMIT" =~ ^[0-9a-f]{7,40}$ ]] || die "--commit wants a commit hash, got '$COMMIT'"
     if disk_is_ours "$DISK"; then
-        echo "disk $DISK already carries taso-zfs and taso-blk: kept"
+        echo "disk $DISK already carries taso-blk: kept"
     elif ! why=$(disk_empty "$DISK"); then
         lsblk -o NAME,SIZE,TYPE,FSTYPE,PARTLABEL,MOUNTPOINTS "$DISK"
         die "$DISK is not empty: $why.  Nothing changed.  Name the drive the OS was not installed on (check shows it), or clear this one by hand."
@@ -208,7 +207,7 @@ if [[ "$mode" == setup ]]; then
     toolchain=; has gcc && has make || toolchain=build-essential
     # shellcheck disable=SC2086
     apt_get install -y git $toolchain pkg-config libclang-dev python3 jq curl chrony runc \
-        e2fsprogs util-linux fio zfsutils-linux nvme-cli blktrace
+        e2fsprogs util-linux fio nvme-cli blktrace
 
     step "3 GNU coreutils"
     if gnu_coreutils; then
@@ -249,30 +248,17 @@ if [[ "$mode" == setup ]]; then
     step "6 the disk $DISK"
     if ! disk_is_ours "$DISK"; then
         bytes=$(blockdev --getsize64 "$DISK")
-        half=$(( bytes / 2 / 1048576 ))
-        echo "$DISK: $(( bytes / 1073741824 )) GiB; two partitions of ${half} MiB"
+        echo "$DISK: $(( bytes / 1073741824 )) GiB; one partition, the whole drive"
         sfdisk --no-reread --wipe always "$DISK" <<EOF
 label: gpt
-name=taso-zfs, size=${half}MiB
 name=taso-blk
 EOF
         partx -u "$DISK" 2>/dev/null || partx -a "$DISK"
         udevadm settle
         disk_is_ours "$DISK" || die "the partitions did not appear as expected: $(lsblk -o NAME,SIZE,PARTLABEL "$DISK" | tr '\n' ';')"
     fi
-    ZFS_PART=/dev/disk/by-partlabel/taso-zfs
     BLK_PART=/dev/disk/by-partlabel/taso-blk
-    [[ -b "$ZFS_PART" && -b "$BLK_PART" ]] || die "by-partlabel links missing (udevadm settle did not help)"
-    if zpool list "$POOL" >/dev/null 2>&1; then
-        member=$(zpool status -P "$POOL" | awk '/\/dev\//{print $1; exit}')
-        [[ "$(readlink -f "$member")" == "$(readlink -f "$ZFS_PART")" ]] || die "pool $POOL exists on $member, not on $ZFS_PART"
-        echo "pool $POOL already on $ZFS_PART"
-    else
-        modprobe zfs || die "no zfs module for kernel $(uname -r)"
-        [[ -z "$(blkid -p -o value -s TYPE "$ZFS_PART" 2>/dev/null)" ]] || die "$ZFS_PART already carries $(blkid -p -o value -s TYPE "$ZFS_PART"); nothing changed"
-        zpool create -o ashift=12 -O compression=lz4 -O atime=off -O mountpoint=/taso "$POOL" "$ZFS_PART"
-    fi
-    zfs list "$POOL/vessel" >/dev/null 2>&1 || zfs create "$POOL/vessel"
+    [[ -b "$BLK_PART" ]] || die "by-partlabel link $BLK_PART missing (udevadm settle did not help)"
     if ! blkid -p -o value -s TYPE "$BLK_PART" 2>/dev/null | grep -qx ext4; then
         [[ -z "$(blkid -p -o value -s TYPE "$BLK_PART" 2>/dev/null)" ]] || die "$BLK_PART already carries $(blkid -p -o value -s TYPE "$BLK_PART"); nothing changed"
         mkfs.ext4 -q -L taso-blk "$BLK_PART"
@@ -313,11 +299,10 @@ EOF
     cat >/etc/profile.d/taso-p5.sh <<EOF
 # P5 measurement host (scripts/p5-node.sh): temporary files on the measured NVMe.
 export TMPDIR=$DATA/tmp
-export TASO_ZFS_DATASET=$POOL/vessel
 [ -r /root/.cargo/env ] && . /root/.cargo/env
 EOF
     export TMPDIR=$DATA/tmp
-    echo "TMPDIR=$TMPDIR, TASO_ZFS_DATASET=$POOL/vessel (for root logins)"
+    echo "TMPDIR=$TMPDIR (for root logins)"
 
     step "8 the repository at $COMMIT"
     if [[ ! -d "$REPO/.git" ]]; then
@@ -357,7 +342,7 @@ report() {
     [[ "${kernel%%.*}" -ge 6 ]] && pass "kernel $kernel" || bad "kernel $kernel is older than 6.0 (ublk)"
 
     step "tools"
-    for t in gcc make git fio python3 jq runc mkfs.ext4 fsfreeze zpool nvme chronyd blktrace; do
+    for t in gcc make git fio python3 jq runc mkfs.ext4 fsfreeze nvme chronyd blktrace; do
         has "$t" && pass "$t" || bad "$t missing"
     done
     if ls /usr/lib/llvm-*/lib/libclang.so* >/dev/null 2>&1 || ls /usr/lib/*-linux-gnu/libclang*.so* >/dev/null 2>&1; then
@@ -369,7 +354,6 @@ report() {
     if [[ -x /root/.cargo/bin/cargo ]]; then pass "$(/root/.cargo/bin/cargo --version)"; else bad "cargo missing"; fi
     modprobe -n ublk_drv 2>/dev/null && pass "ublk_drv available" || bad "ublk_drv not available for $(uname -r)"
     [[ -c /dev/ublk-control ]] && pass "/dev/ublk-control (ublks_max $(cat /sys/module/ublk_drv/parameters/ublks_max 2>/dev/null || echo ?))" || bad "/dev/ublk-control not present (modprobe ublk_drv)"
-    modprobe -n zfs 2>/dev/null && pass "zfs module available" || bad "zfs module not available for $(uname -r)"
     for b in taso-blkd taso-wardend taso-coordd taso-logcheck; do
         [[ -x /usr/local/bin/$b ]] && pass "/usr/local/bin/$b" || bad "/usr/local/bin/$b missing"
     done
@@ -386,7 +370,7 @@ report() {
     for n in $(lsblk -dn -o NAME,TYPE | awk '$2 == "disk" {print $1}'); do
         d=/dev/$n
         if [[ "$d" != /dev/nvme* ]]; then state="not NVMe (setup refuses it)"
-        elif disk_is_ours "$d"; then state="ours (taso-zfs + taso-blk)"
+        elif disk_is_ours "$d"; then state="ours (taso-blk, the whole drive)"
         elif why=$(disk_empty "$d"); then state="EMPTY, free to name"
         else state="in use: $why"; fi
         [[ "$n" != "$root_disk" ]] || state+="; holds the root filesystem"
@@ -400,13 +384,6 @@ report() {
             info "  nvme: (vwc=0x1 means a volatile write cache per the drive; what a flush does to it is A2)"
         fi
     done
-    if zpool list "$POOL" >/dev/null 2>&1; then
-        pass "pool $POOL: $(zpool list -H -o size,alloc,free,health "$POOL" | tr '\t' ' ') on $(zpool status -P "$POOL" | awk '/\/dev\//{print $1; exit}')"
-        info "  ashift=$(zpool get -H -o value ashift "$POOL") $(zfs get -H -o property,value compression,atime "$POOL" | tr '\t' '=' | tr '\n' ' ')"
-        zfs list "$POOL/vessel" >/dev/null 2>&1 && pass "dataset $POOL/vessel" || bad "dataset $POOL/vessel missing"
-    else
-        bad "pool $POOL missing"
-    fi
     if mountpoint -q "$DATA"; then
         pass "$DATA on $(findmnt -no SOURCE,FSTYPE,OPTIONS "$DATA"), $(df -h --output=avail "$DATA" | tail -1 | tr -d ' ') free"
     else
