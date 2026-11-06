@@ -7,13 +7,12 @@
 #
 # Targets
 #
-#   wardend   taso-wardend + taso-logcheck, runc and the ZFS userland.  Runs
-#             privileged with the host's /dev/zfs and pool (see compose.yaml
-#             and the Kubernetes manifests).  The ZFS userland must match the
-#             host's kernel module: the base is Ubuntu 26.04, whose archive
-#             carries 2.4.1 (as on the test server).  A host with another
-#             module version needs another base; checked in step D2, not here.
-#             taso-landlock is at /usr/lib/taso/landlock, to copy into agent
+#   wardend   taso-wardend + taso-logcheck, runc and e2fsprogs (the Warden
+#             makes ext4 on each new branch of the block log: mkfs.ext4,
+#             then mount).  The storage is the block log only (ZFS was
+#             removed, V4b, 2026-11-06); taso-blkd, /dev/ublk-control and
+#             this image's compose and Kubernetes wiring are P5 C3's Warden
+#             image rewrite, not here.  taso-landlock is at /usr/lib/taso/landlock, to copy into agent
 #             rootfs images (it runs inside the agent's container, not here).
 #             The entrypoint is /usr/lib/taso/cgroup-init, which prepares
 #             the container's cgroup for the agents' cgroups (cgroup v2)
@@ -69,7 +68,7 @@ LABEL org.opencontainers.image.title="taso-wardend" \
       org.opencontainers.image.source="https://github.com/Suo-commerce/taso" \
       org.opencontainers.image.licenses="Apache-2.0"
 RUN apt-get update \
- && apt-get install -y --no-install-recommends zfsutils-linux runc ca-certificates \
+ && apt-get install -y --no-install-recommends e2fsprogs runc ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/taso-wardend /out/taso-logcheck /usr/local/bin/
 COPY --from=builder /out/taso-landlock /usr/lib/taso/landlock
@@ -79,7 +78,7 @@ COPY deploy/docker/cgroup-init.sh /usr/lib/taso/cgroup-init
 # The Warden's state (local coordinator, Chronicle state); mount a volume
 # here or point the config elsewhere.
 RUN mkdir -p /var/lib/taso /run/taso
-# The config names the coordinator, the pool, the store, run_dir and the
+# The config names the coordinator, the storage (the block log), the store, run_dir and the
 # Vessels; mount it here.
 ENTRYPOINT ["/usr/lib/taso/cgroup-init", "/usr/local/bin/taso-wardend"]
 CMD ["/etc/taso/wardend.json"]
