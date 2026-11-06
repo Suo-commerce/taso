@@ -78,6 +78,21 @@ impl ObjectId {
     }
 }
 
+/// One store read, as the coordinator's rows use it: three answers kept
+/// apart, so a failed read is never taken as an absence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lookup<T> {
+    /// In the store, and it verifies.
+    Found(T),
+    /// The store answered not-found.
+    NotFound,
+    /// Anything else: the store failed (a timeout, a permission, an
+    /// outage), or the object is there and does not verify (an integrity
+    /// fault, which the view logs).  The accept is refused for now
+    /// (`NotReadable`), never decided on it.
+    Unreadable,
+}
+
 /// What the coordinator reads from the store (spec §0.4, §1.2 step 5).
 /// The coordinator never trusts a Warden's word for these.
 pub trait StoreView {
@@ -98,6 +113,36 @@ pub trait StoreView {
     /// The trailer digest of `item`'s replacement if it is in the store
     /// and matches the item (as `Packs::verify_replacement`).
     fn verify_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Option<HashVal>;
+
+    // The rows read through these three.  Their defaults answer from the
+    // yes/no methods above (a failed read looks absent there); a view
+    // that can tell a failure from a not-found answers them itself.
+    // (Review fix 5a, step 1: the yes/no methods go in step 4.)
+
+    /// [`exists`](Self::exists), with a failed read kept apart.
+    fn lookup(&self, object: &ObjectId) -> Lookup<()> {
+        if self.exists(object) {
+            Lookup::Found(())
+        } else {
+            Lookup::NotFound
+        }
+    }
+    /// [`inventory`](Self::inventory), with a failed read kept apart.
+    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+        match self.inventory(key) {
+            Some(inv) => Lookup::Found(inv),
+            None => Lookup::NotFound,
+        }
+    }
+    /// [`verify_replacement`](Self::verify_replacement), with a failed
+    /// read kept apart.  A replacement that is there and does not match
+    /// its item is an integrity fault: `Unreadable`.
+    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
+        match self.verify_replacement(chronicle, item) {
+            Some(h) => Lookup::Found(h),
+            None => Lookup::NotFound,
+        }
+    }
 }
 
 // ── Submissions and answers ─────────────────────────────────────────
@@ -430,13 +475,48 @@ enum Change {
     NameBound(String, u32),
 }
 
-type Plan = Result<Effects, Final>;
+/// Why a plan stops: for good, or for now because a store read failed
+/// (the same submission is retried; nothing is recorded).
+#[derive(Debug)]
+enum Stop {
+    Final(Final),
+    Unreadable,
+}
+
+impl From<Final> for Stop {
+    fn from(f: Final) -> Self {
+        Self::Final(f)
+    }
+}
+
+type Plan = Result<Effects, Stop>;
 
 fn need(ok: bool, rule: &'static str) -> Result<(), Final> {
     if ok {
         Ok(())
     } else {
         Err(Final::Predicate(rule.into()))
+    }
+}
+
+/// The row needs `l` in the store: its value.  Not-found refuses for good
+/// (`rule`); a failed read stops for now.
+fn found<T>(l: Lookup<T>, rule: &'static str) -> Result<T, Stop> {
+    match l {
+        Lookup::Found(v) => Ok(v),
+        Lookup::NotFound => Err(Final::Predicate(rule.into()).into()),
+        Lookup::Unreadable => Err(Stop::Unreadable),
+    }
+}
+
+/// The row needs `l` gone, as the store's own not-found.  Present refuses
+/// for good (`rule`); a failed read is no proof of absence: it stops for
+/// now (review fix 5a).
+fn gone<T>(l: Lookup<T>, rule: &'static str) -> Result<(), Stop> {
+    match l {
+        Lookup::NotFound => Ok(()),
+        Lookup::Found(_) => Err(Final::Predicate(rule.into()).into()),
+        Lookup::Unreadable => Err(Stop::Unreadable),
     }
 }
 
@@ -748,7 +828,9 @@ impl CoordLog {
             .and_then(|fx| self.check_effects(fx, store, now));
         let fx = match plan {
             Ok(fx) => fx,
-            Err(f) => return self.finalize(chronicle, s, f),
+            Err(Stop::Final(f)) => return self.finalize(chronicle, s, f),
+            // As step 5: the pending submission stays; the Warden retries it.
+            Err(Stop::Unreadable) => return Answer::Refused(Transient::NotReadable),
         };
         // 8. Append.
         self.log.push(Entry {
@@ -985,7 +1067,8 @@ impl CoordLog {
                 let Origin::Fork { parent } = &lineage.origin else {
                     return Err(Final::Predicate(
                         "a Birth is a fork's or a Template-born Vessel's Lineage".into(),
-                    ));
+                    )
+                    .into());
                 };
                 let p = *parent.chronicle.as_bytes();
                 need(
@@ -1263,7 +1346,8 @@ impl CoordLog {
                                 Live::OpenSanction { .. } => "open sanction",
                             }
                             .into(),
-                        ));
+                        )
+                        .into());
                     }
                 }
                 need(
@@ -1274,17 +1358,20 @@ impl CoordLog {
                     "an attempt is open",
                 )?;
                 need(!me.pinned, "retention pin")?;
-                let inv = store
-                    .inventory(p.inventory_key)
-                    .ok_or(Final::Predicate("inventory unreadable".into()))?;
+                let inv = found(
+                    store.lookup_inventory(p.inventory_key),
+                    "inventory unreadable",
+                )?;
                 need(inv.key() == p.inventory_key, "inventory unreadable")?;
-                need(
-                    store.exists(&ObjectId::content(p.local_key)),
+                found(
+                    store.lookup(&ObjectId::content(p.local_key)),
                     "local state unreadable",
                 )?;
+                // A pack set the store could not account for is a failed
+                // read, never a short list: retried, not refused.
                 let projected = self
                     .purge_projection(chronicle, store)
-                    .ok_or(Final::Predicate("packs unreadable".into()))?;
+                    .ok_or(Stop::Unreadable)?;
                 need(inv.items() == projected.as_slice(), "inventory mismatch")?;
                 fx.retire = true;
                 fx.release_all_of = Some(c);
@@ -1316,8 +1403,12 @@ impl CoordLog {
                     replacement_name(&r.pack.name).as_deref() == Some(r.replacement_name.as_str()),
                     "replacement name",
                 )?;
+                let installed = found(
+                    store.lookup_replacement(chronicle, item),
+                    "replacement does not match the inventory",
+                )?;
                 need(
-                    store.verify_replacement(chronicle, item) == Some(r.replacement_key),
+                    installed == r.replacement_key,
                     "replacement does not match the inventory",
                 )?;
                 fx.holds
@@ -1340,9 +1431,14 @@ impl CoordLog {
                     .find(|i| i.pack == l.pack)
                     .ok_or(Final::Predicate("not in the inventory".into()))?;
                 need(!ps.progressed.contains_key(&l.pack.name), "item progressed")?;
-                need(
-                    !store.exists(&ObjectId::pack(chronicle, &l.pack.name))
-                        && store.verify_replacement(chronicle, item).is_none(),
+                // Lost only on the store's own not-found for both: a
+                // failed read is no proof (review fix 5a).
+                gone(
+                    store.lookup(&ObjectId::pack(chronicle, &l.pack.name)),
+                    "original or replacement readable",
+                )?;
+                gone(
+                    store.lookup_replacement(chronicle, item),
                     "original or replacement readable",
                 )?;
                 fx.changes.push(Change::PurgeProgress(
@@ -1372,12 +1468,12 @@ impl CoordLog {
                         && p.items_replaced == ps.items.len() as u64,
                     "history damaged",
                 )?;
-                need(
-                    ps.items
-                        .iter()
-                        .all(|i| !store.exists(&ObjectId::pack(chronicle, &i.pack.name))),
-                    "originals not deleted",
-                )?;
+                for i in &ps.items {
+                    gone(
+                        store.lookup(&ObjectId::pack(chronicle, &i.pack.name)),
+                        "originals not deleted",
+                    )?;
+                }
                 self.purge_end(&mut fx, chronicle, ps);
             }
             ContractRecord::PurgeDamaged(p) => {
@@ -1449,7 +1545,7 @@ impl CoordLog {
             ContractRecord::ReclaimComplete { object_key, .. } => {
                 let o = ObjectId::content(*object_key);
                 need(self.claims.get(&o) == Some(&ClaimBy::Reclaim), "no claim")?;
-                need(!store.exists(&o), "not deleted")?;
+                gone(store.lookup(&o), "not deleted")?;
                 fx.resolve_claims.push(o);
             }
             // D49: any Chronicle with a current epoch may submit it; the row
@@ -1556,19 +1652,21 @@ impl CoordLog {
         self.quarantine.get(o).is_some_and(|&until| now < until)
     }
 
-    /// Step 7: every object to hold exists, is not claimed, not
-    /// quarantined; every claim target has no hold left after the
+    /// Step 7: every object to hold exists (a failed read stops for now),
+    /// is not claimed, not quarantined; every claim target has no hold left after the
     /// record's releases.
     fn check_effects(&self, fx: Effects, store: &dyn StoreView, now: u64) -> Plan {
         for (o, _) in &fx.holds {
             if self.claims.contains_key(o) {
-                return Err(Final::Claimed(o.clone()));
+                return Err(Final::Claimed(o.clone()).into());
             }
             if self.quarantined(o, now) {
-                return Err(Final::Quarantined(o.clone()));
+                return Err(Final::Quarantined(o.clone()).into());
             }
-            if !store.exists(o) {
-                return Err(Final::NoSuchObject(o.clone()));
+            match store.lookup(o) {
+                Lookup::Found(()) => {}
+                Lookup::NotFound => return Err(Final::NoSuchObject(o.clone()).into()),
+                Lookup::Unreadable => return Err(Stop::Unreadable),
             }
         }
         for (o, _) in &fx.claims {
@@ -1578,7 +1676,7 @@ impl CoordLog {
                     && !fx.release_created_by.contains(&h.created_by)
             });
             if held_after {
-                return Err(Final::Predicate("claim target held".into()));
+                return Err(Final::Predicate("claim target held".into()).into());
             }
         }
         Ok(fx)
@@ -1779,6 +1877,9 @@ mod tests {
         unlistable: RefCell<BTreeSet<C16>>,
         closure: RefCell<BTreeMap<C16, Vec<ObjectId>>>,
         replacements: RefCell<BTreeMap<(C16, String), HashVal>>,
+        /// Objects whose read fails (an outage, a timeout, a permission,
+        /// or bytes that do not verify), whether they are there or not.
+        unreadable: RefCell<BTreeSet<ObjectId>>,
     }
 
     impl Store {
@@ -1843,6 +1944,34 @@ mod tests {
                 .get(&(*c.as_bytes(), name))
                 .copied()
         }
+        fn lookup(&self, o: &ObjectId) -> Lookup<()> {
+            if self.unreadable.borrow().contains(o) {
+                Lookup::Unreadable
+            } else if self.exists(o) {
+                Lookup::Found(())
+            } else {
+                Lookup::NotFound
+            }
+        }
+        fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+            if self.unreadable.borrow().contains(&ObjectId::content(key)) {
+                return Lookup::Unreadable;
+            }
+            match self.inventory(key) {
+                Some(inv) => Lookup::Found(inv),
+                None => Lookup::NotFound,
+            }
+        }
+        fn lookup_replacement(&self, c: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
+            let name = replacement_name(&item.pack.name).unwrap_or_default();
+            if self.unreadable.borrow().contains(&ObjectId::pack(c, &name)) {
+                return Lookup::Unreadable;
+            }
+            match self.verify_replacement(c, item) {
+                Some(h) => Lookup::Found(h),
+                None => Lookup::NotFound,
+            }
+        }
     }
 
     // ── a Warden in a test ──────────────────────────────────────────
@@ -1897,6 +2026,29 @@ mod tests {
             match self.submit(c, Submitted::Contract(r)) {
                 Answer::FinalRefused(f) => f,
                 other => panic!("not refused: {other:?}"),
+            }
+        }
+        /// Submit `r` as submission `n`: refused for now, `NotReadable`,
+        /// with nothing recorded (the same `n` can be retried).
+        fn not_readable(&mut self, c: ChronicleId, n: u64, r: &ContractRecord) {
+            let e = self.epoch(c);
+            let head = self.head(c);
+            let a = self.submit_as(c, e, n, Submitted::Contract(r.clone()));
+            assert_eq!(a, Answer::Refused(Transient::NotReadable), "{r:?}");
+            assert_eq!(self.head(c), head, "nothing appended");
+            let s = sub(&Submitted::Contract(r.clone()), e, n);
+            assert_eq!(
+                self.log.query_submission(c, s),
+                SubmissionStatus::AbsentAtRead,
+                "nothing refused for good"
+            );
+        }
+        /// Retry submission `n` of `r`: accepted.
+        fn retried_ok(&mut self, c: ChronicleId, n: u64, r: &ContractRecord) -> u64 {
+            let e = self.epoch(c);
+            match self.submit_as(c, e, n, Submitted::Contract(r.clone())) {
+                Answer::Accepted { log_pos, .. } => log_pos,
+                other => panic!("not accepted on retry: {other:?}"),
             }
         }
     }
@@ -2562,6 +2714,184 @@ mod tests {
         );
     }
 
+    /// Review fix 5a: an item is lost only on the store's own not-found
+    /// for its original and its replacement.  A read that fails (an outage
+    /// while the original is gone, an original that is there but does not
+    /// verify, a replacement that cannot be read) refuses for now, records
+    /// nothing, and the same submission is accepted once the store answers.
+    #[test]
+    fn a_failed_store_read_never_proves_an_item_lost() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let (pc, inv) = purge_inventory(&mut w, f.v);
+        w.ok(f.v, ContractRecord::PurgeCommitted(pc));
+        let it = &inv.items()[0];
+        let original = ObjectId::pack(f.v, &it.pack.name);
+        let rname = replacement_name(&it.pack.name).unwrap();
+        let replacement = ObjectId::pack(f.v, &rname);
+        let lost = ContractRecord::ItemLost(ItemLost {
+            chronicle: f.v,
+            pack: it.pack.clone(),
+        });
+        // The original is gone, but the store is down: no proof.
+        store.del(&original);
+        store.unreadable.borrow_mut().insert(original.clone());
+        w.not_readable(f.v, 1, &lost);
+        // The original is there and fails its check: an integrity fault,
+        // never a loss.
+        store.put(original.clone());
+        w.not_readable(f.v, 1, &lost);
+        // The original is confirmed gone; the replacement cannot be read.
+        store.del(&original);
+        store.unreadable.borrow_mut().clear();
+        store.unreadable.borrow_mut().insert(replacement.clone());
+        w.not_readable(f.v, 1, &lost);
+        // Both confirmed gone: lost, from the same submission.
+        store.unreadable.borrow_mut().clear();
+        w.retried_ok(f.v, 1, &lost);
+        // A replacement that cannot be read is not installed either.
+        let it2 = &inv.items()[1];
+        let rname2 = replacement_name(&it2.pack.name).unwrap();
+        store.put(ObjectId::pack(f.v, &rname2));
+        store
+            .replacements
+            .borrow_mut()
+            .insert((*f.v.as_bytes(), rname2.clone()), h(0xB0));
+        store
+            .unreadable
+            .borrow_mut()
+            .insert(ObjectId::pack(f.v, &rname2));
+        let installed = ContractRecord::ReplacementInstalled(ReplacementInstalled {
+            chronicle: f.v,
+            pack: it2.pack.clone(),
+            replacement_key: h(0xB0),
+            replacement_name: rname2,
+        });
+        w.not_readable(f.v, 2, &installed);
+        store.unreadable.borrow_mut().clear();
+        w.retried_ok(f.v, 2, &installed);
+    }
+
+    /// Review fix 5a: a purge commits only on what the store answered, and
+    /// completes only on the store's not-found for every original.
+    #[test]
+    fn a_failed_store_read_neither_commits_nor_completes_a_purge() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let (pc, inv) = purge_inventory(&mut w, f.v);
+        let pc = ContractRecord::PurgeCommitted(pc);
+        let inv_obj = ObjectId::content(inv.key());
+        let local = ObjectId::content(h(0x70));
+        store.unreadable.borrow_mut().insert(inv_obj);
+        w.not_readable(f.v, 1, &pc);
+        store.unreadable.borrow_mut().clear();
+        store.unreadable.borrow_mut().insert(local.clone());
+        w.not_readable(f.v, 1, &pc);
+        store.unreadable.borrow_mut().clear();
+        w.retried_ok(f.v, 1, &pc);
+        // Every item replaced, every original deleted -- but one deletion
+        // cannot be confirmed while the store is down.
+        for it in inv.items() {
+            let rname = replacement_name(&it.pack.name).unwrap();
+            store.put(ObjectId::pack(f.v, &rname));
+            store
+                .replacements
+                .borrow_mut()
+                .insert((*f.v.as_bytes(), rname.clone()), h(0xB0));
+            w.ok(
+                f.v,
+                ContractRecord::ReplacementInstalled(ReplacementInstalled {
+                    chronicle: f.v,
+                    pack: it.pack.clone(),
+                    replacement_key: h(0xB0),
+                    replacement_name: rname,
+                }),
+            );
+            store.del(&ObjectId::pack(f.v, &it.pack.name));
+        }
+        let first = ObjectId::pack(f.v, &inv.items()[0].pack.name);
+        store.unreadable.borrow_mut().insert(first.clone());
+        let done = ContractRecord::PurgeComplete(PurgeComplete {
+            chronicle: f.v,
+            inventory_key: inv.key(),
+            items_replaced: inv.items().len() as u64,
+            history_attestation: h(0xC0),
+        });
+        w.not_readable(f.v, 2, &done);
+        // Still there (a delete that did not happen): refused for good.
+        store.unreadable.borrow_mut().clear();
+        store.put(first.clone());
+        assert_eq!(
+            w.log.accept(
+                f.v,
+                w.epoch(f.v),
+                sub(&Submitted::Contract(done.clone()), w.epoch(f.v), 2),
+                w.head(f.v),
+                "p100",
+                Submitted::Contract(done.clone()),
+                &store,
+                w.now,
+            ),
+            Answer::FinalRefused(Final::Predicate("originals not deleted".into()))
+        );
+        store.del(&first);
+        w.retried_ok(f.v, 3, &done);
+    }
+
+    /// Review fix 5a: a hold needs the object read, and a reclaim
+    /// completes only on the store's not-found.
+    #[test]
+    fn a_failed_store_read_neither_holds_nor_completes_a_reclaim() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        // A Candidate whose artifact the store cannot read right now: not
+        // `NoSuchObject` for good, but refused for now.
+        let art = ObjectId::content(f.k.artifact_key);
+        store.unreadable.borrow_mut().insert(art.clone());
+        let cand = ContractRecord::Candidate(Box::new(f.k.clone()));
+        w.not_readable(f.v, 1, &cand);
+        store.unreadable.borrow_mut().clear();
+        w.retried_ok(f.v, 1, &cand);
+        // A reclaim of an unheld object; its deletion not yet confirmed.
+        let op = cid(0xEE);
+        w.log.claim_chronicle(op, ClaimAuthority::Vessel).unwrap();
+        let k = ObjectId::content(h(0x99));
+        store.put(k.clone());
+        w.ok(
+            op,
+            ContractRecord::ReclaimClaimed {
+                object_key: h(0x99),
+            },
+        );
+        store.del(&k);
+        store.unreadable.borrow_mut().insert(k.clone());
+        let done = ContractRecord::ReclaimComplete {
+            object_key: h(0x99),
+            outcome: crate::contract::ReclaimOutcome::Deleted,
+        };
+        w.not_readable(op, 1, &done);
+        store.unreadable.borrow_mut().clear();
+        w.retried_ok(op, 1, &done);
+    }
+
     fn genesis_started(t0: ChronicleId) -> GenesisStarted {
         GenesisStarted {
             genesis_id: t0,
@@ -3204,8 +3534,8 @@ mod tests {
     }
 
     /// A store that cannot account for every pack gives no projection,
-    /// and a purge commit against it is refused -- never computed from
-    /// the packs that happened to list.
+    /// and a purge commit against it is refused for now -- never computed
+    /// from the packs that happened to list.
     #[test]
     fn an_unlistable_pack_set_gives_no_projection_and_refuses_the_purge() {
         let store = Store::default();
@@ -3236,10 +3566,12 @@ mod tests {
             inventory_key: full.key(),
             local_key: h(0x70),
         };
-        assert_eq!(
-            w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
-            Final::Predicate("packs unreadable".into())
-        );
+        // A failed listing is a failed read: refused for now, then
+        // accepted from the same submission once the store answers.
+        let pc = ContractRecord::PurgeCommitted(pc);
+        w.not_readable(f.v, 1, &pc);
+        store.unlistable.borrow_mut().clear();
+        w.retried_ok(f.v, 1, &pc);
     }
 
     #[test]
