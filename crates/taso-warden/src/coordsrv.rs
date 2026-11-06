@@ -971,7 +971,9 @@ fn encode_refusal(e: &CoordError) -> Option<Vec<u8>> {
         CoordError::Corrupt { .. }
         | CoordError::Storage(_)
         | CoordError::Unavailable(_)
-        | CoordError::Journal(_) => return None,
+        | CoordError::Journal(_)
+        // Only at open, never an answer to a call.
+        | CoordError::QuarantineChanged { .. } => return None,
     };
     Some(o.0)
 }
