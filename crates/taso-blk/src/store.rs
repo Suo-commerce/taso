@@ -229,6 +229,9 @@ pub enum StoreError {
     },
     /// An earlier append failed; reopen the store.
     Poisoned,
+    /// Another store has this log open (its lock file, named here, is
+    /// held): nothing was read, cut or created.
+    Locked(PathBuf),
 }
 
 impl std::fmt::Display for StoreError {
@@ -260,6 +263,11 @@ impl std::fmt::Display for StoreError {
             ),
             Self::TooLarge(n) => write!(f, "write of {n} bytes exceeds one record"),
             Self::Poisoned => write!(f, "an earlier append failed; reopen the store"),
+            Self::Locked(p) => write!(
+                f,
+                "another store has this log open ({} is locked): two writers would overwrite each other's blocks",
+                p.display()
+            ),
         }
     }
 }
@@ -328,6 +336,11 @@ pub struct Stats {
 
 /// One block log file and the map it holds.
 pub struct Store {
+    /// The log's lock (`<log>.lock`, held exclusively while the store
+    /// lives): one store per log (audit 2026-11-06, finding 1).  A file
+    /// beside the log, not the log itself, so a compaction's rename does
+    /// not take it away: the switch hands it to the new store.
+    lock: File,
     file: File,
     /// The log as the [`Syncer`] sees it: a handle the store shares with
     /// it, which a compaction's switch points at the new log
@@ -358,6 +371,7 @@ impl Store {
     /// Create a new, empty log at `path` (which must not exist) and make
     /// its existence durable.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
+        let lock = lock_log(path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -378,6 +392,7 @@ impl Store {
         file.sync_all()?;
         sync_dir(path)?;
         Ok(Self {
+            lock,
             shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
             file,
             path: path.to_path_buf(),
@@ -403,6 +418,9 @@ impl Store {
     /// verified, then applied together, so records after the last Flush
     /// never reach the map.
     pub fn open(path: &Path) -> Result<(Self, Recovered), StoreError> {
+        // Before anything is read, cut or removed: another store's
+        // unflushed tail is not ours to cut.
+        let lock = lock_log(path)?;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let len = file.metadata()?.len();
         if len < HEADER_LEN {
@@ -422,6 +440,7 @@ impl Store {
         for stale in [
             compact::temp_path(path),
             ckpt_path(&compact::temp_path(path)),
+            lock_path(&compact::temp_path(path)),
         ] {
             remove_if_there(&stale)?;
         }
@@ -503,6 +522,7 @@ impl Store {
             ..Stats::default()
         };
         let store = Self {
+            lock,
             shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
             file,
             path: path.to_path_buf(),
@@ -1457,6 +1477,34 @@ impl Meta {
 }
 
 /// Where the checkpoint of the log at `path` lives.
+/// The log's lock file: `<log>.lock`.  Never removed (a lock on a file
+/// that could be unlinked and made again would let two stores each hold
+/// "the" lock).
+pub fn lock_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+/// Take the log's lock, or say who holds it: [`StoreError::Locked`].
+/// An exclusive `flock` on [`lock_path`]: it conflicts with any other
+/// open of the same file, in this process or another, and goes with the
+/// last descriptor (a dead daemon's lock is gone).
+fn lock_log(path: &Path) -> Result<File, StoreError> {
+    let p = lock_path(path);
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&p)?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Locked(p)),
+        Err(std::fs::TryLockError::Error(e)) => Err(StoreError::Io(e)),
+    }
+}
+
 fn ckpt_path(path: &Path) -> PathBuf {
     let mut p = path.as_os_str().to_owned();
     p.push(".ckpt");
@@ -3498,5 +3546,46 @@ mod tests {
         assert!(!sync.durable(1).unwrap());
         assert_eq!(sync.syncs(), syncs);
         assert_eq!(sync.sync_time(), (total, max), "no sync, no time");
+    }
+
+    /// Audit 2026-11-06, finding 1: a second store on a live log is
+    /// refused before it reads, cuts or creates anything, so it can never
+    /// write over blocks the first acknowledged.  The lock is the log's,
+    /// not the file's: it survives a compaction's switch (the rename
+    /// replaces the file), and it goes when the store is dropped.
+    #[test]
+    fn a_second_store_on_a_live_log_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut first = Store::create(&path).unwrap();
+        let root = first.root_seal().unwrap();
+        let b = first.fork(root).unwrap();
+        first.write(b, 0, &blocks(0x11, 1), false).unwrap(); // not flushed
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            matches!(Store::open(&path), Err(StoreError::Locked(_))),
+            "a second open of a live log"
+        );
+        assert!(
+            matches!(Store::create(&path), Err(StoreError::Locked(_))),
+            "a create over a live log"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "the refused open cut nothing of the first's unflushed tail"
+        );
+        // Still refused after a compaction replaced the file.
+        compact(&mut first);
+        assert!(
+            matches!(Store::open(&path), Err(StoreError::Locked(_))),
+            "a second open after a compaction"
+        );
+        first.write(b, 1, &blocks(0x12, 1), true).unwrap();
+        assert_eq!(read1(&first, b, 0), 0x11);
+        drop(first);
+        // Dropped: the log opens, with both blocks.
+        let (s, _) = Store::open(&path).unwrap();
+        assert_eq!((read1(&s, b, 0), read1(&s, b, 1)), (0x11, 0x12));
     }
 }
