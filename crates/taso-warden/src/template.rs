@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex};
 
 use taso_core::canon::Canon;
 use taso_core::contract::{
-    logical_id, ContractRecord, LayerShipped, LogicalKey, ObjectKind, StorageKind, TemplateReady,
+    logical_id, ContractRecord, LayerShipped, LogicalKey, ObjectKind, TemplateReady,
 };
 use taso_core::coordlog::{ClaimAuthority, ClaimError, Final, Submitted, Transient};
 use taso_core::envelope::{ChronicleId, HashVal, Lsn, Stream};
@@ -271,8 +271,6 @@ pub struct TemplateLayers<P: Pool, X: Sender> {
     pub pool: P,
     /// Makes a Seal's full stream.
     pub sender: X,
-    /// Which storage `pool` is.
-    pub storage: StorageKind,
     /// The store.
     pub store: SharedStore,
     /// Key prefix in the store.
@@ -343,7 +341,7 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
                 });
             }
             let mut warden = self.open_warden(&mut notes)?;
-            let logical = logical_id(&LogicalKey::Layer(t, self.storage));
+            let logical = logical_id(&LogicalKey::Layer(t));
             let mine = match (warden.prepared(logical)?, self.built_here(&ds)?) {
                 (Some(ContractRecord::LayerShipped(p)), _) if self.has_object(p.layer_key)? => {
                     notes.push(format!(
@@ -361,7 +359,6 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
                     ));
                     LayerShipped {
                         template_id: t,
-                        storage: self.storage,
                         layer_key: key,
                         guid,
                     }
@@ -372,7 +369,6 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
                     notes.push(format!("built the layer {}", hex(key.as_bytes())));
                     LayerShipped {
                         template_id: t,
-                        storage: self.storage,
                         layer_key: key,
                         guid,
                     }
@@ -423,7 +419,7 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
     }
 
     fn accepted(&self, t: ChronicleId) -> Result<Option<LayerShipped>, TemplateError> {
-        match self.accepted_record(LogicalKey::Layer(t, self.storage))? {
+        match self.accepted_record(LogicalKey::Layer(t))? {
             Some(ContractRecord::LayerShipped(l)) => Ok(Some(l)),
             Some(_) => Err(TemplateError::Inconsistent(
                 "the Layer row holds LayerShipped".into(),
@@ -1373,7 +1369,7 @@ mod tests {
             }
         }
 
-        fn node(&self, n: u64, storage: StorageKind) -> TemplateLayers<DirPool, DirSend> {
+        fn node(&self, n: u64) -> TemplateLayers<DirPool, DirSend> {
             let at = self.dir.path().join(format!("node{n}"));
             TemplateLayers {
                 pool: DirPool {
@@ -1381,7 +1377,6 @@ mod tests {
                     state: Arc::default(),
                 },
                 sender: DirSend(at.join("pool"), format!("node{n}")),
-                storage,
                 store: self.store.clone(),
                 prefix: PREFIX.into(),
                 coord: self.coord.clone(),
@@ -1400,10 +1395,10 @@ mod tests {
             std::fs::remove_dir_all(self.dir.path().join(format!("node{n}"))).unwrap();
         }
 
-        fn shipped(&self, storage: StorageKind) -> Option<LayerShipped> {
+        fn shipped(&self) -> Option<LayerShipped> {
             match self
                 .coord
-                .query_logical(logical_id(&LogicalKey::Layer(self.t0, storage)))
+                .query_logical(logical_id(&LogicalKey::Layer(self.t0)))
                 .unwrap()
             {
                 Some((_, Submitted::Contract(ContractRecord::LayerShipped(l)))) => Some(l),
@@ -1427,7 +1422,7 @@ mod tests {
     /// the Template range.
     fn present(c: &Cluster, node: &TemplateLayers<DirPool, DirSend>, l: &Layer) {
         use std::os::unix::fs::MetadataExt;
-        let s = c.shipped(node.storage).expect("a LayerShipped is accepted");
+        let s = c.shipped().expect("a LayerShipped is accepted");
         assert_eq!((l.layer_key, l.guid), (s.layer_key, s.guid));
         assert_eq!(l.dataset, node.layer_dataset(c.t0).unwrap());
         let bound = node.pool.layers(&l.dataset).list().unwrap();
@@ -1450,7 +1445,7 @@ mod tests {
     #[test]
     fn the_first_node_builds_and_every_node_receives_the_same_layer() {
         let c = Cluster::new();
-        let n1 = c.node(1, StorageKind::Blk);
+        let n1 = c.node(1);
         let l1 = n1.ensure(c.t0).unwrap();
         present(&c, &n1, &l1);
         assert!(
@@ -1475,7 +1470,7 @@ mod tests {
         assert_eq!(wc.accepted.len(), 1);
 
         // Node 2 builds nothing: it receives the same stream.
-        let n2 = c.node(2, StorageKind::Blk);
+        let n2 = c.node(2);
         let l2 = n2.ensure(c.t0).unwrap();
         present(&c, &n2, &l2);
         assert_eq!((l2.layer_key, l2.guid), (l1.layer_key, l1.guid));
@@ -1494,11 +1489,9 @@ mod tests {
         assert_eq!(again, l2);
         assert_eq!(n2.pool.state.lock().unwrap().created.len(), 1);
 
-        // The other storage kind has its own LayerShipped.  (The test
-        // pool's streams are alike for both kinds, so here it is the same
-        // object; real storages' streams differ.)
-        let z = c.node(3, StorageKind::Zfs).ensure(c.t0).unwrap();
-        assert_eq!(c.shipped(StorageKind::Zfs).unwrap().layer_key, z.layer_key);
+        // A third node receives the same layer: one per Template (D52).
+        let z = c.node(3).ensure(c.t0).unwrap();
+        assert_eq!(c.shipped().unwrap().layer_key, z.layer_key);
         let wc3 = c
             .coord
             .query_chronicle(warden_chronicle(WardenId::new(3)))
@@ -1510,7 +1503,7 @@ mod tests {
     #[test]
     fn not_a_template_is_refused() {
         let c = Cluster::new();
-        let n1 = c.node(1, StorageKind::Blk);
+        let n1 = c.node(1);
         let v = ChronicleId::from_bytes([0x0A; 16]);
         assert!(matches!(n1.ensure(v), Err(TemplateError::NotATemplate(t)) if t == v));
     }
@@ -1518,9 +1511,9 @@ mod tests {
     #[test]
     fn a_layer_received_but_not_checked_is_checked_and_a_bad_one_destroyed() {
         let c = Cluster::new();
-        c.node(1, StorageKind::Blk).ensure(c.t0).unwrap();
+        c.node(1).ensure(c.t0).unwrap();
         // Node 2 stops right after its receive.
-        let mut n2 = c.node(2, StorageKind::Blk);
+        let mut n2 = c.node(2);
         n2.failpoint = fail_at("layer.after_receive");
         assert!(matches!(n2.ensure(c.t0), Err(TemplateError::Failpoint(_))));
         n2.failpoint = no_failpoints();
@@ -1551,7 +1544,7 @@ mod tests {
             "layer.after_receive",
         ] {
             let c = Cluster::new();
-            let mut n1 = c.node(1, StorageKind::Blk);
+            let mut n1 = c.node(1);
             n1.failpoint = fail_at(fp);
             assert!(
                 matches!(n1.ensure(c.t0), Err(TemplateError::Failpoint(p)) if p == fp),
@@ -1588,12 +1581,12 @@ mod tests {
             // The same failpoints on a node lost there: another node
             // finishes, from the store and the log.
             let c = Cluster::new();
-            let mut n1 = c.node(1, StorageKind::Blk);
+            let mut n1 = c.node(1);
             n1.failpoint = fail_at(fp);
             assert!(n1.ensure(c.t0).is_err());
             drop(n1);
             c.lose(1);
-            let n2 = c.node(2, StorageKind::Blk);
+            let n2 = c.node(2);
             let l = n2
                 .ensure(c.t0)
                 .unwrap_or_else(|e| panic!("{fp} on node 2: {e}"));
@@ -1606,18 +1599,18 @@ mod tests {
         let c = Arc::new(Cluster::new());
         // Node 1 builds and receives its own layer; just before it ships,
         // node 2 builds and ships its own (a different stream).
-        let mut n1 = c.node(1, StorageKind::Blk);
+        let mut n1 = c.node(1);
         let c2 = c.clone();
         n1.failpoint = Box::new(move |p| {
-            if p == "layer.before_shipped_accept" && c2.shipped(StorageKind::Blk).is_none() {
-                c2.node(2, StorageKind::Blk)
+            if p == "layer.before_shipped_accept" && c2.shipped().is_none() {
+                c2.node(2)
                     .ensure(c2.t0)
                     .map_err(|e| TemplateError::Inconsistent(e.to_string()))?;
             }
             Ok(())
         });
         let l1 = n1.ensure(c.t0).unwrap();
-        let won = c.shipped(StorageKind::Blk).unwrap();
+        let won = c.shipped().unwrap();
         // Node 1's submission answered Conflict: it took node 2's layer,
         // destroying its own, and said so.
         assert_eq!(l1.layer_key, won.layer_key);
@@ -1663,13 +1656,13 @@ mod tests {
         let c = Cluster::new();
         // Node 1 built, received and checked its own layer, then stopped
         // before shipping it.
-        let mut n1 = c.node(1, StorageKind::Blk);
+        let mut n1 = c.node(1);
         n1.failpoint = fail_at("layer.before_shipped_accept");
         assert!(n1.ensure(c.t0).is_err());
         let mine = n1.layer_dataset(c.t0).unwrap();
         let my_key = n1.pool.layers(&mine).list().unwrap()[0].1;
         // Node 2 ships its own, a different stream.
-        let won = c.node(2, StorageKind::Blk).ensure(c.t0).unwrap();
+        let won = c.node(2).ensure(c.t0).unwrap();
         assert_ne!(won.layer_key, my_key);
         // Node 1 again: the accepted layer is settled; its own is destroyed
         // by guid and the accepted one received.
@@ -1687,7 +1680,7 @@ mod tests {
     #[test]
     fn a_tampered_layer_object_is_never_received() {
         let c = Cluster::new();
-        let l1 = c.node(1, StorageKind::Blk).ensure(c.t0).unwrap();
+        let l1 = c.node(1).ensure(c.t0).unwrap();
         let path = object_key_path(PREFIX, ObjectKind::Layer, l1.layer_key).unwrap();
         let mut bytes = Vec::new();
         c.store
@@ -1699,7 +1692,7 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         c.store.put(&path, &mut &bytes[..]).unwrap();
-        let n2 = c.node(2, StorageKind::Blk);
+        let n2 = c.node(2);
         assert!(matches!(n2.ensure(c.t0), Err(TemplateError::Integrity(p)) if p == path));
         assert!(
             n2.pool
@@ -1713,8 +1706,8 @@ mod tests {
     #[test]
     fn a_node_with_another_template_range_refuses_the_layer() {
         let c = Cluster::new();
-        c.node(1, StorageKind::Blk).ensure(c.t0).unwrap();
-        let mut n2 = c.node(2, StorageKind::Blk);
+        c.node(1).ensure(c.t0).unwrap();
+        let mut n2 = c.node(2);
         n2.template_base = TBASE + SLOT;
         let e = n2.ensure(c.t0).unwrap_err();
         assert!(
@@ -1733,14 +1726,14 @@ mod tests {
     #[test]
     fn the_warden_chronicle_survives_its_node_and_is_one_wardens() {
         let c = Cluster::new();
-        let mut n1 = c.node(1, StorageKind::Blk);
+        let mut n1 = c.node(1);
         n1.failpoint = fail_at("layer.after_shipped_accept");
         assert!(n1.ensure(c.t0).is_err());
         drop(n1);
         c.lose(1);
         // Node 1 again, on a fresh disk: its Chronicle is rebuilt from the
         // packs; the accepted layer is received.
-        let n1 = c.node(1, StorageKind::Blk);
+        let n1 = c.node(1);
         let l = n1.ensure(c.t0).unwrap();
         present(&c, &n1, &l);
         // Another Warden holding warden 5's Chronicle stops warden 5.
@@ -1751,7 +1744,7 @@ mod tests {
                 ClaimAuthority::Vessel,
             )
             .unwrap();
-        let n5 = c.node(5, StorageKind::Zfs);
+        let n5 = c.node(5);
         assert!(matches!(
             n5.ensure(c.t0),
             Err(TemplateError::WardenHeldElsewhere { holder }) if holder == WardenId::new(6)
@@ -1838,7 +1831,7 @@ mod tests {
     fn ten_vessels_are_born_from_one_layer() {
         use std::os::unix::fs::MetadataExt;
         let c = Cluster::new();
-        let n1 = c.node(1, StorageKind::Zfs);
+        let n1 = c.node(1);
         let l = n1.ensure(c.t0).unwrap();
         let h = host(&c, &n1);
         let birth = birth_of(&l, None);
@@ -1923,7 +1916,7 @@ mod tests {
     #[test]
     fn an_interrupted_birth_is_finished_and_never_runs_before_its_birth() {
         let c = Cluster::new();
-        let n1 = c.node(1, StorageKind::Blk);
+        let n1 = c.node(1);
         let l = n1.ensure(c.t0).unwrap();
         let h = host(&c, &n1);
         let birth = birth_of(&l, None);
@@ -1986,7 +1979,7 @@ mod tests {
     #[test]
     fn a_birth_needs_a_settled_layer_and_an_asked_name_that_names_it() {
         let c = Cluster::new();
-        let n1 = c.node(1, StorageKind::Zfs);
+        let n1 = c.node(1);
         let l = n1.ensure(c.t0).unwrap();
         let h = host(&c, &n1);
         // A name that names nothing: the Birth row refuses it.
@@ -2443,7 +2436,7 @@ mod tests {
     #[test]
     fn what_keeps_an_attempt_from_starting_ends_it_launch_failed() {
         let c = Cluster::new();
-        let node = c.node(1, StorageKind::Zfs);
+        let node = c.node(1);
         let (limits, reserved) = (Limits::default(), Reserved::defaults());
         let run = run_with(&c, &node, &limits, &reserved);
         // A vconf that is not one.
@@ -2498,7 +2491,7 @@ mod tests {
     #[test]
     fn a_node_side_failure_ends_an_attempt_interrupted_and_it_runs_again() {
         let c = Cluster::new();
-        let node = c.node(1, StorageKind::Zfs);
+        let node = c.node(1);
         let (limits, reserved) = (Limits::default(), Reserved::defaults());
         let down: SharedStore = Arc::new(Down(c.store.clone()));
         let mut run = run_with(&c, &node, &limits, &reserved);
@@ -2578,7 +2571,7 @@ mod tests {
         let vt = c.dir.path().join("verifier");
         verifier_tree(&vt);
         let verifier = c.template_from(&vt);
-        let node = c.node(1, StorageKind::Zfs);
+        let node = c.node(1);
         let (limits, reserved) = (Limits::default(), Reserved::defaults());
         let run = run_with(&c, &node, &limits, &reserved);
         let script = b"version = 1\nentry = [\"/bin/sh\", \"-c\", \"cat /candidate/app/main.py; if echo x > /candidate/x 2>/dev/null; then exit 9; fi; exit 3\"]\n";
@@ -2690,7 +2683,7 @@ mod tests {
         let vt = c.dir.path().join("verifier");
         verifier_tree(&vt);
         let verifier = c.template_from(&vt);
-        let node = c.node(1, StorageKind::Zfs);
+        let node = c.node(1);
         let (limits, reserved) = (Limits::default(), Reserved::defaults());
         let run = run_with(&c, &node, &limits, &reserved);
         let map = "version = 1\n[[rule]]\nglob = \"**\"\nclass = \"Source\"\n[[rule]]\nglob = \"build/\"\nclass = \"Scratch\"\n[[rule]]\nglob = \"build/keep.rs\"\nclass = \"Source\"\n";
@@ -3159,15 +3152,12 @@ mod tests {
         fin.finish(&mut v, &packs, &s).unwrap();
         assert_eq!(v.tail().lsn, tail);
         // The Template's holds keep its definition; a node builds its layer.
-        let node = c.node(1, StorageKind::Zfs);
+        let node = c.node(1);
         let l = node.ensure(s.template_id).unwrap();
         assert_eq!(l.template_id, s.template_id);
         match c
             .coord
-            .query_logical(logical_id(&LogicalKey::Layer(
-                s.template_id,
-                StorageKind::Zfs,
-            )))
+            .query_logical(logical_id(&LogicalKey::Layer(s.template_id)))
             .unwrap()
         {
             Some((_, Submitted::Contract(ContractRecord::LayerShipped(x)))) => {
@@ -3423,7 +3413,7 @@ mod tests {
             Purged::Complete { .. }
         ));
         // The Template is untouched: its layer still builds on a node.
-        c.node(1, StorageKind::Zfs).ensure(s.template_id).unwrap();
+        c.node(1).ensure(s.template_id).unwrap();
     }
 
     #[test]
