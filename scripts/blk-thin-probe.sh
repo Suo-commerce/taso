@@ -182,7 +182,7 @@ fi
 out "blk-thin-probe $(date -Is); kernel $(uname -r); taso $(git rev-parse --short HEAD 2>/dev/null || echo ?)"
 out "generic/347 stack: data ${DATA_SECTORS} sectors (500 MiB), blocks ${CLUSTER} sectors (512 KiB), volume ${VIRT_SECTORS} sectors, metadata ${META_SECTORS} sectors at ${META_OFFSET}"
 
-rm -f "$LOG" "$ERR" "$LOG.ckpt"
+rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock"
 "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
