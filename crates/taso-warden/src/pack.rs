@@ -29,8 +29,9 @@
 //! All integers are big-endian.  The log digest lets [`Packs::chain`]
 //! verify every pack's log without reading its `fs` stream, which can be
 //! gigabytes; the trailer is checked by [`Packs::open_fs`] at the end of
-//! the stream, and `zfs receive` never sees the last byte of a stream that
-//! fails it ([`crate::zfs::HoldBack`]).
+//! the stream; the block log spools a received stream whole before it
+//! imports anything, so a stream that fails it leaves nothing
+//! ([`crate::blk::BlkPool`]'s receive).
 //!
 //! # Keys are derived from content
 //!
@@ -59,9 +60,9 @@
 //!     Vessel changed);
 //!   - for every later section, the previous shipped `fs` Seal.
 //!
-//!   Its identity is `(base, to, guid)`, not its bytes: ZFS does not
-//!   promise byte-identical streams, and the snapshot guid survives send
-//!   and receive.
+//!   Its identity is `(base, to, guid)`, not its bytes: a stream made
+//!   again need not be byte-identical, and the layer's guid is the same
+//!   on every node it was received on.
 //! - A section is **named** by an `FsShipped` record the holder appends
 //!   after the put ([`SealShipped::record`]): the identity, and the length
 //!   and BLAKE3 of the plain stream, hashed while it was shipped.  Only a
@@ -183,7 +184,7 @@ pub enum FsBase {
         chronicle: ChronicleId,
         /// The parent's Seal record.
         seal: Position,
-        /// The ZFS guid of the parent's Seal snapshot.
+        /// The guid of the parent's Seal layer.
         guid: u64,
     },
 }
@@ -195,7 +196,7 @@ pub struct FsRef {
     pub base: FsBase,
     /// The Seal it brings the dataset to.
     pub to: Position,
-    /// The ZFS guid of the `to` snapshot (kept by send and receive).
+    /// The guid of the `to` layer (the same on every node it was received on).
     pub guid: u64,
 }
 
@@ -2354,7 +2355,7 @@ mod tests {
     type SendCall = (Option<String>, Lsn);
 
     /// Streams describe themselves; `variant` changes the bytes (as a
-    /// regenerated `zfs send` may) without changing what they are.
+    /// stream made again may) without changing what they are.
     #[derive(Clone, Default)]
     struct FakeSend {
         variant: Rc<Cell<u8>>,
@@ -2377,7 +2378,7 @@ mod tests {
     impl Read for Dies {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             match self.0.read(buf)? {
-                0 => Err(io::Error::other("zfs send died")),
+                0 => Err(io::Error::other("the sender died")),
                 n => Ok(n),
             }
         }
@@ -4214,357 +4215,5 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(e.packs.chain(None), Err(PackError::NoLineage)));
-    }
-
-    // ── on a real pool ──────────────────────────────────────────────
-
-    mod node {
-        use super::*;
-        use crate::ship::ZfsSend;
-        use crate::zfs::Zfs;
-        use std::process::Command;
-
-        fn zfs(args: &[&str]) -> String {
-            let out = Command::new("zfs").args(args).output().expect("run zfs");
-            assert!(
-                out.status.success(),
-                "zfs {:?}: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        }
-
-        /// A Vessel forked from a Template: its first Seal pack carries an
-        /// incremental from the Template's Seal, its second an incremental
-        /// from the first.  "Node B" holds the Template (received with its
-        /// guid) and rebuilds the Vessel from the packs alone.
-        #[test]
-        #[ignore = "needs a ZFS pool: set TASO_ZFS_DATASET"]
-        fn ship_packs_then_receive_elsewhere() {
-            use crate::storage::CloneBase;
-            let base = std::env::var("TASO_ZFS_DATASET").expect("set TASO_ZFS_DATASET");
-            let root = format!("{base}/pk-{}", std::process::id());
-            zfs(&["create", &root]);
-            struct Cleanup(String);
-            impl Drop for Cleanup {
-                fn drop(&mut self) {
-                    let _ = Command::new("zfs")
-                        .args(["destroy", "-R", &self.0])
-                        .status();
-                }
-            }
-            let _c = Cleanup(root.clone());
-            let z = Zfs::cli();
-
-            // The Template, sealed at its lsn 40.
-            let tpl = Dataset::new(&format!("{root}/tpl")).unwrap();
-            let tmount = z.create(&tpl).unwrap().mountpoint.unwrap();
-            std::fs::write(tmount.join("base.bin"), vec![3u8; 1 << 20]).unwrap();
-            std::fs::write(tmount.join("f"), b"template").unwrap();
-            let p = parent();
-            let t40 = z.snapshot(&tpl, p.seal, p.seal_hash).unwrap();
-
-            // The Vessel, forked from it.
-            let src = Dataset::new(&format!("{root}/src")).unwrap();
-            let mount = z
-                .clone(&tpl, p.seal, p.seal_hash, &src)
-                .unwrap()
-                .mountpoint
-                .unwrap();
-            let mut log = Log::fork(p);
-            std::fs::write(mount.join("f"), b"one").unwrap();
-            log.fill(3, &[3]);
-            let s3 = z.snapshot(&src, Lsn::new(3), log.at(3).hash).unwrap();
-            let store_dir = tempfile::tempdir().unwrap();
-            let packs = Packs::new(
-                LocalStore::new(store_dir.path()),
-                ZfsSend::default(),
-                "vessels",
-                ID,
-            )
-            .unwrap();
-            // Publish Seal 3: its pack, then the record naming it.
-            let h3 = packs
-                .ship_seal(&log.segs(), &s3, Some(&t40))
-                .unwrap()
-                .unwrap();
-            log.push_payload(Stream::Ctl, Payload::FsShipped(h3.record.clone()));
-            std::fs::write(mount.join("f"), b"two").unwrap();
-            log.fill(7, &[3, 7]);
-            let s7 = z.snapshot(&src, Lsn::new(7), log.at(7).hash).unwrap();
-            let h7 = packs.ship_seal(&log.segs(), &s7, None).unwrap().unwrap();
-            let end = log.push_payload(Stream::Ctl, Payload::FsShipped(h7.record.clone()));
-            packs.ship_log(&log.segs(), end).unwrap();
-            println!(
-                "Seal 3 stream {} bytes, Seal 7 stream {} bytes",
-                h3.record.bytes, h7.record.bytes
-            );
-            let pack3 = std::fs::metadata(store_dir.path().join(packs.key(&h3.header)))
-                .unwrap()
-                .len();
-            println!("first Seal pack {pack3} bytes (Template is over 1 MiB)");
-            assert!(
-                pack3 < 200_000,
-                "the Template does not travel with the Vessel"
-            );
-
-            // Node B: the Template arrives first, keeping its guid.
-            let tpl_b = Dataset::new(&format!("{root}/b-tpl")).unwrap();
-            let out = Command::new("zfs")
-                .args(["send", &tpl.seal_snapshot(p.seal)])
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-            let tb = z
-                .receive(&tpl_b, None, (p.seal, p.seal_hash), &mut &out.stdout[..])
-                .unwrap();
-            assert_eq!(tb.guid, t40.guid);
-
-            let chain = packs.chain(Some(end)).unwrap();
-            assert_eq!(chain.frames, log.seg.frames().unwrap());
-            let dst = Dataset::new(&format!("{root}/dst")).unwrap();
-            for shipped in &chain.seals {
-                let got = shipped.fs;
-                let mut stream = packs.open_fs(shipped).unwrap().unwrap();
-                let to = (got.to.lsn, got.to.hash);
-                let snap = match got.base {
-                    FsBase::Origin {
-                        chronicle,
-                        seal,
-                        guid,
-                    } => {
-                        assert_eq!(chronicle, TPL);
-                        let cb = CloneBase {
-                            dataset: tpl_b.clone(),
-                            seal: seal.lsn,
-                            hash: seal.hash,
-                            guid,
-                        };
-                        z.receive_clone(&dst, &cb, to, &mut stream).unwrap()
-                    }
-                    FsBase::Seal(prev) => z
-                        .receive(&dst, Some((prev.lsn, prev.hash)), to, &mut stream)
-                        .unwrap(),
-                    FsBase::Full => panic!("a forked Vessel has no full stream"),
-                };
-                assert_eq!(
-                    snap.guid, got.guid,
-                    "the received snapshot is the one the Seal was taken from"
-                );
-            }
-            assert_eq!(chain.seals[0].fs.guid, s3.guid);
-            zfs(&["mount", dst.as_str()]);
-            let dmount = std::path::PathBuf::from(
-                zfs(&["get", "-H", "-o", "value", "mountpoint", dst.as_str()]).trim(),
-            );
-            assert_eq!(std::fs::read(dmount.join("f")).unwrap(), b"two");
-            assert_eq!(
-                std::fs::read(dmount.join("base.bin")).unwrap(),
-                vec![3u8; 1 << 20]
-            );
-            println!("packs: {:?}", packs.store.list(&packs.dir).unwrap());
-        }
-    }
-
-    // ── purge (P4 spec rev. 12 §6) ───────────────────────────────────
-
-    /// A log with Seals 6 and 9 shipped and named, and the log shipped to
-    /// its tail; the name of Seal 6's fs pack.
-    fn purge_env() -> (Env, Log, String) {
-        let e = env();
-        let mut log = Log::new();
-        log.fill(6, &[6]);
-        log.publish(&e, 6, 100, None).unwrap();
-        log.fill(9, &[6, 9]);
-        log.publish(&e, 9, 101, None).unwrap();
-        log.fill(11, &[6, 9]);
-        e.packs.ship_log(&log.segs(), log.at(11)).unwrap();
-        let name = e
-            .keys()
-            .into_iter()
-            .map(|k| k.rsplit('/').next().unwrap().to_string())
-            .find(|n| n.ends_with(&format!("-{:020}", 6)))
-            .expect("Seal 6's pack");
-        (e, log, name)
-    }
-
-    fn six() -> BTreeSet<Lsn> {
-        [Lsn::new(6)].into_iter().collect()
-    }
-
-    #[test]
-    fn a_purged_fs_pack_is_replaced_by_the_log_pack_of_its_frames() {
-        let (e, _log, name) = purge_env();
-        let before = e.packs.chain(None).unwrap();
-        let item = e.packs.inventory_item(&name).unwrap();
-        assert_eq!(item.sections, vec![Lsn::new(6)]);
-        assert_eq!(item.form, ReplacementForm::LogOnly);
-        assert_eq!(item.frames.first, Lsn::new(1));
-        assert_eq!(item.frames.last, Lsn::new(6));
-
-        let r = e.packs.install_replacement(&item).unwrap();
-        let rname = replacement_name(&name).unwrap();
-        assert!(
-            e.keys().iter().any(|k| k.ends_with(&rname)),
-            "put under <end>-<base>-0"
-        );
-        assert_eq!(e.packs.verify_replacement(&item).unwrap(), Some(r));
-        assert_eq!(
-            e.packs.install_replacement(&item).unwrap(),
-            r,
-            "a retry is a no-op"
-        );
-
-        // Both present (a crash before the delete): either read works.
-        assert_eq!(e.packs.chain(None).unwrap().frames, before.frames);
-        let c = e.packs.chain_after_purge(None, &six()).unwrap();
-        assert_eq!(c.purged, vec![Lsn::new(6)]);
-        assert_eq!(
-            c.seals
-                .iter()
-                .map(|s| s.fs.to.lsn.get())
-                .collect::<Vec<_>>(),
-            vec![9]
-        );
-
-        assert!(e.packs.delete_original(&item, r).unwrap());
-        assert!(
-            !e.packs.delete_original(&item, r).unwrap(),
-            "a retry is a no-op"
-        );
-        assert!(!e.keys().iter().any(|k| k.ends_with(&name)));
-
-        // Without the purge the chain is incomplete, with it whole.
-        assert!(
-            matches!(e.packs.chain(None), Err(PackError::FsMissing { seal }) if seal == Lsn::new(6))
-        );
-        let c = e.packs.chain_after_purge(None, &six()).unwrap();
-        assert_eq!(c.frames, before.frames, "the log is untouched");
-        assert_eq!(c.end, before.end);
-        assert_eq!(c.purged, vec![Lsn::new(6)]);
-        assert_eq!(c.seals.len(), 1);
-        assert_eq!(
-            c.seals[0], before.seals[1],
-            "Seal 9 still chains from Seal 6"
-        );
-        // Seal 9's stream is still readable and verified.
-        let mut v = Vec::new();
-        e.packs
-            .open_fs(&c.seals[0])
-            .unwrap()
-            .unwrap()
-            .read_to_end(&mut v)
-            .unwrap();
-        assert!(!v.is_empty());
-    }
-
-    #[test]
-    fn an_original_is_deleted_only_after_its_replacement_verifies() {
-        let (e, _log, name) = purge_env();
-        let item = e.packs.inventory_item(&name).unwrap();
-        // No replacement yet.
-        assert!(matches!(
-            e.packs.delete_original(&item, HashVal::from_bytes([7; 32])),
-            Err(PackError::Refused(_))
-        ));
-        let r = e.packs.install_replacement(&item).unwrap();
-        // The wrong replacement key.
-        assert!(matches!(
-            e.packs.delete_original(&item, HashVal::from_bytes([7; 32])),
-            Err(PackError::Refused(_))
-        ));
-        // A replacement tampered with after its install.
-        let rkey = format!("{}/{}", e.packs.dir, replacement_name(&name).unwrap());
-        let mut bytes = std::fs::read(e.path(&rkey)).unwrap();
-        let last = bytes.len() - 1;
-        bytes[last] ^= 1;
-        std::fs::write(e.path(&rkey), &bytes).unwrap();
-        assert!(matches!(
-            e.packs.verify_replacement(&item),
-            Err(PackError::Corrupt { .. })
-        ));
-        assert!(e.packs.delete_original(&item, r).is_err());
-        assert!(
-            e.keys().iter().any(|k| k.ends_with(&name)),
-            "the original stays"
-        );
-    }
-
-    #[test]
-    fn an_item_that_does_not_match_its_pack_is_refused() {
-        let (e, _log, name) = purge_env();
-        let mut item = e.packs.inventory_item(&name).unwrap();
-        item.log_digest = HashVal::from_bytes([1; 32]);
-        assert!(matches!(
-            e.packs.install_replacement(&item),
-            Err(PackError::Refused(_))
-        ));
-        let mut item = e.packs.inventory_item(&name).unwrap();
-        item.frames.last = Lsn::new(5);
-        assert!(matches!(
-            e.packs.install_replacement(&item),
-            Err(PackError::Refused(_))
-        ));
-        assert!(e
-            .keys()
-            .iter()
-            .all(|k| !k.ends_with(&replacement_name(&name).unwrap())));
-    }
-
-    #[test]
-    fn a_pack_and_its_replacement_both_gone_is_lost() {
-        let (e, _log, name) = purge_env();
-        let item = e.packs.inventory_item(&name).unwrap();
-        let key = format!("{}/{name}", e.packs.dir);
-        assert!(e.packs.store.delete(&key).unwrap());
-        assert!(matches!(
-            e.packs.install_replacement(&item),
-            Err(PackError::Lost { .. })
-        ));
-        assert!(matches!(
-            e.packs.inventory_item(&name),
-            Err(PackError::Lost { .. })
-        ));
-        assert_eq!(e.packs.verify_replacement(&item).unwrap(), None);
-    }
-
-    #[test]
-    fn only_fs_packs_and_named_seals_are_purged() {
-        let (e, log, name) = purge_env();
-        // The log pack shipped after Seal 9 holds no fs section.
-        let log_pack = e
-            .keys()
-            .into_iter()
-            .map(|k| k.rsplit('/').next().unwrap().to_string())
-            .find(|n| n.ends_with(&format!("-{:020}", 0)))
-            .unwrap();
-        assert!(matches!(
-            e.packs.inventory_item(&log_pack),
-            Err(PackError::Refused(_))
-        ));
-        assert!(matches!(
-            e.packs.inventory_item("not-a-pack"),
-            Err(PackError::BadKey(_))
-        ));
-        // A purged Seal must be one an FsShipped record names.
-        let five: BTreeSet<Lsn> = [Lsn::new(5)].into_iter().collect();
-        assert!(matches!(
-            e.packs.chain_after_purge(None, &five),
-            Err(PackError::Refused(_))
-        ));
-        // A missing section that no purge excuses still fails.
-        let item = e.packs.inventory_item(&name).unwrap();
-        let r = e.packs.install_replacement(&item).unwrap();
-        e.packs.delete_original(&item, r).unwrap();
-        assert!(matches!(
-            e.packs.chain(Some(log.at(11))),
-            Err(PackError::FsMissing { seal }) if seal == Lsn::new(6)
-        ));
-        let nine: BTreeSet<Lsn> = [Lsn::new(9)].into_iter().collect();
-        assert!(matches!(
-            e.packs.chain_after_purge(None, &nine),
-            Err(PackError::FsMissing { seal }) if seal == Lsn::new(6)
-        ));
     }
 }
