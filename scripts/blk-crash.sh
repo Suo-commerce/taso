@@ -134,7 +134,7 @@ fi
 mkdir -p "$MNT"
 ! mountpoint -q "$MNT" || die "$MNT is already a mount point"
 mkdir -p "$DIR"
-rm -f "$LOG" "$ERR" "$MAN" "$HELPER"
+rm -f "$LOG" "$LOG.lock" "$ERR" "$MAN" "$HELPER"
 
 cat >"$HELPER" <<'PY'
 """crash helper: `write MNT MANIFEST ROUND` or `verify MNT MANIFEST`."""
