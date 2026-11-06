@@ -2587,6 +2587,7 @@ pub(crate) mod tests {
         let contract = Payload::Contract(Box::new(
             taso_core::contract::ContractRecord::ReclaimClaimed {
                 object_key: HashVal::GENESIS,
+                n: 0,
             },
         ));
         assert!(matches!(
