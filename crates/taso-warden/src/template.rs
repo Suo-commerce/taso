@@ -740,48 +740,15 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
 
     // ── The Warden Chronicle ────────────────────────────────────────
 
-    fn open_warden(&self, notes: &mut Vec<String>) -> Result<Warden<'_, P, X>, TemplateError> {
-        let id = warden_chronicle(self.warden);
-        match self
-            .coord
-            .claim_chronicle(id, self.warden, ClaimAuthority::Vessel)
-        {
-            Ok(_) => {}
-            Err(CoordError::AlreadyRegistered(_))
-            | Err(CoordError::Claim(ClaimError::AlreadyClaimed { .. })) => {
-                let own = self.coord.ownership(id)?;
-                if own.holder != self.warden {
-                    return Err(TemplateError::WardenHeldElsewhere { holder: own.holder });
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let packs = Packs::new(self.store.clone(), NoSend, &self.prefix, id)
-            .map_err(TemplateError::Store)?;
-        let dir = self.state_dir.join("warden").join(hex(id.as_bytes()));
-        if !dir.exists() {
-            let anchor = self.coord.shipped(id)?;
-            let frames = if anchor.lsn > Lsn::new(0) {
-                packs.chain(Some(anchor))?.frames
-            } else {
-                Vec::new()
-            };
-            if let Some(p) = dir.parent() {
-                std::fs::create_dir_all(p).map_err(TemplateError::Store)?;
-            }
-            restore_log(&dir, id, &frames)?;
-            if !frames.is_empty() {
-                notes.push("rebuilt this Warden's Chronicle from its packs".into());
-            }
-        }
-        let (chronicle, _) =
-            Chronicle::open_after_gap(&dir, self.coord.clone(), id, self.warden, NoLayers)?;
-        Ok(Warden {
-            t: self,
-            chronicle,
-            packs,
-            attempt: 0,
-        })
+    fn open_warden(&self, notes: &mut Vec<String>) -> Result<WardenLog, TemplateError> {
+        WardenLog::open(
+            &self.coord,
+            self.warden,
+            &self.store,
+            &self.prefix,
+            &self.state_dir,
+            notes,
+        )
     }
 }
 
@@ -899,35 +866,106 @@ impl Read for Verifying {
 
 // ── Submitting from the Warden Chronicle ────────────────────────────
 
-struct Warden<'a, P: Pool, X: Sender> {
-    t: &'a TemplateLayers<P, X>,
+/// A Warden's own Chronicle (D55), open for its records: a layer's
+/// `LayerShipped`, the reclaimer's `ReclaimClaimed` and `ReclaimComplete`.
+/// Records-only ([`NoLayers`]).  Its directory is locked while it is open:
+/// a second open on the node waits briefly, then is refused `Locked`, and
+/// its caller tries again later.
+pub(crate) struct WardenLog {
+    coord: Arc<dyn Coord>,
+    warden: WardenId,
     chronicle: Chronicle<NoLayers>,
     packs: Packs<SharedStore, NoSend>,
     attempt: u64,
 }
 
-impl<P: Pool, X: Sender> Warden<'_, P, X> {
-    /// A record with this logical id already in the local log.
-    fn prepared(&self, logical: HashVal) -> Result<Option<ContractRecord>, TemplateError> {
+impl WardenLog {
+    /// Claim (or find held here) and open this Warden's Chronicle under
+    /// `state_dir`, rebuilding its local log from its packs if this node
+    /// has none.  Held by another Warden: refused (two nodes, one id).
+    pub(crate) fn open(
+        coord: &Arc<dyn Coord>,
+        warden: WardenId,
+        store: &SharedStore,
+        prefix: &str,
+        state_dir: &Path,
+        notes: &mut Vec<String>,
+    ) -> Result<Self, TemplateError> {
+        let id = warden_chronicle(warden);
+        match coord.claim_chronicle(id, warden, ClaimAuthority::Vessel) {
+            Ok(_) => {}
+            Err(CoordError::AlreadyRegistered(_))
+            | Err(CoordError::Claim(ClaimError::AlreadyClaimed { .. })) => {
+                let own = coord.ownership(id)?;
+                if own.holder != warden {
+                    return Err(TemplateError::WardenHeldElsewhere { holder: own.holder });
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let packs = Packs::new(store.clone(), NoSend, prefix, id).map_err(TemplateError::Store)?;
+        let dir = state_dir.join("warden").join(hex(id.as_bytes()));
+        if !dir.exists() {
+            let anchor = coord.shipped(id)?;
+            let frames = if anchor.lsn > Lsn::new(0) {
+                packs.chain(Some(anchor))?.frames
+            } else {
+                Vec::new()
+            };
+            if let Some(p) = dir.parent() {
+                std::fs::create_dir_all(p).map_err(TemplateError::Store)?;
+            }
+            restore_log(&dir, id, &frames)?;
+            if !frames.is_empty() {
+                notes.push("rebuilt this Warden's Chronicle from its packs".into());
+            }
+        }
+        let (chronicle, _) = Chronicle::open_after_gap(&dir, coord.clone(), id, warden, NoLayers)?;
+        Ok(Self {
+            coord: coord.clone(),
+            warden,
+            chronicle,
+            packs,
+            attempt: 0,
+        })
+    }
+
+    /// Every contract record in the local log, in log order (accepted or
+    /// not).
+    pub(crate) fn records(&self) -> Result<Vec<ContractRecord>, TemplateError> {
+        let mut out = Vec::new();
         for f in self.chronicle.frames().map_err(ChronicleError::from)? {
             if f.envelope.stream != Stream::Ctl {
                 continue;
             }
             if let Ok(Payload::Contract(r)) = Payload::decode(&f.payload) {
-                if r.logical_id() == logical {
-                    return Ok(Some(*r));
-                }
+                out.push(*r);
             }
         }
-        Ok(None)
+        Ok(out)
     }
 
-    fn accepted(&self, logical: HashVal) -> Result<Option<ContractRecord>, TemplateError> {
-        Ok(match self.t.coord.query_logical(logical)? {
+    /// A record with this logical id already in the local log.
+    pub(crate) fn prepared(
+        &self,
+        logical: HashVal,
+    ) -> Result<Option<ContractRecord>, TemplateError> {
+        Ok(self
+            .records()?
+            .into_iter()
+            .find(|r| r.logical_id() == logical))
+    }
+
+    /// The record accepted for `logical`, if any.
+    pub(crate) fn accepted(
+        &self,
+        logical: HashVal,
+    ) -> Result<Option<ContractRecord>, TemplateError> {
+        Ok(match self.coord.query_logical(logical)? {
             Some((_, Submitted::Contract(r))) => Some(r),
             Some(_) => {
                 return Err(TemplateError::Inconsistent(
-                    "a Birth under a layer id".into(),
+                    "a Birth under a contract record's logical id".into(),
                 ))
             }
             None => None,
@@ -937,7 +975,7 @@ impl<P: Pool, X: Sender> Warden<'_, P, X> {
     /// Submit `rec` (logical lookup, append once, then the Warden's one
     /// submit path, [`crate::submit`], D89): the record accepted for its
     /// logical id, this one or another.
-    fn submit(&mut self, rec: ContractRecord) -> Result<ContractRecord, TemplateError> {
+    pub(crate) fn submit(&mut self, rec: ContractRecord) -> Result<ContractRecord, TemplateError> {
         let logical = rec.logical_id();
         if let Some(r) = self.accepted(logical)? {
             return Ok(r);
@@ -946,7 +984,7 @@ impl<P: Pool, X: Sender> Warden<'_, P, X> {
             Some(p) if p == rec => p,
             Some(p) => {
                 return Err(TemplateError::Inconsistent(format!(
-                    "the Warden Chronicle already holds another {p:?} for this layer"
+                    "the Warden Chronicle already holds another {p:?} for this logical id"
                 )))
             }
             None => {
@@ -956,11 +994,11 @@ impl<P: Pool, X: Sender> Warden<'_, P, X> {
             }
         };
         let rec = Submitted::Contract(rec);
-        let coord = self.t.coord.as_ref();
-        let pack = submit::put(coord, self.t.warden, &self.chronicle, &self.packs, &rec)?;
+        let coord = self.coord.as_ref();
+        let pack = submit::put(coord, self.warden, &self.chronicle, &self.packs, &rec)?;
         match submit::accept(
             coord,
-            self.t.warden,
+            self.warden,
             &self.chronicle,
             rec,
             pack,
@@ -968,7 +1006,7 @@ impl<P: Pool, X: Sender> Warden<'_, P, X> {
         )? {
             Submitted::Contract(r) => Ok(r),
             _ => Err(TemplateError::Inconsistent(
-                "a Birth under a layer id".into(),
+                "a Birth under a contract record's logical id".into(),
             )),
         }
     }
