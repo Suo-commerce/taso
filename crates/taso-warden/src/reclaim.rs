@@ -88,8 +88,9 @@ pub struct Pass {
 impl Reclaimer {
     /// One pass at `now`: this Warden's open claims finished, then every
     /// content object older than the grace period claimed, deleted and
-    /// resolved.  `Err` only if the Warden's Chronicle cannot be opened or
-    /// the store cannot be listed: nothing is guessed.
+    /// resolved.  `Err` only if the coordinator cannot be asked, the
+    /// Warden's Chronicle cannot be opened or the store cannot be listed:
+    /// nothing is guessed.
     pub fn pass(&self, now: SystemTime) -> Result<Pass, String> {
         let mut pass = Pass::default();
         // The Warden's Chronicle is opened only when there is something to
@@ -97,8 +98,18 @@ impl Reclaimer {
         let mut log: Option<WardenLog> = None;
 
         // 1. This Warden's own claims left open (a crash, a failed delete),
-        //    if it ever claimed anything here.
-        if self.warden_dir().exists() {
+        //    if it ever claimed anything: its local log is here, or the
+        //    coordinator knows its Chronicle (this node's state lost: the
+        //    open rebuilds the log from its packs, which hold every
+        //    accepted claim, shipped before it was accepted).  A claim
+        //    whose object is already deleted is no longer listed, so step
+        //    2 cannot find it (audit 2026-11-06, finding 5).
+        let known = self
+            .coord
+            .query_chronicle(crate::template::warden_chronicle(self.warden))
+            .map_err(|e| format!("the coordinator: {e}"))?
+            .is_some();
+        if self.warden_dir().exists() || known {
             let l = self.open_log(&mut log)?;
             let mut mine: Vec<(HashVal, u64)> = Vec::new();
             for r in l.records().map_err(|e| e.to_string())? {
@@ -625,5 +636,32 @@ mod tests {
         ] {
             assert_eq!(key_of(dir, &bad), None, "{bad}");
         }
+    }
+
+    /// Audit 2026-11-06, finding 5: a claim accepted and its object
+    /// deleted, then this node's state lost (the Warden's local log with
+    /// it).  The object is no longer listed, so only the coordinator still
+    /// knows the claim is open; the pass rebuilds the Warden's log from
+    /// its packs (every accepted record was shipped before it was
+    /// accepted) and resolves it.
+    #[test]
+    fn an_open_claim_is_resolved_after_the_warden_state_is_lost() {
+        let e = env();
+        let k = e.put(b"lost node", HOUR);
+        let r = e.reclaimer();
+        let mut notes = Vec::new();
+        let mut log =
+            WardenLog::open(&e.coord, r.warden, &r.store, PREFIX, &r.state_dir, &mut notes)
+                .unwrap();
+        log.submit(ContractRecord::ReclaimClaimed { object_key: k, n: 0 })
+            .unwrap();
+        drop(log);
+        assert!(r.delete(k).unwrap(), "a crash after the delete");
+        std::fs::remove_dir_all(&r.state_dir).unwrap();
+        let p = r.pass(SystemTime::now()).unwrap();
+        assert!(p.failed.is_empty(), "{p:?}");
+        // Deleted before the loss, so gone when the pass looks.
+        assert_eq!(p.reclaimed, vec![(k, ReclaimOutcome::Absent)], "{p:?}");
+        assert!(e.done(k, 0), "the claim is resolved");
     }
 }
