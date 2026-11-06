@@ -804,6 +804,10 @@ mod tests {
             self.fail::<()>()?;
             self.inner.list(prefix)
         }
+        fn list_times(&self, prefix: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+            self.fail::<()>()?;
+            self.inner.list_times(prefix)
+        }
     }
 
     /// Review fix 5a: a timeout and a permission failure are each

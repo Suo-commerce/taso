@@ -2436,6 +2436,10 @@ mod tests {
             self.lists.fetch_add(1, Ordering::Relaxed);
             self.inner.list(prefix)
         }
+        fn list_times(&self, prefix: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+            self.lists.fetch_add(1, Ordering::Relaxed);
+            self.inner.list_times(prefix)
+        }
         fn delete(&self, key: &str) -> io::Result<bool> {
             self.inner.delete(key)
         }
