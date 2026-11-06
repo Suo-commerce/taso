@@ -163,8 +163,7 @@ use crate::vessel::{
     Ensured, Host, Pool, ReadLog, SealAt, TemplateBirth, Vessel, VesselError, BIRTH_TURN,
 };
 use taso_core::contract::{
-    ContractRecord, LogicalKey, NominatedBy, PathClass, Peer, StorageKind, TemplateRef,
-    VerdictRequest,
+    ContractRecord, LogicalKey, NominatedBy, PathClass, Peer, TemplateRef, VerdictRequest,
 };
 use taso_core::coordlog::Submitted;
 use taso_core::decider::{PendingItem, RetryReason, VerdictAnswer};
@@ -2955,9 +2954,71 @@ pub const BIRTH_FAILPOINTS: [&str; 7] = [
     "birth.before_accept",
 ];
 
+/// The file in the Warden's `state_dir` that says which format its local
+/// state is in (review G-a).
+pub const STATE_GENERATION_FILE: &str = "taso-generation";
+
+/// The local state's format generation: 2 since V4b's format break (the
+/// Vessels' local logs and the Warden Chronicle hold the records that
+/// break changed).  Read as written, `"2\n"`.
+pub const STATE_GENERATION: u32 = 2;
+
+/// Check `dir`'s generation before anything reads it (review G-a).  A
+/// directory with this generation's file passes; an empty (or missing)
+/// one gets the file, written durably; one holding anything else and no
+/// file, or another generation, is refused: old local logs would be
+/// misread (their old records skipped as undecodable), so a Warden of
+/// this version starts on an empty state directory.  `lost+found` (a
+/// directory that is a filesystem's root) is not state.
+pub fn check_state_generation(dir: &Path) -> io::Result<()> {
+    use std::io::Write;
+    let want = format!("{STATE_GENERATION}\n");
+    std::fs::create_dir_all(dir)?;
+    let mark = dir.join(STATE_GENERATION_FILE);
+    match std::fs::read_to_string(&mark) {
+        Ok(got) if got == want => return Ok(()),
+        Ok(got) => {
+            return Err(io::Error::other(format!(
+                "{} says generation {:?}, this Warden's is {STATE_GENERATION}: \
+                 its local state is another format, which is refused, not converted",
+                mark.display(),
+                got.trim()
+            )))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut held: Vec<String> = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let name = e?.file_name().to_string_lossy().into_owned();
+        if name != "lost+found" {
+            held.push(name);
+        }
+    }
+    if !held.is_empty() {
+        held.sort();
+        return Err(io::Error::other(format!(
+            "{} holds local state ({} entries, {:?} first) and no {STATE_GENERATION_FILE}: \
+             it is from before the format break of V4b and is refused, not converted; \
+             a Warden of this version starts on an empty state directory",
+            dir.display(),
+            held.len(),
+            held[0]
+        )));
+    }
+    let tmp = dir.join(format!("{STATE_GENERATION_FILE}.tmp"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(want.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, &mark)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
 impl Node {
     /// A node: refuses a host with SELinux ([`refuse_selinux`]), claims
-    /// the run directory, sweeps containers a dead
+    /// the run directory, checks the state directory's generation
+    /// ([`check_state_generation`]), sweeps containers a dead
     /// incarnation left in its runc root (see "Starting" in the module
     /// docs), then opens the store.  Each error says which step failed.
     pub fn new(config: Config, coord: Arc<dyn Coord>, storage: Storage) -> std::io::Result<Self> {
@@ -2966,6 +3027,9 @@ impl Node {
         };
         refuse_selinux(Path::new("/sys")).map_err(ctx("checking the host"))?;
         let run_lock = claim_run_dir(&config.run_dir).map_err(ctx("claiming the run directory"))?;
+        // Before anything reads it: state from before the format break is
+        // refused, never misread (review G-a).
+        check_state_generation(&config.state_dir).map_err(ctx("the state directory"))?;
         let swept = sweep_stale(&Runc::new(RuncCli::new(config.run_dir.join("runc"))))
             .map_err(ctx("sweeping stale containers"))?;
         for id in &swept.deleted {
@@ -2995,10 +3059,6 @@ impl Node {
             .map(|template_base| TemplateLayers {
                 pool: Clone::clone(&storage),
                 sender: storage.sender(),
-                storage: match config.storage {
-                    StorageConf::Zfs => StorageKind::Zfs,
-                    StorageConf::Blk { .. } => StorageKind::Blk,
-                },
                 store: store.clone(),
                 prefix: config.prefix.clone(),
                 coord: coord.clone(),
@@ -4842,6 +4902,40 @@ mod tests {
             refuse_selinux(&gone).is_err(),
             "no sysfs: cannot tell, refused"
         );
+    }
+
+    /// Review G-a: the state directory's generation.  Empty or missing:
+    /// marked.  Marked: passes, again and again.  Holding state and no
+    /// mark (a pre-break Warden's), or another generation: refused, and
+    /// nothing in it changes.  `lost+found` alone is not state.
+    #[test]
+    fn a_state_dir_from_before_the_break_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fresh = tmp.path().join("fresh/state");
+        check_state_generation(&fresh).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fresh.join(STATE_GENERATION_FILE)).unwrap(),
+            "2\n"
+        );
+        std::fs::create_dir(fresh.join("some-vessel")).unwrap();
+        check_state_generation(&fresh).unwrap();
+        // A pre-break Warden's state: refused by name, left as it was.
+        let old = tmp.path().join("old");
+        std::fs::create_dir_all(old.join("0a0a0a")).unwrap();
+        std::fs::write(old.join("ttl"), b"x").unwrap();
+        let e = check_state_generation(&old).unwrap_err().to_string();
+        assert!(e.contains("before the format break"), "{e}");
+        assert!(!old.join(STATE_GENERATION_FILE).exists(), "nothing written");
+        // Another generation.
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(STATE_GENERATION_FILE), "1\n").unwrap();
+        let e = check_state_generation(&other).unwrap_err().to_string();
+        assert!(e.contains("generation \"1\""), "{e}");
+        // A filesystem's root: lost+found is not state.
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("lost+found")).unwrap();
+        check_state_generation(&root).unwrap();
     }
 
     /// Review fix B-a: after an attempt ends Interrupted here, the next
