@@ -67,7 +67,7 @@ cleanup() {
     [[ -n "$TRACE_PID" ]] && kill "$TRACE_PID" 2>/dev/null
     mountpoint -q "$MNT" && { fsfreeze -u "$MNT" 2>/dev/null; umount "$MNT"; }
     if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then (blk quit) >/dev/null 2>&1 || kill "$DAEMON_PID"; wait "$DAEMON_PID" 2>/dev/null; fi
-    rm -f "$LOG" "$LOG.ckpt"; rmdir "$MNT" 2>/dev/null
+    rm -f "$LOG" "$LOG.ckpt" "$LOG.lock"; rmdir "$MNT" 2>/dev/null
     exit "$rc"
 }
 trap cleanup EXIT
@@ -80,7 +80,7 @@ modprobe ublk_drv; [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
 mkdir -p "$DIR" "$MNT" "$OUT"; ! mountpoint -q "$MNT" || die "$MNT is mounted"
 command -v cargo >/dev/null || PATH=/root/.cargo/bin:$PATH
 cargo build -q --release -p taso-blk
-rm -f "$LOG" "$ERR" "$LOG.ckpt"
+rm -f "$LOG" "$ERR" "$LOG.ckpt" "$LOG.lock"
 TASO_BLKD_OPLOG="$OUT/oplog.txt" "$BLKD" "$LOG" "$SOCK" --size-gib 8 --compact-pct 0 --queues "$QUEUES" --threads "$THREADS" 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
