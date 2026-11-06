@@ -712,6 +712,67 @@ type Journal<'t> = Table<'t, u64, &'static [u8]>;
 /// key = sequence number from 1, value = one [`Entry`].
 const JOURNAL: TableDefinition<u64, &[u8]> = TableDefinition::new("taso.coordinator.journal");
 
+/// The database's format generation, beside the journal (review fix
+/// N4a).
+const META: TableDefinition<&str, u32> = TableDefinition::new("taso.coordinator.meta");
+/// The one key of [`META`].
+const GENERATION_KEY: &str = "generation";
+/// The coordinator state's generation: 2 since V4b's format break (the
+/// records the journal holds changed shape).
+pub const GENERATION: u32 = 2;
+
+/// Whether a table exists and holds a row.
+fn holds<K: redb::Key + 'static, V: redb::Value + 'static>(
+    t: Result<redb::ReadOnlyTable<K, V>, redb::TableError>,
+) -> Result<bool, CoordError> {
+    match t {
+        Ok(t) => Ok(t.first().map_err(storage)?.is_some()),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
+        Err(e) => Err(storage(e)),
+    }
+}
+
+/// Check `db`'s generation before anything else reads or writes it
+/// (review fix N4a).  Marked with [`GENERATION`]: open.  No mark and no
+/// journal or Chronicle rows (a new database): marked, durably, and open.
+/// No mark but state (from before the break), or another generation:
+/// refused, with nothing written; it is not converted.
+fn check_generation(db: &Database) -> Result<(), CoordError> {
+    let refused = |why: &'static str| Err(CoordError::Journal(JournalError(why)));
+    {
+        let r = db.begin_read().map_err(storage)?;
+        match r.open_table(META) {
+            Ok(t) => match t.get(GENERATION_KEY).map_err(storage)? {
+                Some(g) if g.value() == GENERATION => return Ok(()),
+                Some(_) => {
+                    return refused(
+                        "this database is of another generation than this coordinator's (2): \
+                         refused, not converted",
+                    )
+                }
+                None => {}
+            },
+            Err(redb::TableError::TableDoesNotExist(_)) => {}
+            Err(e) => return Err(storage(e)),
+        }
+        let rows = holds(r.open_table(CHRONICLES))?;
+        let journal = holds(r.open_table(JOURNAL))?;
+        if rows || journal {
+            return refused(
+                "this database holds coordinator state from before V4b's format break \
+                 (no generation mark): refused, not converted",
+            );
+        }
+    }
+    let mut w = db.begin_write().map_err(storage)?;
+    w.set_durability(Durability::Immediate).map_err(storage)?;
+    {
+        let mut t = w.open_table(META).map_err(storage)?;
+        t.insert(GENERATION_KEY, GENERATION).map_err(storage)?;
+    }
+    w.commit().map_err(storage)
+}
+
 /// The tables one group transaction writes.
 struct Tables<'t> {
     rows: Rows<'t>,
@@ -748,11 +809,10 @@ struct Tables<'t> {
 /// request rebuilds it from the journal.
 ///
 /// The log's epoch of a Chronicle is the ownership epoch: registering
-/// claims it, every transfer fences it, in the same transaction.  A
-/// Chronicle registered before the log existed is brought in on first use
-/// ([`Op::Sync`]); if it already had records, it gets an obligation that
-/// never closes ([`crate::coordjournal::LEGACY_OBLIGATION`]), since its
-/// effects were never seen (fail closed).
+/// claims it, every transfer fences it, in the same transaction
+/// ([`Op::Sync`]).  A database of an older generation is refused at open
+/// ([`GENERATION`]), so every Chronicle a row names is the log's from its
+/// registration.
 pub struct Coordinator {
     db: Database,
     queue: Mutex<Queue>,
@@ -855,6 +915,7 @@ impl Coordinator {
     /// is replayed from its journal, and every journalled answer checked.
     pub fn open_with(path: impl AsRef<Path>, config: LogConfig) -> Result<Self, CoordError> {
         let db = Database::create(path).map_err(storage)?;
+        check_generation(&db)?;
         let coord = Self {
             db,
             queue: Mutex::default(),
@@ -1135,7 +1196,6 @@ fn sync(
     let op = Op::Sync {
         chronicle,
         epoch: state.epoch,
-        legacy: known.is_none() && state.head.lsn.get() > 0,
     };
     match journal(shared, t, op)? {
         Done::Sync(Ok(_)) => Ok(()),
@@ -1345,7 +1405,6 @@ impl Coord for Coordinator {
                 };
             }
             if !changes.is_empty() {
-                // `legacy` is judged on the head before this batch.
                 let before = load(&t.rows, chronicle)?.expect("loaded above");
                 sync(&shared, t, chronicle, &before)?;
                 for (op, open) in changes {
@@ -1702,8 +1761,8 @@ fn fenced(
     state: &mut State,
     holder: WardenId,
 ) -> Result<Epoch, CoordError> {
-    // The log first knows the Chronicle at its current epoch (legacy is
-    // judged on the head as it is), then follows it to the next.
+    // The log first knows the Chronicle at its current epoch, then follows
+    // it to the next.
     sync(shared, t, chronicle, state)?;
     state.sealed_prefix = state.head;
     state.epoch = state.epoch.next();
@@ -2827,13 +2886,11 @@ mod log_tests {
         genesis_id, submission_id, Consistency, ContractRecord, GenesisStarted, Peer,
         TRANSFORM_VERSION,
     };
-    use taso_core::coordlog::{Final, Transient};
+    use taso_core::coordlog::Final;
     use taso_core::envelope::BranchId;
     use taso_core::record::{
         Authority, Consequence, Dispatch, IntentRecord, OpId, OutcomeRecord, Record, RetryPolicy,
     };
-
-    use crate::coordjournal::LEGACY_OBLIGATION;
 
     const A: WardenId = WardenId::new(1);
     const B: WardenId = WardenId::new(2);
@@ -3310,54 +3367,72 @@ mod log_tests {
         assert!(coord.obligations(c).unwrap().is_empty());
     }
 
+    /// Review fix N4a: a new database is marked and opens again; one
+    /// holding state but no mark (from before the break) is refused with
+    /// nothing written; one of another generation is refused.
     #[test]
-    fn a_chronicle_older_than_the_log_gets_an_obligation_that_never_closes() {
+    fn a_database_from_before_the_break_is_refused_at_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.redb");
         let store = Arc::new(Fake::default());
         let coord = open(&path, store.clone());
         coord.register(chron(1), A).unwrap();
-        coord.register(chron(2), A).unwrap();
-        let (e, _) = next(&coord, chron(1), vec![(Stream::Fs, Payload::Raw(vec![1]))]);
-        coord.append(A, &e[0]).unwrap();
         drop(coord);
-        // As a database from before the log: no journal.
-        {
-            let db = Database::create(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            txn.delete_table(JOURNAL).unwrap();
-            txn.commit().unwrap();
-        }
-        let coord = open(&path, store);
-        // Brought in on first use; one with records is never sanctionable.
-        coord
-            .announce(A, chron(1), Epoch::FIRST, h(1), h(2), h(3))
-            .unwrap()
-            .unwrap();
-        coord
-            .announce(A, chron(2), Epoch::FIRST, h(1), h(2), h(3))
-            .unwrap()
-            .unwrap();
+        let generation = |path: &Path| -> Option<u32> {
+            let db = Database::create(path).unwrap();
+            let r = db.begin_read().unwrap();
+            let t = r.open_table(META).ok()?;
+            let g = t.get(GENERATION_KEY).unwrap().map(|g| g.value());
+            g
+        };
+        assert_eq!(generation(&path), Some(GENERATION), "marked when new");
+        let coord = open(&path, store.clone());
         assert_eq!(
-            coord.obligations(chron(1)).unwrap(),
-            vec![LEGACY_OBLIGATION]
+            coord.ownership(chron(1)).unwrap().holder,
+            A,
+            "and opens again"
         );
-        assert!(coord.obligations(chron(2)).unwrap().is_empty());
-        // An accept under a stale announce still answers by the rules.
-        assert_eq!(
-            coord
-                .accept(
-                    A,
-                    chron(2),
-                    Epoch::FIRST,
-                    h(1),
-                    Head::EMPTY,
-                    "p".into(),
-                    Submitted::Contract(ContractRecord::GenesisStarted(Box::new(genesis()))),
-                )
-                .unwrap(),
-            Answer::FinalRefused(Final::NotAnnounced)
-        );
-        let _ = Transient::NotReadable;
+        drop(coord);
+        // The same state without the mark: a pre-break database.
+        let set = |path: &Path, g: Option<u32>| {
+            let db = Database::create(path).unwrap();
+            let w = db.begin_write().unwrap();
+            match g {
+                None => {
+                    w.delete_table(META).unwrap();
+                }
+                Some(g) => {
+                    w.open_table(META)
+                        .unwrap()
+                        .insert(GENERATION_KEY, g)
+                        .unwrap();
+                }
+            }
+            w.commit().unwrap();
+        };
+        set(&path, None);
+        let e = Coordinator::open_with(
+            &path,
+            LogConfig {
+                store: store.clone(),
+                ..LogConfig::default()
+            },
+        )
+        .err()
+        .expect("refused");
+        assert!(e.to_string().contains("before V4b's format break"), "{e}");
+        assert_eq!(generation(&path), None, "nothing written");
+        // Another generation.
+        set(&path, Some(1));
+        let e = Coordinator::open_with(
+            &path,
+            LogConfig {
+                store,
+                ..LogConfig::default()
+            },
+        )
+        .err()
+        .expect("refused");
+        assert!(e.to_string().contains("another generation"), "{e}");
     }
 }
