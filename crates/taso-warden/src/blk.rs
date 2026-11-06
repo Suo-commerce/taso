@@ -1079,10 +1079,20 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         let mut d = conn(&self.maker, &self.blkd);
         match from {
             None => {
-                if d.find(dataset.as_str())?.is_some() {
-                    return Err(
-                        format!("dataset {dataset} exists; a full stream needs a new one").into(),
-                    );
+                if let Some(b) = d.find(dataset.as_str())? {
+                    // Left by a full receive interrupted after it made the
+                    // branch (audit 2026-11-06, finding 3): finished here.
+                    if !interrupted_receive(&mut *d, b, None)? {
+                        return Err(format!(
+                            "dataset {dataset} exists; a full stream needs a new one"
+                        )
+                        .into());
+                    }
+                    d.reset(b)?;
+                    return Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
+                        let _ = d.reset(b);
+                        let _ = d.flush();
+                    });
                 }
                 let root = d.root()?;
                 let b = d.branch(root, dataset.as_str())?;
@@ -1152,7 +1162,13 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
                         .into())
                     };
                 }
-                return Err(format!("dataset {dataset} exists without Seal {}", to.0.get()).into());
+                // Without any Seal: maybe an interrupted receive, checked
+                // against the base below.
+                if !d.seals(b)?.is_empty() {
+                    return Err(
+                        format!("dataset {dataset} exists without Seal {}", to.0.get()).into(),
+                    );
+                }
             }
         }
         if base.guid != guid(base.seal, base.hash) {
@@ -1180,12 +1196,54 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             )
             .into());
         }
+        // Left by a clone receive interrupted after it made the branch
+        // (audit 2026-11-06, finding 3): finished here, on that branch.
+        if let Some(b) = d.find(dataset.as_str())? {
+            if !interrupted_receive(&mut *d, b, Some(layer))? {
+                return Err(format!(
+                    "dataset {dataset} exists without Seal {}, not as a receive onto {} left it",
+                    to.0.get(),
+                    base.dataset.seal_snapshot(base.seal)
+                )
+                .into());
+            }
+            d.reset(b)?;
+            return Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
+                let _ = d.reset(b);
+                let _ = d.flush();
+            });
+        }
         let b = d.branch(layer, dataset.as_str())?;
         Self::import_and_seal(&mut *d, b, &file, to).inspect_err(|_| {
             let _ = d.drop_layer(b);
             let _ = d.flush();
         })
     }
+}
+
+/// Whether `branch` is exactly what a receive interrupted after making it
+/// leaves (audit 2026-11-06, finding 3): no Seal made from it, no device,
+/// standing on `base` (a clone's) or, for a full receive (`None`), on a
+/// root Seal.  Its blocks of its own are a part of the stream at most:
+/// nothing was promised of a branch without a Seal.  Anything else is
+/// not a receive's to touch.
+fn interrupted_receive<D: Blkd>(
+    d: &mut D,
+    branch: LayerId,
+    base: Option<LayerId>,
+) -> Result<bool, LayerError> {
+    if !d.seals(branch)?.is_empty() {
+        return Ok(false);
+    }
+    let info = d.info(branch)?;
+    if info.dev.is_some() {
+        return Ok(false);
+    }
+    Ok(match (base, info.parent) {
+        (Some(base), parent) => parent == Some(base),
+        (None, Some(parent)) => d.info(parent)?.parent.is_none(),
+        (None, None) => false,
+    })
 }
 
 // ── sending ─────────────────────────────────────────────────────────
@@ -2533,6 +2591,112 @@ mod tests {
             std::fs::read_dir(&na.spool).unwrap().next().is_none(),
             "the spool is left empty"
         );
+    }
+
+    /// Audit 2026-11-06, finding 3: a receive interrupted after it made
+    /// the target's branch (a Warden crash; taso-blkd lives on, or a flush
+    /// made the branch durable) leaves a branch without the Seal.  The
+    /// retry finishes it, full or clone, whether the branch holds nothing
+    /// yet or part of the stream (mid-import, or all of it before the
+    /// Seal).  It is taken as an interrupted receive only if it is exactly
+    /// that: no Seal at all, not attached, standing on a root Seal (full)
+    /// or on the stated base (clone).  Anything else is still refused.
+    #[test]
+    fn an_interrupted_receive_is_finished_by_its_retry() {
+        let src = pool();
+        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        src.create(&a).unwrap();
+        write0(&src, &a, 7);
+        src.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
+        Pool::clone(&src, &a, Lsn::new(2), h(2), &c).unwrap();
+        write0(&src, &c, 9);
+        src.layers(&c)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap()
+            .run()
+            .unwrap();
+        let full = sent(&src, &a, None, Lsn::new(2));
+        let inc = sent(&src, &c, Some(&a.seal_snapshot(Lsn::new(2))), Lsn::new(3));
+        let base = CloneBase {
+            dataset: a.clone(),
+            seal: Lsn::new(2),
+            hash: h(2),
+            guid: guid(Lsn::new(2), h(2)),
+        };
+        for partial in [false, true] {
+            let to = pool();
+            // What the full receive had made: a root Seal, the named
+            // branch on it, maybe some of the stream's blocks.
+            {
+                let mut d = to.blkd.lock().unwrap();
+                let root = d.root().unwrap();
+                let b = d.branch(root, a.as_str()).unwrap();
+                if partial {
+                    d.store.write(b, 0, &[0x55; 4096], false).unwrap();
+                }
+                d.flush().unwrap();
+            }
+            to.receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..])
+                .unwrap_or_else(|e| panic!("full, partial={partial}: {e}"));
+            assert_eq!(block0(&to, &a), 7);
+            // And the clone's, on the base it states.
+            {
+                let mut d = to.blkd.lock().unwrap();
+                let src_b = d.find(a.as_str()).unwrap().unwrap();
+                let (layer, _) = seal_at(&mut *d, src_b, Lsn::new(2)).unwrap().unwrap();
+                let b = d.branch(layer, c.as_str()).unwrap();
+                if partial {
+                    d.store.write(b, 0, &[0x55; 4096], false).unwrap();
+                }
+                d.flush().unwrap();
+            }
+            to.receive_clone(&c, &base, (Lsn::new(3), h(3)), &mut &inc[..])
+                .unwrap_or_else(|e| panic!("clone, partial={partial}: {e}"));
+            assert_eq!(block0(&to, &c), 9);
+            assert_eq!(
+                to.info(&c).unwrap().unwrap().origin_seal(),
+                Some((a.clone(), Lsn::new(2)))
+            );
+        }
+
+        // Not an interrupted receive: refused, and left as it was.
+        let to = pool();
+        // A dataset with a Seal of its own (another Vessel's, say).
+        to.create(&a).unwrap();
+        write0(&to, &a, 1);
+        to.layers(&a)
+            .snapshot(Lsn::new(1), h(1))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert!(to
+            .receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..])
+            .is_err());
+        assert_eq!(block0(&to, &a), 1);
+        // A clone target standing on another base than the one stated.
+        {
+            let mut d = to.blkd.lock().unwrap();
+            let root = d.root().unwrap();
+            d.branch(root, c.as_str()).unwrap();
+        }
+        assert!(to
+            .receive_clone(&c, &base, (Lsn::new(3), h(3)), &mut &inc[..])
+            .is_err());
+        // A full target attached (in use).
+        let to = pool();
+        {
+            let mut d = to.blkd.lock().unwrap();
+            let root = d.root().unwrap();
+            let b = d.branch(root, a.as_str()).unwrap();
+            d.attach(b).unwrap();
+        }
+        assert!(to
+            .receive(&a, None, (Lsn::new(2), h(2)), &mut &full[..])
+            .is_err());
     }
 
     #[test]
