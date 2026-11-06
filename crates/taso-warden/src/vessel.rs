@@ -456,7 +456,7 @@ pub struct Host<P: Pool> {
 pub struct TemplateBirth {
     /// The Template.
     pub template_id: ChronicleId,
-    /// Its settled layer of this node's storage kind (`LayerShipped`).
+    /// Its settled layer (`LayerShipped`).
     pub layer_key: HashVal,
     /// The `name@version` the config named it by, if any (a label).
     pub asked: Option<TemplateAsked>,
