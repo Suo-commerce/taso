@@ -80,7 +80,7 @@ use serde_json::json;
 use taso_warden::coordinator::{Coord, Coordinator, LogConfig};
 use taso_warden::coordsrv::RemoteCoord;
 use taso_warden::coordstore::CoordStore;
-use taso_warden::daemon::{Config, CoordConf, StorageConf};
+use taso_warden::daemon::{Config, CoordConf};
 use taso_warden::explain::{explain, Subject};
 
 const USAGE: &str = "usage: taso-ctl init [--data DIR] [--size-gib N] [--rootfs DIR] [--force]
@@ -403,7 +403,6 @@ fn init_config(a: &InitArgs, landlock: bool) -> String {
         "store": a.data.join("store"),
         "prefix": "vessels",
         "run_dir": PathBuf::from(RUN).join("run"),
-        "batched_snapshots": true,
         "runtime": runtime,
         "effects": "hold",
         "vessels": [],
@@ -509,10 +508,7 @@ fn status(config_path: Option<&str>) -> ExitCode {
             None => "not set".into(),
         }
     );
-    let StorageConf::Blk { socket, .. } = &config.storage else {
-        println!("storage: zfs (taso-ctl status reads the block log only)");
-        return ExitCode::SUCCESS;
-    };
+    let socket = &config.storage.socket;
     match taso_blk::client::Client::connect(socket).and_then(|mut c| c.stats()) {
         Ok(st) => {
             let get = |k: &str| st.get(k).cloned().unwrap_or_else(|| "?".into());
@@ -722,9 +718,7 @@ mod tests {
             assert!(c.vessels.is_empty());
             assert_eq!(c.runtime.rootfs, rootfs);
             assert_eq!(c.runtime.landlock_shim.is_some(), landlock);
-            assert!(
-                matches!(&c.storage, StorageConf::Blk { socket, .. } if socket == Path::new("/run/taso/blk.sock"))
-            );
+            assert_eq!(c.storage.socket, Path::new("/run/taso/blk.sock"));
             assert!(matches!(&c.coordinator, CoordConf::Local { .. }));
         }
     }
