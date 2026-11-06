@@ -502,9 +502,15 @@ mod tests {
             store.exists("loop/object").is_err(),
             "ELOOP is not an absent object"
         );
-        assert!(store.exists("a/dir").is_err(), "a directory is not an object");
+        assert!(
+            store.exists("a/dir").is_err(),
+            "a directory is not an object"
+        );
         assert!(store.exists("a/file").unwrap());
         assert!(!store.exists("a/none").unwrap());
-        assert!(!store.exists("b/none").unwrap(), "its directory missing too");
+        assert!(
+            !store.exists("b/none").unwrap(),
+            "its directory missing too"
+        );
     }
 }

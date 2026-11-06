@@ -36,7 +36,10 @@ fn audit_compaction_dup_failure_must_not_lose_later_writes() {
         Ok(_) => println!("compaction finished"),
         Err(e) => {
             println!("compaction error: {e}; poisoned: {}", store.is_poisoned());
-            assert!(store.is_poisoned(), "an error after the rename poisons the store");
+            assert!(
+                store.is_poisoned(),
+                "an error after the rename poisons the store"
+            );
             return;
         }
     }

@@ -650,11 +650,20 @@ mod tests {
         let k = e.put(b"lost node", HOUR);
         let r = e.reclaimer();
         let mut notes = Vec::new();
-        let mut log =
-            WardenLog::open(&e.coord, r.warden, &r.store, PREFIX, &r.state_dir, &mut notes)
-                .unwrap();
-        log.submit(ContractRecord::ReclaimClaimed { object_key: k, n: 0 })
-            .unwrap();
+        let mut log = WardenLog::open(
+            &e.coord,
+            r.warden,
+            &r.store,
+            PREFIX,
+            &r.state_dir,
+            &mut notes,
+        )
+        .unwrap();
+        log.submit(ContractRecord::ReclaimClaimed {
+            object_key: k,
+            n: 0,
+        })
+        .unwrap();
         drop(log);
         assert!(r.delete(k).unwrap(), "a crash after the delete");
         std::fs::remove_dir_all(&r.state_dir).unwrap();
