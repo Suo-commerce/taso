@@ -355,9 +355,17 @@ impl Compaction {
 
         taso_core::hold("compact.written");
 
-        // The switch.  After the rename the old file is gone from the
-        // directory, so the store must move to the new one whatever
-        // follows.
+        // Every descriptor the switch needs, made before the rename: after
+        // it the old file is gone from the directory, so the store must
+        // move to the new one whatever follows, and nothing between the
+        // rename and the switch may fail (audit 2026-11-06, finding 2: a
+        // failed `try_clone` here returned an error, left the store on the
+        // unlinked old log, not poisoned, and its next acknowledged writes
+        // were lost at the reopen).
+        let for_syncer = fresh.file.try_clone()?;
+        let old_dup = self.old.try_clone()?;
+
+        // The switch.
         std::fs::rename(&self.temp, &self.log)?;
         self.done = true;
         let before = store.tail;
@@ -365,7 +373,7 @@ impl Compaction {
         // The Syncer made from the old store follows it to the new log:
         // the shared handle points at the new file (the store is flushed,
         // nothing is waiting on the old one).
-        store.shared.set(fresh.file.try_clone()?);
+        store.shared.set(for_syncer);
         fresh.shared = std::sync::Arc::clone(&store.shared);
         fresh.stats = Stats {
             syncs: store.stats.syncs,
@@ -380,7 +388,7 @@ impl Compaction {
         // The log's lock stays with the store: the new one takes it, the
         // old one the temporary name's, released as it is dropped here.
         std::mem::swap(&mut store.lock, &mut old.lock);
-        let old_log = OldLog(vec![old.file, self.old.try_clone()?]);
+        let old_log = OldLog(vec![old.file, old_dup]);
         let _ = remove_if_there(&super::lock_path(&self.temp));
         // The rename is durable only once the directory is: a failed sync
         // here is the store's device failing, answered as a failed sync is
