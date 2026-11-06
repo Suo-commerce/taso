@@ -22,6 +22,13 @@
 # K3 stops early if MemAvailable drops below 1 GiB and reports how far it got.
 # BENCH_DAEMON_ARGS adds daemon flags, e.g. BENCH_DAEMON_ARGS="--io-kib 512"
 # (the results' first lines say which were used).
+# The daemon runs --durable-at flush (BLK_BENCH_DURABLE_AT overrides; a
+# --durable-at in BENCH_DAEMON_ARGS comes later and wins): the ext4 here
+# has a journal, and its baseline on a loop device keeps the flush
+# contract.  Under fua (taso-blkd's default since 2026-11-06, right for the
+# Warden's journal-less ext4 only) a journal's commit is answered before any
+# sync, so the fsync and freeze rows would measure a device that does not
+# keep the contract (spec rev. 38, D&D F (a); blk-crash.sh's K1, 2026-11-06).
 # The pass/kill lines are the ones in the spike plan (section 2).
 
 set -euo pipefail
@@ -29,6 +36,8 @@ set -euo pipefail
 QUICK=0
 if [[ "${1:-}" == "--quick" ]]; then QUICK=1; shift; fi
 BLKD=${1:-target/release/taso-blkd}
+DURABLE_AT=${BLK_BENCH_DURABLE_AT:-flush}
+case "$DURABLE_AT" in flush|fua|seal) ;; *) echo "BLK_BENCH_DURABLE_AT=$DURABLE_AT: flush, fua or seal" >&2; exit 2 ;; esac
 DIR=/var/lib/taso-blk
 LOG=$DIR/bench.log
 ERR=$DIR/bench.err
@@ -293,7 +302,7 @@ ratio() { python3 -c 'import sys; a, b = float(sys.argv[1]), float(sys.argv[2]);
 
 {
 echo "blk-bench $(date -u +%Y-%m-%dT%H:%M:%SZ) on $(hostname), kernel $(uname -r), $(nproc) CPUs, $(free -g | awk '/Mem:/{print $2}') GiB RAM"
-echo "daemon $BLKD ${BENCH_DAEMON_ARGS:-}, quick=$QUICK"
+echo "daemon $BLKD --durable-at $DURABLE_AT ${BENCH_DAEMON_ARGS:-}, quick=$QUICK"
 } | tee "$RESULTS"
 
 # ---- setup -----------------------------------------------------------------
@@ -310,7 +319,7 @@ rm -f "$SOCK"
 ulimit -n 1048576 2>/dev/null || ulimit -n "$(ulimit -Hn)"
 say "open-file limit for the daemon: $(ulimit -n)"
 # shellcheck disable=SC2086  # BENCH_DAEMON_ARGS: extra daemon flags, split on purpose
-"$BLKD" "$LOG" "$SOCK" ${BENCH_DAEMON_ARGS:-} 2>>"$ERR" &
+"$BLKD" "$LOG" "$SOCK" --durable-at "$DURABLE_AT" ${BENCH_DAEMON_ARGS:-} 2>>"$ERR" &
 DAEMON_PID=$!
 for _ in $(seq 100); do [[ -S "$SOCK" ]] && break; sleep 0.1; done
 [[ -S "$SOCK" ]] || die "daemon socket did not appear; see $ERR"
