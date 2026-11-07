@@ -118,6 +118,9 @@ impl Summary {
                 self.effect = lsn;
                 match decode()? {
                     Payload::Intent(intent) => {
+                        // Round 3, R3-02: after an op of u64::MAX (never
+                        // assigned here, so from elsewhere) every id is used:
+                        // the next is the exhausted mark, never a reuse.
                         self.next_op = self.next_op.max(intent.op.get().saturating_add(1));
                         // The adoption that finishes the pending promotion:
                         // an intent whose authority names its child and

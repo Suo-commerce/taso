@@ -134,9 +134,14 @@ impl Epoch {
         self.0
     }
 
-    /// The next epoch after this one.
+    /// The next epoch after this one.  As [`Lsn::next`]: none after
+    /// `u64::MAX`, a panic in every build, never a wrap (found beside
+    /// round 2's R2-01).
     pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+        match self.0.checked_add(1) {
+            Some(n) => Self(n),
+            None => panic!("the epoch space is exhausted"),
+        }
     }
 }
 

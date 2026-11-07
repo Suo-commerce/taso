@@ -285,6 +285,8 @@ pub enum VesselError {
         /// The tail.
         tail: Position,
     },
+    /// Every effect id is used (round 3, R3-02): no more effects.
+    OpsExhausted,
     /// Succession refused: these effects are unresolved.
     OpenObligations(Vec<OpId>),
     /// Succession across namespaces was not explicitly allowed.
@@ -392,6 +394,7 @@ impl fmt::Display for VesselError {
                 seal.lsn.get(),
                 tail.lsn.get()
             ),
+            Self::OpsExhausted => write!(f, "every effect id is used: no more effects"),
             Self::OpenObligations(ops) => write!(f, "{} effect(s) unresolved", ops.len()),
             Self::CrossNamespace => write!(f, "succession across namespaces was not allowed"),
             Self::EmptyAuthority => write!(f, "succession needs an actor and a reason"),

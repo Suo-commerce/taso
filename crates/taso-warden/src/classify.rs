@@ -558,6 +558,13 @@ impl Manifest {
             if entries.last().is_some_and(|l| l.path >= e.path) {
                 return Err(bad("entries not strictly ascending"));
             }
+            // Round 3, R3-03 (Kimi): a walk never lists a slot outside the
+            // slot width (it is unsupported, OwnerOutOfRange), so a manifest
+            // that does is not one: refused here, before any consumer adds
+            // it to a base.
+            if e.uid_slot >= SLOT_WIDTH || e.gid_slot >= SLOT_WIDTH {
+                return Err(bad("owner slot out of range"));
+            }
             entries.push(e);
         }
         let n = r.count()?;
@@ -1737,6 +1744,30 @@ class = "Hook"
             .unsupported
             .contains(&(b"src/inner".to_vec(), Unsupported::PathTooLong)));
         assert!(!m.complete() || Manifest::decode(&m.bytes()).is_ok());
+    }
+
+    /// Round 3, R3-03 (Kimi): a manifest naming an owner slot past the
+    /// slot width is refused at decode; a walk never lists one.
+    #[test]
+    fn a_manifest_with_an_owner_slot_out_of_range_is_refused() {
+        let d = tree();
+        let m = walk(d.path(), &map(MAP), me(), &Limits::default(), &[]).unwrap();
+        assert!(Manifest::decode(&m.bytes()).is_ok());
+        for (uid, gid) in [(SLOT_WIDTH, 0), (0, SLOT_WIDTH), (u32::MAX, u32::MAX)] {
+            let mut bad = m.clone();
+            bad.entries[0].uid_slot = uid;
+            bad.entries[0].gid_slot = gid;
+            assert!(
+                Manifest::decode(&bad.bytes()).is_err(),
+                "slots {uid}/{gid} decoded"
+            );
+        }
+        let mut edge = m.clone();
+        edge.entries[0].uid_slot = SLOT_WIDTH - 1;
+        assert!(
+            Manifest::decode(&edge.bytes()).is_ok(),
+            "the last slot is one"
+        );
     }
 
     #[test]

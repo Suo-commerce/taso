@@ -57,6 +57,9 @@ use crate::chronicle::{ChronicleError, Layers};
 use crate::segment::{Position, Segment};
 use crate::vessel::{Vessel, VesselError};
 
+/// Not an op id: the next id once every id is used (round 3, R3-02).
+pub const OP_EXHAUSTED: u64 = u64::MAX;
+
 /// What reconciliation did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reconciled {
@@ -337,6 +340,11 @@ impl Ledger {
             OutcomeState::DispatchAuthorized
         };
         let first_op = self.next_op;
+        // R3-02: every id this adoption takes is below the exhausted mark
+        // (the end may be the mark itself, never past it).
+        let end = first_op
+            .checked_add(proposals.len() as u64)
+            .ok_or(VesselError::OpsExhausted)?;
         let first_lsn = vessel.tail().lsn.next();
         let mut records = Vec::with_capacity(proposals.len() * 2);
         let mut out = Vec::with_capacity(proposals.len());
@@ -371,7 +379,7 @@ impl Ledger {
         let t = crate::timing::span("effect.adopt");
         vessel.append_batch(records)?;
         drop(t);
-        self.next_op = first_op + proposals.len() as u64;
+        self.next_op = end;
         Ok(out)
     }
 
@@ -382,7 +390,7 @@ impl Ledger {
         state: OutcomeState,
         span: &'static str,
     ) -> Result<Authorized, VesselError> {
-        let a = self.assign(vessel, d);
+        let a = self.assign(vessel, d)?;
         let t = crate::timing::span(span);
         vessel.append_batch(vec![
             (Stream::Effect, Payload::Intent(intent(a, d))),
@@ -402,7 +410,7 @@ impl Ledger {
         vessel: &mut Vessel<L>,
         d: &Declared,
     ) -> Result<Authorized, VesselError> {
-        let a = self.assign(vessel, d);
+        let a = self.assign(vessel, d)?;
         vessel.append(Stream::Effect, Payload::Intent(intent(a, d)))?;
         Ok(a)
     }
@@ -536,13 +544,22 @@ impl Ledger {
     // ── internals ───────────────────────────────────────────────────
 
     /// Take the next op id; the barrier is the lsn the intent will get.
-    fn assign<L: Layers>(&mut self, vessel: &Vessel<L>, d: &Declared) -> Authorized {
+    /// Round 3, R3-02 (Kimi): `u64::MAX` is never an op id but the mark
+    /// that every id is used; nothing is reused or wraps.
+    fn assign<L: Layers>(
+        &mut self,
+        vessel: &Vessel<L>,
+        d: &Declared,
+    ) -> Result<Authorized, VesselError> {
+        if self.next_op == OP_EXHAUSTED {
+            return Err(VesselError::OpsExhausted);
+        }
         let op = OpId::new(self.next_op);
         self.next_op += 1;
         let lsn = vessel.tail().lsn.next();
         let barrier =
             (d.consequence != Consequence::NoExternalMutation).then(|| BarrierId::new(lsn.get()));
-        Authorized { op, barrier }
+        Ok(Authorized { op, barrier })
     }
 
     fn reconcile<L, F>(
@@ -730,6 +747,29 @@ mod tests {
             actor: "jarmo".into(),
             reason: "checked the provider by hand".into(),
         }
+    }
+
+    /// Round 3, R3-02 (Kimi): once the last id is used, every further
+    /// effect is refused: no id is reused, none wraps to 0, nothing is
+    /// written.  An adoption that would pass the last id is refused whole.
+    #[test]
+    fn the_last_op_id_is_refused_never_reused_or_wrapped() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut l, _) = open(&mut v);
+        l.next_op = OP_EXHAUSTED - 1;
+        let d = declared("send bob", Consequence::Irreversible);
+        let a = l.release(&mut v, &d).unwrap();
+        assert_eq!(a.op, OpId::new(OP_EXHAUSTED - 1), "the last id");
+        let tail = v.tail();
+        for _ in 0..2 {
+            assert!(matches!(
+                l.release(&mut v, &d),
+                Err(VesselError::OpsExhausted)
+            ));
+        }
+        assert_eq!(v.tail(), tail, "nothing written");
+        assert_eq!(l.next_op(), OpId::new(OP_EXHAUSTED));
     }
 
     #[test]

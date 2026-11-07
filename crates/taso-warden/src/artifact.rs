@@ -306,6 +306,22 @@ pub fn restore(
             return Err(ArtifactError::TargetNotEmpty(shown(n)));
         }
     }
+    // Round 3, R3-03 (Kimi): the slot is bounded by the manifest's decode;
+    // the sum is still checked, so no base can wrap an owner (to root).
+    for e in &manifest.entries {
+        if owner.uid_base.checked_add(e.uid_slot).is_none()
+            || owner.gid_base.checked_add(e.gid_slot).is_none()
+        {
+            return Err(ArtifactError::Malformed(format!(
+                "{}: owner slot {}/{} past the id space from base {}/{}",
+                shown(&e.path),
+                e.uid_slot,
+                e.gid_slot,
+                owner.uid_base,
+                owner.gid_base
+            )));
+        }
+    }
     let uid = |slot: u32| Uid::from_raw(owner.uid_base + slot);
     let gid = |slot: u32| Gid::from_raw(owner.gid_base + slot);
     let mut dirs = Vec::new();

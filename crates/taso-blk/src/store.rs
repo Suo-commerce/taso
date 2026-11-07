@@ -1684,7 +1684,10 @@ fn load_checkpoint(path: &Path, file: &File, len: u64) -> Option<Checkpoint> {
 /// 1 to [`MAX_NAME`] bytes of `A-Z a-z 0-9 _ . : / -`: what dataset names
 /// use, and safe in the daemon's line protocol.
 fn valid_name(name: &str) -> bool {
-    (1..=MAX_NAME).contains(&name.len())
+    // Round 3, R3-04 (Kimi): "-" alone is the control protocol's "none"
+    // (info's fields, export's base), so it is no name.
+    name != "-"
+        && (1..=MAX_NAME).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'))
@@ -2327,7 +2330,8 @@ mod tests {
             s.name(root, "r"),
             Err(StoreError::Map(MapError::NotABranch(_)))
         ));
-        for bad in ["has space", "tab\t", "ä", &"n".repeat(MAX_NAME + 1)] {
+        // "-": the protocol's "none" (round 3, R3-04); "-x" and "a-" are names.
+        for bad in ["has space", "tab\t", "ä", "-", &"n".repeat(MAX_NAME + 1)] {
             assert!(
                 matches!(s.name(b, bad), Err(StoreError::BadName(_))),
                 "{bad:?}"
@@ -2342,6 +2346,8 @@ mod tests {
         assert!(matches!(s.check_name("a b"), Err(StoreError::BadName(_))));
         assert!(matches!(s.check_name(""), Err(StoreError::BadName(_))));
         s.check_name("free").unwrap();
+        s.check_name("-x").unwrap();
+        s.check_name("a-").unwrap();
         s.name(a, "x").unwrap(); // naming again with the same name is fine
         s.name(a, "y").unwrap(); // renaming frees the old name
         assert_eq!((s.find("x"), s.find("y")), (None, Some(a)));
