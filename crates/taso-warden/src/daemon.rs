@@ -3276,7 +3276,9 @@ pub fn check_state_generation(dir: &Path) -> io::Result<()> {
     let mut held: Vec<String> = Vec::new();
     for e in std::fs::read_dir(dir)? {
         let name = e?.file_name().to_string_lossy().into_owned();
-        if name != "lost+found" {
+        // Round 2, R2-06 (Kimi): our own temporary from a first start that
+        // stopped before its rename is not state; it is rewritten below.
+        if name != "lost+found" && name != format!("{STATE_GENERATION_FILE}.tmp") {
             held.push(name);
         }
     }
@@ -5308,6 +5310,21 @@ mod tests {
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("lost+found")).unwrap();
         check_state_generation(&root).unwrap();
+        // Round 2, R2-06 (Kimi): a first start stopped after creating its
+        // temporary, before the rename (empty, or partly written): the
+        // next start finishes it.  Then a restart is as usual.
+        for left in ["", "2"] {
+            let cut = tmp.path().join(format!("cut{}", left.len()));
+            std::fs::create_dir_all(&cut).unwrap();
+            std::fs::write(cut.join(format!("{STATE_GENERATION_FILE}.tmp")), left).unwrap();
+            check_state_generation(&cut).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(cut.join(STATE_GENERATION_FILE)).unwrap(),
+                "2\n"
+            );
+            assert!(!cut.join(format!("{STATE_GENERATION_FILE}.tmp")).exists());
+            check_state_generation(&cut).unwrap();
+        }
     }
 
     /// B1, B2: a slot is given back when its holder ends, a panicking
