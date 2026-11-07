@@ -7,6 +7,8 @@
 #   scripts/release-gate.sh full     overnight: quick's gates at release
 #                                    sizes, plus xfstests -g quick,
 #                                    blk-bench, and 100 crash rounds
+#   scripts/release-gate.sh clean    only the cleaning below (the nightly
+#                                    runs it on nights it skips)
 #
 # As root on taso-test, from the repository root, on a clean tree.  The
 # commit is the one checked out; the runner refuses a dirty tree, and
@@ -24,7 +26,15 @@
 #
 # One run at a time per node: a second one exits 3 (the lock).
 #
-# Env: OUT (default /root/release-<commit>-<tier>-<date>); the store for
+# Disk (taso-test 2026-11-07: a quick run filled the 40 GB disk and p3 hit
+# ENOSPC in round 14).  Under the lock, before anything else: the work
+# directories that gates leave when killed (/var/tmp/taso-p2blk.*,
+# taso-p3.*, taso-f6fork.*, taso-k2e2e.*, e3check.*) are removed, and gate
+# results under /root older than $KEEP_DAYS days.  Then the run refuses to
+# start with less than $MIN_FREE_QUICK (quick) or $MIN_FREE_FULL (full)
+# GiB free.  The table's last column is the GiB free after each gate.
+#
+# Env: KEEP_DAYS (14), MIN_FREE_QUICK (15), MIN_FREE_FULL (35); OUT (default /root/release-<commit>-<tier>-<date>); the store for
 # blk-warden-test and gate-p2-blk as those scripts take it
 # (TASO_BLK_S3_*; unset: a local directory).  `full` needs xfstests set up
 # once (scripts/blk-fstests.sh setup).
@@ -32,15 +42,30 @@
 set -uo pipefail
 
 TIER=${1:-}
-case "$TIER" in quick|full) ;; *) echo "usage: $0 quick|full" >&2; exit 2 ;; esac
+case "$TIER" in quick|full|clean) ;; *) echo "usage: $0 quick|full|clean" >&2; exit 2 ;; esac
+KEEP_DAYS=${KEEP_DAYS:-14}
+MIN_FREE_QUICK=${MIN_FREE_QUICK:-15}
+MIN_FREE_FULL=${MIN_FREE_FULL:-35}
 die() { echo "release-gate: $*" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -f Cargo.toml ] && [ -d scripts ] || die "run from the repository root"
-[ -z "$(git status --porcelain --untracked-files=no)" ] || die "the tree has changes: a release gate runs on a commit"
+[ "$TIER" = clean ] || [ -z "$(git status --porcelain --untracked-files=no)" ] || die "the tree has changes: a release gate runs on a commit"
 # One gate run at a time on a node (they share taso-blkd, /run/taso and the
 # ublk devices); exit 3 when another holds the lock (release-nightly.sh).
 exec 9> /run/taso-release-gate.lock
 flock -n 9 || { echo "release-gate: another release gate is running" >&2; exit 3; }
+
+free_gib() { df --output=avail -B1G /root | tail -1 | tr -d ' '; }
+# Nothing else runs (the lock): what a killed gate left is safe to remove.
+# Not /var/lib/taso*: the node's installed services keep their state there.
+rm -rf /var/tmp/taso-p2blk.* /var/tmp/taso-p3.* /var/tmp/taso-f6fork.* \
+       /var/tmp/taso-k2e2e.* /var/tmp/e3check.*
+find /root -maxdepth 1 -mtime +"$KEEP_DAYS" \
+     \( -name 'taso-gate-*' -o -name 'taso-f6-fork-*' -o -name 'release-*-quick-*' -o -name 'release-*-full-*' \) \
+     -exec rm -rf {} +
+if [ "$TIER" = clean ]; then echo "release-gate: cleaned; $(free_gib) GiB free"; exit 0; fi
+need=$MIN_FREE_QUICK; [ "$TIER" = full ] && need=$MIN_FREE_FULL
+[ "$(free_gib)" -ge "$need" ] || die "$(free_gib) GiB free, $TIER needs $need (old clones' target/ folders: cargo clean)"
 COMMIT=$(git rev-parse --short HEAD)
 OUT=${OUT:-/root/release-$COMMIT-$TIER-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
@@ -58,8 +83,8 @@ run() {
     rc=$?
     [ "$rc" = 124 ] && echo "release-gate: timed out after $limit" >> "$OUT/$n.txt"
     [ "$rc" = 0 ] || FAILED=$((FAILED + 1))
-    printf '%-10s exit %-3s %6ss  %s\n' "$n" "$rc" "$(( $(date +%s) - s ))" \
-        "$(grep -v '^[[:space:]]*$' "$OUT/$n.txt" | tail -1 | cut -c1-90)" | tee -a "$S"
+    printf '%-10s exit %-3s %6ss  %-90s  %sG free\n' "$n" "$rc" "$(( $(date +%s) - s ))" \
+        "$(grep -v '^[[:space:]]*$' "$OUT/$n.txt" | tail -1 | cut -c1-90)" "$(free_gib)" | tee -a "$S"
 }
 
 echo "== release gate ($TIER) on $COMMIT, output in $OUT"

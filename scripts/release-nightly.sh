@@ -18,6 +18,10 @@
 # then skipped, and says so).  A single gate script run by hand takes no
 # lock: start none near 01:00.
 #
+# Disk: release-gate.sh cleans at the start of every run, and the nightly
+# runs `release-gate.sh clean` on the nights it skips, so leftovers go
+# daily; its clone's target/ is cleaned past $TARGET_GIB GiB (15).
+#
 # Morning:  tail /root/release/nightly.log
 # Rerun one night by hand:  systemctl start taso-nightly
 # Reinstall after this script changes:  scripts/release-nightly.sh install
@@ -27,6 +31,7 @@ set -uo pipefail
 CLONE=${CLONE:-/root/taso-nightly}
 REL=${REL:-/root/release}
 KEEP=${KEEP:-14}
+TARGET_GIB=${TARGET_GIB:-15}
 BIN=/usr/local/sbin/taso-nightly
 LOG=$REL/nightly.log
 
@@ -43,6 +48,7 @@ Description=Taso release gate (full) on origin/main
 
 [Service]
 Type=oneshot
+Environment=HOME=/root PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$BIN
 TimeoutStartSec=12h
 EOF
@@ -71,8 +77,13 @@ git fetch -q origin || { note "-- fetch failed"; exit 1; }
 git checkout -q --detach origin/main && git reset -q --hard origin/main || { note "-- checkout failed"; exit 1; }
 c=$(git rev-parse --short HEAD)
 if grep -q " $c full PASS" "$LOG" 2>/dev/null; then
-    note "$c full skipped: passed already"
+    scripts/release-gate.sh clean >/dev/null 2>&1
+    note "$c full skipped: passed already ($(df --output=avail -B1G /root | tail -1 | tr -d ' ') GiB free)"
     exit 0
+fi
+# The nightly's own build folder: cleaned when it passes $TARGET_GIB.
+if [ -d target ] && [ "$(du -s -BG target | cut -dG -f1)" -gt "$TARGET_GIB" ]; then
+    cargo clean -q && note "-- cargo clean: target/ was over $TARGET_GIB GiB"
 fi
 out=$REL/$c-full-$(date +%Y%m%d-%H%M)
 OUT=$out scripts/release-gate.sh full > "$REL/last-night.txt" 2>&1
