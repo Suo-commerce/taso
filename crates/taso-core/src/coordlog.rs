@@ -1429,6 +1429,12 @@ impl CoordLog {
                 need(inv.items() == projected.as_slice(), "inventory mismatch")?;
                 fx.retire = true;
                 fx.release_all_of = Some(c);
+                // Round 2, R2-07 (D&D a): the purge's own record, held for
+                // the log's life: a retry reads the inventory, the local
+                // deletion the local state, and nothing releases them.
+                // Held by this record, so its release above keeps them.
+                fx.holds.push((ObjectId::content(p.inventory_key), c));
+                fx.holds.push((ObjectId::content(p.local_key), c));
                 for it in inv.items() {
                     fx.claims
                         .push((ObjectId::pack(chronicle, &it.pack.name), ClaimBy::Purge(c)));
@@ -1973,6 +1979,9 @@ mod tests {
         fn exists(&self, o: &ObjectId) -> bool {
             self.objects.borrow().contains(o)
         }
+        fn is_inventory(&self, o: &ObjectId) -> bool {
+            matches!(o, ObjectId::Content(k) if self.inventories.borrow().contains_key(k))
+        }
         fn fails(&self, o: &ObjectId) -> bool {
             self.unreadable.borrow().contains(o)
         }
@@ -1988,7 +1997,9 @@ mod tests {
         fn lookup(&self, o: &ObjectId) -> Lookup<()> {
             if self.fails(o) {
                 Lookup::Unreadable
-            } else if self.exists(o) {
+            } else if self.exists(o) || self.is_inventory(o) {
+                // An inventory is a content object, found by its key as
+                // the real store finds it (every content kind is tried).
                 Lookup::Found(())
             } else {
                 Lookup::NotFound
@@ -2475,6 +2486,7 @@ mod tests {
         );
         // The source retires; its packs are the inventory; the Template stays.
         let (pc, inv) = purge_inventory(&mut w, f.v);
+        let pc_keys = (pc.inventory_key, pc.local_key);
         assert_eq!(inv.items().len(), 2);
         w.ok(f.v, ContractRecord::PurgeCommitted(pc));
         assert!(w.log.query_chronicle(f.v).unwrap().retired);
@@ -2484,13 +2496,12 @@ mod tests {
             vec![s.template_id]
         );
         assert!(
-            w.log
-                .query_chronicle(f.v)
-                .unwrap()
-                .holds
-                .iter()
-                .all(|o| matches!(o, ObjectId::Pack(_, n) if n.ends_with(&format!("{:020}", 0)))),
-            "only the replacements stay held"
+            w.log.query_chronicle(f.v).unwrap().holds.iter().all(
+                |o| matches!(o, ObjectId::Pack(_, n) if n.ends_with(&format!("{:020}", 0)))
+                    || *o == ObjectId::content(pc_keys.0)
+                    || *o == ObjectId::content(pc_keys.1)
+            ),
+            "only the replacements and the purge's own record (R2-07) stay held"
         );
     }
 
@@ -2786,6 +2797,41 @@ mod tests {
             w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
             Final::Predicate("liveness dependency".into())
         );
+    }
+
+    /// Round 2, R2-07 (Kimi): an accepted purge's inventory and local
+    /// state are held from its `PurgeCommitted` for the log's life (D&D
+    /// R2-07 a): a retry and the local deletion read them, and they are
+    /// the purge's own record.  A reclaim of either is refused as held.
+    #[test]
+    fn an_accepted_purges_metadata_is_never_reclaimed() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let (pc, _inv) = purge_inventory(&mut w, f.v);
+        let (inv_key, local_key) = (pc.inventory_key, pc.local_key);
+        w.ok(f.v, ContractRecord::PurgeCommitted(pc));
+        assert_eq!(w.log.holders(&ObjectId::content(inv_key)), vec![f.v]);
+        assert_eq!(w.log.holders(&ObjectId::content(local_key)), vec![f.v]);
+        let op = cid(0xEE);
+        w.log.claim_chronicle(op, ClaimAuthority::Vessel).unwrap();
+        for key in [inv_key, local_key] {
+            assert_eq!(
+                w.refused(
+                    op,
+                    ContractRecord::ReclaimClaimed {
+                        object_key: key,
+                        n: 0
+                    }
+                ),
+                Final::Predicate("held".into())
+            );
+        }
     }
 
     /// A replacement is held from its acceptance, so a stalled purge
@@ -3684,10 +3730,11 @@ mod tests {
         let e = w.epoch(f.v);
         let r = Submitted::Contract(ContractRecord::PurgeCommitted(pc));
         assert!(matches!(w.submit_as(f.v, e, 1, r), Answer::Accepted { .. }));
-        // One atomic transition: retired, holds released, Candidate closed, claims held.
+        // One atomic transition: retired, holds released (but the purge's
+        // own record, R2-07), Candidate closed, claims held.
         let view = w.log.query_chronicle(f.v).unwrap();
         assert!(view.retired);
-        assert!(view.holds.is_empty());
+        assert_eq!(view.holds.len(), 2, "the inventory and local state only");
         for it in inv.items() {
             assert!(w.log.is_claimed(&ObjectId::pack(f.v, &it.pack.name)));
         }
