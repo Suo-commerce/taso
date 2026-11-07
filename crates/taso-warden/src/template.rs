@@ -2258,6 +2258,107 @@ mod tests {
 
     const VCONF: &[u8] = b"version = 1\nentry = [\"/bin/sh\", \"-c\", \"exit 0\"]\n";
 
+    fn audit2_nominated(c: &Cluster, subject: &[u8]) -> (Host<crate::vessel::tests::FakePool>, FV, Packs<SharedStore, Bytes>, taso_core::contract::Candidate) {
+        use taso_core::contract::{Candidate, ClassCounts, Facts, SealRef, VerifierRequirement, candidate_id, facts_hash};
+        let host = Host {
+            coord: c.coord.clone(),
+            pool: crate::vessel::tests::FakePool::default(),
+            root: Dataset::new("tank/vessels").unwrap(),
+            state_dir: c.dir.path().join(format!("vstate-{}", hex(subject))),
+            warden: WardenId::new(1),
+        };
+        let (mut v, _) = host.ensure(NS, subject).unwrap();
+        let packs = Packs::new(c.store.clone(), Bytes, PREFIX, v.id()).unwrap();
+        v.append(Stream::Fs, Payload::Raw(vec![1; 8])).unwrap();
+        let s = v
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                Lsn::new(0),
+                TurnId::new(1),
+            )
+            .unwrap()
+            .seal;
+        let snap = crate::storage::Snapshot {
+            dataset: v.dataset().clone(),
+            seal: s.lsn,
+            guid: crate::vessel::tests::fake_guid(s.lsn),
+            seal_hash: Some(s.hash),
+        };
+        v.publish_seal(&packs, &snap, None).unwrap();
+
+        let t = ready_of(c, c.t0).unwrap();
+        let vk = taso_core::contract::object_key(ObjectKind::Vconf, VCONF);
+        let path = object_key_path(PREFIX, ObjectKind::Vconf, vk).unwrap();
+        c.store.put(&path, &mut Cursor::new(VCONF)).unwrap();
+        let requirement = VerifierRequirement { template: c.t0, vconf_key: vk, version: 1 };
+        let facts = Facts { input: ClassCounts { source: 2, ..Default::default() }, excluded: Default::default(), open_obligations: 0, effects_adopted: 0, ledger_lsn: v.tail().lsn, requirement };
+        let exclude = [PathClass::Scratch].into();
+        let cand = Candidate {
+            candidate_id: candidate_id(v.id(), s.hash, &exclude, t.classmap_key, 1, &requirement),
+            chronicle: v.id(), seal: SealRef { lsn: s.lsn, hash: s.hash }, exclude, transform_version: 1,
+            classmap_key: t.classmap_key, input_manifest_key: t.output_manifest_key,
+            output_manifest_key: t.output_manifest_key, artifact_key: t.layer,
+            requirement, facts, facts_hash: facts_hash(&facts), nominated_by: NominatedBy::Agent,
+            nominated_at: v.tail().lsn.next(),
+        };
+        let rec = ContractRecord::Candidate(Box::new(cand.clone()));
+        v.append_contract(rec.clone()).unwrap();
+        let mut counter = *v.attempt_mut();
+        crate::submit::submit(c.coord.as_ref(), WardenId::new(1), v.chronicle(), &packs, Submitted::Contract(rec), &mut counter).unwrap();
+        *v.attempt_mut() = counter;
+        (host, v, packs, cand)
+    }
+
+    fn audit2_prune(c: &Cluster, v: &mut FV, packs: &Packs<SharedStore, Bytes>) {
+        v.set_roll_at(1);
+        for _ in 0..6 {
+            v.append(Stream::Fs, Payload::Raw(vec![1; 8])).unwrap();
+        }
+        packs.ship_log(&v.chronicle().segments(), v.tail()).unwrap();
+        c.coord.advance_shipped(WardenId::new(1), v.id(), v.chronicle().epoch(), v.tail()).unwrap();
+        assert!(!v.prune(2).unwrap().removed.is_empty());
+    }
+
+    #[test]
+    fn audit2_pending_candidate_survives_pruning() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = audit2_nominated(&c, b"audit2-c");
+        let at = attempts(&c);
+        assert_eq!(at.to_attempt(&v).unwrap(), vec![cand.clone()]);
+        audit2_prune(&c, &mut v, &packs);
+        assert_eq!(at.to_attempt(&v).unwrap(), vec![cand]);
+    }
+
+    #[test]
+    fn audit2_open_attempt_survives_pruning() {
+        let c = Cluster::new();
+        let (host, mut v, packs, cand) = audit2_nominated(&c, b"audit2-a");
+        let at = attempts(&c);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        assert_eq!(at.open(&v).unwrap(), vec![st.clone()]);
+        audit2_prune(&c, &mut v, &packs);
+        let id = v.id();
+        drop(v);
+        let (v, _) = host.open(id).unwrap();
+        assert!(c.coord.query_logical(logical_id(&LogicalKey::Attempt(st.attempt_id))).unwrap().is_some());
+        assert_eq!(at.open(&v).unwrap(), vec![st]);
+    }
+
+    #[test]
+    fn audit2_committed_sanction_survives_pruning() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = audit2_nominated(&c, b"audit2-s");
+        let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
+        let r = request(&cand, &f, Decision::Sanction);
+        assert!(matches!(verdicts(&c).handle(&mut v, &packs, &r, PEER).unwrap(), VerdictAnswer::Committed { .. }));
+        let s = sanction_of(&c, cand.candidate_id).unwrap();
+        let fin = finisher(&c, 1);
+        assert_eq!(fin.unfinished(&v).unwrap(), vec![s]);
+        audit2_prune(&c, &mut v, &packs);
+        assert_eq!(fin.unfinished(&v).unwrap(), vec![s]);
+    }
+
     #[test]
     fn an_attempt_holds_the_verifier_layer_and_the_artifact_until_it_finishes() {
         let c = Cluster::new();
