@@ -22,7 +22,8 @@ ublk bindings, and `runc`, which the Warden starts agents with):
 apt install -y build-essential pkg-config libclang-dev runc git curl
 curl -fsSL https://sh.rustup.rs | sh -s -- -y && . ~/.cargo/env
 git clone https://github.com/Suo-commerce/taso.git && cd taso
-cargo build --release -p taso-warden --bin taso-ctl --bin taso-wardend -p taso-blk --bin taso-blkd
+cargo build --release -p taso-warden --bin taso-ctl --bin taso-wardend
+cargo build --release -p taso-blk --bin taso-blkd
 ```
 
 About two minutes on four cores. The binaries are

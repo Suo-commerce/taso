@@ -220,7 +220,8 @@ mkdir -p "$WORK" "$RUN" "$MNT"
 [[ "$(findmnt -no FSTYPE -T "$WORK")" != tmpfs ]] || die "$WORK is on tmpfs; the images need a disk"
 
 say "building (release)"
-cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock -p taso-blk
+cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock
+cargo build --release -q -p taso-blk --bin taso-blkd   # alone: see release-gate.sh
 for b in taso-wardend taso-sim taso-landlock taso-blkd taso-coordd taso-logcheck; do [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"; done
 ROOTFS=$WORK/rootfs
 rm -rf "$ROOTFS"

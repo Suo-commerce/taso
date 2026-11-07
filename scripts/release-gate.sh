@@ -63,7 +63,11 @@ run() {
 }
 
 echo "== release gate ($TIER) on $COMMIT, output in $OUT"
-run build 60m cargo build --release -q --workspace --bins
+# taso-blkd is built on its own, as every script and the README build it:
+# built together with taso-warden, cargo unifies two dependency features
+# (rustix default, serde alloc) into a different binary (taso-test
+# 0e7a58e: gate-p2-blk found the installed daemon "not this build").
+run build 60m bash -c 'cargo build --release -q --workspace --bins && cargo build --release -q -p taso-blk --bin taso-blkd'
 run install 5m bash -c '
     install target/release/taso-blkd /usr/local/bin/taso-blkd &&
     systemctl restart taso-blkd &&

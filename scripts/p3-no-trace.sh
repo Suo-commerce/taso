@@ -60,7 +60,8 @@ done
 
 cd "$(dirname "$0")/.."
 echo "== building (release)"
-cargo build --release -q -p taso-warden -p taso-landlock -p taso-blk
+cargo build --release -q -p taso-warden -p taso-landlock
+cargo build --release -q -p taso-blk --bin taso-blkd   # alone: see release-gate.sh
 BIN=$PWD/target/release
 modprobe ublk_drv
 [ -c /dev/ublk-control ] || { echo "/dev/ublk-control missing (ublk_drv)" >&2; exit 2; }

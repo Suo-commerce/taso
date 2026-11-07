@@ -257,7 +257,8 @@ if [ "$ROLE" = vessel-blk ]; then
     [ -x "$(command -v runc)" ] || die "runc missing"
     modprobe ublk_drv || die "no ublk module on this kernel ($(uname -r)); the block log needs it"
     echo ublk_drv > /etc/modules-load.d/taso-ublk.conf
-    build -p taso-blk --bin taso-blkd -p taso-warden --bin taso-wardend --bin taso-logcheck
+    build -p taso-blk --bin taso-blkd   # alone, as the gates build it (release-gate.sh)
+    build -p taso-warden --bin taso-wardend --bin taso-logcheck
     install -m 755 "$REPO/target/release/taso-blkd" "$REPO/target/release/taso-wardend" "$REPO/target/release/taso-logcheck" /usr/local/bin/
     mkdir -p /var/lib/taso
 

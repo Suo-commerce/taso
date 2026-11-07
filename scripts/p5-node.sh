@@ -316,8 +316,11 @@ EOF
     step "9 build"
     log=/root/taso-build.log
     echo "cargo build --release (minutes; log $log)"
-    if ! (cd "$REPO" && cargo build --release -p taso-blk --bin taso-blkd \
-            -p taso-warden --bin taso-wardend --bin taso-coordd --bin taso-logcheck >"$log" 2>&1); then
+    # taso-blkd in a build of its own: built with taso-warden, cargo unifies
+    # two dependency features (rustix default, serde alloc) into a
+    # different binary from the one the gates test (release-gate.sh).
+    if ! (cd "$REPO" && cargo build --release -p taso-blk --bin taso-blkd >"$log" 2>&1 \
+            && cargo build --release -p taso-warden --bin taso-wardend --bin taso-coordd --bin taso-logcheck >>"$log" 2>&1); then
         tail -n 40 "$log"; die "cargo build failed; the full log is $log"
     fi
     install -m 755 "$REPO"/target/release/{taso-blkd,taso-wardend,taso-coordd,taso-logcheck} /usr/local/bin/
