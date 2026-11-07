@@ -784,17 +784,51 @@ pub fn walk(
     })
 }
 
-fn names(dir: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
-    let mut out = Vec::new();
+/// A directory read with a bound: its `keep` smallest names, in order,
+/// and how many it holds.  Round 2, R2-02 (Kimi; D&D a): the agent owns
+/// the directory, so the Warden never holds more names than the walk can
+/// still list; the deadline is checked while reading too (`None`: it
+/// passed, the walk stops).
+struct Names {
+    kept: Vec<Vec<u8>>,
+    count: u64,
+}
+
+fn names(dir: &OwnedFd, keep: usize, deadline: Instant) -> io::Result<Option<Names>> {
+    let mut heap: std::collections::BinaryHeap<Vec<u8>> = std::collections::BinaryHeap::new();
+    let mut count = 0u64;
     for e in rustix::fs::Dir::read_from(dir)? {
         let e = e?;
         let n = e.file_name().to_bytes();
-        if n != b"." && n != b".." {
-            out.push(n.to_vec());
+        if n == b"." || n == b".." {
+            continue;
+        }
+        count += 1;
+        if count.is_multiple_of(1024) && Instant::now() > deadline {
+            return Ok(None);
+        }
+        if heap.len() < keep {
+            heap.push(n.to_vec());
+        } else if heap.peek().is_some_and(|max| n < max.as_slice()) {
+            heap.pop();
+            heap.push(n.to_vec());
         }
     }
-    out.sort();
-    Ok(out)
+    Ok(Some(Names {
+        kept: heap.into_sorted_vec(),
+        count,
+    }))
+}
+
+/// Whether directory `dir` holds no entry, reading at most one.
+fn is_empty(dir: &OwnedFd) -> io::Result<bool> {
+    for e in rustix::fs::Dir::read_from(dir)? {
+        let n = e?.file_name().to_bytes().to_vec();
+        if n != b"." && n != b".." {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether an xattr list (asked with an empty buffer, so the answer is
@@ -901,9 +935,31 @@ impl Walker<'_> {
     /// Walk directory `fd` (path `prefix`, at `depth`); returns how many
     /// entries it holds.
     fn dir(&mut self, fd: &OwnedFd, prefix: &[u8], depth: u32) -> io::Result<u64> {
-        let list = names(fd)?;
-        let n = list.len() as u64;
-        for name in list {
+        // Every name processed is listed (one entry of `max_entries`) or
+        // stops the walk, but for a reserved one at the root.  So the walk
+        // reaches at most the room left plus one name, the one that finds
+        // no room and stops it for whatever reason it meets first, as
+        // with the whole directory read (R2-02).
+        let listed = (self.entries.len() + self.unsupported.len()) as u64;
+        let mut keep = self
+            .limits
+            .max_entries
+            .saturating_sub(listed)
+            .saturating_add(1);
+        if prefix.is_empty() {
+            keep = keep.saturating_add(self.reserved.len() as u64);
+        }
+        let Some(Names { kept, count }) = names(
+            fd,
+            usize::try_from(keep).unwrap_or(usize::MAX),
+            self.deadline,
+        )?
+        else {
+            self.over(Incomplete::WalkTime);
+            return Ok(0);
+        };
+        let cut = (kept.len() as u64) < count;
+        for name in kept {
             if self.stopped() {
                 break;
             }
@@ -914,7 +970,11 @@ impl Walker<'_> {
             };
             self.entry(fd, &name, path, prefix, depth);
         }
-        Ok(n)
+        // Names left unread: the next one would have found no room.
+        if cut {
+            self.over(Incomplete::Entries);
+        }
+        Ok(count)
     }
 
     fn entry(&mut self, dir: &OwnedFd, name: &[u8], path: Vec<u8>, prefix: &[u8], depth: u32) {
@@ -1081,8 +1141,8 @@ impl Walker<'_> {
 
     fn empty_dir(&self, dir: &OwnedFd, name: &CStr) -> bool {
         self.open(dir, name, OFlags::DIRECTORY)
-            .and_then(|f| names(&f))
-            .is_ok_and(|n| n.is_empty())
+            .and_then(|f| is_empty(&f))
+            .unwrap_or(false)
     }
 
     /// Add an entry, unless a limit stops the walk.  Whether it was added.
