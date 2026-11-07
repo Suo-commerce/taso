@@ -1122,21 +1122,7 @@ impl Daemon {
                 Ok(String::new())
             }
             "drop" => {
-                let l = layer(1)?;
-                let kind = lock_store(&self.store, Site::DropKind)
-                    .map()
-                    .kind(l)
-                    .map_err(|e| e.to_string())?;
-                if kind == Kind::Branch {
-                    let _ = self.detach(l);
-                    lock_store(&self.store, Site::DropBranch)
-                        .drop_branch(l)
-                        .map_err(store_err)?;
-                } else {
-                    lock_store(&self.store, Site::DropSeal)
-                        .drop_seal(l)
-                        .map_err(store_err)?;
-                }
+                self.drop_layer(layer(1)?, kill_device)?;
                 Ok(String::new())
             }
             "flush" => {
@@ -1262,18 +1248,58 @@ impl Daemon {
         lock_store(&self.store, Site::Resolve).map().live(n)
     }
 
+    /// Drop a layer: a branch's device is detached first (`kill` stops it;
+    /// a test's can fail), then the branch is dropped while the device
+    /// table is held, as `reset` does, so no attach starts in between and
+    /// no branch is dropped under a device (review fix H2, Kimi's H2: the
+    /// detach's error was ignored and the table not held, so an attach
+    /// that had checked the branch could start a device for it after the
+    /// drop, and a failed kill left a device on a dropped branch).
+    fn drop_layer(
+        &self,
+        l: LayerId,
+        kill: impl FnOnce(i32) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let kind = lock_store(&self.store, Site::DropKind)
+            .map()
+            .kind(l)
+            .map_err(|e| e.to_string())?;
+        if kind != Kind::Branch {
+            return lock_store(&self.store, Site::DropSeal)
+                .drop_seal(l)
+                .map_err(|e| e.to_string());
+        }
+        let attached = matches!(self.settled(l).get(&l), Some(Slot::Running(_)));
+        if attached {
+            self.detach_with(l, kill)?;
+        }
+        // The table, then the store, never the other way round.
+        let devices = self.settled(l);
+        if devices.contains_key(&l) {
+            return Err(format!("{l} is attached; detach it first"));
+        }
+        lock_store(&self.store, Site::DropBranch)
+            .drop_branch(l)
+            .map_err(|e| e.to_string())?;
+        drop(devices);
+        Ok(())
+    }
+
     /// Start a device for `branch`.  Returns its block device path.
     fn attach(&self, branch: LayerId) -> Result<String, String> {
-        if lock_store(&self.store, Site::AttachKind)
-            .map()
-            .kind(branch)
-            .map_err(|e| e.to_string())?
-            != Kind::Branch
         {
-            return Err(format!("{branch} is a Seal; attach a branch"));
-        }
-        {
+            // The kind is checked and the branch marked Starting under one
+            // hold of the table (the table, then the store), so a drop
+            // cannot come between them (review fix H2).
             let mut devices = lock(&self.devices);
+            if lock_store(&self.store, Site::AttachKind)
+                .map()
+                .kind(branch)
+                .map_err(|e| e.to_string())?
+                != Kind::Branch
+            {
+                return Err(format!("{branch} is a Seal; attach a branch"));
+            }
             match devices.get(&branch) {
                 Some(Slot::Running(d)) => {
                     return Err(format!(
@@ -1900,6 +1926,60 @@ mod detach_test {
         .unwrap();
         assert_eq!(killed, Some(7), "the retry kills the same device");
         assert!(lock(&d.devices).get(&branch).is_none(), "gone once killed");
+    }
+
+    fn alive(d: &Daemon, l: LayerId) -> bool {
+        d.store.lock().unwrap().map().kind(l).is_ok()
+    }
+
+    /// Review fix H2 (Kimi's H2): a drop whose detach fails leaves the
+    /// branch, and its device tracked; it used to ignore the error and
+    /// drop the branch under the live device.
+    #[test]
+    fn a_drop_never_drops_a_branch_under_a_device_it_could_not_stop() {
+        let (_dir, d, branch, stop) = daemon_with_a_running_branch();
+        let e = d
+            .drop_layer(branch, |_| Err("injected".to_string()))
+            .unwrap_err();
+        assert!(e.contains("injected"), "{e}");
+        assert!(alive(&d, branch), "the branch is not dropped");
+        assert!(matches!(
+            lock(&d.devices).get(&branch),
+            Some(Slot::Running(_))
+        ));
+        stop.store(true, Ordering::Relaxed);
+        d.drop_layer(branch, |_| Ok(())).unwrap();
+        assert!(!alive(&d, branch), "dropped once its device is stopped");
+        assert!(lock(&d.devices).get(&branch).is_none());
+        // And no device can be started for it now.
+        assert!(d.attach(branch).is_err());
+    }
+
+    /// Review fix H2: a drop meeting a device that is starting waits for
+    /// it, stops it, then drops the branch; never the branch first.
+    #[test]
+    fn a_drop_waits_out_a_starting_device_then_stops_it_first() {
+        let (_dir, d, branch, stop) = daemon_with_a_running_branch();
+        let Some(Slot::Running(dev)) = lock(&d.devices).insert(branch, Slot::Starting) else {
+            unreachable!()
+        };
+        stop.store(true, Ordering::Relaxed);
+        let mut killed = None;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(alive(&d, branch), "not dropped while the device starts");
+                lock(&d.devices).insert(branch, Slot::Running(dev));
+                d.settle.notify_all();
+            });
+            d.drop_layer(branch, |id| {
+                killed = Some(id);
+                Ok(())
+            })
+            .unwrap();
+        });
+        assert_eq!(killed, Some(7), "its device stopped first");
+        assert!(!alive(&d, branch));
     }
 
     #[test]
