@@ -294,6 +294,17 @@ impl<'v, L: Layers> Session<'v, L> {
         }
     }
 
+    /// A Seal whose publish failed before this session started (the
+    /// Warden's start, or an adoption): counted as a failed publish and
+    /// retried before the next effect, as a turn's Seal is (round 2,
+    /// R2-05, Kimi).  A later Seal's publish covers it.
+    pub fn with_unpublished(mut self, seal: Position, error: String) -> Self {
+        self.after_seal_failures += 1;
+        self.last_after_seal_error = Some(error);
+        self.unpublished = Some(seal);
+        self
+    }
+
     /// Hand Nominate requests to `n`.
     pub fn with_nominations(mut self, n: &'v mut dyn Nominations<L>) -> Self {
         self.nominations = Some(n);
@@ -1620,6 +1631,84 @@ mod tests {
             vec![seal; 3],
             "the same Seal each time, retried once per effect until it landed"
         );
+    }
+
+    /// Round 2, R2-05 (Kimi): a Seal whose publish failed before the
+    /// session (the Warden's start: the birth Seal, the last Seal, an
+    /// adoption Seal) is retried before the first effect and counted, as a
+    /// turn's.  Without it the effect was refused for good although the
+    /// store was back, and the report said no publish failed.
+    #[test]
+    fn a_seal_unpublished_at_start_is_retried_before_the_first_effect() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Hook(Vec<Position>, Rc<Cell<bool>>);
+        impl<L: Layers> AfterSeal<L> for Hook {
+            fn after_seal(&mut self, _: &mut Vessel<L>, seal: Position) -> Result<(), String> {
+                self.0.push(seal);
+                self.1.set(true);
+                Ok(())
+            }
+        }
+        struct Strict(Rc<Cell<bool>>);
+        impl crate::effects::Publish for Strict {
+            fn publish(
+                &mut self,
+                _: taso_core::envelope::ChronicleId,
+                _: taso_core::envelope::Epoch,
+                _: &[&crate::segment::Segment],
+                _: Position,
+            ) -> Result<(), crate::effects::PublishError> {
+                if self.0.get() {
+                    Ok(())
+                } else {
+                    Err(crate::effects::PublishError(
+                        "pack: Seal not shipped".into(),
+                    ))
+                }
+            }
+        }
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        // A Seal taken in an earlier run, then a restart with the store
+        // down: its publish at start failed.
+        let birth = {
+            let mut s0 = Session::new(&mut v, Verdict::Clean).unwrap();
+            s0.handle(hello());
+            let Reply::TurnEnd {
+                sealed: Some(_), ..
+            } = s0.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true,
+            })
+            else {
+                panic!("turn 1 not sealed")
+            };
+            drop(s0);
+            v.last_seal().expect("turn 1's Seal")
+        };
+        let published = Rc::new(Cell::new(false));
+        let (mut fx, _) =
+            Effects::open(Mode::Dispatch, Box::new(Strict(published.clone())), &mut v).unwrap();
+        let mut hook = Hook(Vec::new(), published.clone());
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_after_seal(&mut hook)
+            .with_unpublished(birth, "store down".into());
+        assert_eq!(s.after_seal_failures(), (1, Some("store down")));
+        s.handle(hello());
+        // The store is back: the first effect retries the Seal, then goes.
+        assert!(matches!(
+            s.handle(declare(1, "mail", b"send bob")),
+            Reply::Effect {
+                result: EffectResult::Released { .. },
+                ..
+            }
+        ));
+        assert_eq!(s.after_seal_failures().0, 1, "counted once");
+        drop(s);
+        assert_eq!(hook.0, vec![birth], "the start's Seal, retried");
     }
 
     /// A later Seal published replaces the retry: an earlier Seal is never

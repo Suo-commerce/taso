@@ -4602,17 +4602,23 @@ impl Node {
         // A crash between taking a Seal and publishing it, or the birth
         // Seal just taken: publish now.  Counted only if this shipped it (a
         // Seal published before the restart is not published again).
+        // A failure is retried before the agent's first effect and
+        // counted, as a turn's (round 2, R2-05).
+        let mut unpublished: Option<(Position, String)> = None;
         if let Some(seal) = vessel.last_seal() {
             match publisher.publish(&mut vessel, seal) {
                 Ok(true) => publisher.published += 1,
                 Ok(false) => {}
-                Err(e) => self.log(
-                    vc,
-                    format_args!(
-                        "publishing the last Seal (lsn {}) failed: {e}",
-                        seal.lsn.get()
-                    ),
-                ),
+                Err(e) => {
+                    self.log(
+                        vc,
+                        format_args!(
+                            "publishing the last Seal (lsn {}) failed: {e}",
+                            seal.lsn.get()
+                        ),
+                    );
+                    unpublished = Some((seal, e.to_string()));
+                }
             }
         }
         // Open attempts closed, leftovers destroyed (D69, D66).
@@ -4785,15 +4791,22 @@ impl Node {
                 ),
             );
             match publisher.publish(&mut vessel, seal) {
-                Ok(true) => publisher.published += 1,
-                Ok(false) => {}
-                Err(e) => self.log(
-                    vc,
-                    format_args!(
-                        "publishing the adoption Seal (lsn {}) failed: {e}",
-                        seal.lsn.get()
-                    ),
-                ),
+                // It covers the start's Seal: the log ships through both.
+                Ok(true) => {
+                    publisher.published += 1;
+                    unpublished = None;
+                }
+                Ok(false) => unpublished = None,
+                Err(e) => {
+                    self.log(
+                        vc,
+                        format_args!(
+                            "publishing the adoption Seal (lsn {}) failed: {e}",
+                            seal.lsn.get()
+                        ),
+                    );
+                    unpublished = Some((seal, e.to_string()));
+                }
             }
         }
 
@@ -4920,7 +4933,7 @@ impl Node {
                 start,
                 connections: 0,
                 published: publisher.published,
-                publish_failures: 0,
+                publish_failures: u64::from(unpublished.is_some()),
                 pruned: publisher.pruned,
                 prune_failures: (publisher.prune_failures, publisher.prune_error.clone()),
                 agent: None,
@@ -5013,6 +5026,9 @@ impl Node {
                     .with_tick(&mut ticker);
                 if let Some(w) = watch {
                     session = session.with_watch(w);
+                }
+                if let Some((seal, e)) = unpublished.take() {
+                    session = session.with_unpublished(seal, e);
                 }
                 let served = serve_vessel(
                     &mut session,
