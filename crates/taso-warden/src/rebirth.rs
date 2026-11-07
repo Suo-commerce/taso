@@ -1065,6 +1065,61 @@ mod tests {
         assert!(v.append(Stream::Fs, raw(1)).is_ok(), "A keeps appending");
     }
 
+    /// Release test N4 (review fix N4a): a pack from before V4b's format
+    /// break (header version 1) is refused by the rebirth's first read,
+    /// before any write: nobody is fenced, the holder keeps appending, and
+    /// the new node received nothing and wrote no state.
+    #[test]
+    fn an_old_pack_is_refused_before_any_write() {
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
+        let s1 = turn(&mut v, 1);
+        v.publish_seal(&n.packs(v.id()), &snap(&v, s1), None)
+            .unwrap();
+        // Every pack in the store made version 1, as an old Warden wrote it.
+        let mut packs = 0;
+        let mut dirs = vec![n.tmp.path().join("store")];
+        while let Some(d) = dirs.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    dirs.push(p);
+                    continue;
+                }
+                let mut b = std::fs::read(&p).unwrap();
+                if b.len() > 8 && b[..8] == *b"TASOPAK\0" {
+                    assert_eq!(b[8], 2, "this build writes version 2");
+                    b[8] = 1;
+                    std::fs::write(&p, b).unwrap();
+                    packs += 1;
+                }
+            }
+        }
+        assert!(packs > 0, "the Seal shipped a pack");
+        let before = n.coord.ownership(v.id()).unwrap();
+        let Err(e) = b.rebirth(v.id(), &n.packs(v.id())) else {
+            panic!("an old pack was received")
+        };
+        assert!(e.to_string().contains("pack version 1"), "{e}");
+        let after = n.coord.ownership(v.id()).unwrap();
+        assert_eq!(
+            (after.holder, after.epoch),
+            (before.holder, before.epoch),
+            "not fenced"
+        );
+        assert!(v.append(Stream::Fs, raw(2)).is_ok(), "A keeps appending");
+        let ds = b.dataset_for(v.id());
+        assert!(
+            b.pool.received_of(ds.as_str()).is_empty(),
+            "nothing received"
+        );
+        assert!(
+            !b.state_dir.exists() || std::fs::read_dir(&b.state_dir).unwrap().next().is_none(),
+            "no state written on the new node"
+        );
+    }
+
     /// The chain names the snapshot the Seal was taken from by its guid;
     /// receiving something else is refused.
     #[test]
