@@ -34,17 +34,16 @@ use taso_core::contract::{
     VerificationStarted,
 };
 use taso_core::coordlog::Submitted;
-use taso_core::envelope::{HashVal, Stream};
+use taso_core::envelope::HashVal;
 use taso_core::model::WardenId;
-use taso_core::record::{Origin, Payload};
+use taso_core::record::Origin;
 
 pub use taso_core::decider::{PendingItem, RetryReason, VerdictAnswer};
 
 use crate::attempt::Failpoint;
-use crate::chronicle::{ChronicleError, Layers};
+use crate::chronicle::Layers;
 use crate::coordinator::{Coord, CoordError};
 use crate::pack::Packs;
-use crate::segment::Frame;
 use crate::ship::{Sender, SharedStore};
 use crate::submit::{self, SubmitError};
 use crate::vessel::{Vessel, VesselError};
@@ -353,7 +352,10 @@ impl Verdicts {
             Some(ContractRecord::VerificationStarted(st)) => st,
             _ => return Ok(Some((Refusal::WrongAttempt, "no such attempt".into()))),
         };
-        for st in started_in(&frames(vessel)?) {
+        for st in started_in(&crate::attempt::open_work(
+            self.coord.as_ref(),
+            vessel.id(),
+        )?) {
             if st.candidate_id != req.candidate_id || st.started_at <= named.started_at {
                 continue;
             }
@@ -387,7 +389,10 @@ impl Verdicts {
         vessel: &Vessel<L>,
         cid: HashVal,
     ) -> Result<bool, VerdictError> {
-        for st in started_in(&frames(vessel)?) {
+        for st in started_in(&crate::attempt::open_work(
+            self.coord.as_ref(),
+            vessel.id(),
+        )?) {
             if st.candidate_id == cid
                 && self.accepted(LogicalKey::Attempt(st.attempt_id))?.is_some()
                 && self
@@ -461,24 +466,11 @@ pub(crate) enum Recorded {
     Unknown(String),
 }
 
-fn frames<L: Layers>(vessel: &Vessel<L>) -> Result<Vec<Frame>, VerdictError> {
-    Ok(vessel
-        .chronicle()
-        .frames()
-        .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?)
+fn contracts(frames: &[ContractRecord]) -> impl Iterator<Item = ContractRecord> + '_ {
+    frames.iter().cloned()
 }
 
-fn contracts(frames: &[Frame]) -> impl Iterator<Item = ContractRecord> + '_ {
-    frames
-        .iter()
-        .filter(|f| f.envelope.stream == Stream::Ctl)
-        .filter_map(|f| match Payload::decode(&f.payload) {
-            Ok(Payload::Contract(r)) => Some(*r),
-            _ => None,
-        })
-}
-
-fn started_in(frames: &[Frame]) -> Vec<VerificationStarted> {
+fn started_in(frames: &[ContractRecord]) -> Vec<VerificationStarted> {
     let mut seen = BTreeSet::new();
     contracts(frames)
         .filter_map(|r| match r {
@@ -490,9 +482,15 @@ fn started_in(frames: &[Frame]) -> Vec<VerificationStarted> {
         .collect()
 }
 
-/// The pending Candidates in a Vessel's local log (D73): open (accepted,
-/// not closed), not committed, with at least one finished attempt.
-pub fn pending(coord: &dyn Coord, frames: &[Frame]) -> Result<Vec<PendingItem>, CoordError> {
+/// The pending Candidates of a Vessel (D73): open (accepted, not closed),
+/// not committed, with at least one finished attempt.  From the
+/// coordinator's list of its open work, not its local log (review fix
+/// A2-1: pruning removes the log's prefix).
+pub fn pending(
+    coord: &dyn Coord,
+    chronicle: taso_core::envelope::ChronicleId,
+) -> Result<Vec<PendingItem>, CoordError> {
+    let frames = &crate::attempt::open_work(coord, chronicle)?;
     let q = |key: LogicalKey| -> Result<Option<ContractRecord>, CoordError> {
         Ok(match coord.query_logical(logical_id(&key))? {
             Some((_, Submitted::Contract(r))) => Some(r),

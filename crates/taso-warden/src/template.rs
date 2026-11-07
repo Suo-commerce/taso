@@ -2256,8 +2256,18 @@ mod tests {
 
     const VCONF: &[u8] = b"version = 1\nentry = [\"/bin/sh\", \"-c\", \"exit 0\"]\n";
 
-    fn audit2_nominated(c: &Cluster, subject: &[u8]) -> (Host<crate::vessel::tests::FakePool>, FV, Packs<SharedStore, Bytes>, taso_core::contract::Candidate) {
-        use taso_core::contract::{Candidate, ClassCounts, Facts, SealRef, VerifierRequirement, candidate_id, facts_hash};
+    fn audit2_nominated(
+        c: &Cluster,
+        subject: &[u8],
+    ) -> (
+        Host<crate::vessel::tests::FakePool>,
+        FV,
+        Packs<SharedStore, Bytes>,
+        taso_core::contract::Candidate,
+    ) {
+        use taso_core::contract::{
+            candidate_id, facts_hash, Candidate, ClassCounts, Facts, SealRef, VerifierRequirement,
+        };
         let host = Host {
             coord: c.coord.clone(),
             pool: crate::vessel::tests::FakePool::default(),
@@ -2289,21 +2299,54 @@ mod tests {
         let vk = taso_core::contract::object_key(ObjectKind::Vconf, VCONF);
         let path = object_key_path(PREFIX, ObjectKind::Vconf, vk).unwrap();
         c.store.put(&path, &mut Cursor::new(VCONF)).unwrap();
-        let requirement = VerifierRequirement { template: c.t0, vconf_key: vk, version: 1 };
-        let facts = Facts { input: ClassCounts { source: 2, ..Default::default() }, excluded: Default::default(), open_obligations: 0, effects_adopted: 0, ledger_lsn: v.tail().lsn, requirement };
+        let requirement = VerifierRequirement {
+            template: c.t0,
+            vconf_key: vk,
+            version: 1,
+        };
+        let facts = Facts {
+            input: ClassCounts {
+                source: 2,
+                ..Default::default()
+            },
+            excluded: Default::default(),
+            open_obligations: 0,
+            effects_adopted: 0,
+            ledger_lsn: v.tail().lsn,
+            requirement,
+        };
         let exclude = [PathClass::Scratch].into();
         let cand = Candidate {
             candidate_id: candidate_id(v.id(), s.hash, &exclude, t.classmap_key, 1, &requirement),
-            chronicle: v.id(), seal: SealRef { lsn: s.lsn, hash: s.hash }, exclude, transform_version: 1,
-            classmap_key: t.classmap_key, input_manifest_key: t.output_manifest_key,
-            output_manifest_key: t.output_manifest_key, artifact_key: t.layer,
-            requirement, facts, facts_hash: facts_hash(&facts), nominated_by: NominatedBy::Agent,
+            chronicle: v.id(),
+            seal: SealRef {
+                lsn: s.lsn,
+                hash: s.hash,
+            },
+            exclude,
+            transform_version: 1,
+            classmap_key: t.classmap_key,
+            input_manifest_key: t.output_manifest_key,
+            output_manifest_key: t.output_manifest_key,
+            artifact_key: t.layer,
+            requirement,
+            facts,
+            facts_hash: facts_hash(&facts),
+            nominated_by: NominatedBy::Agent,
             nominated_at: v.tail().lsn.next(),
         };
         let rec = ContractRecord::Candidate(Box::new(cand.clone()));
         v.append_contract(rec.clone()).unwrap();
         let mut counter = *v.attempt_mut();
-        crate::submit::submit(c.coord.as_ref(), WardenId::new(1), v.chronicle(), &packs, Submitted::Contract(rec), &mut counter).unwrap();
+        crate::submit::submit(
+            c.coord.as_ref(),
+            WardenId::new(1),
+            v.chronicle(),
+            &packs,
+            Submitted::Contract(rec),
+            &mut counter,
+        )
+        .unwrap();
         *v.attempt_mut() = counter;
         (host, v, packs, cand)
     }
@@ -2314,7 +2357,9 @@ mod tests {
             v.append(Stream::Fs, Payload::Raw(vec![1; 8])).unwrap();
         }
         packs.ship_log(&v.chronicle().segments(), v.tail()).unwrap();
-        c.coord.advance_shipped(WardenId::new(1), v.id(), v.chronicle().epoch(), v.tail()).unwrap();
+        c.coord
+            .advance_shipped(WardenId::new(1), v.id(), v.chronicle().epoch(), v.tail())
+            .unwrap();
         assert!(!v.prune(2).unwrap().removed.is_empty());
     }
 
@@ -2334,13 +2379,29 @@ mod tests {
         let (host, mut v, packs, cand) = audit2_nominated(&c, b"audit2-a");
         let at = attempts(&c);
         let st = at.start(&mut v, &packs, &cand).unwrap();
-        assert_eq!(at.open(&v).unwrap(), vec![st.clone()]);
+        assert_eq!(at.open(&v).unwrap(), vec![st]);
         audit2_prune(&c, &mut v, &packs);
         let id = v.id();
         drop(v);
-        let (v, _) = host.open(id).unwrap();
-        assert!(c.coord.query_logical(logical_id(&LogicalKey::Attempt(st.attempt_id))).unwrap().is_some());
+        let (mut v, _) = host.open(id).unwrap();
+        assert!(c
+            .coord
+            .query_logical(logical_id(&LogicalKey::Attempt(st.attempt_id)))
+            .unwrap()
+            .is_some());
         assert_eq!(at.open(&v).unwrap(), vec![st]);
+        // And recovery acts on it (D69): closed Interrupted, no longer open.
+        assert_eq!(at.interrupt_open(&mut v, &packs).unwrap(), vec![st]);
+        assert!(matches!(
+            c.coord
+                .query_logical(logical_id(&LogicalKey::AttemptFinished(st.attempt_id)))
+                .unwrap(),
+            Some((_, Submitted::Contract(ContractRecord::VerificationFinished(f))))
+                if f.outcome == VOutcome::Interrupted
+        ));
+        assert!(at.open(&v).unwrap().is_empty());
+        // Interrupted, it is attempted again (D88).
+        assert_eq!(at.to_attempt(&v).unwrap(), vec![cand]);
     }
 
     #[test]
@@ -2349,12 +2410,38 @@ mod tests {
         let (_h, mut v, packs, cand) = audit2_nominated(&c, b"audit2-s");
         let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
         let r = request(&cand, &f, Decision::Sanction);
-        assert!(matches!(verdicts(&c).handle(&mut v, &packs, &r, PEER).unwrap(), VerdictAnswer::Committed { .. }));
+        assert!(matches!(
+            verdicts(&c).handle(&mut v, &packs, &r, PEER).unwrap(),
+            VerdictAnswer::Committed { .. }
+        ));
         let s = sanction_of(&c, cand.candidate_id).unwrap();
         let fin = finisher(&c, 1);
         assert_eq!(fin.unfinished(&v).unwrap(), vec![s]);
         audit2_prune(&c, &mut v, &packs);
         assert_eq!(fin.unfinished(&v).unwrap(), vec![s]);
+        // And it is finished from there: the Template completed.
+        fin.finish(&mut v, &packs, &s).unwrap();
+        assert!(completed(&c, s.template_id));
+        assert!(fin.unfinished(&v).unwrap().is_empty());
+    }
+
+    /// Review fix A2-1: a Candidate with a finished attempt, pruned past,
+    /// is still offered for a decision (D73), and the verdict binds.
+    #[test]
+    fn audit2_pending_decision_survives_pruning() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, cand) = audit2_nominated(&c, b"audit2-p");
+        let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
+        assert_eq!(verdict::pending(c.coord.as_ref(), v.id()).unwrap().len(), 1);
+        audit2_prune(&c, &mut v, &packs);
+        let p = verdict::pending(c.coord.as_ref(), v.id()).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].candidate, cand);
+        let r = request(&cand, &f, Decision::Sanction);
+        assert!(matches!(
+            verdicts(&c).handle(&mut v, &packs, &r, PEER).unwrap(),
+            VerdictAnswer::Committed { .. }
+        ));
     }
 
     #[test]
@@ -2949,13 +3036,11 @@ mod tests {
         let vd = verdicts(&c);
         let cid = cand.candidate_id;
         // Nothing to decide before an attempt has finished (D73).
-        let frames = v.chronicle().frames().unwrap();
-        assert!(verdict::pending(c.coord.as_ref(), &frames)
+        assert!(verdict::pending(c.coord.as_ref(), v.id())
             .unwrap()
             .is_empty());
         let f = attempted(&c, &mut v, &packs, &cand, VOutcome::Exit { code: 0 });
-        let frames = v.chronicle().frames().unwrap();
-        let p = verdict::pending(c.coord.as_ref(), &frames).unwrap();
+        let p = verdict::pending(c.coord.as_ref(), v.id()).unwrap();
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].candidate, cand);
         assert_eq!(p[0].attempts[0].1, f);
@@ -2991,8 +3076,7 @@ mod tests {
         let hold = request(&cand, &f, Decision::Hold);
         assert_eq!(vd.handle(&mut v, &packs, &hold, PEER).unwrap(), a);
         assert_eq!(v.tail().lsn, tail, "nothing more recorded");
-        let frames = v.chronicle().frames().unwrap();
-        assert!(verdict::pending(c.coord.as_ref(), &frames)
+        assert!(verdict::pending(c.coord.as_ref(), v.id())
             .unwrap()
             .is_empty());
     }
@@ -3079,8 +3163,7 @@ mod tests {
             vd.handle(&mut v, &packs, &never, PEER).unwrap(),
             VerdictAnswer::ClosedNever
         );
-        let frames = v.chronicle().frames().unwrap();
-        assert!(verdict::pending(c.coord.as_ref(), &frames)
+        assert!(verdict::pending(c.coord.as_ref(), v.id())
             .unwrap()
             .is_empty());
         // After the close: Closed, for any new request.

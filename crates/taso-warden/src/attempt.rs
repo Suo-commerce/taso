@@ -38,18 +38,16 @@ use taso_core::contract::{
     ObjectKind, Outcome, VerificationFinished, VerificationStarted,
 };
 use taso_core::coordlog::Submitted;
-use taso_core::envelope::{HashVal, Lsn, Stream};
+use taso_core::envelope::{HashVal, Lsn};
 use taso_core::model::WardenId;
-use taso_core::record::Payload;
 
 use crate::artifact;
-use crate::chronicle::{ChronicleError, Layers};
+use crate::chronicle::Layers;
 use crate::classify::{self, Classmap, Limits, Manifest, Owner, Reserved};
 use crate::coordinator::{Coord, CoordError};
 use crate::coordstore::object_key_path;
 use crate::pack::Packs;
 use crate::runtime::{write_verifier_bundle, VerifierSpec, VERIFIER_DIRS};
-use crate::segment::Frame;
 use crate::ship::{Sender, SharedStore};
 use crate::storage::Dataset;
 use crate::submit::{self, SubmitError};
@@ -252,16 +250,17 @@ impl Attempts {
         &self,
         vessel: &Vessel<L>,
     ) -> Result<Vec<Candidate>, AttemptError> {
-        self.to_attempt_in(&frames(vessel)?, false)
+        self.to_attempt_in(&open_work(self.coord.as_ref(), vessel.id())?, false)
     }
 
-    /// [`Attempts::to_attempt`] over a Vessel's local log read without
-    /// opening it.  With `open_as_interrupted`, an attempt still open
-    /// counts as interrupted: the open that settles it (D69) closes it so
-    /// (the Warden's own start, D88).
+    /// [`Attempts::to_attempt`] over a Vessel's open work as the
+    /// coordinator lists it ([`open_work`]), without opening the Vessel.
+    /// With `open_as_interrupted`, an attempt still open counts as
+    /// interrupted: the open that settles it (D69) closes it so (the
+    /// Warden's own start, D88).
     pub fn to_attempt_in(
         &self,
-        frames: &[Frame],
+        frames: &[ContractRecord],
         open_as_interrupted: bool,
     ) -> Result<Vec<Candidate>, AttemptError> {
         // Per Candidate: the interrupted attempts, or None once one is
@@ -319,7 +318,7 @@ impl Attempts {
         &self,
         vessel: &Vessel<L>,
     ) -> Result<Vec<VerificationStarted>, AttemptError> {
-        Ok(started_in(&frames(vessel)?))
+        Ok(started_in(&open_work(self.coord.as_ref(), vessel.id())?))
     }
 
     fn accepted(&self, key: LogicalKey) -> Result<bool, AttemptError> {
@@ -377,15 +376,29 @@ impl Attempts {
     }
 }
 
-fn frames<L: Layers>(vessel: &Vessel<L>) -> Result<Vec<Frame>, AttemptError> {
-    Ok(vessel
-        .chronicle()
-        .frames()
-        .map_err(|e| VesselError::Chronicle(ChronicleError::Segment(e)))?)
+/// The contract records of `chronicle`'s outstanding work, as the
+/// coordinator lists them in log order (review fix A2-1).  Every reader of
+/// a Vessel's contract work starts here: the Vessel's local log loses its
+/// prefix to pruning (after every Seal, two closed segments kept), and a
+/// Candidate, an open attempt or a committed sanction read from it went
+/// undiscovered once its record was pruned, while the coordinator still
+/// held it (Kimi K3.1 Pro's audit, round 2).
+pub fn open_work(
+    coord: &dyn Coord,
+    chronicle: taso_core::envelope::ChronicleId,
+) -> Result<Vec<ContractRecord>, crate::coordinator::CoordError> {
+    Ok(coord
+        .open_work(chronicle)?
+        .into_iter()
+        .filter_map(|(_, s)| match s {
+            Submitted::Contract(r) => Some(r),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Every `VerificationStarted` in `frames`, once each.
-fn started_in(frames: &[Frame]) -> Vec<VerificationStarted> {
+fn started_in(frames: &[ContractRecord]) -> Vec<VerificationStarted> {
     let mut seen = BTreeSet::new();
     contracts(frames)
         .filter_map(|r| match r {
@@ -397,14 +410,8 @@ fn started_in(frames: &[Frame]) -> Vec<VerificationStarted> {
         .collect()
 }
 
-fn contracts(frames: &[Frame]) -> impl Iterator<Item = ContractRecord> + '_ {
-    frames
-        .iter()
-        .filter(|f| f.envelope.stream == Stream::Ctl)
-        .filter_map(|f| match Payload::decode(&f.payload) {
-            Ok(Payload::Contract(r)) => Some(*r),
-            _ => None,
-        })
+fn contracts(frames: &[ContractRecord]) -> impl Iterator<Item = ContractRecord> + '_ {
+    frames.iter().cloned()
 }
 
 /// The `/candidate` dataset of an attempt, `<root>/a-<attempt_id hex>`.

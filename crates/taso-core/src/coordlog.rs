@@ -872,6 +872,62 @@ impl CoordLog {
         })
     }
 
+    /// `query { open_work }` (review fix A2-1): the accepted contract
+    /// records of `chronicle`'s outstanding work, in log order with their
+    /// positions -- every Candidate not closed, every attempt of those
+    /// (started; a reader asks for its finish), and every sanction commit
+    /// whose `SanctionCompleted` is not accepted (the Candidate closes at
+    /// `TemplateReady`, before it).  What the Warden discovers its work from: the
+    /// Vessel's local log loses its prefix to pruning, the log here keeps
+    /// it.  At most `max_open_candidates` Candidates and their attempts.
+    pub fn open_work(&self, chronicle: ChronicleId) -> Vec<(u64, Submitted)> {
+        let c = *chronicle.as_bytes();
+        let mut out: Vec<(u64, Submitted)> = Vec::new();
+        let mut open: BTreeSet<H32> = BTreeSet::new();
+        for (id, k) in &self.cands {
+            if k.chronicle != c {
+                continue;
+            }
+            // A commit is outstanding until its SanctionCompleted, which
+            // comes after the TemplateReady that closes the Candidate.
+            if let Some(pos) = k.commit {
+                let rec = &self.log[pos as usize - 1].record;
+                let completed = match rec {
+                    Submitted::Contract(ContractRecord::SanctionCommitted(sc)) => {
+                        self.logical.contains_key(
+                            crate::contract::logical_id(&LogicalKey::SanctionCompleted(
+                                sc.template_id,
+                            ))
+                            .as_bytes(),
+                        )
+                    }
+                    _ => true,
+                };
+                if !completed {
+                    out.push((pos, rec.clone()));
+                }
+            }
+            if k.state == CandState::Closed {
+                continue;
+            }
+            open.insert(*id);
+            out.push((
+                k.created_by,
+                Submitted::Contract(ContractRecord::Candidate(Box::new(k.record.clone()))),
+            ));
+        }
+        for a in self.attempts.values() {
+            if open.contains(a.started.candidate_id.as_bytes()) {
+                out.push((
+                    a.started_by,
+                    Submitted::Contract(ContractRecord::VerificationStarted(a.started)),
+                ));
+            }
+        }
+        out.sort_by_key(|(pos, _)| *pos);
+        out
+    }
+
     /// `query { logical }`: the accepted record and its position.
     pub fn query_logical(&self, logical: HashVal) -> Option<(u64, &Submitted)> {
         self.logical

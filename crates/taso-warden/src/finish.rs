@@ -227,22 +227,17 @@ impl Finisher {
         })
     }
 
-    /// The accepted commits in `vessel`'s local log whose sanction is not
-    /// completed (step 6).
+    /// The accepted commits of `vessel` whose sanction is not completed
+    /// (step 6), from the coordinator's list of its open work, not its
+    /// local log (review fix A2-1: pruning removes the log's prefix).
     pub fn unfinished<L: Layers>(
         &self,
         vessel: &Vessel<L>,
     ) -> Result<Vec<SanctionCommitted>, FinishError> {
-        let frames = vessel
-            .chronicle()
-            .frames()
-            .map_err(|e| FinishError::Chronicle(ChronicleError::Segment(e)))?;
+        let work = crate::attempt::open_work(self.coord.as_ref(), vessel.id())?;
         let mut out: Vec<SanctionCommitted> = Vec::new();
-        for f in frames.iter().filter(|f| f.envelope.stream == Stream::Ctl) {
-            let Ok(Payload::Contract(r)) = Payload::decode(&f.payload) else {
-                continue;
-            };
-            let ContractRecord::SanctionCommitted(s) = *r else {
+        for r in work {
+            let ContractRecord::SanctionCommitted(s) = r else {
                 continue;
             };
             if out.iter().any(|o| o.candidate_id == s.candidate_id) {

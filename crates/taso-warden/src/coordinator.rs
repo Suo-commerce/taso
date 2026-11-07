@@ -595,6 +595,16 @@ pub trait Coord: Send + Sync {
         Err(no_log())
     }
 
+    /// `query { open_work }` (review fix A2-1): the accepted contract
+    /// records of the Chronicle's outstanding work, in log order with
+    /// their positions ([`taso_core::coordlog::CoordLog::open_work`]).
+    /// The Warden's readers of its contract work start here, not from the
+    /// Vessel's local log, whose prefix pruning removes.
+    fn open_work(&self, chronicle: ChronicleId) -> Result<Vec<(u64, Submitted)>, CoordError> {
+        let _ = chronicle;
+        Err(no_log())
+    }
+
     /// The accepted record at log position `pos` (1-based), as the log
     /// keeps it (`taso ctl explain`, P4 file 12).
     fn query_entry(&self, pos: u64) -> Result<Option<taso_core::coordlog::LogEntry>, CoordError> {
@@ -1815,6 +1825,10 @@ impl Coord for Coordinator {
     /// The Chronicle's open obligations as the log derives them (§1.5).
     fn obligations(&self, chronicle: ChronicleId) -> Result<Vec<u64>, CoordError> {
         self.read_log(move |log| log.obligations(chronicle))
+    }
+
+    fn open_work(&self, chronicle: ChronicleId) -> Result<Vec<(u64, Submitted)>, CoordError> {
+        self.read_log(move |log| log.open_work(chronicle))
     }
 
     fn purge_projection(&self, chronicle: ChronicleId) -> Result<Vec<InventoryItem>, CoordError> {

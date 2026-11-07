@@ -195,6 +195,7 @@ const OP_OBLIGATIONS: u8 = 19;
 const OP_PURGE_PROJECTION: u8 = 20;
 const OP_PURGE_BLOCKER: u8 = 21;
 const OP_QUERY_ENTRY: u8 = 22;
+const OP_OPEN_WORK: u8 = 23;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -319,6 +320,9 @@ enum Request {
         chronicle: ChronicleId,
     },
     PurgeProjection {
+        chronicle: ChronicleId,
+    },
+    OpenWork {
         chronicle: ChronicleId,
     },
     PurgeBlocker {
@@ -644,6 +648,7 @@ impl Request {
             Self::PurgeProjection { chronicle } => {
                 o.u8(OP_PURGE_PROJECTION).bytes(chronicle.as_bytes())
             }
+            Self::OpenWork { chronicle } => o.u8(OP_OPEN_WORK).bytes(chronicle.as_bytes()),
             Self::PurgeBlocker { chronicle } => o.u8(OP_PURGE_BLOCKER).bytes(chronicle.as_bytes()),
             Self::QueryEntry { pos } => o.u8(OP_QUERY_ENTRY).u64(*pos),
         };
@@ -773,6 +778,9 @@ impl Request {
             OP_PURGE_PROJECTION => Self::PurgeProjection {
                 chronicle: i.chronicle()?,
             },
+            OP_OPEN_WORK => Self::OpenWork {
+                chronicle: i.chronicle()?,
+            },
             OP_PURGE_BLOCKER => Self::PurgeBlocker {
                 chronicle: i.chronicle()?,
             },
@@ -808,6 +816,7 @@ impl Request {
             | Self::QueryChronicle { .. }
             | Self::Obligations { .. }
             | Self::PurgeProjection { .. }
+            | Self::OpenWork { .. }
             | Self::PurgeBlocker { .. }
             | Self::QueryEntry { .. } => None,
         }
@@ -834,6 +843,7 @@ impl Request {
             | Self::QueryChronicle { .. }
             | Self::Obligations { .. }
             | Self::PurgeProjection { .. }
+            | Self::OpenWork { .. }
             | Self::PurgeBlocker { .. }
             | Self::QueryEntry { .. } => OkKind::Blob,
         }
@@ -1200,6 +1210,15 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
                 Ok(Reply::Blob(c.into_bytes()))
             })
         }
+        Request::OpenWork { chronicle } => coord.open_work(chronicle).map(|work| {
+            let mut c = Canon::new();
+            c.u64(work.len() as u64);
+            for (pos, rec) in &work {
+                c.u64(*pos);
+                put_submitted(&mut c, rec);
+            }
+            Reply::Blob(c.into_bytes())
+        }),
         Request::QueryEntry { pos } => coord.query_entry(pos).map(|e| {
             let mut c = Canon::new();
             match e {
@@ -1889,6 +1908,19 @@ impl Coord for RemoteCoord {
             taso_core::contract::Inventory::decode(&b)
                 .map(|i| i.items().to_vec())
                 .map_err(|_| JournalError("bad inventory"))
+        })
+    }
+
+    fn open_work(&self, chronicle: ChronicleId) -> Result<Vec<(u64, Submitted)>, CoordError> {
+        let r = self.call(Request::OpenWork { chronicle })?;
+        blob_reply(r, |r| {
+            let n = r.u64()?;
+            // Bounded by the log (max_open_candidates and their attempts):
+            // a count past any honest one is a bad reply, not an allocation.
+            if n > 1 << 16 {
+                return Err(JournalError("too many records of open work"));
+            }
+            (0..n).map(|_| Ok((r.u64()?, get_submitted(r)?))).collect()
         })
     }
 
@@ -2639,6 +2671,8 @@ mod tests {
             c.purge_projection(t0).unwrap(),
             coord.purge_projection(t0).unwrap()
         );
+        // open_work (review fix A2-1): the same records over the wire.
+        assert_eq!(c.open_work(t0).unwrap(), coord.open_work(t0).unwrap());
         // The log's entries (P4 file 12).
         let e = c.query_entry(1).unwrap().unwrap();
         assert_eq!(e, coord.query_entry(1).unwrap().unwrap());
@@ -2786,6 +2820,81 @@ mod tests {
         let c = RemoteCoord::with_timeout(dir.path().join("c.sock"), Duration::from_secs(5));
         let e = c.obligations(chron(1)).unwrap_err();
         assert!(e.outcome_unknown(), "{e:?}");
+        server.stop();
+    }
+
+    /// Review fix A2-1: `open_work` crosses the socket record for record,
+    /// in order, with its positions; and a coordinator without a log says
+    /// so for it as for its other log queries.
+    #[test]
+    fn open_work_crosses_the_socket() {
+        struct Work(Coordinator, Vec<(u64, Submitted)>);
+        impl Coord for Work {
+            fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+                self.0.register(c, h)
+            }
+            fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
+                self.0.append(w, e)
+            }
+            fn append_batch_with(
+                &self,
+                w: WardenId,
+                e: &[Envelope],
+                fx: &[Vec<u8>],
+            ) -> Result<ChronicleHead, CoordError> {
+                self.0.append_batch_with(w, e, fx)
+            }
+            fn transfer_if(
+                &self,
+                c: ChronicleId,
+                h: WardenId,
+                e: (WardenId, Epoch),
+            ) -> Result<Epoch, CoordError> {
+                self.0.transfer_if(c, h, e)
+            }
+            fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+                self.0.transfer(c, h)
+            }
+            fn ownership(&self, c: ChronicleId) -> Result<Ownership, CoordError> {
+                self.0.ownership(c)
+            }
+            fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
+                self.0.head(c)
+            }
+            fn advance_shipped(
+                &self,
+                w: WardenId,
+                c: ChronicleId,
+                e: Epoch,
+                to: Position,
+            ) -> Result<Position, CoordError> {
+                self.0.advance_shipped(w, c, e, to)
+            }
+            fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+                self.0.shipped(c)
+            }
+            fn open_work(&self, c: ChronicleId) -> Result<Vec<(u64, Submitted)>, CoordError> {
+                assert_eq!(c, chron(7));
+                Ok(self.1.clone())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let work = vec![
+            (3, genesis_record()),
+            (
+                9,
+                Submitted::Contract(taso_core::contract::ContractRecord::SanctionCompleted {
+                    template_id: chron(8),
+                }),
+            ),
+        ];
+        let served: Arc<dyn Coord> = Arc::new(Work(
+            Coordinator::open(dir.path().join("c.redb")).unwrap(),
+            work.clone(),
+        ));
+        let server = Server::spawn(dir.path().join("c.sock"), served).unwrap();
+        let c = RemoteCoord::with_timeout(dir.path().join("c.sock"), Duration::from_secs(5));
+        assert_eq!(c.open_work(chron(7)).unwrap(), work);
         server.stop();
     }
 

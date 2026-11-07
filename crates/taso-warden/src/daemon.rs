@@ -2061,12 +2061,10 @@ impl crate::decidesrv::Decide for NodeDecider {
                 continue;
             }
             match node.hold_for_decider(*id.as_bytes()) {
-                // Not running: its local log, read as it is (no open).
+                // Not running: the coordinator's list (no open).
                 Ok(_slot) => {
-                    let frames = crate::chronicle::read_log(&node.host().dir_for(id))
-                        .map_err(|e| format!("reading the log of {}: {e}", id_hex(id)))?;
                     items.extend(
-                        crate::verdict::pending(node.coord.as_ref(), &frames)
+                        crate::verdict::pending(node.coord.as_ref(), id)
                             .map_err(|e| format!("coordinator: {e}"))?,
                     );
                 }
@@ -3913,14 +3911,14 @@ impl Node {
                 return later();
             }
         }
-        let frames = match crate::chronicle::read_log(&self.host().dir_for(id)) {
-            Ok(f) => f,
+        let work = match crate::attempt::open_work(self.coord.as_ref(), id) {
+            Ok(w) => w,
             Err(e) => {
-                log(format!("verifier: reading its log: {e}"));
+                log(format!("verifier: coordinator: {e}"));
                 return later();
             }
         };
-        let todo = match self.attempts().to_attempt_in(&frames, true) {
+        let todo = match self.attempts().to_attempt_in(&work, true) {
             Ok(t) => t,
             Err(e) => {
                 log(format!("verifier: listing Candidates to verify: {e}"));
@@ -4026,14 +4024,8 @@ impl Node {
     fn do_job(&self, vessel: &mut Vessel<BlkLayers>, job: Job) {
         match job {
             Job::Pending(tx) => {
-                let r = vessel
-                    .chronicle()
-                    .frames()
-                    .map_err(|e| format!("reading the log of {}: {e}", id_hex(vessel.id())))
-                    .and_then(|f| {
-                        crate::verdict::pending(self.coord.as_ref(), &f)
-                            .map_err(|e| format!("coordinator: {e}"))
-                    });
+                let r = crate::verdict::pending(self.coord.as_ref(), vessel.id())
+                    .map_err(|e| format!("coordinator: {e}"));
                 let _ = tx.send(r);
             }
             Job::Verdict(req, peer, tx) => {
