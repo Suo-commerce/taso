@@ -226,6 +226,16 @@ for n in a b; do
     tar -C "$WORK" -cf - bin rootfs | on "$n" "tar -C $WORK -xf -"
     durable "$n"
 done
+# The installed daemons (node A; node B too with two machines) must answer
+# and must be this build: a socket file can outlive its daemon, and an old
+# installed binary would gate old code (2026-11-07, both seen on taso-test).
+installed=a; [ "$ONE_MACHINE" = 0 ] && installed="a b"
+for n in $installed; do
+    blk "$n" names >/dev/null 2>&1 \
+        || die "node $n: taso-blkd does not answer on $(sock_of "$n") (systemctl start taso-blkd)"
+    on "$n" "p=\$(systemctl show -p MainPID --value taso-blkd); [ \"\${p:-0}\" != 0 ] && cmp -s $WORK/bin/taso-blkd /proc/\$p/exe" \
+        || die "node $n: the running taso-blkd is not this build; on node $n: install $WORK/bin/taso-blkd /usr/local/bin/taso-blkd && systemctl restart taso-blkd"
+done
 
 # ── coordinator and store ─────────────────────────────────────────────
 if [ "$ONE_MACHINE" = 1 ]; then
