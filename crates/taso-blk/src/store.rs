@@ -664,6 +664,12 @@ impl Store {
         if buf.is_empty() || !(buf.len() as u64).is_multiple_of(BLOCK) {
             return Err(StoreError::BadLength(buf.len()));
         }
+        // The range checked before any block, as `write` does: unchecked,
+        // `lba + i` panicked in a debug build and, optimized, wrapped to
+        // LBA 0 and returned another block's data (review fix H1, Kimi's
+        // H1, reproduced in both profiles).
+        lba.checked_add(buf.len() as u64 / BLOCK)
+            .ok_or(MapError::Overflow)?;
         for (i, chunk) in buf.chunks_mut(BLOCK as usize).enumerate() {
             match self.map.read(layer, lba + i as u64)? {
                 Some(Loc::Log(off)) => self.file.read_exact_at(chunk, off)?,
@@ -1986,6 +1992,32 @@ mod tests {
             0,
             "the Seal never sees a branch's writes"
         );
+    }
+
+    /// Review fix H1 (Kimi's H1): a read whose range passes the last LBA
+    /// is refused before any block; it used to wrap (optimized: the second
+    /// block returned LBA 0's data; debug: a panic).
+    #[test]
+    fn a_read_past_the_last_lba_is_refused_and_never_wraps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::create(&dir.path().join("log")).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &vec![0x5a; BLOCK as usize], false).unwrap();
+        let mut buf = vec![0xee; 2 * BLOCK as usize];
+        for lba in [u64::MAX, u64::MAX - 1] {
+            assert!(
+                matches!(
+                    s.read(b, lba, &mut buf),
+                    Err(StoreError::Map(MapError::Overflow))
+                ),
+                "a read of two blocks at {lba}"
+            );
+        }
+        assert!(buf.iter().all(|&x| x == 0xee), "nothing was read");
+        // The last whole range that fits still reads (unwritten: zeros).
+        s.read(b, u64::MAX - 2, &mut buf).unwrap();
+        assert!(buf.iter().all(|&x| x == 0));
     }
 
     #[test]
