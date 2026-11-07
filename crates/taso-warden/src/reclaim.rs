@@ -54,6 +54,16 @@ fn kinds() -> impl Iterator<Item = ObjectKind> {
         .filter(|k| *k != ObjectKind::Tombstone)
 }
 
+/// Why a delete under a claim stopped.
+enum Halt {
+    /// The claim is no longer open as this one: resolved meanwhile, or
+    /// another number.  Nothing more is deleted.
+    Stale,
+    /// A store or coordinator error.
+    Failed(String),
+}
+use Halt::{Failed, Stale};
+
 /// One Warden's reclaimer.
 pub struct Reclaimer {
     /// The coordinator.
@@ -119,7 +129,8 @@ impl Reclaimer {
             }
             for (key, n) in mine {
                 match self.open_claim(key) {
-                    Ok(Some(open)) if open == n => self.finish(l, key, n, &mut pass),
+                    // The kind is not known here: each is tried in turn.
+                    Ok(Some(open)) if open == n => self.finish(l, key, n, None, &mut pass),
                     Ok(_) => {}
                     Err(e) => pass.failed.push(format!("{key}: {e}")),
                 }
@@ -154,7 +165,7 @@ impl Reclaimer {
                     continue; // finished in step 1
                 }
                 let l = self.open_log(&mut log)?;
-                self.reclaim(l, key, &mut pass);
+                self.reclaim(l, key, kind, &mut pass);
             }
         }
         Ok(pass)
@@ -189,7 +200,7 @@ impl Reclaimer {
 
     /// Claim `key` as its next reclaim, or take up the claim already open
     /// for it, then delete and resolve.
-    fn reclaim(&self, log: &mut WardenLog, key: HashVal, pass: &mut Pass) {
+    fn reclaim(&self, log: &mut WardenLog, key: HashVal, kind: ObjectKind, pass: &mut Pass) {
         let n = match self.done(key) {
             Ok(n) => n,
             Err(e) => return pass.failed.push(format!("{key}: {e}")),
@@ -200,7 +211,7 @@ impl Reclaimer {
             Ok(ContractRecord::ReclaimClaimed { object_key, n: m })
                 if object_key == key && m == n =>
             {
-                self.finish(log, key, n, pass)
+                self.finish(log, key, n, Some(kind), pass)
             }
             Ok(other) => pass
                 .failed
@@ -210,23 +221,29 @@ impl Reclaimer {
         }
     }
 
-    /// Delete `key` under its open claim `n`, then resolve the claim.  The
-    /// claim is checked open right before the delete: a stale `n` deletes
-    /// nothing.
-    fn finish(&self, log: &mut WardenLog, key: HashVal, n: u64, pass: &mut Pass) {
-        match self.open_claim(key) {
-            Ok(Some(open)) if open == n => {}
-            Ok(_) => return, // resolved meanwhile, or not ours to finish
-            Err(e) => return pass.failed.push(format!("{key}: {e}")),
-        }
+    /// Delete `key` (where `kind` keeps it; every kind if not known)
+    /// under its open claim `n`, then resolve the claim.  Round 3, R3-01
+    /// (D&D a): the claim is checked open right before each delete call,
+    /// so a stale reclaimer has at most one call in flight past the
+    /// resolution, landing within the store's request timeout -- far
+    /// inside the quarantine, during which nothing may hold the key.
+    fn finish(
+        &self,
+        log: &mut WardenLog,
+        key: HashVal,
+        n: u64,
+        kind: Option<ObjectKind>,
+        pass: &mut Pass,
+    ) {
         let prepared = match log.prepared(logical_id(&LogicalKey::ReclaimDone(key, n))) {
             Ok(p) => p,
             Err(e) => return pass.failed.push(format!("{key}: {e}")),
         };
         // Gone in the store, as the resolution's row checks; a resolution
         // prepared before a crash keeps the outcome it named.
-        let outcome = match (self.delete(key), prepared) {
-            (Err(e), _) => return pass.failed.push(format!("{key}: deleting it: {e}")),
+        let outcome = match (self.delete(key, n, kind), prepared) {
+            (Err(Stale), _) => return, // resolved meanwhile, or not ours
+            (Err(Failed(e)), _) => return pass.failed.push(format!("{key}: deleting it: {e}")),
             (Ok(_), Some(ContractRecord::ReclaimComplete { outcome, .. })) => outcome,
             (Ok(true), _) => ReclaimOutcome::Deleted,
             (Ok(false), _) => ReclaimOutcome::Absent,
@@ -248,13 +265,26 @@ impl Reclaimer {
         }
     }
 
-    /// Delete `key` wherever a content kind keeps it: `true` if anything
-    /// was there.
-    fn delete(&self, key: HashVal) -> std::io::Result<bool> {
+    /// Delete `key` where `kind` keeps it, or wherever a content kind
+    /// does: `true` if anything was there.  Each call only while claim `n`
+    /// is open (R3-01).
+    fn delete(&self, key: HashVal, n: u64, kind: Option<ObjectKind>) -> Result<bool, Halt> {
         let mut any = false;
-        for kind in kinds() {
+        let all: Vec<ObjectKind> = match kind {
+            Some(k) => vec![k],
+            None => kinds().collect(),
+        };
+        for kind in all {
+            match self.open_claim(key) {
+                Ok(Some(open)) if open == n => {}
+                Ok(_) => return Err(Stale),
+                Err(e) => return Err(Failed(e)),
+            }
             let path = object_key_path(&self.prefix, kind, key).expect("a content kind");
-            any |= self.store.delete(&path)?;
+            any |= self
+                .store
+                .delete(&path)
+                .map_err(|e| Failed(e.to_string()))?;
         }
         Ok(any)
     }
@@ -446,7 +476,7 @@ mod tests {
         )
         .unwrap();
         let mut stale = Pass::default();
-        r.finish(&mut log, k, 0, &mut stale);
+        r.finish(&mut log, k, 0, None, &mut stale);
         drop(log);
         assert_eq!(stale, Pass::default());
         assert!(e.present(k), "a stale reclaim deletes nothing");
@@ -485,6 +515,128 @@ mod tests {
         let p = r.pass(SystemTime::now()).unwrap();
         assert_eq!(p.reclaimed, vec![(k, ReclaimOutcome::Deleted)], "{p:?}");
         assert!(e.done(k, 0) && !e.present(k));
+    }
+
+    /// A store that counts its deletes and can run something during the
+    /// first (another Warden, while this one's call is in flight).
+    struct Gated {
+        inner: SharedStore,
+        deletes: std::sync::Mutex<Vec<String>>,
+        during_first: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl ObjectStore for Gated {
+        fn put(&self, k: &str, d: &mut dyn std::io::Read) -> std::io::Result<u64> {
+            self.inner.put(k, d)
+        }
+        fn get(&self, k: &str) -> std::io::Result<Option<crate::ship::ByteStream>> {
+            self.inner.get(k)
+        }
+        fn exists(&self, k: &str) -> std::io::Result<bool> {
+            self.inner.exists(k)
+        }
+        fn list(&self, p: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list(p)
+        }
+        fn list_times(&self, p: &str) -> std::io::Result<Vec<(String, SystemTime)>> {
+            self.inner.list_times(p)
+        }
+        fn delete(&self, k: &str) -> std::io::Result<bool> {
+            self.deletes.lock().unwrap().push(k.to_string());
+            let r = self.inner.delete(k);
+            if let Some(f) = self.during_first.lock().unwrap().take() {
+                f();
+            }
+            r
+        }
+    }
+
+    /// Round 3, R3-01 (Kimi; D&D a): a listed object is deleted by one call
+    /// (its kind's), and a reclaimer whose claim another Warden resolves
+    /// while its call is in flight makes no further call: the claim is
+    /// checked before each.  So a stale delete is at most one call, within
+    /// the store's timeout, far inside the quarantine (at least 600 s).
+    #[test]
+    fn a_stale_reclaimer_makes_at_most_one_call_after_the_claim_resolves() {
+        let e = env();
+        let gated = |e: &Env| {
+            Arc::new(Gated {
+                inner: e.store.clone(),
+                deletes: Default::default(),
+                during_first: Default::default(),
+            })
+        };
+        // A listed orphan: one delete, of its own kind's path.
+        let k = e.put(b"listed", 2 * DAY);
+        let g = gated(&e);
+        let r = Reclaimer {
+            store: g.clone(),
+            ..e.reclaimer()
+        };
+        assert_eq!(r.pass(SystemTime::now()).unwrap().reclaimed.len(), 1);
+        assert_eq!(
+            *g.deletes.lock().unwrap(),
+            vec![object_key_path(PREFIX, ObjectKind::Manifest, k).unwrap()]
+        );
+
+        // A claim left open by a crash (its kind unknown: every kind is
+        // tried), resolved by another Warden during this one's first call.
+        let k = e.put(b"resumed", HOUR);
+        let mut notes = Vec::new();
+        let mut log = WardenLog::open(
+            &e.coord,
+            r.warden,
+            &r.store,
+            PREFIX,
+            &r.state_dir,
+            &mut notes,
+        )
+        .unwrap();
+        log.submit(ContractRecord::ReclaimClaimed {
+            object_key: k,
+            n: 0,
+        })
+        .unwrap();
+        drop(log);
+        let g = gated(&e);
+        let other = Reclaimer {
+            warden: WardenId::new(2),
+            state_dir: e.root.join("state-2"),
+            ..e.reclaimer()
+        };
+        *g.during_first.lock().unwrap() = Some(Box::new(move || {
+            let mut notes = Vec::new();
+            let mut log = WardenLog::open(
+                &other.coord,
+                other.warden,
+                &other.store,
+                PREFIX,
+                &other.state_dir,
+                &mut notes,
+            )
+            .unwrap();
+            let mut p = Pass::default();
+            other.finish(&mut log, k, 0, Some(ObjectKind::Manifest), &mut p);
+            assert_eq!(p.reclaimed.len(), 1, "the other Warden resolved it: {p:?}");
+        }));
+        let r = Reclaimer {
+            store: g.clone(),
+            ..e.reclaimer()
+        };
+        let p = r.pass(SystemTime::now()).unwrap();
+        assert!(p.failed.is_empty(), "{:?}", p.failed);
+        assert_eq!(
+            g.deletes.lock().unwrap().len(),
+            1,
+            "one call in flight, then the claim was seen resolved: no more"
+        );
+        assert!(e.done(k, 0));
+    }
+
+    /// The shortest quarantine is 20 store-request timeouts (R3-01).
+    #[test]
+    fn the_quarantine_outlasts_a_delete_in_flight_by_far() {
+        assert!(crate::coordinator::deleted_quarantine(599).is_err());
+        assert_eq!(crate::coordinator::deleted_quarantine(600), Ok(600));
     }
 
     /// A store that cannot say an object's age stops the pass: nothing is
@@ -666,7 +818,10 @@ mod tests {
         })
         .unwrap();
         drop(log);
-        assert!(r.delete(k).unwrap(), "a crash after the delete");
+        assert!(
+            matches!(r.delete(k, 0, None), Ok(true)),
+            "a crash after the delete"
+        );
         std::fs::remove_dir_all(&r.state_dir).unwrap();
         let p = r.pass(SystemTime::now()).unwrap();
         assert!(p.failed.is_empty(), "{p:?}");

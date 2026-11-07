@@ -916,8 +916,12 @@ pub struct LogConfig {
 /// [`MIN_DELETED_QUARANTINE`]..=[`MAX_DELETED_QUARANTINE`]
 /// ([`deleted_quarantine`]); fixed for a coordinator database's life.
 pub const DELETED_QUARANTINE: u64 = 3600;
-/// The shortest `store.deleted_quarantine`: twice a store request's timeout.
-pub const MIN_DELETED_QUARANTINE: u64 = 60;
+/// The shortest `store.deleted_quarantine`: 20 times a store request's
+/// timeout (round 3, R3-01, D&D a: a stale reclaimer's delete lands within
+/// one request's timeout of its last claim check, and the quarantine must
+/// outlast it by far).
+pub const MIN_DELETED_QUARANTINE: u64 = 600;
+const _: () = assert!(MIN_DELETED_QUARANTINE >= 20 * 30, "20 request timeouts");
 /// The longest `store.deleted_quarantine`: 30 days.
 pub const MAX_DELETED_QUARANTINE: u64 = 30 * 24 * 3600;
 

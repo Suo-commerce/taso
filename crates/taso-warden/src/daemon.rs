@@ -6191,9 +6191,10 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let local = |s: u64| serde_json::json!({"local": "/var/lib/taso/c.redb", "deleted_quarantine_seconds": s});
-        assert_eq!(q(with(local(60)).unwrap()), 60);
+        assert_eq!(q(with(local(600)).unwrap()), 600);
         assert_eq!(q(with(local(30 * 86400)).unwrap()), 30 * 86400);
-        for s in [0, 59, 30 * 86400 + 1] {
+        // R3-01: 60 s was the old minimum, twice a request's timeout.
+        for s in [0, 59, 60, 599, 30 * 86400 + 1] {
             let e = with(local(s)).unwrap_err().to_string();
             assert!(e.contains("store.deleted_quarantine must be"), "{s}: {e}");
         }
