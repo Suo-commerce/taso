@@ -51,6 +51,25 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
+/// The out-of-memory score every agent and verifier runs with: the
+/// kernel's neutral 0, written out (review fix M3, Kimi's M3).  Taso's own
+/// daemons mark themselves -1000 ([`protect_from_oom`]); a container's
+/// process would inherit that from the Warden, and an agent the kernel
+/// can never kill for memory would starve the node instead.  With 0, a
+/// runaway agent is killed before taso-blkd, the coordinator or the
+/// Warden, which keep every other Vessel alive.
+pub const AGENT_OOM_SCORE_ADJ: i32 = 0;
+
+/// Mark this process the last the kernel's out-of-memory killer may pick
+/// (`oom_score_adj` -1000; review fix M3, Kimi's M3).  Vessels run
+/// without memory limits unless the operator sets them (D&D M3-a,
+/// Jarmo 2026-11-07); a runaway agent must then die before the services
+/// every Vessel on the node depends on.  Needs root (CAP_SYS_RESOURCE);
+/// an error is the caller's to log, never fatal.
+pub fn protect_from_oom() -> std::io::Result<()> {
+    std::fs::write("/proc/self/oom_score_adj", "-1000")
+}
+
 /// Where the Field socket appears inside the Vessel.
 pub const FIELD_SOCKET: &str = "/run/taso/field.sock";
 
@@ -282,7 +301,10 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
                 "bounding": no_caps, "effective": no_caps, "inheritable": no_caps,
                 "permitted": no_caps, "ambient": no_caps
             },
-            "rlimits": [{ "type": "RLIMIT_NOFILE", "hard": 4096, "soft": 4096 }]
+            "rlimits": [{ "type": "RLIMIT_NOFILE", "hard": 4096, "soft": 4096 }],
+            // The kernel's neutral score, said: the Warden marks itself
+            // -1000 (review fix M3), and a child would inherit that.
+            "oomScoreAdj": AGENT_OOM_SCORE_ADJ
         },
         "root": { "path": spec.rootfs, "readonly": true },
         "mounts": [
@@ -419,7 +441,8 @@ pub fn verifier_config(spec: &VerifierSpec) -> Result<Value, SpecError> {
             "rlimits": [
                 { "type": "RLIMIT_NOFILE", "hard": 4096, "soft": 4096 },
                 { "type": "RLIMIT_CPU", "hard": spec.cpu_seconds, "soft": spec.cpu_seconds }
-            ]
+            ],
+            "oomScoreAdj": AGENT_OOM_SCORE_ADJ
         },
         "root": { "path": spec.rootfs, "readonly": true },
         "mounts": [
@@ -897,6 +920,8 @@ mod tests {
         let c = verifier_config(&spec).unwrap();
         assert_eq!(c["root"]["readonly"], json!(true));
         assert_eq!(c["root"]["path"], json!("/mnt/t-77/.view"));
+        // Review fix M3: never the Warden's -1000, inherited.
+        assert_eq!(c["process"]["oomScoreAdj"], json!(0));
         let mounts = c["mounts"].as_array().unwrap();
         let cand = mounts
             .iter()
@@ -974,6 +999,10 @@ mod tests {
     #[test]
     fn isolation_rules_are_in_the_config() {
         let c = oci_config(&spec()).unwrap();
+        // Review fix M3: an agent's score is said, never the Warden's
+        // -1000 inherited (an agent the kernel cannot kill for memory).
+        assert_eq!(c["process"]["oomScoreAdj"], json!(AGENT_OOM_SCORE_ADJ));
+        assert_eq!(AGENT_OOM_SCORE_ADJ, 0);
         // User namespace with an unprivileged range.
         let ns: Vec<&str> = c["linux"]["namespaces"]
             .as_array()

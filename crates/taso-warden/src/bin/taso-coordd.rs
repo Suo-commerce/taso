@@ -174,6 +174,10 @@ fn parse(args: &[String]) -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // Last for the out-of-memory killer (review fix M3).
+    if let Err(e) = taso_warden::runtime::protect_from_oom() {
+        eprintln!("taso-coordd: cannot protect itself from the out-of-memory killer: {e}");
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Args {
         db,

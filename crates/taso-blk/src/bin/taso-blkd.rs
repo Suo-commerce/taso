@@ -673,6 +673,12 @@ fn main() {
 
     // From here on libraries may print (libublk); no write may panic.
     streams::guard();
+    // Last for the out-of-memory killer (review fix M3, Kimi's M3): every
+    // Vessel's disk is served from here, and agents run without memory
+    // limits unless the operator sets them.
+    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-1000") {
+        log!("taso-blkd: cannot protect itself from the out-of-memory killer: {e}");
+    }
 
     let store = if log.exists() {
         match Store::open(&log) {

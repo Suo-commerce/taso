@@ -530,6 +530,7 @@ fn status(config_path: Option<&str>) -> ExitCode {
             None => "not set".into(),
         }
     );
+    println!("{}", agent_limits(&config));
     let socket = &config.storage.socket;
     match taso_blk::client::Client::connect(socket).and_then(|mut c| c.stats()) {
         Ok(st) => {
@@ -557,6 +558,34 @@ fn status(config_path: Option<&str>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The agents' limits as `status` says them: the node's, then each Vessel
+/// that sets its own; none set reads \"unlimited\" (review fix M3: Vessels
+/// are unlimited by default, the operator limits them).
+fn agent_limits(config: &Config) -> String {
+    let say = |m: Option<u64>, p: Option<u64>| {
+        format!(
+            "memory {}, processes {}",
+            m.map_or("unlimited".to_string(), |b| format!("{} MiB", b >> 20)),
+            p.map_or("unlimited".to_string(), |n| n.to_string())
+        )
+    };
+    let node = (config.runtime.memory_bytes, config.runtime.pids);
+    let mut out = format!(
+        "agent limits: {} (runtime.memory_bytes, runtime.pids)",
+        say(node.0, node.1)
+    );
+    for v in &config.vessels {
+        let own = (
+            v.runtime.as_ref().and_then(|r| r.memory_bytes).or(node.0),
+            v.runtime.as_ref().and_then(|r| r.pids).or(node.1),
+        );
+        if own != node {
+            out.push_str(&format!("; {}: {}", v.subject, say(own.0, own.1)));
+        }
+    }
+    out
 }
 
 fn read_config(path: &str) -> Result<Config, String> {
@@ -788,6 +817,33 @@ mod tests {
             assert_eq!(c.storage.socket, Path::new("/run/taso/blk.sock"));
             assert!(matches!(&c.coordinator, CoordConf::Local { .. }));
         }
+    }
+
+    /// Review fix M3: `status` says the agents' limits, \"unlimited\"
+    /// when none is set, and each Vessel that sets its own.
+    #[test]
+    fn status_says_the_agents_limits() {
+        let a = InitArgs {
+            data: PathBuf::from("/var/lib/taso"),
+            size_gib: 64,
+            rootfs: Some(PathBuf::from("/srv/agent-rootfs")),
+            force: false,
+        };
+        let c = Config::parse(&init_config(&a, false)).unwrap();
+        assert_eq!(
+            agent_limits(&c),
+            "agent limits: memory unlimited, processes unlimited (runtime.memory_bytes, runtime.pids)"
+        );
+        let mut v: serde_json::Value = serde_json::from_str(&init_config(&a, false)).unwrap();
+        v["runtime"]["pids"] = serde_json::json!(512);
+        let mut e = demo_entry();
+        e["runtime"]["memory_bytes"] = serde_json::json!(268_435_456u64);
+        v["vessels"] = serde_json::json!([e]);
+        let c = Config::parse(&v.to_string()).unwrap();
+        assert_eq!(
+            agent_limits(&c),
+            "agent limits: memory unlimited, processes 512 (runtime.memory_bytes, runtime.pids); demo: memory 256 MiB, processes 512"
+        );
     }
 
     #[test]

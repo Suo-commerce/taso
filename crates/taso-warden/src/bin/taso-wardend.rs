@@ -87,6 +87,10 @@ const RECLAIM_EVERY: Duration = Duration::from_secs(3600);
 const STATUS_TICK: Duration = Duration::from_secs(1);
 
 fn main() -> ExitCode {
+    // Last for the out-of-memory killer (review fix M3); agents are not.
+    if let Err(e) = taso_warden::runtime::protect_from_oom() {
+        eprintln!("taso-wardend: cannot protect itself from the out-of-memory killer: {e}");
+    }
     // Before any other thread exists, so that every thread inherits it.
     let shutdown = Stop::new();
     let signals = match signals::block() {
