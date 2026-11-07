@@ -3230,6 +3230,14 @@ pub const BIRTH_FAILPOINTS: [&str; 7] = [
 /// state is in (review G-a).
 pub const STATE_GENERATION_FILE: &str = "taso-generation";
 
+/// An operator's file that becomes a content object (a classification map,
+/// a vconf), read within its kind's limit (review fix H4): one larger
+/// would be stored and then never read back by any node.
+pub fn read_object_file(path: &Path, kind: taso_core::contract::ObjectKind) -> io::Result<Vec<u8>> {
+    let mut f = std::fs::File::open(path)?;
+    taso_core::contract::read_object(&mut f, kind)
+}
+
 /// The local state's format generation: 2 since V4b's format break (the
 /// Vessels' local logs and the Warden Chronicle hold the records that
 /// break changed).  Read as written, `"2\n"`.
@@ -3346,15 +3354,17 @@ impl Node {
         let nominator = match &config.sanction {
             None => None,
             Some(sc) => {
-                let bytes = std::fs::read(&sc.classmap).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!(
-                            "reading the classification map {}: {e}",
-                            sc.classmap.display()
-                        ),
-                    )
-                })?;
+                let bytes =
+                    read_object_file(&sc.classmap, taso_core::contract::ObjectKind::Classmap)
+                        .map_err(|e| {
+                            io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "reading the classification map {}: {e}",
+                                    sc.classmap.display()
+                                ),
+                            )
+                        })?;
                 let mut conf = crate::nominate::SanctionConf::new(bytes).map_err(|e| {
                     io::Error::other(format!(
                         "the classification map {}: {e}",
@@ -4154,7 +4164,7 @@ impl Node {
             Ok((t, _)) => t,
             Err(e) => return retry(format!("the verifier Template: {e}")),
         };
-        let vconf = match std::fs::read(&vf.config) {
+        let vconf = match read_object_file(&vf.config, taso_core::contract::ObjectKind::Vconf) {
             Ok(b) => b,
             Err(e) => return retry(format!("reading {}: {e}", vf.config.display())),
         };

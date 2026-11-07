@@ -34,7 +34,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::Read;
 use std::sync::Arc;
 
 use taso_core::contract::{
@@ -230,9 +229,9 @@ impl Purger {
 
     fn put_content(&self, kind: ObjectKind, key: HashVal, bytes: &[u8]) -> Result<(), PurgeError> {
         let path = object_key_path(&self.prefix, kind, key).expect("a content kind");
+        taso_core::contract::check_object_size(kind, bytes.len() as u64).map_err(PackError::Io)?;
         if let Some(mut r) = self.store.get(&path).map_err(PackError::Io)? {
-            let mut have = Vec::new();
-            r.read_to_end(&mut have).map_err(PackError::Io)?;
+            let have = taso_core::contract::read_object(&mut r, kind).map_err(PackError::Io)?;
             if have != bytes {
                 return Err(PurgeError::Inconsistent(format!(
                     "{path} holds other bytes"
@@ -254,8 +253,8 @@ impl Purger {
             .get(&path)
             .map_err(PackError::Io)?
             .ok_or_else(|| PurgeError::Inconsistent(format!("{path} is not in the store")))?;
-        let mut b = Vec::new();
-        r.read_to_end(&mut b).map_err(PackError::Io)?;
+        let b = taso_core::contract::read_object(&mut r, ObjectKind::Inventory)
+            .map_err(PackError::Io)?;
         let inv = Inventory::decode(&b)
             .map_err(|e| PurgeError::Inconsistent(format!("{path}: {e:?}")))?;
         if inv.key() != key {
@@ -568,8 +567,8 @@ impl Purger {
             .get(&path)
             .map_err(PackError::Io)?
             .ok_or_else(|| PurgeError::Inconsistent(format!("{path} is not in the store")))?;
-        let mut b = Vec::new();
-        r.read_to_end(&mut b).map_err(PackError::Io)?;
+        let b =
+            taso_core::contract::read_object(&mut r, ObjectKind::Local).map_err(PackError::Io)?;
         let local = LocalState::decode(&b)
             .map_err(|e| PurgeError::Inconsistent(format!("{path}: {e:?}")))?;
         if local.key() != local_key {

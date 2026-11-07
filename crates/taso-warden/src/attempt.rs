@@ -28,7 +28,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -660,9 +659,7 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
     }
 
     fn object(&self, kind: ObjectKind, key: HashVal) -> Result<Vec<u8>, Failure> {
-        let mut b = Vec::new();
-        self.reader(kind, key)?
-            .read_to_end(&mut b)
+        let b = taso_core::contract::read_object(&mut self.reader(kind, key)?, kind)
             .map_err(|e| Failure::Node(format!("reading a {kind:?} object: {e}")))?;
         let got = taso_core::contract::object_key(kind, &b);
         if got != key {

@@ -471,9 +471,7 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
 
     /// A small content object, read whole and checked against its key.
     fn read_content(&self, kind: ObjectKind, key: HashVal) -> Result<Vec<u8>, TemplateError> {
-        let mut b = Vec::new();
-        self.get(kind, key)?
-            .read_to_end(&mut b)
+        let b = taso_core::contract::read_object(&mut self.get(kind, key)?, kind)
             .map_err(TemplateError::Store)?;
         if taso_core::contract::object_key(kind, &b) != key {
             return Err(TemplateError::Integrity(self.path(kind, key)));

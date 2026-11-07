@@ -255,8 +255,11 @@ fn build(
 
 /// The request, with the map read from its file.
 fn load_request(r: &cli::RunArgs) -> Result<Request, String> {
-    let classmap =
-        std::fs::read(&r.classmap).map_err(|e| format!("{}: {e}", r.classmap.display()))?;
+    let classmap = taso_warden::daemon::read_object_file(
+        &r.classmap,
+        taso_core::contract::ObjectKind::Classmap,
+    )
+    .map_err(|e| format!("{}: {e}", r.classmap.display()))?;
     Ok(Request {
         source: r.source.clone(),
         classmap,

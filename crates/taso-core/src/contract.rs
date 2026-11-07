@@ -110,6 +110,53 @@ pub enum ObjectKind {
     Layer,
 }
 
+/// The most bytes an object of `kind` may have (spec rev. 38 §11.1;
+/// review fix H4, Kimi's H4), or `None` for the kinds read as streams
+/// (packs, artifacts, layers, tombstones).  Checked where an object is made and
+/// on every whole read from the store, so no node can make an object
+/// that no node can read back.
+pub fn max_object_bytes(kind: ObjectKind) -> Option<u64> {
+    match kind {
+        // `manifest.max_manifest_bytes`, and the one byte a stopped walk adds.
+        ObjectKind::Manifest => Some((256 << 20) + 1),
+        // TOML an operator writes: real ones are kilobytes.
+        ObjectKind::Classmap | ObjectKind::Vconf => Some(1 << 20),
+        // About 100 bytes a pack: over two million packs.
+        ObjectKind::Inventory => Some(256 << 20),
+        ObjectKind::Local => Some(16 << 20),
+        ObjectKind::Pack | ObjectKind::Artifact | ObjectKind::Layer | ObjectKind::Tombstone => None,
+    }
+}
+
+/// Refuse `len` bytes for an object of `kind` if over its limit.
+pub fn check_object_size(kind: ObjectKind, len: u64) -> std::io::Result<()> {
+    match max_object_bytes(kind) {
+        Some(max) if len > max => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("a {kind:?} object of over {max} bytes (its limit)"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Read a whole object of `kind`: at most its limit and one byte more,
+/// and that byte is an error, never a quiet truncation (review fix H4:
+/// a store answering with a body without end exhausted the reader's
+/// memory).  A kind read as a stream is refused here.
+pub fn read_object(r: &mut dyn std::io::Read, kind: ObjectKind) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let Some(max) = max_object_bytes(kind) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("a {kind:?} object is read as a stream, not whole"),
+        ));
+    };
+    let mut b = Vec::new();
+    r.take(max + 1).read_to_end(&mut b)?;
+    check_object_size(kind, b.len() as u64)?;
+    Ok(b)
+}
+
 impl ObjectKind {
     /// The kind's domain string (§2.1).
     pub const fn prefix(self) -> &'static str {
@@ -2722,6 +2769,54 @@ impl<'a> Reader<'a> {
 pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// Review fix H4: a whole read takes at most its kind's limit.
+    #[test]
+    fn a_whole_object_reads_up_to_its_limit_and_no_further() {
+        let max = max_object_bytes(ObjectKind::Classmap).unwrap();
+        let exact = vec![b'#'; max as usize];
+        assert_eq!(
+            read_object(&mut &exact[..], ObjectKind::Classmap)
+                .unwrap()
+                .len(),
+            max as usize
+        );
+        let over = vec![b'#'; max as usize + 1];
+        let e = read_object(&mut &over[..], ObjectKind::Classmap).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+        // A body without end: refused after the limit and one byte.
+        let e = read_object(&mut std::io::repeat(0), ObjectKind::Vconf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+    }
+
+    #[test]
+    fn kinds_read_as_streams_are_never_read_whole() {
+        for kind in [
+            ObjectKind::Pack,
+            ObjectKind::Artifact,
+            ObjectKind::Layer,
+            ObjectKind::Tombstone,
+        ] {
+            assert_eq!(max_object_bytes(kind), None);
+            assert!(read_object(&mut &b""[..], kind).is_err(), "{kind:?}");
+            assert!(check_object_size(kind, u64::MAX).is_ok(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn an_object_over_its_limit_is_refused_where_it_is_made() {
+        for kind in [
+            ObjectKind::Manifest,
+            ObjectKind::Classmap,
+            ObjectKind::Vconf,
+            ObjectKind::Inventory,
+            ObjectKind::Local,
+        ] {
+            let max = max_object_bytes(kind).unwrap();
+            assert!(check_object_size(kind, max).is_ok(), "{kind:?}");
+            assert!(check_object_size(kind, max + 1).is_err(), "{kind:?}");
+        }
+    }
 
     // ── fixed examples ──────────────────────────────────────────────
 

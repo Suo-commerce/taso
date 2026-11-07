@@ -792,10 +792,11 @@ impl<P: Pool> Genesis<P> {
 
     /// The map `GenesisStarted` names, from the store (D48).
     fn stored_map(&self, key: HashVal) -> Result<Classmap, GenesisError> {
-        let mut bytes = Vec::new();
-        self.get_content(ObjectKind::Classmap, key)?
-            .read_to_end(&mut bytes)
-            .map_err(GenesisError::Store)?;
+        let bytes = taso_core::contract::read_object(
+            &mut self.get_content(ObjectKind::Classmap, key)?,
+            ObjectKind::Classmap,
+        )
+        .map_err(GenesisError::Store)?;
         let map = Classmap::parse(&bytes).map_err(GenesisError::Classmap)?;
         if map.key() != key {
             return Err(GenesisError::Integrity(

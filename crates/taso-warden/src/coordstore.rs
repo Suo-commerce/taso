@@ -31,7 +31,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use taso_core::contract::{object_key, Inventory, InventoryItem, ObjectKind};
@@ -311,10 +310,12 @@ impl StoreView for CoordStore {
             Ok(None) => return Lookup::NotFound,
             Err(e) => return failed(&path, e, false),
         };
-        let mut bytes = Vec::new();
-        if let Err(e) = r.read_to_end(&mut bytes) {
-            return failed(&path, e, false);
-        }
+        let bytes = match taso_core::contract::read_object(&mut r, ObjectKind::Inventory) {
+            Ok(b) => b,
+            // Over its limit: bytes that are there and cannot be one.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return failed(&path, e, true),
+            Err(e) => return failed(&path, e, false),
+        };
         if object_key(ObjectKind::Inventory, &bytes) != key {
             return failed(&path, "does not hash to its key", true);
         }
@@ -380,6 +381,7 @@ impl StoreView for CoordStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use taso_core::canon::Canonical;
     use taso_core::contract::{genesis_id, Consistency, ContractRecord, GenesisStarted, Peer};
     use taso_core::envelope::{BranchId, Epoch, Stream};
@@ -808,6 +810,61 @@ mod tests {
             self.fail::<()>()?;
             self.inner.list_times(prefix)
         }
+    }
+
+    /// A store whose every object is a body without end, read through a
+    /// reader that panics past a budget: unbounded code fails the test at
+    /// the budget instead of exhausting the machine's memory.
+    struct Endless {
+        budget: u64,
+    }
+    struct Budget {
+        left: u64,
+    }
+    impl Read for Budget {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                self.left > 0,
+                "read past the budget: the read is not bounded"
+            );
+            let n = (buf.len() as u64).min(self.left) as usize;
+            buf[..n].fill(0);
+            self.left -= n as u64;
+            Ok(n)
+        }
+    }
+    impl ObjectStore for Endless {
+        fn put(&self, _: &str, data: &mut dyn Read) -> io::Result<u64> {
+            io::copy(data, &mut io::sink())
+        }
+        fn get(&self, _: &str) -> io::Result<Option<ByteStream>> {
+            Ok(Some(Box::new(Budget { left: self.budget })))
+        }
+        fn exists(&self, _: &str) -> io::Result<bool> {
+            Ok(true)
+        }
+        fn list(&self, _: &str) -> io::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn list_times(&self, _: &str) -> io::Result<Vec<(String, std::time::SystemTime)>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Review fix H4 (Kimi's H4): an inventory body without end is read to
+    /// its limit and one byte, then refused as a store-integrity fault
+    /// (`Unreadable`, never an absence); it used to be read to the end of
+    /// the machine's memory.
+    #[test]
+    fn an_endless_inventory_is_refused_at_its_limit() {
+        let max = taso_core::contract::max_object_bytes(ObjectKind::Inventory).unwrap();
+        let cs = CoordStore::new(
+            Arc::new(Endless {
+                budget: max + 64 * 1024,
+            }),
+            PREFIX,
+        );
+        assert_eq!(cs.lookup_inventory(h(3)), Lookup::Unreadable);
     }
 
     /// Review fix 5a: a timeout and a permission failure are each
