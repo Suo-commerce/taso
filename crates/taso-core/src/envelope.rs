@@ -164,9 +164,23 @@ impl Lsn {
         self.0
     }
 
-    /// The next LSN.
+    /// The next LSN.  There is none after `u64::MAX`: that is a panic in
+    /// every build, never a wrap to 0 (round 2, R2-01).  Where an LSN
+    /// comes from outside (a file, the store, a peer), use
+    /// [`Lsn::checked_next`] and refuse.
     pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+        match self.checked_next() {
+            Some(n) => n,
+            None => panic!("the LSN space is exhausted"),
+        }
+    }
+
+    /// The next LSN, or `None` after `u64::MAX`.
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(n) => Some(Self(n)),
+            None => None,
+        }
     }
 }
 

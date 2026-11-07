@@ -125,6 +125,11 @@ pub enum SegmentError {
         /// What the segment expected.
         expected: Lsn,
     },
+    /// The tail's lsn is `u64::MAX`: no record can follow it.
+    Exhausted {
+        /// What the envelope carried.
+        lsn: Lsn,
+    },
     /// The envelope's `prev` is not the tail's hash.
     PrevMismatch {
         /// The envelope's lsn.
@@ -187,6 +192,12 @@ impl fmt::Display for SegmentError {
             Self::ChronicleMismatch { expected, got } => {
                 write!(f, "chronicle {got:?} is not this segment's {expected:?}")
             }
+            Self::Exhausted { lsn } => write!(
+                f,
+                "lsn {}: nothing follows the last lsn ({})",
+                lsn.get(),
+                u64::MAX
+            ),
             Self::NotNext { lsn, expected } => {
                 write!(
                     f,
@@ -671,7 +682,11 @@ pub(crate) fn check_frame(
             got: env.chronicle,
         });
     }
-    let expected = tail.lsn.next();
+    // Round 2, R2-01 (Kimi): nothing follows u64::MAX; a frame read from
+    // a file after it is refused, never chained to a wrapped 0.
+    let Some(expected) = tail.lsn.checked_next() else {
+        return Err(SegmentError::Exhausted { lsn: env.lsn });
+    };
     if env.lsn != expected {
         return Err(SegmentError::NotNext {
             lsn: env.lsn,
@@ -988,6 +1003,35 @@ mod tests {
     }
 
     // ── local chain refusals ────────────────────────────────────────
+
+    /// Round 2, R2-01 (Kimi): a segment whose base is the last LSN takes
+    /// no record: a frame that would wrap to 0 is refused (it panicked in
+    /// a debug build and chained in a release one), and the tail stays.
+    #[test]
+    fn nothing_follows_the_last_lsn() {
+        let base = Position {
+            lsn: Lsn::new(u64::MAX),
+            hash: HashVal::from_bytes([0; 32]),
+        };
+        let (_d, path, mut seg) = fresh(base);
+        let rec = Record::new(
+            chron(1),
+            BranchId::TRUNK,
+            Epoch::FIRST,
+            Stream::Fs,
+            Lsn::new(0),
+            base.hash,
+            Payload::Raw(Vec::new()),
+        );
+        let len = file_len(&path);
+        assert!(matches!(
+            seg.append(&rec.envelope, &rec.payload.canon_bytes()),
+            Err(SegmentError::Exhausted { .. })
+        ));
+        assert_eq!(seg.tail(), base);
+        assert_eq!(file_len(&path), len, "nothing written");
+        assert_eq!(Lsn::new(u64::MAX).checked_next(), None);
+    }
 
     #[test]
     fn append_refusals_leave_the_file_unchanged() {
