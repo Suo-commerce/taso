@@ -234,7 +234,7 @@ for n in $installed; do
     blk "$n" names >/dev/null 2>&1 \
         || die "node $n: taso-blkd does not answer on $(sock_of "$n") (systemctl start taso-blkd)"
     on "$n" "p=\$(systemctl show -p MainPID --value taso-blkd); [ \"\${p:-0}\" != 0 ] && cmp -s $WORK/bin/taso-blkd /proc/\$p/exe" \
-        || die "node $n: the running taso-blkd is not this build; on node $n: install $WORK/bin/taso-blkd /usr/local/bin/taso-blkd && systemctl restart taso-blkd"
+        || die "node $n: the running taso-blkd is not this build: install this commit's target/release/taso-blkd as node $n's /usr/local/bin/taso-blkd, then systemctl restart taso-blkd (scripts/release-gate.sh does it)"
 done
 
 # ── coordinator and store ─────────────────────────────────────────────
