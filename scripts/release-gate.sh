@@ -2,8 +2,8 @@
 # release-gate.sh: every gate on one commit, one table (V4b plan §9, the
 # release runner).  A release needs a PASS of `full` on the commit tagged.
 #
-#   scripts/release-gate.sh quick    about 1.5 h: every gate once, the
-#                                    default sizes
+#   scripts/release-gate.sh quick    about 7 minutes (taso-test, 1b7ebe1):
+#                                    every gate once, the default sizes
 #   scripts/release-gate.sh full     overnight: quick's gates at release
 #                                    sizes, plus xfstests -g quick,
 #                                    blk-bench, and 100 crash rounds
