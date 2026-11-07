@@ -287,24 +287,23 @@ fn init(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     // The host: the module now and at boot; expedited RCU now and at boot.
-    let steps: Vec<(&str, Result<(), String>)> = vec![
+    // One at a time, the first failure stopping the rest (review fix M5,
+    // Kimi's M5: all four used to run before any result was looked at).
+    let mut steps: Vec<Step> = vec![
         (
             "ublk_drv kept at boot",
-            write_file(MODULES_CONF, "ublk_drv\n"),
+            Box::new(|| write_file(MODULES_CONF, "ublk_drv\n")),
         ),
-        ("ublk_drv loaded", modprobe("ublk_drv")),
+        ("ublk_drv loaded", Box::new(|| modprobe("ublk_drv"))),
         (
             "rcu_expedited kept at boot",
-            write_file(RCU_CONF, "w /sys/kernel/rcu_expedited - - - - 1\n"),
+            Box::new(|| write_file(RCU_CONF, "w /sys/kernel/rcu_expedited - - - - 1\n")),
         ),
-        ("rcu_expedited set", write_file(RCU, "1")),
+        ("rcu_expedited set", Box::new(|| write_file(RCU, "1"))),
     ];
-    for (what, r) in steps {
-        if let Err(e) = r {
-            eprintln!("taso-ctl init: {what}: {e}");
-            return ExitCode::from(1);
-        }
-        println!("  {what}");
+    if let Err(e) = run_steps(&mut steps, |what| println!("  {what}")) {
+        eprintln!("taso-ctl init: {e}");
+        return ExitCode::from(1);
     }
     // The directories, the config.
     for d in [
@@ -434,6 +433,30 @@ fn nearest_existing(p: &Path) -> PathBuf {
         }
     }
     q
+}
+
+/// One host step of `init`: what it does, and doing it.
+type Step<'a> = (&'static str, Box<dyn FnMut() -> Result<(), String> + 'a>);
+
+/// Run `steps` in order, telling `done` of each that succeeds; the first
+/// failure stops the rest and says which steps already took effect (they
+/// are each idempotent: running `init` again after fixing the cause
+/// finishes the job).
+fn run_steps(steps: &mut [Step], mut done: impl FnMut(&str)) -> Result<(), String> {
+    let mut made: Vec<&str> = Vec::new();
+    for (what, step) in steps.iter_mut() {
+        if let Err(e) = step() {
+            let before = if made.is_empty() {
+                "nothing was changed before it".to_string()
+            } else {
+                format!("done before it, and left: {}", made.join(", "))
+            };
+            return Err(format!("{what}: {e} (stopped here; {before})"));
+        }
+        done(what);
+        made.push(what);
+    }
+    Ok(())
 }
 
 fn write_file(path: &str, content: &str) -> Result<(), String> {
@@ -703,6 +726,46 @@ fn demo(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review fix M5 (Kimi's M5): the first failing step stops the rest,
+    /// and the error names what was already done.
+    #[test]
+    fn a_failing_step_stops_the_rest_and_names_what_was_done() {
+        let ran = std::cell::RefCell::new(Vec::new());
+        let mut steps: Vec<Step> = vec![
+            (
+                "one",
+                Box::new(|| {
+                    ran.borrow_mut().push(1);
+                    Ok(())
+                }),
+            ),
+            (
+                "two",
+                Box::new(|| {
+                    ran.borrow_mut().push(2);
+                    Err("no module".into())
+                }),
+            ),
+            (
+                "three",
+                Box::new(|| {
+                    ran.borrow_mut().push(3);
+                    Ok(())
+                }),
+            ),
+        ];
+        let mut said = Vec::new();
+        let e = run_steps(&mut steps, |w| said.push(w.to_string())).unwrap_err();
+        drop(steps);
+        assert_eq!(*ran.borrow(), [1, 2], "the third never ran");
+        assert_eq!(said, ["one"]);
+        assert!(e.starts_with("two: no module"), "{e}");
+        assert!(e.contains("done before it, and left: one"), "{e}");
+        let mut first: Vec<Step> = vec![("only", Box::new(|| Err("x".into())))];
+        let e = run_steps(&mut first, |_| {}).unwrap_err();
+        assert!(e.contains("nothing was changed before it"), "{e}");
+    }
 
     /// What `init` writes is what the Warden reads (c-d): parsed as the
     /// Warden parses it, with and without a rootfs and the Landlock shim,
