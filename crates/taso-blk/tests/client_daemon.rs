@@ -406,3 +406,53 @@ fn an_attach_holds_up_no_call_about_another_branch() {
     c.quit().unwrap();
     assert!(d.wait(), "quit exits cleanly");
 }
+
+/// Round 2, R2-03 (Kimi): `fork` is one command, all or none.  A device
+/// that does not start (here: no ublk, or not root) leaves no branch and
+/// no name behind, so the same fork can be asked again.  Where the device
+/// does start (root and ublk), there is nothing to test: it is detached.
+#[test]
+fn a_failed_fork_leaves_no_branch_or_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, sock) = (dir.path().join("log"), dir.path().join("sock"));
+    let d = Daemon::start(&log, &sock);
+    let mut c = Client::connect(&sock).unwrap();
+    let root = c.root().unwrap();
+    let before = c.stats().unwrap()["layers"].clone();
+    match c.fork(root, Some("tank/failed")) {
+        Ok((b, _)) => {
+            c.detach(b).unwrap();
+        }
+        Err(e) => {
+            assert!(matches!(e, ClientError::Daemon(_)), "{e:?}");
+            assert_eq!(c.find("tank/failed").unwrap(), None, "no name left");
+            assert_eq!(c.stats().unwrap()["layers"], before, "no branch left");
+            // And the same fork answers the same way again, not "taken".
+            match c.fork(root, Some("tank/failed")) {
+                Err(ClientError::Daemon(e)) => assert!(!e.contains("taken"), "{e}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+    c.quit().unwrap();
+    assert!(d.wait());
+}
+
+/// Round 2, R2-04 (Kimi): `quit` answers only after the final checkpoint,
+/// and a failed one is an error and a non-zero exit, never "ok" and 0.
+/// The checkpoint's temporary is made a directory, so writing it fails.
+#[test]
+fn quit_reports_a_failed_final_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, sock) = (dir.path().join("log"), dir.path().join("sock"));
+    let d = Daemon::start(&log, &sock);
+    let mut c = Client::connect(&sock).unwrap();
+    let root = c.root().unwrap();
+    c.branch(root, Some("tank/q")).unwrap();
+    std::fs::create_dir(dir.path().join("log.ckpt.tmp")).unwrap();
+    assert!(
+        matches!(c.quit(), Err(ClientError::Daemon(e)) if e.contains("final checkpoint")),
+        "quit must say the checkpoint failed"
+    );
+    assert!(!d.wait(), "and exit non-zero");
+}

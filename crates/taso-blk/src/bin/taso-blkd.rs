@@ -750,16 +750,10 @@ fn main() {
         let d = daemon.clone();
         let socket = socket.clone();
         std::thread::spawn(move || {
-            if serve(&d, conn) {
-                d.stop_all();
-                // A clean shutdown loses nothing: end the last group, and
-                // leave a checkpoint so the next start is quick.
-                if let Err(e) = lock_store(&d.store, Site::Quit).checkpoint() {
-                    log!("taso-blkd: final checkpoint: {e}");
-                }
+            if let Some(code) = serve(&d, conn) {
                 let _ = std::fs::remove_file(&socket);
                 log!("taso-blkd: quit");
-                streams::drained_exit(0);
+                streams::drained_exit(code);
             }
         });
     }
@@ -923,20 +917,26 @@ fn fail(msg: &str) -> ! {
     streams::drained_exit(1);
 }
 
-/// Serve one control connection.  `true` if it asked the daemon to quit.
-fn serve(d: &Daemon, conn: UnixStream) -> bool {
+/// Serve one control connection.  `Some(exit code)` if it asked the
+/// daemon to quit: by then the devices are stopped and the final
+/// checkpoint written, or the answer said which failed (round 2, R2-04).
+fn serve(d: &Daemon, conn: UnixStream) -> Option<i32> {
     let Ok(mut out) = conn.try_clone() else {
-        return false;
+        return None;
     };
     for line in BufReader::new(conn).lines() {
-        let Ok(line) = line else { return false };
+        let Ok(line) = line else { return None };
         let words: Vec<&str> = line.split_whitespace().collect();
         if words.is_empty() {
             continue;
         }
         let quit = words[0] == "quit";
         let poisoned_before = lock_store(&d.store, Site::Poisoned).is_poisoned();
-        let answer = match d.command(&words) {
+        let answer = match if quit {
+            d.shutdown()
+        } else {
+            d.command(&words)
+        } {
             Ok(a) if a.is_empty() => "ok".to_string(),
             Ok(a) => format!("ok {a}"),
             Err(e) => {
@@ -951,11 +951,15 @@ fn serve(d: &Daemon, conn: UnixStream) -> bool {
                 format!("err {e}")
             }
         };
-        if writeln!(out, "{answer}").is_err() || quit {
-            return quit;
+        if quit {
+            let _ = writeln!(out, "{answer}");
+            return Some(if answer == "ok" { 0 } else { 1 });
+        }
+        if writeln!(out, "{answer}").is_err() {
+            return None;
         }
     }
-    false
+    None
 }
 
 impl Daemon {
@@ -981,8 +985,16 @@ impl Daemon {
             "fork" => {
                 let seal = layer(1)?;
                 let branch = self.branch(seal, words.get(2).copied())?;
-                let dev = self.attach(branch)?;
-                Ok(format!("{branch} {dev}"))
+                match self.attach(branch) {
+                    Ok(dev) => Ok(format!("{branch} {dev}")),
+                    // Round 2, R2-03 (Kimi): one command, so all or none:
+                    // the branch its caller never learns of is dropped
+                    // (and its name with it), or the answer says it stays.
+                    Err(e) => match self.unfork(branch) {
+                        Ok(()) => Err(e),
+                        Err(u) => Err(format!("{e}; the new branch {branch} stays: {u}")),
+                    },
+                }
             }
             "name" => {
                 let branch = layer(1)?;
@@ -1139,7 +1151,7 @@ impl Daemon {
                 Ok(lsn.to_string())
             }
             "stats" => Ok(self.stats()),
-            "quit" => Ok(String::new()),
+            "quit" => self.shutdown(),
             other => Err(format!("unknown command {other}")),
         }
     }
@@ -1424,13 +1436,54 @@ impl Daemon {
         Ok(())
     }
 
-    fn stop_all(&self) {
+    fn stop_all(&self) -> Result<(), String> {
         let branches: Vec<LayerId> = lock(&self.devices).keys().copied().collect();
+        let mut failed = Vec::new();
         for b in branches {
             if let Err(e) = self.detach(b) {
                 log!("taso-blkd: {e}");
+                failed.push(e);
             }
         }
+        match failed.len() {
+            0 => Ok(()),
+            n => Err(format!("{n} device(s) did not stop, first: {}", failed[0])),
+        }
+    }
+
+    /// `quit`: every device stopped, then the last group ended and a
+    /// checkpoint left, so the next start is quick and loses nothing.
+    /// Answered only after both, with what failed (round 2, R2-04): a
+    /// failed final flush or checkpoint is never an "ok".
+    fn shutdown(&self) -> Result<String, String> {
+        let stopped = self.stop_all();
+        let ckpt = lock_store(&self.store, Site::Quit)
+            .checkpoint()
+            .map(|_| ())
+            .map_err(|e| format!("final checkpoint: {e}"));
+        if let Err(e) = &ckpt {
+            log!("taso-blkd: {e}");
+        }
+        match (stopped, ckpt) {
+            (Ok(()), Ok(())) => Ok(String::new()),
+            (Err(a), Ok(())) | (Ok(()), Err(a)) => Err(a),
+            (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+        }
+    }
+
+    /// Drop `branch`, just made by a `fork` whose device did not start
+    /// (R2-03).  Never one a device runs on: under the table's hold, as
+    /// `drop` does (the table, then the store).
+    fn unfork(&self, branch: LayerId) -> Result<(), String> {
+        let devices = self.settled(branch);
+        if devices.contains_key(&branch) {
+            return Err(format!("{branch} is attached"));
+        }
+        let r = lock_store(&self.store, Site::DropBranch)
+            .drop_branch(branch)
+            .map_err(|e| e.to_string());
+        drop(devices);
+        r
     }
 
     /// Everything up to `lsn` on the medium (group commit); a failed sync
