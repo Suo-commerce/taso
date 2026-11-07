@@ -486,10 +486,15 @@ struct Device {
 /// taso-test, 2026-10-29): the table is not held across that, so a call
 /// about another branch (an `info`, another `attach`) never waits on it;
 /// a call that needs this branch's own entry settled waits for it
-/// ([`Daemon::settled`]).
+/// ([`Daemon::settled`]).  `Stopping` while `detach` kills its device
+/// (review fix H3, Kimi's H3): the entry stays in the table until the
+/// kill is known to have worked, so a failed kill leaves the device
+/// `Running` and tracked, and no `attach` can start a second device for
+/// the branch meanwhile.
 enum Slot {
     Starting,
     Running(Device),
+    Stopping,
 }
 
 /// Per-operation time on the device path, for `stats`: how long a request
@@ -1281,6 +1286,11 @@ impl Daemon {
                         "{branch} is already attached (its device is starting)"
                     ))
                 }
+                Some(Slot::Stopping) => {
+                    return Err(format!(
+                        "{branch} is attached (its device is being stopped)"
+                    ))
+                }
                 None => {}
             }
             devices.insert(branch, Slot::Starting);
@@ -1331,7 +1341,7 @@ impl Daemon {
     /// The device table, once `branch`'s entry is not `Starting`.
     fn settled(&self, branch: LayerId) -> MutexGuard<'_, HashMap<LayerId, Slot>> {
         let mut devices = lock(&self.devices);
-        while matches!(devices.get(&branch), Some(Slot::Starting)) {
+        while matches!(devices.get(&branch), Some(Slot::Starting | Slot::Stopping)) {
             devices = self
                 .settle
                 .wait(devices)
@@ -1342,13 +1352,43 @@ impl Daemon {
 
     /// Stop `branch`'s device and wait for its thread.
     fn detach(&self, branch: LayerId) -> Result<(), String> {
-        let Some(Slot::Running(d)) = self.settled(branch).remove(&branch) else {
-            return Err(format!("{branch} is not attached"));
+        self.detach_with(branch, kill_device)
+    }
+
+    /// [`Self::detach`] with the kill given (a test's can fail).  The
+    /// entry is `Stopping` while the kill runs, the table not held; a
+    /// failed kill puts the device back `Running`, still tracked, and says
+    /// so (review fix H3: the entry used to be gone before the kill, so a
+    /// failed kill lost the device and its serving thread, a retry said
+    /// "not attached", and `stop_all` never found it again).
+    fn detach_with(
+        &self,
+        branch: LayerId,
+        kill: impl FnOnce(i32) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let d = {
+            let mut devices = self.settled(branch);
+            match devices.remove(&branch) {
+                Some(Slot::Running(d)) => {
+                    devices.insert(branch, Slot::Stopping);
+                    d
+                }
+                Some(other) => {
+                    // Not reachable: settled waits out Starting and Stopping.
+                    devices.insert(branch, other);
+                    return Err(format!("{branch} is not attached"));
+                }
+                None => return Err(format!("{branch} is not attached")),
+            }
         };
-        UblkCtrl::new_simple(d.dev_id)
-            .and_then(|c| c.kill_dev())
-            .map_err(|e| format!("cannot stop /dev/ublkb{}: {e:?}", d.dev_id))?;
+        if let Err(e) = kill(d.dev_id) {
+            lock(&self.devices).insert(branch, Slot::Running(d));
+            self.settle.notify_all();
+            return Err(e);
+        }
         let _ = d.thread.join();
+        lock(&self.devices).remove(&branch);
+        self.settle.notify_all();
         Ok(())
     }
 
@@ -1474,6 +1514,14 @@ fn reap_dead_devices() -> (usize, usize) {
         }
     }
     (removed, failed)
+}
+
+/// Kill a device by id (the kernel's `kill_dev`).
+fn kill_device(dev_id: i32) -> Result<(), String> {
+    UblkCtrl::new_simple(dev_id)
+        .and_then(|c| c.kill_dev())
+        .map(|_| ())
+        .map_err(|e| format!("cannot stop /dev/ublkb{dev_id}: {e:?}"))
 }
 
 /// Whether `pid` is a running `taso-blkd`.
@@ -1783,5 +1831,90 @@ mod streams_test {
             Some(0),
             "the child's eprintln! to /dev/full must not panic it"
         );
+    }
+}
+
+/// Review fix H3 (Kimi's H3): a failed kill leaves the device tracked.
+#[cfg(test)]
+mod detach_test {
+    use super::*;
+
+    /// A daemon over a fresh log, no device started; a branch, and an
+    /// entry for it as if its device ran (a parked thread for its own).
+    fn daemon_with_a_running_branch() -> (tempfile::TempDir, Daemon, LayerId, Arc<AtomicBool>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::create(&dir.path().join("log")).unwrap();
+        let root = store.root_seal().unwrap();
+        let branch = store.fork(root).unwrap();
+        let sync = Arc::new(store.syncer().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                std::thread::park_timeout(std::time::Duration::from_millis(5));
+            }
+        });
+        let mut devices = HashMap::new();
+        devices.insert(branch, Slot::Running(Device { dev_id: 7, thread }));
+        let d = Daemon {
+            store: Arc::new(Mutex::new(store)),
+            sync,
+            devices: Mutex::new(devices),
+            settle: Condvar::new(),
+            geometry: Geometry {
+                size: 1 << 30,
+                depth: 1,
+                queues: 1,
+                threads: 1,
+                io_bytes: 512 << 10,
+                checkpoint_every: 0,
+                compact_pct: 0,
+                compact_min: 1 << 30,
+            },
+            compacting: AtomicBool::new(false),
+        };
+        (dir, d, branch, stop)
+    }
+
+    #[test]
+    fn a_failed_kill_leaves_the_device_running_and_tracked() {
+        let (_dir, d, branch, stop) = daemon_with_a_running_branch();
+        let e = d
+            .detach_with(branch, |id| {
+                Err(format!("cannot stop /dev/ublkb{id}: injected"))
+            })
+            .unwrap_err();
+        assert!(e.contains("injected"), "{e}");
+        assert!(
+            matches!(lock(&d.devices).get(&branch), Some(Slot::Running(dev)) if dev.dev_id == 7),
+            "the device is still tracked, Running"
+        );
+        // So a second attach is refused, and a retry finds it.
+        assert!(d.attach(branch).unwrap_err().contains("already attached"));
+        let mut killed = None;
+        stop.store(true, Ordering::Relaxed);
+        d.detach_with(branch, |id| {
+            killed = Some(id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(killed, Some(7), "the retry kills the same device");
+        assert!(lock(&d.devices).get(&branch).is_none(), "gone once killed");
+    }
+
+    #[test]
+    fn while_its_kill_runs_the_branch_cannot_be_attached_again() {
+        let (_dir, d, branch, stop) = daemon_with_a_running_branch();
+        stop.store(true, Ordering::Relaxed);
+        let mut during = None;
+        d.detach_with(branch, |_| {
+            during = Some(matches!(
+                lock(&d.devices).get(&branch),
+                Some(Slot::Stopping)
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(during, Some(true), "Stopping while the kill runs");
     }
 }
