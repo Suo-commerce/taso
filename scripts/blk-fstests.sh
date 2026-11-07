@@ -27,7 +27,9 @@
 # Without compaction the log grows by everything written: the raw and fsx
 # phases alone write more than 15 GiB.
 # Exit 0 only if raw and fsx passed, no compaction failed, and no test is
-# OURS.
+# OURS.  generic/223 and generic/347 follow the rotational flag (finding
+# 2026-10-19); each run proves that again both ways before it counts them
+# as ROTATIONAL, not OURS (see KNOWN_ROTATIONAL).
 #
 # setup touches, and nothing else:
 #   apt packages: automake bc e2fsprogs fio gawk gcc git libacl1-dev
@@ -549,11 +551,32 @@ note_stats "after xfstests"
 [[ ! -e "$RES/.disk-stop" ]] || FAILS=$((FAILS + 1))
 
 # ---- 4 recheck failures: ours again, and loop ------------------------------------
+# Tests whose result follows the rotational flag, not the device
+# (Taso_finding_fstests_2026-10-19, finding 4: ext4 allocates differently
+# on a non-rotational device; verified in all four directions).  Such a
+# test is not taken on trust: each run proves it again, failing on ours
+# with the flag as it is and passing with rotational=1, and passing on
+# loop as it is (rotational) and failing with rotational=0.  Only then is
+# it ROTATIONAL; otherwise it stays OURS.
+KNOWN_ROTATIONAL=(generic/223 generic/347)
 mapfile -t FAILED <"$RES/failed-ours.txt"
-OURS=() FLAKY=() BOTH=()
+OURS=() FLAKY=() BOTH=() ROT=() KNOWN=()
+: >"$RES/failed-ours-rot.txt"
+: >"$RES/failed-loop-nonrot.txt"
 if [[ ${#FAILED[@]} -gt 0 && ! -e "$RES/.disk-stop" ]]; then
     say "4 recheck: ${#FAILED[@]} failed tests, again on ours, then on loop"
     xfstests ours-again "$TDEV" "$SDEV" "$RES/failed-ours-again.txt" "${FAILED[@]}" || true
+    for t in "${KNOWN_ROTATIONAL[@]}"; do
+        grep -qx "$t" "$RES/failed-ours-again.txt" && KNOWN+=("$t")
+    done
+    if [[ ${#KNOWN[@]} -gt 0 ]]; then
+        was_t=$(rotational "$TDEV") was_s=$(rotational "$SDEV")
+        set_rotational "$TDEV" 1
+        set_rotational "$SDEV" 1
+        xfstests ours-rot "$TDEV" "$SDEV" "$RES/failed-ours-rot.txt" "${KNOWN[@]}" || true
+        set_rotational "$TDEV" "$was_t"
+        set_rotational "$SDEV" "$was_s"
+    fi
     blk detach "$TB" >/dev/null
     blk detach "$SB" >/dev/null
 
@@ -566,13 +589,29 @@ if [[ ${#FAILED[@]} -gt 0 && ! -e "$RES/.disk-stop" ]]; then
     fi
     echo "loop devices: TEST $LT, SCRATCH $LS (4096-byte sectors), rotational $(rotational "$LT")/$(rotational "$LS")" | tee -a "$RES/summary.txt"
     xfstests loop "$LT" "$LS" "$RES/failed-loop.txt" "${FAILED[@]}" || true
+    if [[ ${#KNOWN[@]} -gt 0 ]]; then
+        was_t=$(rotational "$LT") was_s=$(rotational "$LS")
+        set_rotational "$LT" 0
+        set_rotational "$LS" 0
+        xfstests loop-nonrot "$LT" "$LS" "$RES/failed-loop-nonrot.txt" "${KNOWN[@]}" || true
+        set_rotational "$LT" "$was_t"
+        set_rotational "$LS" "$was_s"
+    fi
     for l in "${LOOPS[@]}"; do losetup -d "$l"; done
     LOOPS=()
     rm -f "$LOOP_TEST_IMG" "$LOOP_SCRATCH_IMG"
 
     for t in "${FAILED[@]}"; do
         if grep -qx "$t" "$RES/failed-loop.txt"; then BOTH+=("$t")
-        elif grep -qx "$t" "$RES/failed-ours-again.txt"; then OURS+=("$t")
+        elif grep -qx "$t" "$RES/failed-ours-again.txt"; then
+            # Known, and the flag decided it once more in both directions.
+            if printf '%s\n' "${KNOWN[@]}" | grep -qx "$t" \
+                && ! grep -qx "$t" "$RES/failed-ours-rot.txt" \
+                && grep -qx "$t" "$RES/failed-loop-nonrot.txt"; then
+                ROT+=("$t")
+            else
+                OURS+=("$t")
+            fi
         else FLAKY+=("$t")
         fi
     done
@@ -582,6 +621,7 @@ fi
     echo
     echo "failed on ours, passed on loop (OURS):   ${OURS[*]:-none}"
     echo "failed once on ours, then passed (FLAKY): ${FLAKY[*]:-none}"
+    echo "follow the rotational flag (proved again, ours and loop both ways): ${ROT[*]:-none}"
     echo "failed on loop too (not the device):      ${BOTH[*]:-none}"
     echo "log $(du -h --apparent-size "$LOG" 2>/dev/null | cut -f1); $(free_gib) GiB free at the end"
     echo "automatic compactions: $(grep -c '^taso-blkd: compacted:' "$ERR" || true) done, $(grep -c '^taso-blkd: compaction:' "$ERR" || true) failed, $(grep -c '^taso-blkd: compaction waits:' "$ERR" || true) times short of room"

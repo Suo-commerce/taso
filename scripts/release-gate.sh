@@ -68,6 +68,11 @@ need=$MIN_FREE_QUICK; [ "$TIER" = full ] && need=$MIN_FREE_FULL
 [ "$(free_gib)" -ge "$need" ] || die "$(free_gib) GiB free, $TIER needs $need (old clones' target/ folders: cargo clean)"
 COMMIT=$(git rev-parse --short HEAD)
 OUT=${OUT:-/root/release-$COMMIT-$TIER-$(date +%Y%m%d-%H%M%S)}
+# Not passed on: gate-p2-blk, p3-no-trace and f6-fork-blk read OUT as
+# their own results directory, and the nightly sets it in the
+# environment (2c9f8cf's first full run: gate-p2-blk wrote its summary
+# over this table).
+export -n OUT
 mkdir -p "$OUT"
 S=$OUT/summary.txt
 : > "$S"
