@@ -949,6 +949,7 @@ mod tests {
                 access_key_id: env("TASO_S3_KEY_ID"),
                 secret_key: env("TASO_S3_SECRET"),
                 ca_file: std::env::var_os("TASO_S3_CA").map(Into::into),
+                plaintext: env("TASO_S3_ENDPOINT").starts_with("http://"),
             },
             std::time::Duration::from_secs(10),
         )

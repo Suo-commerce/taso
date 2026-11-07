@@ -553,6 +553,7 @@ mod tests {
                 access_key_id: var("TASO_S3_KEY_ID"),
                 secret_key: var("TASO_S3_SECRET"),
                 ca_file: std::env::var_os("TASO_S3_CA").map(Into::into),
+                plaintext: var("TASO_S3_ENDPOINT").starts_with("http://"),
             },
             Duration::from_secs(30),
         )

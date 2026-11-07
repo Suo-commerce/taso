@@ -327,6 +327,7 @@ fn rebirth_on_a_second_node_from_shipped_packs() {
                 env("TASO_BLK_S3_BUCKET")
             );
             StoreConf::S3 {
+                plaintext: endpoint.starts_with("http://"),
                 endpoint,
                 region: env("TASO_BLK_S3_REGION"),
                 bucket: env("TASO_BLK_S3_BUCKET"),

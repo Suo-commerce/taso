@@ -248,7 +248,7 @@ if [ -n "${TASO_BLK_S3_ENDPOINT:-}" ]; then
         on "$n" "umask 077; cat > $WORK/s3.secret" < "$SECRET_FILE"
         durable "$n"
     done
-    STORE_JSON=$(python3 -c "import json,os; print(json.dumps({'s3': {'endpoint': os.environ['TASO_BLK_S3_ENDPOINT'], 'region': os.environ.get('TASO_BLK_S3_REGION', 'garage'), 'bucket': os.environ['TASO_BLK_S3_BUCKET'], 'access_key_id': os.environ['TASO_BLK_S3_ACCESS_KEY_ID'], 'secret_key_file': '$WORK/s3.secret'}}))")
+    STORE_JSON=$(python3 -c "import json,os; print(json.dumps({'s3': {'endpoint': os.environ['TASO_BLK_S3_ENDPOINT'], 'region': os.environ.get('TASO_BLK_S3_REGION', 'garage'), 'bucket': os.environ['TASO_BLK_S3_BUCKET'], 'access_key_id': os.environ['TASO_BLK_S3_ACCESS_KEY_ID'], 'secret_key_file': '$WORK/s3.secret', 'plaintext': os.environ['TASO_BLK_S3_ENDPOINT'].startswith('http://')}}))")
     PREFIX="gate-p2blk-$RUN"
     MODE="$MODE, packs to $TASO_BLK_S3_ENDPOINT/$TASO_BLK_S3_BUCKET"
 else

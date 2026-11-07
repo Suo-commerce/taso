@@ -51,6 +51,11 @@ pub struct S3Config {
     /// For `https://`: trust only the CA certificates in this PEM file
     /// instead of the public web roots.
     pub ca_file: Option<std::path::PathBuf>,
+    /// The operator's yes to an `http://` endpoint: data and signed
+    /// requests cross the network unencrypted (review fix M4, Kimi's M4).
+    /// Without it `http://` is refused; with `https://` it is a
+    /// contradiction and refused too.
+    pub plaintext: bool,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -62,6 +67,7 @@ impl std::fmt::Debug for S3Config {
             .field("access_key_id", &self.access_key_id)
             .field("secret_key", &"<hidden>")
             .field("ca_file", &self.ca_file)
+            .field("plaintext", &self.plaintext)
             .finish()
     }
 }
@@ -103,6 +109,29 @@ impl S3Store {
                 io::ErrorKind::InvalidInput,
                 "a CA file needs an https:// endpoint",
             ));
+        }
+        // Plain HTTP only when the operator said so (review fix M4).
+        match (tls, config.plaintext) {
+            (false, false) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "endpoint {:?} is plain http: the store's data and signed requests would cross the network unencrypted; use https://, or say \"plaintext\": true",
+                        config.endpoint
+                    ),
+                ))
+            }
+            (true, true) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "\"plaintext\": true with an https:// endpoint",
+                ))
+            }
+            (false, true) => eprintln!(
+                "taso: the store {} is plain http (\"plaintext\": true): its data and signed requests cross the network unencrypted",
+                config.endpoint
+            ),
+            (true, false) => {}
         }
         if config.bucket.is_empty()
             || !config
@@ -674,6 +703,7 @@ pub(crate) mod tests {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
             ca_file: None,
+            plaintext: true,
         }
     }
 
@@ -820,14 +850,31 @@ pub(crate) mod tests {
             ..aws_example()
         };
         assert!(S3Store::new(ok.clone(), Duration::from_secs(1)).is_ok());
+        let https = S3Config {
+            endpoint: "https://garage.example:3900".into(),
+            plaintext: false,
+            ..ok.clone()
+        };
+        assert!(S3Store::new(https.clone(), Duration::from_secs(1)).is_ok());
+        // Review fix M4: http:// only with the operator's yes, and that
+        // yes with https:// is a contradiction.
+        let e = S3Store::new(
+            S3Config {
+                plaintext: false,
+                ..ok.clone()
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("plain http"), "{e}");
         assert!(S3Store::new(
             S3Config {
-                endpoint: "https://garage.example:3900".into(),
-                ..ok.clone()
+                plaintext: true,
+                ..https
             },
             Duration::from_secs(1)
         )
-        .is_ok());
+        .is_err());
         assert!(
             S3Store::new(
                 S3Config {
@@ -904,6 +951,7 @@ class H(http.server.BaseHTTPRequestHandler):
                     region: "garage".into(),
                     bucket: "taso".into(),
                     ca_file: ca.map(|c| srv.dir.path().join(c)),
+                    plaintext: false,
                     ..aws_example()
                 },
                 Duration::from_secs(5),
@@ -1072,6 +1120,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 access_key_id: env("TASO_S3_KEY_ID"),
                 secret_key: env("TASO_S3_SECRET"),
                 ca_file: std::env::var_os("TASO_S3_CA").map(Into::into),
+                plaintext: env("TASO_S3_ENDPOINT").starts_with("http://"),
             },
             Duration::from_secs(10),
         )

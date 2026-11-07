@@ -223,6 +223,9 @@ pub enum StoreConf {
         secret_key_file: PathBuf,
         /// For an `https://` endpoint: trust only this CA (PEM).
         ca_file: Option<PathBuf>,
+        /// `"plaintext": true`: the operator's yes to an `http://`
+        /// endpoint (review fix M4).
+        plaintext: bool,
     },
 }
 
@@ -247,6 +250,7 @@ impl StoreConf {
                         "access_key_id",
                         "secret_key_file",
                         "ca_file",
+                        "plaintext",
                     ],
                 )?;
                 StoreConf::S3 {
@@ -260,6 +264,7 @@ impl StoreConf {
                     } else {
                         None
                     },
+                    plaintext: bool_or(s, "plaintext", false)?,
                 }
             }
             _ => return Err(bad("\"store\" must be a directory or {\"s3\": {...}}")),
@@ -277,6 +282,7 @@ impl StoreConf {
                 access_key_id,
                 secret_key_file,
                 ca_file,
+                plaintext,
             } => {
                 let secret = std::fs::read_to_string(secret_key_file).map_err(|e| {
                     std::io::Error::new(e.kind(), format!("{}: {e}", secret_key_file.display()))
@@ -289,6 +295,7 @@ impl StoreConf {
                         access_key_id: access_key_id.clone(),
                         secret_key: secret.trim().to_string(),
                         ca_file: ca_file.clone(),
+                        plaintext: *plaintext,
                     },
                     Duration::from_secs(30),
                 )?)
@@ -6247,8 +6254,23 @@ mod tests {
                 access_key_id: "GK1".into(),
                 secret_key_file: "/etc/taso/s3.secret".into(),
                 ca_file: None,
+                plaintext: false,
             }
         );
+        // Review fix M4: "plaintext" read as given.
+        let yes = with(|v| {
+            v["store"] = serde_json::json!({ "s3": {
+                "endpoint": "http://10.0.0.2:3900", "bucket": "taso", "plaintext": true,
+                "access_key_id": "GK1", "secret_key_file": "/etc/taso/s3.secret" } })
+        })
+        .unwrap();
+        assert!(matches!(
+            yes.store,
+            StoreConf::S3 {
+                plaintext: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6262,6 +6284,7 @@ mod tests {
             access_key_id: "GK1".into(),
             secret_key_file: file,
             ca_file: None,
+            plaintext: true,
         };
         assert!(
             s3(dir.path().join("missing")).open().is_err(),
