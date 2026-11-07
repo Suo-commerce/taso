@@ -843,7 +843,28 @@ pub enum ServeEvent<'a> {
         /// The refusal, as the agent was told it.
         message: &'a str,
     },
+    /// A connection was refused: its socket already had
+    /// [`MAX_CONNECTIONS_PER_SOCKET`] open, or no thread could be started
+    /// for it (review fix M2, Kimi's M2).  Reported at the 1st, 2nd, 4th,
+    /// 8th … refusal of a serve, so a flood does not flood the log.
+    Refused {
+        /// The socket it came to.
+        socket: Socket,
+        /// Its connections open when it came.
+        open: usize,
+        /// Refusals so far in this serve.
+        refused: u64,
+    },
 }
+
+/// The most connections one of a Vessel's sockets holds at once (review
+/// fix M2, Kimi's M2).  Each costs the Warden a thread outside the
+/// agent's own limits, so an agent opening connections without end would
+/// exhaust the Warden's threads and memory (and a failed thread start
+/// panicked the serve).  The protocol needs one agent connection and the
+/// sender's; 16 leaves room for an agent's tools.  One beyond it is
+/// accepted and closed at once: the agent sees the connection end.
+pub const MAX_CONNECTIONS_PER_SOCKET: usize = 16;
 
 enum Msg {
     Request {
@@ -884,6 +905,7 @@ pub fn serve_vessel<L: Layers>(
     std::thread::scope(|scope| -> io::Result<()> {
         let mut conns: BTreeMap<u64, (Conn, UnixStream)> = BTreeMap::new();
         let mut next_id = 0u64;
+        let mut refused = 0u64;
         let mut closing = false;
         let mut failed: Option<io::Error> = None;
         loop {
@@ -893,12 +915,38 @@ pub fn serve_vessel<L: Layers>(
                     loop {
                         match listener.listener.accept() {
                             Ok((stream, _)) => {
-                                stream.set_nonblocking(false)?;
-                                let id = next_id;
-                                next_id += 1;
-                                conns.insert(id, (Conn::new(socket), stream.try_clone()?));
-                                let tx = tx.clone();
-                                scope.spawn(move || connection(id, stream, tx));
+                                let open =
+                                    conns.values().filter(|(c, _)| c.socket == socket).count();
+                                let started = if open >= MAX_CONNECTIONS_PER_SOCKET {
+                                    None
+                                } else {
+                                    stream.set_nonblocking(false)?;
+                                    let id = next_id;
+                                    let kept = stream.try_clone()?;
+                                    let tx = tx.clone();
+                                    std::thread::Builder::new()
+                                        .name(format!("field-{id}"))
+                                        .spawn_scoped(scope, move || connection(id, stream, tx))
+                                        .ok()
+                                        .map(|_| (id, kept))
+                                };
+                                match started {
+                                    Some((id, kept)) => {
+                                        next_id += 1;
+                                        conns.insert(id, (Conn::new(socket), kept));
+                                    }
+                                    None => {
+                                        // Closed now: the agent sees it end.
+                                        refused += 1;
+                                        if refused.is_power_of_two() {
+                                            on_event(ServeEvent::Refused {
+                                                socket,
+                                                open,
+                                                refused,
+                                            });
+                                        }
+                                    }
+                                }
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -2475,6 +2523,92 @@ mod tests {
         });
         assert_eq!(fenced.len(), 1, "{fenced:?}");
         assert!(fenced[0].starts_with("TurnEnd: "), "{fenced:?}");
+    }
+
+    /// Review fix M2 (Kimi's M2): an agent opening connections without end
+    /// gets at most MAX_CONNECTIONS_PER_SOCKET; the next is closed at once
+    /// and reported, and the Warden's threads stay bounded.
+    #[test]
+    fn connections_beyond_the_cap_are_refused_and_reported() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = FieldSocket::bind(dir.path().join("agent.sock")).unwrap();
+        let sender = FieldSocket::bind(dir.path().join("sender.sock")).unwrap();
+        let done = AtomicBool::new(false);
+        let mut refusals = Vec::new();
+        let mut ended = 0usize;
+        // What the agent saw: whether each extra connection ended
+        // unanswered, and whether a held one still worked.  Recorded, not
+        // asserted, so `done` is always set and a wrong Warden fails the
+        // test instead of hanging it.
+        let seen = std::thread::scope(|scope| {
+            let a = agent.path().to_path_buf();
+            let done = &done;
+            let client = scope.spawn(move || {
+                let wait = Some(Duration::from_secs(5));
+                let mut held = Vec::new();
+                for _ in 0..MAX_CONNECTIONS_PER_SOCKET {
+                    let mut c = UnixStream::connect(&a).unwrap();
+                    c.set_read_timeout(wait).unwrap();
+                    let _ = send_request(&mut c, &hello());
+                    let _ = recv_reply(&mut c);
+                    held.push(c);
+                }
+                let mut extras_closed = Vec::new();
+                for _ in 0..3 {
+                    let mut extra = UnixStream::connect(&a).unwrap();
+                    extra.set_read_timeout(wait).unwrap();
+                    let _ = send_request(&mut extra, &hello());
+                    extras_closed.push(matches!(recv_reply(&mut extra), Ok(None) | Err(_)));
+                    held.push(extra);
+                }
+                let _ = send_request(&mut held[0], &hello());
+                let held_works = matches!(recv_reply(&mut held[0]), Ok(Some(_)));
+                held.clear();
+                done.store(true, Ordering::SeqCst);
+                (extras_closed, held_works)
+            });
+            let mut session = Session::new(&mut v, Verdict::Clean).unwrap();
+            serve_vessel(
+                &mut session,
+                &agent,
+                &sender,
+                &|| done.load(Ordering::SeqCst),
+                Duration::from_millis(5),
+                &mut |ev| match ev {
+                    ServeEvent::Refused {
+                        socket,
+                        open,
+                        refused,
+                    } => refusals.push((socket, open, refused)),
+                    ServeEvent::Ended(_) => ended += 1,
+                    ServeEvent::Fenced { .. } => {}
+                },
+            )
+            .unwrap();
+            client.join().unwrap()
+        });
+        assert_eq!(
+            seen.0,
+            [true, true, true],
+            "each connection beyond the cap is closed unanswered"
+        );
+        assert!(seen.1, "the connections within the cap still work");
+        // Three refused, reported at the 1st and 2nd (powers of two).
+        assert_eq!(
+            refusals,
+            [
+                (Socket::Agent, MAX_CONNECTIONS_PER_SOCKET, 1),
+                (Socket::Agent, MAX_CONNECTIONS_PER_SOCKET, 2)
+            ]
+        );
+        assert_eq!(
+            ended, MAX_CONNECTIONS_PER_SOCKET,
+            "only the accepted ones ran"
+        );
     }
 
     /// Review finding 2: who may write an outcome is a trust boundary.  The

@@ -5024,6 +5024,16 @@ impl Node {
                                 "fenced: {request} refused, another Warden holds this Vessel now: {message}"
                             ),
                         ),
+                        ServeEvent::Refused {
+                            socket,
+                            open,
+                            refused,
+                        } => self.log(
+                            vc,
+                            format_args!(
+                                "{socket:?} connection refused: {open} open (at most {}), {refused} refused so far", crate::field::MAX_CONNECTIONS_PER_SOCKET
+                            ),
+                        ),
                     },
                 )
                 .map_err(io("serving the sockets"));
