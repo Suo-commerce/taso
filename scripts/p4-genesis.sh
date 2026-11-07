@@ -255,7 +255,8 @@ scratches() {
     blk names | tr ' ' '\n' | grep -c '/genesis-' || true
 }
 views() {
-    blk names | tr ' ' '\n' | grep -c '\.view-' || true
+    # The Warden's (.view-) and taso-genesis's (.gview-, review fix S1).
+    blk names | tr ' ' '\n' | grep -c -E '\.g?view-' || true
 }
 
 # ── 1. A directory becomes a Template ───────────────────────────────

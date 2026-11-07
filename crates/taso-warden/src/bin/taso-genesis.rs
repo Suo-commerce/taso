@@ -238,7 +238,8 @@ fn build(
         None => taso_warden::genesis::no_failpoints(),
     };
     Ok(Genesis {
-        pool: config.storage.open(),
+        // Its Seal views are named apart from the Warden's (review fix S1).
+        pool: config.storage.open().for_genesis(),
         store,
         prefix: config.prefix.clone(),
         coord,

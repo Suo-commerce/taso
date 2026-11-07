@@ -470,6 +470,9 @@ pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
     mount_root: PathBuf,
     spool: PathBuf,
     views: Views,
+    /// The word in this process's Seal view names: `view` for the Warden,
+    /// `gview` for taso-genesis (review fix S1, [`BlkPool::for_genesis`]).
+    view_kind: &'static str,
 }
 
 impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
@@ -481,6 +484,7 @@ impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
             mount_root: self.mount_root.clone(),
             spool: self.spool.clone(),
             views: self.views.clone(),
+            view_kind: self.view_kind,
         }
     }
 }
@@ -514,7 +518,21 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             mount_root: mount_root.into(),
             spool: spool.into(),
             views: Arc::default(),
+            view_kind: "view",
         }
+    }
+
+    /// Name this process's Seal views as taso-genesis's, `<dataset>.gview-
+    /// <lsn>` (review fix S1).  G-a shares a view within one process; a
+    /// view's count is the process's own, so another process meeting its
+    /// name would take it for a crash's and take it down under its user.
+    /// With a word per kind of process, a genesis and the Warden never
+    /// meet each other's views (a genesis from a Vessel's Seal while the
+    /// Warden views it for a nomination or an attempt), and each process
+    /// takes down only its own kind's leftovers.
+    pub fn for_genesis(mut self) -> Self {
+        self.view_kind = "gview";
+        self
     }
 
     /// The [`Sender`] for this pool's Seals.
@@ -856,7 +874,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     /// found in the block log but not in this process's count is a
     /// crash's.
     fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
-        let name = format!("{}.view-{}", dataset.as_str(), lsn.get());
+        let name = format!("{}.{}-{}", dataset.as_str(), self.view_kind, lsn.get());
         let dir = self.mount_root.join(".views").join(&name);
         let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((users, _)) = views.get_mut(&name) {
@@ -2455,6 +2473,58 @@ mod tests {
             c[0].starts_with("mount-ro ") && c[1].starts_with("umount "),
             "{c:?}"
         );
+    }
+
+    /// Review fix S1: taso-genesis and the Warden, two processes over one
+    /// daemon, view the same Seal at once (a genesis from a Vessel's Seal
+    /// while the Warden nominates it).  Each has its own count, so with
+    /// one name the genesis took the Warden's view for a crash's and
+    /// unmounted it under its user.
+    #[test]
+    fn a_genesis_and_the_warden_never_take_down_each_others_views() {
+        let warden = pool();
+        let a = ds("tank/v-a");
+        warden.create(&a).unwrap();
+        warden
+            .layers(&a)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap()
+            .run()
+            .unwrap();
+        let held = warden.seal_view(&a, Lsn::new(3)).unwrap();
+        // Another process: the same daemon and mounts, its own count.
+        let genesis = BlkPool {
+            views: Arc::default(),
+            ..Clone::clone(&warden)
+        }
+        .for_genesis();
+        calls(&warden);
+        let g = genesis.seal_view(&a, Lsn::new(3)).unwrap();
+        let c = calls(&warden);
+        assert!(
+            !c.iter().any(|c| c.starts_with("umount ")),
+            "the Warden's view unmounted under it: {c:?}"
+        );
+        assert_eq!(c.len(), 1, "one mount: {c:?}");
+        assert!(
+            c[0].starts_with("mount-ro ") && c[0].ends_with("/tank/v-a.gview-3"),
+            "{c:?}"
+        );
+        assert_eq!(g.path(), Path::new("/mnt/taso/.views/tank/v-a.gview-3"));
+        drop(g);
+        assert_eq!(calls(&warden), ["umount /mnt/taso/.views/tank/v-a.gview-3"]);
+        assert!(
+            warden
+                .blkd
+                .lock()
+                .unwrap()
+                .find("tank/v-a.view-3")
+                .unwrap()
+                .is_some(),
+            "the Warden's view stands"
+        );
+        drop(held);
+        assert_eq!(calls(&warden), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
     }
 
     #[test]
