@@ -22,6 +22,8 @@
 # $OUT/summary.txt, the table (gate, exit, seconds, last line).  Exit 0
 # only if every gate passed.
 #
+# One run at a time per node: a second one exits 3 (the lock).
+#
 # Env: OUT (default /root/release-<commit>-<tier>-<date>); the store for
 # blk-warden-test and gate-p2-blk as those scripts take it
 # (TASO_BLK_S3_*; unset: a local directory).  `full` needs xfstests set up
@@ -35,6 +37,10 @@ die() { echo "release-gate: $*" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -f Cargo.toml ] && [ -d scripts ] || die "run from the repository root"
 [ -z "$(git status --porcelain --untracked-files=no)" ] || die "the tree has changes: a release gate runs on a commit"
+# One gate run at a time on a node (they share taso-blkd, /run/taso and the
+# ublk devices); exit 3 when another holds the lock (release-nightly.sh).
+exec 9> /run/taso-release-gate.lock
+flock -n 9 || { echo "release-gate: another release gate is running" >&2; exit 3; }
 COMMIT=$(git rev-parse --short HEAD)
 OUT=${OUT:-/root/release-$COMMIT-$TIER-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
@@ -61,9 +67,20 @@ run build 60m cargo build --release -q --workspace --bins
 run install 5m bash -c '
     install target/release/taso-blkd /usr/local/bin/taso-blkd &&
     systemctl restart taso-blkd &&
-    for _ in $(seq 50); do [ -S /run/taso/blk.sock ] && break; sleep 0.1; done &&
-    python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(\"/run/taso/blk.sock\"); s.sendall(b\"names\n\"); a=s.makefile().readline(); assert a.startswith(\"ok\"), a" &&
-    echo "taso-blkd: this build, answering"'
+    python3 - <<PY && echo "taso-blkd: this build, answering"
+import socket, time
+# The old socket file outlives the restart: ask until the new daemon answers.
+for i in range(100):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect("/run/taso/blk.sock")
+        s.sendall(b"names\n"); a = s.makefile().readline()
+        assert a.startswith("ok"), a
+        break
+    except (ConnectionRefusedError, FileNotFoundError):
+        if i == 99: raise
+        time.sleep(0.1)
+PY
+'
 
 if [ "$TIER" = quick ]; then CRASH=10 P3N=20 P2N=20 LIMIT=45m
 else                          CRASH=100 P3N=100 P2N=100 LIMIT=4h; fi
