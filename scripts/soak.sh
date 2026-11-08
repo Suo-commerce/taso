@@ -415,12 +415,28 @@ else:
     expect "$id: one chain" is "$chain" ok
 done
 
-say "taso-blkd quits clean and leaves no device"
+say "taso-blkd quits clean and leaves no device (predict: after the Vessels' file systems are unmounted, quit answers ok within 60 s and the daemon exits 0)"
+# The Warden leaves its Vessels mounted when it stops (a crash leaves
+# them too); a device under a mounted file system cannot be stopped, so
+# they are unmounted first, as an operator would (taso-test 2026-11-08:
+# quit with them mounted did not answer in 120 s).
+while read -r m; do
+    [[ -n "$m" ]] || continue
+    umount "$m" || umount -l "$m"
+done < <(mounts_under)
+expect "nothing mounted under $MNT" is "$(mounts_under | wc -l)" 0
 blk quit >/dev/null && QRC=0 || QRC=$?
-wait "$BLKD_PID" 2>/dev/null || true
-BLKD_PID=
-rm -f "$BLK_SOCK"
+BRC=timeout
+for _ in $(seq 600); do
+    if ! kill -0 "$BLKD_PID" 2>/dev/null; then
+        wait "$BLKD_PID" 2>/dev/null && BRC=0 || BRC=$?
+        break
+    fi
+    sleep 0.1
+done
+[[ "$BRC" != timeout ]] && { BLKD_PID=; rm -f "$BLK_SOCK"; }
 expect "quit answered ok" is "$QRC" 0
+expect "taso-blkd exited 0" is "$BRC" 0
 expect "ublk devices as before" is "$(ublk_devices)" "$DEVS_BEFORE"
 
 echo
