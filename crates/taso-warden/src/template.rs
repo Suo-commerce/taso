@@ -2444,6 +2444,101 @@ mod tests {
         ));
     }
 
+    /// Release test N3b (review fix N3b-a): 300 Candidates pending (the
+    /// review's 200, and past the point where one 16 MiB reply could carry
+    /// them: 300 x 64 KiB is 18.75 MiB), each with an attempt finished at
+    /// the full 64 KiB output.  Through the decider's real socket, all are
+    /// listed, across pages of at most 64, each once and in id
+    /// order; each one can then be decided; and decided, none is pending.
+    #[test]
+    fn release_n3b_three_hundred_pending_are_listed_and_each_decided() {
+        use crate::decidesrv::{Decide, DeciderClient, DeciderConf, DeciderServer};
+        use taso_core::decider::{PendingItem, Reply, Request};
+        const N: usize = 300;
+        let c = Cluster::new();
+        let mut held = Vec::new();
+        for i in 0..N {
+            let (h, mut v, packs, cand) = audit2_nominated(&c, format!("n3b-{i}").as_bytes());
+            let at = attempts(&c);
+            let st = at.start(&mut v, &packs, &cand).unwrap();
+            let f = at
+                .finish(
+                    &mut v,
+                    &packs,
+                    &st,
+                    VOutcome::Exit { code: 0 },
+                    vec![b'o'; 64 << 10],
+                )
+                .unwrap();
+            held.push((h, v, packs, cand, f));
+        }
+        struct Node {
+            coord: Arc<Coordinator>,
+            ids: Vec<ChronicleId>,
+        }
+        impl Decide for Node {
+            fn pending(&self) -> Result<Vec<PendingItem>, String> {
+                let mut all = Vec::new();
+                for id in &self.ids {
+                    all.extend(
+                        verdict::pending(self.coord.as_ref(), *id).map_err(|e| e.to_string())?,
+                    );
+                }
+                Ok(all)
+            }
+            fn verdict(
+                &self,
+                _: &taso_core::contract::VerdictRequest,
+                _: taso_core::contract::Peer,
+            ) -> Result<taso_core::decider::VerdictAnswer, String> {
+                Err("decided directly in this test".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let conf = DeciderConf::defaults(dir.path());
+        let node = Arc::new(Node {
+            coord: c.coord.clone(),
+            ids: held.iter().map(|(_, v, ..)| v.id()).collect(),
+        });
+        let _srv = DeciderServer::spawn(&conf, node).unwrap();
+        let mut client = DeciderClient::connect(&conf.socket).unwrap();
+        let (mut pages, mut after, mut seen) = (Vec::new(), None, Vec::new());
+        loop {
+            let Reply::Pending { items, more } = client.call(&Request::Pending { after }).unwrap()
+            else {
+                panic!("not a page")
+            };
+            assert!(items.len() <= 64);
+            assert!(items
+                .iter()
+                .all(|i| i.attempts.iter().any(|a| a.1.output.len() == 64 << 10)));
+            pages.push(items.len());
+            after = items.last().map(|i| i.candidate.candidate_id);
+            seen.extend(items.into_iter().map(|i| i.candidate.candidate_id));
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(pages, [64, 64, 64, 64, 44]);
+        let mut want: Vec<HashVal> = held.iter().map(|(.., cand, _)| cand.candidate_id).collect();
+        want.sort_by_key(|h| *h.as_bytes());
+        assert_eq!(seen, want, "all of them, each once, in id order");
+        assert_eq!(client.pending_all().unwrap().len(), N);
+        // Each one decided.
+        let vd = verdicts(&c);
+        for (_, v, packs, cand, f) in &mut held {
+            let r = request(cand, f, Decision::Sanction);
+            assert!(matches!(
+                vd.handle(v, packs, &r, PEER).unwrap(),
+                VerdictAnswer::Committed { .. }
+            ));
+        }
+        assert!(
+            client.pending_all().unwrap().is_empty(),
+            "decided: none pending"
+        );
+    }
+
     #[test]
     fn an_attempt_holds_the_verifier_layer_and_the_artifact_until_it_finishes() {
         let c = Cluster::new();
