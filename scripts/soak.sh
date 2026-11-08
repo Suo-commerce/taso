@@ -43,7 +43,7 @@
 # /mnt/soak and mounts under it, the /dev/ublkb* devices its taso-blkd
 # creates, runc containers under /var/lib/taso-soak/run/runc.
 
-set -euo pipefail
+set -Eeuo pipefail
 
 SECS=${1:-600}
 VESSELS=${2:-4}
@@ -90,7 +90,13 @@ print(line)
 sys.exit(0 if line.startswith("ok") else 1)
 PY
 }
-ublk_devices() { ls /dev/ublkb* 2>/dev/null | wc -l; }
+# Not `ls | wc -l`: with no device, ls fails, and under pipefail and -e
+# that ended the script with no word (taso-test, 2026-11-08, twice).
+ublk_devices() {
+    local n=0 d
+    for d in /dev/ublkb*; do [[ -e "$d" ]] && n=$((n + 1)); done
+    echo "$n"
+}
 
 # stop_warden KILL: a crash, its containers left for the next start to
 # sweep (as in production); stop_warden TERM: the end, containers removed.
@@ -130,6 +136,8 @@ cleanup() {
     exit "$rc"
 }
 trap cleanup EXIT
+# A command that fails under -e says where, never a silent end.
+trap 'echo "ABORT: line $LINENO: \"$BASH_COMMAND\" failed" >&2' ERR
 
 # ── Checks, build ───────────────────────────────────────────────────
 
