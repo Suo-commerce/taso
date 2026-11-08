@@ -116,6 +116,7 @@ stop_warden() {
 cleanup() {
     local rc=$?
     set +e
+    trap - ERR   # the cleanup's own failures are expected and said otherwise
     [[ -z "$SAMPLER_PID" ]] || { kill "$SAMPLER_PID" 2>/dev/null; wait "$SAMPLER_PID" 2>/dev/null; }
     [[ -z "$POLICY_PID" ]] || { kill "$POLICY_PID" 2>/dev/null; wait "$POLICY_PID" 2>/dev/null; }
     stop_warden TERM
