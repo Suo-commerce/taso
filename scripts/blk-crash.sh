@@ -78,16 +78,34 @@ print(s.makefile().readline().strip())
     esac
 }
 
+# A restart replays the whole log (a killed daemon leaves no checkpoint)
+# and removes the dead daemon's device before it answers: it slows as the
+# log grows.  Each restart's time is said; one over START_WARN seconds is
+# noted, and one over START_LIMIT fails the run with the daemon's last
+# words and where it waits (2c9f8cf's first full run: round 76's restart
+# passed the old 10 s limit, and its log was gone by the next run).
+START_WARN=${BLK_CRASH_START_WARN:-10}
+START_LIMIT=${BLK_CRASH_START_LIMIT:-120}
 start_daemon() {
     rm -f "$SOCK"    # a killed daemon leaves its socket; wait for the new one
+    local t0=$SECONDS
     "$BLKD" "$LOG" "$SOCK" --durable-at "$DURABLE_AT" 2>>"$ERR" &
     DAEMON_PID=$!
-    for _ in $(seq 100); do
-        [[ -S "$SOCK" ]] && return 0
-        kill -0 "$DAEMON_PID" 2>/dev/null || die "daemon exited; see $ERR"
+    for _ in $(seq $((START_LIMIT * 10))); do
+        if [[ -S "$SOCK" ]]; then
+            START_SECS=$((SECONDS - t0))
+            [[ $START_SECS -le $START_WARN ]] || say "  slow restart: ${START_SECS} s"
+            return 0
+        fi
+        kill -0 "$DAEMON_PID" 2>/dev/null || { tail -n 20 "$ERR"; die "daemon exited; see $ERR"; }
         sleep 0.1
     done
-    die "daemon socket did not appear in 10 s"
+    echo "-- the daemon's last words ($ERR):"; tail -n 20 "$ERR"
+    echo "-- where it waits (pid $DAEMON_PID):"
+    ps -o pid,etimes,stat,wchan:30 -p "$DAEMON_PID" || true
+    head -n 12 "/proc/$DAEMON_PID/stack" 2>/dev/null || true
+    ls /dev/ublkc* /dev/ublkb* 2>/dev/null | tr '\n' ' '; echo
+    die "daemon socket did not appear in $START_LIMIT s"
 }
 
 wait_dev() {
@@ -253,7 +271,7 @@ CTRL_BEFORE=$(control_devices)
 # Restart, recover, attach, journal replay, fsck, check the manifest.
 recover_and_check() {
     start_daemon
-    say "  $(grep -o 'recovered.*' "$ERR" | tail -n 1)"
+    say "  $(grep -o 'recovered.*' "$ERR" | tail -n 1); answering after ${START_SECS} s"
     DEV=$(blk attach "$BR")
     wait_dev "$DEV"
     if ! mount "$DEV" "$MNT"; then

@@ -32,9 +32,10 @@
 # taso-p3.*, taso-f6fork.*, taso-k2e2e.*, e3check.*) are removed, and gate
 # results under /root older than $KEEP_DAYS days.  Then the run refuses to
 # start with less than $MIN_FREE_QUICK (quick) or $MIN_FREE_FULL (full)
-# GiB free.  The table's last column is the GiB free after each gate.
+# GiB free (full: xfstests checks its own 20; the first full run used 4
+# more at its lowest).  The table's last column is the GiB free after each gate.
 #
-# Env: KEEP_DAYS (14), MIN_FREE_QUICK (15), MIN_FREE_FULL (35); OUT (default /root/release-<commit>-<tier>-<date>); the store for
+# Env: KEEP_DAYS (14), MIN_FREE_QUICK (15), MIN_FREE_FULL (25); OUT (default /root/release-<commit>-<tier>-<date>); the store for
 # blk-warden-test and gate-p2-blk as those scripts take it
 # (TASO_BLK_S3_*; unset: a local directory).  `full` needs xfstests set up
 # once (scripts/blk-fstests.sh setup).
@@ -45,7 +46,7 @@ TIER=${1:-}
 case "$TIER" in quick|full|clean) ;; *) echo "usage: $0 quick|full|clean" >&2; exit 2 ;; esac
 KEEP_DAYS=${KEEP_DAYS:-14}
 MIN_FREE_QUICK=${MIN_FREE_QUICK:-15}
-MIN_FREE_FULL=${MIN_FREE_FULL:-35}
+MIN_FREE_FULL=${MIN_FREE_FULL:-25}
 die() { echo "release-gate: $*" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || die "run as root"
 [ -f Cargo.toml ] && [ -d scripts ] || die "run from the repository root"
