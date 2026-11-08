@@ -930,13 +930,21 @@ fn serve(d: &Daemon, conn: UnixStream) -> Option<i32> {
         if words.is_empty() {
             continue;
         }
-        let quit = words[0] == "quit";
+        let mut quit = words[0] == "quit";
         let poisoned_before = lock_store(&d.store, Site::Poisoned).is_poisoned();
-        let answer = match if quit {
-            d.shutdown()
+        let result = if quit {
+            match d.shutdown() {
+                Quit::Done(r) => r,
+                // Nothing stopped: the daemon serves on (busy devices).
+                Quit::Refused(e) => {
+                    quit = false;
+                    Err(e)
+                }
+            }
         } else {
             d.command(&words)
-        } {
+        };
+        let answer = match result {
             Ok(a) if a.is_empty() => "ok".to_string(),
             Ok(a) => format!("ok {a}"),
             Err(e) => {
@@ -960,6 +968,14 @@ fn serve(d: &Daemon, conn: UnixStream) -> Option<i32> {
         }
     }
     None
+}
+
+/// What `quit` did.
+enum Quit {
+    /// Stopped (or tried to): the daemon exits, 0 only if all went well.
+    Done(Result<String, String>),
+    /// Nothing stopped: the daemon serves on.
+    Refused(String),
 }
 
 impl Daemon {
@@ -1151,7 +1167,10 @@ impl Daemon {
                 Ok(lsn.to_string())
             }
             "stats" => Ok(self.stats()),
-            "quit" => self.shutdown(),
+            "quit" => match self.shutdown() {
+                Quit::Done(r) => r,
+                Quit::Refused(e) => Err(e),
+            },
             other => Err(format!("unknown command {other}")),
         }
     }
@@ -1436,11 +1455,11 @@ impl Daemon {
         Ok(())
     }
 
-    fn stop_all(&self) -> Result<(), String> {
+    fn stop_all_with(&self, kill: impl Fn(i32) -> Result<(), String>) -> Result<(), String> {
         let branches: Vec<LayerId> = lock(&self.devices).keys().copied().collect();
         let mut failed = Vec::new();
         for b in branches {
-            if let Err(e) = self.detach(b) {
+            if let Err(e) = self.detach_with(b, &kill) {
                 log!("taso-blkd: {e}");
                 failed.push(e);
             }
@@ -1454,9 +1473,38 @@ impl Daemon {
     /// `quit`: every device stopped, then the last group ended and a
     /// checkpoint left, so the next start is quick and loses nothing.
     /// Answered only after both, with what failed (round 2, R2-04): a
-    /// failed final flush or checkpoint is never an "ok".
-    fn shutdown(&self) -> Result<String, String> {
-        let stopped = self.stop_all();
+    /// failed final flush or checkpoint is never an "ok".  Refused, with
+    /// nothing stopped and the daemon serving on, while a device is in use
+    /// (mounted): its stop would wait for the unmount for good (soak,
+    /// taso-test 2026-11-08).
+    fn shutdown(&self) -> Quit {
+        self.shutdown_with(in_use, kill_device)
+    }
+
+    fn shutdown_with(
+        &self,
+        in_use: impl Fn(i32) -> Option<String>,
+        kill: impl Fn(i32) -> Result<(), String>,
+    ) -> Quit {
+        let busy: Vec<String> = lock(&self.devices)
+            .iter()
+            .filter_map(|(b, slot)| match slot {
+                Slot::Running(d) => in_use(d.dev_id).map(|e| format!("{b}: {e}")),
+                _ => None,
+            })
+            .collect();
+        if !busy.is_empty() {
+            return Quit::Refused(format!(
+                "not quitting, {} device(s) in use: {}",
+                busy.len(),
+                busy.join("; ")
+            ));
+        }
+        Quit::Done(self.shutdown_now(kill))
+    }
+
+    fn shutdown_now(&self, kill: impl Fn(i32) -> Result<(), String>) -> Result<String, String> {
+        let stopped = self.stop_all_with(kill);
         let ckpt = lock_store(&self.store, Site::Quit)
             .checkpoint()
             .map(|_| ())
@@ -1601,12 +1649,56 @@ fn reap_dead_devices() -> (usize, usize) {
     (removed, failed)
 }
 
-/// Kill a device by id (the kernel's `kill_dev`).
+/// Kill a device by id (the kernel's `kill_dev`), never one in use.
+///
+/// A file system mounted on the device holds it exclusively, and the
+/// device's thread then waits in the kernel's delete for the last opener
+/// for good: `quit` and `detach` never answered (soak, taso-test
+/// 2026-11-08).  So the device is opened exclusively first (`EBUSY`: in
+/// use, refused, nothing stopped), and held across the stop, so nothing
+/// can mount it in between.
 fn kill_device(dev_id: i32) -> Result<(), String> {
-    UblkCtrl::new_simple(dev_id)
+    let hold = hold_exclusively(dev_id)?;
+    let r = UblkCtrl::new_simple(dev_id)
         .and_then(|c| c.kill_dev())
         .map(|_| ())
-        .map_err(|e| format!("cannot stop /dev/ublkb{dev_id}: {e:?}"))
+        .map_err(|e| format!("cannot stop /dev/ublkb{dev_id}: {e:?}"));
+    drop(hold);
+    r
+}
+
+/// `/dev/ublkb<dev_id>` opened exclusively, or why it cannot be: in use
+/// (mounted, or held by another exclusive opener).  `None` when the node
+/// is not there (udev has not made it, or already removed it): nothing can
+/// be mounted through it.
+fn hold_exclusively(dev_id: i32) -> Result<Option<File>, String> {
+    hold_exclusively_at(&format!("/dev/ublkb{dev_id}"))
+}
+
+fn hold_exclusively_at(path: &str) -> Result<Option<File>, String> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_o_excl())
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.raw_os_error() == Some(EBUSY) => Err(format!(
+            "{path} is in use (mounted?): not stopped; unmount it first"
+        )),
+        Err(e) => Err(format!("{path}: {e}")),
+    }
+}
+
+/// Whether `/dev/ublkb<dev_id>` is in use, as [`hold_exclusively`] finds it.
+fn in_use(dev_id: i32) -> Option<String> {
+    hold_exclusively(dev_id).err()
+}
+
+const EBUSY: i32 = 16;
+/// `O_EXCL`: on a block device without `O_CREAT`, an exclusive open.
+const fn libc_o_excl() -> i32 {
+    0o200
 }
 
 /// Whether `pid` is a running `taso-blkd`.
@@ -1985,6 +2077,98 @@ mod detach_test {
         .unwrap();
         assert_eq!(killed, Some(7), "the retry kills the same device");
         assert!(lock(&d.devices).get(&branch).is_none(), "gone once killed");
+    }
+
+    /// Soak, taso-test 2026-11-08: `quit` with a Vessel still mounted on
+    /// a device never answered (the device's delete waits for the last
+    /// opener).  A device in use refuses the quit: nothing is stopped, the
+    /// devices stay tracked and the daemon serves on; unmounted, the quit
+    /// goes through.
+    #[test]
+    fn quit_is_refused_while_a_device_is_in_use_and_nothing_stops() {
+        let (_dir, d, branch, stop) = daemon_with_a_running_branch();
+        let killed = std::cell::Cell::new(0);
+        match d.shutdown_with(
+            |id| Some(format!("/dev/ublkb{id} is in use (mounted?)")),
+            |_| {
+                killed.set(killed.get() + 1);
+                Ok(())
+            },
+        ) {
+            Quit::Refused(e) => assert!(
+                e.contains("1 device(s) in use") && e.contains("ublkb7"),
+                "{e}"
+            ),
+            Quit::Done(r) => panic!("quit went through: {r:?}"),
+        }
+        assert_eq!(killed.get(), 0, "nothing stopped");
+        assert!(matches!(
+            lock(&d.devices).get(&branch),
+            Some(Slot::Running(_))
+        ));
+        stop.store(true, Ordering::Relaxed);
+        match d.shutdown_with(|_| None, |_| Ok(())) {
+            Quit::Done(r) => assert_eq!(r, Ok(String::new())),
+            Quit::Refused(e) => panic!("refused: {e}"),
+        }
+        assert!(lock(&d.devices).is_empty(), "stopped once unmounted");
+    }
+
+    /// The kernel's side of it, on a real block device (a loop device, as
+    /// root): a mounted file system holds it, so the exclusive open the
+    /// stop takes first is refused; unmounted, it is taken.  Skipped
+    /// without root or losetup.
+    #[test]
+    fn a_mounted_block_device_cannot_be_held_exclusively() {
+        let root = std::fs::read_to_string("/proc/self/status").is_ok_and(|s| {
+            s.lines()
+                .any(|l| l.starts_with("Uid:") && l.split_whitespace().nth(1) == Some("0"))
+        });
+        let has = |c: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {c}")])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !root || !has("losetup") || !has("mkfs.ext4") {
+            eprintln!("skipped: needs root, losetup and mkfs.ext4");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(32 << 20)
+            .unwrap();
+        let run = |args: &[&str]| {
+            let o = std::process::Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        let lo = run(&["losetup", "-f", "--show", img.to_str().unwrap()]);
+        run(&["mkfs.ext4", "-q", &lo]);
+        let mnt = dir.path().join("mnt");
+        std::fs::create_dir(&mnt).unwrap();
+        run(&["mount", &lo, mnt.to_str().unwrap()]);
+        let busy = hold_exclusively_at(&lo);
+        run(&["umount", mnt.to_str().unwrap()]);
+        let free = hold_exclusively_at(&lo).map(|f| f.is_some());
+        let _ = std::process::Command::new("losetup")
+            .args(["-d", &lo])
+            .status();
+        assert!(
+            busy.as_ref().is_err_and(|e| e.contains("in use")),
+            "{busy:?}"
+        );
+        assert_eq!(free, Ok(true), "unmounted, it is held");
+        assert!(matches!(hold_exclusively_at("/dev/ublkb-none"), Ok(None)));
     }
 
     fn alive(d: &Daemon, l: LayerId) -> bool {
