@@ -3677,6 +3677,60 @@ mod tests {
         assert_eq!(v.tail().lsn, tail);
     }
 
+    /// Release test N6 (review, finding 6; D84): the Template is
+    /// independent of its source.  Sanction v0, finish into T(1), purge v0
+    /// (its filesystem packs replaced by log-only ones, its dataset gone,
+    /// the Chronicle retired), then birth from T(1) on a node that never
+    /// held v0, from the store and the coordinator alone: the Vessel has
+    /// the sanctioned files, in the Template's range.  The purge is the
+    /// Warden's own Purger (an operator purge is a deferred feature, §11.3:
+    /// this exercises the contract under it, not the command).
+    #[test]
+    fn release_n6_a_template_is_born_after_its_source_is_purged() {
+        use std::os::unix::fs::MetadataExt;
+        let c = Cluster::new();
+        let (h, mut v, packs, s) = committed(&c, b"n6");
+        finisher(&c, 1).finish(&mut v, &packs, &s).unwrap();
+        assert!(completed(&c, s.template_id));
+        let source = v.id();
+        // The source purged.
+        let out = purger(&c).purge(&h.pool, &mut v, &packs).unwrap();
+        assert!(matches!(out, Purged::Complete { .. }), "{out:?}");
+        assert!(c.coord.query_chronicle(source).unwrap().unwrap().retired);
+        assert_eq!(h.pool.guid(v.dataset()).unwrap(), None, "v0's dataset gone");
+        let (fs_packs, _) = fs_pack_names(&packs);
+        assert!(
+            fs_packs.is_empty(),
+            "no filesystem pack of v0 left: {fs_packs:?}"
+        );
+        drop(v);
+        drop(h);
+        // A node that never held v0 builds T(1)'s layer and births from it.
+        let n2 = c.node(2);
+        let l = n2.ensure(s.template_id).unwrap();
+        assert_eq!(l.template_id, s.template_id);
+        let h2 = host(&c, &n2);
+        let id = vessel_id(NS, b"after-purge");
+        let born = h2
+            .born_from_template(
+                NS,
+                b"after-purge",
+                &birth_of(&l, None),
+                &vpacks(&c, &n2, id),
+                &nofail,
+            )
+            .unwrap();
+        assert!(h2.birth_accepted(&born).unwrap());
+        let info = h2.pool.info(born.dataset()).unwrap().unwrap();
+        let root = info.mountpoint.unwrap();
+        assert_eq!(
+            std::fs::read(root.join("app/main.py")).unwrap(),
+            b"print(1)\n"
+        );
+        let m = std::fs::metadata(root.join("app/main.py")).unwrap();
+        assert_eq!((m.uid(), m.gid()), (TBASE, TBASE), "the Template's range");
+    }
+
     #[test]
     fn what_blocks_a_purge_is_answered_and_nothing_recorded() {
         let c = Cluster::new();
