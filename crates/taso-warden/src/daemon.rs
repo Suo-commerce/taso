@@ -3317,6 +3317,21 @@ impl Node {
         // Before anything reads it: state from before the format break is
         // refused, never misread (review G-a).
         check_state_generation(&config.state_dir).map_err(ctx("the state directory"))?;
+        // Before the sweep: an agent writing into a file system its killed
+        // Warden left frozen (mid-Seal) waits in the kernel and cannot be
+        // killed until a thaw (soak, taso-test 2026-11-08).  Thawed, the
+        // sweep kills it; the reopen rolls the Vessel back to its last
+        // Seal, so nothing it wrote after the freeze stays.
+        let thawed = storage
+            .thaw_left_frozen(&config.root)
+            .map_err(|e| io::Error::other(format!("thawing what a dead Warden froze: {e}")))?;
+        for dir in &thawed {
+            eprintln!(
+                "taso-wardend[{}]: thawed {}, left frozen by a dead incarnation",
+                config.warden.get(),
+                dir.display()
+            );
+        }
         let swept = sweep_stale(&Runc::new(RuncCli::new(config.run_dir.join("runc"))))
             .map_err(ctx("sweeping stale containers"))?;
         for id in &swept.deleted {

@@ -637,6 +637,35 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
         Ok(guid(to.0, to.1))
     }
 
+    /// Thaw every file system of `root`'s datasets that a dead Warden left
+    /// frozen; the mount points thawed.  A Warden killed while it held a
+    /// Seal's freeze leaves the file system frozen, and the Vessel's agent
+    /// then waits in the kernel, unkillable, at its next write: the next
+    /// start's sweep could not remove its container, and the Warden refused
+    /// to start for good (soak, taso-test 2026-11-08: two agents in state D
+    /// in `ext4_page_mkwrite`).  Only a mount exactly at a dataset's mount
+    /// point, from one of the block log's devices, is thawed (never what
+    /// holds a plain directory: the freeze's rule); one not frozen answers
+    /// `EINVAL` and is left as it is.
+    pub fn thaw_left_frozen(&self, root: &Dataset) -> Result<Vec<PathBuf>, LayerError> {
+        let mut thawed = Vec::new();
+        for ds in self.children(root)? {
+            let dir = self.mountpoint(&ds);
+            let Some(dev) = self.mounts.source(&dir).map_err(|e| e.to_string())? else {
+                continue;
+            };
+            if !dev.to_string_lossy().starts_with("/dev/ublkb") {
+                continue;
+            }
+            match self.mounts.thaw(&dir) {
+                Ok(()) => thawed.push(dir),
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {} // not frozen
+                Err(e) => return Err(format!("thawing {}: {e}", dir.display()).into()),
+            }
+        }
+        Ok(thawed)
+    }
+
     /// Where `dataset` is mounted.
     pub fn mountpoint(&self, dataset: &Dataset) -> PathBuf {
         self.mount_root.join(dataset.as_str())
@@ -1759,7 +1788,7 @@ mod tests {
             if self.devs.contains_key(&branch) {
                 return Err("already attached".into());
             }
-            let dev = PathBuf::from(format!("/dev/fake{}", branch.get()));
+            let dev = PathBuf::from(format!("/dev/ublkb{}", branch.get()));
             self.devs.insert(branch, dev.clone());
             Ok(dev)
         }
@@ -2016,7 +2045,12 @@ mod tests {
             if *self.fail_thaw.borrow() {
                 return Err(io::Error::other("device gone"));
             }
-            self.frozen.borrow_mut().retain(|d| d != dir);
+            // As the kernel: a thaw of a file system not frozen is EINVAL.
+            let mut frozen = self.frozen.borrow_mut();
+            if !frozen.iter().any(|d| d == dir) {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            frozen.retain(|d| d != dir);
             Ok(())
         }
     }
@@ -2628,6 +2662,39 @@ mod tests {
         // A new dataset of the same name has another guid.
         p.create(&a).unwrap();
         assert_ne!(p.guid(&a).unwrap(), Some(g));
+    }
+
+    /// Soak, taso-test 2026-11-08: a Warden killed mid-Seal left two
+    /// Vessels frozen; their agents waited in the kernel, unkillable, and
+    /// every later start refused (its sweep could not remove them).  The
+    /// start now thaws, first: the frozen one is thawed and named; one
+    /// mounted but not frozen (EINVAL) and one not mounted are left alone;
+    /// nothing outside the root is touched.
+    #[test]
+    fn a_start_thaws_what_a_dead_warden_left_frozen() {
+        let p = pool();
+        let (a, b, c) = (ds("tank/v-a"), ds("tank/v-b"), ds("tank/v-c"));
+        for d in [&a, &b, &c] {
+            p.create(d).unwrap();
+        }
+        p.mounts.freeze(&p.mountpoint(&a)).unwrap();
+        p.mounts.table.borrow_mut().remove(&p.mountpoint(&c));
+        calls(&p);
+        assert_eq!(
+            p.thaw_left_frozen(&ds("tank")).unwrap(),
+            vec![p.mountpoint(&a)]
+        );
+        assert!(p.mounts.frozen.borrow().is_empty(), "thawed");
+        assert_eq!(
+            calls(&p),
+            ["thaw /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-b"],
+            "a thawed; b asked and found not frozen; c not mounted"
+        );
+        // A thaw that fails otherwise is an error, naming the mount.
+        p.mounts.freeze(&p.mountpoint(&b)).unwrap();
+        *p.mounts.fail_thaw.borrow_mut() = true;
+        let e = p.thaw_left_frozen(&ds("tank")).unwrap_err().to_string();
+        assert!(e.contains("thawing /mnt/taso/tank/v-"), "{e}");
     }
 
     #[test]
