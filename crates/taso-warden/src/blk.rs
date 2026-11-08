@@ -659,7 +659,10 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             }
             match self.mounts.thaw(&dir) {
                 Ok(()) => thawed.push(dir),
-                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {} // not frozen
+                // Not frozen: EINVAL, seen by its kind (the real call wraps
+                // the error with its mount point and so loses the raw
+                // number: taso-test 1ef7531, every start refused).
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
                 Err(e) => return Err(format!("thawing {}: {e}", dir.display()).into()),
             }
         }
@@ -2045,10 +2048,14 @@ mod tests {
             if *self.fail_thaw.borrow() {
                 return Err(io::Error::other("device gone"));
             }
-            // As the kernel: a thaw of a file system not frozen is EINVAL.
+            // As the real call: a thaw of a file system not frozen is
+            // EINVAL, wrapped with the mount point (no raw number left).
             let mut frozen = self.frozen.borrow_mut();
             if !frozen.iter().any(|d| d == dir) {
-                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("thaw {}: Invalid argument (os error 22)", dir.display()),
+                ));
             }
             frozen.retain(|d| d != dir);
             Ok(())
@@ -2695,6 +2702,59 @@ mod tests {
         *p.mounts.fail_thaw.borrow_mut() = true;
         let e = p.thaw_left_frozen(&ds("tank")).unwrap_err().to_string();
         assert!(e.contains("thawing /mnt/taso/tank/v-"), "{e}");
+    }
+
+    /// The kernel's side, through the real [`System`] (as root, on a loop
+    /// device with the Vessels' ext4): a thaw of a file system not frozen
+    /// is an error of kind `InvalidInput`, which `thaw_left_frozen` takes
+    /// as "not frozen"; frozen, the thaw goes through.  taso-test 1ef7531:
+    /// the fake said EINVAL by number, the real call by kind only, and
+    /// every start refused.  Skipped without root, losetup or mkfs.ext4.
+    #[test]
+    fn the_real_thaw_of_a_file_system_not_frozen_is_invalid_input() {
+        let root = std::fs::read_to_string("/proc/self/status").is_ok_and(|s| {
+            s.lines()
+                .any(|l| l.starts_with("Uid:") && l.split_whitespace().nth(1) == Some("0"))
+        });
+        let has = |c: &str| {
+            Command::new("sh")
+                .args(["-c", &format!("command -v {c}")])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !root || !has("losetup") || !has("mkfs.ext4") {
+            eprintln!("skipped: needs root, losetup and mkfs.ext4");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(32 << 20)
+            .unwrap();
+        let out = |args: &[&str]| {
+            let o = Command::new(args[0]).args(&args[1..]).output().unwrap();
+            assert!(
+                o.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        let lo = PathBuf::from(out(&["losetup", "-f", "--show", img.to_str().unwrap()]));
+        System.mkfs(&lo).unwrap();
+        let mnt = dir.path().join("mnt");
+        System.mount(&lo, &mnt).unwrap();
+        let not_frozen = System.thaw(&mnt);
+        System.freeze(&mnt).unwrap();
+        let frozen = System.thaw(&mnt);
+        System.umount(&mnt).unwrap();
+        let _ = Command::new("losetup").arg("-d").arg(&lo).status();
+        assert_eq!(
+            not_frozen.map_err(|e| e.kind()),
+            Err(io::ErrorKind::InvalidInput)
+        );
+        assert!(frozen.is_ok(), "{frozen:?}");
     }
 
     #[test]
