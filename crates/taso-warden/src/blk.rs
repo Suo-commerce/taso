@@ -954,19 +954,29 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         // open Seal view) stands on one of its layers.
         let mut mine: Vec<LayerId> = own.clone();
         mine.extend(root);
+        //
+        // Another branch can go while this looks (another attempt's
+        // /candidate, a Seal view released: taso-test fd7199d, p4-verify
+        // case 11, "no layer L155"): a layer that is gone stands on
+        // nothing, so a failed look is an error only while its name still
+        // names that branch.
         for (name, x) in d.names()? {
             if x == b {
                 continue;
             }
-            let mut cur = d.info(x)?.parent;
+            let mut cur = Some(x);
             while let Some(l) = cur {
-                if mine.contains(&l) {
+                if l != x && mine.contains(&l) {
                     return Err(format!(
                         "{name} stands on {dataset}'s layer {l}; not destroying it"
                     )
                     .into());
                 }
-                cur = d.info(l)?.parent;
+                cur = match d.info(l) {
+                    Ok(i) => i.parent,
+                    Err(_) if d.find(&name)? != Some(x) => None, // gone meanwhile
+                    Err(e) => return Err(e),
+                };
             }
         }
         take_down(&mut *d, &*self.mounts, b, &self.mountpoint(dataset))?;
@@ -1716,6 +1726,9 @@ mod tests {
         store: Store,
         devs: HashMap<LayerId, PathBuf>,
         fail_seal: bool,
+        /// Names `names` still lists after their branch went (as another
+        /// connection's drop between `names` and `info`).
+        ghosts: Vec<(String, LayerId)>,
     }
 
     impl StoreBlkd {
@@ -1727,6 +1740,7 @@ mod tests {
                 store,
                 devs: HashMap::new(),
                 fail_seal: false,
+                ghosts: Vec::new(),
             }
         }
     }
@@ -1827,7 +1841,9 @@ mod tests {
             Ok(self.store.import(branch, &mut std::fs::File::open(path)?)?)
         }
         fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError> {
-            Ok(self.store.names())
+            let mut n = self.store.names();
+            n.extend(self.ghosts.iter().cloned());
+            Ok(n)
         }
         fn flush(&mut self) -> Result<(), LayerError> {
             self.store.flush()?;
@@ -2525,6 +2541,31 @@ mod tests {
         );
         drop(held);
         assert_eq!(calls(&warden), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
+    }
+
+    /// taso-test fd7199d, p4-verify case 11: two attempts' /candidate
+    /// datasets were destroyed at once; one destroy listed the names, the
+    /// other's branch went, and the first failed on it ("no layer L155"),
+    /// leaving its dataset for the next start.  A branch that goes while
+    /// destroy looks stands on nothing: the destroy goes on.  One that is
+    /// still there and unreadable is still an error.
+    #[test]
+    fn destroy_goes_on_when_another_branch_goes_while_it_looks() {
+        let p = pool();
+        let (a, b) = (ds("tank/a-1"), ds("tank/a-2"));
+        p.create(&a).unwrap();
+        p.create(&b).unwrap();
+        let gone = p.blkd.lock().unwrap().find("tank/a-2").unwrap().unwrap();
+        assert!(Pool::destroy(&p, &b, gone.get()).unwrap());
+        // The other destroy's listing still has it.
+        p.blkd
+            .lock()
+            .unwrap()
+            .ghosts
+            .push(("tank/a-2".into(), gone));
+        let g = p.guid(&a).unwrap().unwrap();
+        assert!(Pool::destroy(&p, &a, g).unwrap(), "a is destroyed");
+        assert_eq!(p.guid(&a).unwrap(), None);
     }
 
     #[test]
