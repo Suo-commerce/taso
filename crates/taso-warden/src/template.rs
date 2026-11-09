@@ -3677,6 +3677,77 @@ mod tests {
         assert_eq!(v.tail().lsn, tail);
     }
 
+    /// Soak, taso-test 2026-11-09: a sanctioned Candidate stayed counted
+    /// open, so after `max_open_candidates_per_vessel` sanctions a Vessel
+    /// could never nominate again.  With a limit of one: while its
+    /// sanction is committing, a second nomination is answered Retry; once
+    /// the Template is ready (the Candidate closed, sanctioned, §3.5), it is
+    /// accepted.
+    #[test]
+    fn a_sanctioned_candidate_no_longer_counts_against_the_limit() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, s) = committed(&c, b"limit");
+        // A second Seal to nominate.
+        v.append(Stream::Fs, Payload::Raw(vec![2; 8])).unwrap();
+        let seal = v
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                Lsn::new(0),
+                TurnId::new(2),
+            )
+            .unwrap()
+            .seal;
+        let snap = crate::storage::Snapshot {
+            dataset: v.dataset().clone(),
+            seal: seal.lsn,
+            guid: crate::vessel::tests::fake_guid(seal.lsn),
+            seal_hash: Some(seal.hash),
+        };
+        v.publish_seal(&packs, &snap, None).unwrap();
+        let tree = c.dir.path().join(format!("seal-{}", hex(b"limit")));
+        let mut conf = SanctionConf::new(MAP.as_bytes().to_vec()).unwrap();
+        conf.min_interval = Duration::ZERO;
+        conf.max_open_candidates = 1;
+        let n = Nominator::new(
+            c.store.clone(),
+            PREFIX,
+            c.coord.clone(),
+            WardenId::new(1),
+            BASE,
+            c.dir.path().join("ntmp2"),
+            conf,
+        );
+        let ask = Ask {
+            seal: None,
+            exclude: [PathClass::Scratch].into(),
+            verifier: c.t0,
+            vconf: VCONF.to_vec(),
+            version: 1,
+            by: NominatedBy::Agent,
+        };
+        // Committing: still open.
+        let t = tree.clone();
+        let a = n
+            .nominate(&mut v, &packs, &ask, &move |_| {
+                Ok(SealView::new(t.clone(), None))
+            })
+            .unwrap();
+        assert!(
+            matches!(a, Answer::Retry(ref why) if why.contains("1 open Candidates")),
+            "{a:?}"
+        );
+        // The Template ready: closed, sanctioned; the Vessel nominates again.
+        finisher(&c, 1).finish(&mut v, &packs, &s).unwrap();
+        assert!(ready_of(&c, s.template_id).is_some());
+        let a = n
+            .nominate(&mut v, &packs, &ask, &move |_| {
+                Ok(SealView::new(tree.clone(), None))
+            })
+            .unwrap();
+        assert!(matches!(a, Answer::Nominated(_)), "{a:?}");
+    }
+
     /// Release test N6 (review, finding 6; D84): the Template is
     /// independent of its source.  Sanction v0, finish into T(1), purge v0
     /// (its filesystem packs replaced by log-only ones, its dataset gone,

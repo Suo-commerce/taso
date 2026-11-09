@@ -672,7 +672,12 @@ impl Nominator {
     }
 
     /// The Vessel's open Candidates: those its log carries that are
-    /// accepted and not closed.
+    /// accepted and not closed.  Closed (§3.5): by `Never`, `Cancel` or
+    /// `Supersede`, and sanctioned once the commit's `TemplateReady` is
+    /// accepted (a commit before that is "committing", still counted).
+    /// Soak, taso-test 2026-11-09: a sanctioned Candidate was counted open
+    /// for good, so after four sanctions a Vessel's every nomination was
+    /// answered Retry for the rest of its life (12 000 times in 5 hours).
     fn open_candidates(&self, frames: &[Frame]) -> Result<usize, NominateError> {
         let ids: BTreeSet<[u8; 32]> = frames
             .iter()
@@ -688,9 +693,19 @@ impl Nominator {
         let mut open = 0;
         for id in ids {
             let id = HashVal::from_bytes(id);
-            if self.accepted(LogicalKey::Candidate(id))?.is_some()
-                && self.accepted(LogicalKey::CandidateClose(id))?.is_none()
+            if self.accepted(LogicalKey::Candidate(id))?.is_none()
+                || self.accepted(LogicalKey::CandidateClose(id))?.is_some()
             {
+                continue;
+            }
+            let sanctioned = match self.accepted(LogicalKey::Sanction(id))? {
+                Some(ContractRecord::SanctionCommitted(c)) => matches!(
+                    self.accepted(LogicalKey::Template(c.template_id))?,
+                    Some(ContractRecord::TemplateReady(_))
+                ),
+                _ => false,
+            };
+            if !sanctioned {
                 open += 1;
             }
         }
