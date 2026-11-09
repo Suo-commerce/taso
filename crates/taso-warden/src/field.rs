@@ -2169,6 +2169,97 @@ mod tests {
         ));
     }
 
+    /// A turn that was lost takes its held proposals with it (finding
+    /// 2026-11-09, SP (a)).  A child declares an action and its Warden
+    /// dies before TurnEnd; at the next start the child's files are back
+    /// at its last Seal, so its agent runs the turn again and declares
+    /// the same action again.  A promotion adopts that action once.
+    #[test]
+    fn a_lost_turns_proposal_is_not_adopted_with_its_rerun() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.seal_birth().unwrap();
+        let mut b = FakeBranches {
+            host: &e.host,
+            quota: 1,
+            children: Vec::new(),
+            promoted: Vec::new(),
+        };
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut p,
+        )
+        .unwrap();
+        {
+            let mut s = Session::new(&mut p, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx)
+                .with_branches(&mut b);
+            s.handle(hello());
+            assert!(matches!(
+                s.handle(Request::TurnEnd {
+                    turn: 1,
+                    quiescent: true,
+                }),
+                Reply::TurnEnd {
+                    sealed: Some(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                s.handle(Request::Fork { seal: None }),
+                Reply::Fork {
+                    result: ForkResult::Forked { .. }
+                }
+            ));
+        }
+        let mut children = std::mem::take(&mut b.children);
+        let c = &mut children[0];
+        // The lost turn: one action declared and held, no TurnEnd; the
+        // session and its ledger end with the Warden.
+        {
+            let (mut cfx, _) =
+                Effects::open(Mode::Hold, Box::new(crate::effects::AlwaysPublish), c).unwrap();
+            let mut s = Session::new(c, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut cfx);
+            s.handle(hello());
+            assert!(matches!(
+                s.handle(declare(0, "pay", b"child-0")),
+                Reply::Effect {
+                    result: EffectResult::Held { .. },
+                    ..
+                }
+            ));
+        }
+        // The next start: the same turn again, the same action, a TurnEnd.
+        propose(c, 1);
+        drop(children);
+
+        let mut s = Session::new(&mut p, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        let Reply::Promote {
+            result: PromoteResult::Promoted { adopted, .. },
+            ..
+        } = s.handle(Request::Promote {
+            child: "c1".into(),
+            seal: None,
+        })
+        else {
+            panic!("c1 not promoted")
+        };
+        assert_eq!(adopted.len(), 1, "the action is adopted once, not twice");
+        let Reply::Open { effects } = s.handle_as(&mut sender(), Request::Open) else {
+            panic!()
+        };
+        assert_eq!(effects.len(), 1, "and the sender is offered it once");
+        assert_eq!(effects[0].request, b"child-0");
+    }
+
     /// D1 over the Field: the agent asks, the Warden's `Branches` makes
     /// the child (its quota refuses the rest); a promotion adopts that
     /// child's held proposals as this Vessel's released effects, and a
