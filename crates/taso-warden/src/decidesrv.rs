@@ -21,6 +21,13 @@
 //! page asks the node again, so a Candidate decided between two pages is
 //! simply not on the next one.
 //!
+//! `Proposals { vessel, after }` (version 3, 4a) is a read, answered with
+//! one page of that Vessel's held proposals: nothing is recorded, nothing
+//! is released.  A Vessel the node cannot answer for is an `Error` that
+//! says so, never an empty page.  One proposal whose reply would pass the
+//! frame limit cannot be sent: the connection closes, which is an
+//! unavailable answer, not a wrong one.
+//!
 //! Normative reference: `Taso_spec_p4_contracts` rev. 22, BLAKE3
 //! `f3a54561505ebef478c43426273d79c789ec60dc74d0ff9c74ae0455720bde46`.
 
@@ -35,7 +42,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use taso_core::contract::{Peer, VerdictRequest};
-use taso_core::decider::{PendingItem, Reply, Request, VerdictAnswer, VERSION};
+use taso_core::decider::{PendingItem, ProposalItem, Reply, Request, VerdictAnswer, VERSION};
+use taso_core::envelope::{ChronicleId, Lsn};
 use taso_core::frame::{self, FrameError};
 
 /// The decider socket's settings (`decider.*`, §11.1).
@@ -67,6 +75,14 @@ pub trait Decide: Send + Sync {
     fn pending(&self) -> Result<Vec<PendingItem>, String>;
     /// A verdict from `peer`, whose `request_id` has been checked (D74).
     fn verdict(&self, request: &VerdictRequest, peer: Peer) -> Result<VerdictAnswer, String>;
+    /// Every held proposal of `vessel`, in any order, and its last Seal
+    /// (4a).  A read: it records nothing.  A Vessel this node cannot
+    /// answer for is an error, never an empty list.  A node that keeps no
+    /// Vessels' logs answers as here.
+    fn proposals(&self, vessel: ChronicleId) -> Result<(Vec<ProposalItem>, Option<Lsn>), String> {
+        let _ = vessel;
+        Err("this Warden lists no proposals".into())
+    }
 }
 
 /// The serving socket.  Dropping it stops it.
@@ -276,6 +292,20 @@ fn serve_conn(d: &dyn Decide, mut s: UnixStream, peer: Peer, max_frame: u32) {
                 Ok(answer) => (Reply::Verdict { answer }, false),
                 Err(e) => (err(e), false),
             },
+            Ok(Request::Proposals { vessel, after }) => match d.proposals(vessel) {
+                Ok((all, last_seal)) => {
+                    let (items, more) = taso_core::decider::proposal_page(all, after);
+                    (
+                        Reply::Proposals {
+                            items,
+                            more,
+                            last_seal,
+                        },
+                        false,
+                    )
+                }
+                Err(e) => (err(e), false),
+            },
         };
         if send(&mut s, &reply).is_err() || close {
             return;
@@ -340,6 +370,46 @@ impl DeciderClient {
         }
     }
 
+    /// Every held proposal of `vessel`, read page by page, and the last
+    /// Seal the final page named.  Pages that do not move forward are an
+    /// error, never a loop.  The Vessel may seal between two pages, so a
+    /// caller that needs one consistent view reads again until two reads
+    /// name the same Seal.
+    pub fn proposals_all(
+        &mut self,
+        vessel: ChronicleId,
+    ) -> Result<(Vec<ProposalItem>, Option<Lsn>), String> {
+        let mut all: Vec<ProposalItem> = Vec::new();
+        let mut after = None;
+        loop {
+            let (items, more, last_seal) = match self
+                .call(&Request::Proposals { vessel, after })
+                .map_err(|e| e.to_string())?
+            {
+                Reply::Proposals {
+                    items,
+                    more,
+                    last_seal,
+                } => (items, more, last_seal),
+                Reply::Error { message } => return Err(message),
+                other => return Err(format!("unexpected reply {other:?}")),
+            };
+            let forward = match (items.first().map(|i| i.intent.op.get()), after) {
+                (Some(f), Some(a)) => f > a,
+                (Some(_), None) => true,
+                (None, _) => !more,
+            };
+            if !forward {
+                return Err("the Warden's Proposals pages do not move forward".into());
+            }
+            after = items.last().map(|i| i.intent.op.get()).or(after);
+            all.extend(items);
+            if !more {
+                return Ok((all, last_seal));
+            }
+        }
+    }
+
     /// Send `req`, read the reply.
     pub fn call(&mut self, req: &Request) -> io::Result<Reply> {
         frame::write_frame(&mut self.s, &req.encode()).map_err(frame_io)?;
@@ -373,6 +443,9 @@ mod tests {
         seen: Mutex<Vec<(VerdictRequest, Peer)>>,
         /// What `pending` gives; `None`: it fails.
         items: Option<Vec<PendingItem>>,
+        /// The one Vessel `proposals` knows, its held proposals and its
+        /// last Seal; any other Vessel is unknown.
+        held: Option<(ChronicleId, Vec<ProposalItem>, Option<Lsn>)>,
     }
 
     impl Decide for Fake {
@@ -384,6 +457,46 @@ mod tests {
             Ok(VerdictAnswer::Retry(taso_core::decider::RetryReason::Rule(
                 Refusal::OpenAttempt,
             )))
+        }
+        fn proposals(
+            &self,
+            vessel: ChronicleId,
+        ) -> Result<(Vec<ProposalItem>, Option<Lsn>), String> {
+            match &self.held {
+                Some((v, items, seal)) if *v == vessel => Ok((items.clone(), *seal)),
+                _ => Err(format!("no Vessel {vessel:?} here")),
+            }
+        }
+    }
+
+    /// A Decide that says nothing of proposals: the trait's own answer.
+    struct NoProposals;
+
+    impl Decide for NoProposals {
+        fn pending(&self) -> Result<Vec<PendingItem>, String> {
+            Ok(Vec::new())
+        }
+        fn verdict(&self, _: &VerdictRequest, _: Peer) -> Result<VerdictAnswer, String> {
+            Err("no verdicts here".into())
+        }
+    }
+
+    fn proposal(op: u64) -> ProposalItem {
+        use taso_core::record::{Consequence, Dispatch, IntentRecord, OpId, RetryPolicy};
+        ProposalItem {
+            lsn: Lsn::new(10 + op),
+            intent: IntentRecord {
+                op: OpId::new(op),
+                provider: "mail".into(),
+                request: format!("to: a{op}").into_bytes(),
+                footprint: b"inbox:a".to_vec(),
+                dispatch: Dispatch::Immediate,
+                retry: RetryPolicy::UnsafeToRetry,
+                consequence: Consequence::Irreversible,
+                authority: Vec::new(),
+                barrier: None,
+            },
+            sealed: op <= 100,
         }
     }
 
@@ -591,5 +704,101 @@ mod tests {
         let (_srv2, _f2, conf2) = server(dir2.path(), 8);
         let mut c2 = DeciderClient::connect(&conf2.socket).unwrap();
         assert_eq!(c2.pending_all().unwrap_err(), "no Vessels here");
+    }
+
+    /// 4a: a Vessel's held proposals are answered page by page, in op
+    /// order, with the Seal that decided `sealed`; asking records nothing.
+    #[test]
+    fn proposals_are_answered_page_by_page_and_record_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let vessel = ChronicleId::from_bytes([5; 16]);
+        let items: Vec<ProposalItem> = (1..=150u64).rev().map(proposal).collect();
+        let (_srv, fake, conf) = server_with(
+            dir.path(),
+            8,
+            Fake {
+                held: Some((vessel, items, Some(Lsn::new(110)))),
+                ..Fake::default()
+            },
+        );
+        let mut c = DeciderClient::connect(&conf.socket).unwrap();
+        let (mut seen, mut after, mut pages) = (Vec::new(), None, Vec::new());
+        loop {
+            let Reply::Proposals {
+                items,
+                more,
+                last_seal,
+            } = c.call(&Request::Proposals { vessel, after }).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(last_seal, Some(Lsn::new(110)));
+            pages.push(items.len());
+            after = items.last().map(|i| i.intent.op.get());
+            seen.extend(items.iter().map(|i| (i.intent.op.get(), i.sealed)));
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(pages, [64, 64, 22]);
+        let want: Vec<(u64, bool)> = (1..=150).map(|op| (op, op <= 100)).collect();
+        assert_eq!(seen, want, "each once, in op order, its flag kept");
+        // The client's own reader gives the same, all of it.
+        let (all, last_seal) = c.proposals_all(vessel).unwrap();
+        assert_eq!(all.len(), 150);
+        assert_eq!(all[0].intent.request, b"to: a1");
+        assert_eq!(last_seal, Some(Lsn::new(110)));
+        assert!(lock(&fake.seen).is_empty(), "a read: no verdict was made");
+    }
+
+    /// 4a, rule R: a Vessel the Warden cannot answer for is an error that
+    /// says so, never an empty list, and the connection stays open; a
+    /// Warden that lists no proposals at all says that.
+    #[test]
+    fn an_unknown_vessel_is_an_error_never_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let vessel = ChronicleId::from_bytes([5; 16]);
+        let other = ChronicleId::from_bytes([6; 16]);
+        let (_srv, _fake, conf) = server_with(
+            dir.path(),
+            8,
+            Fake {
+                held: Some((vessel, Vec::new(), None)),
+                ..Fake::default()
+            },
+        );
+        let mut c = DeciderClient::connect(&conf.socket).unwrap();
+        let e = c.proposals_all(other).unwrap_err();
+        assert!(e.contains("no Vessel"), "{e}");
+        // The same connection still answers: a Vessel holding nothing is
+        // an empty list, a different answer from the error above.
+        assert_eq!(c.proposals_all(vessel).unwrap(), (Vec::new(), None));
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let conf2 = DeciderConf {
+            socket: dir2.path().join("d").join("decide.sock"),
+            max_frame_bytes: 4096,
+            max_connections: 8,
+        };
+        let _srv2 = DeciderServer::spawn(&conf2, Arc::new(NoProposals)).unwrap();
+        let mut c2 = DeciderClient::connect(&conf2.socket).unwrap();
+        let e = c2.proposals_all(vessel).unwrap_err();
+        assert!(e.contains("lists no proposals"), "{e}");
+    }
+
+    /// 4a: Proposals before Hello is out of order, as any request is.
+    #[test]
+    fn proposals_before_hello_is_refused_and_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_srv, _fake, conf) = server(dir.path(), 8);
+        let mut s = UnixStream::connect(&conf.socket).unwrap();
+        let q = Request::Proposals {
+            vessel: ChronicleId::from_bytes([5; 16]),
+            after: None,
+        };
+        frame::write_frame(&mut s, &q.encode()).unwrap();
+        let body = frame::read_frame(&mut s).unwrap().unwrap();
+        assert!(matches!(Reply::decode(&body).unwrap(), Reply::Error { .. }));
+        assert!(frame::read_frame(&mut s).unwrap().is_none(), "closed");
     }
 }
