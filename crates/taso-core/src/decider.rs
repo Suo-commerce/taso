@@ -11,6 +11,7 @@
 //! | `Pending { after }` | 1 | `Pending { items, more }` | 1 |
 //! | `Verdict { request }` | 2 | `Verdict { answer }` | 2 |
 //! | | | `Error { message }` | 3 |
+//! | `Proposals { vessel, after }` | 3 | `Proposals { items, more, last_seal }` | 4 |
 //!
 //! Answers (D77, D86): `Committed { template_id }` 0, `Held` 1,
 //! `ClosedNever` 2, `Refused { rule }` 3, `Retry { reason }` 4.  A Retry's
@@ -23,17 +24,24 @@
 //! [`PENDING_PAGE_BYTES`], and `more` while any remain.  A caller reads
 //! until `more` is false, passing the last item's id as `after`, so every
 //! pending Candidate is seen whatever their number.
+//!
+//! `Proposals` (version 3) is a read: the held proposals of one Vessel,
+//! in op order after `after`, in pages cut the same way.  It records
+//! nothing and changes nothing; it never releases, adopts or refuses.
+//! A proposal is what an agent asked for on a branch that may never be
+//! promoted: only the sender socket's `Open` list says what may be sent.
 
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
     Candidate, Refusal, VerdictRequest, VerificationFinished, VerificationStarted,
 };
 use crate::decode::{DecodeError, Reader};
-use crate::envelope::{ChronicleId, HashVal};
+use crate::envelope::{ChronicleId, HashVal, Lsn};
+use crate::record::IntentRecord;
 
-/// The protocol version.  2: `Pending` in pages (review fix N3b-a); a
-/// peer speaking 1 is refused at `Hello`.
-pub const VERSION: u32 = 2;
+/// The protocol version.  2: `Pending` in pages (review fix N3b-a).  3:
+/// `Proposals`.  A peer speaking another version is refused at `Hello`.
+pub const VERSION: u32 = 3;
 
 /// The most items in one `Pending` page.
 pub const PENDING_PAGE: usize = 64;
@@ -51,6 +59,56 @@ pub struct PendingItem {
     pub candidate: Candidate,
     /// Its finished attempts.
     pub attempts: Vec<(VerificationStarted, VerificationFinished)>,
+}
+
+/// One held proposal of a Vessel: an intent its agent declared that no
+/// Vessel has released.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalItem {
+    /// The Intent record's lsn in the Vessel's Chronicle.
+    pub lsn: Lsn,
+    /// The intent, with the exact request bytes.
+    pub intent: IntentRecord,
+    /// Whether the Vessel's last Seal covers it (the intent is at or
+    /// before that Seal's ledger position).  One that is not can vanish
+    /// when the Vessel is rolled back, and cannot be promoted yet.
+    pub sealed: bool,
+}
+
+impl Canonical for ProposalItem {
+    fn canon(&self, out: &mut Canon) {
+        self.lsn.canon(out);
+        self.intent.canon(out);
+        out.bool(self.sealed);
+    }
+}
+
+/// One page of `items` (every held proposal of one Vessel, any order)
+/// after the op `after`: in op order, at most [`PENDING_PAGE`] items and
+/// about [`PENDING_PAGE_BYTES`] (at least one), and whether more remain.
+/// What a Warden answers `Proposals { after }` with.
+pub fn proposal_page(
+    mut items: Vec<ProposalItem>,
+    after: Option<u64>,
+) -> (Vec<ProposalItem>, bool) {
+    let op = |i: &ProposalItem| i.intent.op.get();
+    items.retain(|i| after.is_none_or(|a| op(i) > a));
+    items.sort_by_key(op);
+    items.dedup_by_key(|i| op(i));
+    let mut bytes = 0;
+    let mut n = 0;
+    for i in &items {
+        if n == PENDING_PAGE || (n > 0 && bytes >= PENDING_PAGE_BYTES) {
+            break;
+        }
+        let mut c = Canon::new();
+        i.canon(&mut c);
+        bytes += c.as_bytes().len();
+        n += 1;
+    }
+    let more = items.len() > n;
+    items.truncate(n);
+    (items, more)
 }
 
 /// Why the Warden answers [`VerdictAnswer::Retry`] (D86): for a person
@@ -124,6 +182,14 @@ pub enum Request {
         /// The request; its `request_id` is checked against the peer.
         request: Box<VerdictRequest>,
     },
+    /// A page of one Vessel's held proposals: those after the op `after`.
+    /// A read; nothing is recorded.
+    Proposals {
+        /// The Vessel's Chronicle id.
+        vessel: ChronicleId,
+        /// The last op of the page before; `None`: from the first.
+        after: Option<u64>,
+    },
 }
 
 /// A reply from the decider socket.
@@ -150,6 +216,16 @@ pub enum Reply {
     Error {
         /// Why.
         message: String,
+    },
+    /// A page of a Vessel's held proposals, in op order.
+    Proposals {
+        /// Each one.
+        items: Vec<ProposalItem>,
+        /// Whether more remain after the last of `items`.
+        more: bool,
+        /// The Vessel's last Seal, by which `sealed` was decided; `None`:
+        /// it has none.
+        last_seal: Option<Lsn>,
     },
 }
 
@@ -262,6 +338,14 @@ impl Request {
                 c.tag(2);
                 request.canon(&mut c);
             }
+            Self::Proposals { vessel, after } => {
+                c.tag(3);
+                vessel.canon(&mut c);
+                match after {
+                    None => c.tag(0),
+                    Some(op) => c.tag(1).u64(*op),
+                };
+            }
         }
         c.into_bytes()
     }
@@ -276,6 +360,10 @@ impl Request {
             },
             (_, 2) => Self::Verdict {
                 request: Box::new(r.verdict_request()?),
+            },
+            (_, 3) => Self::Proposals {
+                vessel: r.chronicle()?,
+                after: r.option(Reader::u64)?,
             },
             (at, t) => return Reader::bad(at, "decider request", t),
         };
@@ -302,6 +390,16 @@ impl Reply {
             Self::Error { message } => {
                 c.tag(3).str(message);
             }
+            Self::Proposals {
+                items,
+                more,
+                last_seal,
+            } => {
+                c.tag(4)
+                    .seq(items.iter())
+                    .bool(*more)
+                    .option(last_seal.as_ref());
+            }
         }
         c.into_bytes()
     }
@@ -325,6 +423,17 @@ impl Reply {
             },
             (_, 3) => Self::Error {
                 message: r.string()?,
+            },
+            (_, 4) => Self::Proposals {
+                items: r.seq(|r| {
+                    Ok(ProposalItem {
+                        lsn: r.lsn()?,
+                        intent: r.intent()?,
+                        sealed: r.bool()?,
+                    })
+                })?,
+                more: r.bool()?,
+                last_seal: r.option(Reader::lsn)?,
             },
             (at, t) => return Reader::bad(at, "decider reply", t),
         };
@@ -355,6 +464,8 @@ fn answer(r: &mut Reader<'_>) -> Result<VerdictAnswer, DecodeError> {
 mod tests {
     use super::*;
     use crate::contract::tests::{candidate, finished, started, verdict_request};
+    use crate::envelope::Lsn;
+    use crate::record::{BarrierId, Consequence, Dispatch, IntentRecord, OpId, RetryPolicy};
 
     fn every_reply() -> Vec<Reply> {
         let mut v = vec![
@@ -418,7 +529,7 @@ mod tests {
             }
         }
         assert!(matches!(
-            Request::decode(&[3]),
+            Request::decode(&[4]),
             Err(DecodeError::BadTag { .. })
         ));
         for p in every_reply() {
@@ -430,7 +541,7 @@ mod tests {
             assert!(Reply::decode(&b[..b.len() - 1]).is_err());
         }
         assert!(matches!(
-            Reply::decode(&[4]),
+            Reply::decode(&[5]),
             Err(DecodeError::BadTag { .. })
         ));
         assert!(Reply::decode(&[2, 5]).is_err(), "no answer tag 5 (D86)");
@@ -511,6 +622,115 @@ mod tests {
         let mut huge = items[0].clone();
         huge.attempts[0].1.output = vec![0; PENDING_PAGE_BYTES + 1];
         let (got, more) = page(vec![huge], None);
+        assert_eq!((got.len(), more), (1, false));
+    }
+
+    fn proposal(op: u64, request_len: usize) -> ProposalItem {
+        ProposalItem {
+            lsn: Lsn::new(10 + op),
+            intent: IntentRecord {
+                op: OpId::new(op),
+                provider: "mail".into(),
+                request: vec![7; request_len],
+                footprint: b"inbox:a".to_vec(),
+                dispatch: Dispatch::Immediate,
+                retry: RetryPolicy::ProviderDeduplicated { key: b"k".to_vec() },
+                consequence: Consequence::Irreversible,
+                authority: Vec::new(),
+                barrier: Some(BarrierId::new(op)),
+            },
+            sealed: op.is_multiple_of(2),
+        }
+    }
+
+    /// 4a: the Proposals request and reply round-trip under their own
+    /// tags, and decoding stays strict.
+    #[test]
+    fn proposals_round_trip_and_decoding_is_strict() {
+        let vessel = ChronicleId::from_bytes([5; 16]);
+        for q in [
+            Request::Proposals {
+                vessel,
+                after: None,
+            },
+            Request::Proposals {
+                vessel,
+                after: Some(41),
+            },
+        ] {
+            let b = q.encode();
+            assert_eq!(b[0], 3);
+            assert_eq!(Request::decode(&b).unwrap(), q);
+            let mut t = b.clone();
+            t.push(0);
+            assert!(matches!(
+                Request::decode(&t),
+                Err(DecodeError::Trailing { .. })
+            ));
+            assert!(Request::decode(&b[..b.len() - 1]).is_err());
+        }
+        for p in [
+            Reply::Proposals {
+                items: vec![],
+                more: false,
+                last_seal: None,
+            },
+            Reply::Proposals {
+                items: vec![proposal(1, 3), proposal(2, 0)],
+                more: true,
+                last_seal: Some(Lsn::new(12)),
+            },
+        ] {
+            let b = p.encode();
+            assert_eq!(b[0], 4);
+            assert_eq!(Reply::decode(&b).unwrap(), p);
+            let mut t = b.clone();
+            t.push(0);
+            assert!(Reply::decode(&t).is_err());
+            assert!(Reply::decode(&b[..b.len() - 1]).is_err());
+        }
+    }
+
+    /// 4a: 150 proposals, given in any order, are each seen once, in op
+    /// order, in pages of at most 64; nothing held is one empty page.
+    #[test]
+    fn proposal_pages_cover_every_proposal_once() {
+        let all: Vec<ProposalItem> = (1..=150u64).rev().map(|op| proposal(op, 8)).collect();
+        let mut seen = Vec::new();
+        let mut after = None;
+        let mut pages = 0;
+        loop {
+            let (got, more) = proposal_page(all.clone(), after);
+            pages += 1;
+            assert!(got.len() <= PENDING_PAGE);
+            assert!(!got.is_empty() || !more);
+            seen.extend(got.iter().map(|i| i.intent.op.get()));
+            after = got.last().map(|i| i.intent.op.get());
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(pages, 3, "64 + 64 + 22");
+        assert_eq!(
+            seen,
+            (1..=150).collect::<Vec<u64>>(),
+            "each once, in op order"
+        );
+        assert_eq!(proposal_page(Vec::new(), None), (Vec::new(), false));
+        // `after` at or past the last op: an empty page, no more.
+        assert_eq!(proposal_page(all, Some(150)), (Vec::new(), false));
+    }
+
+    /// 4a: a page of proposals ends at about PENDING_PAGE_BYTES, and one
+    /// proposal larger than the bound still makes a page.
+    #[test]
+    fn a_proposal_page_ends_at_its_byte_bound() {
+        let items: Vec<ProposalItem> = (1..=4)
+            .map(|op| proposal(op, PENDING_PAGE_BYTES / 2))
+            .collect();
+        let (got, more) = proposal_page(items, None);
+        assert_eq!((got.len(), more), (2, true), "two halves reach the bound");
+        let (got, more) = proposal_page(vec![proposal(1, PENDING_PAGE_BYTES + 1)], None);
         assert_eq!((got.len(), more), (1, false));
     }
 }
