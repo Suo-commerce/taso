@@ -63,6 +63,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use taso_core::coordlog::Submitted;
+use taso_core::decider::ProposalItem;
 use taso_core::decode::DecodeError;
 use taso_core::envelope::{ChronicleHead, ChronicleId, HashVal, Lsn, Stream};
 use taso_core::model::WardenId;
@@ -572,6 +573,24 @@ impl ReadLog {
             .collect();
         proposals.sort_by_key(|e| e.intent.op);
         Ok(proposals)
+    }
+
+    /// Every held proposal in this log, in op order, each marked by
+    /// whether the last accepted Seal covers it, and that Seal (4a).  A
+    /// Seal past the anchored head is not accepted and covers nothing.
+    pub fn held_proposals(&self) -> Result<(Vec<ProposalItem>, Option<Lsn>), VesselError> {
+        let mut last = None;
+        for f in &self.frames {
+            if f.envelope.stream == Stream::Ctl && f.envelope.lsn <= self.head.lsn {
+                if let Payload::Seal(_) = decode(f)? {
+                    last = Some(Position {
+                        lsn: f.envelope.lsn,
+                        hash: f.envelope.hash,
+                    });
+                }
+            }
+        }
+        held_proposals(&self.frames, last)
     }
 }
 
@@ -1496,6 +1515,13 @@ impl<L: Layers> Vessel<L> {
         self.chronicle.last_seal()
     }
 
+    /// Every held proposal of this Vessel, in op order, each marked by
+    /// whether its last accepted Seal covers it, and that Seal (4a).  A
+    /// read: nothing is recorded.
+    pub fn held_proposals(&self) -> Result<(Vec<ProposalItem>, Option<Lsn>), VesselError> {
+        held_proposals(&self.frames()?, self.last_seal())
+    }
+
     /// The Chronicle, for reading.
     pub fn chronicle(&self) -> &Chronicle<L> {
         &self.chronicle
@@ -1904,6 +1930,31 @@ fn read_lineage(
 /// The fold of `frames` ([`crate::summary`]).
 fn summary(frames: &[Frame]) -> Result<crate::summary::Summary, VesselError> {
     crate::summary::Summary::of(frames).map_err(|(lsn, error)| VesselError::Decode { lsn, error })
+}
+
+/// The held proposals among `frames`, in op order.  One is `sealed` when
+/// its intent is at or before the `ledger_pos` of `last_seal`: what a
+/// promotion at that Seal would adopt.  The others are of a turn that has
+/// not ended.  Being adopted by a parent does not take a proposal off this
+/// list: the child's Chronicle is never touched by a promotion.
+fn held_proposals(
+    frames: &[Frame],
+    last_seal: Option<Position>,
+) -> Result<(Vec<ProposalItem>, Option<Lsn>), VesselError> {
+    let covered = match last_seal {
+        Some(seal) => Some(seal_ledger_pos(frames, seal)?),
+        None => None,
+    };
+    let mut items: Vec<ProposalItem> = summary(frames)?
+        .proposals()
+        .map(|e| ProposalItem {
+            lsn: e.lsn,
+            intent: e.intent.clone(),
+            sealed: covered.is_some_and(|pos| e.lsn <= pos),
+        })
+        .collect();
+    items.sort_by_key(|i| i.intent.op);
+    Ok((items, last_seal.map(|s| s.lsn)))
 }
 
 /// The `ledger_pos` of the accepted Seal at `seal`: from its record, or
@@ -2676,6 +2727,45 @@ pub(crate) mod tests {
         assert_eq!(
             e.host.read_log_of(cid).unwrap().frames.len(),
             log.frames.len()
+        );
+    }
+
+    /// 4a: a Vessel's held proposals, each marked by whether its last
+    /// accepted Seal covers it, read from its local log without claiming
+    /// it and from the open Vessel alike.  A promotion does not touch the
+    /// child's Chronicle, so the child's list is the same after it.
+    #[test]
+    fn held_proposals_are_listed_with_the_seal_that_covers_them() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        let pseal = seal(&mut p);
+        // A Vessel that proposed nothing: an empty list, its Seal named.
+        assert_eq!(p.held_proposals().unwrap(), (Vec::new(), Some(pseal.lsn)));
+
+        let (cid, cseal) = child_with_proposals(&e, p.id(), b"child", 2, 1);
+        let log = e.host.read_log_of(cid).unwrap();
+        let (items, last_seal) = log.held_proposals().unwrap();
+        assert_eq!(last_seal, Some(cseal.lsn));
+        let got: Vec<(u64, bool)> = items
+            .iter()
+            .map(|i| (i.intent.op.get(), i.sealed))
+            .collect();
+        assert_eq!(got, vec![(1, true), (2, true), (3, false)]);
+        assert_eq!(items[0].intent.request, b"pay 1");
+        assert!(items.windows(2).all(|w| w[0].lsn < w[1].lsn));
+
+        // The open Vessel answers the same.
+        drop(log);
+        let (c, _) = e.host.open(cid).unwrap();
+        assert_eq!(c.held_proposals().unwrap(), (items.clone(), last_seal));
+        drop(c);
+
+        // Promoted: the parent has them as its own; the child's list stands.
+        let log = e.host.read_log_of(cid).unwrap();
+        p.promote(&log, SealAt::Last).unwrap();
+        assert_eq!(
+            e.host.read_log_of(cid).unwrap().held_proposals().unwrap(),
+            (items, last_seal)
         );
     }
 
