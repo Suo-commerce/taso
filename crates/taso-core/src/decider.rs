@@ -70,8 +70,9 @@ pub struct ProposalItem {
     /// The intent, with the exact request bytes.
     pub intent: IntentRecord,
     /// Whether the Vessel's last Seal covers it (the intent is at or
-    /// before that Seal's ledger position).  One that is not can vanish
-    /// when the Vessel is rolled back, and cannot be promoted yet.
+    /// before that Seal's ledger position): what a promotion at that Seal
+    /// would adopt.  One that is not is of a turn that has not ended, and
+    /// cannot be promoted yet.
     pub sealed: bool,
 }
 
