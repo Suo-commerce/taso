@@ -309,7 +309,7 @@ impl Reader<'_> {
         })
     }
 
-    fn intent(&mut self) -> R<IntentRecord> {
+    pub(crate) fn intent(&mut self) -> R<IntentRecord> {
         let op = OpId::new(self.u64()?);
         let provider = self.string()?;
         let request = self.bytes()?;
