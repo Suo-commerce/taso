@@ -444,6 +444,10 @@ echo
 tail -n 3 "$W/soak.tsv" | column -t
 echo
 if [[ $FAIL -eq 0 ]]; then
+    # A pass keeps its logs and samples, not its block log and store (5.7
+    # GB after 5 h on taso-test 2026-11-09: the night's xfstests then found
+    # 18 GiB free, wanting 20).
+    rm -rf "$W/blk.log" "$W/store" "$W/spool"
     echo "SOAK PASS: $SECS s, $VESSELS Vessels, $KILLS kills, $ATTEMPTS attempts, $SANCTIONS sanctions; $PASS checks"
     exit 0
 else

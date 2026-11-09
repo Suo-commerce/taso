@@ -166,7 +166,10 @@ mkdir -p "$MNT"; [[ -z "$(mounts_under)" ]] || die "something is already mounted
 HOST_NOTE="/var/lib/taso-blk on $(findmnt -no SOURCE,FSTYPE -T /var/lib/taso-blk), durable at $DURABLE_AT"
 
 say "building (release)"
-cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock -p taso-blk
+cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock
+# taso-blkd on its own: built with taso-warden, cargo unifies two dependency
+# features into a different binary from the one the gates test.
+cargo build --release -q -p taso-blk --bin taso-blkd
 BIN=$PWD/target/release
 for b in taso-wardend taso-sim taso-landlock taso-blkd; do [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"; done
 

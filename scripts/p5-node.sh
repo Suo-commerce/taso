@@ -261,7 +261,10 @@ EOF
     [[ -b "$BLK_PART" ]] || die "by-partlabel link $BLK_PART missing (udevadm settle did not help)"
     if ! blkid -p -o value -s TYPE "$BLK_PART" 2>/dev/null | grep -qx ext4; then
         [[ -z "$(blkid -p -o value -s TYPE "$BLK_PART" 2>/dev/null)" ]] || die "$BLK_PART already carries $(blkid -p -o value -s TYPE "$BLK_PART"); nothing changed"
-        mkfs.ext4 -q -L taso-blk "$BLK_PART"
+        # Inode tables and journal written now, not by ext4lazyinit in the
+        # background while the first rows measure the same drive (metal
+        # 2026-11-08: the first rows read ~3.5 ms slower at P=64 p50).
+        mkfs.ext4 -q -L taso-blk -E lazy_itable_init=0,lazy_journal_init=0 "$BLK_PART"
     fi
     mkdir -p "$DATA"
     grep -q "^LABEL=taso-blk[[:space:]]" /etc/fstab || echo "LABEL=taso-blk $DATA ext4 defaults,noatime 0 2" >>/etc/fstab
