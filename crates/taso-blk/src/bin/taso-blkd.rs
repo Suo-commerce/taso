@@ -746,16 +746,45 @@ fn main() {
             .unwrap_or_else(|e| fail(&format!("cannot start the upkeep thread: {e}")));
     }
     for conn in listener.incoming() {
-        let Ok(conn) = conn else { continue };
+        let Ok(conn) = conn else {
+            // An accept that fails may fail for a while (no descriptor
+            // left): wait a little, so this loop does not take a whole
+            // CPU from the devices meanwhile (audit 2026-11-09, accept
+            // loop).
+            std::thread::sleep(ACCEPT_RETRY);
+            continue;
+        };
         let d = daemon.clone();
         let socket = socket.clone();
-        std::thread::spawn(move || {
+        // Not `std::thread::spawn`: it panics when the system refuses a
+        // thread, and a panic here, on the main thread, ends the process
+        // and every Vessel's disk with it (audit 2026-11-09, accept loop).
+        let spawned = std::thread::Builder::new().spawn(move || {
             if let Some(code) = serve(&d, conn) {
                 let _ = std::fs::remove_file(&socket);
                 log!("taso-blkd: quit");
                 streams::drained_exit(code);
             }
         });
+        if let Some(line) = connection_refused(spawned) {
+            log!("{line}");
+        }
+    }
+}
+
+/// How long the accept loop waits after an accept that failed.
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What the accept loop says when a connection's thread could not be
+/// started: the line for the log, or `None` if it runs.  The connection
+/// went with the closure that held it, so its caller sees it closed and
+/// can try again; the devices and the other connections are served on.
+fn connection_refused(spawned: std::io::Result<std::thread::JoinHandle<()>>) -> Option<String> {
+    match spawned {
+        Ok(_) => None,
+        Err(e) => Some(format!(
+            "taso-blkd: a control connection is dropped: cannot start its thread: {e}"
+        )),
     }
 }
 
@@ -2052,6 +2081,29 @@ mod streams_test {
             Some(0),
             "the child's eprintln! to /dev/full must not panic it"
         );
+    }
+}
+
+#[cfg(test)]
+mod accept_test {
+    use super::*;
+
+    /// Audit 2026-11-09, the accept loop started each connection's thread
+    /// with `std::thread::spawn`, which panics when the system refuses a
+    /// thread: the panic, on the main thread, ended taso-blkd and every
+    /// device it served.
+    #[test]
+    fn a_refused_connection_thread_is_logged_and_the_loop_goes_on() {
+        // What the system answers when it has no thread to give (EAGAIN).
+        let refused = Err(std::io::Error::from_raw_os_error(libc::EAGAIN));
+        let line = connection_refused(refused).expect("a line for the log");
+        assert!(
+            line.starts_with("taso-blkd: a control connection is dropped"),
+            "{line}"
+        );
+        // A thread that started says nothing.
+        let started = std::thread::Builder::new().spawn(|| {});
+        assert_eq!(connection_refused(started), None);
     }
 }
 
