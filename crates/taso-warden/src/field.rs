@@ -162,6 +162,15 @@ impl Conn {
 /// slot has at most 10 digits.
 pub const MAX_CHILD_NAME: usize = crate::daemon::MAX_SUBJECT + "-fork-".len() + 10;
 
+/// The largest effect an agent may declare, in bytes: its provider,
+/// request, footprint and authority together.  1 MiB.  The request is
+/// data Taso records and hands to the sender; it is not a channel for
+/// bulk.  Without a bound, one request could be as large as a Field
+/// frame (16 MiB), and what carries every open request at once could
+/// not be written: the sender's `Open` reply (one frame) and the
+/// Checkpoint of a prune (one record).
+pub const MAX_EFFECT_REQUEST: usize = 1 << 20;
+
 /// How a session's Fork and Promote requests reach the Warden (the
 /// daemon: [`crate::daemon`]).  A refusal is a reason for the agent;
 /// nothing is made.
@@ -460,6 +469,22 @@ impl<'v, L: Layers> Session<'v, L> {
                     authority,
                 },
             ) => {
+                // An effect's request is kept whole in the ledger, in
+                // every Checkpoint while it is open, and in every `Open`
+                // reply to the sender until its outcome is reported: its
+                // size is bounded here, before anything is recorded
+                // (audit 2026-11-09, large effect requests; D&D L2 (a)).
+                let size = provider.len() + request.len() + footprint.len() + authority.len();
+                if size > MAX_EFFECT_REQUEST {
+                    return Reply::Effect {
+                        call,
+                        result: EffectResult::Refused {
+                            reason: format!(
+                                "the effect's request is {size} bytes (provider, request, footprint and authority together); at most {MAX_EFFECT_REQUEST} are recorded: keep the body elsewhere and name it in the request"
+                            ),
+                        },
+                    };
+                }
                 if self.effects.is_none() {
                     return Reply::Effect {
                         call,
@@ -3449,6 +3474,67 @@ mod tests {
             }
         ));
         assert!(v.last_seal().is_some());
+    }
+
+    fn declare_of(call: u64, n: usize) -> Request {
+        Request::Effect {
+            call,
+            provider: "mail".into(),
+            request: vec![call as u8; n - "mail".len() - "user".len()],
+            footprint: Vec::new(),
+            retry: taso_core::record::RetryPolicy::UnsafeToRetry,
+            consequence: taso_core::record::Consequence::Irreversible,
+            authority: b"user".to_vec(),
+        }
+    }
+
+    /// Audit 2026-11-09, an agent could declare an effect whose request
+    /// was as large as a Field frame, 16 MiB, and the Warden recorded it
+    /// whole.  A request over 1 MiB is refused with the reason and
+    /// nothing is recorded; one of exactly 1 MiB is taken.
+    #[test]
+    fn an_effect_request_over_the_limit_is_refused_and_not_recorded() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        let before = s.vessel.tail();
+        let r = s.handle(declare_of(1, MAX_EFFECT_REQUEST + 1));
+        let Reply::Effect {
+            call: 1,
+            result: EffectResult::Refused { reason },
+        } = &r
+        else {
+            panic!(
+                "an effect of {} bytes was not refused",
+                MAX_EFFECT_REQUEST + 1
+            )
+        };
+        assert!(
+            reason.contains("1048577 bytes") && reason.contains("at most 1048576"),
+            "{reason}"
+        );
+        assert!(
+            reason.len() < 300,
+            "the refusal does not repeat the request"
+        );
+        assert_eq!(s.vessel.tail(), before, "nothing was recorded");
+        // Exactly the limit is an effect like any other.
+        assert!(matches!(
+            s.handle(declare_of(2, MAX_EFFECT_REQUEST)),
+            Reply::Effect {
+                result: EffectResult::Released { .. },
+                ..
+            }
+        ));
     }
 
     /// Audit 2026-11-09, a `Promote` request's child name had no length

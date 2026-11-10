@@ -38,6 +38,9 @@ building a relay.
      meaningful to the sender, opaque to Taso.
    - `request`: the exact bytes to send, durable with the intent, so
      they can be re-sent byte for byte after a crash.
+     An effect's provider, request, footprint and authority together
+     are at most 1 MiB; the Warden refuses a larger one with the
+     reason.  A larger body belongs elsewhere, named in the request.
    - `retry`: the retry policy — how the sender may safely re-issue the
      request.
    - `consequence` and `authority`: what it does to the world and what
