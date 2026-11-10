@@ -74,6 +74,7 @@ one an_agent_nothing_can_stop_is_ended_before_the_run_returns $W
 one a_run_that_fails_after_its_agent_started_leaves_no_agent $W
 one one_candidates_error_does_not_end_the_pass_for_the_others -p taso-warden --bin taso-policy
 # The block log
+one a_view_left_by_a_killed_warden_does_not_block_destroy $W
 one a_destroy_cut_short_at_any_step_is_finished_by_a_retry $W
 one a_mount_root_written_any_way_names_the_mount_points_the_kernel_lists $W
 one a_poisoned_store_does_not_answer_from_a_map_ahead_of_the_file -p taso-blk --lib

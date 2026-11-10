@@ -1018,10 +1018,16 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         Ok(d.find(dataset.as_str())?.map(|b| b.get()))
     }
 
-    /// Unmount, detach, drop the branch, then its own Seals (newest first)
-    /// and, for a dataset born from the void, its root Seal.  The block
-    /// log refuses to drop a layer something stands on (a clone).
+    /// Unmount and detach the branch, take its own Seals from under it
+    /// (newest first), drop it and, for a dataset born from the void, its
+    /// root Seal.  Refused if something stands on one of its layers (a
+    /// clone, a Seal view in use); a view of this process's kind that no
+    /// view of this process holds was left by a process that died, and is
+    /// taken down first.
     fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
+        // The views before the connection, as `seal_view` takes them.
+        let views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        let my_views = format!("{}.{}-", dataset.as_str(), self.view_kind);
         let mut d = conn(&self.maker, &self.blkd);
         let Some(b) = d.find(dataset.as_str())? else {
             return Ok(false);
@@ -1061,6 +1067,21 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         // names that branch.
         for (name, x) in d.names()? {
             if x == b {
+                continue;
+            }
+            // A view of this dataset this process's kind makes, that no
+            // view of this process holds: a killed Warden's, which no
+            // process counts any more.  It kept the dataset from being
+            // destroyed for good (audit 2026-11-09, a Seal view left by a
+            // killed Warden).  Another kind's (a genesis running now) is
+            // left to its process, and refuses below.
+            if name.starts_with(&my_views) && !views.contains_key(&name) {
+                take_down(
+                    &mut *d,
+                    &*self.mounts,
+                    x,
+                    &self.mount_root.join(".views").join(&name),
+                )?;
                 continue;
             }
             let mut cur = Some(x);
@@ -2643,6 +2664,54 @@ mod tests {
             views: Arc::default(),
             ..Clone::clone(p)
         }
+    }
+
+    /// Audit 2026-11-09, a Seal view a killed Warden left (its branch and
+    /// mount stay; the new process counts no view) kept its dataset from
+    /// being destroyed for good: an attempt's leftover /candidate, a
+    /// purged Vessel's dataset.  The destroy takes it down.  A view this
+    /// process holds still refuses, and so does another kind's.
+    #[test]
+    fn a_view_left_by_a_killed_warden_does_not_block_destroy() {
+        let p = pool();
+        let a = ds("tank/a-1");
+        p.create(&a).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(1), h(1))
+            .unwrap()
+            .run()
+            .unwrap();
+        // A view in use by this process refuses.
+        let held = p.seal_view(&a, Lsn::new(1)).unwrap();
+        let g = p.guid(&a).unwrap().unwrap();
+        assert!(Pool::destroy(&p, &a, g).is_err(), "a view in use");
+        // The process dies holding it.
+        std::mem::forget(held);
+        let p = after_a_crash(&p);
+        // A genesis's view, held by a process that is alive.
+        let gen = after_a_crash(&p).for_genesis();
+        let gview = gen.seal_view(&a, Lsn::new(1)).unwrap();
+        assert!(Pool::destroy(&p, &a, g).is_err(), "a genesis's view");
+        drop(gview);
+        let r = Pool::destroy(&p, &a, g);
+        assert!(
+            matches!(r, Ok(true)),
+            "the killed Warden's view kept the dataset: {r:?}"
+        );
+        assert_eq!(p.guid(&a).unwrap(), None);
+        let names: Vec<String> = p
+            .blkd
+            .lock()
+            .unwrap()
+            .names()
+            .unwrap()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.starts_with("tank/a-1")),
+            "{names:?}"
+        );
     }
 
     #[test]
