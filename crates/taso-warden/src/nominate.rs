@@ -418,7 +418,7 @@ impl Nominator {
         }
 
         // 2. Warden-local limits.
-        let open = self.open_candidates(&frames)?;
+        let open = self.open_candidates(id)?;
         if open >= self.conf.max_open_candidates {
             return Ok(Answer::Retry(format!(
                 "{open} open Candidates, the most a Vessel may have (warden.max_open_candidates_per_vessel)"
@@ -671,45 +671,24 @@ impl Nominator {
         })
     }
 
-    /// The Vessel's open Candidates: those its log carries that are
-    /// accepted and not closed.  Closed (§3.5): by `Never`, `Cancel` or
+    /// The Vessel's open Candidates: those the coordinator has accepted
+    /// and not closed.  Closed (§3.5): by `Never`, `Cancel` or
     /// `Supersede`, and sanctioned once the commit's `TemplateReady` is
     /// accepted (a commit before that is "committing", still counted).
     /// Soak, taso-test 2026-11-09: a sanctioned Candidate was counted open
     /// for good, so after four sanctions a Vessel's every nomination was
     /// answered Retry for the rest of its life (12 000 times in 5 hours).
-    fn open_candidates(&self, frames: &[Frame]) -> Result<usize, NominateError> {
-        let ids: BTreeSet<[u8; 32]> = frames
+    fn open_candidates(&self, chronicle: ChronicleId) -> Result<usize, NominateError> {
+        // From the coordinator's list of the Vessel's outstanding work,
+        // never its local log, which loses its prefix to pruning (audit
+        // 2026-11-09, A5; review fix A2-1's class): counted from the log,
+        // the limit read 0 once the Candidates' records were pruned.  The
+        // list holds every Candidate not closed, and a Candidate closes
+        // at its close record or at its Template's `TemplateReady`.
+        Ok(crate::attempt::open_work(self.coord.as_ref(), chronicle)?
             .iter()
-            .filter(|f| f.envelope.stream == Stream::Ctl)
-            .filter_map(|f| match Payload::decode(&f.payload) {
-                Ok(Payload::Contract(r)) => match *r {
-                    ContractRecord::Candidate(c) => Some(*c.candidate_id.as_bytes()),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
-        let mut open = 0;
-        for id in ids {
-            let id = HashVal::from_bytes(id);
-            if self.accepted(LogicalKey::Candidate(id))?.is_none()
-                || self.accepted(LogicalKey::CandidateClose(id))?.is_some()
-            {
-                continue;
-            }
-            let sanctioned = match self.accepted(LogicalKey::Sanction(id))? {
-                Some(ContractRecord::SanctionCommitted(c)) => matches!(
-                    self.accepted(LogicalKey::Template(c.template_id))?,
-                    Some(ContractRecord::TemplateReady(_))
-                ),
-                _ => false,
-            };
-            if !sanctioned {
-                open += 1;
-            }
-        }
-        Ok(open)
+            .filter(|r| matches!(r, ContractRecord::Candidate(_)))
+            .count())
     }
 
     /// Write the archive of `root` by `manifest` to a temporary file, then
@@ -1586,6 +1565,68 @@ class = \"Scratch\"
             .unwrap();
         assert!(
             matches!(a, Answer::Retry(ref why) if why.contains("min_interval")),
+            "{a:?}"
+        );
+    }
+
+    /// Audit 2026-11-09, A5: the limit of open Candidates is counted from
+    /// the coordinator's list, not from the Vessel's local log.  That log
+    /// loses its prefix to pruning: counted from it, the limit read 0
+    /// once the Candidates' records were pruned, and never held.
+    #[test]
+    fn the_open_candidate_limit_holds_after_the_log_is_pruned() {
+        let w = world();
+        make_tree(&w.tree);
+        let mut c = conf();
+        c.max_open_candidates = 1;
+        let n = nominator(&w, c);
+        let (mut v, packs) = vessel(&w, b"a", true);
+        assert!(matches!(
+            n.nominate(&mut v, &packs, &ask(&w, NominatedBy::Agent), &view(&w.tree))
+                .unwrap(),
+            Answer::Nominated(_)
+        ));
+        // The Candidate's record leaves the local log: roll after every
+        // record, write past it, and prune everything shipped.
+        let has_candidate = |v: &Vessel<_>| {
+            v.chronicle().frames().unwrap().iter().any(|f| {
+                matches!(
+                    Payload::decode(&f.payload),
+                    Ok(Payload::Contract(r)) if matches!(*r, ContractRecord::Candidate(_))
+                )
+            })
+        };
+        assert!(has_candidate(&v));
+        // A later turn in a new segment file, sealed and published as the
+        // agent's run does: the newest Seal stays local, the file before
+        // it is shipped and pruned.
+        v.set_roll_at(1);
+        v.append(Stream::Transcript, Payload::Raw(b"later".to_vec()))
+            .unwrap();
+        v.set_roll_at(u64::MAX);
+        let s = v
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                Lsn::new(0),
+                TurnId::new(2),
+            )
+            .unwrap()
+            .seal;
+        let snap = Snapshot {
+            dataset: v.dataset().clone(),
+            seal: s.lsn,
+            guid: fake_guid(s.lsn),
+            seal_hash: Some(s.hash),
+        };
+        v.publish_seal(&packs, &snap, None).unwrap();
+        v.prune(0).unwrap();
+        assert!(!has_candidate(&v), "pruned");
+        let mut other = ask(&w, NominatedBy::Agent);
+        other.exclude = BTreeSet::new();
+        let a = n.nominate(&mut v, &packs, &other, &view(&w.tree)).unwrap();
+        assert!(
+            matches!(a, Answer::Retry(ref why) if why.contains("open Candidates")),
             "{a:?}"
         );
     }
