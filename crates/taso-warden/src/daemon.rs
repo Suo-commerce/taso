@@ -2599,6 +2599,16 @@ impl<'s, 'e> Verifications<'s, 'e> {
         self.wake = None;
     }
 
+    /// The Candidates could not be listed (the coordinator unreachable, a
+    /// store read failed): look again after [`QUEUE_RETRY`].  It used to
+    /// stop looking until a nomination or a restart, so a Vessel's open
+    /// Candidates went unverified after one failed look (audit
+    /// 2026-11-09, a coordinator error while listing Candidates).
+    fn look_again_later(&mut self, now: Instant) {
+        self.want = true;
+        self.wake = Some(now + QUEUE_RETRY);
+    }
+
     fn tick(&mut self, vessel: &mut Vessel<BlkLayers>) {
         while let Ok(d) = self.rx.try_recv() {
             self.done(vessel, d);
@@ -2623,6 +2633,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
             Ok(t) => t,
             Err(e) => {
                 self.log(format_args!("listing Candidates to verify: {e}"));
+                self.look_again_later(Instant::now());
                 return;
             }
         };
@@ -2630,6 +2641,7 @@ impl<'s, 'e> Verifications<'s, 'e> {
             Ok(p) => p,
             Err(e) => {
                 self.log(format_args!("packs: {e}"));
+                self.look_again_later(Instant::now());
                 return;
             }
         };
@@ -8135,6 +8147,33 @@ mod tests {
         // The real question, through the coordinator: nothing of slot 4's
         // child was ever registered.
         assert!(!host.is_born(child(4)).unwrap());
+    }
+
+    /// Audit 2026-11-09, a look for Candidates that failed (the coordinator
+    /// unreachable) set nothing to look again: the Vessel's open
+    /// Candidates went unverified until a nomination or a restart.  After
+    /// a failed look the session wants to look again, after the retry
+    /// wait, and not before.
+    #[test]
+    fn a_failed_look_for_candidates_is_tried_again_after_a_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = bare_node(tmp.path());
+        std::thread::scope(|scope| {
+            let mut v = Verifications::new(scope, &node, "u".into());
+            let now = Instant::now();
+            // What `launch` does first, then the failed look.
+            v.looked = Some(now);
+            v.want = false;
+            v.look_again_later(now);
+            assert_eq!(
+                v.left(),
+                Some(now + QUEUE_RETRY),
+                "after a failed look nothing would look again"
+            );
+            // A nomination meanwhile looks at once.
+            v.want();
+            assert!(v.left().is_some_and(|t| t <= Instant::now()));
+        });
     }
 
     /// Audit 2026-11-09, the Warden wrote a Vessel's TTL start without

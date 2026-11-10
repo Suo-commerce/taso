@@ -52,6 +52,7 @@ one a_fork_asked_again_from_a_newer_seal_replaces_the_interrupted_clone $W
 one a_fork_slot_is_taken_by_a_born_child_not_by_a_directory $W
 # Verification attempts
 one a_restore_walk_cut_short_by_this_nodes_clock_is_interrupted $W
+one a_failed_look_for_candidates_is_tried_again_after_a_wait $W
 # Purges
 one a_purge_finished_on_another_node_deletes_that_nodes_dataset $W
 # Genesis
