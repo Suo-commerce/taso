@@ -340,7 +340,21 @@ impl Nominator {
             .chronicle()
             .frames()
             .map_err(|e| VesselError::Chronicle(crate::chronicle::ChronicleError::Segment(e)))?;
-        let Some((seal, record)) = find_seal(&frames, ask.seal)? else {
+        let found = match (find_seal(&frames, ask.seal)?, ask.seal) {
+            (Some(found), _) => Some(found),
+            // A named Seal before the local log's first record: pruned
+            // here after it was shipped, so its pack has it (audit
+            // 2026-11-09, A5; D&D P2 (a)).  Read from the log alone, an
+            // accepted and shipped Seal was refused as never accepted.
+            (None, Some(lsn)) if frames.first().is_some_and(|f| lsn < f.envelope.lsn) => {
+                let shipped = packs
+                    .shipped_frame(lsn)
+                    .map_err(|e| NominateError::Vessel(VesselError::Pack(e)))?;
+                find_seal(shipped.as_slice(), Some(lsn))?
+            }
+            (None, _) => None,
+        };
+        let Some((seal, record)) = found else {
             return Ok(Answer::Refused(NominationRefusal::SealNotAccepted));
         };
         // Refused, nothing recorded: the log or the node's settings already
@@ -1628,6 +1642,63 @@ class = \"Scratch\"
         assert!(
             matches!(a, Answer::Retry(ref why) if why.contains("open Candidates")),
             "{a:?}"
+        );
+    }
+
+    /// Audit 2026-11-09, A5 (D&D P2 (a)): a named Seal whose record was
+    /// pruned from the local log is read from the pack that shipped it.
+    /// Read from the local log alone, an accepted and shipped Seal was
+    /// refused for good as "not accepted".
+    #[test]
+    fn a_named_seal_pruned_from_the_log_is_read_from_its_pack() {
+        let w = world();
+        make_tree(&w.tree);
+        let n = nominator(&w, conf());
+        let (mut v, packs) = vessel(&w, b"a", true);
+        let first = v.last_seal().unwrap();
+        v.set_roll_at(1);
+        v.append(Stream::Transcript, Payload::Raw(b"later".to_vec()))
+            .unwrap();
+        v.set_roll_at(u64::MAX);
+        let s = v
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                Lsn::new(0),
+                TurnId::new(2),
+            )
+            .unwrap()
+            .seal;
+        let snap = Snapshot {
+            dataset: v.dataset().clone(),
+            seal: s.lsn,
+            guid: fake_guid(s.lsn),
+            seal_hash: Some(s.hash),
+        };
+        v.publish_seal(&packs, &snap, None).unwrap();
+        v.prune(0).unwrap();
+        let local = v.chronicle().frames().unwrap();
+        assert!(
+            local[0].envelope.lsn > first.lsn,
+            "the first Seal is pruned"
+        );
+
+        let mut a = ask(&w, NominatedBy::Agent);
+        a.seal = Some(first.lsn);
+        let Answer::Nominated(cid) = n.nominate(&mut v, &packs, &a, &view(&w.tree)).unwrap() else {
+            panic!("the pruned Seal is nominated");
+        };
+        assert_eq!(candidate(&w, cid).seal.lsn, first.lsn);
+        // A pruned lsn that holds no Seal, and one past the log: refused.
+        a.seal = Some(Lsn::new(1));
+        assert_eq!(
+            n.nominate(&mut v, &packs, &a, &view(&w.tree)).unwrap(),
+            Answer::Refused(NominationRefusal::SealNotAccepted)
+        );
+        a.seal = Some(Lsn::new(9999));
+        assert_eq!(
+            n.nominate(&mut v, &packs, &a, &view(&w.tree)).unwrap(),
+            Answer::Refused(NominationRefusal::SealNotAccepted)
         );
     }
 

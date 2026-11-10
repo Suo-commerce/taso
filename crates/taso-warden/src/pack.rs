@@ -1927,6 +1927,31 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
             .collect())
     }
 
+    /// The shipped record at `lsn`, read from the pack that carries it:
+    /// `None` if no pack in the store covers that lsn.  For a reader whose
+    /// record has left the Vessel's local log to pruning (the records a
+    /// Checkpoint summarises stay in the store).  The pack's log is
+    /// verified as every pack read is; whether the record is on the
+    /// accepted chain is for the caller's use of it to settle (a
+    /// nomination's Seal is checked by the coordinator).
+    pub fn shipped_frame(&self, lsn: Lsn) -> Result<Option<Frame>, PackError> {
+        for name in self.pack_names()? {
+            let Some((end, base, _)) = name_bounds(&name) else {
+                continue;
+            };
+            if !(base < lsn && lsn <= end) {
+                continue;
+            }
+            let Some((_, frames)) = self.read_pack_log(&name)? else {
+                continue;
+            };
+            if let Some(f) = frames.into_iter().find(|f| f.envelope.lsn == lsn) {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
+    }
+
     /// Whether the pack `name` is in the store (nothing is read).
     pub fn has_pack(&self, name: &str) -> Result<bool, PackError> {
         let (key, _) = self.key_of(name)?;
