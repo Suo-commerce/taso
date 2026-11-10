@@ -404,6 +404,7 @@ impl Ledger {
             (Stream::Effect, outcome(a.op, state, None)),
         ])?;
         drop(t);
+        self.used(a);
         Ok(a)
     }
 
@@ -419,6 +420,7 @@ impl Ledger {
     ) -> Result<Authorized, VesselError> {
         let a = self.assign(vessel, d)?;
         vessel.append(Stream::Effect, Payload::Intent(intent(a, d)))?;
+        self.used(a);
         Ok(a)
     }
 
@@ -550,11 +552,15 @@ impl Ledger {
 
     // ── internals ───────────────────────────────────────────────────
 
-    /// Take the next op id; the barrier is the lsn the intent will get.
+    /// The next op id; the barrier is the lsn the intent will get.  The
+    /// id is not used up here but by [`Ledger::used`], once the intent is
+    /// recorded: an append that fails consumes nothing (audit 2026-11-09,
+    /// op id consumed by a failed append: it was advanced here, before
+    /// the append).
     /// Round 3, R3-02 (Kimi): `u64::MAX` is never an op id but the mark
     /// that every id is used; nothing is reused or wraps.
     fn assign<L: Layers>(
-        &mut self,
+        &self,
         vessel: &Vessel<L>,
         d: &Declared,
     ) -> Result<Authorized, VesselError> {
@@ -562,11 +568,16 @@ impl Ledger {
             return Err(VesselError::OpsExhausted);
         }
         let op = OpId::new(self.next_op);
-        self.next_op += 1;
         let lsn = vessel.tail().lsn.next();
         let barrier =
             (d.consequence != Consequence::NoExternalMutation).then(|| BarrierId::new(lsn.get()));
         Ok(Authorized { op, barrier })
+    }
+
+    /// The intent of `a` is recorded: its op id is used.  (Below
+    /// [`OP_EXHAUSTED`], as [`Ledger::assign`] gave it: no overflow.)
+    fn used(&mut self, a: Authorized) {
+        self.next_op = a.op.get() + 1;
     }
 
     fn reconcile<L, F>(
@@ -843,6 +854,34 @@ mod tests {
         }
         assert_eq!(v.tail(), tail, "nothing written");
         assert_eq!(l.next_op(), OpId::new(OP_EXHAUSTED));
+    }
+
+    /// Audit 2026-11-09, a release whose append failed still used up an
+    /// op id in memory, against the rule at [`Ledger::next_op`] ("nothing
+    /// is consumed until the effect is recorded").  Here the coordinator
+    /// refuses the appends: another Warden took the Vessel.
+    #[test]
+    fn a_failed_append_consumes_no_op_id() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut l, _) = open(&mut v);
+        let d = declared("send bob", Consequence::Irreversible);
+        assert_eq!(l.release(&mut v, &d).unwrap().op, OpId::new(1));
+        let before = l.next_op();
+        e.host
+            .coord
+            .transfer(v.id(), taso_core::model::WardenId::new(2))
+            .unwrap();
+        let tail = v.tail();
+        for _ in 0..3 {
+            assert!(l.release(&mut v, &d).is_err());
+        }
+        assert_eq!(v.tail(), tail, "nothing recorded");
+        assert_eq!(
+            l.next_op(),
+            before,
+            "three failed appends recorded nothing and consumed op ids"
+        );
     }
 
     #[test]
