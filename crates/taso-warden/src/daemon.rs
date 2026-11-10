@@ -1860,6 +1860,55 @@ pub fn container_id(id: ChronicleId, warden: WardenId) -> String {
     format!("taso-{hex}-w{}", warden.get())
 }
 
+/// Whether this Vessel's log holds a Promotion of `child`: in its local
+/// records `local`, or, where pruning has taken the records that follow
+/// the Seal `fork` the child was forked at, in the shipped ones (`shipped`
+/// reads the records `from..=to` from the packs).
+///
+/// A Promotion is written after the Seal its child was forked at and
+/// before the next Seal (one choice per fork point), so the shipped log
+/// is read from that Seal to the next one and no further.  Read from the
+/// local log alone, a configured promotion looked "not done" once its
+/// record was pruned; it was tried again, refused because the parent had
+/// moved on, and every start of the Vessel was refused (audit 2026-11-09,
+/// A5).
+pub(crate) fn promoted_before<E>(
+    local: &[crate::segment::Frame],
+    child: ChronicleId,
+    fork: Option<Lsn>,
+    shipped: impl Fn(Lsn, Lsn) -> Result<Vec<crate::segment::Frame>, E>,
+) -> Result<bool, E> {
+    use taso_core::record::Payload;
+    // What a record says: a Promotion of `child`, a Seal, or neither.
+    let read = |f: &crate::segment::Frame| match Payload::decode(&f.payload) {
+        Ok(Payload::Promotion(p)) if p.child == child => Some(true),
+        Ok(Payload::Seal(_)) if f.envelope.stream == taso_core::envelope::Stream::Ctl => {
+            Some(false)
+        }
+        _ => None,
+    };
+    if local.iter().any(|f| read(f) == Some(true)) {
+        return Ok(true);
+    }
+    let (Some(fork), Some(first)) = (fork, local.first().map(|f| f.envelope.lsn.get())) else {
+        return Ok(false);
+    };
+    // The shipped records after the fork Seal that are not local, a
+    // window at a time, up to the first Seal.
+    const WINDOW: u64 = 1024;
+    let mut from = fork.get() + 1;
+    while from < first {
+        let to = (from + WINDOW - 1).min(first - 1);
+        for f in shipped(Lsn::new(from), Lsn::new(to))? {
+            if let Some(found) = read(&f) {
+                return Ok(found);
+            }
+        }
+        from = to + 1;
+    }
+    Ok(false)
+}
+
 /// Why a Vessel is to be purged at this TTL pass, or `None`, from what
 /// the coordinator says of it: `ended` (its purge's end is accepted) and
 /// its Chronicle `view`.  `start` reads the Vessel's TTL start and is
@@ -4741,20 +4790,31 @@ impl Node {
         //
         // Skipped when the child was already promoted (a previous start
         // with the same config completed the promotion, or crash recovery
-        // above finished it).  Checked by looking for a Promotion record
-        // naming this child in the Ctl stream.
+        // above finished it): [`promoted_before`].
         if let Some(pc) = &vc.promote {
             let child_id = taso_core::record::vessel_id(vc.namespace, pc.child.as_bytes());
             let frames = vessel
                 .chronicle()
                 .frames()
                 .map_err(|e| DaemonError::Io(format!("reading frames for promotion check: {e}")))?;
-            let already = frames.iter().any(|f| {
-                matches!(
-                    taso_core::record::Payload::decode(&f.payload),
-                    Ok(taso_core::record::Payload::Promotion(p)) if p.child == child_id
-                )
-            });
+            // The child's log names the Seal it was forked at: where the
+            // records pruning took from this Vessel's log are looked for
+            // in its shipped packs.  Without it only the local log speaks.
+            let fork = self
+                .host()
+                .read_log_of(child_id)
+                .ok()
+                .and_then(|c| c.lineage.origin.parent().map(|p| p.seal));
+            let packs = self.packs(vessel.id())?;
+            let already = promoted_before(&frames, child_id, fork, |from, to| {
+                packs.shipped_frames(from, to)
+            })
+            .map_err(|e| {
+                DaemonError::Refused(format!(
+                    "promote: whether {:?} was promoted before cannot be read from this Vessel's shipped log: {e}",
+                    pc.child
+                ))
+            })?;
             if already {
                 self.log(
                     vc,

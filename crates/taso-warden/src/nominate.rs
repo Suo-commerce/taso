@@ -512,11 +512,21 @@ impl Nominator {
         (self.failpoint)("nominate.after_artifact_put")?;
 
         // 6. The Candidate.
+        // The adopted effects are counted over the whole log up to the
+        // Seal: what pruning took from the local log is read from the
+        // shipped packs (D&D P1 (a1); a Checkpoint will carry the count
+        // at the next format break).
+        let earlier = match frames.first().map(|f| f.envelope.lsn.get()) {
+            Some(first) if first > 1 => packs
+                .shipped_frames(Lsn::new(1), Lsn::new(first - 1))
+                .map_err(|e| NominateError::Vessel(VesselError::Pack(e)))?,
+            _ => Vec::new(),
+        };
         let facts = Facts {
             input: input.counts(),
             excluded: dropped_counts(&input, &output),
             open_obligations: self.coord.obligations(id)?.len() as u64,
-            effects_adopted: effects_adopted(&frames, seal.lsn)?,
+            effects_adopted: effects_adopted(earlier.iter().chain(frames.iter()), seal.lsn)?,
             ledger_lsn: record.ledger_pos,
             requirement,
         };
@@ -940,10 +950,17 @@ fn dropped_counts(input: &Manifest, output: &Manifest) -> ClassCounts {
 /// The operations adopted by promotion in the log up to `seal` (D63):
 /// intents whose authority is an `AdoptedFrom` naming a child and Seal of
 /// an earlier Promotion record.
-fn effects_adopted(frames: &[Frame], seal: Lsn) -> Result<u64, NominateError> {
+///
+/// `frames` is the Vessel's log from its first record: a local log that
+/// has lost its prefix to pruning counts only what is left (audit
+/// 2026-11-09, A5), so the caller puts the shipped records before it.
+pub(crate) fn effects_adopted<'a>(
+    frames: impl Iterator<Item = &'a Frame>,
+    seal: Lsn,
+) -> Result<u64, NominateError> {
     let mut prefixes: Vec<Vec<u8>> = Vec::new();
     let mut n = 0;
-    for f in frames.iter().take_while(|f| f.envelope.lsn <= seal) {
+    for f in frames.take_while(|f| f.envelope.lsn <= seal) {
         match Payload::decode(&f.payload) {
             Ok(Payload::Promotion(p)) => {
                 let mut c = taso_core::canon::Canon::default();
@@ -1682,6 +1699,20 @@ class = \"Scratch\"
             local[0].envelope.lsn > first.lsn,
             "the first Seal is pruned"
         );
+        // What pruning took is in the packs, every record of it.
+        let before = local[0].envelope.lsn.get() - 1;
+        let shipped = packs.shipped_frames(Lsn::new(1), Lsn::new(before)).unwrap();
+        assert_eq!(
+            shipped
+                .iter()
+                .map(|f| f.envelope.lsn.get())
+                .collect::<Vec<_>>(),
+            (1..=before).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            packs.shipped_frames(Lsn::new(1), Lsn::new(9999)),
+            Err(crate::pack::PackError::Gap { .. })
+        ));
 
         let mut a = ask(&w, NominatedBy::Agent);
         a.seal = Some(first.lsn);

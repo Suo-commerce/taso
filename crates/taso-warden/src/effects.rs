@@ -1026,6 +1026,46 @@ mod tests {
         assert_eq!(fx.pending_promotion(), None);
         assert_eq!(fx.released(&p).unwrap().len(), 3);
         assert!(fx.finish_promotion(&mut p, &log).unwrap().is_empty());
+        // The Candidate fact "effects adopted" counts them over the whole
+        // log; a log cut by pruning counts only what is left (audit
+        // 2026-11-09, A5), so a nomination puts the shipped records
+        // before it.
+        let all = p.chronicle().frames().unwrap();
+        let tail = all.last().unwrap().envelope.lsn;
+        let count =
+            |f: &[crate::segment::Frame]| crate::nominate::effects_adopted(f.iter(), tail).unwrap();
+        let cut = all.len() - 1;
+        assert_eq!((count(&all), count(&all[cut..])), (3, 0));
+        let (shipped, local) = all.split_at(cut);
+        assert_eq!(
+            crate::nominate::effects_adopted(shipped.iter().chain(local.iter()), tail).unwrap(),
+            3
+        );
+        // Whether the child was promoted before is read the same way: a
+        // configured promotion whose record was pruned is found in the
+        // shipped records after the Seal the child was forked at, and the
+        // search stops at the next Seal.
+        let fork = log.lineage.origin.parent().map(|s| s.seal);
+        let none = |_, _| -> Result<Vec<crate::segment::Frame>, String> { Ok(Vec::new()) };
+        let before = |local: &[crate::segment::Frame], id| {
+            crate::daemon::promoted_before(local, id, fork, |from: Lsn, to: Lsn| {
+                Ok::<_, String>(
+                    all.iter()
+                        .filter(|f| from <= f.envelope.lsn && f.envelope.lsn <= to)
+                        .cloned()
+                        .collect(),
+                )
+            })
+            .unwrap()
+        };
+        assert!(crate::daemon::promoted_before(&all, c, fork, none).unwrap());
+        assert!(
+            !crate::daemon::promoted_before(&all[cut..], c, fork, none).unwrap(),
+            "the local log alone no longer says so"
+        );
+        assert!(before(&all[cut..], c));
+        let other = ChronicleId::from_bytes([9; 16]);
+        assert!(!before(&all[cut..], other), "another child was not");
         // Reopened: nothing pending, still three, not six.
         drop((fx, p));
         let mut p = vessel(&e);

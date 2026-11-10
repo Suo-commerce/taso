@@ -1952,6 +1952,51 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         Ok(None)
     }
 
+    /// The shipped records `from..=to`, in order, read from the packs
+    /// that carry them (their `fs` sections are not read).  For a reader
+    /// that needs records the Vessel's local log has lost to pruning.
+    /// Every lsn of the range is answered or the read fails
+    /// ([`PackError::Gap`]): a missing pack must not read as "no such
+    /// record".  The one hole allowed is the one a Gap record explains
+    /// (records lost with a node, never shipped).
+    pub fn shipped_frames(&self, from: Lsn, to: Lsn) -> Result<Vec<Frame>, PackError> {
+        let mut found: std::collections::BTreeMap<u64, Frame> = std::collections::BTreeMap::new();
+        for name in self.pack_names()? {
+            let Some((end, base, _)) = name_bounds(&name) else {
+                continue;
+            };
+            if end < from || base >= to {
+                continue;
+            }
+            let Some((_, frames)) = self.read_pack_log(&name)? else {
+                continue;
+            };
+            for f in frames {
+                let lsn = f.envelope.lsn;
+                if from <= lsn && lsn <= to {
+                    found.entry(lsn.get()).or_insert(f);
+                }
+            }
+        }
+        let mut expected = from.get();
+        for (lsn, f) in &found {
+            let explained = f.envelope.stream == Stream::Ctl
+                && matches!(Payload::decode(&f.payload), Ok(Payload::Gap(_)));
+            if *lsn != expected && !explained {
+                return Err(PackError::Gap {
+                    missing: Lsn::new(expected),
+                });
+            }
+            expected = lsn + 1;
+        }
+        if expected <= to.get() {
+            return Err(PackError::Gap {
+                missing: Lsn::new(expected),
+            });
+        }
+        Ok(found.into_values().collect())
+    }
+
     /// Whether the pack `name` is in the store (nothing is read).
     pub fn has_pack(&self, name: &str) -> Result<bool, PackError> {
         let (key, _) = self.key_of(name)?;
