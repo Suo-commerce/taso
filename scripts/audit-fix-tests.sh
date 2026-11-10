@@ -50,6 +50,8 @@ one a_promotion_that_would_overfill_the_outbox_is_refused_before_it_is_recorded 
 # Forks
 one a_fork_asked_again_from_a_newer_seal_replaces_the_interrupted_clone $W
 one a_fork_slot_is_taken_by_a_born_child_not_by_a_directory $W
+# Verification attempts
+one a_restore_walk_cut_short_by_this_nodes_clock_is_interrupted $W
 # The reclaimer
 one a_pass_claims_nothing_the_coordinator_says_it_would_refuse $W
 # Kubernetes

@@ -567,6 +567,18 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
                 .map_err(|e| Failure::Candidate(format!("the Candidate's output manifest: {e}")))?;
         let walked = classify::walk(&mount, &map, owner, self.walk_limits, self.reserved)
             .map_err(|e| node(format!("walking the restored Candidate: {e}")))?;
+        // A walk this node's clock cut short says nothing about the files:
+        // how long a walk takes is the machine's and its load's.  It used
+        // to end the attempt `LaunchFailed`, a result about the Candidate,
+        // for good (audit 2026-11-09, a restore walk cut short).  The
+        // other walk limits are fixed counts and sizes that the same files
+        // meet on every node: those stay the Candidate's.
+        if walked.incomplete == Some(classify::Incomplete::WalkTime) {
+            return Err(node(format!(
+                "walking the restored Candidate took longer than this node's {} s",
+                self.walk_limits.max_walk.as_secs()
+            )));
+        }
         if !same_entries(&walked, &want) {
             return Err(Failure::Candidate(
                 "the restored Candidate does not walk to its output manifest".into(),

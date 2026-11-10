@@ -2847,6 +2847,54 @@ mod tests {
         assert!(text.contains("is not in the store"), "{text}");
     }
 
+    /// Audit 2026-11-09, an attempt whose restore walk this node's clock
+    /// cut short ended `LaunchFailed`, a result about the Candidate's
+    /// files, for good.  With the walk's time at zero it ends
+    /// `Interrupted`, and D88 attempts the Candidate again; with the
+    /// default time the same Candidate gets past the walk.
+    #[test]
+    fn a_restore_walk_cut_short_by_this_nodes_clock_is_interrupted() {
+        let c = Cluster::new();
+        let vt = c.dir.path().join("verifier");
+        verifier_tree(&vt);
+        let verifier = c.template_from(&vt);
+        let node = c.node(1);
+        let reserved = Reserved::defaults();
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", verifier, VCONF);
+        let at = attempts(&c);
+        let cut = Limits {
+            max_walk: Duration::ZERO,
+            ..Limits::default()
+        };
+        let run = run_with(&c, &node, &cut, &reserved);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert_eq!(
+            o,
+            VOutcome::Interrupted,
+            "a walk this node cut short decided the Candidate: {text}"
+        );
+        assert!(text.contains("took longer than this node's 0 s"), "{text}");
+        at.finish(&mut v, &packs, &st, o, out).unwrap();
+        assert_eq!(
+            at.to_attempt(&v).unwrap(),
+            vec![cand.clone()],
+            "attempted again (D88)"
+        );
+        let _ = attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id);
+        // With this node's usual time the walk finishes.
+        let limits = Limits::default();
+        let run = run_with(&c, &node, &limits, &reserved);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            !text.contains("does not walk") && !text.contains("took longer"),
+            "{o:?}: {text}"
+        );
+    }
+
     /// A verifier image: the host's `sh` and `cat` with their libraries,
     /// and the mount targets.
     fn verifier_tree(at: &Path) {
