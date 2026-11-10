@@ -1341,10 +1341,11 @@ pub struct Server {
 /// when the worker ends, however it ends.  A worker whose handler panics
 /// must still close its connection: the list holds a second handle on the
 /// socket, and while that stays open the client is told nothing and waits
-/// its whole timeout (audit 2026-11-09, panicking worker).
-struct ConnGuard {
-    conns: Arc<Mutex<HashMap<u64, UnixStream>>>,
-    id: u64,
+/// its whole timeout (audit 2026-11-09, panicking worker).  The decider
+/// socket uses it too.
+pub(crate) struct ConnGuard {
+    pub(crate) conns: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    pub(crate) id: u64,
 }
 
 impl Drop for ConnGuard {

@@ -124,7 +124,10 @@ impl DeciderServer {
         let workers: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
         let accept = {
             let (stop, conns, workers) = (stop.clone(), conns.clone(), workers.clone());
-            std::thread::spawn(move || {
+            let sock = path.clone();
+            // A thread the system refuses is an error to the caller, not
+            // a panic (audit 2026-11-09, accept loop).
+            let spawned = std::thread::Builder::new().spawn(move || {
                 let mut next = 0u64;
                 while !stop.load(Ordering::SeqCst) {
                     let mut stream = match listener.accept() {
@@ -133,7 +136,15 @@ impl DeciderServer {
                             std::thread::sleep(ACCEPT_POLL);
                             continue;
                         }
-                        Err(_) => continue,
+                        // Any other error (out of descriptors, say) may
+                        // last: wait as for an idle listener instead of
+                        // asking again at once, which kept a whole
+                        // processor busy for as long as the error lasted
+                        // (audit 2026-11-09, accept loop).
+                        Err(_) => {
+                            std::thread::sleep(ACCEPT_POLL);
+                            continue;
+                        }
                     };
                     if stream.set_nonblocking(false).is_err() {
                         continue;
@@ -163,16 +174,50 @@ impl DeciderServer {
                     let id = next;
                     next += 1;
                     lock(&conns).insert(id, handle);
-                    let (d, conns_w) = (d.clone(), conns.clone());
-                    let w = std::thread::spawn(move || {
+                    let d = d.clone();
+                    // Takes the connection out of `conns` and closes it
+                    // however the worker ends.  A worker whose handler
+                    // panicked used to leave it there: the decider was
+                    // told nothing, and the connection went on counting
+                    // against `max_connections` until the Warden
+                    // restarted (audit 2026-11-09, panicking worker).
+                    let guard = crate::coordsrv::ConnGuard {
+                        conns: conns.clone(),
+                        id,
+                    };
+                    let w = std::thread::Builder::new().spawn(move || {
+                        let _guard = guard;
                         serve_conn(d.as_ref(), stream, peer, max_frame);
-                        lock(&conns_w).remove(&id);
                     });
+                    // The system refused a thread: that connection is
+                    // closed (the closure, dropped unrun, drops its guard
+                    // and its stream) and the Warden keeps accepting.
+                    // `std::thread::spawn` panics here, which ended this
+                    // thread: the socket stayed but nobody answered on it
+                    // (audit 2026-11-09, accept loop).
+                    let w = match w {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!(
+                                "taso decider socket {}: no thread for a new connection \
+                                 (dropped): {e}",
+                                sock.display()
+                            );
+                            continue;
+                        }
+                    };
                     let mut ws = lock(&workers);
                     ws.retain(|w| !w.is_finished());
                     ws.push(w);
                 }
-            })
+            });
+            match spawned {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+            }
         };
         Ok(Self {
             path,
@@ -591,5 +636,50 @@ mod tests {
         let (_srv2, _f2, conf2) = server(dir2.path(), 8);
         let mut c2 = DeciderClient::connect(&conf2.socket).unwrap();
         assert_eq!(c2.pending_all().unwrap_err(), "no Vessels here");
+    }
+
+    /// A Warden whose `pending` panics.
+    struct Boom;
+
+    impl Decide for Boom {
+        fn pending(&self) -> Result<Vec<PendingItem>, String> {
+            panic!("boom")
+        }
+        fn verdict(&self, _: &VerdictRequest, _: Peer) -> Result<VerdictAnswer, String> {
+            Err("not asked".into())
+        }
+    }
+
+    /// Audit 2026-11-09, a connection thread whose handler panicked left its
+    /// connection open in the server's list: the decider was told nothing
+    /// and waited for ever, and the connection went on counting against
+    /// `max_connections`, so a few panics shut every decider out until the
+    /// Warden restarted.  A panicking worker closes its connection and
+    /// frees its place.
+    #[test]
+    fn a_panicking_worker_closes_its_connection_and_frees_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = DeciderConf {
+            socket: dir.path().join("d").join("decide.sock"),
+            max_frame_bytes: 4096,
+            max_connections: 1,
+        };
+        let srv = DeciderServer::spawn(&conf, Arc::new(Boom)).unwrap();
+        const TIMEOUT: Duration = Duration::from_secs(3);
+        let mut c = DeciderClient::connect(&conf.socket).unwrap();
+        c.s.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let t0 = std::time::Instant::now();
+        let err = c.call(&Request::Pending { after: None }).unwrap_err();
+        let took = t0.elapsed();
+        assert!(
+            took < TIMEOUT / 2,
+            "the handler panicked; the decider waited {took:?} for `{err}`"
+        );
+        drop(c);
+        // The worker is long dead; give its bookkeeping a moment anyway.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(lock(&srv.conns).len(), 0, "connections still kept");
+        // The one place is free again.
+        DeciderClient::connect(&conf.socket).unwrap();
     }
 }
