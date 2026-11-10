@@ -145,6 +145,9 @@ pub struct KubeSource<L: ListVessels> {
     runtime: RuntimeConf,
     tick: Duration,
     next_list: Option<Instant>,
+    /// Why the last list failed, if it did: until a list succeeds, every
+    /// poll answers this error, never "unchanged".
+    failed: Option<String>,
     /// The set last answered.
     last: Option<Vec<VesselConf>>,
     /// The last good entry of each resource, by uid.
@@ -162,6 +165,7 @@ impl<L: ListVessels> KubeSource<L> {
             runtime,
             tick,
             next_list: None,
+            failed: None,
             last: None,
             last_good: BTreeMap::new(),
             view: SharedView::default(),
@@ -447,16 +451,33 @@ impl<L: ListVessels> VesselSource for KubeSource<L> {
             if now < next {
                 std::thread::sleep(wait.min(next - now));
                 if Instant::now() < next {
-                    return Ok(None);
+                    // Not listed again before the tick.  If the last list
+                    // failed, the set is still unknown, and the answer is
+                    // still that error: "unchanged" would let the
+                    // supervisor start due restarts while the API server
+                    // cannot be reached (audit 2026-11-09, failed list
+                    // answered as unchanged).
+                    return match &self.failed {
+                        Some(why) => Err(SourceError(why.clone())),
+                        None => Ok(None),
+                    };
                 }
             }
         }
         self.next_list = Some(Instant::now() + self.tick);
-        let list = self
+        let listed = self
             .lister
             .list(&self.conf.node)
-            .map_err(|e| SourceError(e.to_string()))?;
-        let (set, view) = self.read(&list)?;
+            .map_err(|e| SourceError(e.to_string()))
+            .and_then(|list| self.read(&list));
+        let (set, view) = match listed {
+            Ok(read) => read,
+            Err(e) => {
+                self.failed = Some(e.0.clone());
+                return Err(e);
+            }
+        };
+        self.failed = None;
         *self.view.lock().unwrap_or_else(|p| p.into_inner()) = view;
         if self.last.as_ref() == Some(&set) {
             return Ok(None);
@@ -1293,6 +1314,48 @@ mod tests {
             "waited for the tick"
         );
         assert_eq!(fake.1.load(Ordering::SeqCst), 2);
+    }
+
+    /// Audit 2026-11-09, after a list that failed, `poll` answered
+    /// "unchanged" until its next tick, so the supervisor went on to
+    /// start due restarts while the API server could not be reached.
+    #[test]
+    fn a_failing_list_is_never_answered_as_unchanged() {
+        let f = fixture();
+        let fake = Fake::default();
+        fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({}))]));
+        let mut s = KubeSource::new(
+            fake.clone(),
+            f.conf.clone(),
+            f.runtime.clone(),
+            Duration::from_secs(2), // DEFAULT_TICK
+        );
+        assert_eq!(s.poll(Duration::ZERO).unwrap().map(|v| v.len()), Some(1));
+        s.next_list = Some(Instant::now()); // the tick has passed
+        fake.fail("api server unreachable");
+        assert!(
+            s.poll(Duration::from_millis(50)).is_err(),
+            "the failed list"
+        );
+        // The supervisor's next polls, within the 2 s.
+        for _ in 0..2 {
+            let next = s.poll(Duration::from_millis(50));
+            assert!(
+                next.is_err(),
+                "the API server is still unreachable, and poll answered {next:?} (unchanged)"
+            );
+        }
+        assert_eq!(
+            fake.1.load(Ordering::SeqCst),
+            2,
+            "not listed again before the tick"
+        );
+        // A list that works ends it; the set is the one answered before.
+        fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({}))]));
+        s.next_list = Some(Instant::now()); // the tick has passed
+        assert_eq!(s.poll(Duration::from_millis(50)).unwrap(), None);
+        assert_eq!(s.poll(Duration::from_millis(50)).unwrap(), None);
+        assert_eq!(fake.1.load(Ordering::SeqCst), 3);
     }
 
     #[test]
