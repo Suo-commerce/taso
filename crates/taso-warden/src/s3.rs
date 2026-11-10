@@ -78,6 +78,8 @@ pub struct S3Store {
     config: S3Config,
     host: String,
     agent: ureq::Agent,
+    /// The bucket answered as there once: a HEAD's 404 is then the key's.
+    bucket_seen: std::sync::atomic::AtomicBool,
 }
 
 impl S3Store {
@@ -149,6 +151,7 @@ impl S3Store {
             config,
             host,
             agent,
+            bucket_seen: Default::default(),
         })
     }
 
@@ -270,6 +273,35 @@ fn bad_key(key: &str) -> io::Error {
     )
 }
 
+fn no_bucket(what: &str, bucket: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{what}: the bucket {bucket:?} does not exist (NoSuchBucket): not an absent object"
+        ),
+    )
+}
+
+impl S3Store {
+    /// `Ok` if the bucket is there (a HEAD of it answers 2xx), asked once
+    /// in this store's life; an error if it answers 404 or anything else.
+    fn bucket_is_there(&self, what: &str) -> io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.bucket_seen.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let path = format!("/{}", self.config.bucket);
+        let req = self.request("HEAD", &path, &[], EMPTY_SHA256, &[]);
+        let resp = self.send(what, req, ())?;
+        if resp.status() == http::StatusCode::NOT_FOUND {
+            return Err(no_bucket(what, &self.config.bucket));
+        }
+        success(&format!("{what}: head the bucket"), resp)?;
+        self.bucket_seen.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 /// The answer if it is a success (2xx), else an `io::Error` with the
 /// status and the store's `<Code>`.
 fn success(
@@ -357,14 +389,23 @@ impl ObjectStore for S3Store {
         Ok(body.len() as u64)
     }
 
+    /// `None` for a key that is not there.  A 404 that says the bucket is
+    /// not there (`NoSuchBucket`: missing, misnamed, another region's) is
+    /// an error: it used to read as "the object is absent", and an absent
+    /// object is a fact the Warden acts on (a Candidate's object gone, a
+    /// pack never shipped) (audit 2026-11-09).
     fn get(&self, key: &str) -> io::Result<Option<ByteStream>> {
         if !valid_key(key) {
             return Err(bad_key(key));
         }
         let what = format!("get {key}");
         let req = self.request("GET", &self.path(key), &[], EMPTY_SHA256, &[]);
-        let resp = self.send(&what, req, ())?;
+        let mut resp = self.send(&what, req, ())?;
         if resp.status() == http::StatusCode::NOT_FOUND {
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            if between(&body, "<Code>", "</Code>") == Some("NoSuchBucket") {
+                return Err(no_bucket(&what, &self.config.bucket));
+            }
             return Ok(None);
         }
         let resp = success(&what, resp)?;
@@ -379,9 +420,14 @@ impl ObjectStore for S3Store {
         let req = self.request("HEAD", &self.path(key), &[], EMPTY_SHA256, &[]);
         let resp = self.send(&what, req, ())?;
         if resp.status() == http::StatusCode::NOT_FOUND {
+            // A HEAD's answer has no body to say whose 404 it is: the
+            // bucket is asked for once, and from then on a 404 is the key's.
+            self.bucket_is_there(&what)?;
             return Ok(false);
         }
         success(&what, resp)?;
+        self.bucket_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(true)
     }
 
@@ -940,7 +986,9 @@ pub(crate) mod tests {
             r#"
 class H(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
-        self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+        # The bucket is there; every key in it is not.
+        ok = self.path.rstrip("/") == "/taso"
+        self.send_response(200 if ok else 404); self.send_header("Content-Length", "0"); self.end_headers()
     def log_message(self, *a): pass
 "#,
         );
@@ -975,6 +1023,83 @@ class H(http.server.BaseHTTPRequestHandler):
         assert!(
             tls_trusting(&empty).is_err(),
             "a CA file with no certificate"
+        );
+    }
+
+    /// A stand-in whose every answer is 404; with `bucket` the bucket
+    /// itself is there (a HEAD of it is 200) and a GET's 404 says
+    /// NoSuchKey, else NoSuchBucket.
+    fn four_oh_four(bucket: bool) -> TestServer {
+        let code = if bucket { "NoSuchKey" } else { "NoSuchBucket" };
+        TestServer::start(
+            false,
+            &format!(
+                r#"
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        body = b"<Error><Code>{code}</Code><Message>m</Message></Error>"
+        self.send_response(404)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_HEAD(self):
+        ok = {bucket} and self.path.rstrip("/") == "/tsao"
+        self.send_response(200 if ok else 404); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+"#,
+                bucket = if bucket { "True" } else { "False" },
+            ),
+        )
+    }
+
+    fn store_at(port: u16) -> S3Store {
+        S3Store::new(
+            S3Config {
+                endpoint: format!("http://127.0.0.1:{port}"),
+                region: "garage".into(),
+                bucket: "tsao".into(),
+                plaintext: true,
+                ..aws_example()
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    /// Audit 2026-11-09, a 404 because the bucket is missing or misnamed
+    /// read as "the object is absent", and the Warden acts on an absent
+    /// object (a Candidate's object gone, a pack never shipped).  GET and
+    /// HEAD both answer an error then; with the bucket there, a missing
+    /// key is still `None` and `false`.
+    #[test]
+    fn a_missing_bucket_is_not_an_absent_object() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = four_oh_four(false);
+        let store = store_at(srv.port);
+        let got = store.get("d/a").map(|o| o.is_some());
+        assert!(
+            got.as_ref()
+                .is_err_and(|e| e.to_string().contains("NoSuchBucket")),
+            "get answered {got:?} for a 404 NoSuchBucket"
+        );
+        let head = store.exists("d/a");
+        assert!(
+            head.as_ref()
+                .is_err_and(|e| e.to_string().contains("does not exist")),
+            "exists answered {head:?} with no bucket"
+        );
+        let srv = four_oh_four(true);
+        let store = store_at(srv.port);
+        assert!(store.get("d/a").unwrap().is_none());
+        assert!(!store.exists("d/a").unwrap());
+        assert!(
+            !store.exists("d/b").unwrap(),
+            "the bucket is asked for once"
         );
     }
 
@@ -1022,7 +1147,8 @@ class H(http.server.BaseHTTPRequestHandler):
         self.reply(200)
     def do_HEAD(self):
         b, k, _ = self.key()
-        self.reply(200 if k in objs else 404)
+        # A HEAD of the bucket itself: it is there.
+        self.reply(200 if k in objs or k == "" else 404)
     def do_GET(self):
         b, k, q = self.key()
         if k == "" and q.get("list-type") == ["2"]:

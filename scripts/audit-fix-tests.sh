@@ -61,6 +61,8 @@ one a_purge_finished_on_another_node_deletes_that_nodes_dataset $W
 one a_resume_never_refuses_a_genesis_from_an_object_that_is_not_its_keys $W
 # The reclaimer
 one a_pass_claims_nothing_the_coordinator_says_it_would_refuse $W
+# The object store
+one a_missing_bucket_is_not_an_absent_object $W
 # Kubernetes
 one a_field_cleared_by_a_later_event_is_cleared_on_the_resource $W
 one a_failing_list_is_never_answered_as_unchanged $W
