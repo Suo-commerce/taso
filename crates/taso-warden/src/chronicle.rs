@@ -614,7 +614,22 @@ impl<L: Layers> Chronicle<L> {
             .map_err(ChronicleError::Coord)?;
         let head = coord.head(id).map_err(ChronicleError::Coord)?;
 
-        let files = list_segments(dir)?;
+        let mut files = list_segments(dir)?;
+        // A newest file shorter than a header is a segment whose create
+        // stopped midway: it held no frame, and the log ends in the file
+        // before it (audit 2026-11-09, A7).  The only file of a log that
+        // has records is not one: that is a damaged log, refused below.
+        if let Some(last) = files.last() {
+            if (files.len() > 1 || head.lsn == Lsn::new(0))
+                && Segment::is_stub(last).map_err(SegmentError::Io)?
+            {
+                std::fs::remove_file(last).map_err(SegmentError::Io)?;
+                std::fs::File::open(dir)
+                    .and_then(|d| d.sync_all())
+                    .map_err(SegmentError::Io)?;
+                files.pop();
+            }
+        }
         let (closed, segment, seg_recovery) = match files.split_last() {
             None if head.lsn == Lsn::new(0) => {
                 let seg = Segment::create(dir.join(SEGMENT_FILE), id, Position::GENESIS)?;
@@ -1259,7 +1274,9 @@ impl<L: Layers> Chronicle<L> {
     /// while live, so every frame in the old file is accepted: it opens
     /// later as a complete closed segment, and the new one joins it end to
     /// start.  A crash right after the new file is created leaves an empty
-    /// newest segment based at the head, which opens as usual.
+    /// newest segment based at the head, which opens as usual; one during
+    /// its creation leaves nothing under a segment's name
+    /// ([`Segment::create`]).
     fn roll_if_full(&mut self) -> Result<(), ChronicleError> {
         if self.segment.is_empty() || self.segment.bytes() < self.roll_at {
             return Ok(());
@@ -1411,7 +1428,15 @@ fn lock_dir(dir: &Path) -> Result<File, ChronicleError> {
 /// for the caller to judge.
 pub fn read_log(dir: &Path) -> Result<Vec<Frame>, ChronicleError> {
     let mut frames = Vec::new();
-    for path in list_segments(dir)? {
+    let mut files = list_segments(dir)?;
+    // A half-made newest file holds no frame (see `open_inner`); it is
+    // left in place here, where nothing is written.
+    if let Some(last) = files.last() {
+        if files.len() > 1 && Segment::is_stub(last).map_err(SegmentError::Io)? {
+            files.pop();
+        }
+    }
+    for path in files {
         frames.extend(Segment::open_read_only(&path)?.frames()?);
     }
     Ok(frames)
@@ -1751,6 +1776,41 @@ mod tests {
     }
 
     // ── rolling ─────────────────────────────────────────────────────
+
+    /// Audit 2026-11-09, A7: a roll that stopped between creating the
+    /// next segment's file and writing its header (a full disk, a kill)
+    /// left a file shorter than a header.  The running Chronicle then
+    /// refused every append (the file exists), and after a restart it
+    /// would not open ("file shorter than the header") until the file was
+    /// removed by hand, with every accepted record intact beside it.
+    #[test]
+    fn a_half_made_segment_file_is_no_obstacle() {
+        let e = env();
+        let mut c = e.create();
+        c.set_roll_at(crate::segment::HEADER_LEN + 300);
+        c.append(Stream::Fs, raw(1)).unwrap();
+        c.append(Stream::Fs, raw(2)).unwrap();
+        // What the interrupted roll left: the next segment's name, empty.
+        let stub = e.dir.join(segment_name(c.tail().lsn));
+        std::fs::write(&stub, b"").unwrap();
+        // The running Chronicle rolls over it.
+        for n in 3..6 {
+            c.append(Stream::Fs, raw(n)).unwrap();
+        }
+        let tail = c.tail();
+        drop(c);
+        // And one left as the newest file opens as if it were not there.
+        let stub = e.dir.join(segment_name(Lsn::new(tail.lsn.get() + 100)));
+        std::fs::write(&stub, b"TASO").unwrap();
+        assert!(
+            !read_log(&e.dir).unwrap().is_empty(),
+            "read without a claim"
+        );
+        let (mut c, _) = e.open(A);
+        assert_eq!(c.tail(), tail);
+        assert!(!stub.exists(), "the half-made file is removed");
+        c.append(Stream::Fs, raw(7)).unwrap();
+    }
 
     /// A full segment is closed and the next starts at its tail: one log
     /// across many files, reopened whole, with a Seal found in a closed
