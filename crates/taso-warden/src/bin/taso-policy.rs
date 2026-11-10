@@ -27,12 +27,15 @@
 //! ```
 //!
 //! and, at the end of each pass, `{"pass": <n>, "pending": <n>, "sent": <n>}`.
+//! A Candidate whose verdict the Warden answered `Error` has `"error"` in
+//! its line in place of `"answer"`, and is not counted in `sent`; the pass
+//! goes on with the next Candidate and fails at its end.
 //!
 //! # Exit status
 //!
 //! 0 a `--once` pass done (whatever the answers); 1 it could not reach the
-//! socket or was answered `Error`; 2 a bad command line, configuration or
-//! policy.
+//! socket or a Candidate's verdict was answered `Error`; 2 a bad command
+//! line, configuration or policy.
 //!
 //! Normative reference: `Taso_spec_p4_contracts` rev. 24, BLAKE3
 //! `6e94168a59236aa86cf5b26bdeb5e518f05ec8445132da88ab5df96d7954ad81`.
@@ -93,13 +96,23 @@ fn answer_fields(v: &mut Value, a: &VerdictAnswer) {
     }
 }
 
-/// One pass: `Err` if the socket could not be used.
+/// One pass: `Err` if the socket could not be used, or, at the end of the
+/// pass, if the Warden answered a Candidate's verdict `Error`.
+///
+/// Such an `Error` is that Candidate's alone: the Warden says what it
+/// could not do and keeps the connection open (`decidesrv`).  It is
+/// written on the Candidate's line and the pass decides the others.  It
+/// used to end the pass there, so one Candidate that kept failing kept
+/// every Candidate listed after it undecided (audit 2026-11-09, policy
+/// pass).  An `Error` after which the Warden closes the connection ends
+/// the pass at the next request, as a socket that cannot be used.
 fn pass(n: u64, socket: &std::path::Path, policy: &Policy, dry: bool) -> Result<(), String> {
     let mut c = DeciderClient::connect(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     // Every page (review fix N3b-a): a pass sees every pending Candidate.
     let items = c.pending_all()?;
     let uid = rustix::process::getuid().as_raw();
     let mut sent = 0;
+    let mut errors: Vec<String> = Vec::new();
     for item in &items {
         let Some(choice) = policy.decide(item) else {
             continue;
@@ -135,7 +148,8 @@ fn pass(n: u64, socket: &std::path::Path, policy: &Policy, dry: bool) -> Result<
                 Reply::Error { message } => {
                     v["error"] = json!(message);
                     println!("{v}");
-                    return Err(message);
+                    errors.push(message);
+                    continue;
                 }
                 other => return Err(format!("unexpected reply {other:?}")),
             }
@@ -147,7 +161,14 @@ fn pass(n: u64, socket: &std::path::Path, policy: &Policy, dry: bool) -> Result<
         "{}",
         json!({"pass": n, "pending": items.len(), "sent": sent})
     );
-    Ok(())
+    match errors.first() {
+        None => Ok(()),
+        Some(first) => Err(format!(
+            "{} of {} verdicts were answered Error, the first: {first}",
+            errors.len(),
+            errors.len() + sent
+        )),
+    }
 }
 
 fn main() -> ExitCode {
@@ -202,5 +223,86 @@ fn main() -> ExitCode {
             Err(e) => eprintln!("taso-policy: pass {n}: {e}"),
         }
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use taso_core::contract::{Outcome, Peer, VerdictRequest};
+    use taso_core::decider::PendingItem;
+    use taso_core::envelope::HashVal;
+    use taso_warden::decidesrv::{Decide, DeciderConf, DeciderServer};
+
+    mod pending {
+        include!("../../tests/support/pending.rs");
+    }
+
+    /// Two pending Candidates; a verdict on the first fails (its Vessel's
+    /// trouble), a verdict on the second is answered.
+    struct OneFails {
+        items: Vec<PendingItem>,
+        seen: Mutex<Vec<HashVal>>,
+    }
+
+    impl Decide for OneFails {
+        fn pending(&self) -> Result<Vec<PendingItem>, String> {
+            Ok(self.items.clone())
+        }
+        fn verdict(&self, r: &VerdictRequest, _: Peer) -> Result<VerdictAnswer, String> {
+            self.seen.lock().unwrap().push(r.candidate_id);
+            if r.candidate_id == self.items[0].candidate.candidate_id {
+                Err("vessel: this Vessel's log cannot be written".into())
+            } else {
+                Ok(VerdictAnswer::Held)
+            }
+        }
+    }
+
+    /// Audit 2026-11-09, a pass ended at the first Candidate whose verdict
+    /// the Warden answered `Error`, so the Candidates after it were not
+    /// decided in that pass, nor in any later one while the first kept
+    /// failing.
+    #[test]
+    fn one_candidates_error_does_not_end_the_pass_for_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = DeciderConf {
+            socket: dir.path().join("d").join("decide.sock"),
+            max_frame_bytes: 1 << 20,
+            max_connections: 4,
+        };
+        let pass_outcome = [Outcome::Exit { code: 0 }];
+        let fake = Arc::new(OneFails {
+            items: vec![
+                pending::item(1, pending::clean(1), &pass_outcome),
+                pending::item(2, pending::clean(1), &pass_outcome),
+            ],
+            seen: Mutex::default(),
+        });
+        let _srv = DeciderServer::spawn(&conf, fake.clone()).unwrap();
+        let policy =
+            Policy::parse(b"version = 1\nactor = \"taso-policy\"\ndefault = \"hold\"\n").unwrap();
+        let done = pass(1, &conf.socket, &policy, false);
+        let seen = fake.seen.lock().unwrap().clone();
+        let ids: Vec<HashVal> = fake
+            .items
+            .iter()
+            .map(|i| i.candidate.candidate_id)
+            .collect();
+        assert_eq!(
+            seen, ids,
+            "one pass ({done:?}) sends a verdict for each Candidate"
+        );
+        // The pass still says that something failed, and what.
+        let e = done.expect_err("a pass with an Error fails");
+        assert!(
+            e.starts_with("1 of 2 verdicts were answered Error")
+                && e.ends_with("this Vessel's log cannot be written"),
+            "{e}"
+        );
+        // A dry run sends nothing, so nothing fails.
+        assert_eq!(pass(2, &conf.socket, &policy, true), Ok(()));
+        assert_eq!(fake.seen.lock().unwrap().len(), 2);
     }
 }
