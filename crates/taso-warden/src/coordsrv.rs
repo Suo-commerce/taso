@@ -1337,6 +1337,31 @@ pub struct Server {
     accept: Option<JoinHandle<()>>,
 }
 
+/// Takes a worker's connection out of the server's list and closes it
+/// when the worker ends, however it ends.  A worker whose handler panics
+/// must still close its connection: the list holds a second handle on the
+/// socket, and while that stays open the client is told nothing and waits
+/// its whole timeout (audit 2026-11-09, panicking worker).
+struct ConnGuard {
+    conns: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    id: u64,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        // This may run while the thread is panicking: a poisoned lock is
+        // taken as it is, never a second panic.
+        let handle = self
+            .conns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+        if let Some(c) = handle {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 /// Bind the socket in a private staging directory beside `path`, set its
 /// mode and group there, then rename it to `path`.  The directory is
 /// removed on every exit.
@@ -1421,7 +1446,10 @@ impl Server {
         let workers: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
         let accept = {
             let (stop, conns, workers) = (stop.clone(), conns.clone(), workers.clone());
-            std::thread::spawn(move || {
+            let sock = path.clone();
+            // A thread the system refuses is an error to the caller, not
+            // a panic (audit 2026-11-09, accept loop).
+            let spawned = std::thread::Builder::new().spawn(move || {
                 let mut next_id = 0u64;
                 while !stop.load(Ordering::SeqCst) {
                     let stream = match listener.accept() {
@@ -1430,7 +1458,15 @@ impl Server {
                             std::thread::sleep(ACCEPT_POLL);
                             continue;
                         }
-                        Err(_) => continue,
+                        // Any other error (out of descriptors, say) may
+                        // last: wait as for an idle listener instead of
+                        // asking again at once, which kept a whole
+                        // processor busy for as long as the error lasted
+                        // (audit 2026-11-09, accept loop).
+                        Err(_) => {
+                            std::thread::sleep(ACCEPT_POLL);
+                            continue;
+                        }
                     };
                     // Connections block; only the listener polls.
                     if stream.set_nonblocking(false).is_err() {
@@ -1453,16 +1489,44 @@ impl Server {
                     let id = next_id;
                     next_id += 1;
                     conns.lock().expect("conns").insert(id, handle);
-                    let (coord, conns_w) = (coord.clone(), conns.clone());
-                    let w = std::thread::spawn(move || {
+                    let coord = coord.clone();
+                    let guard = ConnGuard {
+                        conns: conns.clone(),
+                        id,
+                    };
+                    let w = std::thread::Builder::new().spawn(move || {
+                        let _guard = guard;
                         serve_conn(coord.as_ref(), stream, peer);
-                        conns_w.lock().expect("conns").remove(&id);
                     });
+                    // The system refused a thread: that connection is
+                    // closed (the closure, dropped unrun, drops its guard
+                    // and its stream) and the coordinator keeps
+                    // accepting.  `std::thread::spawn` panics here, which
+                    // ended this thread and left a coordinator that ran
+                    // but answered nobody (audit 2026-11-09, accept loop).
+                    let w = match w {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!(
+                                "taso coordinator on {}: no thread for a new connection \
+                                 (dropped): {e}",
+                                sock.display()
+                            );
+                            continue;
+                        }
+                    };
                     let mut ws = workers.lock().expect("workers");
                     ws.retain(|w| !w.is_finished());
                     ws.push(w);
                 }
-            })
+            });
+            match spawned {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+            }
         };
         Ok(Self {
             path,
@@ -1476,6 +1540,15 @@ impl Server {
     /// The socket path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the thread that accepts connections is still running.  It
+    /// runs until [`Server::stop`]; if it has ended on its own (it
+    /// panicked), nobody can connect any more and the process serving the
+    /// coordinator should end with an error rather than stay up, deaf
+    /// (audit 2026-11-09, accept loop).
+    pub fn accepting(&self) -> bool {
+        self.accept.as_ref().is_some_and(|a| !a.is_finished())
     }
 
     /// Stop accepting, close every connection, wait for every thread, and
@@ -3301,6 +3374,89 @@ mod tests {
             "with the coordinator back up, {} of {} calls failed: {failed:?}",
             failed.len(),
             IDLE + 2
+        );
+    }
+
+    /// A coordinator whose `head` panics.
+    struct Boom(Coordinator);
+    impl Coord for Boom {
+        fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+            self.0.register(c, h)
+        }
+        fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
+            self.0.append(w, e)
+        }
+        fn append_batch_with(
+            &self,
+            w: WardenId,
+            e: &[Envelope],
+            fx: &[Vec<u8>],
+        ) -> Result<ChronicleHead, CoordError> {
+            self.0.append_batch_with(w, e, fx)
+        }
+        fn transfer_if(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+            e: (WardenId, Epoch),
+        ) -> Result<Epoch, CoordError> {
+            self.0.transfer_if(c, h, e)
+        }
+        fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+            self.0.transfer(c, h)
+        }
+        fn ownership(&self, c: ChronicleId) -> Result<Ownership, CoordError> {
+            self.0.ownership(c)
+        }
+        fn head(&self, _: ChronicleId) -> Result<ChronicleHead, CoordError> {
+            panic!("boom")
+        }
+        fn advance_shipped(
+            &self,
+            w: WardenId,
+            c: ChronicleId,
+            e: Epoch,
+            to: Position,
+        ) -> Result<Position, CoordError> {
+            self.0.advance_shipped(w, c, e, to)
+        }
+        fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+            self.0.shipped(c)
+        }
+    }
+
+    /// Audit 2026-11-09, a connection thread whose handler panicked left its
+    /// connection open in the server's list: the client was told nothing
+    /// and waited its whole timeout, and the server kept the descriptor.
+    /// A panicking worker closes its connection, so the client sees the
+    /// end at once.
+    #[test]
+    fn a_panicking_worker_closes_its_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let boom = Arc::new(Boom(Coordinator::open(dir.path().join("c.redb")).unwrap()));
+        let server = Server::spawn(dir.path().join("c.sock"), boom).unwrap();
+        const TIMEOUT: Duration = Duration::from_secs(3);
+        let c = RemoteCoord::with_timeout(dir.path().join("c.sock"), TIMEOUT);
+        c.register(chron(1), A).unwrap();
+        let t0 = std::time::Instant::now();
+        let err = c.head(chron(1)).unwrap_err();
+        let took = t0.elapsed();
+        drop(c);
+        // The worker is long dead; give its bookkeeping a moment anyway.
+        std::thread::sleep(Duration::from_millis(200));
+        let workers_alive = server
+            .workers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| !w.is_finished())
+            .count();
+        let left = server.conns.lock().unwrap().len();
+        assert!(
+            took < TIMEOUT / 2 && left == 0,
+            "the handler panicked; the client waited {took:?} (its timeout is {TIMEOUT:?}) for \
+             `{err}`; the server still keeps {left} connection descriptor(s) with \
+             {workers_alive} worker(s) alive"
         );
     }
 }

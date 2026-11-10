@@ -234,17 +234,57 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _server = match Server::spawn_with(&sock, coord, options.build()) {
+    // Each connected Warden holds one descriptor per connection, and a
+    // Warden keeps up to 128 idle ones: the usual soft limit of 1024 is
+    // soon reached, and then no new connection is accepted (audit
+    // 2026-11-09, accept loop).
+    let open_files = raise_open_files();
+    let server = match Server::spawn_with(&sock, coord, options.build()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("taso-coordd: serving on {sock}: {e}");
             return ExitCode::FAILURE;
         }
     };
-    eprintln!("taso-coordd: serving {db} on {sock} ({who}; {reads})");
-    loop {
-        std::thread::park();
+    eprintln!("taso-coordd: serving {db} on {sock} ({who}; {reads}; open-file limit {open_files})");
+    // Until killed.  If the thread that accepts connections ever ends on
+    // its own, no Warden can connect any more: end with an error, so
+    // whoever started the coordinator sees it and starts it again, rather
+    // than stay up and answer nobody (audit 2026-11-09, accept loop).
+    while server.accepting() {
+        std::thread::park_timeout(ACCEPT_CHECK);
     }
+    eprintln!("taso-coordd: the thread accepting connections on {sock} has ended: giving up");
+    ExitCode::FAILURE
+}
+
+/// How often `main` checks that connections are still being accepted.
+const ACCEPT_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Raise the open-file soft limit to the hard limit and return the soft
+/// limit in force (0 if it cannot be read), as `taso-blkd` does.
+fn raise_open_files() -> u64 {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit and setrlimit only read and write the struct passed
+    // by reference, which lives for the whole call.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return 0;
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            let want = libc::rlimit {
+                rlim_cur: lim.rlim_max,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
+                lim = want;
+            }
+        }
+    }
+    lim.rlim_cur
 }
 
 #[cfg(test)]
