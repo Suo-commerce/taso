@@ -1860,6 +1860,45 @@ pub fn container_id(id: ChronicleId, warden: WardenId) -> String {
     format!("taso-{hex}-w{}", warden.get())
 }
 
+/// Why a Vessel is to be purged at this TTL pass, or `None`, from what
+/// the coordinator says of it: `ended` (its purge's end is accepted) and
+/// its Chronicle `view`.  `start` reads the Vessel's TTL start and is
+/// asked only when the TTL decides.
+///
+/// A sanctioned Vessel is kept (D81).  Whether it is sanctioned is the
+/// coordinator's word (`view.sanctioned`), never the Vessel's local log:
+/// that log loses its prefix to pruning after every published Seal, and
+/// read from it a sanctioned Vessel was purged once the commit's record
+/// was pruned (audit 2026-11-09, A1; the class of review fix A2-1).
+fn ttl_reason(
+    ended: bool,
+    view: Option<&taso_core::coordlog::ChronicleView>,
+    now: u64,
+    ttl: Duration,
+    start: impl FnOnce() -> Result<u64, String>,
+) -> Result<Option<String>, String> {
+    if ended {
+        return Ok(None);
+    }
+    if view.is_some_and(|v| v.retired) {
+        return Ok(Some("committed before: finishing it".into()));
+    }
+    if view.is_some_and(|v| v.sanctioned) {
+        return Ok(None);
+    }
+    // A blocked Vessel is checked again at every pass from its TTL
+    // start: nothing is recorded while it is blocked (D85).
+    let start = start()?;
+    if now >= start.saturating_add(ttl.as_secs()) {
+        Ok(Some(format!(
+            "its TTL of {}s from {start} has passed",
+            ttl.as_secs()
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3993,39 +4032,11 @@ impl Node {
                 .map_err(|e| format!("coordinator: {e}"))?
                 .is_some())
         };
-        if accepted(LogicalKey::PurgeEnd(id))? {
-            return Ok(None);
-        }
-        if view.is_some_and(|v| v.retired) {
-            return Ok(Some("committed before: finishing it".into()));
-        }
-        let frames = crate::chronicle::read_log(&self.host().dir_for(id))
-            .map_err(|e| format!("reading its log: {e}"))?;
-        for f in &frames {
-            if let Ok(taso_core::record::Payload::Contract(r)) =
-                taso_core::record::Payload::decode(&f.payload)
-            {
-                // A sanctioned Vessel is kept (D81).
-                if let ContractRecord::SanctionCommitted(s) = *r {
-                    if accepted(LogicalKey::Sanction(s.candidate_id))? {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-        // A blocked Vessel is checked again at every pass from its TTL
-        // start: nothing is recorded while it is blocked (D85).
-        let start = self
-            .ttl_start(id)
-            .map_err(|e| format!("its TTL start: {e}"))?;
-        if now >= start.saturating_add(ttl.as_secs()) {
-            Ok(Some(format!(
-                "its TTL of {}s from {start} has passed",
-                ttl.as_secs()
-            )))
-        } else {
-            Ok(None)
-        }
+        let ended = accepted(LogicalKey::PurgeEnd(id))?;
+        ttl_reason(ended, view.as_ref(), now, ttl, || {
+            self.ttl_start(id)
+                .map_err(|e| format!("its TTL start: {e}"))
+        })
     }
 
     fn verdicts(&self) -> crate::verdict::Verdicts {
@@ -5549,6 +5560,48 @@ mod tests {
         spawner.join().unwrap();
         assert!(spawned.load(Ordering::Relaxed) >= 300);
         assert_eq!(refused, 0, "{refused} of {claims} claims refused");
+    }
+
+    /// Audit 2026-11-09, A1: the TTL pass keeps a sanctioned Vessel on the
+    /// coordinator's word.  It used to look for the commit's record in the
+    /// Vessel's local log, and purged the Vessel once pruning had removed
+    /// it.
+    #[test]
+    fn the_ttl_pass_keeps_a_sanctioned_vessel_on_the_coordinators_word() {
+        use taso_core::coordlog::{ChronicleView, Head};
+        let view = |retired, sanctioned| ChronicleView {
+            epoch: taso_core::envelope::Epoch::FIRST,
+            head: Head {
+                pos: 9,
+                digest: taso_core::envelope::HashVal::GENESIS,
+            },
+            retired,
+            sanctioned,
+            pending: None,
+            accepted: Vec::new(),
+            holds: Vec::new(),
+        };
+        let ttl = Duration::from_secs(30);
+        let long_ago = || Ok(100);
+        let never = || -> Result<u64, String> { panic!("the TTL start is not read") };
+        // Past its TTL and not sanctioned: purged.
+        let due = ttl_reason(false, Some(&view(false, false)), 1000, ttl, long_ago).unwrap();
+        assert!(due.unwrap().contains("has passed"));
+        // Sanctioned: kept, however old, and nothing local is read.
+        assert_eq!(
+            ttl_reason(false, Some(&view(false, true)), 1000, ttl, never).unwrap(),
+            None
+        );
+        // A purge committed before is finished, sanctioned or not (an
+        // operator's purge of a sanctioned Vessel is allowed).
+        let fin = ttl_reason(false, Some(&view(true, true)), 1000, ttl, never).unwrap();
+        assert!(fin.unwrap().contains("finishing"));
+        // Ended: nothing to do.  Young: not yet.
+        assert_eq!(ttl_reason(true, None, 1000, ttl, never).unwrap(), None);
+        assert_eq!(
+            ttl_reason(false, Some(&view(false, false)), 120, ttl, long_ago).unwrap(),
+            None
+        );
     }
 
     #[test]

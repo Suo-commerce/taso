@@ -31,7 +31,7 @@
 //! the other.
 //!
 //! ```text
-//! request  version 2 (1) · op (1) · fields
+//! request  version 3 (1) · op (1) · fields
 //!   1 register   chronicle (16) · holder (8)
 //!   2 append     warden (8) · envelope (137, as in a segment frame)
 //!   3 transfer   chronicle (16) · new_holder (8)
@@ -167,11 +167,12 @@ use taso_core::coordlog::{
     Answer, ChronicleView, ClaimAuthority, ClaimError, Head, SubmissionStatus, Submitted,
 };
 
-/// The protocol version every request starts with.  2 since V4b's format
-/// break (review fix N4a): an old Warden and a new coordinator, or the
-/// other way round, refuse each other at the first request, before
-/// anything is written.
-const WIRE_VERSION: u8 = 2;
+/// The protocol version every request starts with: an old Warden and a
+/// new coordinator, or the other way round, refuse each other at the
+/// first request, before anything is written.  2 since V4b's format break
+/// (review fix N4a); 3 since the Chronicle view says `sanctioned` (audit
+/// 2026-11-09, A1).
+const WIRE_VERSION: u8 = 3;
 
 const OP_REGISTER: u8 = 1;
 const OP_APPEND: u8 = 2;
@@ -659,8 +660,8 @@ impl Request {
         let mut i = In { b: body };
         if i.u8()? != WIRE_VERSION {
             return Err(Malformed(
-                "another protocol version: this coordinator speaks version 2 \
-                 (since V4b's format break; 1 is older)",
+                "another protocol version: this coordinator speaks version 3 \
+                 (since the Chronicle view says `sanctioned`; 2 and 1 are older)",
             ));
         }
         let op = i.u8()?;
@@ -2250,7 +2251,7 @@ mod tests {
             let mut extra = b.clone();
             extra.push(0);
             assert!(Request::decode(&extra).is_err(), "trailing {r:?}");
-            for other in [1, 3] {
+            for other in [1, 2, 4] {
                 let mut v = b.clone();
                 v[0] = other;
                 assert!(Request::decode(&v).is_err(), "version {other} {r:?}");
@@ -2357,7 +2358,7 @@ mod tests {
         let reply = read_frame(&mut s).unwrap().unwrap();
         assert_eq!(reply[0], ST_BAD);
         let text = String::from_utf8_lossy(&reply[1..]);
-        assert!(text.contains("speaks version 2"), "{text}");
+        assert!(text.contains("speaks version 3"), "{text}");
         assert_eq!(read_frame(&mut s).unwrap(), None, "closed");
         let after = c.ownership(chron(1)).unwrap();
         assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
