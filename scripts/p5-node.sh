@@ -415,7 +415,10 @@ report() {
 if [[ "$mode" == setup ]]; then
     step "10 report"
     mkdir -p "$DATA"
-    report | tee "$REPORT"
+    # Not through a pipe: report counts its FAIL lines in this shell, and
+    # the last line of this script exits by that count.
+    report > "$REPORT"
+    cat "$REPORT"
     echo "saved to $REPORT"
     echo
     echo "For this shell (setup's environment does not reach it; new root logins have it):"

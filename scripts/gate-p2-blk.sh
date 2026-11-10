@@ -498,8 +498,16 @@ print(next(f["turn"] for f in b["frames"] if f["lsn"] == l and f["kind"] == "sea
     fi
 done
 
-python3 - "$OUT/rounds.tsv" "$N" "$MODE" "$KILL" <<'PY' | tee "$OUT/summary.txt"
+failed=0
+python3 - "$OUT/rounds.tsv" "$N" "$MODE" "$KILL" <<'PY' | tee "$OUT/summary.txt" || failed=1
 import math, sys
+# A check line that ends in FAIL fails the gate: release-gate.sh judges
+# this script by its exit status (pipefail carries it through tee).
+failed = False
+def say(line):
+    global failed
+    failed |= line.endswith("FAIL")
+    print(line)
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if l.strip()]
 n = int(sys.argv[2]); kill = sys.argv[4]
 secs = sorted(float(r[1]) for r in rows if r[1] != "nan")
@@ -510,18 +518,20 @@ same = sum(int(r[3]) for r in rows)
 blockeq = sum(int(r[9]) for r in rows); fileeq = sum(int(r[10]) for r in rows)
 resumed = sum(1 for r in rows if r[5] not in ("none", "None"))
 print(f"P2 gate on the block log ({sys.argv[3]}), {n} rounds")
-print(f"1. reborn: {reborn}/{n}, p50 {q(secs, .5):.2f} s, p95 {q(secs, .95):.2f} s (< 30) -> {'PASS' if reborn == n and q(secs, .95) < 30 else 'FAIL'}")
-print(f"2. last common Seal identical: blocks {blockeq}/{n}, files {fileeq}/{n} -> {'PASS' if same == n else 'FAIL'}")
+say(f"1. reborn: {reborn}/{n}, p50 {q(secs, .5):.2f} s, p95 {q(secs, .95):.2f} s (< 30) -> {'PASS' if reborn == n and q(secs, .95) < 30 else 'FAIL'}")
+say(f"2. last common Seal identical: blocks {blockeq}/{n}, files {fileeq}/{n} -> {'PASS' if same == n else 'FAIL'}")
 if kill == "stop":
     refused = sum(1 for r in rows if r[2] == "1")
-    print(f"3. old Warden refused: {refused}/{n} -> {'PASS' if refused == n else 'FAIL'}")
+    say(f"3. old Warden refused: {refused}/{n} -> {'PASS' if refused == n else 'FAIL'}")
 else:
     print("3. old Warden refused: n/a (KILL=power: A was off; its return is F1/F2 territory)")
-print(f"4. agent on B resumed after a sealed turn: {resumed}/{n} -> {'PASS' if resumed == n else 'FAIL'}")
+say(f"4. agent on B resumed after a sealed turn: {resumed}/{n} -> {'PASS' if resumed == n else 'FAIL'}")
 logok = sum(int(r[6]) for r in rows)
 lossy = sum(1 for r in rows if r[7] not in ("None", "0"))
 dbok = sum(int(r[8]) for r in rows)
-print(f"5. losses reported in ctl (Gap + Unverified first Seal, against the coordinator): {logok}/{n}, {lossy} rounds lost records -> {'PASS' if logok == n else 'FAIL'}")
-print(f"6. no partial transaction at the last common Seal (integrity_check, whole turns): {dbok}/{n} -> {'PASS' if dbok == n else 'FAIL'}")
+say(f"5. losses reported in ctl (Gap + Unverified first Seal, against the coordinator): {logok}/{n}, {lossy} rounds lost records -> {'PASS' if logok == n else 'FAIL'}")
+say(f"6. no partial transaction at the last common Seal (integrity_check, whole turns): {dbok}/{n} -> {'PASS' if dbok == n else 'FAIL'}")
+sys.exit(1 if failed else 0)
 PY
 echo "results in $OUT"
+[ "$failed" = 0 ]

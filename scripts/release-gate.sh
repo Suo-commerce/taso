@@ -120,9 +120,10 @@ PY
 if [ "$TIER" = quick ]; then CRASH=10 P3N=20 P2N=20 LIMIT=45m
 else                          CRASH=100 P3N=100 P2N=100 LIMIT=4h; fi
 
-run unit     "$LIMIT" bash -c 'o=$(cargo test -q --workspace --no-fail-fast 2>&1); echo "$o" | grep -E "^test result|FAILED|panicked"; ! echo "$o" | grep -q FAILED && echo "$(echo "$o" | grep -E "^test result" | awk "{p+=\$4} END {print p}") passed"'
+run unit     "$LIMIT" scripts/gate-unit.sh
 run clippy   "$LIMIT" bash -c 'cargo clippy -q --workspace --all-targets -- -D warnings && echo clean'
 run fmt      5m       bash -c 'cargo fmt --all --check && echo clean'
+run gates    5m       scripts/gate-exit-test.sh
 run smoke    "$LIMIT" scripts/blk-smoke.sh
 run contract "$LIMIT" scripts/blk-contract.sh
 run crash    "$LIMIT" scripts/blk-crash.sh "$CRASH"

@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Tests of the gate scripts' own exit status: a gate that cannot fail checks
+# nothing.  No root, no build; run from the repository root.
+#
+#   scripts/gate-exit-test.sh
+#
+# 1. gate-unit.sh fails when cargo test fails without printing "FAILED" (a
+#    test binary killed by a signal), and when it prints FAILED; passes on a
+#    clean run.
+# 2. gate-p2-blk.sh's summary exits 1 when a check says FAIL, 0 when all pass.
+# 3. p5-node.sh's report keeps its FAIL count when its output is saved.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+T=$(mktemp -d /tmp/gate-exit-test.XXXXXX); trap 'rm -rf "$T"' EXIT
+bad=0
+check() { # check NAME WANT GOT
+    if [ "$2" = "$3" ]; then echo "ok    $1"; else echo "FAIL  $1: exit $3, expected $2"; bad=$((bad + 1)); fi
+}
+
+# 1. a cargo that prints $FAKE_OUT and exits $FAKE_RC
+mkdir "$T/bin"
+printf '#!/bin/sh\nprintf "%%s\\n" "$FAKE_OUT"\nexit "$FAKE_RC"\n' > "$T/bin/cargo"; chmod +x "$T/bin/cargo"
+unit() { FAKE_OUT=$1 FAKE_RC=$2 PATH="$T/bin:$PATH" scripts/gate-unit.sh >/dev/null 2>&1; echo $?; }
+check "unit: a clean run passes" 0 "$(unit 'test result: ok. 5 passed; 0 failed; 0 ignored' 0)"
+check "unit: a FAILED line fails" 1 "$(unit 'test result: FAILED. 4 passed; 1 failed; 0 ignored' 101)"
+check "unit: a test binary killed by a signal fails" 1 "$(unit 'test result: ok. 5 passed; 0 failed; 0 ignored
+error: test failed, to rerun pass `-p taso-blk --lib`
+  process didn'"'"'t exit successfully: (signal: 6, SIGABRT: process abort signal)' 101)"
+check "unit: a build error fails" 1 "$(unit 'error: could not compile `taso-core`' 101)"
+
+# 2. the summary of gate-p2-blk.sh, cut out of the script, over two tables
+awk "/^python3 - .*rounds.tsv.*<<'PY'/ {on=1; next} on && /^PY\$/ {exit} on" scripts/gate-p2-blk.sh > "$T/p2.py"
+row() { printf '%s\t' "$@" | sed 's/\t$/\n/'; }   # k secs refused same - resumed logok lost dbok blockeq fileeq
+{ row 1 2.0 1 1 x 3 1 0 1 1 1; row 2 2.5 1 1 x 4 1 0 1 1 1; } > "$T/good.tsv"
+{ row 1 2.0 1 1 x 3 1 0 1 1 1; row 2 2.5 1 0 x 4 1 0 1 0 0; } > "$T/bad.tsv"
+p2() { python3 "$T/p2.py" "$1" 2 stop stop >/dev/null 2>&1; echo $?; }
+check "p2: every check PASS exits 0" 0 "$(p2 "$T/good.tsv")"
+check "p2: a FAIL line exits 1" 1 "$(p2 "$T/bad.tsv")"
+
+# 3. p5-node.sh's way of saving its report: the count must reach the end
+awk '/step "10 report"/ {on=1} on && /^ *report( |$)/ {print; exit}' scripts/p5-node.sh > "$T/save.line"
+[ -s "$T/save.line" ] || { echo "FAIL  p5-node: the line that saves the report was not found"; bad=$((bad + 1)); }
+p5() { bash -c 'fail=0; REPORT='"$T"'/report.txt; report() { echo "FAIL  x"; fail=$((fail + 1)); }
+'"$(cat "$T/save.line")"' >/dev/null
+[[ $fail -eq 0 ]]' >/dev/null 2>&1; echo $?; }
+check "p5-node: setup's saved report keeps its FAIL count" 1 "$(p5)"
+
+[ "$bad" = 0 ] && echo "gate-exit-test: PASS" || { echo "gate-exit-test: $bad FAILED"; exit 1; }
