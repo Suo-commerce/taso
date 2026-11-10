@@ -67,7 +67,14 @@ pub struct Reconciled {
     pub settled: Vec<OpId>,
     /// Barrier intents still open: obligations an operator must resolve.
     pub open: Vec<OpId>,
+    /// Held proposals of a turn that did not end, withdrawn now.
+    pub withdrawn: Vec<OpId>,
 }
+
+/// The evidence of a withdrawal: a held proposal past the last Seal at a
+/// start, closed `ConfirmedNotApplied` (it was never released, so never
+/// sent).
+pub const WITHDRAWN: &str = "withdrawn: its turn was reset";
 
 // ── Publishing ──────────────────────────────────────────────────────
 
@@ -584,6 +591,10 @@ impl Ledger {
         let summary = crate::summary::Summary::of(&frames)
             .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
         self.next_op = self.next_op.max(summary.next_op);
+        let mut report = Reconciled {
+            withdrawn: self.withdraw_lost_turn(vessel, &frames, &summary)?,
+            ..Reconciled::default()
+        };
         // Held proposals are not visited: they are nobody's obligation
         // here, and only the parent may release them.
         let intents: BTreeMap<OpId, IntentRecord> = summary
@@ -595,7 +606,6 @@ impl Ledger {
             .filter_map(|e| e.state.map(|s| (e.intent.op, s)))
             .collect();
 
-        let mut report = Reconciled::default();
         for (op, i) in intents {
             let state = latest.get(&op).copied();
             if matches!(
@@ -630,6 +640,69 @@ impl Ledger {
             }
         }
         Ok(report)
+    }
+}
+
+impl Ledger {
+    /// Withdraw the held proposals of a turn that did not end.
+    ///
+    /// The ledger is opened at a start, when the Vessel's files are back
+    /// at its last Seal.  A proposal past that Seal's ledger position was
+    /// declared in a turn whose files are gone; its agent runs the turn
+    /// again and declares it again, and the next Seal would cover both, so
+    /// a promotion would adopt the action twice.  It was never released,
+    /// so nothing was sent: each is closed `ConfirmedNotApplied` with
+    /// [`WITHDRAWN`], all in one write, before the agent runs.
+    ///
+    /// Not withdrawn: what this Vessel adopted from a child it promoted
+    /// (everything recorded after a Promotion that follows the last Seal:
+    /// a promoted Vessel takes nothing more until its next start), since
+    /// that is not of a lost turn.  A Vessel with no Seal has had no
+    /// reset, and nothing is withdrawn.
+    fn withdraw_lost_turn<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        frames: &[crate::segment::Frame],
+        summary: &crate::summary::Summary,
+    ) -> Result<Vec<OpId>, VesselError> {
+        let Some(seal) = &summary.seal else {
+            return Ok(Vec::new());
+        };
+        let mut promoted_at = None;
+        for f in frames {
+            if f.envelope.stream == Stream::Ctl && f.envelope.lsn > seal.lsn {
+                let payload = Payload::decode(&f.payload).map_err(|error| VesselError::Decode {
+                    lsn: f.envelope.lsn,
+                    error,
+                })?;
+                if matches!(payload, Payload::Promotion(_)) {
+                    promoted_at = Some(f.envelope.lsn);
+                }
+            }
+        }
+        let mut lost: Vec<OpId> = summary
+            .proposals()
+            .filter(|e| e.lsn > seal.ledger_pos && promoted_at.is_none_or(|p| e.lsn < p))
+            .map(|e| e.intent.op)
+            .collect();
+        lost.sort_unstable();
+        if !lost.is_empty() {
+            vessel.append_batch(
+                lost.iter()
+                    .map(|op| {
+                        (
+                            Stream::Effect,
+                            outcome(
+                                *op,
+                                OutcomeState::ConfirmedNotApplied,
+                                Some(WITHDRAWN.as_bytes().to_vec()),
+                            ),
+                        )
+                    })
+                    .collect(),
+            )?;
+        }
+        Ok(lost)
     }
 }
 
@@ -891,7 +964,7 @@ mod tests {
             r,
             Reconciled {
                 settled: vec![OpId::new(1)],
-                open: vec![]
+                ..Reconciled::default()
             }
         );
         assert!(l.authorized());
@@ -914,8 +987,8 @@ mod tests {
         assert_eq!(
             r,
             Reconciled {
-                settled: vec![],
-                open: vec![a.op]
+                open: vec![a.op],
+                ..Reconciled::default()
             }
         );
         assert!(!l.authorized());
@@ -1071,6 +1144,119 @@ mod tests {
             vec![(1, OutcomeState::Proposed)],
             "reconcile wrote nothing about it"
         );
+    }
+
+    fn held_ops(v: &Vessel<FakeLayers>) -> Vec<u64> {
+        let frames = v.chronicle().frames().unwrap();
+        let mut ops: Vec<u64> = crate::summary::Summary::of(&frames)
+            .unwrap()
+            .proposals()
+            .map(|e| e.intent.op.get())
+            .collect();
+        ops.sort_unstable();
+        ops
+    }
+
+    fn seal_turn(v: &mut Vessel<FakeLayers>, turn: u64) {
+        let ledger_pos = v.tail().lsn;
+        v.seal(
+            taso_core::record::StreamCut::EMPTY,
+            taso_core::record::Verdict::Clean,
+            ledger_pos,
+            taso_core::record::TurnId::new(turn),
+        )
+        .unwrap();
+    }
+
+    /// A turn that did not end takes its held proposals with it (finding
+    /// 2026-11-09, SP (a)).  At a start the Vessel's files are back at
+    /// its last Seal, so every proposal past that Seal's ledger position
+    /// is of a turn the agent will run again: the open withdraws each as
+    /// not applied, with the reason, before the agent runs.  What the
+    /// Seal covers stays held.  A second open finds nothing to withdraw.
+    #[test]
+    fn a_lost_turns_proposals_are_withdrawn_at_the_next_open() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut l, _) = open(&mut v);
+        l.propose(&mut v, &declared("covered", Consequence::Irreversible))
+            .unwrap();
+        seal_turn(&mut v, 1);
+        l.propose(&mut v, &declared("lost 1", Consequence::Irreversible))
+            .unwrap();
+        l.propose(&mut v, &declared("lost 2", Consequence::Irreversible))
+            .unwrap();
+        assert_eq!(held_ops(&v), vec![1, 2, 3]);
+        drop((l, v));
+
+        let mut v = vessel(&e);
+        let (l, r) = Ledger::open(Box::new(AlwaysPublish), &mut v, no_settle).unwrap();
+        assert_eq!(r.withdrawn, vec![OpId::new(2), OpId::new(3)]);
+        assert!(r.settled.is_empty() && r.open.is_empty());
+        assert_eq!(held_ops(&v), vec![1], "what the Seal covers stays held");
+        let withdrawals: Vec<OutcomeRecord> = records(&v)
+            .into_iter()
+            .filter_map(|p| match p {
+                Payload::Outcome(o) if o.state == OutcomeState::ConfirmedNotApplied => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(withdrawals.len(), 2);
+        assert!(withdrawals
+            .iter()
+            .all(|o| o.evidence.as_deref() == Some(WITHDRAWN.as_bytes())));
+        assert!(l.authorized(), "a withdrawal withholds nothing");
+        assert_eq!(l.next_op(), OpId::new(4), "no op id is used again");
+        drop((l, v));
+
+        let mut v = vessel(&e);
+        let (_, r) = Ledger::open(Box::new(AlwaysPublish), &mut v, no_settle).unwrap();
+        assert_eq!(r, Reconciled::default(), "nothing left to withdraw");
+        assert_eq!(held_ops(&v), vec![1]);
+    }
+
+    /// What a holding Vessel adopted from a child it promoted is not of a
+    /// lost turn: it was recorded after the Promotion and stays held
+    /// across a start, even when the Warden died before the adoption
+    /// Seal.  The promoting turn's own proposal, declared before the
+    /// Promotion in a turn that never ends (the child's files replace
+    /// it), is withdrawn like any other (W-b (i)).
+    #[test]
+    fn adopted_proposals_stay_and_the_promoting_turns_own_are_withdrawn() {
+        use crate::vessel::SealAt;
+        let e = env();
+        let mut p = vessel(&e);
+        seal_turn(&mut p, 1);
+        // The child: two proposals, sealed.
+        let mut c = e.host.fork_from_log(p.id(), SealAt::Last, b"c").unwrap();
+        c.seal_birth().unwrap();
+        let (mut cl, _) = open(&mut c);
+        for k in ["c 1", "c 2"] {
+            cl.propose(&mut c, &declared(k, Consequence::Irreversible))
+                .unwrap();
+        }
+        seal_turn(&mut c, 2);
+        let cid = c.id();
+        drop((cl, c));
+
+        // The parent holds: its own proposal, then the promotion and the
+        // adoption, held again.  No Seal follows: the Warden dies here.
+        let (mut l, _) = open(&mut p);
+        l.propose(&mut p, &declared("own", Consequence::Irreversible))
+            .unwrap();
+        let log = e.host.read_log_of(cid).unwrap();
+        let (record, proposals) = p.promote(&log, SealAt::Last).unwrap();
+        let intents: Vec<IntentRecord> = proposals.into_iter().map(|e| e.intent).collect();
+        let adopted = l.adopt(&mut p, cid, record.seal, &intents, true).unwrap();
+        let adopted: Vec<u64> = adopted.iter().map(|a| a.op.get()).collect();
+        assert_eq!(adopted, vec![2, 3]);
+        assert_eq!(held_ops(&p), vec![1, 2, 3]);
+        drop((l, p));
+
+        let mut p = vessel(&e);
+        let (_, r) = Ledger::open(Box::new(AlwaysPublish), &mut p, no_settle).unwrap();
+        assert_eq!(r.withdrawn, vec![OpId::new(1)], "the promoting turn's own");
+        assert_eq!(held_ops(&p), adopted, "the adoption stays held");
     }
 
     /// Adopting a proposal releases a copy as this Vessel's own: a new op

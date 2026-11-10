@@ -170,6 +170,26 @@ This property is verified by the no-trace gate
 (`scripts/p3-no-trace.sh`): N forks, one promoted, the parent's
 released effects are exactly that child's — and only that child's.
 
+A turn that does not end takes its held effects with it.  If a Warden
+stops between an agent's effect and its `TurnEnd`, the Vessel's files
+are back at its last Seal when the next Warden starts it, and the agent
+runs that turn again.  The proposals the lost turn left in the Chronicle
+were never released, so nothing was sent.  Before the agent runs, the
+Warden closes each of them as not applied, with the evidence
+`withdrawn: its turn was reset`, and names them in its start line
+(`effects (Hold) reconciled: ... withdrawn: [...]`).  A promotion then
+adopts what the turn declared when it ran to its end, once.  An agent
+asking `Result { op }` for a withdrawn op is told it was not applied.
+What a Vessel adopted from a child it promoted is not withdrawn; a
+proposal the promoting Vessel declared itself, earlier in the turn in
+which it promoted, is (that turn never ends: the child's files replace
+it).  The gate's fourth check kills a child's Warden between its
+effects and its `TurnEnd` in every round.
+
+A released effect is different: a Vessel that dispatches keeps the
+released effects of a lost turn, because one may already have been
+sent.  They stay on `Open` as before.
+
 The agent may ask for forks and the promotion itself, over the Field
 (`Fork { seal }`, `Promote { child, seal }`; decision D1).  These are
 requests: the Warden picks the child's uid slot from the Vessel's
