@@ -1847,33 +1847,33 @@ mod tests {
             Ok(self.store.seal_tagged(branch, tag)?)
         }
         fn find(&mut self, name: &str) -> Result<Option<LayerId>, LayerError> {
-            Ok(self.store.find(name))
+            Ok(self.store.find(name)?)
         }
         fn seals(&mut self, branch: LayerId) -> Result<Vec<(LayerId, Vec<u8>)>, LayerError> {
             Ok(self
                 .store
-                .seals_of(branch)
+                .seals_of(branch)?
                 .into_iter()
-                .map(|l| (l, self.store.tag(l).unwrap().to_vec()))
+                .map(|l| (l, self.store.tag(l).unwrap().unwrap().to_vec()))
                 .collect())
         }
         fn info(&mut self, l: LayerId) -> Result<Info, LayerError> {
-            let kind = self.store.map().kind(l)?;
+            let kind = self.store.map()?.kind(l)?;
             Ok(Info {
                 kind: if kind == Kind::Branch {
                     LayerKind::Branch
                 } else {
                     LayerKind::Seal
                 },
-                parent: self.store.map().parent(l)?,
-                name: self.store.name_of(l).map(str::to_string),
-                tag: self.store.tag(l).map(<[u8]>::to_vec),
-                origin: self.store.origin(l),
+                parent: self.store.map()?.parent(l)?,
+                name: self.store.name_of(l)?.map(str::to_string),
+                tag: self.store.tag(l)?.map(<[u8]>::to_vec),
+                origin: self.store.origin(l)?,
                 dev: self.devs.get(&l).cloned(),
             })
         }
         fn drop_layer(&mut self, l: LayerId) -> Result<(), LayerError> {
-            if self.store.map().kind(l)? == Kind::Branch {
+            if self.store.map()?.kind(l)? == Kind::Branch {
                 self.devs.remove(&l);
                 self.store.drop_branch(l)?;
             } else {
@@ -1918,7 +1918,7 @@ mod tests {
             Ok(self.store.import(branch, &mut std::fs::File::open(path)?)?)
         }
         fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError> {
-            let mut n = self.store.names();
+            let mut n = self.store.names()?;
             n.extend(self.ghosts.iter().cloned());
             Ok(n)
         }
@@ -3197,7 +3197,7 @@ mod tests {
     /// The bytes of block 0 of the dataset's branch, through the store.
     fn block0(p: &TestPool, a: &Dataset) -> u8 {
         let d = p.blkd.lock().unwrap();
-        let b = d.store.find(a.as_str()).unwrap();
+        let b = d.store.find(a.as_str()).unwrap().unwrap();
         let mut buf = vec![0u8; 4096];
         d.store.read(b, 0, &mut buf).unwrap();
         buf[0]
@@ -3205,7 +3205,7 @@ mod tests {
 
     fn write0(p: &TestPool, a: &Dataset, v: u8) {
         let mut d = p.blkd.lock().unwrap();
-        let b = d.store.find(a.as_str()).unwrap();
+        let b = d.store.find(a.as_str()).unwrap().unwrap();
         d.store.write(b, 0, &[v; 4096], false).unwrap();
     }
 

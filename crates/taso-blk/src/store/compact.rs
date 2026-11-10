@@ -340,7 +340,7 @@ impl Compaction {
             && fresh.lsn == store.lsn
             && fresh.tail == self.tail
             && fresh.map.layers() == store.map.layers()
-            && fresh.names() == store.names()
+            && fresh.names()? == store.names()?
             && fresh.meta.seals.len() == store.meta.seals.len();
         if !agrees {
             return Err(StoreError::Io(io::Error::other(format!(

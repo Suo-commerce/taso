@@ -980,13 +980,15 @@ enum Quit {
 
 impl Daemon {
     fn command(&self, words: &[&str]) -> Result<String, String> {
-        let layer = |i: usize| -> Result<LayerId, String> {
+        let number = |i: usize| -> Result<u64, String> {
             let w = words.get(i).ok_or("missing layer id")?;
-            let n: u64 = w
-                .trim_start_matches('L')
+            w.trim_start_matches('L')
                 .parse()
-                .map_err(|_| format!("bad layer id {w}"))?;
-            self.find(n).ok_or_else(|| format!("no layer L{n}"))
+                .map_err(|_| format!("bad layer id {w}"))
+        };
+        let layer = |i: usize| -> Result<LayerId, String> {
+            let n = number(i)?;
+            self.find(n)?.ok_or_else(|| format!("no layer L{n}"))
         };
         let store_err = |e: taso_blk::store::StoreError| e.to_string();
         match words[0] {
@@ -1022,7 +1024,11 @@ impl Daemon {
             }
             "find" => {
                 let name = words.get(1).ok_or("missing name")?;
-                let found = lock_store(&self.store, Site::Find).find(name);
+                // A poisoned store refuses (audit 2026-11-09, poisoned
+                // reads): its names may be ahead of the log.
+                let found = lock_store(&self.store, Site::Find)
+                    .find(name)
+                    .map_err(store_err)?;
                 found
                     .map(|b| b.to_string())
                     .ok_or_else(|| format!("no branch named {name}"))
@@ -1030,11 +1036,11 @@ impl Daemon {
             "seals" => {
                 let branch = layer(1)?;
                 let s = lock_store(&self.store, Site::Seals);
-                let list: Vec<String> = s
-                    .seals_of(branch)
-                    .into_iter()
-                    .map(|l| format!("{l}:{}", hex(s.tag(l).unwrap_or(&[]))))
-                    .collect();
+                let mut list: Vec<String> = Vec::new();
+                for l in s.seals_of(branch).map_err(store_err)? {
+                    let tag = s.tag(l).map_err(store_err)?;
+                    list.push(format!("{l}:{}", hex(tag.unwrap_or(&[]))));
+                }
                 Ok(list.join(" "))
             }
             "info" => {
@@ -1144,7 +1150,9 @@ impl Daemon {
                 Ok(compacted(&self.compact()?))
             }
             "names" => {
-                let names = lock_store(&self.store, Site::Names).names();
+                let names = lock_store(&self.store, Site::Names)
+                    .names()
+                    .map_err(store_err)?;
                 Ok(names
                     .into_iter()
                     .map(|(n, b)| format!("{n}:{b}"))
@@ -1152,7 +1160,15 @@ impl Daemon {
                     .join(" "))
             }
             "detach" => {
-                self.detach(layer(1)?)?;
+                // A device can still be detached from a poisoned store:
+                // the store then refuses to name a layer (audit
+                // 2026-11-09, poisoned reads), but the device table names
+                // every attached branch, and a detach needs nothing else.
+                let branch = match layer(1) {
+                    Ok(b) => b,
+                    Err(e) => self.attached(number(1)?).ok_or(e)?,
+                };
+                self.detach(branch)?;
                 Ok(String::new())
             }
             "drop" => {
@@ -1201,8 +1217,14 @@ impl Daemon {
             _ => None,
         };
         let s = lock_store(&self.store, Site::Info);
-        let kind = s.map().kind(l).map_err(|e| e.to_string())?;
-        let parent = s.map().parent(l).map_err(|e| e.to_string())?;
+        // A poisoned store refuses all of these (audit 2026-11-09,
+        // poisoned reads), and so does this answer.
+        let map = s.map().map_err(|e| e.to_string())?;
+        let kind = map.kind(l).map_err(|e| e.to_string())?;
+        let parent = map.parent(l).map_err(|e| e.to_string())?;
+        let name = s.name_of(l).map_err(|e| e.to_string())?;
+        let tag = s.tag(l).map_err(|e| e.to_string())?;
+        let origin = s.origin(l).map_err(|e| e.to_string())?;
         let or_dash = |o: Option<String>| o.unwrap_or_else(|| "-".to_string());
         Ok(format!(
             "kind={} parent={} name={} tag={} origin={} dev={}",
@@ -1212,9 +1234,9 @@ impl Daemon {
                 "seal"
             },
             or_dash(parent.map(|p| p.to_string())),
-            or_dash(s.name_of(l).map(str::to_string)),
-            or_dash(s.tag(l).map(hex)),
-            or_dash(s.origin(l).map(|o| o.to_string())),
+            or_dash(name.map(str::to_string)),
+            or_dash(tag.map(hex)),
+            or_dash(origin.map(|o| o.to_string())),
             or_dash(dev),
         ))
     }
@@ -1280,9 +1302,20 @@ impl Daemon {
         Ok(done)
     }
 
-    /// The live layer with id number `n`, if any.
-    fn find(&self, n: u64) -> Option<LayerId> {
-        lock_store(&self.store, Site::Resolve).map().live(n)
+    /// The live layer with id number `n`, if any.  An error if the store
+    /// is poisoned: its map may be ahead of the log, so it names no layer
+    /// (audit 2026-11-09, poisoned reads).
+    fn find(&self, n: u64) -> Result<Option<LayerId>, String> {
+        Ok(lock_store(&self.store, Site::Resolve)
+            .map()
+            .map_err(|e| e.to_string())?
+            .live(n))
+    }
+
+    /// The branch with id number `n` in the device table, if any: asked
+    /// without the store.
+    fn attached(&self, n: u64) -> Option<LayerId> {
+        lock(&self.devices).keys().find(|l| l.get() == n).copied()
     }
 
     /// Drop a layer: a branch's device is detached first (`kill` stops it;
@@ -1299,6 +1332,7 @@ impl Daemon {
     ) -> Result<(), String> {
         let kind = lock_store(&self.store, Site::DropKind)
             .map()
+            .map_err(|e| e.to_string())?
             .kind(l)
             .map_err(|e| e.to_string())?;
         if kind != Kind::Branch {
@@ -1331,6 +1365,7 @@ impl Daemon {
             let mut devices = lock(&self.devices);
             if lock_store(&self.store, Site::AttachKind)
                 .map()
+                .map_err(|e| e.to_string())?
                 .kind(branch)
                 .map_err(|e| e.to_string())?
                 != Kind::Branch
@@ -1571,6 +1606,15 @@ impl Daemon {
         // (the store's and the Syncer's; P5 bite 3).
         // lock=SITE:COUNT:TOTAL_US:MAX_US,... -- every hold of the store's
         // lock by site, the sites that held it at least once (bite 5).
+        // layers=? once the store is poisoned: it refuses its map then
+        // (the map may be ahead of the log; audit 2026-11-09, poisoned
+        // reads), and the operator still needs the rest of this line, so
+        // the count is shown as unknown, as threads= and rss_kib= are
+        // when they cannot be read.
+        let layers = match s.map() {
+            Ok(map) => map.layers().to_string(),
+            Err(_) => "?".to_string(),
+        };
         let (sync_us, sync_max_us) = self.sync.sync_time();
         let held = *lock(&HELD);
         let lock_line = SITES
@@ -1587,7 +1631,7 @@ impl Daemon {
             st.records,
             st.syncs + self.sync.syncs(),
             s.lsn(),
-            s.map().layers(),
+            layers,
             devices,
             field("Threads:"),
             field("VmRSS:"),
@@ -2171,8 +2215,47 @@ mod detach_test {
         assert!(matches!(hold_exclusively_at("/dev/ublkb-none"), Ok(None)));
     }
 
+    /// Audit 2026-11-09, a poisoned store still answered `find`, `seals`,
+    /// `names` and `info` from a map that may be ahead of its log, so the
+    /// Warden could be told of a name or a layer that a restart would not
+    /// have.
+    #[test]
+    fn a_poisoned_store_answers_err_to_find_seals_names_and_info() {
+        let (_dir, d, branch, stop) = daemon_with_a_running_branch();
+        let l = branch.to_string();
+        d.command(&["name", &l, "tank/a"]).unwrap();
+        d.command(&["seal", &l]).unwrap();
+        for words in [
+            &["find", "tank/a"][..],
+            &["seals", &l],
+            &["names"],
+            &["info", &l],
+        ] {
+            d.command(words).unwrap();
+        }
+        assert!(!d.stats().contains("layers=?"), "{}", d.stats());
+        lock_store(&d.store, Site::Poisoned).poison();
+        for words in [
+            &["find", "tank/a"][..],
+            &["seals", &l],
+            &["names"],
+            &["info", &l],
+            &["branch", &l, "tank/b"],
+        ] {
+            let e = d.command(words).unwrap_err();
+            assert!(e.contains("reopen the store"), "{words:?}: {e}");
+        }
+        // The operator's line still comes, with the layer count unknown.
+        assert!(d.stats().contains(" layers=? "), "{}", d.stats());
+        // And the device can still be detached: the device table names it.
+        assert_eq!(d.attached(branch.get()), Some(branch));
+        stop.store(true, Ordering::Relaxed);
+        d.detach_with(branch, |_| Ok(())).unwrap();
+        assert_eq!(d.attached(branch.get()), None);
+    }
+
     fn alive(d: &Daemon, l: LayerId) -> bool {
-        d.store.lock().unwrap().map().kind(l).is_ok()
+        d.store.lock().unwrap().map().unwrap().kind(l).is_ok()
     }
 
     /// Review fix H2 (Kimi's H2): a drop whose detach fails leaves the

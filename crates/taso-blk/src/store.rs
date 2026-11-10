@@ -547,9 +547,13 @@ impl Store {
         ))
     }
 
-    /// The map (read-only): layers, kinds, deltas.
-    pub fn map(&self) -> &Map {
-        &self.map
+    /// The map (read-only): layers, kinds, deltas.  Refused once the
+    /// store is poisoned, as every read below is: the map may then be
+    /// ahead of the file, and an answer from it could name a layer whose
+    /// record never reached the log (audit 2026-11-09, poisoned reads).
+    pub fn map(&self) -> Result<&Map, StoreError> {
+        self.check()?;
+        Ok(&self.map)
     }
 
     /// Where the log lives.
@@ -792,24 +796,28 @@ impl Store {
 
     /// The tag of a live Seal (empty if it has none); `None` if `seal` is
     /// not a live Seal.
-    pub fn tag(&self, seal: LayerId) -> Option<&[u8]> {
-        self.meta.seals.get(&seal).map(|i| i.tag.as_slice())
+    pub fn tag(&self, seal: LayerId) -> Result<Option<&[u8]>, StoreError> {
+        self.check()?;
+        Ok(self.meta.seals.get(&seal).map(|i| i.tag.as_slice()))
     }
 
     /// The branch a live Seal was made from; `None` for a root Seal or if
     /// `seal` is not a live Seal.
-    pub fn origin(&self, seal: LayerId) -> Option<LayerId> {
-        self.meta.seals.get(&seal).and_then(|i| i.origin)
+    pub fn origin(&self, seal: LayerId) -> Result<Option<LayerId>, StoreError> {
+        self.check()?;
+        Ok(self.meta.seals.get(&seal).and_then(|i| i.origin))
     }
 
     /// The live Seals made from `branch`, oldest first.
-    pub fn seals_of(&self, branch: LayerId) -> Vec<LayerId> {
-        self.meta
+    pub fn seals_of(&self, branch: LayerId) -> Result<Vec<LayerId>, StoreError> {
+        self.check()?;
+        Ok(self
+            .meta
             .seals
             .iter()
             .filter(|(_, i)| i.origin == Some(branch))
             .map(|(id, _)| *id)
-            .collect()
+            .collect())
     }
 
     /// Give `branch` the name `name`, or take its name away (`name` empty).
@@ -840,6 +848,7 @@ impl Store {
     /// Whether `name` could be given to a new branch: valid and not taken.
     /// Changes nothing.
     pub fn check_name(&self, name: &str) -> Result<(), StoreError> {
+        self.check()?;
         if !valid_name(name) {
             return Err(StoreError::BadName(name.to_string()));
         }
@@ -850,13 +859,15 @@ impl Store {
     }
 
     /// The live branch named `name`.
-    pub fn find(&self, name: &str) -> Option<LayerId> {
-        self.meta.names.get(name).copied()
+    pub fn find(&self, name: &str) -> Result<Option<LayerId>, StoreError> {
+        self.check()?;
+        Ok(self.meta.names.get(name).copied())
     }
 
     /// The name of `branch`, if it has one.
-    pub fn name_of(&self, branch: LayerId) -> Option<&str> {
-        self.meta.by_layer.get(&branch).map(String::as_str)
+    pub fn name_of(&self, branch: LayerId) -> Result<Option<&str>, StoreError> {
+        self.check()?;
+        Ok(self.meta.by_layer.get(&branch).map(String::as_str))
     }
 
     /// Drop a branch; its blocks become garbage.
@@ -1090,7 +1101,8 @@ impl Store {
     }
 
     /// Every live branch name, with its branch, in name order.
-    pub fn names(&self) -> Vec<(String, LayerId)> {
+    pub fn names(&self) -> Result<Vec<(String, LayerId)>, StoreError> {
+        self.check()?;
         let mut v: Vec<(String, LayerId)> = self
             .meta
             .names
@@ -1098,7 +1110,7 @@ impl Store {
             .map(|(n, b)| (n.clone(), *b))
             .collect();
         v.sort();
-        v
+        Ok(v)
     }
 
     /// Drop a Seal nothing stands on; its blocks become garbage.
@@ -1997,6 +2009,45 @@ mod tests {
         );
     }
 
+    /// Audit 2026-11-09, a poisoned store still answered its read
+    /// accessors (`find`, `names`, `name_of`, `seals_of`, `tag`, `origin`,
+    /// `map`) from a map that may be ahead of the file: here it found a
+    /// name whose record never reached the log.
+    #[test]
+    fn a_poisoned_store_does_not_answer_from_a_map_ahead_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        let seal = s.seal_tagged(b, b"tag").unwrap();
+        s.flush().unwrap();
+        // The next append fails: the file handle cannot be written.
+        s.file = File::open(&path).unwrap();
+        assert!(s.name(b, "ghost").is_err(), "the append fails");
+        assert!(s.is_poisoned());
+        // The mutating and data calls do fail.
+        assert!(matches!(s.flush(), Err(StoreError::Poisoned)));
+        let mut buf = vec![0u8; B];
+        assert!(matches!(s.read(b, 0, &mut buf), Err(StoreError::Poisoned)));
+        // So do the reads of the map, the names, the tags and the origins.
+        assert!(matches!(s.find("ghost"), Err(StoreError::Poisoned)));
+        assert!(matches!(s.names(), Err(StoreError::Poisoned)));
+        assert!(matches!(s.name_of(b), Err(StoreError::Poisoned)));
+        assert!(matches!(s.seals_of(b), Err(StoreError::Poisoned)));
+        assert!(matches!(s.tag(seal), Err(StoreError::Poisoned)));
+        assert!(matches!(s.origin(seal), Err(StoreError::Poisoned)));
+        assert!(matches!(s.map(), Err(StoreError::Poisoned)));
+        assert!(matches!(s.check_name("free"), Err(StoreError::Poisoned)));
+        // Reopened, the store answers again, from the log: the name whose
+        // record never reached it is not there.
+        drop(s);
+        let (s2, _) = Store::open(&path).unwrap();
+        assert_eq!(s2.find("ghost").unwrap(), None);
+        assert_eq!(s2.name_of(b).unwrap(), None);
+        assert_eq!(s2.seals_of(b).unwrap(), vec![seal]);
+    }
+
     /// Review fix H1 (Kimi's H1): a read whose range passes the last LBA
     /// is refused before any block; it used to wrap (optimized: the second
     /// block returned LBA 0's data; debug: a panic).
@@ -2073,7 +2124,7 @@ mod tests {
             b = s.fork(root).unwrap();
             s.write(b, 1, &blocks(1, 1), false).unwrap();
             s2 = s.seal(b).unwrap();
-            seal_lsn = s.map().kind(s2).unwrap();
+            seal_lsn = s.map().unwrap().kind(s2).unwrap();
             s.write(b, 1, &blocks(2, 1), false).unwrap();
             s.write(b, 2, &blocks(3, 1), false).unwrap();
             s.discard(b, 2, 1).unwrap();
@@ -2084,9 +2135,9 @@ mod tests {
         assert_eq!(rec.groups, 3, "root, seal, and the explicit flush");
         // root, flush, fork, write, seal: the Seal is record 5, before and after.
         assert_eq!(seal_lsn, Kind::Seal { lsn: 5 });
-        assert_eq!(s.map().kind(s2).unwrap(), seal_lsn);
+        assert_eq!(s.map().unwrap().kind(s2).unwrap(), seal_lsn);
         assert_eq!(
-            s.map().parent(b).unwrap(),
+            s.map().unwrap().parent(b).unwrap(),
             Some(s2),
             "same ids after replay"
         );
@@ -2293,20 +2344,28 @@ mod tests {
             s.flush().unwrap();
         }
         let (s, _) = Store::open(&path).unwrap();
-        assert_eq!(s.find("tank/taso/vessel-a"), Some(a));
-        assert_eq!(s.find("tank/taso/vessel-b"), Some(b));
-        assert_eq!(s.name_of(a), Some("tank/taso/vessel-a"));
-        assert_eq!(s.tag(s1), Some(&b"lsn=7 hash=aa"[..]));
-        assert_eq!(s.tag(s2), Some(&[0xff; MAX_TAG][..]));
-        assert_eq!(s.tag(s3), Some(&b""[..]));
-        assert_eq!(s.tag(root), Some(&b""[..]));
+        assert_eq!(s.find("tank/taso/vessel-a").unwrap(), Some(a));
+        assert_eq!(s.find("tank/taso/vessel-b").unwrap(), Some(b));
+        assert_eq!(s.name_of(a).unwrap(), Some("tank/taso/vessel-a"));
+        assert_eq!(s.tag(s1).unwrap(), Some(&b"lsn=7 hash=aa"[..]));
+        assert_eq!(s.tag(s2).unwrap(), Some(&[0xff; MAX_TAG][..]));
+        assert_eq!(s.tag(s3).unwrap(), Some(&b""[..]));
+        assert_eq!(s.tag(root).unwrap(), Some(&b""[..]));
         assert_eq!(
-            (s.origin(s1), s.origin(s3), s.origin(root)),
+            (
+                s.origin(s1).unwrap(),
+                s.origin(s3).unwrap(),
+                s.origin(root).unwrap()
+            ),
             (Some(a), Some(b), None)
         );
-        assert_eq!(s.seals_of(a), vec![s1, s2], "a's own Seals, oldest first");
         assert_eq!(
-            s.seals_of(b),
+            s.seals_of(a).unwrap(),
+            vec![s1, s2],
+            "a's own Seals, oldest first"
+        );
+        assert_eq!(
+            s.seals_of(b).unwrap(),
             vec![s3],
             "b's own Seals only, not the one it was forked from"
         );
@@ -2350,12 +2409,15 @@ mod tests {
         s.check_name("a-").unwrap();
         s.name(a, "x").unwrap(); // naming again with the same name is fine
         s.name(a, "y").unwrap(); // renaming frees the old name
-        assert_eq!((s.find("x"), s.find("y")), (None, Some(a)));
+        assert_eq!(
+            (s.find("x").unwrap(), s.find("y").unwrap()),
+            (None, Some(a))
+        );
         s.name(b, "x").unwrap();
         s.name(b, "").unwrap(); // taking the name away
-        assert_eq!((s.find("x"), s.name_of(b)), (None, None));
+        assert_eq!((s.find("x").unwrap(), s.name_of(b).unwrap()), (None, None));
         s.drop_branch(a).unwrap(); // dropping frees the name
-        assert_eq!(s.find("y"), None);
+        assert_eq!(s.find("y").unwrap(), None);
         let c = s.fork(root).unwrap();
         s.name(c, "y").unwrap();
         let sc = s.seal(c).unwrap();
@@ -2363,14 +2425,25 @@ mod tests {
         s.drop_branch(c).unwrap();
         s.drop_seal(sc).unwrap();
         assert_eq!(
-            (s.tag(sc), s.origin(sc), s.seals_of(c)),
+            (
+                s.tag(sc).unwrap(),
+                s.origin(sc).unwrap(),
+                s.seals_of(c).unwrap()
+            ),
             (None, None, vec![])
         );
         s.flush().unwrap();
         let path = s.path().to_path_buf();
         drop(s);
         let (s, _) = Store::open(&path).unwrap();
-        assert_eq!((s.find("x"), s.find("y"), s.name_of(b)), (None, None, None));
+        assert_eq!(
+            (
+                s.find("x").unwrap(),
+                s.find("y").unwrap(),
+                s.name_of(b).unwrap()
+            ),
+            (None, None, None)
+        );
     }
 
     #[test]
@@ -2411,8 +2484,11 @@ mod tests {
             (1, 0),
             "the reset survives a reopen"
         );
-        assert_eq!((s.find("tank/v-a"), s.seals_of(a)), (Some(a), vec![s1]));
-        assert_eq!(s.map().parent(a).unwrap(), Some(s1));
+        assert_eq!(
+            (s.find("tank/v-a").unwrap(), s.seals_of(a).unwrap()),
+            (Some(a), vec![s1])
+        );
+        assert_eq!(s.map().unwrap().parent(a).unwrap(), Some(s1));
     }
 
     #[test]
@@ -2446,7 +2522,11 @@ mod tests {
                 (1, 1, 0),
                 "reads as s1"
             );
-            assert_eq!(s.seals_of(a), vec![s1], "the orphan is no Seal of it");
+            assert_eq!(
+                s.seals_of(a).unwrap(),
+                vec![s1],
+                "the orphan is no Seal of it"
+            );
             s.flush().unwrap();
         }
         let (s, _) = Store::open(&path).unwrap();
@@ -2455,9 +2535,12 @@ mod tests {
             (1, 0),
             "the unseal survives a reopen"
         );
-        assert_eq!((s.find("tank/v-a"), s.seals_of(a)), (Some(a), vec![s1]));
-        assert_eq!(s.map().parent(a).unwrap(), Some(s1));
-        assert!(s.map().kind(orphan).is_err());
+        assert_eq!(
+            (s.find("tank/v-a").unwrap(), s.seals_of(a).unwrap()),
+            (Some(a), vec![s1])
+        );
+        assert_eq!(s.map().unwrap().parent(a).unwrap(), Some(s1));
+        assert!(s.map().unwrap().kind(orphan).is_err());
     }
 
     /// Every block `0..span` of `layer`, one byte each (blocks are filled
@@ -2673,7 +2756,7 @@ mod tests {
         let mut b = Store::create(&dir.path().join("b")).unwrap();
         let rb = b.root_seal().unwrap();
         let vb = b.fork(rb).unwrap();
-        let clean = |b: &Store| b.map().delta(vb).unwrap().next().is_none();
+        let clean = |b: &Store| b.map().unwrap().delta(vb).unwrap().next().is_none();
         let mut tried = 0;
         // Cut at every length short of whole.
         for len in 0..good.len() {
@@ -2721,7 +2804,7 @@ mod tests {
         s.name(y, "tank/b").unwrap();
         s.name(x, "tank/a").unwrap();
         assert_eq!(
-            s.names(),
+            s.names().unwrap(),
             vec![("tank/a".to_string(), x), ("tank/b".to_string(), y)]
         );
     }
@@ -2758,7 +2841,7 @@ mod tests {
         let path = dir.path().join("log");
         let (s, layers, at) = busy_store(&path);
         let want = snapshot(&s, &layers, 9);
-        let (stats, names) = (s.stats(), s.names());
+        let (stats, names) = (s.stats(), s.names().unwrap());
         drop(s);
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!(rec.checkpoint, Some(at));
@@ -2775,8 +2858,8 @@ mod tests {
             ),
             (stats.log_bytes, stats.garbage_bytes, stats.records)
         );
-        assert_eq!(s.names(), names);
-        assert_eq!(s.seals_of(layers[1]), vec![layers[2], layers[4]]);
+        assert_eq!(s.names().unwrap(), names);
+        assert_eq!(s.seals_of(layers[1]).unwrap(), vec![layers[2], layers[4]]);
         drop(s);
         // The same as a full replay.
         std::fs::remove_file(ckpt_path(&path)).unwrap();
@@ -2841,7 +2924,10 @@ mod tests {
         }
         let (s, rec) = Store::open(&path).unwrap();
         assert!(rec.cut > 0);
-        assert_eq!((s.find("kept"), s.find("lost")), (Some(a), None));
+        assert_eq!(
+            (s.find("kept").unwrap(), s.find("lost").unwrap()),
+            (Some(a), None)
+        );
     }
 
     #[test]
@@ -2889,7 +2975,7 @@ mod tests {
         s.drop_branch(b).unwrap(); // blocks 0 and 5 freed
         assert_eq!(s.stats().garbage_bytes, 4 * BLOCK);
         s.drop_seal(root).unwrap();
-        assert_eq!(s.map().layers(), 0);
+        assert_eq!(s.map().unwrap().layers(), 0);
     }
 
     // ── crash injection ─────────────────────────────────────────────
@@ -2906,9 +2992,14 @@ mod tests {
     fn snapshot(s: &Store, layers: &[LayerId], span: u64) -> Snapshot {
         layers
             .iter()
-            .filter(|l| s.map().kind(**l).is_ok())
+            .filter(|l| s.map().unwrap().kind(**l).is_ok())
             .map(|l| {
-                let meta = format!("{:?} {:?} {:?}", s.name_of(*l), s.tag(*l), s.origin(*l));
+                let meta = format!(
+                    "{:?} {:?} {:?}",
+                    s.name_of(*l).unwrap(),
+                    s.tag(*l).unwrap(),
+                    s.origin(*l).unwrap()
+                );
                 (*l, ((0..span).map(|b| read1(s, *l, b)).collect(), meta))
             })
             .collect()
@@ -3115,8 +3206,13 @@ mod tests {
     type Whole = (Snapshot, Vec<(String, LayerId)>, Vec<Vec<LayerId>>, usize);
 
     fn whole(s: &Store, layers: &[LayerId]) -> Whole {
-        let seals = layers.iter().map(|l| s.seals_of(*l)).collect();
-        (snapshot(s, layers, 9), s.names(), seals, s.map().layers())
+        let seals = layers.iter().map(|l| s.seals_of(*l).unwrap()).collect();
+        (
+            snapshot(s, layers, 9),
+            s.names().unwrap(),
+            seals,
+            s.map().unwrap().layers(),
+        )
     }
 
     fn compact(s: &mut Store) -> Compacted {
@@ -3285,7 +3381,7 @@ mod tests {
         assert_eq!(s.stats().garbage_bytes, 0);
         assert!(done.after < before.log_bytes / 4, "{done:?}");
         // Live: a has 3 (0..3) + 7; b has 6; the Seals 1 and 3 blocks.
-        assert_eq!(done.live, s.map().log_locs().len() as u64 * BLOCK);
+        assert_eq!(done.live, s.map().unwrap().log_locs().len() as u64 * BLOCK);
         assert_eq!(std::fs::read(&path).unwrap()[..8], *COMPACT_MAGIC);
         assert!(!compact::temp_path(&path).exists());
 
@@ -3339,8 +3435,8 @@ mod tests {
         let done = c.finish(&mut s).unwrap();
         assert!(done.records > 0);
         assert_eq!(whole(&s, &layers), want);
-        assert_eq!(s.tag(seal), Some(&b"three"[..]));
-        assert_eq!(s.find("tank/e"), Some(e));
+        assert_eq!(s.tag(seal).unwrap(), Some(&b"three"[..]));
+        assert_eq!(s.find("tank/e").unwrap(), Some(e));
         drop(s);
         let (s, _) = Store::open(&path).unwrap();
         assert_eq!(
