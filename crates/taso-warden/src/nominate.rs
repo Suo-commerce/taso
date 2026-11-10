@@ -948,8 +948,16 @@ fn dropped_counts(input: &Manifest, output: &Manifest) -> ClassCounts {
 }
 
 /// The operations adopted by promotion in the log up to `seal` (D63):
-/// intents whose authority is an `AdoptedFrom` naming a child and Seal of
-/// an earlier Promotion record.
+/// intents whose authority is an `AdoptedFrom` naming the child and Seal
+/// of the Promotion record before them, written before the next Seal.
+///
+/// An adoption is written right after its Promotion, and the Vessel takes
+/// no effect from its agent until the next Seal, its adoption Seal (C7,
+/// audit A3/A4).  `authority` is otherwise the agent's own bytes: it used
+/// to count any later intent whose authority began with a promoted
+/// child's id and Seal, so an agent could raise the count by declaring
+/// effects that named them (audit 2026-11-09, an agent-declared
+/// authority inflates the adopted-effects count).
 ///
 /// `frames` is the Vessel's log from its first record: a local log that
 /// has lost its prefix to pruning counts only what is left (audit
@@ -958,7 +966,9 @@ pub(crate) fn effects_adopted<'a>(
     frames: impl Iterator<Item = &'a Frame>,
     seal: Lsn,
 ) -> Result<u64, NominateError> {
-    let mut prefixes: Vec<Vec<u8>> = Vec::new();
+    // The Promotion whose adoption may still be written: until the next
+    // Seal.
+    let mut adopting: Option<Vec<u8>> = None;
     let mut n = 0;
     for f in frames.take_while(|f| f.envelope.lsn <= seal) {
         match Payload::decode(&f.payload) {
@@ -966,11 +976,14 @@ pub(crate) fn effects_adopted<'a>(
                 let mut c = taso_core::canon::Canon::default();
                 p.child.canon(&mut c);
                 p.seal.canon(&mut c);
-                prefixes.push(c.as_bytes().to_vec());
+                adopting = Some(c.as_bytes().to_vec());
             }
+            Ok(Payload::Seal(_)) => adopting = None,
             Ok(Payload::Intent(i))
                 if i.authority.len() == 32
-                    && prefixes.iter().any(|p| i.authority.starts_with(p)) =>
+                    && adopting
+                        .as_ref()
+                        .is_some_and(|p| i.authority.starts_with(p)) =>
             {
                 n += 1;
             }
