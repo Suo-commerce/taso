@@ -430,6 +430,11 @@ pub struct CoordLog {
     purges: BTreeMap<C16, PurgeState>,
     /// The greatest accepted version of every Template name (D49).
     names: BTreeMap<String, u32>,
+    /// Every pending submission announced, by when: what [`CoordLog::
+    /// expire`] looks at, oldest first.  An entry stays after its pending
+    /// submission was resolved; `expire` drops it once it is past the
+    /// TTL, as it would have expired it.
+    pending_at: std::collections::BTreeSet<(u64, C16)>,
 }
 
 /// What a record does once accepted, computed before anything changes.
@@ -538,6 +543,7 @@ impl CoordLog {
             purges: BTreeMap::new(),
             names: BTreeMap::new(),
             reclaims: BTreeMap::new(),
+            pending_at: Default::default(),
         }
     }
 
@@ -632,16 +638,27 @@ impl CoordLog {
     }
 
     /// Expire every pending submission older than `announce.ttl`.
+    ///
+    /// It runs at every announce and accept.  It used to walk every
+    /// Chronicle to find them, so each of those calls cost in proportion
+    /// to how many Chronicles the coordinator had ever known (audit
+    /// 2026-11-09: 7 ms at 100,000).  It walks the announced ones in the
+    /// order of their time, and stops at the first that is not past the
+    /// TTL: the same submissions expire, at the same calls.
     pub fn expire(&mut self, now: u64) {
         let ttl = self.config.announce_ttl;
-        for (c, ch) in self.chrons.iter_mut() {
-            if ch
-                .pending
-                .as_ref()
-                .is_some_and(|p| now.saturating_sub(p.at) > ttl)
-            {
+        while let Some(&(at, c)) = self.pending_at.first() {
+            if now.saturating_sub(at) <= ttl {
+                break;
+            }
+            self.pending_at.pop_first();
+            // Resolved since, or announced again later: not this entry's.
+            let Some(ch) = self.chrons.get_mut(&c) else {
+                continue;
+            };
+            if ch.pending.as_ref().is_some_and(|p| p.at == at) {
                 let p = ch.pending.take().expect("checked");
-                self.refused_subs.insert((*c, p.submission), Final::Expired);
+                self.refused_subs.insert((c, p.submission), Final::Expired);
             }
         }
     }
@@ -708,6 +725,7 @@ impl CoordLog {
                     digest: *digest.as_bytes(),
                     at: now,
                 });
+                self.pending_at.insert((now, *chronicle.as_bytes()));
                 Ok(())
             }
         }
@@ -2552,6 +2570,135 @@ mod tests {
                     || *o == ObjectId::content(pc_keys.1)
             ),
             "only the replacements and the purge's own record (R2-07) stay held"
+        );
+    }
+
+    // ── Expiry (audit 2026-11-09) ───────────────────────────────────
+
+    fn id_of(n: u32) -> ChronicleId {
+        let mut b = [0u8; 16];
+        b[..4].copy_from_slice(&n.to_be_bytes());
+        ChronicleId::from_bytes(b)
+    }
+
+    fn hash_of(n: u32, salt: u8) -> HashVal {
+        let mut b = [salt; 32];
+        b[..4].copy_from_slice(&n.to_be_bytes());
+        HashVal::from_bytes(b)
+    }
+
+    /// The rule as it was: every Chronicle looked at.
+    fn expire_by_walking_every_chronicle(log: &mut CoordLog, now: u64) {
+        let ttl = log.config.announce_ttl;
+        for (c, ch) in log.chrons.iter_mut() {
+            if ch
+                .pending
+                .as_ref()
+                .is_some_and(|p| now.saturating_sub(p.at) > ttl)
+            {
+                let p = ch.pending.take().expect("checked");
+                log.refused_subs.insert((*c, p.submission), Final::Expired);
+            }
+        }
+    }
+
+    /// Expiry by time expires exactly what walking every Chronicle did, at
+    /// the same calls, through announces, cancels, fences, announces again
+    /// with the time going back, and resolved submissions left in the
+    /// index.
+    #[test]
+    fn expiry_by_time_expires_what_the_walk_did() {
+        let mut a = CoordLog::new(cfg());
+        for n in 0..40 {
+            a.claim_chronicle(id_of(n), ClaimAuthority::Vessel).unwrap();
+        }
+        let mut b = a.clone();
+        let mut now = 1000u64;
+        let mut seed = 7u64;
+        for step in 0..3000u32 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let n = (seed >> 33) as u32 % 40;
+            let c = id_of(n);
+            // Mostly forward, sometimes back (a clock is no promise).
+            now = match (seed >> 20) % 10 {
+                0 => now.saturating_sub(300),
+                1..=3 => now + 400,
+                _ => now + 13,
+            };
+            let e = a.chrons[c.as_bytes()].epoch;
+            let sub = hash_of(step, 1);
+            match (seed >> 40) % 6 {
+                0..=2 => {
+                    let r = a.announce(c, e, sub, hash_of(step, 2), hash_of(step, 3), now);
+                    // The old rule, by hand: expire, then the same announce.
+                    expire_by_walking_every_chronicle(&mut b, now);
+                    let saved = std::mem::take(&mut b.pending_at);
+                    b.pending_at = Default::default();
+                    let r2 = b.announce(c, e, sub, hash_of(step, 2), hash_of(step, 3), now);
+                    b.pending_at = saved;
+                    assert_eq!(r, r2, "step {step}");
+                }
+                3 => {
+                    let pending = a.chrons[c.as_bytes()]
+                        .pending
+                        .as_ref()
+                        .map(|p| HashVal::from_bytes(p.submission));
+                    if let Some(p) = pending {
+                        assert_eq!(a.cancel(c, e, p), b.cancel(c, e, p), "step {step}");
+                    }
+                }
+                4 => {
+                    assert_eq!(a.fence(c), b.fence(c));
+                }
+                _ => {
+                    a.expire(now);
+                    expire_by_walking_every_chronicle(&mut b, now);
+                }
+            }
+            for (k, ch) in &a.chrons {
+                assert_eq!(
+                    ch.pending.as_ref().map(|p| (p.submission, p.at)),
+                    b.chrons[k].pending.as_ref().map(|p| (p.submission, p.at)),
+                    "step {step}"
+                );
+            }
+            assert_eq!(a.refused_subs, b.refused_subs, "step {step}");
+        }
+        assert!(
+            a.refused_subs.values().any(|f| *f == Final::Expired),
+            "the sequence expired something"
+        );
+    }
+
+    /// Audit 2026-11-09, `expire` walked every Chronicle at every announce
+    /// and accept: 7 ms each at 100,000 Chronicles (debug build).  It now
+    /// looks only at what was announced.
+    #[test]
+    fn expiry_does_not_walk_every_chronicle() {
+        let mut log = CoordLog::new(cfg());
+        for n in 0..100_000 {
+            log.claim_chronicle(id_of(n), ClaimAuthority::Vessel)
+                .unwrap();
+        }
+        let t = std::time::Instant::now();
+        for step in 0..2000u32 {
+            let c = id_of(step % 50);
+            let e = log.chrons[c.as_bytes()].epoch;
+            let _ = log.announce(
+                c,
+                e,
+                hash_of(step, 1),
+                hash_of(step, 2),
+                hash_of(step, 3),
+                1000 + u64::from(step),
+            );
+        }
+        let took = t.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "2000 announces among 100,000 Chronicles took {took:?}"
         );
     }
 
