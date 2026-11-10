@@ -552,8 +552,18 @@ impl Purger {
         }
     }
 
-    /// Step 5: the dataset and its layers, only if it is still the one the
-    /// local-state object names.
+    /// Step 5: the dataset and its layers.
+    ///
+    /// The local-state object names the dataset's guid on the node that
+    /// committed the purge.  A purge finished on another node (the Vessel
+    /// taken over) meets that node's own copy of the same Chronicle's
+    /// dataset, with another guid, and refused to delete it: the purge
+    /// ended Complete and the purged files stayed on that node for good
+    /// (audit 2026-11-09, a purge finished on another node).  A dataset
+    /// is named by its Chronicle, and a Chronicle whose purge ended is
+    /// retired and has no later Vessel, so whatever dataset bears its
+    /// name is its, on this node: deleted by the guid it has here, with a
+    /// line in the Warden's log when that is not the one recorded.
     fn delete_local<P: Pool>(
         &self,
         pool: &P,
@@ -579,15 +589,17 @@ impl Purger {
             .map_err(|e| PurgeError::Vessel(VesselError::Pool(e)))?
         {
             None => Ok(()),
-            Some(g) if g == local.dataset_guid => {
+            Some(g) => {
+                if g != local.dataset_guid {
+                    eprintln!(
+                        "taso-wardend: {ds}: the purge was committed where this dataset had guid {}; here it has guid {g} (taken over): deleting this node's copy",
+                        local.dataset_guid
+                    );
+                }
                 pool.destroy(ds, g)
                     .map_err(|e| PurgeError::Vessel(VesselError::Pool(e)))?;
                 Ok(())
             }
-            Some(g) => Err(PurgeError::Inconsistent(format!(
-                "{ds} has guid {g}, the purge's local state names {}: not deleted",
-                local.dataset_guid
-            ))),
         }
     }
 }

@@ -3938,6 +3938,109 @@ mod tests {
         }
     }
 
+    /// Another node's pool over the same fake: the dataset's guid (the
+    /// block log: its branch id, per node) is another one.
+    struct OtherNode(crate::vessel::tests::FakePool);
+
+    impl Pool for OtherNode {
+        type Layers = <crate::vessel::tests::FakePool as Pool>::Layers;
+        fn create(&self, d: &Dataset) -> Result<DatasetInfo, crate::chronicle::LayerError> {
+            self.0.create(d)
+        }
+        fn clone(
+            &self,
+            s: &Dataset,
+            seal: Lsn,
+            h: HashVal,
+            t: &Dataset,
+        ) -> Result<DatasetInfo, crate::chronicle::LayerError> {
+            Pool::clone(&self.0, s, seal, h, t)
+        }
+        fn info(&self, d: &Dataset) -> Result<Option<DatasetInfo>, crate::chronicle::LayerError> {
+            self.0.info(d)
+        }
+        fn layers(&self, d: &Dataset) -> Self::Layers {
+            self.0.layers(d)
+        }
+        fn receive(
+            &self,
+            d: &Dataset,
+            from: Option<(Lsn, HashVal)>,
+            to: (Lsn, HashVal),
+            s: &mut dyn std::io::Read,
+        ) -> Result<u64, crate::chronicle::LayerError> {
+            self.0.receive(d, from, to, s)
+        }
+        fn adopt(
+            &self,
+            d: &Dataset,
+            base: (Lsn, HashVal),
+            to: (Lsn, HashVal),
+            child: &Dataset,
+            child_seal: Lsn,
+            sender: &dyn Sender,
+        ) -> Result<u64, crate::chronicle::LayerError> {
+            self.0.adopt(d, base, to, child, child_seal, sender)
+        }
+        fn receive_clone(
+            &self,
+            d: &Dataset,
+            base: &CloneBase,
+            to: (Lsn, HashVal),
+            s: &mut dyn std::io::Read,
+        ) -> Result<u64, crate::chronicle::LayerError> {
+            self.0.receive_clone(d, base, to, s)
+        }
+        fn seal_view(&self, d: &Dataset, l: Lsn) -> Result<SealView, crate::chronicle::LayerError> {
+            self.0.seal_view(d, l)
+        }
+        fn guid(&self, d: &Dataset) -> Result<Option<u64>, crate::chronicle::LayerError> {
+            Ok(self.0.guid(d)?.map(|g| g + 7))
+        }
+        fn destroy(&self, d: &Dataset, guid: u64) -> Result<bool, crate::chronicle::LayerError> {
+            match self.guid(d)? {
+                None => Ok(false),
+                Some(g) if g != guid => Err("another guid".into()),
+                Some(g) => self.0.destroy(d, g - 7),
+            }
+        }
+    }
+
+    /// Audit 2026-11-09, a purge committed on one node and finished on
+    /// another (the Vessel taken over: its dataset there is that node's
+    /// own, with another guid) ended Complete and left that node's
+    /// dataset in place, at every later pass too.  It is deleted.
+    #[test]
+    fn a_purge_finished_on_another_node_deletes_that_nodes_dataset() {
+        let c = Cluster::new();
+        let (h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let mut p = purger(&c);
+        p.failpoint = Arc::new(|q| q == "purge.after_accept");
+        assert!(matches!(
+            p.purge(&h.pool, &mut v, &packs),
+            Err(PurgeError::Failpoint("purge.after_accept"))
+        ));
+        // The other node: the same Vessel, its dataset with its own guid.
+        let b = OtherNode(Clone::clone(&h.pool));
+        assert_ne!(
+            b.guid(v.dataset()).unwrap(),
+            h.pool.guid(v.dataset()).unwrap()
+        );
+        let p = purger(&c);
+        let out = p.purge(&b, &mut v, &packs);
+        assert!(
+            matches!(out, Ok(Purged::Complete { .. })),
+            "{:?}",
+            out.err().map(|e| e.to_string())
+        );
+        assert!(
+            b.guid(v.dataset()).unwrap().is_none(),
+            "the purge ended but the dataset is still on the node that finished it"
+        );
+        // A later pass has nothing left to do.
+        assert!(!p.delete_ended(&b, v.id(), v.dataset()).unwrap());
+    }
+
     #[test]
     fn an_item_lost_after_the_commit_is_recorded_and_the_purge_is_damaged() {
         let c = Cluster::new();
