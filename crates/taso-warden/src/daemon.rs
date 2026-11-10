@@ -7723,4 +7723,185 @@ mod tests {
         assert_eq!(a[..12], b[..12], "the hostname part is the Vessel's");
         assert!(a.len() <= 128 && a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
     }
+    // ── audit confirmation round, group g1 (tests only) ─────────────
+
+    /// A Node put together without its start (no runc sweep, no block
+    /// log): for what reads only its config and state directory.
+    fn confirm_bare_node(tmp: &Path) -> Node {
+        let mut v: Value = serde_json::from_str(GOOD).unwrap();
+        v["run_dir"] = tmp.join("run").to_string_lossy().into();
+        v["store"] = tmp.join("store").to_string_lossy().into();
+        v["state_dir"] = tmp.join("state").to_string_lossy().into();
+        let config = Config::parse(&v.to_string()).unwrap();
+        let coord: Arc<dyn Coord> =
+            Arc::new(crate::coordinator::Coordinator::open(tmp.join("c.redb")).unwrap());
+        let storage = BlkPool::new("/nonexistent/blk.sock", tmp.join("mnt"), tmp.join("spool"));
+        let store = config.store.open().unwrap();
+        let run_lock = claim_run_dir(&config.run_dir).unwrap();
+        Node {
+            config,
+            coord,
+            storage,
+            store,
+            run_lock,
+            held: Vec::new(),
+            requested: Requested::new(),
+            started: Default::default(),
+            layers: None,
+            failpoint: None,
+            nominator: None,
+            verifiers: Verifiers::new(MAX_CONCURRENT_VERIFIERS),
+            reruns: Reruns::default(),
+            verifier_limits: crate::verify::VerifierLimits::default(),
+            attempt_failpoint: crate::attempt::no_failpoints(),
+            decide_slots: Default::default(),
+        }
+    }
+
+    /// G1-3: the TTL start file is written by write + rename with no
+    /// fsync; a power loss can leave the name with no bytes.  The TTL
+    /// start must still be answered (kept again), not refused for good.
+    #[test]
+    fn confirm_g1_3_an_empty_ttl_start_file_does_not_stop_the_ttl_for_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = confirm_bare_node(tmp.path());
+        let id = vessel_id(ns(1), b"u");
+        // A first call keeps it: the file as the code writes it.
+        let t0 = node.ttl_start(id).unwrap();
+        assert_eq!(node.ttl_start(id).unwrap(), t0);
+        // Power loss after the rename, before the data reached the disk.
+        std::fs::write(node.ttl_file(id), b"").unwrap();
+        let passes: Vec<String> = (0..3)
+            .map(|_| match node.ttl_start(id) {
+                Ok(t) => format!("ok {t}"),
+                Err(e) => format!("err {e}"),
+            })
+            .collect();
+        assert!(
+            passes.iter().any(|p| p.starts_with("ok")),
+            "every pass fails: {passes:?}"
+        );
+    }
+
+    /// G1-3, the shared temp name: the run's thread and the TTL pass's
+    /// write the same `<id>.tmp`.
+    #[test]
+    fn confirm_g1_3_two_threads_keeping_one_ttl_start_both_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = Arc::new(confirm_bare_node(tmp.path()));
+        let mut failures = Vec::new();
+        for round in 0..300u32 {
+            let id = vessel_id(ns(1), format!("u{round}").as_bytes());
+            let go = Arc::new(std::sync::Barrier::new(2));
+            let ts: Vec<_> = (0..2)
+                .map(|_| {
+                    let (node, go) = (node.clone(), go.clone());
+                    std::thread::spawn(move || {
+                        go.wait();
+                        node.ttl_start(id).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for t in ts {
+                if let Err(e) = t.join().unwrap() {
+                    failures.push(e);
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of 600 calls failed, first: {}",
+            failures.len(),
+            failures[0]
+        );
+    }
+
+    /// G1-4: `std::thread::spawn` panics when the OS gives no thread.  In
+    /// `run_attempt_queue` that is after `verifiers.next()` took the id:
+    /// the closure (and its slot) is dropped by the unwind, `done(id)`
+    /// never runs.  The Warden's end must still settle.
+    #[test]
+    fn confirm_g1_4_the_queue_settles_after_a_spawn_that_panicked() {
+        let v = Verifiers::new(2);
+        let id = [7u8; 16];
+        v.add(id, Instant::now());
+        let worker = {
+            let v = v.clone();
+            // The worker's loop body, with the spawn's panic in place of
+            // the spawn (the closure owning `slot` is dropped unrun).
+            std::thread::spawn(move || {
+                while let Some((_id, slot)) = v.next(Instant::now()) {
+                    let job = move || drop(slot);
+                    drop(job);
+                    panic!("failed to spawn thread: Resource temporarily unavailable");
+                }
+            })
+        };
+        assert!(worker.join().is_err(), "the worker thread is gone");
+        {
+            let s = v.lock();
+            assert_eq!(s.used, 0, "the slot came back");
+            assert!(s.waiting.is_empty(), "and the Vessel is off the list");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let v2 = v.clone();
+        std::thread::spawn(move || {
+            v2.settle(false);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "settle (the Warden's shutdown) never returns: {:?} stays taken",
+            v.lock().taken
+        );
+    }
+
+
+    // ── Audit confirmation round, group g3 (tests only) ─────────────
+
+    /// G3-12.  "Every object the Warden reads refuses keys it does not
+    /// know": a Vessel entry too.
+    #[test]
+    fn g3_12_a_vessel_entry_refuses_a_key_it_does_not_know() {
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            f(&mut v);
+            Config::parse(&v.to_string())
+        };
+        // Control: the key spelt right is read.
+        let c = with(&|v| v["vessels"][0]["effects"] = "hold".into()).unwrap();
+        assert_eq!(c.vessels[0].effects, Some(EffectsConf::Hold));
+        let mut passed = Vec::new();
+        for (key, value) in [
+            ("effect", serde_json::json!("hold")),
+            ("tempalte", serde_json::json!("base@1")),
+            ("uid-slot", serde_json::json!(3)),
+        ] {
+            if let Ok(c) = with(&|v| v["vessels"][0][key] = value.clone()) {
+                passed.push(format!(
+                    "{key:?} accepted: effects {:?}, template {:?}",
+                    c.vessels[0].effects, c.vessels[0].template
+                ));
+            }
+        }
+        assert!(passed.is_empty(), "{passed:#?}");
+    }
+
+    /// G3-12, second part: a `"candidate"` needs the node's `"sanction"`;
+    /// `"sanction": null` is none.
+    #[test]
+    fn g3_12_a_candidate_needs_a_sanction_that_is_not_null() {
+        let mut v: Value = serde_json::from_str(GOOD).unwrap();
+        v["sanction"] = Value::Null;
+        v["vessels"][0]["verifier"] =
+            serde_json::json!({"template": "checks@2", "config": "/etc/taso/v.toml", "version": 3});
+        v["vessels"][0]["candidate"] = serde_json::json!({"seal": "last", "exclude": []});
+        match Config::parse(&v.to_string()) {
+            Err(e) => assert!(e.0.contains("the node's \"sanction\""), "{}", e.0),
+            Ok(c) => panic!(
+                "accepted: sanction {:?}, vessel candidate {:?}",
+                c.sanction, c.vessels[0].candidate
+            ),
+        }
+    }
 }

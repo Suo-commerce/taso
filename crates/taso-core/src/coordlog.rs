@@ -3983,4 +3983,377 @@ mod tests {
         );
         let _ = object_key(ObjectKind::Pack, b"");
     }
+
+    // ── audit confirmation round, group g2 (tests state the CORRECT
+    //    behaviour; each fails today for the defect it names) ─────────
+
+    fn g2_world<'a>(log: &'a mut CoordLog, store: &'a Store) -> W<'a> {
+        W {
+            log,
+            store,
+            now: 100,
+        }
+    }
+
+    /// G2-8 (coordlog level): a fork of V exists (claimed, running) but no
+    /// `Birth` was ever submitted for it -- which is what the Warden does
+    /// for every fork (`Host::birth_accepted` answers true for a non-Template
+    /// origin; `fork_at` only appends the Lineage locally).  V must not be
+    /// purged while the fork needs its packs.
+    #[test]
+    fn g2_8_a_parent_with_a_fork_that_submitted_no_birth_is_not_purged() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let f = vessel(&mut w);
+        let fork = cid(0x0F);
+        w.log.claim_chronicle(fork, ClaimAuthority::Vessel).unwrap();
+        // No Birth: the log has no way to know `fork` is V's fork.
+        assert!(
+            w.log.purge_blocker(f.v).is_some(),
+            "nothing blocks the purge of a parent whose fork is live"
+        );
+        let (pc, inv) = purge_inventory(&mut w, f.v);
+        assert_eq!(inv.items().len(), 2);
+        assert_eq!(
+            w.refused(f.v, ContractRecord::PurgeCommitted(pc)),
+            Final::Predicate("liveness dependency".into())
+        );
+    }
+
+    /// G2-9a: a pack that lands in the store after `PurgeCommitted` (a
+    /// fenced Warden's late put) is in no inventory; `PurgeComplete` must
+    /// not end the purge while an fs pack of the Chronicle is left.
+    #[test]
+    fn g2_9_a_pack_put_after_the_commit_does_not_survive_a_complete_purge() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let f = vessel(&mut w);
+        let (pc, inv) = purge_inventory(&mut w, f.v);
+        w.ok(f.v, ContractRecord::PurgeCommitted(pc));
+        // The late put: an fs pack of V, after the commit read the pack set.
+        let late = pname(12, 9, 12);
+        store.put(ObjectId::pack(f.v, &late));
+        store.fs.borrow_mut().get_mut(f.v.as_bytes()).unwrap().push(InventoryItem {
+            pack: PackRef {
+                name: late.clone(),
+                digest: h(0x5F),
+            },
+            sections: vec![Lsn::new(12)],
+            log_digest: h(0x6F),
+            frames: FrameRange {
+                first: Lsn::new(10),
+                last: Lsn::new(12),
+            },
+            form: ReplacementForm::LogOnly,
+        });
+        // Every inventoried item replaced and deleted.
+        for it in inv.items() {
+            let rname = replacement_name(&it.pack.name).unwrap();
+            store.put(ObjectId::pack(f.v, &rname));
+            store
+                .replacements
+                .borrow_mut()
+                .insert((*f.v.as_bytes(), rname.clone()), h(0xB0));
+            w.ok(
+                f.v,
+                ContractRecord::ReplacementInstalled(ReplacementInstalled {
+                    chronicle: f.v,
+                    pack: it.pack.clone(),
+                    replacement_key: h(0xB0),
+                    replacement_name: rname,
+                }),
+            );
+            store.del(&ObjectId::pack(f.v, &it.pack.name));
+        }
+        let a = w.submit(
+            f.v,
+            Submitted::Contract(ContractRecord::PurgeComplete(PurgeComplete {
+                chronicle: f.v,
+                inventory_key: inv.key(),
+                items_replaced: inv.items().len() as u64,
+                history_attestation: h(0xC0),
+            })),
+        );
+        let left: Vec<String> = store
+            .fs_packs(f.v)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.pack.name)
+            .collect();
+        assert!(
+            !matches!(a, Answer::Accepted { .. }),
+            "the purge ended Complete with fs pack(s) {left:?} still in the store, \
+             unclaimed and unheld (holders: {:?})",
+            w.log.holders(&ObjectId::pack(f.v, &late))
+        );
+    }
+
+    /// G2-9b: `PurgeDamaged` resolves every item's claim; it must make the
+    /// "originals not deleted" check `PurgeComplete` makes.
+    #[test]
+    fn g2_9_a_damaged_purge_does_not_end_with_an_original_still_in_the_store() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let f = vessel(&mut w);
+        let (pc, inv) = purge_inventory(&mut w, f.v);
+        w.ok(f.v, ContractRecord::PurgeCommitted(pc));
+        // Item 1: replaced, its original NOT deleted.
+        let it = inv.items()[0].clone();
+        let rname = replacement_name(&it.pack.name).unwrap();
+        store.put(ObjectId::pack(f.v, &rname));
+        store
+            .replacements
+            .borrow_mut()
+            .insert((*f.v.as_bytes(), rname.clone()), h(0xB0));
+        w.ok(
+            f.v,
+            ContractRecord::ReplacementInstalled(ReplacementInstalled {
+                chronicle: f.v,
+                pack: it.pack.clone(),
+                replacement_key: h(0xB0),
+                replacement_name: rname,
+            }),
+        );
+        // Item 2: lost.
+        let it2 = inv.items()[1].clone();
+        store.del(&ObjectId::pack(f.v, &it2.pack.name));
+        w.ok(
+            f.v,
+            ContractRecord::ItemLost(ItemLost {
+                chronicle: f.v,
+                pack: it2.pack.clone(),
+            }),
+        );
+        let original = ObjectId::pack(f.v, &it.pack.name);
+        assert!(store.exists(&original) && w.log.is_claimed(&original));
+        let a = w.submit(
+            f.v,
+            Submitted::Contract(ContractRecord::PurgeDamaged(crate::contract::PurgeDamaged {
+                chronicle: f.v,
+                inventory_key: inv.key(),
+                items_replaced: 1,
+                items_lost: 1,
+            })),
+        );
+        assert!(
+            !matches!(a, Answer::Accepted { .. }),
+            "the purge ended with original {:?} still in the store; its claim resolved: {}",
+            it.pack.name,
+            !w.log.is_claimed(&original)
+        );
+    }
+
+    /// G2-12a: `CandidateClosed { Never }` names a verdict: an accepted
+    /// `Never` verdict of this Candidate, not any accepted logical id.
+    #[test]
+    fn g2_12_a_never_close_needs_a_never_verdict_of_the_candidate() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let f = vessel(&mut w);
+        let cand = ContractRecord::Candidate(Box::new(f.k.clone()));
+        w.ok(f.v, cand.clone());
+        // The "verdict" is the Candidate record's own logical id: no
+        // verdict of any kind was ever submitted.
+        let a = w.submit(
+            f.v,
+            Submitted::Contract(ContractRecord::CandidateClosed(CandidateClosed {
+                candidate_id: f.k.candidate_id,
+                how: CloseKind::Never {
+                    verdict: cand.logical_id(),
+                    reason: "no verdict exists".into(),
+                },
+            })),
+        );
+        assert_eq!(
+            a,
+            Answer::FinalRefused(Final::Predicate("no such verdict".into())),
+            "closed Never on a logical id that is no verdict"
+        );
+    }
+
+    /// G2-12b: a verdict's `facts_hash`, `artifact_key`, `requirement` and
+    /// `exclude` "must equal the Candidate's" (contract.rs, VerdictRequest).
+    #[test]
+    fn g2_12_a_verdict_over_other_facts_than_the_candidates_is_refused() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let f = vessel(&mut w);
+        w.ok(f.v, ContractRecord::Candidate(Box::new(f.k.clone())));
+        let st = started(&f.k, 11);
+        w.ok(f.v, ContractRecord::VerificationStarted(st));
+        let fin = finished(&st, 0);
+        w.ok(f.v, ContractRecord::VerificationFinished(fin.clone()));
+        let mut vd = verdict(&f.k, &fin, Decision::Sanction);
+        vd.request.facts_hash = h(0xEE);
+        vd.request.artifact_key = h(0xEF);
+        vd.request.exclude = BTreeSet::new();
+        vd.request.request_id = request_id(peer().uid, OpKind::Verdict, &vd.request.body());
+        let a = w.submit(
+            f.v,
+            Submitted::Contract(ContractRecord::VerdictSubmitted(Box::new(vd.clone()))),
+        );
+        // And the commit that names it goes through as well.
+        let s = commit(&f.k, &fin, &vd, f.t0);
+        let c = w.submit(f.v, Submitted::Contract(ContractRecord::SanctionCommitted(s)));
+        assert!(
+            matches!(a, Answer::FinalRefused(_)),
+            "a Sanction verdict over facts/artifact/exclude that are not the Candidate's: \
+             {a:?}; the commit naming it: {c:?}"
+        );
+    }
+
+    /// G2-13: a cancel under an epoch that is not the current one changes
+    /// nothing of the current epoch's pending submission.
+    #[test]
+    fn g2_13_a_cancel_under_a_stale_epoch_does_not_refuse_the_pending_submission() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let f = vessel(&mut w);
+        let r = Submitted::Contract(ContractRecord::Candidate(Box::new(f.k.clone())));
+        let e = w.epoch(f.v);
+        let s = sub(&r, e, 1);
+        w.log
+            .announce(f.v, e, s, r.logical_id(), r.digest(), w.now)
+            .unwrap();
+        // The cancel names another epoch than the current one.
+        let stale = Epoch::new(e.get() + 7);
+        let c = w.log.cancel(f.v, stale, s);
+        assert_eq!(
+            w.log.query_chronicle(f.v).unwrap().pending,
+            Some(s),
+            "the pending submission is untouched (as the code intends)"
+        );
+        store.ship(f.v, "p1", &r);
+        let head = w.head(f.v);
+        let a = w.log.accept(f.v, e, s, head, "p1", r, &store, w.now);
+        assert!(
+            matches!(a, Answer::Accepted { .. }),
+            "cancel under epoch {} answered {c:?}; the accept of the still-pending \
+             submission under the current epoch {}: {a:?}",
+            stale.get(),
+            e.get()
+        );
+    }
+
+    /// G2-14a: a `Birth` accepted after the Chronicle's own
+    /// `PurgeCommitted` adds a hold nothing releases.
+    #[test]
+    fn g2_14_a_birth_of_a_retired_chronicle_is_refused() {
+        use crate::contract::LayerShipped;
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let t0 = genesis_t0(&mut w);
+        let layer = h(0x1A);
+        store.put(ObjectId::content(layer));
+        let v = cid(0x0A);
+        w.log.claim_chronicle(v, ClaimAuthority::Vessel).unwrap();
+        w.ok(
+            v,
+            ContractRecord::LayerShipped(LayerShipped {
+                template_id: t0,
+                layer_key: layer,
+                guid: 7,
+            }),
+        );
+        let (pc, _) = purge_inventory(&mut w, v);
+        w.ok(v, ContractRecord::PurgeCommitted(pc));
+        assert!(w.log.query_chronicle(v).unwrap().retired);
+        let a = w.submit(
+            v,
+            Submitted::Birth {
+                chronicle: v,
+                lineage: LineageRecord {
+                    origin: Origin::Template {
+                        template_id: t0,
+                        layer_key: layer,
+                        asked: None,
+                    },
+                    namespace: Namespace::from_bytes([1; 16]),
+                    ledger_pos: Lsn::new(0),
+                },
+            },
+        );
+        assert!(
+            matches!(a, Answer::FinalRefused(_)),
+            "a retired Chronicle's Birth: {a:?}; holders of the layer now: {:?}",
+            w.log.holders(&ObjectId::content(layer))
+        );
+    }
+
+    /// G2-14b: a Template target claimed by `Sanction { commit }` and not
+    /// yet ready is not purged: its `TemplateReady` would be refused for
+    /// good ("target not empty") and the source's open sanction never ends.
+    #[test]
+    fn g2_14_a_sanction_target_not_yet_ready_is_not_purged() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = g2_world(&mut log, &store);
+        let f = vessel(&mut w);
+        let (fin, vd) = to_verdict(&mut w, &f);
+        let s = commit(&f.k, &fin, &vd, f.t0);
+        w.ok(f.v, ContractRecord::SanctionCommitted(s));
+        let commit_lid = ContractRecord::SanctionCommitted(s).logical_id();
+        w.log
+            .claim_chronicle(
+                s.template_id,
+                ClaimAuthority::Sanction { commit: commit_lid },
+            )
+            .unwrap();
+        let (pc, _) = purge_inventory(&mut w, s.template_id);
+        let purge = w.submit(
+            s.template_id,
+            Submitted::Contract(ContractRecord::PurgeCommitted(pc)),
+        );
+        let ready = w.submit(s.template_id, Submitted::Contract(ready(&s, f.v)));
+        assert!(
+            matches!(ready, Answer::Accepted { .. }),
+            "PurgeCommitted of the claimed target: {purge:?}; then TemplateReady: {ready:?}; \
+             the source is blocked by: {:?}",
+            w.log.purge_blocker(f.v)
+        );
+    }
+
+    /// G2-10 (measurement, not a pass/fail of correctness): the cost of one
+    /// announce grows with the number of Chronicles the log knows
+    /// (`expire` walks every one), and of one `purge_projection` with the
+    /// number of holds (no index by object).
+    #[test]
+    fn g2_10_cost_of_an_announce_grows_with_the_number_of_chronicles() {
+        fn id(n: u32) -> ChronicleId {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&n.to_be_bytes());
+            b[15] = 0xAA;
+            ChronicleId::from_bytes(b)
+        }
+        let time = |chrons: u32| {
+            let mut log = CoordLog::new(cfg());
+            for n in 0..chrons {
+                log.claim_chronicle(id(n), ClaimAuthority::Vessel).unwrap();
+            }
+            let t = std::time::Instant::now();
+            const CALLS: u32 = 200;
+            for n in 0..CALLS {
+                // A refused announce (stale epoch): nothing changes.
+                let _ = log.announce(id(0), Epoch::new(99), h(n as u8), h(1), h(2), 100);
+            }
+            t.elapsed().as_nanos() as f64 / f64::from(CALLS)
+        };
+        let (small, large) = (time(100), time(100_000));
+        eprintln!(
+            "G2-10: one announce costs {small:.0} ns with 100 Chronicles, {large:.0} ns with \
+             100000 ({:.0}x)",
+            large / small
+        );
+        assert!(
+            large < small * 20.0,
+            "one announce: {small:.0} ns with 100 Chronicles, {large:.0} ns with 100000"
+        );
+    }
 }

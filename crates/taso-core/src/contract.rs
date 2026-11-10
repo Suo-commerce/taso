@@ -2770,6 +2770,53 @@ pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// Audit confirmation G2-11: decoding an inventory reserves memory in
+    /// proportion to its bytes, not to `count * size_of::<InventoryItem>()`
+    /// for a count the object only claims.  The crafted object is a count
+    /// (as large as `Reader::seq` lets through: the bytes that follow it)
+    /// and filler that fails at the first item.
+    #[test]
+    fn g2_11_decoding_an_inventory_reserves_no_more_than_a_few_times_its_size() {
+        fn vm_bytes() -> u64 {
+            // /proc/self/statm: total program size in pages, first field.
+            let s = std::fs::read_to_string("/proc/self/statm").unwrap();
+            s.split_whitespace().next().unwrap().parse::<u64>().unwrap() * 4096
+        }
+        const LEN: usize = 2 << 20;
+        let mut bytes = vec![0xFFu8; LEN];
+        let count = (LEN - 8) as u64;
+        bytes[..8].copy_from_slice(&count.to_le_bytes());
+        let item = std::mem::size_of::<InventoryItem>() as u64;
+        let before = vm_bytes();
+        let mut during = 0;
+        let mut r = Reader::new(&bytes);
+        // Exactly what `Reader::inventory` runs (`ascending` -> `seq`).
+        let got = r.seq(|r| {
+            if during == 0 {
+                during = vm_bytes();
+            }
+            r.inventory_item()
+        });
+        assert!(got.is_err(), "the filler is no item");
+        assert!(Inventory::decode(&bytes).is_err());
+        let reserved = during.saturating_sub(before);
+        let limit = max_object_bytes(ObjectKind::Inventory).unwrap();
+        eprintln!(
+            "G2-11: size_of::<InventoryItem>() = {item}; a {LEN}-byte object claiming {count} \
+             items made the address space grow by {reserved} bytes ({}x its size) before the \
+             first item was read; at the Inventory limit of {limit} bytes that is {} GiB",
+            reserved / LEN as u64,
+            (limit - 8) * item >> 30
+        );
+        assert!(
+            reserved <= 4 * LEN as u64,
+            "a {LEN}-byte object reserved {reserved} bytes ({} per claimed item, \
+             size_of::<InventoryItem>() = {item}); at the {limit}-byte Inventory limit: {} GiB",
+            reserved / count,
+            (limit - 8) * item >> 30
+        );
+    }
+
     /// Review fix H4: a whole read takes at most its kind's limit.
     #[test]
     fn a_whole_object_reads_up_to_its_limit_and_no_further() {

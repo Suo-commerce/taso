@@ -204,3 +204,74 @@ fn main() -> ExitCode {
         std::thread::sleep(Duration::from_secs(interval));
     }
 }
+
+// Audit confirmation round, group g3 (test only).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use taso_core::contract::{Outcome, Peer, VerdictRequest};
+    use taso_core::decider::PendingItem;
+    use taso_core::envelope::HashVal;
+    use taso_warden::decidesrv::{Decide, DeciderConf, DeciderServer};
+
+    mod pending {
+        include!("../../tests/support/pending.rs");
+    }
+
+    /// Two pending Candidates; a verdict on the first fails (its Vessel's
+    /// trouble), a verdict on the second is answered.
+    struct OneFails {
+        items: Vec<PendingItem>,
+        seen: Mutex<Vec<HashVal>>,
+    }
+
+    impl Decide for OneFails {
+        fn pending(&self) -> Result<Vec<PendingItem>, String> {
+            Ok(self.items.clone())
+        }
+        fn verdict(&self, r: &VerdictRequest, _: Peer) -> Result<VerdictAnswer, String> {
+            self.seen.lock().unwrap().push(r.candidate_id);
+            if r.candidate_id == self.items[0].candidate.candidate_id {
+                Err("vessel: this Vessel's log cannot be written".into())
+            } else {
+                Ok(VerdictAnswer::Held)
+            }
+        }
+    }
+
+    /// G3-4.  A failed Decide is per request (decidesrv: "answered `Error`
+    /// and the connection stays open"): the Candidates after it in the
+    /// pass are still decided.
+    #[test]
+    fn g3_4_one_candidates_error_does_not_end_the_pass_for_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = DeciderConf {
+            socket: dir.path().join("d").join("decide.sock"),
+            max_frame_bytes: 1 << 20,
+            max_connections: 4,
+        };
+        let pass_outcome = [Outcome::Exit { code: 0 }];
+        let fake = Arc::new(OneFails {
+            items: vec![
+                pending::item(1, pending::clean(1), &pass_outcome),
+                pending::item(2, pending::clean(1), &pass_outcome),
+            ],
+            seen: Mutex::default(),
+        });
+        let _srv = DeciderServer::spawn(&conf, fake.clone()).unwrap();
+        let policy =
+            Policy::parse(b"version = 1\nactor = \"taso-policy\"\ndefault = \"hold\"\n").unwrap();
+        let mut passes = Vec::new();
+        for n in 1..=3 {
+            passes.push(pass(n, &conf.socket, &policy, false));
+        }
+        let seen = fake.seen.lock().unwrap().clone();
+        let second = fake.items[1].candidate.candidate_id;
+        assert!(
+            seen.contains(&second),
+            "three passes ({passes:?}) sent {} verdicts, none for the second Candidate",
+            seen.len()
+        );
+    }
+}

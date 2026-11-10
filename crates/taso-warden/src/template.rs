@@ -4081,4 +4081,285 @@ mod tests {
         );
         assert_eq!(e.explain["purge"]["replaced"], json!(1));
     }
+
+    // ── Audit confirmation round, group g3 (tests only) ─────────────
+
+    /// G3-1.  The restore walk of an attempt stopped by this node's walk
+    /// time limit is this node's (no result: `Interrupted`), not a result
+    /// about the Candidate's files.
+    #[test]
+    fn g3_1_a_restore_walk_cut_short_by_the_node_is_not_a_result_about_the_files() {
+        let c = Cluster::new();
+        let vt = c.dir.path().join("verifier");
+        for d in ["proc", "dev", "sys", "tmp", "candidate", "bin"] {
+            std::fs::create_dir_all(vt.join(d)).unwrap();
+        }
+        std::fs::write(vt.join("bin/x"), "x\n").unwrap();
+        assert!(Command::new("chown")
+            .args(["-hR", "0:0"])
+            .arg(&vt)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("sh")
+            .arg("-c")
+            .arg("find \"$0\" -mindepth 1 ! -type d -exec touch -h -d @1700000000 {} + && find \"$0\" -depth -type d -exec touch -d @1600000000 {} +")
+            .arg(&vt)
+            .status()
+            .unwrap()
+            .success());
+        let verifier = c.template_from(&vt);
+        let node = c.node(1);
+        let reserved = Reserved::defaults();
+        // Control: with the default limits the restore check passes (the
+        // attempt gets past it, whatever stops it later on this machine).
+        let limits = Limits::default();
+        let run = run_with(&c, &node, &limits, &reserved);
+        let (_h, mut v, packs, cand) = nominated(&c, b"a", verifier, VCONF);
+        let at = attempts(&c);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        eprintln!("control: {o:?}: {text}");
+        assert!(!text.contains("does not walk"), "control: {o:?} {text}");
+        at.finish(&mut v, &packs, &st, VOutcome::Interrupted, Vec::new())
+            .unwrap();
+        let _ = attempt::destroy_candidate(&node.pool, &node.root, st.attempt_id);
+        // The same Candidate, the node's walk out of time.
+        let limits = Limits {
+            max_walk: Duration::ZERO,
+            ..Limits::default()
+        };
+        let run = run_with(&c, &node, &limits, &reserved);
+        let st = at.start(&mut v, &packs, &cand).unwrap();
+        let (o, out) = run.run(&st, &cand).unwrap();
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert_eq!(
+            o,
+            VOutcome::Interrupted,
+            "a walk this node cut short decided the Candidate: {text}"
+        );
+    }
+
+    /// G3-1, the comparison alone: an incomplete walk is "not the same".
+    #[test]
+    fn g3_1_same_entries_is_false_for_a_walk_that_did_not_finish() {
+        let c = Cluster::new();
+        let src = c.dir.path().join("src");
+        let map = Classmap::parse(MAP.as_bytes()).unwrap();
+        let owner = Owner {
+            uid_base: 0,
+            gid_base: 0,
+        };
+        let reserved = Reserved::defaults();
+        let full = classify::walk(&src, &map, owner, &Limits::default(), &reserved).unwrap();
+        assert!(same_entries(&full, &full));
+        let mut cut = full.clone();
+        cut.incomplete = Some(crate::classify::Incomplete::WalkTime);
+        // Same entries, only the walk's clock ran out: reported "differs".
+        assert!(!same_entries(&cut, &full));
+    }
+
+    fn g3_2_prepared_then_reclaimed(label: Option<&str>) -> Result<Layer, TemplateError> {
+        let c = Cluster::new();
+        // Node 1 built, received and checked its layer K1, appended its
+        // LayerShipped to its own Chronicle, and stopped before the accept
+        // (the coordinator was down at submit's put or accept).
+        let mut n1 = c.node(1);
+        n1.failpoint = fail_at("layer.before_shipped_accept");
+        assert!(n1.ensure(c.t0).is_err());
+        let ds = n1.layer_dataset(c.t0).unwrap();
+        let (k1, g1) = n1.built_here(&ds).unwrap().unwrap();
+        {
+            let mut notes = Vec::new();
+            let mut w = n1.open_warden(&mut notes).unwrap();
+            w.chronicle
+                .append(
+                    Stream::Ctl,
+                    Payload::Contract(Box::new(ContractRecord::LayerShipped(LayerShipped {
+                        template_id: c.t0,
+                        layer_key: k1,
+                        guid: g1,
+                    }))),
+                )
+                .unwrap();
+            let logical = logical_id(&LogicalKey::Layer(c.t0));
+            assert!(w.prepared(logical).unwrap().is_some());
+            assert!(w.accepted(logical).unwrap().is_none());
+        }
+        // No record holds K1; past the grace the reclaimer deletes it.
+        c.store
+            .delete(&object_key_path(PREFIX, ObjectKind::Layer, k1).unwrap())
+            .unwrap();
+        n1.failpoint = no_failpoints();
+        if let Some(l) = label {
+            // A rebuild's stream is another one (a new mkfs.ext4).
+            n1.sender = DirSend(n1.sender.0.clone(), l.into());
+        }
+        let r = n1.ensure(c.t0);
+        if let Ok(l) = &r {
+            eprintln!(
+                "rebuilt: K1 {} K2 {}",
+                hex(k1.as_bytes()),
+                hex(l.layer_key.as_bytes())
+            );
+        }
+        r
+    }
+
+    /// G3-2.  A prepared, never accepted LayerShipped whose object was
+    /// reclaimed: the next ensure builds the layer again and ships it.
+    #[test]
+    fn g3_2_a_prepared_layer_reclaimed_from_the_store_is_built_and_shipped_again() {
+        let r = g3_2_prepared_then_reclaimed(Some("node1-second-build"));
+        assert!(r.is_ok(), "{}", r.err().unwrap());
+    }
+
+    /// G3-2, control: the same with a byte-identical rebuild (the test
+    /// pool's tar stream, same label).
+    #[test]
+    fn g3_2_control_an_identical_rebuild_reuses_the_prepared_record() {
+        let r = g3_2_prepared_then_reclaimed(None);
+        assert!(r.is_ok(), "{}", r.err().unwrap());
+    }
+
+    /// Another node's pool over the same fake: the dataset's guid (the
+    /// block log: its branch id, per node) is another one.
+    struct OtherNode(crate::vessel::tests::FakePool);
+
+    impl Pool for OtherNode {
+        type Layers = <crate::vessel::tests::FakePool as Pool>::Layers;
+        fn create(&self, d: &Dataset) -> Result<DatasetInfo, crate::chronicle::LayerError> {
+            self.0.create(d)
+        }
+        fn clone(
+            &self,
+            s: &Dataset,
+            seal: Lsn,
+            h: HashVal,
+            t: &Dataset,
+        ) -> Result<DatasetInfo, crate::chronicle::LayerError> {
+            Pool::clone(&self.0, s, seal, h, t)
+        }
+        fn info(&self, d: &Dataset) -> Result<Option<DatasetInfo>, crate::chronicle::LayerError> {
+            self.0.info(d)
+        }
+        fn layers(&self, d: &Dataset) -> Self::Layers {
+            self.0.layers(d)
+        }
+        fn receive(
+            &self,
+            d: &Dataset,
+            from: Option<(Lsn, HashVal)>,
+            to: (Lsn, HashVal),
+            s: &mut dyn std::io::Read,
+        ) -> Result<u64, crate::chronicle::LayerError> {
+            self.0.receive(d, from, to, s)
+        }
+        fn adopt(
+            &self,
+            d: &Dataset,
+            base: (Lsn, HashVal),
+            to: (Lsn, HashVal),
+            child: &Dataset,
+            child_seal: Lsn,
+            sender: &dyn Sender,
+        ) -> Result<u64, crate::chronicle::LayerError> {
+            self.0.adopt(d, base, to, child, child_seal, sender)
+        }
+        fn receive_clone(
+            &self,
+            d: &Dataset,
+            base: &CloneBase,
+            to: (Lsn, HashVal),
+            s: &mut dyn std::io::Read,
+        ) -> Result<u64, crate::chronicle::LayerError> {
+            self.0.receive_clone(d, base, to, s)
+        }
+        fn seal_view(&self, d: &Dataset, l: Lsn) -> Result<SealView, crate::chronicle::LayerError> {
+            self.0.seal_view(d, l)
+        }
+        fn guid(&self, d: &Dataset) -> Result<Option<u64>, crate::chronicle::LayerError> {
+            Ok(self.0.guid(d)?.map(|g| g + 7))
+        }
+        fn destroy(&self, d: &Dataset, guid: u64) -> Result<bool, crate::chronicle::LayerError> {
+            match self.guid(d)? {
+                None => Ok(false),
+                Some(g) if g != guid => Err("another guid".into()),
+                Some(g) => self.0.destroy(d, g - 7),
+            }
+        }
+    }
+
+    /// G3-3.  A purge committed on one node and finished on another (the
+    /// Vessel taken over: its dataset there is that node's own, with
+    /// another guid) still deletes the local dataset of the node that
+    /// finishes it.
+    #[test]
+    fn g3_3_a_purge_finished_on_another_node_deletes_that_nodes_dataset() {
+        let c = Cluster::new();
+        let (h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let mut p = purger(&c);
+        p.failpoint = Arc::new(|q| q == "purge.after_accept");
+        assert!(matches!(
+            p.purge(&h.pool, &mut v, &packs),
+            Err(PurgeError::Failpoint("purge.after_accept"))
+        ));
+        // The other node: the same Vessel, its dataset with its own guid.
+        let b = OtherNode(Clone::clone(&h.pool));
+        assert_ne!(
+            b.guid(v.dataset()).unwrap(),
+            h.pool.guid(v.dataset()).unwrap()
+        );
+        let p = purger(&c);
+        let first = p.purge(&b, &mut v, &packs);
+        let ended = p.ended(v.id()).unwrap();
+        // Every later pass (the daemon's TTL pass calls delete_ended).
+        let ds = v.dataset().clone();
+        let later: Vec<String> = (0..2)
+            .map(|_| format!("{:?}", p.delete_ended(&b, v.id(), &ds)))
+            .collect();
+        assert!(
+            b.guid(&ds).unwrap().is_none(),
+            "the purge ended ({ended:?}) but the dataset is still here: the finishing run answered {first:?}; later passes {later:?}"
+        );
+    }
+
+    /// G3-5.  A record the coordinator refuses for good, recorded again
+    /// (the caller's retry): the Vessel's log does not grow by a frame
+    /// per retry.
+    #[test]
+    fn g3_5_a_refused_record_retried_does_not_grow_the_log() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let rec = ContractRecord::PurgeComplete(taso_core::contract::PurgeComplete {
+            chronicle: v.id(),
+            inventory_key: HashVal::from_bytes([9; 32]),
+            items_replaced: 0,
+            history_attestation: HashVal::from_bytes([8; 32]),
+        });
+        let vd = verdicts(&c);
+        let t0 = v.tail().lsn;
+        let r = vd.record(&mut v, &packs, rec.clone());
+        assert!(
+            matches!(
+                r,
+                Err(VerdictError::Submit(crate::submit::SubmitError::Refused(_)))
+            ),
+            "{:?}",
+            r.err().map(|e| e.to_string())
+        );
+        let t1 = v.tail().lsn;
+        for _ in 0..3 {
+            assert!(vd.record(&mut v, &packs, rec.clone()).is_err());
+        }
+        let t2 = v.tail().lsn;
+        assert_eq!(
+            t2.get() - t1.get(),
+            0,
+            "three retries of one refused record added frames (first try: {} -> {})",
+            t0.get(),
+            t1.get()
+        );
+    }
 }

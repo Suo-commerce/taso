@@ -1295,6 +1295,31 @@ mod tests {
         assert_eq!(fake.1.load(Ordering::SeqCst), 2);
     }
 
+    /// Confirmation G5-6: while the list fails, every poll says so; a
+    /// failure is never followed by "unchanged" until a list has worked.
+    #[test]
+    fn g5_6_a_failing_list_is_never_answered_as_unchanged() {
+        let f = fixture();
+        let fake = Fake::default();
+        fake.set(list(vec![item(&f, "team-a", "v1", "u1", json!({}))]));
+        let mut s = KubeSource::new(
+            fake.clone(),
+            f.conf.clone(),
+            f.runtime.clone(),
+            Duration::from_secs(2), // DEFAULT_TICK
+        );
+        assert_eq!(s.poll(Duration::ZERO).unwrap().map(|v| v.len()), Some(1));
+        s.next_list = Some(Instant::now()); // the tick has passed
+        fake.fail("api server unreachable");
+        assert!(s.poll(Duration::from_millis(200)).is_err(), "the failed list");
+        // The supervisor's next polls (its tick is 200 ms), within the 2 s.
+        let next = s.poll(Duration::from_millis(200));
+        assert!(
+            next.is_err(),
+            "the API server is still unreachable, and poll answered {next:?} (unchanged)"
+        );
+    }
+
     #[test]
     fn memory_quantities() {
         let ok = [

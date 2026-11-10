@@ -986,6 +986,48 @@ mod tests {
         assert_eq!(fx.released(&p).unwrap().len(), 2);
     }
 
+    /// Audit confirmation G4-14: the Candidate fact "effects adopted"
+    /// counts adoptions, not what an agent says.  `authority` is the
+    /// agent's own bytes in a declared effect; one of 32 bytes starting
+    /// with a promoted child's id and Seal is counted as adopted.
+    #[test]
+    fn g4_14_an_agents_declared_authority_is_not_an_adoption() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let c = child(&e, &p, b"c", 2);
+        let log = e.host.read_log_of(c).unwrap();
+        let (mut fx, _) = open_dispatch(&mut p);
+        let (record, adopted) = fx.promote(&mut p, &log, SealAt::Last).unwrap();
+        assert_eq!(adopted.len(), 2);
+        // Later (the adoption Seal taken, the agent running again), the
+        // agent declares effects of its own, naming the child and Seal.
+        for k in 0..3 {
+            let mut d = pay(&format!("the agent's own {k}"));
+            d.authority = crate::ledger::AdoptedFrom {
+                child: record.child,
+                seal: record.seal,
+                op: OpId::new(1000 + k),
+            }
+            .canon_bytes();
+            assert_eq!(d.authority.len(), 32);
+            assert!(matches!(fx.ask(&mut p, &d).unwrap(), Asked::Released { .. }));
+        }
+        let all = p.chronicle().frames().unwrap();
+        let tail = all.last().unwrap().envelope.lsn;
+        assert_eq!(
+            crate::nominate::effects_adopted(all.iter(), tail).unwrap(),
+            2,
+            "two effects were adopted; three more were declared by the agent"
+        );
+    }
+
     /// A crash after the Promotion, before the adoption: on reopen the
     /// Promotion is pending, nothing is released, and finishing adopts
     /// everything at once.  A second finish adopts nothing more.

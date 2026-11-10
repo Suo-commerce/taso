@@ -785,6 +785,46 @@ mod tests {
         (copy, lsn)
     }
 
+    // ── Audit confirmation, group g4 (2026-11-10) ───────────────────
+
+    /// G4-12 (a): a held proposal (an Intent whose only outcome is
+    /// `Proposed`) is terminal for the Vessel that wrote it: it is never
+    /// released there, so nobody owes it an outcome and its Seals are not
+    /// short of one.
+    #[test]
+    fn g4_12a_a_held_proposal_is_not_a_missing_outcome() {
+        let mut sim = Sim::new();
+        let i = sim.append(Stream::Effect, intent(1, Consequence::Irreversible, Some(1)));
+        assert_eq!(i, Lsn::new(1));
+        sim.append(Stream::Effect, outcome(1, OutcomeState::Proposed));
+        let s = sim.seal();
+        assert_eq!(sim.nav(s), Navigation::Consistent(vec![]));
+    }
+
+    /// G4-12 (b): a Gap record naming `u64::MAX` as where the log resumes
+    /// is a broken chain, not a panic.
+    #[test]
+    fn g4_12b_a_gap_resuming_at_the_last_lsn_breaks_the_chain() {
+        let mut sim = Sim::new();
+        sim.append(Stream::Transcript, Payload::Raw(b"x".to_vec()));
+        let s = sim.seal();
+        let crafted = Record::new(
+            cid(),
+            crate::envelope::BranchId::TRUNK,
+            Epoch::FIRST,
+            Stream::Ctl,
+            Lsn::new(1),
+            HashVal::GENESIS,
+            Payload::Gap(GapRecord {
+                kept: Lsn::new(0),
+                kept_hash: HashVal::GENESIS,
+                resumes: Lsn::new(u64::MAX),
+                resumes_hash: HashVal::GENESIS,
+            }),
+        );
+        assert_eq!(sim.nav_records(&[crafted], s), chain_broken(1));
+    }
+
     // ── The first ten labelled Chronicles ──────────────────────────
 
     #[test]

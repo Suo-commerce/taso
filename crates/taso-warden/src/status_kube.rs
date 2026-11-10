@@ -681,6 +681,48 @@ mod tests {
         status_of(&Event::Started(vc(n)), W).unwrap()
     }
 
+    /// Confirmation G5-7: a field a later event clears (`birthSeal: null`
+    /// after a first run that took the birth Seal) is cleared on the
+    /// resource too.  The fake applies the patch as the API server does a
+    /// JSON merge patch: a key left out stays.
+    #[test]
+    fn g5_7_a_field_cleared_by_a_later_event_is_cleared_on_the_resource() {
+        let fake = Fake::default();
+        fake.put("v1", "u1", "node-a");
+        let mut w = writer(&fake);
+        let v = view(&[("v1", "u1")], vec![]);
+        let exited = |r: Report| {
+            status_of(
+                &Event::Exited {
+                    vc: vc("v1"),
+                    out: Ok(r),
+                    stopped: false,
+                    restart_in: None,
+                },
+                W,
+            )
+            .unwrap()
+        };
+        // The first run: a birth, its Seal at 1, nothing rolled back.
+        let mut first = report(Some((true, "")), false);
+        first.start = Start::Birth;
+        first.settled.birth = Some(pos(1));
+        first.settled.rolled_back_to = None;
+        w.round(&v, vec![exited(first)]);
+        assert_eq!(fake.status("v1")["settled"]["birthSeal"], json!(1));
+        // The second run: an open, no birth Seal (the event says null).
+        let second = exited(report(Some((true, "")), false));
+        assert_eq!(second.1["settled"]["birthSeal"], Value::Null, "the event clears it");
+        w.round(&v, vec![second]);
+        let after = fake.status("v1");
+        assert_eq!(after["start"], json!("Open"), "the second run was written");
+        assert_eq!(
+            after["settled"].get("birthSeal"),
+            None,
+            "birthSeal of the first run is still on the resource: {after}"
+        );
+    }
+
     #[test]
     fn statuses_are_written_once_with_the_generation() {
         let fake = Fake::default();

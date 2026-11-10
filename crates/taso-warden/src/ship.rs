@@ -670,4 +670,48 @@ mod tests {
             "its directory missing too"
         );
     }
+    // ── audit confirmation round, group g1 (tests only) ─────────────
+
+    /// G1-9: a put's temp file is `.tmp-<pid>-<n>`, n counted from 0 in
+    /// each process.  A Warden killed in a put leaves its temp file; a
+    /// later process with the same pid (a container's pid 1, a pid file
+    /// reused after a reboot) meets the name.  The put must still store
+    /// the object, and the leftover must not stay for good.
+    #[test]
+    fn confirm_g1_9_a_temp_file_left_by_a_dead_process_fails_no_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("p/obj/first", &mut &b"1"[..]).unwrap();
+        // The leftovers of an earlier process of this pid: the names this
+        // process's next puts take (other tests move the counter too).
+        let next = TMP_COUNTER.load(Ordering::Relaxed);
+        let stale: Vec<std::path::PathBuf> = (next..next + 64)
+            .map(|n| {
+                dir.path()
+                    .join("p/obj")
+                    .join(format!("{TMP_PREFIX}{}-{n}", std::process::id()))
+            })
+            .collect();
+        for f in &stale {
+            std::fs::write(f, b"half a pack").unwrap();
+        }
+        let r = store.put("p/obj/second", &mut &b"2"[..]);
+        assert!(r.is_ok(), "the put failed: {}", r.unwrap_err());
+    }
+
+    /// G1-9: a temp file of another (dead) process is never removed.
+    #[test]
+    fn confirm_g1_9_temp_files_of_dead_processes_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("p/obj/first", &mut &b"1"[..]).unwrap();
+        // pid 4194305 is above the kernel's pid_max: no live process.
+        let stale = dir.path().join("p/obj/.tmp-4194305-0");
+        std::fs::write(&stale, vec![0u8; 1 << 16]).unwrap();
+        store.put("p/obj/second", &mut &b"2"[..]).unwrap();
+        store.put("p/obj/first", &mut &b"3"[..]).unwrap();
+        assert_eq!(store.list("p").unwrap(), ["p/obj/first", "p/obj/second"]);
+        assert!(!stale.exists(), "{} is left for good", stale.display());
+    }
+
 }

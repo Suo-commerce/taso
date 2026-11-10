@@ -969,6 +969,43 @@ mod tests {
         );
     }
 
+    /// Confirmation G5-6 at the supervisor: the answers KubeSource gives
+    /// while its list fails (an error, then "unchanged" until its next
+    /// tick; see source_kube's g5_6 test).  As the test above, the restart
+    /// must wait for an answer.
+    #[test]
+    fn g5_6_no_restart_while_the_source_fails_as_kube_source_fails() {
+        let f = Fake::with(&[("a", &[Act::Exit(Some(false)), Act::UntilStop])]);
+        let mut src = Scripted {
+            steps: [Ok(Some(vec![vc("a", 0, Restart::OnFailure)]))]
+                .into_iter()
+                .chain((0..30).flat_map(|_| [Err("down".to_string()), Ok(None)]))
+                .collect(),
+            finite: false,
+        };
+        let shutdown = Stop::new();
+        let mut sup = supervisor(&f);
+        let h = {
+            let (f, sd) = (f.clone(), shutdown.clone());
+            std::thread::spawn(move || {
+                wait_for("the second run", || {
+                    f.live.lock().unwrap().get("a") == Some(&1) && f.runs_of("a").len() == 1
+                });
+                sd.request();
+            })
+        };
+        let started_at = Instant::now();
+        sup.run(&mut src, &shutdown, |_| {});
+        h.join().unwrap();
+        let runs = f.runs_of("a");
+        assert_eq!(runs.len(), 2);
+        assert!(
+            runs[1].1.duration_since(started_at) >= Duration::from_millis(30 * 2),
+            "restarted while the source failed, after {:?}",
+            runs[1].1.duration_since(started_at)
+        );
+    }
+
     /// A run that ends by itself after its stop was requested still counts
     /// as stopped: it is reported so, and its policy does not restart it.
     #[test]

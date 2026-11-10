@@ -433,6 +433,54 @@ mod tests {
         assert!(p.reclaimed.is_empty() && p.failed.is_empty(), "{p:?}");
     }
 
+    /// Confirmation G5-5 (a measurement, it passes): N objects reclaimed,
+    /// put again (quarantined: every claim refused), then three passes
+    /// that each claim all N again.  Prints each pass's time, the records
+    /// in the Warden's log and the coordinator file's size.
+    #[test]
+    fn g5_5_measure_passes_that_refuse_everything() {
+        for n in [50usize, 100, 200] {
+            let e = env();
+            let r = e.reclaimer();
+            for i in 0..n {
+                e.put(format!("obj {i}").as_bytes(), 2 * DAY);
+            }
+            let t = std::time::Instant::now();
+            let p = r.pass(SystemTime::now()).unwrap();
+            assert_eq!(p.reclaimed.len(), n, "{:?}", p.failed);
+            let first = t.elapsed();
+            for i in 0..n {
+                e.put(format!("obj {i}").as_bytes(), 2 * DAY);
+            }
+            let records = |e: &Env| {
+                let mut notes = Vec::new();
+                let l = WardenLog::open(&e.coord, r.warden, &r.store, PREFIX, &r.state_dir, &mut notes)
+                    .unwrap();
+                l.records().unwrap().len()
+            };
+            let size = |e: &Env| std::fs::metadata(e.root.join("coord.redb")).unwrap().len();
+            eprintln!(
+                "g5_5 n={n}: reclaiming pass {:.2}s; log records {}, coord.redb {} bytes",
+                first.as_secs_f64(),
+                records(&e),
+                size(&e)
+            );
+            for i in 1..=3 {
+                let t = std::time::Instant::now();
+                let p = r.pass(SystemTime::now()).unwrap();
+                let took = t.elapsed();
+                assert_eq!((p.refused, p.reclaimed.len()), (n, 0), "{:?}", p.failed);
+                eprintln!(
+                    "g5_5 n={n}: refusing pass {i}: {:.2}s ({:.1} ms per object); log records {}, coord.redb {} bytes",
+                    took.as_secs_f64(),
+                    took.as_secs_f64() * 1000.0 / n as f64,
+                    records(&e),
+                    size(&e)
+                );
+            }
+        }
+    }
+
     /// A pass with nothing to claim writes nothing at the coordinator: the
     /// Warden's Chronicle is not even registered (a pass at every start of
     /// a short-lived Warden, a test's, changes nothing).

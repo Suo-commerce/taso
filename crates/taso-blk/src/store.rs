@@ -1974,6 +1974,74 @@ mod tests {
         Store::create(&dir.path().join("log")).unwrap()
     }
 
+    /// Confirmation G5-2: the module doc says a poisoned store fails every
+    /// later call, reads too, because the map may be ahead of the file.
+    /// A `name` whose append fails leaves the name in the map; `find`,
+    /// `names`, `name_of` must not answer from it.
+    #[test]
+    fn g5_2_a_poisoned_store_does_not_answer_from_a_map_ahead_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        let seal = s.seal_tagged(b, b"tag").unwrap();
+        s.flush().unwrap();
+        // The next append fails: the file handle cannot be written.
+        s.file = File::open(&path).unwrap();
+        assert!(s.name(b, "ghost").is_err(), "the append fails");
+        assert!(s.is_poisoned());
+        // The mutating and data calls do fail.
+        assert!(matches!(s.flush(), Err(StoreError::Poisoned)));
+        let mut buf = vec![0u8; B];
+        assert!(matches!(s.read(b, 0, &mut buf), Err(StoreError::Poisoned)));
+        // The accessors answer from the map all the same.
+        let answered = (
+            s.find("ghost"),
+            s.names(),
+            s.name_of(b).map(str::to_string),
+            s.seals_of(b),
+            s.tag(seal).map(<[u8]>::to_vec),
+            s.map().kind(b).is_ok(),
+        );
+        drop(s);
+        let (s2, _) = Store::open(&path).unwrap();
+        assert_eq!(s2.find("ghost"), None, "the name never reached the log");
+        assert_eq!(
+            answered.0, None,
+            "a poisoned store answered find from a name that is not in the log; all it answered: {answered:?}"
+        );
+    }
+
+    /// Confirmation G5-11 (the last step only): a hole in the middle of
+    /// the log (a group whose sync failed and never reached the medium)
+    /// makes `open` cut every later group, acknowledged or not, without an
+    /// error.  This PASSES: it shows what replay does with such a hole.
+    #[test]
+    fn g5_11_a_hole_in_the_log_cuts_every_later_group_silently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        s.flush().unwrap();
+        let len1 = std::fs::metadata(&path).unwrap().len();
+        s.write(b, 1, &blocks(2, 1), false).unwrap();
+        s.flush().unwrap(); // the group whose sync "failed"
+        let len2 = std::fs::metadata(&path).unwrap().len();
+        s.write(b, 2, &blocks(3, 1), false).unwrap();
+        s.flush().unwrap(); // acknowledged after a later, successful sync
+        let len3 = std::fs::metadata(&path).unwrap().len();
+        drop(s);
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.write_all_at(&vec![0u8; (len2 - len1) as usize], len1).unwrap();
+        drop(f);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.cut, len3 - len1, "both later groups are cut");
+        assert_eq!((read1(&s, b, 0), read1(&s, b, 1), read1(&s, b, 2)), (1, 0, 0));
+    }
+
     #[test]
     fn writes_read_back_and_unwritten_blocks_are_zeros() {
         let dir = tempfile::tempdir().unwrap();

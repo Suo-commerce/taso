@@ -3586,4 +3586,357 @@ mod log_tests {
         .expect("refused");
         assert!(e.to_string().contains("another generation"), "{e}");
     }
+
+    // ── audit confirmation round, group g2 (tests state the CORRECT
+    //    behaviour; each fails today for the defect it names) ─────────
+
+    /// A store that can fail its pack listing and be slow to answer.
+    #[derive(Default)]
+    struct G2Store {
+        inner: Fake,
+        unlistable: std::sync::atomic::AtomicBool,
+        slow_ms: std::sync::atomic::AtomicU64,
+    }
+
+    impl StoreView for G2Store {
+        fn carries(&self, c: ChronicleId, name: &str, digest: HashVal) -> bool {
+            let ms = self.slow_ms.load(std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            self.inner.carries(c, name, digest)
+        }
+        fn lookup(&self, o: &ObjectId) -> Lookup<()> {
+            self.inner.lookup(o)
+        }
+        fn lookup_inventory(&self, k: HashVal) -> Lookup<Inventory> {
+            self.inner.lookup_inventory(k)
+        }
+        fn fs_packs(&self, c: ChronicleId) -> Option<Vec<InventoryItem>> {
+            if self.unlistable.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            self.inner.fs_packs(c)
+        }
+        fn seal_closure(&self, c: ChronicleId, l: Lsn) -> Lookup<Vec<ObjectId>> {
+            self.inner.seal_closure(c, l)
+        }
+        fn lookup_replacement(&self, c: ChronicleId, i: &InventoryItem) -> Lookup<HashVal> {
+            self.inner.lookup_replacement(c, i)
+        }
+    }
+
+    fn g2_open(path: &Path) -> (Arc<G2Store>, Coordinator) {
+        let store = Arc::new(G2Store::default());
+        let coord = Coordinator::open_with(
+            path,
+            LogConfig {
+                store: store.clone(),
+                clock: Arc::new(|| 1_000),
+                ..LogConfig::default()
+            },
+        )
+        .unwrap();
+        (store, coord)
+    }
+
+    fn g2_queued(coord: &Coordinator) -> usize {
+        coord.queue.lock().unwrap().jobs.len()
+    }
+
+    /// G2-1: "Every request is checked on its own ... grouping changes no
+    /// answer."  A read-only `purge_projection` whose store listing fails
+    /// must fail alone; the append of another Chronicle that shares its
+    /// group is accepted.
+    #[test]
+    fn g2_1_a_failed_purge_projection_fails_no_request_grouped_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, coord) = g2_open(&dir.path().join("c.redb"));
+        coord.register(chron(1), A).unwrap();
+        coord.register(chron(2), B).unwrap();
+        let (envs, _) = next(&coord, chron(1), vec![(Stream::Fs, Payload::Raw(vec![1]))]);
+        store
+            .unlistable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (leading, go) = (mpsc::channel(), mpsc::channel::<()>());
+        let (projection, append) = std::thread::scope(|s| {
+            let coord = &coord;
+            let (leading_tx, go_rx) = (leading.0, go.1);
+            // A leader held in its own (harmless) request, so the two
+            // below queue behind it and run as one group.
+            s.spawn(move || {
+                coord
+                    .write(move |_| {
+                        leading_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            leading.1.recv().unwrap();
+            let p = s.spawn(move || coord.purge_projection(chron(2)));
+            while g2_queued(coord) < 1 {
+                std::thread::yield_now();
+            }
+            let env = envs[0];
+            let a = s.spawn(move || coord.append(A, &env));
+            while g2_queued(coord) < 2 {
+                std::thread::yield_now();
+            }
+            go.0.send(()).unwrap();
+            (p.join().unwrap(), a.join().unwrap())
+        });
+        assert!(projection.is_err(), "the listing failed: no projection");
+        let head = coord.head(chron(1)).unwrap().lsn.get();
+        assert!(
+            append.is_ok(),
+            "an append of another Chronicle, grouped with a read-only query whose store read \
+             failed, answered: {} (outcome unknown: {}); its Chronicle's head is at lsn {head}",
+            append.as_ref().unwrap_err(),
+            append.as_ref().unwrap_err().outcome_unknown()
+        );
+    }
+
+    /// G2-1 (the lone case): a failed read-only query is not a failure of
+    /// the coordinator's own state: the in-memory log stays (it is not
+    /// dropped and replayed from the whole journal by the next request).
+    #[test]
+    fn g2_1_a_failed_purge_projection_alone_keeps_the_in_memory_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, coord) = g2_open(&dir.path().join("c.redb"));
+        coord.register(chron(2), B).unwrap();
+        assert!(coord.shared.log.lock().unwrap().is_some());
+        store
+            .unlistable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let e = coord.purge_projection(chron(2)).unwrap_err();
+        assert!(
+            coord.shared.log.lock().unwrap().is_some(),
+            "a read-only query answered `{e}` (outcome_unknown = {}), and the in-memory log \
+             was discarded: the next request replays the whole journal",
+            e.outcome_unknown()
+        );
+    }
+
+    /// G2-2 (mechanism, deterministic): the caller that leads is answered
+    /// once ITS group has committed, not once the queue has drained.
+    #[test]
+    fn g2_2_the_leader_returns_when_its_own_group_has_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, coord) = g2_open(&dir.path().join("c.redb"));
+        let (in1, go1) = (mpsc::channel(), mpsc::channel::<()>());
+        let (in2, go2) = (mpsc::channel(), mpsc::channel::<()>());
+        let (returned_tx, returned) = mpsc::channel();
+        let back = std::thread::scope(|s| {
+            let coord = &coord;
+            let (in1_tx, go1_rx, in2_tx, go2_rx) = (in1.0, go1.1, in2.0, go2.1);
+            s.spawn(move || {
+                let r = coord.write(move |_| {
+                    in1_tx.send(()).unwrap();
+                    go1_rx.recv().unwrap();
+                    Ok(())
+                });
+                let _ = returned_tx.send(r.is_ok());
+            });
+            in1.1.recv().unwrap();
+            // Another caller queues behind the leader; its request is slow.
+            s.spawn(move || {
+                coord
+                    .write(move |_| {
+                        in2_tx.send(()).unwrap();
+                        go2_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+            while g2_queued(coord) < 1 {
+                std::thread::yield_now();
+            }
+            go1.0.send(()).unwrap();
+            // The second request is running: so the leader's own group has
+            // committed and its answer was delivered.
+            in2.1.recv().unwrap();
+            let back = returned.recv_timeout(std::time::Duration::from_secs(2));
+            go2.0.send(()).unwrap();
+            back
+        });
+        assert!(
+            back.is_ok(),
+            "the leader's request committed in the first group, but its call had not returned \
+             2 s later: its thread was running the next group for another caller"
+        );
+    }
+
+    /// G2-2 (under load): with callers submitting continuously, no single
+    /// call waits for the whole busy period.
+    #[test]
+    fn g2_2_no_call_waits_for_the_whole_busy_period() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        const THREADS: u8 = 6;
+        const BUSY: Duration = Duration::from_secs(4);
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, coord) = g2_open(&dir.path().join("c.redb"));
+        for t in 0..THREADS {
+            coord
+                .register(chron(t), WardenId::new(u64::from(t) + 1))
+                .unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let start = std::sync::Barrier::new(usize::from(THREADS));
+        let t0 = Instant::now();
+        // Per thread: (calls, the longest call, when that call returned).
+        let per: Vec<(u64, Duration, Duration)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let (coord, stop, start) = (&coord, &stop, &start);
+                    s.spawn(move || {
+                        let me = WardenId::new(u64::from(t) + 1);
+                        let (mut calls, mut longest, mut at) = (0, Duration::ZERO, Duration::ZERO);
+                        start.wait();
+                        while !stop.load(Ordering::SeqCst) {
+                            let (envs, _) =
+                                next(coord, chron(t), vec![(Stream::Fs, Payload::Raw(vec![t]))]);
+                            let c0 = Instant::now();
+                            coord.append(me, &envs[0]).unwrap();
+                            let took = c0.elapsed();
+                            calls += 1;
+                            if took > longest {
+                                (longest, at) = (took, t0.elapsed());
+                            }
+                        }
+                        (calls, longest, at)
+                    })
+                })
+                .collect();
+            std::thread::sleep(BUSY);
+            stop.store(true, Ordering::SeqCst);
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let groups = coord.groups.load(Ordering::Relaxed);
+        eprintln!("G2-2: busy for {BUSY:?}; {groups} groups; per thread (calls, longest, at):");
+        for p in &per {
+            eprintln!("G2-2:   {p:?}");
+        }
+        let worst = per.iter().map(|p| p.1).max().unwrap();
+        assert!(
+            worst < BUSY / 4,
+            "a call waited {worst:?} of a {BUSY:?} busy period; per thread (calls, longest \
+             call, when it returned): {per:?}"
+        );
+    }
+
+    /// G2-3: a slow store read for one Chronicle's `accept` does not stall
+    /// an append of another Chronicle.
+    #[test]
+    fn g2_3_a_slow_store_read_does_not_stall_another_chronicles_append() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let (store, coord) = g2_open(&dir.path().join("c.redb"));
+        coord.register(chron(1), A).unwrap();
+        let g = genesis();
+        let t0 = g.genesis_id;
+        store.inner.put(ObjectId::content(h(0x20)));
+        store.inner.put(ObjectId::content(h(0x21)));
+        coord.claim_chronicle(t0, A, ClaimAuthority::Genesis).unwrap();
+        let r = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(g)));
+        let s = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 1);
+        coord
+            .announce(A, t0, Epoch::FIRST, s, r.logical_id(), r.digest())
+            .unwrap()
+            .unwrap();
+        store.inner.ship(t0, "pack-1", &r);
+        let head = coord.query_chronicle(t0).unwrap().unwrap().head;
+        let (envs, _) = next(&coord, chron(1), vec![(Stream::Fs, Payload::Raw(vec![1]))]);
+        const SLOW: u64 = 1500;
+        store
+            .slow_ms
+            .store(SLOW, std::sync::atomic::Ordering::SeqCst);
+        let took = std::thread::scope(|sc| {
+            let coord = &coord;
+            let a = sc.spawn(move || {
+                coord
+                    .accept(A, t0, Epoch::FIRST, s, head, "pack-1".into(), r)
+                    .unwrap()
+            });
+            // Let the accept reach the store.
+            std::thread::sleep(Duration::from_millis(200));
+            let c0 = Instant::now();
+            coord.append(A, &envs[0]).unwrap();
+            let took = c0.elapsed();
+            assert!(matches!(a.join().unwrap(), Answer::Accepted { .. }));
+            took
+        });
+        assert!(
+            took < Duration::from_millis(SLOW / 3),
+            "an append of another Chronicle took {took:?} while one accept's store read \
+             ({SLOW} ms) ran inside the group transaction"
+        );
+    }
+
+    /// G2-5: a `cancel` naming a Chronicle nobody holds (no ownership row)
+    /// records nothing: the Chronicle's later first holder is not refused
+    /// for a submission id somebody else cancelled before it existed.
+    #[test]
+    fn g2_5_a_cancel_of_an_unowned_chronicle_refuses_nothing_of_its_later_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Fake::default());
+        let coord = open(&dir.path().join("c.redb"), store.clone());
+        let g = genesis();
+        let t0 = g.genesis_id;
+        let r = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(g)));
+        let s = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 1);
+        // B is nobody to t0; t0 has no ownership row and is unknown to the log.
+        let rows = journal_len(&coord);
+        let pre = coord.cancel(B, t0, Epoch::FIRST, s);
+        let journalled = journal_len(&coord) - rows;
+        // Now the real holder claims it and submits its first record.
+        store.put(ObjectId::content(h(0x20)));
+        store.put(ObjectId::content(h(0x21)));
+        coord.claim_chronicle(t0, A, ClaimAuthority::Genesis).unwrap();
+        let a = submit(&coord, &store, t0, Epoch::FIRST, 1, r);
+        assert!(
+            matches!(a, Answer::Accepted { .. }),
+            "warden B's cancel on the unowned Chronicle answered {pre:?} and wrote {journalled} \
+             journal row(s); holder A's first submission then answered {a:?}"
+        );
+    }
+
+    /// G2-7 (measurement): a refused request changes nothing, so it needs
+    /// no journal row; the journal is what every open and every failed
+    /// group replays in full.
+    #[test]
+    fn g2_7_refused_submissions_do_not_grow_the_journal() {
+        const N: u64 = 300;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let coord = open(&path, store.clone());
+        coord.register(chron(1), A).unwrap();
+        let (rows0, size0) = (journal_len(&coord), std::fs::metadata(&path).unwrap().len());
+        for n in 0..N {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            // A stale epoch: refused for good, nothing changes in the log
+            // (an announce refused for the epoch records nothing).
+            let r = coord
+                .announce(A, chron(1), Epoch::new(9), HashVal::from_bytes(id), h(1), h(2))
+                .unwrap();
+            assert_eq!(r, Err(Answer::FinalRefused(Final::StaleEpoch)));
+        }
+        let rows = journal_len(&coord) - rows0;
+        drop(coord);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let t = std::time::Instant::now();
+        let coord = open(&path, store);
+        let reopen = t.elapsed();
+        eprintln!(
+            "G2-7: {N} refused announces wrote {rows} journal rows; redb file {size0} -> {size} \
+             bytes; reopen replayed {} rows in {reopen:?}",
+            journal_len(&coord)
+        );
+        assert_eq!(
+            rows, 0,
+            "{N} refused announces wrote {rows} journal rows (file {size0} -> {size} bytes), \
+             all replayed at every open and after every failed group"
+        );
+    }
 }

@@ -1411,4 +1411,49 @@ mod tests {
             "reported: the same answer as before the gap"
         );
     }
+    // ── audit confirmation round, group g1 (tests only) ─────────────
+
+    /// G1-12: `as_born` takes any dataset of the id that is there.  What
+    /// stands before it: `verify` refuses a dataset holding a Seal the
+    /// shipped chain does not name, and with no section shipped the chain
+    /// names none.  A dataset this node ran the Vessel on has at least its
+    /// birth Seal (taken at the first start, before the agent runs).
+    #[test]
+    fn confirm_g1_12_a_used_dataset_is_refused_before_as_born() {
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
+        v.append(Stream::Fs, raw(1)).unwrap();
+        flush(&n, &v, 1);
+        // Node b holds a dataset of that id that was used: one Seal layer
+        // (any Seal: a birth Seal is the least a started Vessel has).
+        b.pool.put_snapshot(
+            b.dataset_for(v.id()).as_str(),
+            Lsn::new(2),
+            HashVal::from_bytes([9; 32]),
+        );
+        let r = b.rebirth(v.id(), &n.packs(v.id()));
+        assert!(
+            matches!(r, Err(VesselError::LocalState(_))),
+            "a used dataset was taken as born"
+        );
+        // Nobody was fenced: the Vessel still runs where it was.
+        assert_eq!(n.coord.ownership(v.id()).unwrap().holder, WardenId::new(1));
+    }
+
+    /// G1-12, what is left of it: a dataset of the id with no Seal layer
+    /// is taken as it is; only its origin is checked (by the open).
+    #[test]
+    fn confirm_g1_12_a_dataset_without_seals_is_taken_unchecked() {
+        let n = Nodes::new();
+        let (a, b) = (n.host(1), n.host(2));
+        let (mut v, _) = a.ensure(ns(1), b"user").unwrap();
+        v.append(Stream::Fs, raw(1)).unwrap();
+        flush(&n, &v, 1);
+        b.pool.create(&b.dataset_for(v.id())).unwrap();
+        let (w, r) = b.rebirth(v.id(), &n.packs(v.id())).unwrap();
+        assert_eq!((r.received.len(), r.dataset_at), (0, None));
+        assert!(b.pool.snaps_of(w.dataset().as_str()).is_empty());
+    }
+
 }

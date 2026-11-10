@@ -978,6 +978,50 @@ class H(http.server.BaseHTTPRequestHandler):
         );
     }
 
+    /// Confirmation G5-3: a 404 whose error code is NoSuchBucket (the
+    /// bucket is missing or misnamed) is not "the object is absent".
+    #[test]
+    fn g5_3_a_missing_bucket_is_not_an_absent_object() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = TestServer::start(
+            false,
+            r#"
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        body = b"<Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>"
+        self.send_response(404)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_HEAD(self):
+        self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+"#,
+        );
+        let store = S3Store::new(
+            S3Config {
+                endpoint: format!("http://127.0.0.1:{}", srv.port),
+                region: "garage".into(),
+                bucket: "tsao".into(),
+                ..aws_example()
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let got = store.get("d/a").map(|o| o.is_some());
+        let head = store.exists("d/a");
+        eprintln!("g5_3: get -> {got:?}, exists -> {head:?}");
+        assert!(
+            got.is_err(),
+            "get answered {got:?} for a 404 NoSuchBucket: a missing bucket read as an absent object"
+        );
+    }
+
     /// PUT, GET, HEAD and a paged list against a local S3 stand-in (plain
     /// HTTP), and the store's error answers: a missing key is `None` /
     /// `false`, a refusal carries the store's `<Code>`, and the payload

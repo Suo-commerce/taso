@@ -3252,4 +3252,121 @@ mod tests {
             })?;
         }
     }
+
+    // ── audit confirmation round, group g2 (tests state the CORRECT
+    //    behaviour; each fails today for the defect it names) ─────────
+
+    /// G2-4: "Any failure to get an answer is `Unavailable`; that
+    /// connection is dropped, never reused, and the next call opens a new
+    /// one."  After the coordinator restarts, the client's idle
+    /// connections are all dead; at most one call pays for finding out.
+    #[test]
+    fn g2_4_after_a_restart_one_failed_call_is_enough() {
+        const IDLE: usize = 8;
+        let mut e = Env::new();
+        let c = e.client();
+        c.register(chron(1), A).unwrap();
+        // IDLE connections in flight together, then idle (as after a burst
+        // of concurrent calls: `concurrent_calls_are_in_flight_together`).
+        let held: Vec<UnixStream> = (0..IDLE).map(|_| c.checkout().unwrap()).collect();
+        for s in held {
+            c.checkin(s);
+        }
+        assert_eq!(c.idle.lock().unwrap().len(), IDLE);
+        e.stop();
+        e.start();
+        // The coordinator is back and answering.
+        assert_eq!(e.client().ownership(chron(1)).unwrap().holder, A);
+        let failed: Vec<String> = (0..IDLE + 2)
+            .filter_map(|_| c.head(chron(1)).err())
+            .map(|e| format!("{e} (outcome unknown: {})", e.outcome_unknown()))
+            .collect();
+        assert!(
+            failed.len() <= 1,
+            "with the coordinator back up, {} of {} calls failed: {failed:?}",
+            failed.len(),
+            IDLE + 2
+        );
+    }
+
+    /// A coordinator whose `head` panics.
+    struct Boom(Coordinator);
+    impl Coord for Boom {
+        fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+            self.0.register(c, h)
+        }
+        fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
+            self.0.append(w, e)
+        }
+        fn append_batch_with(
+            &self,
+            w: WardenId,
+            e: &[Envelope],
+            fx: &[Vec<u8>],
+        ) -> Result<ChronicleHead, CoordError> {
+            self.0.append_batch_with(w, e, fx)
+        }
+        fn transfer_if(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+            e: (WardenId, Epoch),
+        ) -> Result<Epoch, CoordError> {
+            self.0.transfer_if(c, h, e)
+        }
+        fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+            self.0.transfer(c, h)
+        }
+        fn ownership(&self, c: ChronicleId) -> Result<Ownership, CoordError> {
+            self.0.ownership(c)
+        }
+        fn head(&self, _: ChronicleId) -> Result<ChronicleHead, CoordError> {
+            panic!("boom")
+        }
+        fn advance_shipped(
+            &self,
+            w: WardenId,
+            c: ChronicleId,
+            e: Epoch,
+            to: Position,
+        ) -> Result<Position, CoordError> {
+            self.0.advance_shipped(w, c, e, to)
+        }
+        fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+            self.0.shipped(c)
+        }
+    }
+
+    /// G2-6 (the `conns` leak): a worker whose handler panics closes its
+    /// connection: the client is told at once (EOF), and the server keeps
+    /// no descriptor for it.
+    #[test]
+    fn g2_6_a_panicking_worker_closes_its_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let boom = Arc::new(Boom(Coordinator::open(dir.path().join("c.redb")).unwrap()));
+        let server = Server::spawn(dir.path().join("c.sock"), boom).unwrap();
+        const TIMEOUT: Duration = Duration::from_secs(3);
+        let c = RemoteCoord::with_timeout(dir.path().join("c.sock"), TIMEOUT);
+        c.register(chron(1), A).unwrap();
+        let t0 = std::time::Instant::now();
+        let err = c.head(chron(1)).unwrap_err();
+        let took = t0.elapsed();
+        drop(c);
+        // The worker is long dead; give its bookkeeping a moment anyway.
+        std::thread::sleep(Duration::from_millis(200));
+        let workers_alive = server
+            .workers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| !w.is_finished())
+            .count();
+        let left = server.conns.lock().unwrap().len();
+        assert!(
+            took < TIMEOUT / 2 && left == 0,
+            "the handler panicked; the client waited {took:?} (its timeout is {TIMEOUT:?}) for \
+             `{err}`; the server still keeps {left} connection descriptor(s) with \
+             {workers_alive} worker(s) alive"
+        );
+    }
 }

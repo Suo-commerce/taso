@@ -1806,6 +1806,9 @@ mod tests {
         /// Names `names` still lists after their branch went (as another
         /// connection's drop between `names` and `info`).
         ghosts: Vec<(String, LayerId)>,
+        /// Audit confirmation G1-7: drops of Seal layers fail (the daemon
+        /// or the connection going away between two commands).
+        fail_drop_seal: bool,
     }
 
     impl StoreBlkd {
@@ -1818,6 +1821,7 @@ mod tests {
                 devs: HashMap::new(),
                 fail_seal: false,
                 ghosts: Vec::new(),
+                fail_drop_seal: false,
             }
         }
     }
@@ -1877,6 +1881,9 @@ mod tests {
                 self.devs.remove(&l);
                 self.store.drop_branch(l)?;
             } else {
+                if self.fail_drop_seal {
+                    return Err("taso-blkd closed the connection".into());
+                }
                 self.store.drop_seal(l)?;
             }
             Ok(())
@@ -3432,6 +3439,198 @@ mod tests {
         assert_eq!(
             (info.origin_seal(), info.parent),
             (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash))
+        );
+    }
+    // ── audit confirmation round, group g1 (tests only) ─────────────
+
+    /// G1-5: a Seal view left by a killed Warden (its branch and mount
+    /// stay; the new process counts no view) must not keep its dataset
+    /// from being destroyed for good.
+    #[test]
+    fn confirm_g1_5_a_view_left_by_a_crash_does_not_block_destroy() {
+        let p = pool();
+        let a = ds("tank/a-1");
+        p.create(&a).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(1), h(1))
+            .unwrap()
+            .run()
+            .unwrap();
+        std::mem::forget(p.seal_view(&a, Lsn::new(1)).unwrap());
+        let p = after_a_crash(&p);
+        let g = p.guid(&a).unwrap().unwrap();
+        // What attempt.rs (prepare_and_run, destroy_candidate) does with a
+        // leftover /candidate dataset.
+        let r = Pool::destroy(&p, &a, g);
+        assert!(
+            r.is_ok(),
+            "the leftover dataset cannot be destroyed: {}",
+            r.unwrap_err()
+        );
+    }
+
+    /// G1-6: the mount point is matched as text.  A mount root written
+    /// with `//` or `/./` (or through a symlink) names the same directory;
+    /// the kernel lists the canonical path.
+    #[test]
+    fn confirm_g1_6_a_non_canonical_mount_point_is_still_found() {
+        let mi = "\
+22 1 252:2 / / rw,relatime shared:1 - ext4 /dev/vda2 rw
+90 22 259:3 / /mnt/taso/tank/v-1 rw,relatime shared:50 - ext4 /dev/ublkb3 rw
+";
+        // What BlkPool::mountpoint gives for mount_root "/mnt//taso" or
+        // "/mnt/./taso": PathBuf::join keeps the text.
+        for root in ["/mnt//taso", "/mnt/./taso", "/mnt/taso/"] {
+            let dir = PathBuf::from(root).join("tank/v-1");
+            assert_eq!(
+                mount_source(mi, &dir),
+                Some("/dev/ublkb3".into()),
+                "{} reads as not mounted",
+                dir.display()
+            );
+        }
+    }
+
+    /// G1-6, the other half: nothing canonicalises the root on the way in.
+    #[test]
+    fn confirm_g1_6_the_pool_keeps_the_mount_root_as_written() {
+        let spool = tempfile::tempdir().unwrap().keep();
+        let p: TestPool = BlkPool::with(
+            StoreBlkd::new(),
+            FakeMounts::default(),
+            "/mnt//taso/./x",
+            spool,
+        );
+        assert_eq!(
+            p.mountpoint(&ds("tank/v-1")).to_str().unwrap(),
+            "/mnt/taso/x/tank/v-1",
+            "the mount point is compared as text with mountinfo"
+        );
+    }
+
+    /// G1-7: a destroy that fails after the branch went (here: the first
+    /// Seal drop fails) must still be finishable: a retry takes the Seals.
+    #[test]
+    fn confirm_g1_7_a_destroy_cut_short_is_finished_by_a_retry() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        for n in [2u8, 4] {
+            p.layers(&a)
+                .snapshot(Lsn::new(n as u64), h(n))
+                .unwrap()
+                .run()
+                .unwrap();
+        }
+        let g = p.guid(&a).unwrap().unwrap();
+        let layers: Vec<LayerId> = {
+            let mut d = p.blkd.lock().unwrap();
+            let b = d.find("tank/v-a").unwrap().unwrap();
+            let mut v = Vec::new();
+            let mut cur = d.info(b).unwrap().parent;
+            while let Some(l) = cur {
+                v.push(l);
+                cur = d.info(l).unwrap().parent;
+            }
+            v
+        };
+        assert_eq!(layers.len(), 3, "two Seals and the root");
+        p.blkd.lock().unwrap().fail_drop_seal = true;
+        assert!(Pool::destroy(&p, &a, g).is_err(), "cut short");
+        p.blkd.lock().unwrap().fail_drop_seal = false;
+        // The retry (the purge's next pass, the next start's settle).
+        let again = Pool::destroy(&p, &a, g);
+        let left: Vec<LayerId> = {
+            let mut d = p.blkd.lock().unwrap();
+            layers
+                .iter()
+                .copied()
+                .filter(|l| d.info(*l).is_ok())
+                .collect()
+        };
+        assert!(
+            left.is_empty(),
+            "the retry answered {again:?} and layers {left:?} are left with no name to reach them"
+        );
+    }
+
+    /// G1-10: spool files a killed Warden left (its guards never ran) are
+    /// removed by a new Warden's pool, at the latest when it next spools.
+    #[test]
+    fn confirm_g1_10_spool_files_of_a_dead_warden_are_swept() {
+        let spool = tempfile::tempdir().unwrap();
+        let stale = [
+            spool.path().join("recv-4242-0-1.blks"),
+            spool.path().join("send-4242-1-2.blks"),
+        ];
+        for f in &stale {
+            std::fs::write(f, vec![0u8; 4096]).unwrap();
+        }
+        let p: TestPool = BlkPool::with(
+            StoreBlkd::new(),
+            FakeMounts::default(),
+            "/mnt/taso",
+            spool.path(),
+        );
+        // A start (the thaw sweep is the pool's start-time pass), a
+        // dataset, a Seal, and a send through the spool.
+        p.thaw_left_frozen(&ds("tank")).unwrap();
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
+        drop(p.sender().send(&a, None, Lsn::new(2)).unwrap());
+        let left: Vec<_> = stale.iter().filter(|f| f.exists()).collect();
+        assert!(left.is_empty(), "left in the spool: {left:?}");
+    }
+
+
+    /// Audit confirmation G3-7 (test only): two taso-genesis processes
+    /// over one daemon view the same Seal at once (two geneses from one
+    /// Vessel's Seal).  The second does not take the first's view down
+    /// under its user.
+    #[test]
+    fn g3_7_two_genesis_processes_never_take_down_each_others_views() {
+        let warden = pool();
+        let a = ds("tank/v-a");
+        warden.create(&a).unwrap();
+        warden
+            .layers(&a)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap()
+            .run()
+            .unwrap();
+        // Two processes: the same daemon and mounts, each its own count.
+        let first = BlkPool {
+            views: Arc::default(),
+            ..Clone::clone(&warden)
+        }
+        .for_genesis();
+        let second = BlkPool {
+            views: Arc::default(),
+            ..Clone::clone(&warden)
+        }
+        .for_genesis();
+        let held = first.seal_view(&a, Lsn::new(3)).unwrap();
+        let branch = warden
+            .blkd
+            .lock()
+            .unwrap()
+            .find("tank/v-a.gview-3")
+            .unwrap()
+            .unwrap();
+        calls(&warden);
+        let other = second.seal_view(&a, Lsn::new(3));
+        let c = calls(&warden);
+        let now = warden.blkd.lock().unwrap().find("tank/v-a.gview-3").unwrap();
+        assert!(
+            !c.iter().any(|c| c.starts_with("umount ")) && now == Some(branch),
+            "the first genesis's view ({}, branch {branch:?}) was taken down under it: calls {c:?}, the name is now {now:?}, the second got {:?}",
+            held.path().display(),
+            other.as_ref().map(|v| v.path().to_path_buf()).map_err(|e| e.to_string())
         );
     }
 }

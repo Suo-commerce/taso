@@ -3625,6 +3625,34 @@ pub(crate) mod tests {
         ));
     }
 
+    /// Audit confirmation G2-8 (Warden level): a fork that may run
+    /// (`birth_accepted`) is known to the coordinator as its parent's
+    /// liveness dependency (the Birth row's `Live::Fork` and its holds on
+    /// the parent's Seal closure), so the parent cannot be purged under it.
+    #[test]
+    fn g2_8_a_running_fork_blocks_its_parents_purge_at_the_coordinator() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s = seal(&mut p);
+        let child = e.host.fork(&p, s, b"child").unwrap();
+        let may_run = e.host.birth_accepted(&child).unwrap();
+        let birth = Submitted::Birth {
+            chronicle: child.id(),
+            lineage: child.lineage().clone(),
+        };
+        let accepted = e.host.coord.query_logical(birth.logical_id()).unwrap();
+        let known = e.host.coord.query_chronicle(p.id()).unwrap().is_some();
+        let blocker = e.host.coord.purge_blocker(p.id()).unwrap();
+        assert!(
+            accepted.is_some() && blocker.is_some(),
+            "the fork may run: {may_run}; its Birth accepted at the coordinator: {}; the \
+             parent is known to the coordinator log: {known}; what blocks the parent's purge: \
+             {blocker:?}",
+            accepted.is_some()
+        );
+    }
+
     #[test]
     fn forked_vessel_with_a_tampered_dataset_parent_is_refused() {
         let e = env();
@@ -3961,4 +3989,82 @@ pub(crate) mod tests {
         assert_eq!(new.id(), new_id);
         assert!(matches!(new.lineage().origin, Origin::Succession { .. }));
     }
+    // ── audit confirmation round, group g1 (tests only) ─────────────
+
+    /// G1-2 (first half): a fork over the Field that stops after the
+    /// child's state directory is made and before its Lineage is accepted
+    /// (here: the coordinator refuses the Lineage; a crash at
+    /// `fork.branched` leaves the same).  `NodeBranches::fork` takes a uid
+    /// slot as free only if `!host.dir_for(child).exists()`: the failed
+    /// fork must not leave that true for good.
+    #[test]
+    fn confirm_g1_2_a_fork_that_failed_leaves_its_slot_free() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut p);
+        let pid = p.id();
+        let child = vessel_id(ns(1), b"base.fork-3");
+        // What `unborn` leaves when the Warden stops between its steps and
+        // the Lineage (the clone, the Chronicle registered and empty).
+        let ps = (&e.host.dataset_for(pid), s1.lsn, s1.hash);
+        drop(e.host.unborn(child, Some(ps)).unwrap());
+        assert!(
+            crate::vessel::lineage_in(&e.host.dir_for(child))
+                .unwrap()
+                .is_none(),
+            "no Vessel was born"
+        );
+        assert!(
+            !e.host.dir_for(child).exists(),
+            "no Vessel of that name was born, yet its directory stays and the slot reads as taken"
+        );
+    }
+
+    /// G1-2 (second half): the clone is made, the Warden dies before the
+    /// child's directory.  The parent seals and ships again.  The agent's
+    /// next Fork ("last") takes the same slot (nothing marks it taken) and
+    /// must make the child, as `fork_from_log(.., SealAt::Last, ..)` does.
+    /// The calls are `NodeBranches::fork`'s: `shipped_seal` fixes "last"
+    /// to one lsn, then `fork_from_log(parent, SealAt::At(lsn), name)`.
+    #[test]
+    fn confirm_g1_2_a_field_fork_after_an_interrupted_one_is_not_a_conflict() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut p);
+        let pid = p.id();
+        let child_ds = e.host.dataset_for(vessel_id(ns(1), b"base.fork-3"));
+        Pool::clone(
+            &e.host.pool,
+            &e.host.dataset_for(pid),
+            s1.lsn,
+            s1.hash,
+            &child_ds,
+        )
+        .unwrap();
+        assert!(!e
+            .host
+            .dir_for(vessel_id(ns(1), b"base.fork-3"))
+            .exists());
+        // The parent moves on, and ships.
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let s2 = seal(&mut p);
+        e.host
+            .coord
+            .advance_shipped(e.host.warden, pid, p.chronicle().epoch(), s2)
+            .unwrap();
+        for round in 0..3 {
+            let seal = e.host.shipped_seal(pid, SealAt::Last).unwrap();
+            let r = e
+                .host
+                .fork_from_log(pid, SealAt::At(seal.lsn), b"base.fork-3");
+            assert!(
+                r.is_ok(),
+                "Fork request {round} after the interrupted one: {}",
+                r.err().unwrap()
+            );
+        }
+    }
+
 }

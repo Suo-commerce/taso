@@ -2588,4 +2588,84 @@ class = "Scratch"
             r.notes
         );
     }
+
+    // ── Audit confirmation round, group g3 (tests only) ─────────────
+
+    /// The one source artifact in `c`'s store: its path and bytes.
+    fn g3_only_artifact(c: &Cluster) -> (String, Vec<u8>) {
+        let any = object_key_path(PREFIX, ObjectKind::Artifact, HashVal::from_bytes([0; 32]))
+            .unwrap();
+        let dir = any.rsplit_once('/').unwrap().0.to_string();
+        let names = c.store.list(&dir).unwrap();
+        assert_eq!(names.len(), 1, "{names:?}");
+        let mut b = Vec::new();
+        c.store
+            .get(&names[0])
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut b)
+            .unwrap();
+        (names[0].clone(), b)
+    }
+
+    /// G3-6.  A resume judges the source artifact named by GenesisStarted:
+    /// an object in the store that is not its key's is an integrity error,
+    /// never a recorded (final) GenesisRefused.
+    #[test]
+    fn g3_6_a_resume_never_refuses_a_genesis_from_an_object_that_is_not_its_keys() {
+        let want = reference();
+        // Another tree's source artifact, one the judge refuses.
+        let bad = Cluster::new();
+        good_tree(&bad.src(), 0);
+        file(&bad.src(), "odd/x", b"?", 0);
+        settle(&bad.src(), 0);
+        let mut g = bad.node(1);
+        g.failpoint = fail_at("genesis.after_source_put");
+        assert!(g.run(&dir_request(&bad)).is_err());
+        let (_, bad_bytes) = g3_only_artifact(&bad);
+        // The genesis: started on node 1, which is then lost.
+        let c = Cluster::new();
+        good_tree(&c.src(), 0);
+        let mut a = c.node(1);
+        a.failpoint = fail_at("genesis.after_started_accept");
+        assert!(a.run(&dir_request(&c)).is_err());
+        let (path, good_bytes) = g3_only_artifact(&c);
+        assert_ne!(good_bytes, bad_bytes);
+        // The store now answers other bytes under the source's key.
+        c.store.delete(&path).unwrap();
+        c.store.put(&path, &mut &bad_bytes[..]).unwrap();
+        let r = c.node(2).resume(want.0);
+        let refused = accepted(&c, LogicalKey::GenesisRefused(want.0));
+        assert!(
+            refused.is_none() && matches!(r, Err(GenesisError::Integrity(_))),
+            "resume answered {:?}; accepted for the genesis: {refused:?}",
+            r.as_ref().map(|r| &r.outcome).map_err(|e| e.to_string())
+        );
+    }
+
+    /// G3-8.  A genesis interrupted on node 1 before its cleanup and
+    /// finished on node 2: a later run on node 1 removes node 1's scratch.
+    #[test]
+    fn g3_8_a_genesis_finished_elsewhere_does_not_leave_the_first_nodes_scratch() {
+        let want = reference();
+        let c = Cluster::new();
+        good_tree(&c.src(), 0);
+        let mut a = c.node(1);
+        a.failpoint = fail_at("genesis.before_cleanup");
+        assert!(a.run(&dir_request(&c)).is_err());
+        let scratch = a.scratch(want.0).unwrap();
+        assert!(a.pool.guid(&scratch).unwrap().is_some());
+        let r = c.node(2).resume(want.0).unwrap();
+        assert!(r.cleaned);
+        a.failpoint = no_failpoints();
+        let again = a.run(&dir_request(&c)).unwrap();
+        assert!(again.cleaned);
+        let by_id = a.resume(want.0).unwrap();
+        assert!(by_id.cleaned);
+        assert_eq!(
+            a.pool.guid(&scratch).unwrap(),
+            None,
+            "{scratch} is still on node 1 after the genesis was cleaned up (GenesisCleanedUp accepted) and node 1 ran it again twice"
+        );
+    }
 }

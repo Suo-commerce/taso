@@ -845,6 +845,34 @@ mod tests {
         assert_eq!(l.next_op(), OpId::new(OP_EXHAUSTED));
     }
 
+    /// Audit confirmation G4-13: "nothing is consumed until the effect is
+    /// recorded" ([`Ledger::next_op`]).  A release whose append fails (here
+    /// the coordinator refuses it: another Warden took the Vessel) records
+    /// nothing, so the next op id is what it was.
+    #[test]
+    fn g4_13_a_failed_append_consumes_no_op_id() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut l, _) = open(&mut v);
+        let d = declared("send bob", Consequence::Irreversible);
+        assert_eq!(l.release(&mut v, &d).unwrap().op, OpId::new(1));
+        let before = l.next_op();
+        e.host
+            .coord
+            .transfer(v.id(), taso_core::model::WardenId::new(2))
+            .unwrap();
+        let tail = v.tail();
+        for _ in 0..3 {
+            assert!(l.release(&mut v, &d).is_err());
+        }
+        assert_eq!(v.tail(), tail, "nothing recorded");
+        assert_eq!(
+            l.next_op(),
+            before,
+            "three failed appends recorded nothing and consumed op ids"
+        );
+    }
+
     #[test]
     fn release_writes_the_intent_and_its_release_together() {
         let e = env();

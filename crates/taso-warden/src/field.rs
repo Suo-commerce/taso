@@ -3418,4 +3418,385 @@ mod tests {
         ));
         assert!(v.last_seal().is_some());
     }
+
+    // ── Audit confirmation, group g4 (2026-11-10) ───────────────────
+
+    /// A declared effect with a request of `n` bytes and nothing else big.
+    fn declare_big(call: u64, n: usize) -> Request {
+        Request::Effect {
+            call,
+            provider: "mail".into(),
+            request: vec![call as u8; n],
+            footprint: Vec::new(),
+            retry: taso_core::record::RetryPolicy::UnsafeToRetry,
+            consequence: taso_core::record::Consequence::Irreversible,
+            authority: b"user".to_vec(),
+        }
+    }
+
+    /// G4-1: an agent that never ends a turn may not grow the local,
+    /// unsealed log without bound: somewhere a budget must refuse it.
+    /// Today every entry is accepted (each a valid Field frame), and each
+    /// reader then loads the whole log.
+    #[test]
+    fn g4_1_transcript_without_a_turn_end_is_bounded() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        s.handle(hello());
+        const ENTRY: usize = 8 << 20;
+        const N: usize = 6;
+        let mut accepted = 0;
+        for i in 0..N {
+            let req = Request::Transcript {
+                entry: vec![i as u8; ENTRY],
+            };
+            assert!(req.encode().len() <= taso_field::protocol::MAX_FRAME as usize);
+            if matches!(s.handle(req), Reply::Recorded { .. }) {
+                accepted += 1;
+            }
+        }
+        drop(s);
+        let loaded: usize = v
+            .chronicle()
+            .frames()
+            .unwrap()
+            .iter()
+            .map(|f| f.payload.len())
+            .sum();
+        assert!(
+            accepted < N,
+            "all {accepted} entries of {ENTRY} bytes were recorded with no turn ended and no Seal; \
+             frames() (what Result, Nominate, Promote and Session::new call) now loads {loaded} bytes"
+        );
+    }
+
+    /// G4-2 (a): what `Open` hands out must reach the sender: a reply the
+    /// frame cannot carry hands nothing out.  Two released effects whose
+    /// requests sum past MAX_FRAME: the reply cannot be sent, and the ops
+    /// are marked handed out all the same.
+    #[test]
+    fn g4_2_the_open_reply_fits_a_frame() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        for call in 1..=2u64 {
+            let req = declare_big(call, 9 << 20);
+            assert!(req.encode().len() <= taso_field::protocol::MAX_FRAME as usize);
+            assert!(matches!(
+                s.handle(req),
+                Reply::Effect {
+                    result: EffectResult::Released { .. },
+                    ..
+                }
+            ));
+        }
+        let reply = s.handle_as(&mut sender(), Request::Open);
+        let Reply::Open { effects } = &reply else {
+            panic!("not an Open reply")
+        };
+        assert_eq!(effects.len(), 2);
+        let sent = send_reply(&mut Vec::new(), &reply);
+        // The same on every later Open, now with both listed as handed
+        // out before (`unknown`), though no sender ever received them.
+        let again = s.handle_as(&mut sender(), Request::Open);
+        let Reply::Open { effects } = &again else {
+            panic!("not an Open reply")
+        };
+        let marked = effects.iter().filter(|e| e.unknown).count();
+        let sent_again = send_reply(&mut Vec::new(), &again);
+        assert!(
+            sent.is_ok() && sent_again.is_ok(),
+            "the Open reply ({} bytes) cannot be sent: {sent:?}; again: {sent_again:?}; \
+             {marked} op(s) marked as handed out before",
+            reply.encode().len()
+        );
+    }
+
+    /// G4-2 (b): the Checkpoint a prune writes carries every open intent
+    /// in full, so a few large open effects make it larger than a segment
+    /// payload may be and the prune fails, at every publish.
+    #[test]
+    fn g4_2_a_prune_with_large_open_effects_succeeds() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        // A small roll size so there are closed segments to prune (the
+        // daemon's are 64 MiB; a long-lived Vessel has many).
+        v.set_roll_at(1);
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(hello());
+        // 5 x 14 MiB open requests: 70 MiB, over MAX_PAYLOAD (64 MiB).
+        for call in 1..=5u64 {
+            assert!(matches!(
+                s.handle(declare_big(call, 14 << 20)),
+                Reply::Effect {
+                    result: EffectResult::Released { .. },
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                sealed: Some(_),
+                ..
+            }
+        ));
+        drop(s);
+        // Everything shipped; closed segments exist (each effect rolled).
+        assert!(v.chronicle().segments().len() > 2);
+        e.host
+            .coord
+            .advance_shipped(e.host.warden, v.id(), v.chronicle().epoch(), v.tail())
+            .unwrap();
+        let before = v.chronicle().segments().len();
+        let r = v.prune(1);
+        assert!(
+            r.is_ok(),
+            "the prune failed: {}; {} segment files stay",
+            r.as_ref().map(|_| String::new()).unwrap_or_else(|e| e.to_string()),
+            before
+        );
+    }
+
+    /// G4-3: a `Promote` naming a child no Vessel could have is refused
+    /// before it reaches the Warden's log.  Today the name reaches the
+    /// Branches hooks whole (the daemon's log it with `{:?}`, twice in one
+    /// line: once in the refusal's reason, once as the child), whatever
+    /// its length; a control byte is 5 bytes in the Debug form, so the
+    /// line is 10 times the name.
+    #[test]
+    fn g4_3_a_huge_child_name_is_refused_before_the_hooks() {
+        struct Seen {
+            child_log: usize,
+            promoted: usize,
+            line: usize,
+        }
+        impl Branches<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers> for Seen {
+            fn fork(
+                &mut self,
+                _: &Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>,
+                _: SealAt,
+            ) -> Result<(String, u64), String> {
+                Err("no".into())
+            }
+            // The daemon's `NodeBranches::child_log` and `promoted`, their
+            // formatting copied (daemon.rs).
+            fn child_log(
+                &mut self,
+                _: &Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>,
+                child: &str,
+            ) -> Result<ReadLog, String> {
+                self.child_log = child.len();
+                Err(format!(
+                    "the log of {child:?} cannot be read here: no such vessel"
+                ))
+            }
+            fn promoted(&mut self, child: &str, result: &PromoteResult) {
+                self.promoted = child.len();
+                if let PromoteResult::Refused { reason } = result {
+                    self.line = format!("promotion of {child:?} refused: {reason}").len();
+                }
+            }
+        }
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut b = Seen {
+            child_log: 0,
+            promoted: 0,
+            line: 0,
+        };
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        // 1 MiB here; the frame allows 16 MiB.
+        let child = "\u{1}".repeat(1 << 20);
+        let req = Request::Promote {
+            child: child.clone(),
+            seal: None,
+        };
+        // It comes through the wire's decoder unchanged.
+        let req = Request::decode(&req.encode()).unwrap();
+        let reply = s.handle(req);
+        let reply_len = reply.encode().len();
+        drop(s);
+        assert!(
+            b.child_log == 0 && b.promoted == 0,
+            "a child name of {} bytes reached child_log ({} bytes) and promoted ({} bytes); \
+             the daemon's log line for it is {} bytes ({}x); the reply is {} bytes",
+            child.len(),
+            b.child_log,
+            b.promoted,
+            b.line,
+            b.line / child.len(),
+            reply_len
+        );
+    }
+
+    /// G4-6: a turn number that leaves no later turn is not taken: after
+    /// it the Vessel (and every fork and successor of it) could never be
+    /// sealed by its harness again.
+    #[test]
+    fn g4_6_the_last_turn_number_does_not_end_the_seals() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        s.handle(hello());
+        let first = s.handle(Request::TurnEnd {
+            turn: u64::MAX,
+            quiescent: true,
+        });
+        let sealed_max = matches!(
+            first,
+            Reply::TurnEnd {
+                sealed: Some(_),
+                ..
+            }
+        );
+        // Whatever was answered, a later ordinary turn must still seal.
+        let later = s.handle(Request::TurnEnd {
+            turn: 2,
+            quiescent: true,
+        });
+        drop(s);
+        // A fork of it takes its turn over.
+        let seal = v.last_seal().unwrap();
+        let c = e.host.fork(&v, seal, b"child").unwrap();
+        let inherited = e.host.birth_turn(&c).unwrap();
+        assert!(
+            matches!(
+                later,
+                Reply::TurnEnd {
+                    sealed: Some(_),
+                    ..
+                }
+            ),
+            "turn u64::MAX sealed: {sealed_max}; turn 2 after it: {later:?}; a fork's birth turn: {}",
+            inherited.get()
+        );
+    }
+
+    /// G4-4: a connection that cannot be set up (`set_nonblocking` or
+    /// `try_clone` failing, here with EMFILE) ends the serve at once, as
+    /// an accept error does: the open connections are shut down so their
+    /// threads end.  Today the `?` leaves the scope with those threads
+    /// still reading the agent's streams, and the scope waits for them
+    /// for as long as the agent keeps its connection open.
+    ///
+    /// Ignored by default: it lowers RLIMIT_NOFILE for the whole test
+    /// process for three seconds.  Run it alone:
+    /// `cargo test -p taso-warden --lib g4_4 -- --ignored`.
+    #[test]
+    #[ignore]
+    fn g4_4_a_connection_that_cannot_be_set_up_ends_the_serve() {
+        use rustix::process::{getrlimit, setrlimit, Resource};
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = FieldSocket::bind(dir.path().join("agent.sock")).unwrap();
+        let sender = FieldSocket::bind(dir.path().join("sender.sock")).unwrap();
+        let (returned, stop, hung) = (
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        );
+        let mut result = None;
+        std::thread::scope(|scope| {
+            let a = agent.path().to_path_buf();
+            let (returned, stop, hung) = (&returned, &stop, &hung);
+            scope.spawn(move || {
+                // One agent connection, served.
+                let mut first = UnixStream::connect(&a).unwrap();
+                send_request(&mut first, &hello()).unwrap();
+                recv_reply(&mut first).unwrap().unwrap();
+                // Leave exactly two free descriptors: the next client's
+                // and the one its accept takes.  `try_clone` then fails.
+                let highest = || {
+                    std::fs::read_dir("/proc/self/fd")
+                        .unwrap()
+                        .filter_map(|d| d.ok()?.file_name().to_str()?.parse::<i32>().ok())
+                        .max()
+                        .unwrap()
+                };
+                let top = highest();
+                let mut fill = Vec::new();
+                loop {
+                    let f = std::fs::File::open("/dev/null").unwrap();
+                    if f.as_raw_fd() > top {
+                        break;
+                    }
+                    fill.push(f);
+                }
+                let old = getrlimit(Resource::Nofile);
+                let mut low = old.clone();
+                low.current = Some(top as u64 + 3);
+                setrlimit(Resource::Nofile, low).unwrap();
+                let second = UnixStream::connect(&a);
+                // The serve should end by itself now.
+                for _ in 0..300 {
+                    if returned.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                hung.store(!returned.load(Ordering::SeqCst), Ordering::SeqCst);
+                setrlimit(Resource::Nofile, old).unwrap();
+                drop(fill);
+                drop(second);
+                // Only now does the agent close its first connection.
+                drop(first);
+                stop.store(true, Ordering::SeqCst);
+            });
+            let mut session = Session::new(&mut v, Verdict::Clean).unwrap();
+            result = Some(serve_vessel(
+                &mut session,
+                &agent,
+                &sender,
+                &|| stop.load(Ordering::SeqCst),
+                Duration::from_millis(5),
+                &mut |_| {},
+            ));
+            returned.store(true, Ordering::SeqCst);
+        });
+        let result = result.unwrap();
+        assert!(
+            result.is_err(),
+            "the set-up did not fail (the test's descriptor count is off): {result:?}"
+        );
+        assert!(
+            !hung.load(Ordering::SeqCst),
+            "serve_vessel failed with {result:?} but did not return for 3 s: it returned only \
+             when the agent closed its other connection"
+        );
+    }
 }

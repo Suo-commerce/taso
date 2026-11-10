@@ -309,6 +309,36 @@ mod tests {
         assert_eq!(outcome_of(e), Outcome::Timeout);
     }
 
+    /// Audit confirmation G4-5: a kill that did not take (here: the first
+    /// call does nothing, as a `runc kill` that found no container yet)
+    /// must be asked for again; the run may not go on past its wall time
+    /// for as long as the process likes.  The child ends by itself after
+    /// 4 s so the test cannot hang.
+    #[test]
+    fn g4_5_a_kill_that_did_not_take_is_asked_for_again() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let flaky = |pid: u32| {
+            if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                kill(pid);
+            }
+        };
+        let t = Instant::now();
+        let (e, _) = run_capped(
+            &mut sh("exec sleep 4"),
+            Duration::from_millis(200),
+            1 << 10,
+            &flaky,
+        )
+        .unwrap();
+        assert_eq!(e, Ended::Timeout);
+        let (n, took) = (calls.load(Ordering::SeqCst), t.elapsed());
+        assert!(
+            n > 1 && took < Duration::from_secs(3),
+            "the kill was asked for {n} time(s) and the run went on for {took:?} past a 200 ms wall time"
+        );
+    }
+
     #[test]
     fn out_of_cpu_is_a_timeout_and_other_signals_an_exit() {
         let (e, _) =

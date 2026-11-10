@@ -569,6 +569,44 @@ mod tests {
     use crate::canon::Canonical;
     use proptest::prelude::*;
 
+    /// Audit confirmation G4-11: what `Reader::seq` reserves before it has
+    /// decoded one element is in proportion to its input.  It checks only
+    /// `count <= remaining bytes` and then reserves `count` elements, so
+    /// for a Checkpoint's `open` list a payload of the largest size a
+    /// segment takes (64 MiB, `MAX_PAYLOAD` in taso-warden) reserves
+    /// `count * size_of::<OpenEffect>()`.  Arithmetic only: nothing of
+    /// that size is allocated here.
+    #[test]
+    fn g4_11_a_sequence_reserves_in_proportion_to_its_input() {
+        const MAX_PAYLOAD: u64 = 64 << 20;
+        // A real count-prefixed sequence is accepted on the count alone:
+        // 1000 claimed elements over 1000 bytes pass the check, and the
+        // first element is asked for (after the reservation).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&crate::canon::Canon::default().u64(1000).as_bytes().to_vec());
+        bytes.extend_from_slice(&[0u8; 1000]);
+        let mut asked = 0;
+        let mut r = Reader::new(&bytes);
+        let got: R<Vec<OpenEffect>> = r.seq(|r| {
+            asked += 1;
+            Err(DecodeError::Truncated {
+                at: r.position(),
+                need: 1,
+            })
+        });
+        assert!(got.is_err() && asked == 1, "the count was accepted");
+        // The largest count a 64 MiB payload can claim: one per byte left.
+        let count = MAX_PAYLOAD - 256;
+        let each = std::mem::size_of::<OpenEffect>() as u64;
+        let reserved = count * each;
+        assert!(
+            reserved <= 4 * MAX_PAYLOAD,
+            "size_of::<OpenEffect>() = {each}; a {MAX_PAYLOAD}-byte payload claiming {count} open effects \
+             makes Vec::with_capacity reserve {reserved} bytes ({} GiB) before one is decoded",
+            reserved >> 30
+        );
+    }
+
     // ── generators ──────────────────────────────────────────────────
 
     fn lsn() -> impl Strategy<Value = Lsn> {

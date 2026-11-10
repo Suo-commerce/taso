@@ -1407,6 +1407,130 @@ mod tests {
         assert_eq!(r.runner.calls.borrow().len(), 1);
     }
 
+    // ── Audit confirmation, group g4 (2026-11-10) ───────────────────
+
+    /// G4-7: what a container prints is not kept in the Warden's memory
+    /// without bound.  A stand-in for `runc run` that prints 8 MiB on each
+    /// of stdout and stderr (an agent does, through `"terminal": false`
+    /// and no redirection in the bundle): `Runc::run` returns all of it.
+    #[test]
+    fn g4_7_a_containers_output_is_kept_within_a_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join("runc");
+        std::fs::write(
+            &prog,
+            "#!/bin/sh\nhead -c 8388608 /dev/zero | tr '\\0' o\nhead -c 8388608 /dev/zero | tr '\\0' e >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = RuncCli {
+            program: prog,
+            root: dir.path().join("root"),
+        };
+        // The bundle leaves the agent's output where runc's is.
+        let c = oci_config(&spec()).unwrap();
+        assert_eq!(c["process"]["terminal"], json!(false));
+        let (_, out, _) = cli.run(&s(&["run", "--bundle", "/b", "x"])).unwrap();
+        let (ok, err) = Runc::new(cli).run(Path::new("/b"), "x").unwrap();
+        assert!(!ok);
+        assert!(
+            err.len() <= 1 << 20 && out.len() <= 1 << 20,
+            "collected {} bytes of stderr and {} of stdout (then dropped) in memory",
+            err.len(),
+            out.len()
+        );
+    }
+
+    /// G4-8: new namespaces are refused however they are asked for:
+    /// `unshare` and `setns` are on the deny list, `clone`/`clone3` with
+    /// `CLONE_NEW*` are the same request.
+    #[test]
+    fn g4_8_clone_into_new_namespaces_is_refused_like_unshare() {
+        assert!(DENIED_SYSCALLS.contains(&"unshare") && DENIED_SYSCALLS.contains(&"setns"));
+        for c in [
+            oci_config(&spec()).unwrap(),
+            verifier_config(&VerifierSpec {
+                id: "a-0123".into(),
+                rootfs: "/mnt/t".into(),
+                candidate: "/mnt/a".into(),
+                uid_base: 789_824,
+                args: vec!["/bin/check".into()],
+                env: vec![],
+                memory_bytes: 1 << 30,
+                cpu_seconds: 60,
+                pids: 64,
+            })
+            .unwrap(),
+        ] {
+            let rules = c["linux"]["seccomp"]["syscalls"].as_array().unwrap();
+            assert_eq!(c["linux"]["seccomp"]["defaultAction"], json!("SCMP_ACT_ALLOW"));
+            let covered = |name: &str| {
+                rules.iter().any(|r| {
+                    r["action"] != json!("SCMP_ACT_ALLOW")
+                        && r["names"].as_array().unwrap().contains(&json!(name))
+                })
+            };
+            assert!(
+                covered("clone") && covered("clone3"),
+                "{} rule(s); clone covered: {}, clone3 covered: {}",
+                rules.len(),
+                covered("clone"),
+                covered("clone3")
+            );
+        }
+    }
+
+    /// G4-9: the host's `/sys` is not bound into a container.  (`ro` on an
+    /// `rbind` is the top mount's alone; the mounts under it keep their
+    /// own flags.)
+    #[test]
+    fn g4_9_the_hosts_sys_is_not_bound_in() {
+        let v = verifier_config(&VerifierSpec {
+            id: "a-0123".into(),
+            rootfs: "/mnt/t".into(),
+            candidate: "/mnt/a".into(),
+            uid_base: 789_824,
+            args: vec!["/bin/check".into()],
+            env: vec![],
+            memory_bytes: 1 << 30,
+            cpu_seconds: 60,
+            pids: 64,
+        })
+        .unwrap();
+        for (what, c) in [("vessel", oci_config(&spec()).unwrap()), ("verifier", v)] {
+            let sys = mount(&c, "/sys");
+            let opts = sys["options"].as_array().unwrap();
+            assert!(
+                !(sys["source"] == json!("/sys") && opts.contains(&json!("rbind"))),
+                "{what}: /sys is {sys}"
+            );
+        }
+    }
+
+    /// G4-10: an environment that changes what the Landlock shim itself
+    /// loads is refused: the shim is `args[0]`, dynamically linked, and
+    /// restricts itself only after the loader has run.
+    #[test]
+    fn g4_10_loader_variables_do_not_reach_the_landlock_shim() {
+        for e in ["LD_PRELOAD=/work/evil.so", "LD_LIBRARY_PATH=/work/lib", "LD_AUDIT=/work/a.so"] {
+            let mut sp = spec();
+            sp.landlock_shim = Some("/usr/lib/taso/landlock".into());
+            sp.env = vec![e.into()];
+            // The config's own check passes it too.
+            assert_eq!(crate::daemon::check_env(&sp.env), Ok(()));
+            let r = oci_config(&sp);
+            let reaches = r.as_ref().is_ok_and(|c| {
+                c["process"]["args"][0] == json!("/usr/lib/taso/landlock")
+                    && c["process"]["env"].as_array().unwrap().contains(&json!(e))
+            });
+            assert!(
+                matches!(r, Err(SpecError::BadEnv(_))),
+                "{e} accepted; it reaches the shim's environment: {reaches}"
+            );
+        }
+    }
+
     #[test]
     fn cli_creates_its_root_before_running() {
         use std::os::unix::fs::PermissionsExt;

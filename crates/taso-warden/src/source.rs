@@ -714,6 +714,41 @@ mod tests {
         assert_eq!(set.iter().find(|v| v.subject == "p").unwrap().uid_slot, 1);
     }
 
+    /// Confirmation G5-8: a requested child does not outlive its parent's
+    /// entry: once the source no longer lists the parent, the child is not
+    /// in the set either (nothing else can ever take it out).
+    #[test]
+    fn g5_8_a_requested_child_leaves_the_set_with_its_parent() {
+        struct Script(std::collections::VecDeque<Option<Vec<VesselConf>>>);
+        impl VesselSource for Script {
+            fn poll(&mut self, _: Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+                Ok(self.0.pop_front().flatten())
+            }
+            fn is_finite(&self) -> bool {
+                false
+            }
+        }
+        let z = Duration::ZERO;
+        let req = Requested::new();
+        let parent = with_forks("p", 1, &[5]);
+        let child = crate::daemon::ForksConf::child(&parent, 5, taso_core::envelope::Lsn::new(3));
+        let mut inner = Script([Some(vec![parent.clone()]), None, Some(vec![])].into());
+        let mut src = WithRequested::new(&mut inner, req.clone());
+        assert_eq!(names(&src.poll(z).unwrap().unwrap()), vec!["p"]);
+        assert!(req.add(child.clone()));
+        assert_eq!(src.poll(z).unwrap().unwrap().len(), 2, "parent and child");
+        // The parent's entry is deleted from the source.
+        let set = src.poll(z).unwrap().unwrap();
+        let mut guard = Guard::new(runtime());
+        let admitted = guard.admit(set.clone());
+        assert!(
+            set.is_empty(),
+            "the parent is gone from the source and the set still holds {:?}; the guard admits {:?}",
+            names(&set),
+            names(&admitted.set)
+        );
+    }
+
     fn with_forks(subject: &str, slot: u32, forks: &[u32]) -> VesselConf {
         VesselConf {
             forks: Some(Box::new(crate::daemon::ForksConf {
