@@ -1331,8 +1331,13 @@ fn sync(
 
 /// Refuse `warden` if it is not `chronicle`'s holder, then [`sync`]: the
 /// current epoch is its holder's (P4 spec §1.6, §1.8; as for an append).
-/// A Chronicle with no ownership row is left to the log, which answers
-/// for an unknown Chronicle itself (`StaleEpoch`).
+/// A Chronicle with no ownership row has no holder, so nobody may
+/// announce, accept or cancel for it: the request is refused
+/// ([`CoordError::UnknownChronicle`]) before the log sees it and nothing
+/// is journalled.  It used to be passed on to the log, whose `cancel`
+/// then kept the submission id as refused for good, against the
+/// Chronicle's later first holder (audit 2026-11-09, cancel of an
+/// unowned Chronicle).
 fn holder_synced(
     shared: &Shared,
     t: &mut Tables<'_>,
@@ -1345,7 +1350,7 @@ fn holder_synced(
             holder: state.holder,
         }),
         Some(state) => sync(shared, t, chronicle, &state),
-        None => Ok(()),
+        None => Err(CoordError::UnknownChronicle(chronicle)),
     }
 }
 
@@ -3716,6 +3721,44 @@ mod log_tests {
             "a read-only query answered `{e}` (outcome_unknown = {}), and the in-memory log \
              was discarded: the next request replays the whole journal",
             e.outcome_unknown()
+        );
+    }
+
+    /// Audit 2026-11-09, a `cancel` naming a Chronicle nobody held yet (no
+    /// ownership row) was run and journalled, and the log kept the
+    /// submission id as refused for good: the Chronicle's later first
+    /// holder was answered `FinalRefused` for a submission somebody else
+    /// had cancelled before the Chronicle existed.  Such a request is
+    /// refused (`UnknownChronicle`) and records nothing.
+    #[test]
+    fn a_cancel_of_an_unowned_chronicle_refuses_nothing_of_its_later_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Fake::default());
+        let coord = open(&dir.path().join("c.redb"), store.clone());
+        let g = genesis();
+        let t0 = g.genesis_id;
+        let r = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(g)));
+        let s = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 1);
+        // B is nobody to t0; t0 has no ownership row and is unknown to the log.
+        let rows = journal_len(&coord);
+        let pre = coord.cancel(B, t0, Epoch::FIRST, s);
+        let journalled = journal_len(&coord) - rows;
+        assert!(
+            matches!(pre, Err(CoordError::UnknownChronicle(c)) if c == t0) && journalled == 0,
+            "warden B's cancel on the unowned Chronicle answered {pre:?} and wrote {journalled} \
+             journal row(s)"
+        );
+        // Now the real holder claims it and submits its first record.
+        store.put(ObjectId::content(h(0x20)));
+        store.put(ObjectId::content(h(0x21)));
+        coord
+            .claim_chronicle(t0, A, ClaimAuthority::Genesis)
+            .unwrap();
+        let a = submit(&coord, &store, t0, Epoch::FIRST, 1, r);
+        assert!(
+            matches!(a, Answer::Accepted { .. }),
+            "warden B's cancel on the unowned Chronicle answered {pre:?} and wrote {journalled} \
+             journal row(s); holder A's first submission then answered {a:?}"
         );
     }
 }
