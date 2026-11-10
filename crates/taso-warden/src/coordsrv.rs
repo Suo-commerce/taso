@@ -1516,7 +1516,11 @@ impl Drop for Server {
 /// carries one request at a time.  Idle connections are kept for reuse
 /// (at most [`MAX_IDLE`]).  Any failure to get an answer is
 /// [`CoordError::Unavailable`]; that connection is dropped, never reused,
-/// and the next call opens a new one.  Nothing is retried.
+/// and the next call opens a new one.  If the connection that failed was
+/// an idle one taken for reuse, the other idle ones are dropped with it:
+/// they were opened to the same coordinator, which has most likely
+/// restarted, and each would otherwise fail one call of its own (audit
+/// 2026-11-09, dead idle connections).  Nothing is retried.
 pub struct RemoteCoord {
     path: PathBuf,
     timeout: Duration,
@@ -1542,10 +1546,10 @@ impl RemoteCoord {
         }
     }
 
-    /// An idle connection, or a new one.
-    fn checkout(&self) -> Result<UnixStream, CoordError> {
+    /// An idle connection, or a new one; `true` with an idle one.
+    fn checkout(&self) -> Result<(UnixStream, bool), CoordError> {
         if let Some(s) = self.idle.lock().unwrap_or_else(|p| p.into_inner()).pop() {
-            return Ok(s);
+            return Ok((s, true));
         }
         // An interrupted connect left nothing behind (a new socket each
         // try): retry it.  See `read_frame` on EINTR.
@@ -1559,7 +1563,7 @@ impl RemoteCoord {
             .map_err(CoordError::Unavailable)?;
         s.set_write_timeout(Some(self.timeout))
             .map_err(CoordError::Unavailable)?;
-        Ok(s)
+        Ok((s, false))
     }
 
     /// Give a connection that just answered cleanly back for reuse.
@@ -1571,7 +1575,7 @@ impl RemoteCoord {
     }
 
     fn call(&self, req: Request) -> Result<Reply, CoordError> {
-        let mut stream = self.checkout()?;
+        let (mut stream, was_idle) = self.checkout()?;
         let result = (|| {
             write_frame(&mut stream, &req.encode()).map_err(unavailable)?;
             let body = read_frame(&mut stream)
@@ -1599,7 +1603,21 @@ impl RemoteCoord {
                 Ok(reply)
             }
             // The connection is dropped: whatever it holds is not trusted.
-            Err(e) => Err(e),
+            // The request is not sent again on another connection: once
+            // its bytes may have left, only the caller can settle what
+            // became of it.
+            Err(e) => {
+                if was_idle {
+                    // An idle connection that fails was most likely
+                    // opened to a coordinator that has since restarted,
+                    // and then so were all the other idle ones.  Drop
+                    // them now, so the next call connects afresh instead
+                    // of failing once per dead connection (audit
+                    // 2026-11-09, dead idle connections).
+                    self.idle.lock().unwrap_or_else(|p| p.into_inner()).clear();
+                }
+                Err(e)
+            }
         }
     }
 }
@@ -3251,5 +3269,38 @@ mod tests {
                 Box::new(e.client())
             })?;
         }
+    }
+
+    /// Audit 2026-11-09, after the coordinator restarted, every idle
+    /// connection the client kept failed one call each (up to `MAX_IDLE`
+    /// calls answered "unavailable, outcome unknown" against a coordinator
+    /// that was back and answering).  One failed call is enough to find out.
+    #[test]
+    fn after_a_restart_one_failed_call_is_enough() {
+        const IDLE: usize = 8;
+        let mut e = Env::new();
+        let c = e.client();
+        c.register(chron(1), A).unwrap();
+        // IDLE connections in flight together, then idle (as after a burst
+        // of concurrent calls: `concurrent_calls_are_in_flight_together`).
+        let held: Vec<UnixStream> = (0..IDLE).map(|_| c.checkout().unwrap().0).collect();
+        for s in held {
+            c.checkin(s);
+        }
+        assert_eq!(c.idle.lock().unwrap().len(), IDLE);
+        e.stop();
+        e.start();
+        // The coordinator is back and answering.
+        assert_eq!(e.client().ownership(chron(1)).unwrap().holder, A);
+        let failed: Vec<String> = (0..IDLE + 2)
+            .filter_map(|_| c.head(chron(1)).err())
+            .map(|e| format!("{e} (outcome unknown: {})", e.outcome_unknown()))
+            .collect();
+        assert!(
+            failed.len() <= 1,
+            "with the coordinator back up, {} of {} calls failed: {failed:?}",
+            failed.len(),
+            IDLE + 2
+        );
     }
 }
