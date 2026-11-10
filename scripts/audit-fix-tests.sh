@@ -35,6 +35,7 @@ one after_a_restart_one_failed_call_is_enough $W
 one a_panicking_worker_closes_its_connection $W
 one a_panicking_worker_closes_its_connection_and_frees_its_place $W
 one a_cancel_of_an_unowned_chronicle_refuses_nothing_of_its_later_holder $W
+one a_cancel_under_a_stale_epoch_refuses_nothing_of_the_pending_submission $W
 # The agent's side: the session, the verifier, the ledger
 one a_child_name_no_fork_could_have_is_refused_before_the_hooks $W
 one a_subject_longer_than_a_resource_may_have_is_refused $W

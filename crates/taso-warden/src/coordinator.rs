@@ -1805,6 +1805,27 @@ impl Coord for Coordinator {
         let shared = self.shared.clone();
         self.write(move |t| {
             holder_synced(&shared, t, warden, chronicle)?;
+            // A cancel under an epoch that is not the Chronicle's is
+            // refused here, before the log runs it and before anything
+            // is journalled, unless the submission's answer is final
+            // already (then the log repeats that answer and changes
+            // nothing).  The log's own `cancel` leaves the pending
+            // submission alone under another epoch but still keeps the
+            // id as refused for good, so the holder's accept of its
+            // pending submission was then refused `Cancelled` (audit
+            // 2026-11-09, cancel under a stale epoch).  The log's rule
+            // is not changed: the journal keeps each answer and replay
+            // compares them, so journals written before this still
+            // open (D&D Y5 (c)).
+            {
+                let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+                let log = loaded(&mut g, &shared, &t.journal)?;
+                let open =
+                    log.query_submission(chronicle, submission) == SubmissionStatus::AbsentAtRead;
+                if open && log.epoch(chronicle) != Some(epoch) {
+                    return Ok(Answer::FinalRefused(taso_core::coordlog::Final::StaleEpoch));
+                }
+            }
             let op = Op::Cancel {
                 chronicle,
                 epoch,
@@ -3721,6 +3742,70 @@ mod log_tests {
             "a read-only query answered `{e}` (outcome_unknown = {}), and the in-memory log \
              was discarded: the next request replays the whole journal",
             e.outcome_unknown()
+        );
+    }
+
+    /// Audit 2026-11-09, a `cancel` under an epoch that is not the
+    /// Chronicle's left the pending submission pending but kept its id as
+    /// refused for good: the holder's accept of that submission, under
+    /// the current epoch, was then refused `Cancelled`.  Such a cancel is
+    /// answered `StaleEpoch`, changes nothing and writes nothing; a
+    /// cancel under the current epoch still cancels.
+    #[test]
+    fn a_cancel_under_a_stale_epoch_refuses_nothing_of_the_pending_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Fake::default());
+        let coord = open(&dir.path().join("c.redb"), store.clone());
+        let g = genesis();
+        let t0 = g.genesis_id;
+        store.put(ObjectId::content(h(0x20)));
+        store.put(ObjectId::content(h(0x21)));
+        coord
+            .claim_chronicle(t0, A, ClaimAuthority::Genesis)
+            .unwrap();
+        let r = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(g)));
+        let s = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 1);
+        coord
+            .announce(A, t0, Epoch::FIRST, s, r.logical_id(), r.digest())
+            .unwrap()
+            .unwrap();
+        let rows = journal_len(&coord);
+        let stale = Epoch::new(Epoch::FIRST.get() + 7);
+        let c = coord.cancel(A, t0, stale, s).unwrap();
+        let journalled = journal_len(&coord) - rows;
+        assert!(
+            c == Answer::FinalRefused(Final::StaleEpoch) && journalled == 0,
+            "the cancel under epoch {} answered {c:?} and wrote {journalled} journal row(s)",
+            stale.get()
+        );
+        assert_eq!(
+            coord.query_submission(t0, s).unwrap(),
+            SubmissionStatus::AbsentAtRead,
+            "the submission is not final"
+        );
+        // The pending submission is accepted under the current epoch.
+        store.ship(t0, "pack-1", &r);
+        let head = coord.query_chronicle(t0).unwrap().unwrap().head;
+        let a = coord
+            .accept(A, t0, Epoch::FIRST, s, head, "pack-1".into(), r.clone())
+            .unwrap();
+        assert!(
+            matches!(a, Answer::Accepted { .. }),
+            "the cancel under epoch {} answered {c:?}; the accept of the pending submission: {a:?}",
+            stale.get()
+        );
+        // Final now: a cancel under any epoch repeats that answer.
+        assert!(matches!(
+            coord.cancel(A, t0, stale, s).unwrap(),
+            Answer::AlreadyAccepted { .. }
+        ));
+        // A cancel under the current epoch still cancels what is pending.
+        let r2 = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(genesis())));
+        let s2 = submission_id(r2.logical_id(), r2.digest(), Epoch::FIRST, 2);
+        let _ = coord.announce(A, t0, Epoch::FIRST, s2, r2.logical_id(), r2.digest());
+        assert_eq!(
+            coord.cancel(A, t0, Epoch::FIRST, s2).unwrap(),
+            Answer::FinalRefused(Final::Cancelled)
         );
     }
 
