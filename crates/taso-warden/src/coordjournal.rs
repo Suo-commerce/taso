@@ -1011,6 +1011,7 @@ pub(crate) fn put_view(o: &mut Canon, v: &ChronicleView) {
     o.u64(v.epoch.get());
     put_head(o, &v.head);
     o.bool(v.retired);
+    o.bool(v.sanctioned);
     match &v.pending {
         None => o.tag(0),
         Some(s) => o.tag(1).fixed(s.as_bytes()),
@@ -1030,6 +1031,7 @@ pub(crate) fn get_view(r: &mut Rd<'_>) -> Result<ChronicleView, JournalError> {
         epoch: Epoch::new(r.u64()?),
         head: get_head(r)?,
         retired: r.bool()?,
+        sanctioned: r.bool()?,
         pending: match r.u8()? {
             0 => None,
             1 => Some(HashVal::from_bytes(r.fixed()?)),

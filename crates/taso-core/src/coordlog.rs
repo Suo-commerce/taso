@@ -944,6 +944,10 @@ impl CoordLog {
             epoch: ch.epoch,
             head: ch.head,
             retired: ch.retired,
+            sanctioned: self
+                .cands
+                .values()
+                .any(|k| k.chronicle == *c && k.commit.is_some()),
             pending: ch
                 .pending
                 .as_ref()
@@ -1915,6 +1919,11 @@ pub struct ChronicleView {
     pub head: Head,
     /// Whether its `PurgeCommitted` is accepted.
     pub retired: bool,
+    /// Whether a `SanctionCommitted` of one of its Candidates is accepted,
+    /// its sanction completed or not.  The Warden's TTL pass keeps such a
+    /// Vessel (D81) and reads it here: the Vessel's local log loses the
+    /// commit's record to pruning (audit 2026-11-09, A1).
+    pub sanctioned: bool,
     /// The pending submission, if any.
     pub pending: Option<HashVal>,
     /// Log positions of its accepted records, in order.
@@ -2456,7 +2465,10 @@ mod tests {
         assert!(w.log.is_template(f.t0));
         let (fin, vd) = to_verdict(&mut w, &f);
         let s = commit(&f.k, &fin, &vd, f.t0);
+        // A verdict is not a sanction; the accepted commit is (A1).
+        assert!(!w.log.query_chronicle(f.v).unwrap().sanctioned);
         w.ok(f.v, ContractRecord::SanctionCommitted(s));
+        assert!(w.log.query_chronicle(f.v).unwrap().sanctioned);
         // The source cannot retire while the sanction is open.
         let (pc, _) = purge_inventory(&mut w, f.v);
         assert_eq!(
@@ -2479,6 +2491,10 @@ mod tests {
                 template_id: s.template_id,
             },
         );
+        // Completed, the source still reads as sanctioned; the Template
+        // it became does not (nothing of its own was sanctioned).
+        assert!(w.log.query_chronicle(f.v).unwrap().sanctioned);
+        assert!(!w.log.query_chronicle(s.template_id).unwrap().sanctioned);
         // The artifact is the Template's now.
         assert_eq!(
             w.log.holders(&ObjectId::content(s.artifact_key)),
