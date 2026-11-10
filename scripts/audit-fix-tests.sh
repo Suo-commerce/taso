@@ -47,6 +47,9 @@ one of_what_an_agent_prints_the_warden_keeps_the_end $W
 one transcript_between_two_seals_is_bounded_and_a_seal_makes_room $W
 one a_full_outbox_refuses_a_new_effect_until_an_outcome_is_reported $W
 one a_promotion_that_would_overfill_the_outbox_is_refused_before_it_is_recorded $W
+# Forks
+one a_fork_asked_again_from_a_newer_seal_replaces_the_interrupted_clone $W
+one a_fork_slot_is_taken_by_a_born_child_not_by_a_directory $W
 # The reclaimer
 one a_pass_claims_nothing_the_coordinator_says_it_would_refuse $W
 # Kubernetes

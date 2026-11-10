@@ -2894,6 +2894,40 @@ impl<R: RuncRunner> Drop for RunningAgent<R> {
     }
 }
 
+/// The first of `slots` that no child of `vc` has taken: not asked for
+/// in this Warden's life, no child of that name born (`born`: the
+/// coordinator accepted a record of it), and no files of anyone's owned
+/// by its range.  `None` if every one is taken.
+///
+/// A child is taken by being born, not by having a directory on this
+/// node: a fork interrupted after its directory was made, before its
+/// Lineage was accepted, left a directory and nothing else, and its slot
+/// read as taken for good (audit 2026-11-09, an interrupted fork uses up
+/// its uid slot).  The next fork of that slot finishes or replaces what
+/// it left ([`crate::vessel::Host::fork_from_log`]).
+fn free_fork_slot(
+    node: &Node,
+    vc: &VesselConf,
+    slots: &[u32],
+    born: impl Fn(ChronicleId) -> Result<bool, String>,
+) -> Result<Option<u32>, String> {
+    for &slot in slots {
+        let id = vessel_id(
+            vc.namespace,
+            ForksConf::child_name(&vc.subject, slot).as_bytes(),
+        );
+        if node.requested.contains(id.as_bytes())
+            || node.held.iter().any(|h| h.slots.contains(&slot))
+        {
+            continue;
+        }
+        if !born(id).map_err(|e| format!("is the fork in uid slot {slot} born? {e}"))? {
+            return Ok(Some(slot));
+        }
+    }
+    Ok(None)
+}
+
 impl Branches<BlkLayers> for NodeBranches<'_> {
     fn fork(&mut self, vessel: &Vessel<BlkLayers>, at: SealAt) -> Result<(String, u64), String> {
         let Some(forks) = &self.vc.forks else {
@@ -2903,18 +2937,9 @@ impl Branches<BlkLayers> for NodeBranches<'_> {
             ));
         };
         let host = self.node.host();
-        // The first slot no child has taken: not asked for in this
-        // Warden's life, no Vessel of that name on this node, and no
-        // files of anyone's owned by its range.
-        let slot = forks.slots.iter().copied().find(|&slot| {
-            let id = vessel_id(
-                self.vc.namespace,
-                ForksConf::child_name(&self.vc.subject, slot).as_bytes(),
-            );
-            !self.node.requested.contains(id.as_bytes())
-                && !host.dir_for(id).exists()
-                && !self.node.held.iter().any(|h| h.slots.contains(&slot))
-        });
+        let slot = free_fork_slot(self.node, self.vc, &forks.slots, |id| {
+            host.is_born(id).map_err(|e| e.to_string())
+        })?;
         let Some(slot) = slot else {
             return Err(format!(
                 "no fork slot left: all {} of {:?}'s are taken",
@@ -8062,6 +8087,54 @@ mod tests {
             attempt_failpoint: crate::attempt::no_failpoints(),
             decide_slots: Default::default(),
         }
+    }
+
+    /// Audit 2026-11-09, an interrupted fork used up its uid slot: the
+    /// Warden took a slot as free only if no directory of its child was
+    /// on the node, and a fork interrupted after the directory was made,
+    /// before its Lineage was accepted, left one.  A slot is taken by a
+    /// child that was born; a directory alone does not take it.
+    #[test]
+    fn a_fork_slot_is_taken_by_a_born_child_not_by_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = bare_node(tmp.path());
+        let vc = &node.config.vessels[0];
+        let child = |slot: u32| {
+            vessel_id(
+                vc.namespace,
+                ForksConf::child_name(&vc.subject, slot).as_bytes(),
+            )
+        };
+        // Slot 3's fork was interrupted: its directory is there.
+        let host = node.host();
+        std::fs::create_dir_all(host.dir_for(child(3))).unwrap();
+        let none_born = |_: ChronicleId| Ok(false);
+        assert_eq!(
+            free_fork_slot(&node, vc, &[3, 4], none_born),
+            Ok(Some(3)),
+            "the slot of a fork that was never born was lost to its directory"
+        );
+        // A child born in slot 3 takes it.
+        let three = child(3);
+        let born = move |id: ChronicleId| Ok(id == three);
+        assert_eq!(free_fork_slot(&node, vc, &[3, 4], born), Ok(Some(4)));
+        // Every one born: none left.
+        assert_eq!(free_fork_slot(&node, vc, &[3, 4], |_| Ok(true)), Ok(None));
+        // Asked for in this Warden's life: taken, without asking.
+        node.requested.add(ForksConf::child(vc, 3, Lsn::new(5)));
+        assert_eq!(
+            free_fork_slot(&node, vc, &[3, 4], |_| -> Result<bool, String> {
+                Ok(false)
+            }),
+            Ok(Some(4))
+        );
+        // The coordinator cannot say: the Fork is refused, not guessed.
+        let e =
+            free_fork_slot(&node, vc, &[4], |_| Err("coordinator unreachable".into())).unwrap_err();
+        assert!(e.contains("uid slot 4") && e.contains("unreachable"), "{e}");
+        // The real question, through the coordinator: nothing of slot 4's
+        // child was ever registered.
+        assert!(!host.is_born(child(4)).unwrap());
     }
 
     /// Audit 2026-11-09, the Warden wrote a Vessel's TTL start without
