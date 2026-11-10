@@ -804,6 +804,20 @@ fn take_down<D: Blkd, M: Mounts + ?Sized>(
     b: LayerId,
     mp: &Path,
 ) -> Result<(), LayerError> {
+    take_off(d, m, b, mp)?;
+    d.drop_layer(b)?;
+    d.flush()?;
+    Ok(())
+}
+
+/// Branch `b` off its mount on `mp` and its device; its layer and name
+/// stay.  Refused if `mp` is mounted from anything else.
+fn take_off<D: Blkd, M: Mounts + ?Sized>(
+    d: &mut D,
+    m: &M,
+    b: LayerId,
+    mp: &Path,
+) -> Result<(), LayerError> {
     let info = d.info(b)?;
     match (info.dev.as_ref(), m.source(mp)?) {
         (Some(dev), Some(src)) if &src == dev => m.umount(mp)?,
@@ -820,8 +834,6 @@ fn take_down<D: Blkd, M: Mounts + ?Sized>(
     if info.dev.is_some() {
         d.detach(b)?;
     }
-    d.drop_layer(b)?;
-    d.flush()?;
     Ok(())
 }
 
@@ -1066,10 +1078,23 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
                 };
             }
         }
-        take_down(&mut *d, &*self.mounts, b, &self.mountpoint(dataset))?;
+        // The branch keeps its name until its Seals are gone: each is
+        // taken from under it (unseal), newest first, so a destroy cut
+        // short at any step is found again by name and finished by the
+        // next one.  The branch used to go first, and a failure after it
+        // left the Seals with no name to reach them; the retry answered
+        // "nothing there" (audit 2026-11-09, `destroy` cut short).
+        take_off(&mut *d, &*self.mounts, b, &self.mountpoint(dataset))?;
         for l in own {
-            d.drop_layer(l)?;
+            if d.info(b)?.parent != Some(l) {
+                return Err(format!("{dataset}: branch {b} does not stand on its Seal {l}").into());
+            }
+            d.unseal(b)?;
         }
+        // What is left: the branch on what it was born on.  A void
+        // birth's own root goes after the branch; between the two only
+        // that root, the empty file system it was made with, can be left.
+        d.drop_layer(b)?;
         if let Some(r) = root {
             d.drop_layer(r)?;
         }
@@ -1816,9 +1841,24 @@ mod tests {
         /// Names `names` still lists after their branch went (as another
         /// connection's drop between `names` and `info`).
         ghosts: Vec<(String, LayerId)>,
+        /// Taking a Seal away (an unseal, a drop) fails from the n-th on
+        /// (the daemon or the connection going away between two
+        /// commands); `None`: it succeeds.
+        fail_unseal_after: Option<usize>,
     }
 
     impl StoreBlkd {
+        fn seal_goes(&mut self) -> Result<(), LayerError> {
+            match &mut self.fail_unseal_after {
+                Some(0) => Err("taso-blkd closed the connection".into()),
+                Some(n) => {
+                    *n -= 1;
+                    Ok(())
+                }
+                None => Ok(()),
+            }
+        }
+
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let store = Store::create(&dir.path().join("log")).unwrap();
@@ -1828,6 +1868,7 @@ mod tests {
                 devs: HashMap::new(),
                 fail_seal: false,
                 ghosts: Vec::new(),
+                fail_unseal_after: None,
             }
         }
     }
@@ -1887,6 +1928,7 @@ mod tests {
                 self.devs.remove(&l);
                 self.store.drop_branch(l)?;
             } else {
+                self.seal_goes()?;
                 self.store.drop_seal(l)?;
             }
             Ok(())
@@ -1907,6 +1949,7 @@ mod tests {
             if self.devs.contains_key(&branch) {
                 return Err("attached; detach first".into());
             }
+            self.seal_goes()?;
             Ok(self.store.unseal(branch)?)
         }
         fn export(
@@ -2118,6 +2161,58 @@ mod tests {
     }
 
     type TestPool = BlkPool<StoreBlkd, FakeMounts>;
+
+    /// Audit 2026-11-09, a destroy took the branch (and its name) first
+    /// and then its Seals; cut short after that, it left the Seals with no
+    /// name to reach them, and the retry answered "nothing there".  Cut
+    /// short after each step, a retry finishes it and nothing is left.
+    #[test]
+    fn a_destroy_cut_short_at_any_step_is_finished_by_a_retry() {
+        for cut in 0..3 {
+            let p = pool();
+            let a = ds("tank/v-a");
+            p.create(&a).unwrap();
+            for n in [2u8, 4, 6] {
+                p.layers(&a)
+                    .snapshot(Lsn::new(n as u64), h(n))
+                    .unwrap()
+                    .run()
+                    .unwrap();
+            }
+            let g = p.guid(&a).unwrap().unwrap();
+            let chain: Vec<LayerId> = {
+                let mut d = p.blkd.lock().unwrap();
+                let b = d.find("tank/v-a").unwrap().unwrap();
+                let mut v = vec![b];
+                let mut cur = d.info(b).unwrap().parent;
+                while let Some(l) = cur {
+                    v.push(l);
+                    cur = d.info(l).unwrap().parent;
+                }
+                v
+            };
+            assert_eq!(chain.len(), 5, "the branch, three Seals, the root");
+            p.blkd.lock().unwrap().fail_unseal_after = Some(cut);
+            assert!(Pool::destroy(&p, &a, g).is_err(), "cut short after {cut}");
+            p.blkd.lock().unwrap().fail_unseal_after = None;
+            assert_eq!(
+                p.guid(&a).unwrap(),
+                Some(g),
+                "cut short after {cut}: the name still reaches what is left"
+            );
+            assert!(Pool::destroy(&p, &a, g).unwrap(), "the retry finds it");
+            let left: Vec<LayerId> = {
+                let mut d = p.blkd.lock().unwrap();
+                chain
+                    .iter()
+                    .copied()
+                    .filter(|l| d.info(*l).is_ok())
+                    .collect()
+            };
+            assert!(left.is_empty(), "cut short after {cut}: {left:?} are left");
+            assert!(!Pool::destroy(&p, &a, g).unwrap(), "nothing there now");
+        }
+    }
 
     /// Audit 2026-11-09, the mount root was kept as written, and a mount
     /// point is matched against mountinfo as text: a root given as
