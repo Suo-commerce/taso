@@ -54,6 +54,7 @@ one a_fork_slot_is_taken_by_a_born_child_not_by_a_directory $W
 # Verification attempts
 one a_restore_walk_cut_short_by_this_nodes_clock_is_interrupted $W
 one a_failed_look_for_candidates_is_tried_again_after_a_wait $W
+one the_pending_list_fails_when_the_coordinator_cannot_say_who_holds_a_vessel $W
 # Purges
 one a_refused_record_retried_does_not_grow_the_log $W
 one a_purge_finished_on_another_node_deletes_that_nodes_dataset $W

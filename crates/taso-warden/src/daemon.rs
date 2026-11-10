@@ -2177,12 +2177,37 @@ const SESSION_WAIT: Duration = Duration::from_secs(30);
 /// The decider socket's side of a node (D73, D74).
 pub struct NodeDecider(pub Arc<Node>);
 
+/// Whether this Warden (`me`) holds a Vessel and has its local log here,
+/// from whether its log directory is here and who the coordinator says
+/// holds it.  `Err` if the coordinator could not say: never "not here".
+fn held_here<E: fmt::Display>(
+    log_here: bool,
+    holder: Result<WardenId, E>,
+    me: WardenId,
+) -> Result<bool, String> {
+    if !log_here {
+        return Ok(false);
+    }
+    holder.map(|h| h == me).map_err(|e| e.to_string())
+}
+
 impl crate::decidesrv::Decide for NodeDecider {
     fn pending(&self) -> Result<Vec<PendingItem>, String> {
         let node = &*self.0;
         let mut items = Vec::new();
         for id in node.local_vessels()? {
-            if node.mine_here(id).is_err() {
+            // Another Warden's, or no local log: not this node's to list.
+            // The coordinator unreachable: the list fails, it is not
+            // answered short.  It used to skip such a Vessel and answer
+            // "nothing pending" while the coordinator was down (audit
+            // 2026-11-09, the decider's pending list).
+            if !held_here(
+                node.host().dir_for(id).exists(),
+                node.coord.ownership(id).map(|o| o.holder),
+                node.config.warden,
+            )
+            .map_err(|e| format!("Vessel {}: coordinator: {e}", id_hex(id)))?
+            {
                 continue;
             }
             match node.hold_for_decider(*id.as_bytes()) {
@@ -8147,6 +8172,31 @@ mod tests {
         // The real question, through the coordinator: nothing of slot 4's
         // child was ever registered.
         assert!(!host.is_born(child(4)).unwrap());
+    }
+
+    /// Audit 2026-11-09, the decider's pending list skipped every Vessel
+    /// whose holder the coordinator could not say, and answered "nothing
+    /// pending" while it was down.  Only a Vessel that is not this
+    /// Warden's, or has no log here, is left out; the coordinator not
+    /// answering fails the list.
+    #[test]
+    fn the_pending_list_fails_when_the_coordinator_cannot_say_who_holds_a_vessel() {
+        let me = WardenId::new(1);
+        let other = WardenId::new(2);
+        assert_eq!(held_here(true, Ok::<_, String>(me), me), Ok(true));
+        assert_eq!(held_here(true, Ok::<_, String>(other), me), Ok(false));
+        assert_eq!(held_here(false, Ok::<_, String>(me), me), Ok(false));
+        let down: Result<WardenId, String> = Err("connection refused".into());
+        assert_eq!(
+            held_here(true, down, me),
+            Err("connection refused".to_string()),
+            "a Vessel the coordinator could not place was left out of the list"
+        );
+        // No log here: nothing to ask.
+        assert_eq!(
+            held_here(false, Err::<WardenId, _>("connection refused"), me),
+            Ok(false)
+        );
     }
 
     /// Audit 2026-11-09, a look for Candidates that failed (the coordinator
