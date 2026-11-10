@@ -65,7 +65,7 @@
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use taso_warden::coordinator::{Coord, Coordinator};
 use taso_warden::coordsrv::{RemoteCoord, Server};
@@ -372,6 +372,27 @@ fn kube_clients(k: &KubeSourceConf) -> Result<(Kube, Kube), String> {
     Ok((client()?, client()?))
 }
 
+/// How long the Warden does not log the same source error again.
+const SOURCE_ERROR_AGAIN: Duration = Duration::from_secs(10);
+
+/// Whether the Warden logs source error `e` at `now`: a new error at
+/// once, the same error again only after [`SOURCE_ERROR_AGAIN`].  `said`
+/// is what it last logged and when.  A source that cannot be reached
+/// answers its error at every poll, several times a second, until it can
+/// (audit 2026-11-09, failed list answered as unchanged): each answer
+/// keeps the supervisor from starting anything, but one line of it in
+/// the log is enough.
+fn say_source_error(said: &mut Option<(String, Instant)>, e: &str, now: Instant) -> bool {
+    let again = match said {
+        Some((last, at)) => last != e || now.duration_since(*at) >= SOURCE_ERROR_AGAIN,
+        None => true,
+    };
+    if again {
+        *said = Some((e.to_string(), now));
+    }
+    again
+}
+
 /// Log an event; record how each Vessel's last run went.  The line for an
 /// ended run is the one the gate scripts match: keep its form.
 fn report(
@@ -432,7 +453,14 @@ fn report(
             println!("{}: refused: {}", r.subject, r.reason);
             last.entry(r.subject.clone()).or_insert(false);
         }
-        Event::SourceFailed(e) => eprintln!("taso-wardend: {e}"),
+        Event::SourceFailed(e) => {
+            static SAID: std::sync::Mutex<Option<(String, Instant)>> = std::sync::Mutex::new(None);
+            let e = e.to_string();
+            let mut said = SAID.lock().unwrap_or_else(|p| p.into_inner());
+            if say_source_error(&mut said, &e, Instant::now()) {
+                eprintln!("taso-wardend: {e}");
+            }
+        }
     }
 }
 
@@ -638,6 +666,30 @@ mod tests {
     use std::os::unix::thread::JoinHandleExt;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// A source that stays unreachable answers its error at every poll;
+    /// the Warden logs it once, then again every ten seconds, and a
+    /// different error at once.
+    #[test]
+    fn a_source_error_that_repeats_is_logged_once_in_a_while() {
+        use super::{say_source_error, SOURCE_ERROR_AGAIN};
+        let t0 = std::time::Instant::now();
+        let mut said = None;
+        let step = Duration::from_millis(400);
+        let logged = (0..50u32)
+            .filter(|i| say_source_error(&mut said, "api server unreachable", t0 + step * *i))
+            .count();
+        // 50 polls over 20 s: at 0 s and at 10 s.
+        assert_eq!(logged, 2, "of 50 answers of one error");
+        let t = t0 + step * 50;
+        assert!(say_source_error(&mut said, "forbidden", t), "a new error");
+        assert!(!say_source_error(&mut said, "forbidden", t + step));
+        assert!(say_source_error(
+            &mut said,
+            "forbidden",
+            t + SOURCE_ERROR_AGAIN
+        ));
+    }
 
     /// The stop signals are blocked in the daemon, but a program it runs
     /// (runc, mount) must start with them unblocked: a SIGTERM sent to it
