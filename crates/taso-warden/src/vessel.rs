@@ -1082,6 +1082,17 @@ impl<P: Pool> Host<P> {
     // ── internals ───────────────────────────────────────────────────
 
     /// `Some(head)` if the coordinator knows `id`.
+    /// Whether a Vessel `id` was born: the coordinator accepted a record
+    /// of its Chronicle (its Lineage first).  A Chronicle registered with
+    /// nothing accepted, or a local directory with no accepted record, is
+    /// what an interrupted birth leaves: the next birth of that id
+    /// finishes or replaces it.  What a fork slot is taken by.
+    pub fn is_born(&self, id: ChronicleId) -> Result<bool, VesselError> {
+        Ok(self
+            .registered_head(id)?
+            .is_some_and(|h| h.lsn != Lsn::new(0)))
+    }
+
     fn registered_head(&self, id: ChronicleId) -> Result<Option<ChronicleHead>, VesselError> {
         match self.coord.head(id) {
             Ok(h) => Ok(Some(h)),
@@ -1160,12 +1171,68 @@ impl<P: Pool> Host<P> {
                     let ours = info.parent == Some(seal_hash)
                         && info.origin_seal() == Some((parent_ds.clone(), seal));
                     if !ours {
-                        return Err(VesselError::DatasetConflict(dataset));
+                        self.replace_leftover(&dataset, &info, parent_ds, seal, seal_hash)?;
                     }
                 }
             }
         }
         self.chronicle(id, registered)
+    }
+
+    /// `dataset` is a clone of `parent_ds` at a Seal other than `seal`:
+    /// left by a birth from that parent (a fork, a succession) that was
+    /// interrupted after the clone and before its Lineage was accepted,
+    /// then asked for again from another Seal.  The Warden forks "last"
+    /// as one fixed lsn, so the next Fork of that slot after the parent
+    /// sealed again met this and was refused as a conflict for good, and
+    /// the slot was lost (audit 2026-11-09, an interrupted fork uses up
+    /// its uid slot).  Nothing depends on such a clone: no record of its
+    /// Chronicle was accepted ([`Host::unborn`] refuses one that was, as
+    /// `AlreadyExists`, before this), and it has no Seal of its own.  It
+    /// is destroyed and the clone made from the Seal asked for, with a
+    /// line in the Warden's log.  A clone of another dataset, or one with
+    /// a Seal of its own, is still a conflict.
+    fn replace_leftover(
+        &self,
+        dataset: &Dataset,
+        info: &DatasetInfo,
+        parent_ds: &Dataset,
+        seal: Lsn,
+        seal_hash: HashVal,
+    ) -> Result<(), VesselError> {
+        let conflict = || VesselError::DatasetConflict(dataset.clone());
+        let Some((from, old)) = info.origin_seal() else {
+            return Err(conflict());
+        };
+        if from != *parent_ds
+            || !self
+                .pool
+                .layers(dataset)
+                .list()
+                .map_err(pool_err)?
+                .is_empty()
+        {
+            return Err(conflict());
+        }
+        let guid = self
+            .pool
+            .guid(dataset)
+            .map_err(pool_err)?
+            .ok_or_else(conflict)?;
+        if !self.pool.destroy(dataset, guid).map_err(pool_err)? {
+            return Err(conflict());
+        }
+        eprintln!(
+            "taso-wardend: {}: destroyed a clone of {} at Seal lsn {} left by an interrupted birth (nothing of it was accepted); cloning it from Seal lsn {} as asked",
+            dataset.as_str(),
+            parent_ds.as_str(),
+            old.get(),
+            seal.get()
+        );
+        self.pool
+            .clone(parent_ds, seal, seal_hash, dataset)
+            .map_err(pool_err)?;
+        Ok(())
     }
 
     /// Create (register) or reopen a Chronicle that must have no records.
@@ -3512,7 +3579,7 @@ pub(crate) mod tests {
 
     /// An interrupted fork from "last" (its dataset already a clone of
     /// the Seal it started from) is finished from that Seal even after the
-    /// parent sealed again; an explicit lsn that disagrees is refused.
+    /// parent sealed again.
     #[test]
     fn an_interrupted_fork_resumes_from_its_datasets_seal() {
         let e = env();
@@ -3535,11 +3602,6 @@ pub(crate) mod tests {
         p.append(Stream::Fs, raw(2)).unwrap();
         let s2 = seal(&mut p);
         assert_ne!(s1, s2);
-        // An explicit lsn other than the dataset's is a real conflict.
-        assert!(matches!(
-            e.host.fork_from_log(pid, SealAt::At(s2.lsn), b"child"),
-            Err(VesselError::DatasetConflict(_))
-        ));
         // "last" finishes the fork from the Seal it started from.
         let c = e.host.fork_from_log(pid, SealAt::Last, b"child").unwrap();
         let ps = c.lineage().origin.parent().copied().unwrap();
@@ -3547,6 +3609,77 @@ pub(crate) mod tests {
             (ps.chronicle, ps.seal, ps.seal_hash),
             (pid, s1.lsn, s1.hash)
         );
+    }
+
+    /// Audit 2026-11-09, an interrupted fork used up its uid slot.  The
+    /// Warden forks "last" as one fixed lsn, the shipped Seal it checked.
+    /// A fork interrupted after its clone, then asked for again once the
+    /// parent sealed and shipped again, met the clone of the older Seal
+    /// and was refused as a conflict at every later Fork.  Now the
+    /// leftover is replaced and the child is made from the Seal asked
+    /// for.  What is not such a leftover is still refused: a clone of
+    /// another dataset, and a child whose Lineage was accepted.
+    #[test]
+    fn a_fork_asked_again_from_a_newer_seal_replaces_the_interrupted_clone() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut p);
+        let pid = p.id();
+        let child = vessel_id(ns(1), b"base.fork-3");
+        let child_ds = e.host.dataset_for(child);
+        assert!(!e.host.is_born(child).unwrap(), "nothing of it yet");
+        Pool::clone(
+            &e.host.pool,
+            &e.host.dataset_for(pid),
+            s1.lsn,
+            s1.hash,
+            &child_ds,
+        )
+        .unwrap();
+        // The parent moves on.
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let s2 = seal(&mut p);
+        let c = e
+            .host
+            .fork_from_log(pid, SealAt::At(s2.lsn), b"base.fork-3");
+        let c = match c {
+            Ok(c) => c,
+            Err(e) => panic!("the Fork after the interrupted one was refused: {e}"),
+        };
+        let ps = c.lineage().origin.parent().copied().unwrap();
+        assert_eq!((ps.seal, ps.seal_hash), (s2.lsn, s2.hash));
+        assert!(e.host.is_born(child).unwrap());
+        let info = Pool::info(&e.host.pool, &child_ds).unwrap().unwrap();
+        assert_eq!(info.origin_seal(), Some((e.host.dataset_for(pid), s2.lsn)));
+        drop(c);
+        // Its Lineage is accepted now: not a leftover, never replaced.
+        p.append(Stream::Fs, raw(3)).unwrap();
+        let s3 = seal(&mut p);
+        assert!(matches!(
+            e.host
+                .fork_from_log(pid, SealAt::At(s3.lsn), b"base.fork-3"),
+            Err(VesselError::AlreadyExists(_))
+        ));
+        // A clone of another Vessel's dataset in the child's place is
+        // not this parent's leftover.
+        let (mut q, _) = e.host.ensure(ns(1), b"other").unwrap();
+        q.append(Stream::Fs, raw(1)).unwrap();
+        let q1 = seal(&mut q);
+        let stranger = e.host.dataset_for(vessel_id(ns(1), b"base.fork-4"));
+        Pool::clone(
+            &e.host.pool,
+            &e.host.dataset_for(q.id()),
+            q1.lsn,
+            q1.hash,
+            &stranger,
+        )
+        .unwrap();
+        assert!(matches!(
+            e.host
+                .fork_from_log(pid, SealAt::At(s3.lsn), b"base.fork-4"),
+            Err(VesselError::DatasetConflict(_))
+        ));
     }
 
     #[test]
