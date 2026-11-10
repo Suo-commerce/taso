@@ -281,21 +281,40 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Create a new, empty segment at `path`.  Refuses if the file exists.
+    /// Create a new, empty segment at `path`.  Refuses if a segment is
+    /// there.
     ///
-    /// The header is fsynced, and so is the parent directory, so the file
-    /// itself survives a crash.
+    /// The file gets its name only once its header is written and
+    /// fsynced (it is made under a temporary name and renamed), and the
+    /// parent directory is fsynced, so the name never stands for less
+    /// than a whole header and the file survives a crash.  A create that
+    /// stops midway leaves at most the temporary file, which the next
+    /// create writes over.  A file already at `path` that is shorter than
+    /// a header ([`Segment::is_stub`]) held no frame and is replaced.
     pub fn create(
         path: impl AsRef<Path>,
         chronicle: ChronicleId,
         base: Position,
     ) -> Result<Self, SegmentError> {
         let path = path.as_ref().to_path_buf();
+        if path.try_exists()? && !Self::is_stub(&path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists", path.display()),
+            )
+            .into());
+        }
+        let mut tmp = path.clone();
+        tmp.set_file_name(format!(
+            ".new-{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
-            .open(&path)?;
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
         let mut header = Vec::with_capacity(HEADER_LEN as usize);
         header.extend_from_slice(&MAGIC);
         header.push(VERSION);
@@ -304,6 +323,7 @@ impl Segment {
         header.extend_from_slice(base.hash.as_bytes());
         file.write_all_at(&header, 0)?;
         file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
         sync_parent(&path)?;
         Ok(Self {
             path,
@@ -314,6 +334,13 @@ impl Segment {
             ends: Vec::new(),
             poisoned: false,
         })
+    }
+
+    /// Whether the file at `path` is shorter than a segment header: what
+    /// a create that stopped midway left under an older Warden.  It never
+    /// held a frame, so nothing is lost by removing it.
+    pub fn is_stub(path: &Path) -> io::Result<bool> {
+        Ok(std::fs::metadata(path)?.len() < HEADER_LEN)
     }
 
     /// Open an existing segment and recover it against the coordinator's
