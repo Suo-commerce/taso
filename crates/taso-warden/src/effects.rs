@@ -70,7 +70,9 @@
 //! waits.
 
 use taso_core::envelope::Lsn;
-use taso_core::record::{Authority, IntentRecord, OpId, Origin, OutcomeState, PromotionRecord};
+use taso_core::record::{
+    Authority, IntentRecord, OpId, Origin, OutcomeState, PromotionRecord, RetryPolicy,
+};
 
 use crate::chronicle::Layers;
 use crate::ledger::{Answer, Authorized, Declared, Ledger};
@@ -126,6 +128,47 @@ pub enum Asked {
     },
 }
 
+/// How much may wait in a Vessel's outbox, in bytes: the effects it has
+/// released or holds whose outcome is not final, each counted as
+/// [`effect_weight`].  8 MiB.  Everything waiting is carried at once in
+/// two places: the sender's `Open` reply (one frame, 16 MiB) and the
+/// Checkpoint a prune writes (one record, 64 MiB).  With no bound, a
+/// Vessel whose sender was down, or whose agent meant it, filled the
+/// outbox past them: the sender could then fetch nothing at any later
+/// `Open`, so nothing was ever reported and the outbox never emptied,
+/// and every prune of the log failed (audit 2026-11-09, large effect
+/// requests; D&D L2b (a)).
+pub const MAX_OUTBOX: usize = 8 << 20;
+
+/// What one effect counts for in the outbox, in bytes: its provider,
+/// request, footprint, authority and retry key or probe, and 128 for
+/// the rest of its record, so that effects of no size are bounded in
+/// number too.
+pub fn effect_weight(
+    provider: &str,
+    request: &[u8],
+    footprint: &[u8],
+    authority: &[u8],
+    retry: &RetryPolicy,
+) -> usize {
+    let retry = match retry {
+        RetryPolicy::ProviderDeduplicated { key } => key.len(),
+        RetryPolicy::Queryable { probe } => probe.len(),
+        RetryPolicy::UnsafeToRetry => 0,
+    };
+    128 + provider.len() + request.len() + footprint.len() + authority.len() + retry
+}
+
+fn weight_of(i: &IntentRecord) -> usize {
+    effect_weight(
+        &i.provider,
+        &i.request,
+        &i.footprint,
+        &i.authority,
+        &i.retry,
+    )
+}
+
 /// Why a sender's report was refused.
 #[derive(Debug)]
 pub enum ReportError {
@@ -141,6 +184,15 @@ pub enum PromoteError {
     /// [`Vessel::promote`] refused it (not my fork, parent moved, Seal
     /// not proven) or recording failed; nothing was adopted.
     Vessel(VesselError),
+    /// The child's proposals do not fit this Vessel's outbox beside what
+    /// waits in it ([`MAX_OUTBOX`]).  Nothing was recorded: the same
+    /// promotion goes through once outcomes have made room.
+    OutboxFull {
+        /// What waits in this Vessel's outbox, in bytes.
+        waiting: usize,
+        /// What the promotion would add.
+        incoming: usize,
+    },
     /// The Promotion is recorded but the ledger could not be shipped, so
     /// nothing was adopted yet.  Calling [`Effects::finish_promotion`]
     /// later finishes it.
@@ -198,6 +250,11 @@ pub struct Effects {
     /// Warden restart reconcile records them `OutcomeUnknown` anyway.
     handed_out: std::collections::BTreeSet<OpId>,
     pending: Option<PromotionRecord>,
+    /// What waits in the outbox, in bytes ([`MAX_OUTBOX`]), counted from
+    /// above: every effect recorded adds to it and nothing takes away,
+    /// until it would pass the bound.  Then it is counted again from the
+    /// log ([`Effects::room`]), which is where an outcome shows.
+    waiting: usize,
 }
 
 impl Effects {
@@ -225,6 +282,7 @@ impl Effects {
             unlisted,
             handed_out: Default::default(),
             pending: summary.promotion,
+            waiting: summary.open.values().map(|e| weight_of(&e.intent)).sum(),
         };
         // Listed once a ship covers them (a failure leaves them unlisted
         // until one does: [`Effects::ship_unlisted`]).
@@ -282,7 +340,24 @@ impl Effects {
                 ),
             });
         }
+        let weight = effect_weight(
+            &d.provider,
+            &d.request,
+            &d.footprint,
+            &d.authority,
+            &d.retry,
+        );
+        if let Err(waiting) = self.room(vessel, weight)? {
+            return Ok(Asked::Refused {
+                reason: format!(
+                    "the outbox is full: {waiting} bytes of effects wait for their outcome, and with this one ({weight} bytes) that would pass {MAX_OUTBOX}; ask again once outcomes are reported"
+                ),
+            });
+        }
         let _total = crate::timing::span("effect.total");
+        // Counted before it is recorded: if recording fails after the
+        // record was written, the count is not below the truth.
+        self.waiting += weight;
         match self.mode {
             Mode::Hold => {
                 let a = self.ledger.propose(vessel, d)?;
@@ -303,6 +378,33 @@ impl Effects {
                 }
             }
         }
+    }
+
+    /// Whether `incoming` more bytes fit the outbox ([`MAX_OUTBOX`]);
+    /// `Err` with what waits in it if not.  The running count is from
+    /// above, so only when it says no is the outbox counted from the log,
+    /// where every outcome since shows: one read of the local log then,
+    /// none otherwise.  An empty outbox takes anything: one effect is
+    /// bounded by the session, one promotion by the child's own outbox.
+    fn room<L: Layers>(
+        &mut self,
+        vessel: &Vessel<L>,
+        incoming: usize,
+    ) -> Result<Result<(), usize>, VesselError> {
+        if self.waiting + incoming > MAX_OUTBOX {
+            self.waiting = summary(vessel)?
+                .open
+                .values()
+                .map(|e| weight_of(&e.intent))
+                .sum();
+        }
+        Ok(
+            if self.waiting == 0 || self.waiting + incoming <= MAX_OUTBOX {
+                Ok(())
+            } else {
+                Err(self.waiting)
+            },
+        )
     }
 
     /// The released, unsettled effects whose records are shipped, in op
@@ -441,6 +543,17 @@ impl Effects {
         at: SealAt,
     ) -> Result<(PromotionRecord, Vec<Authorized>), PromoteError> {
         let _total = crate::timing::span("promote.total");
+        // Room for what the promotion adopts, asked before the Promotion
+        // is recorded: a recorded one must be finished, whatever it adds.
+        let (_, ledger_pos) = child.prove(at)?;
+        let incoming: usize = child
+            .proposals(ledger_pos)?
+            .iter()
+            .map(|e| weight_of(&e.intent))
+            .sum();
+        if let Err(waiting) = self.room(vessel, incoming)? {
+            return Err(PromoteError::OutboxFull { waiting, incoming });
+        }
         let t = crate::timing::span("promote.record");
         let (record, _) = vessel.promote(child, at)?;
         drop(t);
@@ -489,6 +602,7 @@ impl Effects {
             .map(|e| e.intent)
             .collect();
         let held = self.mode == Mode::Hold;
+        self.waiting += proposals.iter().map(weight_of).sum::<usize>();
         let adopted = self
             .ledger
             .adopt(vessel, p.child, p.seal, &proposals, held)?;
@@ -1223,6 +1337,159 @@ mod tests {
         assert!(mfx.released(&m).unwrap().is_empty());
         assert!(states(&m).iter().all(|(_, s)| *s == OutcomeState::Proposed));
         assert!(mfx.authorized());
+    }
+
+    // ── the outbox's bound ──────────────────────────────────────────
+
+    /// An effect of 1 MiB, the largest the session lets an agent declare.
+    fn big(k: u64) -> Declared {
+        Declared {
+            provider: "mail".into(),
+            request: vec![k as u8; (1 << 20) - 8],
+            footprint: Vec::new(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::UnsafeToRetry,
+            consequence: Consequence::Irreversible,
+            authority: b"user".to_vec(),
+        }
+    }
+
+    /// Audit 2026-11-09, nothing bounded what waited in a Vessel's outbox:
+    /// past 16 MiB the sender's `Open` reply could not be sent, so no
+    /// outcome was ever reported, and past 64 MiB no prune could write
+    /// its Checkpoint.  Seven effects of 1 MiB are released; the eighth
+    /// would pass 8 MiB and is refused with nothing recorded.  Once the
+    /// sender reports an outcome there is room again.
+    #[test]
+    fn a_full_outbox_refuses_a_new_effect_until_an_outcome_is_reported() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut v);
+        for k in 1..=7 {
+            assert_eq!(
+                fx.ask(&mut v, &big(k)).unwrap(),
+                Asked::Released { op: OpId::new(k) }
+            );
+        }
+        let before = v.tail();
+        let Asked::Refused { reason } = fx.ask(&mut v, &big(8)).unwrap() else {
+            panic!("an eighth MiB-sized effect was taken into an outbox of 8 MiB")
+        };
+        assert!(reason.contains("the outbox is full"), "{reason}");
+        assert_eq!(v.tail(), before, "nothing was recorded");
+        // What the sender is handed fits one frame, with room to spare.
+        let listed: usize = fx
+            .released(&v)
+            .unwrap()
+            .iter()
+            .map(|r| weight_of(&r.intent))
+            .sum();
+        assert!(listed <= MAX_OUTBOX, "{listed}");
+        // A small effect still fits beside them.
+        assert!(matches!(
+            fx.ask(&mut v, &pay("small")).unwrap(),
+            Asked::Released { .. }
+        ));
+        // The sender reports one: the next large effect is taken.
+        fx.report(
+            &mut v,
+            OpId::new(1),
+            &Answer::Applied {
+                receipt: b"sent".to_vec(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            fx.ask(&mut v, &big(9)).unwrap(),
+            Asked::Released { .. }
+        ));
+        // And after a restart of the engine the outbox is counted from
+        // the log: still full.
+        drop(fx);
+        let (mut fx, _) = open_dispatch(&mut v);
+        assert!(matches!(
+            fx.ask(&mut v, &big(10)).unwrap(),
+            Asked::Refused { .. }
+        ));
+    }
+
+    /// A promotion that would fill the parent's outbox past its bound is
+    /// refused before the Promotion is recorded, so nothing is left half
+    /// done; once the sender has reported outcomes the same promotion
+    /// goes through.
+    #[test]
+    fn a_promotion_that_would_overfill_the_outbox_is_refused_before_it_is_recorded() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.append(Stream::Fs, Payload::Raw(vec![1])).unwrap();
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        // A child holding two proposals of 1 MiB.
+        let kid = {
+            let mut c = e.host.fork_from_log(p.id(), SealAt::Last, b"c1").unwrap();
+            c.seal_birth().unwrap();
+            let (mut fx, _) = Effects::open(Mode::Hold, Box::new(AlwaysPublish), &mut c).unwrap();
+            for k in 1..=2 {
+                assert!(matches!(
+                    fx.ask(&mut c, &big(k)).unwrap(),
+                    Asked::Held { .. }
+                ));
+            }
+            let pos = ledger_pos(&c).unwrap();
+            c.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(1))
+                .unwrap();
+            c.id()
+        };
+        let (mut fx, _) = open_dispatch(&mut p);
+        for k in 1..=7 {
+            assert!(matches!(
+                fx.ask(&mut p, &big(k)).unwrap(),
+                Asked::Released { .. }
+            ));
+        }
+        let log = e.host.read_log_of(kid).unwrap();
+        let before = p.tail();
+        let r = fx.promote(&mut p, &log, SealAt::Last);
+        assert!(
+            matches!(r, Err(PromoteError::OutboxFull { .. })),
+            "two more MiB were adopted into an outbox holding seven: {r:?}"
+        );
+        assert_eq!(p.tail(), before, "no Promotion was recorded");
+        assert_eq!(fx.pending_promotion(), None);
+        // Two outcomes reported: there is room for the child's two.
+        for op in [1, 2] {
+            fx.report(
+                &mut p,
+                OpId::new(op),
+                &Answer::Applied {
+                    receipt: b"sent".to_vec(),
+                },
+            )
+            .unwrap();
+        }
+        let (_, adopted) = fx.promote(&mut p, &log, SealAt::Last).unwrap();
+        assert_eq!(adopted.len(), 2);
+        assert_eq!(fx.released(&p).unwrap().len(), 7);
+    }
+
+    /// An empty outbox takes a promotion whatever its size: a child's
+    /// proposals are bounded by the child's own outbox.
+    #[test]
+    fn an_empty_outbox_takes_any_promotion() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut v);
+        assert_eq!(fx.room(&v, MAX_OUTBOX * 2).unwrap(), Ok(()));
+        assert!(matches!(
+            fx.ask(&mut v, &pay("one")).unwrap(),
+            Asked::Released { .. }
+        ));
+        assert!(fx.room(&v, MAX_OUTBOX).unwrap().is_err());
     }
 
     #[test]

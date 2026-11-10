@@ -163,7 +163,7 @@ impl Conn {
 pub const MAX_CHILD_NAME: usize = crate::daemon::MAX_SUBJECT + "-fork-".len() + 10;
 
 /// The largest effect an agent may declare, in bytes: its provider,
-/// request, footprint and authority together.  1 MiB.  The request is
+/// request, footprint, authority and retry key or probe together.  1 MiB.  The request is
 /// data Taso records and hands to the sender; it is not a channel for
 /// bulk.  Without a bound, one request could be as large as a Field
 /// frame (16 MiB), and what carries every open request at once could
@@ -474,13 +474,15 @@ impl<'v, L: Layers> Session<'v, L> {
                 // reply to the sender until its outcome is reported: its
                 // size is bounded here, before anything is recorded
                 // (audit 2026-11-09, large effect requests; D&D L2 (a)).
-                let size = provider.len() + request.len() + footprint.len() + authority.len();
+                let size = crate::effects::effect_weight(
+                    &provider, &request, &footprint, &authority, &retry,
+                ) - 128;
                 if size > MAX_EFFECT_REQUEST {
                     return Reply::Effect {
                         call,
                         result: EffectResult::Refused {
                             reason: format!(
-                                "the effect's request is {size} bytes (provider, request, footprint and authority together); at most {MAX_EFFECT_REQUEST} are recorded: keep the body elsewhere and name it in the request"
+                                "the effect's request is {size} bytes (provider, request, footprint, authority and retry key together); at most {MAX_EFFECT_REQUEST} are recorded: keep the body elsewhere and name it in the request"
                             ),
                         },
                     };
@@ -755,6 +757,15 @@ impl<'v, L: Layers> Session<'v, L> {
                 } else {
                     e.to_string()
                 })
+            }
+            // Nothing recorded: the same Promote goes through once the
+            // sender has reported outcomes.
+            Err(crate::effects::PromoteError::OutboxFull { waiting, incoming }) => {
+                self.adopting = recorded;
+                refused(format!(
+                    "this vessel's outbox is full: {waiting} bytes of effects wait for their outcome, and the child's {incoming} bytes of proposals would pass {}; promote again once outcomes are reported",
+                    crate::effects::MAX_OUTBOX
+                ))
             }
             Err(crate::effects::PromoteError::NotShipped(e)) => {
                 self.adopting = true;
