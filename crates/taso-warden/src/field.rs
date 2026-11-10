@@ -157,9 +157,10 @@ impl Conn {
 /// The longest child name a `Promote` request may carry, in bytes: the
 /// longest name the Warden gives a fork.  A fork is named
 /// `<subject>-fork-<uid slot>` ([`crate::daemon::ForksConf::child_name`]),
-/// a subject is at most 256 bytes (the rule for a Vessel resource's
-/// `spec.subject`), and a uid slot has at most 10 digits.
-pub const MAX_CHILD_NAME: usize = 256 + "-fork-".len() + 10;
+/// a subject is at most [`crate::daemon::MAX_SUBJECT`] bytes (in the
+/// config file and in a Vessel resource's `spec.subject`), and a uid
+/// slot has at most 10 digits.
+pub const MAX_CHILD_NAME: usize = crate::daemon::MAX_SUBJECT + "-fork-".len() + 10;
 
 /// How a session's Fork and Promote requests reach the Warden (the
 /// daemon: [`crate::daemon`]).  A refusal is a reason for the agent;

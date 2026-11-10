@@ -1638,6 +1638,17 @@ impl Config {
             if !ids.insert(*vc.id().as_bytes()) {
                 return Err(bad(format!("vessel {:?} is listed twice", vc.subject)));
             }
+            // The rule for a Vessel resource's `spec.subject`, held for
+            // the file too: the session refuses a child name longer than
+            // any fork of such a subject could have
+            // ([`crate::field::MAX_CHILD_NAME`]), so a longer subject
+            // here would be one whose fork could never be promoted.
+            if vc.subject.len() > MAX_SUBJECT {
+                return Err(bad(format!(
+                    "vessel: \"subject\" is {} bytes; at most {MAX_SUBJECT}",
+                    vc.subject.len()
+                )));
+            }
             if vc.host_uid(&runtime).is_none() {
                 return Err(bad(format!(
                     "vessel {:?}: uid_slot {} does not fit above host_uid_base",
@@ -2830,12 +2841,7 @@ const PROMOTED_GRACE: Duration = Duration::from_secs(2);
 /// `id` until `agent`, the thread that runs it, is done (`exited`), and
 /// joins that thread.  A kill can fail while the container is still being
 /// created, so it is sent again every 20 ms, as a stop sends it.
-fn end_agent<R: RuncRunner>(
-    runc: &Runc<R>,
-    id: &str,
-    exited: &AtomicBool,
-    agent: std::thread::JoinHandle<std::io::Result<(bool, String)>>,
-) {
+fn end_agent<R: RuncRunner>(runc: &Runc<R>, id: &str, exited: &AtomicBool, agent: AgentThread) {
     while !exited.load(Ordering::SeqCst) && !agent.is_finished() {
         // Refused while there is no container yet: sent again below.
         let _ = runc.kill(id);
@@ -2844,6 +2850,48 @@ fn end_agent<R: RuncRunner>(
     // How a killed agent ended is not this run's result: the caller
     // answers the error that made it end the agent.
     let _ = agent.join();
+    // Its thread is gone, even if it panicked before it could say so:
+    // whoever waits for `exited` (the stopper) ends too.
+    exited.store(true, Ordering::SeqCst);
+}
+
+/// The agent of one run and the thread that stops it, from the moment
+/// both are started until the run takes them back with
+/// [`RunningAgent::finish`].
+///
+/// A run that returns an error in between (the quiescence watch cannot
+/// be set up, the session cannot be opened, serving the sockets fails)
+/// used to return with the container still running and both threads
+/// alive: nothing stopped that agent until the next start of the Vessel
+/// deleted the stale container (audit 2026-11-09, container left
+/// running).  Dropped without `finish`, this ends the agent
+/// ([`end_agent`]) and joins the stopper, so no error path of the run
+/// can leave them behind.
+struct RunningAgent<R: RuncRunner> {
+    runc: Runc<R>,
+    id: String,
+    exited: Arc<AtomicBool>,
+    threads: Option<(AgentThread, std::thread::JoinHandle<bool>)>,
+}
+
+/// The thread that runs an agent's container.
+type AgentThread = std::thread::JoinHandle<std::io::Result<(bool, String)>>;
+
+impl<R: RuncRunner> RunningAgent<R> {
+    /// The run goes on to its end: it joins the two threads itself.
+    fn finish(mut self) -> (AgentThread, std::thread::JoinHandle<bool>) {
+        self.threads.take().expect("taken once, here")
+    }
+}
+
+impl<R: RuncRunner> Drop for RunningAgent<R> {
+    fn drop(&mut self) {
+        if let Some((agent, stopper)) = self.threads.take() {
+            end_agent(&self.runc, &self.id, &self.exited, agent);
+            // It ends once `exited` is set, which `end_agent` did.
+            let _ = stopper.join();
+        }
+    }
 }
 
 impl Branches<BlkLayers> for NodeBranches<'_> {
@@ -3091,6 +3139,10 @@ impl From<VesselError> for DaemonError {
 fn io(what: &str) -> impl Fn(std::io::Error) -> DaemonError + '_ {
     move |e| DaemonError::Io(format!("{what}: {e}"))
 }
+
+/// The longest subject a Vessel may have, in bytes: in the config file
+/// and in a Vessel resource alike.
+pub const MAX_SUBJECT: usize = 256;
 
 /// The lock file in a run directory.
 pub const RUN_LOCK: &str = "daemon.lock";
@@ -5234,6 +5286,14 @@ impl Node {
                 )));
             }
         };
+        // From here to the end of the run an error must not leave the
+        // agent running (audit 2026-11-09, container left running).
+        let running = RunningAgent {
+            runc: Runc::new(RuncCli::new(self.config.run_dir.join("runc"))),
+            id: spec.id.clone(),
+            exited: exited.clone(),
+            threads: Some((agent, stopper)),
+        };
 
         // Both sockets, every connection on its own thread, every request
         // handled here, one at a time (C5).
@@ -5343,10 +5403,16 @@ impl Node {
                 ),
             );
         }
-        let agent = agent
-            .join()
-            .map_err(|_| DaemonError::Io("the runc thread panicked".into()))?
-            .ok();
+        let (agent, stopper) = running.finish();
+        let agent = agent.join();
+        if agent.is_err() {
+            // It panicked before it could say it was done: said here, so
+            // the stopper, which waits for that, ends too.
+            exited.store(true, Ordering::SeqCst);
+            let _ = stopper.join();
+            return Err(DaemonError::Io("the runc thread panicked".into()));
+        }
+        let agent = agent.ok().and_then(Result::ok);
         if let Some((ok, err)) = &agent {
             self.log(
                 vc,
@@ -6177,6 +6243,25 @@ mod tests {
             v["vessels"][1]["fork"] = serde_json::json!({"parent": "a"});
         });
         assert!(c.is_ok(), "{:?}", c.err().map(|e| e.0));
+    }
+
+    /// A subject in the file is held to the length a Vessel resource's
+    /// is: the longest fork name the session accepts in a `Promote` is
+    /// made from it.
+    #[test]
+    fn a_subject_longer_than_a_resource_may_have_is_refused() {
+        let with = |n: usize| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            v["vessels"][0]["subject"] = "s".repeat(n).into();
+            Config::parse(&v.to_string())
+        };
+        assert!(with(MAX_SUBJECT).is_ok());
+        let e = with(MAX_SUBJECT + 1).unwrap_err();
+        assert!(e.0.contains("\"subject\" is 257 bytes"), "{}", e.0);
+        // The longest name a fork of the longest subject is given fits
+        // what the session accepts.
+        let longest = format!("{}-fork-{}", "s".repeat(MAX_SUBJECT), u32::MAX);
+        assert!(longest.len() <= crate::field::MAX_CHILD_NAME);
     }
 
     /// Audit 2026-11-09, `"sanction": null` counted as the node's
@@ -8177,6 +8262,79 @@ mod tests {
                 other => panic!("runc {other}"),
             }
         }
+    }
+
+    /// Audit 2026-11-09, a run that returned an error after its agent was
+    /// started (the quiescence watch, the session, serving the sockets)
+    /// left the container running and its two threads alive.  What holds
+    /// them now ends the agent when the run lets go of it without
+    /// finishing.
+    #[test]
+    fn a_run_that_fails_after_its_agent_started_leaves_no_agent() {
+        let one = OneContainer::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let agent = {
+            let (exited, runc) = (exited.clone(), Runc::new(one.clone()));
+            std::thread::spawn(move || {
+                let r = runc.run(Path::new("/bundle"), "c1");
+                let _ = runc.delete("c1");
+                exited.store(true, Ordering::SeqCst);
+                r
+            })
+        };
+        // The stopper, as a run starts it, with no stop asked for.
+        let stopper_done = Arc::new(AtomicBool::new(false));
+        let stopper = {
+            let (exited, done) = (exited.clone(), stopper_done.clone());
+            std::thread::spawn(move || {
+                while !exited.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                done.store(true, Ordering::SeqCst);
+                false
+            })
+        };
+        let run = || -> Result<(), DaemonError> {
+            let _running = RunningAgent {
+                runc: Runc::new(one.clone()),
+                id: "c1".into(),
+                exited: exited.clone(),
+                threads: Some((agent, stopper)),
+            };
+            // What a run does when a step after the start fails.
+            Err(DaemonError::Io("quiescence watch: no such file".into()))
+        };
+        assert!(run().is_err());
+        assert!(
+            one.killed.load(Ordering::SeqCst) && one.deleted.load(Ordering::SeqCst),
+            "the run returned its error and the container is still running"
+        );
+        assert!(exited.load(Ordering::SeqCst), "the agent's thread is done");
+        assert!(
+            stopper_done.load(Ordering::SeqCst),
+            "the stop thread is done"
+        );
+    }
+
+    /// A run that goes to its end takes both threads back: nothing is
+    /// killed.
+    #[test]
+    fn a_run_that_finishes_kills_nothing() {
+        let one = OneContainer::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let running = RunningAgent {
+            runc: Runc::new(one.clone()),
+            id: "c1".into(),
+            exited: exited.clone(),
+            threads: Some((
+                std::thread::spawn(|| Ok((true, String::new()))),
+                std::thread::spawn(|| false),
+            )),
+        };
+        let (agent, stopper) = running.finish();
+        assert!(agent.join().unwrap().unwrap().0);
+        assert!(!stopper.join().unwrap());
+        assert_eq!(one.kills.load(Ordering::SeqCst), 0);
     }
 
     /// Audit 2026-11-09, a run started the thread that stops its agent
