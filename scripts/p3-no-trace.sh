@@ -5,13 +5,19 @@
 #   1. released = promoted child's keys only (no sibling, no other fork)
 #   2. all-or-none after SIGKILL ×$KILLS (keys.log has the full set or 0)
 #   3. no duplicate keys across 20 rounds
+#   4. a lost turn's effects are withdrawn, never promoted (finding
+#      2026-11-09, SP (a)): child-0's Warden is killed between its
+#      agent's effects and the TurnEnd; the turn runs again
 #
 # Per round:
 #   a. Parent Vessel, agent runs (relay, --effects 0): seals one turn,
 #      exits.
 #   b. $FORKS child Vessels (forks from parent), each runs relay
 #      --effects $EFFECTS (held: forks hold by default): declares effects,
-#      seals, exits.
+#      seals, exits.  Child-0 first runs a turn that is lost: its agent
+#      declares its effects and stalls, the Warden is SIGKILLed, and the
+#      run above follows as the next start (the same turn again, with
+#      new keys).
 #   c. SIGKILL loop ($KILLS times): start parent Warden with
 #      "promote": {"child": "<child-0>"}, SIGKILL after a tiny sleep.
 #   d. Clean start: parent Warden with promote config; finish_promotion
@@ -215,19 +221,24 @@ json.dump({
 PY
 }
 
-# config_child <subject> <parent-subject> <uid-slot> <out-file>
+# config_child <subject> <parent-subject> <uid-slot> <out-file> [stall]
+# With "stall", the agent declares its effects, writes their keys to
+# /work/lost-turn and never ends the turn.
 config_child() {
-    local subject="$1" parent="$2" uid_slot="$3" out="$4"
+    local subject="$1" parent="$2" uid_slot="$3" out="$4" stall="${5:-}"
     python3 - "$subject" "$parent" "$uid_slot" "$out" \
-             "$SOCK" "$ROUND_BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$EFFECTS" "$BLK_SOCK" "$MNT" <<'PY'
+             "$SOCK" "$ROUND_BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$EFFECTS" "$BLK_SOCK" "$MNT" "$stall" <<'PY'
 import json, sys
 subject, parent, uid_slot, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-sock, base, work, rootfs, ns, landlock, effects, blk_sock, mnt = sys.argv[5:14]
+sock, base, work, rootfs, ns, landlock, effects, blk_sock, mnt, stall = sys.argv[5:15]
+args = ["/usr/bin/python3", "/usr/bin/p3-relay.py", "--role", "agent",
+        "--effects", effects, "--turns", "1"]
+if stall:
+    args += ["--stall-after-effects", "/work/lost-turn"]
 rt = {
     "rootfs": rootfs,
     "host_uid_base": 200000,
-    "args": ["/usr/bin/python3", "/usr/bin/p3-relay.py", "--role", "agent",
-             "--effects", effects, "--turns", "1"],
+    "args": args,
     "memory_bytes": 268435456,
     "pids": 64,
 }
@@ -309,6 +320,15 @@ P2: all-or-none after SIGKILL mid-promotion.
     crash recovery) or NONE (no Promotion record was fsync'd before
     the kill, so Open returns empty).  Never a partial subset.
 
+P4: a lost turn's effects are withdrawn, never promoted.
+    Expect: child-0's Warden is SIGKILLed after its agent declared
+    $EFFECTS effects and before the TurnEnd.  At child-0's next start the
+    Warden's line "effects (Hold) reconciled" names them as withdrawn;
+    the agent runs the turn again with new keys.  The sender is offered
+    the second run's keys only: none of the lost turn's.  Without the
+    withdrawal the next Seal covers both runs and check 1 fails too
+    (the promoted set is twice child-0's declared.log).
+
 P3: no duplicate keys.
     Expect: across all N rounds, no idempotency key appears more than
     once in any keys.log.  The "already promoted" guard in daemon.rs
@@ -344,8 +364,42 @@ for k in $(seq 1 "$N"); do
     echo "  parent: $parent_ds"
 
     # b. N forks, each declares $EFFECTS effects (held).
+    lost_keys_file="$OUT/lost-$k.log"
+    : > "$lost_keys_file"
     for f in $(seq 0 $((FORKS - 1))); do
         child_subj="p3-$RUN-$k-child-$f"
+        if [ "$f" -eq 0 ]; then
+            # The lost turn: child-0's agent declares its effects and
+            # stalls before TurnEnd; its keys are read from its /work,
+            # then the Warden is SIGKILLed.  Those files go at the next
+            # start (the reset to the birth Seal); the proposals stay in
+            # the Chronicle, and that start must withdraw them.
+            config_child "$child_subj" "$parent_subj" 1 "$WORK/child-$k-0-lost.json" stall
+            "$WORK/bin/taso-wardend" "$WORK/child-$k-0-lost.json" \
+                >"$OUT/child-$k-0-lost.out" 2>"$OUT/child-$k-0-lost.err" &
+            PID=$!
+            lost_at=""
+            for _ in $(seq 600); do
+                lds=$(grep -o ': dataset [^ ]*$' "$OUT/child-$k-0-lost.err" 2>/dev/null \
+                          | head -1 | sed 's/: dataset //' || true)
+                if [ -n "$lds" ] && [ -f "$MNT/$lds/lost-turn" ]; then
+                    lost_at="$MNT/$lds/lost-turn"
+                    break
+                fi
+                kill -0 "$PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            if [ -n "$lost_at" ]; then
+                cp "$lost_at" "$lost_keys_file"
+            else
+                echo "  ERROR: child-0's lost turn never declared its effects:"
+                tail -5 "$OUT/child-$k-0-lost.err" || true
+            fi
+            kill -KILL "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+            kill_runc
+            echo "  child 0: lost turn, $(wc -l < "$lost_keys_file") key(s) declared, Warden killed"
+        fi
         config_child "$child_subj" "$parent_subj" "$((f + 1))" "$WORK/child-$k-$f.json"
         run_daemon "$WORK/child-$k-$f.json" "$OUT/child-$k-$f.out" "$OUT/child-$k-$f.err"
         child_ds=$(vessel_ds "$OUT/child-$k-$f.err")
@@ -358,7 +412,7 @@ for k in $(seq 1 "$N"); do
     child0_declared="$child0_mount/declared.log"
     if [ ! -f "$child0_declared" ]; then
         echo "  ERROR: child-0's declared.log not found at $child0_declared"
-        printf '%s\tERROR\t0\t0\t0\n' "$k" >> "$OUT/rounds.tsv"
+        printf '%s\tERROR\t0\t0\t0\t0\t0\n' "$k" >> "$OUT/rounds.tsv"
         continue
     fi
     child0_keys=$(sort "$child0_declared")
@@ -455,14 +509,28 @@ for k in $(seq 1 "$N"); do
         cat "$parent_keys_file" >> "$ALL_KEYS"
     fi
 
+    # Check 4: the lost turn.  It declared its keys (else the round
+    # proved nothing); child-0's next start says it withdrew them; none
+    # of them is among the keys the sender was offered.
+    lost_count=$(wc -l < "$lost_keys_file")
+    withdrawn=0
+    grep -q 'withdrawn: \[OpId' "$OUT/child-$k-0.err" && withdrawn=1
+    lost_leak=0
+    if [ "$parent_count" -gt 0 ] && [ "$lost_count" -gt 0 ]; then
+        lost_leak=$(comm -12 <(sort "$lost_keys_file") <(echo "$parent_keys") | wc -l)
+    fi
+    lost_ok=0
+    [ "$lost_count" -eq "$EFFECTS" ] && [ "$withdrawn" = 1 ] && [ "$lost_leak" -eq 0 ] && lost_ok=1
+
     # Log from the final start.
     promote_log=$(grep -o 'promot[^ ]*.*' "$OUT/parent-$k-final.err" | head -3 || true)
 
-    printf '%s\t%s\t%s\t%s\t%s\n' "$k" "$released_match" "$sibling_leak" "$dup_count" "$parent_count" | tee -a "$OUT/rounds.tsv"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$k" "$released_match" "$sibling_leak" "$dup_count" "$parent_count" "$lost_ok" "$lost_leak" | tee -a "$OUT/rounds.tsv"
     [ -n "$promote_log" ] && echo "  $promote_log"
     [ "$released_match" = "PARTIAL" ] && echo "  FAIL: partial keys (expected all-or-none)"
     [ "$sibling_leak" = "1" ] && echo "  FAIL: sibling keys leaked"
     [ "$dup_count" -gt 0 ] && echo "  FAIL: $dup_count duplicate key(s)"
+    [ "$lost_ok" = 1 ] || echo "  FAIL: the lost turn ($lost_count of $EFFECTS key(s) declared, withdrawn=$withdrawn, $lost_leak promoted)"
 
     # This round's datasets stay in the block log under $ROUND_BASE (a
     # fresh log per run); the cleanup at the end unmounts them.
@@ -475,6 +543,11 @@ if [ -s "$ALL_KEYS" ]; then
 fi
 
 # ── summary ───────────────────────────────────────────────────────────
+# The verdict is the exit status: 0 only if every check passed and at
+# least one round promoted (pipefail carries the summary's status through
+# tee).  Before 2026-11-10 the script ended 0 whatever the table said, so
+# release-gate.sh, which reads the status, could not fail on it.
+echo "results in $OUT"
 python3 - "$OUT/rounds.tsv" "$N" "$global_dups" <<'PY' | tee "$OUT/summary.txt"
 import sys
 
@@ -504,8 +577,18 @@ print(f"2. no sibling leak: {no_leak}/{n} -> {'PASS' if no_leak == n else 'FAIL'
 print(f"3. no duplicate keys (per-round and global): per-round {no_dups}/{n}, "
       f"global {global_dups} -> {'PASS' if no_dups == n and global_dups == 0 else 'FAIL'}")
 
+# Check 4: the lost turn's effects were withdrawn and never promoted.
+lost_ok = sum(1 for r in rows if len(r) > 5 and r[5] == "1")
+lost_promoted = sum(int(r[6]) for r in rows if len(r) > 6)
+print(f"4. a lost turn's effects are withdrawn, never promoted: {lost_ok}/{n}, "
+      f"{lost_promoted} promoted -> {'PASS' if lost_ok == n and lost_promoted == 0 else 'FAIL'}")
+
 if all_count == 0:
-    print("WARNING: no round completed a promotion (all SIGKILLs too early); "
+    print("FAIL: no round completed a promotion (all SIGKILLs too early); "
           "the gate proves nothing about the promoted set.  Increase KILLS or check timing.")
+
+ok = (all_or_none == n and no_leak == n and no_dups == n and global_dups == 0
+      and lost_ok == n and lost_promoted == 0 and all_count > 0)
+print("P3 no-trace gate: " + ("PASS" if ok else "FAIL"))
+sys.exit(0 if ok else 1)
 PY
-echo "results in $OUT"

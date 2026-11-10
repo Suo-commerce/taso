@@ -360,6 +360,19 @@ def agent(args):
             declared.append((call, key_hex, op, result))
             print(f"  effect call={call} key={key_hex[:16]}.. -> {result} op={op}", file=sys.stderr)
 
+        # A turn that never ends (the gate's lost turn): the keys just
+        # declared are written, then the agent waits to be killed with
+        # its Warden.  No Transcript, no TurnEnd.
+        if args.stall_after_effects:
+            tmp = args.stall_after_effects + ".tmp"
+            with open(tmp, "w") as f:
+                for _call, key_hex, _op, _result in declared:
+                    f.write(key_hex + "\n")
+            os.replace(tmp, args.stall_after_effects)
+            print(f"stalling before TurnEnd ({args.stall_after_effects})", file=sys.stderr)
+            while True:
+                time.sleep(3600)
+
         # Transcript + TurnEnd
         entry = f"turn {turn}: {args.effects} effects declared".encode()
         reply = ask(sock, encode_transcript(entry))
@@ -431,6 +444,9 @@ def main():
     p.add_argument("--keys-file", default="/work/keys.log",
                    help="write each released effect's key here (sender)")
     p.add_argument("--turns", type=int, default=1, help="number of turns (agent)")
+    p.add_argument("--stall-after-effects", default=None, metavar="FILE",
+                   help="agent: after the first turn's effects, write their keys "
+                        "to FILE and wait forever, never ending the turn")
     args = p.parse_args()
     if args.role == "agent":
         agent(args)
