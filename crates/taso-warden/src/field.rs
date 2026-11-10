@@ -2216,6 +2216,8 @@ mod tests {
         }
         let mut children = std::mem::take(&mut b.children);
         let c = &mut children[0];
+        // As at every real start: the birth Seal, before the agent runs.
+        c.seal_birth().unwrap();
         // The lost turn: one action declared and held, no TurnEnd; the
         // session and its ledger end with the Warden.
         {
