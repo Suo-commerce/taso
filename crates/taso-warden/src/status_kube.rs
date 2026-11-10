@@ -169,16 +169,18 @@ fn message(s: &str) -> String {
     format!("{}...", &s[..end])
 }
 
-/// RFC 7386 merge of `patch` into `into`.
-fn merge(into: &mut Value, patch: &Value) {
+/// Fold the merge patch `patch` into the merge patch `into`: the result
+/// asks for what `into` asked for, then what `patch` asks for.  A `null`
+/// stays in the result, because the result is what the writer sends: a
+/// merge patch clears a key only where it names it with `null`, and leaves
+/// a key it does not name (audit 2026-11-09, cleared field stays: the
+/// nulls were dropped here, so a field a later event cleared stayed on
+/// the resource).
+fn fold(into: &mut Value, patch: &Value) {
     match (into.as_object_mut(), patch.as_object()) {
         (Some(o), Some(p)) => {
             for (k, v) in p {
-                if v.is_null() {
-                    o.remove(k);
-                } else {
-                    merge(o.entry(k.clone()).or_insert(Value::Null), v);
-                }
+                fold(o.entry(k.clone()).or_insert(Value::Null), v);
             }
         }
         _ => *into = patch.clone(),
@@ -246,7 +248,8 @@ struct Writer<A: StatusApi> {
     api: A,
     view: SharedView,
     node: String,
-    /// What events asked for, per resource uid (merged).
+    /// What events asked for, per resource uid, as one merge patch (a
+    /// `null` for a field to clear).
     wanted: BTreeMap<String, Value>,
     /// What was last written, per resource uid.
     written: BTreeMap<String, Value>,
@@ -280,7 +283,7 @@ impl<A: StatusApi> Writer<A> {
             // Only for a Vessel the view has a resource for (else it is gone,
             // or no longer this node's).
             if let Some(o) = view.objects.get(&key) {
-                merge(
+                fold(
                     self.wanted
                         .entry(o.uid.clone())
                         .or_insert_with(|| json!({})),
@@ -305,12 +308,12 @@ impl<A: StatusApi> Writer<A> {
                 .unwrap_or_else(|| json!({}));
             let mut status = base;
             if r.kept_previous {
-                merge(
+                fold(
                     &mut status,
                     &json!({ "message": message(&format!("spec refused, running its last good spec: {}", r.reason)) }),
                 );
             } else {
-                merge(
+                fold(
                     &mut status,
                     &json!({ "phase": "Refused", "message": message(&r.reason) }),
                 );
@@ -544,6 +547,23 @@ mod tests {
         assert_eq!(message(&"a".repeat(MAX_MESSAGE)).len(), MAX_MESSAGE);
     }
 
+    /// RFC 7386 merge of `patch` into `into`: what the API server does
+    /// with a status patch (the fake does the same).
+    fn merge(into: &mut Value, patch: &Value) {
+        match (into.as_object_mut(), patch.as_object()) {
+            (Some(o), Some(p)) => {
+                for (k, v) in p {
+                    if v.is_null() {
+                        o.remove(k);
+                    } else {
+                        merge(o.entry(k.clone()).or_insert(Value::Null), v);
+                    }
+                }
+            }
+            _ => *into = patch.clone(),
+        }
+    }
+
     #[test]
     fn merge_patch() {
         let mut v = json!({ "a": 1, "s": { "x": 1, "y": 2 } });
@@ -554,6 +574,26 @@ mod tests {
         assert_eq!(v, json!({ "b": 2, "s": { "x": 1, "z": 3 } }));
         merge(&mut v, &json!({ "s": 5 }));
         assert_eq!(v["s"], 5);
+    }
+
+    /// Folding two patches and applying the result is applying the first,
+    /// then the second.
+    #[test]
+    fn a_folded_patch_keeps_its_nulls() {
+        let first = json!({ "a": 1, "s": { "x": 1, "y": 2 } });
+        let second = json!({ "a": null, "b": 2, "s": { "y": null, "z": 3 } });
+        let mut folded = first.clone();
+        fold(&mut folded, &second);
+        assert_eq!(
+            folded,
+            json!({ "a": null, "b": 2, "s": { "x": 1, "y": null, "z": 3 } })
+        );
+        let mut one = json!({ "a": 0, "s": { "y": 0 }, "other": true });
+        let mut two = one.clone();
+        merge(&mut one, &first);
+        merge(&mut one, &second);
+        merge(&mut two, &folded);
+        assert_eq!(one, two);
     }
 
     // ── The writer ──────────────────────────────────────────────────
@@ -679,6 +719,57 @@ mod tests {
 
     fn started(n: &str) -> (VesselKey, Value) {
         status_of(&Event::Started(vc(n)), W).unwrap()
+    }
+
+    /// Audit 2026-11-09, a field a later event cleared (`birthSeal: null`
+    /// on an open, after a first run that took the birth Seal) stayed on
+    /// the resource: the writer dropped the null before it sent the patch,
+    /// and a merge patch leaves a key it does not name.  The fake applies
+    /// the patch as the API server does.
+    #[test]
+    fn a_field_cleared_by_a_later_event_is_cleared_on_the_resource() {
+        let fake = Fake::default();
+        fake.put("v1", "u1", "node-a");
+        let mut w = writer(&fake);
+        let v = view(&[("v1", "u1")], vec![]);
+        let exited = |r: Report| {
+            status_of(
+                &Event::Exited {
+                    vc: vc("v1"),
+                    out: Ok(r),
+                    stopped: false,
+                    restart_in: None,
+                },
+                W,
+            )
+            .unwrap()
+        };
+        // The first run: a birth, its Seal at 1, nothing rolled back.
+        let mut first = report(Some((true, "")), false);
+        first.start = Start::Birth;
+        first.settled.birth = Some(pos(1));
+        first.settled.rolled_back_to = None;
+        w.round(&v, vec![exited(first)]);
+        assert_eq!(fake.status("v1")["settled"]["birthSeal"], json!(1));
+        // The second run: an open, no birth Seal (the event says null).
+        let second = exited(report(Some((true, "")), false));
+        assert_eq!(
+            second.1["settled"]["birthSeal"],
+            Value::Null,
+            "the event clears it"
+        );
+        w.round(&v, vec![second]);
+        let after = fake.status("v1");
+        assert_eq!(after["start"], json!("Open"), "the second run was written");
+        assert_eq!(
+            after["settled"].get("birthSeal"),
+            None,
+            "birthSeal of the first run is still on the resource: {after}"
+        );
+        // Nothing changed: nothing more is written.
+        let patches = fake.patches();
+        w.round(&v, vec![]);
+        assert_eq!(fake.patches(), patches);
     }
 
     #[test]
