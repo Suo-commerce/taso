@@ -436,7 +436,13 @@ impl Verdicts {
                 )));
             }
         }
-        vessel.append_contract(rec)?;
+        // A record the log already carries is submitted again, not
+        // appended again: a caller retrying one the coordinator refused
+        // for good added a frame to the Vessel's log at every retry
+        // (audit 2026-11-09, a refused commit appended again).
+        if !carries(vessel, &sub)? {
+            vessel.append_contract(rec)?;
+        }
         let mut attempt = *vessel.attempt_mut();
         let got = submit::submit(
             self.coord.as_ref(),
@@ -457,6 +463,25 @@ impl Verdicts {
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Whether `vessel`'s local log carries `record` (a contract frame with
+/// its digest): what [`submit::submit`] finds it by.
+fn carries<L: Layers>(vessel: &Vessel<L>, record: &Submitted) -> Result<bool, VerdictError> {
+    use taso_core::envelope::Stream;
+    use taso_core::record::Payload;
+    let digest = record.digest();
+    let frames = vessel
+        .chronicle()
+        .frames()
+        .map_err(|e| SubmitError::from(crate::chronicle::ChronicleError::from(e)))?;
+    Ok(frames.iter().any(|f| {
+        f.envelope.stream == Stream::Ctl
+            && match Payload::decode(&f.payload) {
+                Ok(Payload::Contract(r)) => Submitted::Contract(*r).digest() == digest,
+                _ => false,
+            }
+    }))
 }
 
 /// What [`Verdicts::record`] learnt (short-lived, matched at once).

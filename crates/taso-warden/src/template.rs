@@ -3117,6 +3117,46 @@ mod tests {
         }
     }
 
+    /// Audit 2026-11-09, a record the coordinator refused for good,
+    /// recorded again (the caller's retry), was appended to the Vessel's
+    /// log again each time: the log grew by a frame per retry.  The retry
+    /// submits the frame the log already carries.
+    #[test]
+    fn a_refused_record_retried_does_not_grow_the_log() {
+        let c = Cluster::new();
+        let (_h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let rec = ContractRecord::PurgeComplete(taso_core::contract::PurgeComplete {
+            chronicle: v.id(),
+            inventory_key: HashVal::from_bytes([9; 32]),
+            items_replaced: 0,
+            history_attestation: HashVal::from_bytes([8; 32]),
+        });
+        let vd = verdicts(&c);
+        let t0 = v.tail().lsn;
+        let r = vd.record(&mut v, &packs, rec.clone());
+        assert!(
+            matches!(
+                r,
+                Err(VerdictError::Submit(crate::submit::SubmitError::Refused(_)))
+            ),
+            "{:?}",
+            r.err().map(|e| e.to_string())
+        );
+        let t1 = v.tail().lsn;
+        assert_eq!(t1.get() - t0.get(), 1, "the first try appends it once");
+        for _ in 0..3 {
+            assert!(matches!(
+                vd.record(&mut v, &packs, rec.clone()),
+                Err(VerdictError::Submit(crate::submit::SubmitError::Refused(_)))
+            ));
+        }
+        assert_eq!(
+            v.tail().lsn,
+            t1,
+            "three retries of one refused record added frames"
+        );
+    }
+
     /// A request by `PEER` for `cand`, naming `f`'s attempt and result.
     fn request(
         cand: &taso_core::contract::Candidate,
