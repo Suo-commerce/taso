@@ -155,9 +155,14 @@ pub enum Ended {
     OutputLimit,
 }
 
+/// How long [`run_capped`] waits for a child it asked to have killed
+/// before it asks again.
+pub const KILL_AGAIN: Duration = Duration::from_millis(100);
+
 /// Run `cmd` with its standard output and error captured together, in
 /// order, up to `bound` bytes; past the bound, or past `wall`, `kill` is
-/// called (with the child's pid) and the run ends `OutputLimit` or
+/// called (with the child's pid), and called again every [`KILL_AGAIN`]
+/// until the child has exited, and the run ends `OutputLimit` or
 /// `Timeout`.  Returns how it ended and the captured output (at most
 /// `bound` bytes).
 pub fn run_capped(
@@ -198,6 +203,8 @@ pub fn run_capped(
     });
     let start = Instant::now();
     let mut ended = None;
+    // When the kill was last asked for.
+    let mut asked = None;
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
@@ -205,11 +212,17 @@ pub fn run_capped(
         if ended.is_none() {
             if rx.try_recv().is_ok() {
                 ended = Some(Ended::OutputLimit);
-                kill(pid);
             } else if start.elapsed() >= wall {
                 ended = Some(Ended::Timeout);
-                kill(pid);
             }
+        }
+        // Past a limit the kill is asked for until the child has exited,
+        // not once: a kill can fail to take (a `runc kill` that finds no
+        // container yet), and then the run went on for as long as the
+        // verifier liked (audit 2026-11-09, kill asked for once).
+        if ended.is_some() && asked.is_none_or(|at: Instant| at.elapsed() >= KILL_AGAIN) {
+            kill(pid);
+            asked = Some(Instant::now());
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -307,6 +320,36 @@ mod tests {
         assert_eq!(e, Ended::Timeout);
         assert!(t.elapsed() < Duration::from_secs(10));
         assert_eq!(outcome_of(e), Outcome::Timeout);
+    }
+
+    /// Audit 2026-11-09, past its wall time the Warden asked for the kill
+    /// once and then waited without a bound: after a kill that did not
+    /// take (a `runc kill` that found no container yet) the verifier ran
+    /// for as long as it liked.  Here the first kill does nothing; the
+    /// child ends by itself after 4 s so the test cannot hang.
+    #[test]
+    fn a_kill_that_did_not_take_is_asked_for_again() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let flaky = |pid: u32| {
+            if calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                kill(pid);
+            }
+        };
+        let t = Instant::now();
+        let (e, _) = run_capped(
+            &mut sh("exec sleep 4"),
+            Duration::from_millis(200),
+            1 << 10,
+            &flaky,
+        )
+        .unwrap();
+        assert_eq!(e, Ended::Timeout);
+        let (n, took) = (calls.load(Ordering::SeqCst), t.elapsed());
+        assert!(
+            n > 1 && took < Duration::from_secs(3),
+            "the kill was asked for {n} time(s) and the run went on for {took:?} past a 200 ms wall time"
+        );
     }
 
     #[test]

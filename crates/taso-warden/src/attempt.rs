@@ -615,6 +615,9 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
             .args(["run", "--bundle"])
             .arg(&bundle)
             .arg(&id);
+        // A kill that fails is not reported: `run_capped` asks for it
+        // again until `runc run` has exited (audit 2026-11-09, kill asked
+        // for once).
         let kill = |_pid: u32| {
             let _ = runc(&["kill", &id, "KILL"]);
         };
