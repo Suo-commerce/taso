@@ -85,7 +85,11 @@ run() {
     local n=$1 limit=$2 s rc; shift 2
     printf '%s  ' "$(date +%H:%M)"
     s=$(date +%s)
-    timeout --foreground -k 60 "$limit" "$@" > "$OUT/$n.txt" 2>&1
+    # 9>&-: the gate does not get the lock's descriptor.  With it, a process
+    # a killed gate left behind (a taso-blkd, a Warden) kept the lock, and
+    # every later run exited 3 until someone found it (audit 2026-11-09,
+    # gate lock).
+    timeout --foreground -k 60 "$limit" "$@" > "$OUT/$n.txt" 2>&1 9>&-
     rc=$?
     [ "$rc" = 124 ] && echo "release-gate: timed out after $limit" >> "$OUT/$n.txt"
     [ "$rc" = 0 ] || FAILED=$((FAILED + 1))

@@ -10,6 +10,8 @@
 # 2. gate-p2-blk.sh's summary exits 1 when a check says FAIL, 0 when all pass.
 # 3. p5-node.sh's report keeps its FAIL count when its output is saved.
 # 4. soak.sh's growth rule fails a leak, and fails a run too short to judge.
+# 5. release-gate.sh's lock is free again when the run ends, whatever a
+#    gate left running.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d /tmp/gate-exit-test.XXXXXX); trap 'rm -rf "$T"' EXIT
@@ -62,5 +64,22 @@ exit "$FAIL"' soak "$T" "$@" >/dev/null 2>&1; echo $?
 check "soak: steady threads and open files pass" 0 "$(soak "10 20" "12 22" "11 21" "12 20" "10 22" "11 21")"
 check "soak: a leak fails, both columns" 2 "$(soak "10 20" "500 900" "1500 3000" "3000 6000" "5000 9000" "7000 12000")"
 check "soak: too few samples to judge fail, both columns" 2 "$(soak "10 20" "500 900" "1500 3000" "3000 6000" "5000 9000")"
+
+# 5. release-gate.sh's lock lines and its run(), cut out of the script, the
+# lock file under $T (no root): a first run whose gate leaves a process
+# behind, then a second run, which exits 3 if the lock is still held.
+sed -n '/^exec 9> /,/^flock -n 9 /p' scripts/release-gate.sh | sed "s|/run/taso-release-gate.lock|$T/gate.lock|" > "$T/lock.lines"
+sed -n '/^run() {/,/^}/p' scripts/release-gate.sh > "$T/run.fn"
+grep -q "^exec 9> $T/gate.lock" "$T/lock.lines" && [ -s "$T/run.fn" ] ||
+    { echo "FAIL  release-gate: its lock lines or its run() were not found"; bad=$((bad + 1)); }
+gate() { # gate CMD: one run with CMD as its only gate; prints the run's exit
+    bash -c 'OUT=$1 S=$1/summary.txt FAILED=0
+free_gib() { echo 0; }
+'"$(cat "$T/lock.lines" "$T/run.fn")"'
+run gate 20 bash -c "$2"' gate "$T" "$1" >/dev/null 2>&1; echo $?
+}
+check "release-gate: a first run takes the lock" 0 "$(gate "sleep 60 & echo \$! > $T/left.pid")"
+check "release-gate: what a gate left running does not keep the lock" 0 "$(gate true)"
+[ -s "$T/left.pid" ] && kill "$(cat "$T/left.pid")" 2>/dev/null
 
 [ "$bad" = 0 ] && echo "gate-exit-test: PASS" || { echo "gate-exit-test: $bad FAILED"; exit 1; }
