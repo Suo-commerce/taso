@@ -382,6 +382,16 @@ impl Mounts for System {
     }
 }
 
+/// `root` as the kernel lists a mount point under it: through any
+/// symlink if it exists, else written plainly (no `//`, no `/./`, no
+/// trailing `/`).  A mount point is matched against mountinfo as text,
+/// and the kernel lists the canonical path, so a mount root written any
+/// other way read every mounted Vessel as not mounted (audit 2026-11-09,
+/// a non-canonical mount root; the Seal then went on without its freeze).
+fn canonical_root(root: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&root).unwrap_or_else(|_| root.components().collect())
+}
+
 /// The source of the last mount on exactly `dir` in a mountinfo text
 /// (`proc(5)`: field 5 is the mount point, the field after `-` and the
 /// file-system type is the source; spaces are written as `\040`).
@@ -574,7 +584,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             blkd: Arc::new(Mutex::new(blkd)),
             maker,
             mounts: Arc::new(mounts),
-            mount_root: mount_root.into(),
+            mount_root: canonical_root(mount_root.into()),
             spool: spool.into(),
             views: Arc::default(),
             view_kind: "view",
@@ -2108,6 +2118,44 @@ mod tests {
     }
 
     type TestPool = BlkPool<StoreBlkd, FakeMounts>;
+
+    /// Audit 2026-11-09, the mount root was kept as written, and a mount
+    /// point is matched against mountinfo as text: a root given as
+    /// `/mnt//taso`, `/mnt/./taso/` or through a symlink read every
+    /// mounted Vessel as not mounted.  The pool keeps the root as the
+    /// kernel lists it.
+    #[test]
+    fn a_mount_root_written_any_way_names_the_mount_points_the_kernel_lists() {
+        let spool = tempfile::tempdir().unwrap();
+        let mk = |root: &str| -> TestPool {
+            BlkPool::with(StoreBlkd::new(), FakeMounts::default(), root, spool.path())
+        };
+        for root in ["/mnt//taso/./x", "/mnt/taso/x/", "/mnt/taso/x"] {
+            // As text: that is how mountinfo is matched (`Path`'s own
+            // comparison would call these equal).
+            assert_eq!(
+                mk(root).mountpoint(&ds("tank/v-1")).to_str(),
+                Some("/mnt/taso/x/tank/v-1"),
+                "{root}"
+            );
+        }
+        // Through a symlink: the path it leads to.
+        let real = tempfile::tempdir().unwrap();
+        let link = spool.path().join("link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let p = mk(link.to_str().unwrap());
+        let want = std::fs::canonicalize(real.path()).unwrap().join("tank/v-1");
+        assert_eq!(p.mountpoint(&ds("tank/v-1")), want);
+        // And what mountinfo lists for it is found.
+        let mi = format!(
+            "90 22 259:3 / {} rw,relatime shared:50 - ext4 /dev/ublkb3 rw\n",
+            want.display()
+        );
+        assert_eq!(
+            mount_source(&mi, &p.mountpoint(&ds("tank/v-1"))),
+            Some("/dev/ublkb3".into())
+        );
+    }
 
     fn pool() -> TestPool {
         let spool = tempfile::tempdir().unwrap().keep();
