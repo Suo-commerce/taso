@@ -441,6 +441,65 @@ impl<D> std::ops::DerefMut for Conn<'_, D> {
 /// for a command itself; `None` when the daemon gives none (the fakes).
 type Maker<D> = Option<Arc<Mutex<D>>>;
 
+/// The uids owning `top` and everything under it.  One descriptor is
+/// open at a time however deep the tree is: the walk goes down with
+/// `openat(dir, name)` and back up with `openat(dir, "..")`, and checks on
+/// the way up that it is where it came from (nothing runs in a Vessel
+/// while its tree is walked; a tree that moved under the walk is an error,
+/// never a walk outside it).
+fn owner_uids_under(top: &Path) -> io::Result<std::collections::BTreeSet<u32>> {
+    use rustix::fs::{fstat, openat, statat, AtFlags, Dir, FileType, Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut uids = std::collections::BTreeSet::new();
+    let mut at = openat(rustix::fs::CWD, top, flags, Mode::empty())?;
+    let st = fstat(&at)?;
+    uids.insert(st.st_uid);
+    let mut here = (st.st_dev, st.st_ino);
+    // Per level from `top` down to `at`: that directory's identity, and
+    // its subdirectories still to walk.
+    let mut levels: Vec<((u64, u64), Vec<std::ffi::CString>)> = Vec::new();
+    loop {
+        // Everything in `at`: files counted, subdirectories listed.
+        let mut subdirs = Vec::new();
+        for entry in Dir::read_from(&at)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            let st = statat(&at, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            uids.insert(st.st_uid);
+            if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
+                subdirs.push(name.to_owned());
+            }
+        }
+        levels.push((here, subdirs));
+        // The next directory: down into the deepest level that still has
+        // one, going up a level each time one is done.
+        loop {
+            let pending = &mut levels.last_mut().expect("pushed above").1;
+            if let Some(name) = pending.pop() {
+                at = openat(&at, &name, flags, Mode::empty())?;
+                let st = fstat(&at)?;
+                here = (st.st_dev, st.st_ino);
+                break;
+            }
+            levels.pop();
+            let Some((parent, _)) = levels.last() else {
+                return Ok(uids);
+            };
+            at = openat(&at, c"..", flags, Mode::empty())?;
+            let st = fstat(&at)?;
+            if (st.st_dev, st.st_ino) != *parent {
+                return Err(io::Error::other(format!(
+                    "{}: the tree moved while it was walked",
+                    top.display()
+                )));
+            }
+        }
+    }
+}
+
 /// A fresh connection from `maker`, if it makes them.  Its lock is held
 /// only to copy the handle (no command, no I/O).
 fn fresh<D: Blkd>(maker: &Maker<D>) -> Option<D> {
@@ -581,31 +640,17 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
 
     /// The uids owning files in `dataset` (it is mounted for the walk if
     /// it is not).
+    ///
+    /// The tree is an agent's: it is walked by directory descriptor, one
+    /// name at a time and never through a symlink, so no depth of nesting
+    /// makes a path too long (audit 2026-11-09, A2: walked by absolute
+    /// path, a tree nested past PATH_MAX failed the Warden's start).
     pub fn owner_uids(
         &self,
         dataset: &Dataset,
     ) -> Result<std::collections::BTreeSet<u32>, LayerError> {
-        use std::os::unix::fs::MetadataExt;
         self.ensure_mounted(dataset)?;
-        let mut uids = std::collections::BTreeSet::new();
-        let mut stack = vec![self.mountpoint(dataset)];
-        while let Some(dir) = stack.pop() {
-            let meta = std::fs::symlink_metadata(&dir)?;
-            uids.insert(meta.uid());
-            if !meta.is_dir() {
-                continue;
-            }
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
-                let m = entry.metadata()?; // does not follow symlinks
-                if m.is_dir() {
-                    stack.push(entry.path());
-                } else {
-                    uids.insert(m.uid());
-                }
-            }
-        }
-        Ok(uids)
+        Ok(owner_uids_under(&self.mountpoint(dataset))?)
     }
 
     /// Copy `stream` into a new spool file; the file is removed when the
@@ -2834,6 +2879,47 @@ mod tests {
             p.owner_uids(&a).unwrap().into_iter().collect::<Vec<_>>(),
             [me]
         );
+    }
+
+    /// Audit 2026-11-09, A2: the Warden's start walks every Vessel's tree
+    /// for its owners.  Walked by absolute path, a tree an agent nested
+    /// past PATH_MAX failed the walk with ENAMETOOLONG, and the Warden
+    /// refused to start until someone removed the tree by hand.
+    #[test]
+    fn owner_uids_walks_a_tree_deeper_than_path_max() {
+        use rustix::fs::{mkdirat, openat, Mode, OFlags};
+        let mounts = tempfile::tempdir().unwrap();
+        let p = BlkPool::with(
+            StoreBlkd::new(),
+            FakeMounts::default(),
+            mounts.path(),
+            mounts.path().join("spool"),
+        );
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        let mp = p.mountpoint(&a);
+        std::fs::create_dir_all(&mp).unwrap();
+        // 3000 levels of "a": a path of 6000 bytes, past PATH_MAX (4096).
+        // Two branches at the top, so the walk also has to come back up.
+        let dir = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let mut at = openat(rustix::fs::CWD, &mp, dir, Mode::empty()).unwrap();
+        mkdirat(&at, "b", Mode::from_raw_mode(0o755)).unwrap();
+        std::fs::write(mp.join("b/f"), b"x").unwrap();
+        for _ in 0..3000 {
+            mkdirat(&at, "a", Mode::from_raw_mode(0o755)).unwrap();
+            at = openat(&at, "a", dir, Mode::empty()).unwrap();
+        }
+        let me = std::fs::metadata(&mp)
+            .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+            .unwrap();
+        let walked = p.owner_uids(&a);
+        // tempdir's own removal walks by path too: take the tree down
+        // from the bottom, by descriptor, before anything can panic.
+        for _ in 0..3000 {
+            at = openat(&at, "..", dir, Mode::empty()).unwrap();
+            rustix::fs::unlinkat(&at, "a", rustix::fs::AtFlags::REMOVEDIR).unwrap();
+        }
+        assert_eq!(walked.unwrap().into_iter().collect::<Vec<_>>(), [me]);
     }
 
     /// A stream of `to`, from node `src` (incremental from `from`).
