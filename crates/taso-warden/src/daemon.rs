@@ -3426,6 +3426,60 @@ pub fn check_state_generation(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// The TTL start kept in file `f`; if none is kept yet, the Warden keeps
+/// `now` there first.  Whoever asks gets what the file holds.
+///
+/// The run's thread and the TTL pass both come here for one Vessel, so
+/// the Warden lets one of them in at a time: the first writes, the other
+/// reads what the first wrote.  The file is written under a temporary
+/// name of this writer alone, synced, renamed, and its directory synced,
+/// so a power cut leaves the old state or the whole new file.  An empty
+/// file is what a power cut left of a write before that was so (the name
+/// without its bytes): nothing was kept, and the start is kept anew.  Any
+/// other content that is not a number is refused, not guessed (audit
+/// 2026-11-09, TTL start file).
+fn keep_ttl_start(f: &Path, now: u64) -> io::Result<u64> {
+    use std::io::Write;
+    static ONE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let _one = ONE_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+    match std::fs::read_to_string(f) {
+        Ok(t) if t.is_empty() => {}
+        Ok(t) => {
+            return t
+                .trim()
+                .parse()
+                .map_err(|_| io::Error::other(format!("{}: not a number", f.display())))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let dir = f
+        .parent()
+        .ok_or_else(|| io::Error::other(format!("{}: no directory", f.display())))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp = f.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut w = File::create(&tmp)?;
+        w.write_all(format!("{now}\n").as_bytes())?;
+        w.sync_all()?;
+        drop(w);
+        std::fs::rename(&tmp, f)
+    })();
+    if let Err(e) = written {
+        // The write's own error is the answer; the temporary is this
+        // writer's alone and is taken away if it is there.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    File::open(dir)?.sync_all()?;
+    Ok(now)
+}
+
 impl Node {
     /// A node: refuses a host with SELinux ([`refuse_selinux`]), claims
     /// the run directory, checks the state directory's generation
@@ -3825,24 +3879,7 @@ impl Node {
     /// When Vessel `id`'s TTL started (seconds since the Unix epoch): kept
     /// once, the first time this Warden runs it or checks it (D81).
     fn ttl_start(&self, id: ChronicleId) -> io::Result<u64> {
-        let f = self.ttl_file(id);
-        match std::fs::read_to_string(&f) {
-            Ok(t) => t
-                .trim()
-                .parse()
-                .map_err(|_| io::Error::other(format!("{}: not a number", f.display()))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let now = unix_now();
-                if let Some(d) = f.parent() {
-                    std::fs::create_dir_all(d)?;
-                }
-                let tmp = f.with_extension("tmp");
-                std::fs::write(&tmp, format!("{now}\n"))?;
-                std::fs::rename(&tmp, &f)?;
-                Ok(now)
-            }
-            Err(e) => Err(e),
-        }
+        keep_ttl_start(&self.ttl_file(id), unix_now())
     }
 
     /// One reclaimer pass ([`crate::reclaim`]): what it did is logged.
@@ -7816,5 +7853,127 @@ mod tests {
         );
         assert_eq!(a[..12], b[..12], "the hostname part is the Vessel's");
         assert!(a.len() <= 128 && a.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'));
+    }
+
+    /// A Node put together without its start (no runc sweep, no block
+    /// log): for what reads only its config and state directory.
+    fn bare_node(tmp: &Path) -> Node {
+        let mut v: Value = serde_json::from_str(GOOD).unwrap();
+        v["run_dir"] = tmp.join("run").to_string_lossy().into();
+        v["store"] = tmp.join("store").to_string_lossy().into();
+        v["state_dir"] = tmp.join("state").to_string_lossy().into();
+        let config = Config::parse(&v.to_string()).unwrap();
+        let coord: Arc<dyn Coord> =
+            Arc::new(crate::coordinator::Coordinator::open(tmp.join("c.redb")).unwrap());
+        let storage = BlkPool::new("/nonexistent/blk.sock", tmp.join("mnt"), tmp.join("spool"));
+        let store = config.store.open().unwrap();
+        let run_lock = claim_run_dir(&config.run_dir).unwrap();
+        Node {
+            config,
+            coord,
+            storage,
+            store,
+            run_lock,
+            held: Vec::new(),
+            requested: Requested::new(),
+            started: Default::default(),
+            layers: None,
+            failpoint: None,
+            nominator: None,
+            verifiers: Verifiers::new(MAX_CONCURRENT_VERIFIERS),
+            reruns: Reruns::default(),
+            verifier_limits: crate::verify::VerifierLimits::default(),
+            attempt_failpoint: crate::attempt::no_failpoints(),
+            decide_slots: Default::default(),
+        }
+    }
+
+    /// Audit 2026-11-09, the Warden wrote a Vessel's TTL start without
+    /// syncing it, so a power cut could leave the file empty; every later
+    /// read then failed ("not a number") and the Vessel was never purged
+    /// at its TTL.
+    #[test]
+    fn an_empty_ttl_start_file_does_not_stop_the_ttl_for_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = bare_node(tmp.path());
+        let id = vessel_id(ns(1), b"u");
+        // A first call keeps it: the file as the code writes it.
+        let t0 = node.ttl_start(id).unwrap();
+        assert_eq!(node.ttl_start(id).unwrap(), t0);
+        // What a power cut left of an unsynced write: the name, no bytes.
+        std::fs::write(node.ttl_file(id), b"").unwrap();
+        // The Warden keeps the start anew, and it stays kept.
+        let t1 = node.ttl_start(id).unwrap();
+        assert!(t1 >= t0);
+        assert_eq!(node.ttl_start(id).unwrap(), t1);
+        assert_eq!(
+            std::fs::read_to_string(node.ttl_file(id)).unwrap(),
+            format!("{t1}\n")
+        );
+    }
+
+    /// Audit 2026-11-09, the run's thread and the TTL pass wrote a
+    /// Vessel's TTL start through the same temporary name: one of them
+    /// could find its temporary already renamed away and fail, and the
+    /// two could answer different starts.
+    ///
+    /// Two threads are let go together, each with its own time.  Which
+    /// of them writes first is the scheduler's choice and not this
+    /// test's: what it holds is that, whichever does, neither fails and
+    /// both answer the one start the file keeps.  (Before the fix a few
+    /// of the 600 calls failed in most runs, not in every run.)
+    #[test]
+    fn two_threads_keeping_one_ttl_start_both_succeed() {
+        let tmp = tempfile::tempdir().unwrap();
+        for round in 0..300u64 {
+            let f = tmp.path().join("ttl").join(format!("{round:032x}"));
+            let go = Arc::new(std::sync::Barrier::new(2));
+            let ts: Vec<_> = [100 + round, 900 + round]
+                .into_iter()
+                .map(|now| {
+                    let (f, go) = (f.clone(), go.clone());
+                    std::thread::spawn(move || {
+                        go.wait();
+                        keep_ttl_start(&f, now).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            let got: Vec<_> = ts.into_iter().map(|t| t.join().unwrap()).collect();
+            let kept = std::fs::read_to_string(&f).unwrap();
+            let kept: u64 = kept.trim().parse().unwrap();
+            assert!(
+                kept == 100 + round || kept == 900 + round,
+                "round {round}: the file keeps {kept}"
+            );
+            assert_eq!(
+                got,
+                [Ok(kept), Ok(kept)],
+                "round {round}: both answer what the file keeps"
+            );
+        }
+        // Nothing but the kept starts is left in the directory.
+        let left = std::fs::read_dir(tmp.path().join("ttl")).unwrap().count();
+        assert_eq!(left, 300, "no temporary stays behind");
+    }
+
+    /// The same without a race: the first start kept is the one every
+    /// later caller is answered; an empty file is kept anew; other
+    /// content that is no number is refused and left as it is.
+    #[test]
+    fn a_ttl_start_is_kept_once_and_junk_is_not_guessed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("ttl").join("a");
+        assert_eq!(keep_ttl_start(&f, 100).unwrap(), 100);
+        assert_eq!(keep_ttl_start(&f, 900).unwrap(), 100, "the first stays");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "100\n");
+        std::fs::write(&f, b"").unwrap();
+        assert_eq!(keep_ttl_start(&f, 900).unwrap(), 900, "empty: kept anew");
+        assert_eq!(keep_ttl_start(&f, 950).unwrap(), 900);
+        for junk in ["12x\n", "\n", "\0\0\0\0"] {
+            std::fs::write(&f, junk).unwrap();
+            let e = keep_ttl_start(&f, 900).unwrap_err().to_string();
+            assert!(e.contains("not a number"), "{junk:?}: {e}");
+            assert_eq!(std::fs::read_to_string(&f).unwrap(), junk, "left as it was");
+        }
     }
 }
