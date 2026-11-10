@@ -246,6 +246,19 @@ pub enum Answer {
     FinalRefused(Final),
 }
 
+/// Why a content object cannot be claimed for reclaim now
+/// ([`CoordLog::reclaim_blocker`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReclaimBlocker {
+    /// A record holds it.
+    Held,
+    /// It is claimed for deletion: by a purge, or by a reclaim not yet
+    /// resolved.
+    Claimed,
+    /// It was deleted under a claim and its key is still quarantined.
+    Quarantined,
+}
+
 /// `query { submission }` (§1.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubmissionStatus {
@@ -994,6 +1007,27 @@ impl CoordLog {
     /// Whether `object` is claimed for deletion.
     pub fn is_claimed(&self, object: &ObjectId) -> bool {
         self.claims.contains_key(object)
+    }
+
+    /// What would refuse a reclaim claim of content object `key` at
+    /// `now`, in the order the `ReclaimClaimed` row checks: a hold, a
+    /// claim, the quarantine after a deletion.  `None` if nothing would.
+    /// For a reclaimer to ask before it claims: a claim is a record,
+    /// announced, shipped and accepted, and it was the only way to learn
+    /// that an object is still needed (audit 2026-11-09, the reclaimer
+    /// claims every old object at every pass).  Only a hint: the claim's
+    /// own acceptance decides.
+    pub fn reclaim_blocker(&self, key: HashVal, now: u64) -> Option<ReclaimBlocker> {
+        let o = ObjectId::content(key);
+        if self.holds.values().any(|h| h.object == o) {
+            Some(ReclaimBlocker::Held)
+        } else if self.claims.contains_key(&o) {
+            Some(ReclaimBlocker::Claimed)
+        } else if self.quarantined(&o, now) {
+            Some(ReclaimBlocker::Quarantined)
+        } else {
+            None
+        }
     }
 
     /// Whether `template` is registered (its `TemplateReady` accepted).
@@ -2642,6 +2676,17 @@ mod tests {
             w.refused(f.v, ContractRecord::Candidate(Box::new(f.k.clone()))),
             Final::Claimed(ObjectId::content(f.k.artifact_key))
         );
+        // What a reclaimer is told when it asks first: each answer is the
+        // refusal the claim itself would get.
+        assert_eq!(
+            w.log.reclaim_blocker(f.k.artifact_key, w.now),
+            Some(ReclaimBlocker::Claimed)
+        );
+        assert_eq!(
+            w.log.reclaim_blocker(h(0x30), w.now),
+            Some(ReclaimBlocker::Held)
+        );
+        assert_eq!(w.log.reclaim_blocker(h(0x77), w.now), None, "an orphan");
         // Hold first: a reclaim of a held object is refused.
         assert_eq!(
             w.refused(
@@ -2663,6 +2708,15 @@ mod tests {
                 n: 0,
                 outcome: crate::contract::ReclaimOutcome::Deleted,
             },
+        );
+        assert_eq!(
+            w.log.reclaim_blocker(f.k.artifact_key, w.now),
+            Some(ReclaimBlocker::Quarantined)
+        );
+        assert_eq!(
+            w.log.reclaim_blocker(f.k.artifact_key, u64::MAX),
+            None,
+            "the quarantine ends"
         );
         store.put(ObjectId::content(f.k.artifact_key));
         let mut k2 = f.k.clone();

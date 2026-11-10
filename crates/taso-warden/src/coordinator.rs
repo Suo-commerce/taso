@@ -621,6 +621,17 @@ pub trait Coord: Send + Sync {
         let _ = chronicle;
         Err(no_log())
     }
+
+    /// What would refuse a reclaim claim of content object `key` now, or
+    /// `None` ([`taso_core::coordlog::CoordLog::reclaim_blocker`], at the
+    /// coordinator's clock).  Read-only: nothing is journalled.
+    fn reclaim_blocker(
+        &self,
+        key: HashVal,
+    ) -> Result<Option<taso_core::coordlog::ReclaimBlocker>, CoordError> {
+        let _ = key;
+        Err(no_log())
+    }
 }
 
 /// The answer of a coordinator with no coordinator log.
@@ -1892,6 +1903,14 @@ impl Coord for Coordinator {
 
     fn query_entry(&self, pos: u64) -> Result<Option<taso_core::coordlog::LogEntry>, CoordError> {
         self.read_log(move |log| log.entry_at(pos))
+    }
+
+    fn reclaim_blocker(
+        &self,
+        key: HashVal,
+    ) -> Result<Option<taso_core::coordlog::ReclaimBlocker>, CoordError> {
+        let now = (self.shared.config.clock)();
+        self.read_log(move |log| log.reclaim_blocker(key, now))
     }
 }
 

@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use taso_core::contract::{logical_id, ContractRecord, LogicalKey, ObjectKind, ReclaimOutcome};
+use taso_core::coordlog::ReclaimBlocker;
 use taso_core::envelope::HashVal;
 use taso_core::model::WardenId;
 
@@ -163,6 +164,41 @@ impl Reclaimer {
                 }
                 if pass.reclaimed.iter().any(|(k, _)| *k == key) {
                     continue; // finished in step 1
+                }
+                // Ask before claiming.  A claim is a record of this
+                // Warden's Chronicle: announced, shipped in a pack and
+                // put to the coordinator, to be refused if the object is
+                // still needed, as nearly every old object is.  The
+                // reclaimer used to claim every one of them at every
+                // pass (audit 2026-11-09, the reclaimer claims every old
+                // object; D&D R1 (b)).  The question changes nothing at
+                // the coordinator, and the claim's acceptance still
+                // decides: a hold accepted after this answer refuses it.
+                match self.coord.reclaim_blocker(key) {
+                    Ok(None) => {}
+                    // Held by a record, or just deleted: not an orphan.
+                    Ok(Some(ReclaimBlocker::Held | ReclaimBlocker::Quarantined)) => {
+                        pass.refused += 1;
+                        continue;
+                    }
+                    // Claimed.  A reclaim claim left open by a Warden
+                    // that is gone is finished here, under that claim,
+                    // as before; a purge's claim is the purge's.
+                    Ok(Some(ReclaimBlocker::Claimed)) => match self.open_claim(key) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            pass.refused += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            pass.failed.push(format!("{key}: {e}"));
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        pass.failed.push(format!("{key}: the coordinator: {e}"));
+                        continue;
+                    }
                 }
                 let l = self.open_log(&mut log)?;
                 self.reclaim(l, key, kind, &mut pass);
@@ -410,6 +446,50 @@ mod tests {
 
     const DAY: Duration = Duration::from_secs(24 * 3600);
     const HOUR: Duration = Duration::from_secs(3600);
+
+    /// Audit 2026-11-09, the reclaimer claimed every old object at every
+    /// pass: a record of its Chronicle, shipped in a pack and put to the
+    /// coordinator, to learn that the object is still needed.  Twenty
+    /// objects are reclaimed and then put again, so each is quarantined.
+    /// The next pass asks the coordinator first, claims none of them and
+    /// puts nothing in the store; once the quarantine has ended it
+    /// reclaims them as each key's second reclaim.
+    #[test]
+    fn a_pass_claims_nothing_the_coordinator_says_it_would_refuse() {
+        const N: usize = 20;
+        let e = env();
+        let r = e.reclaimer();
+        let put_all = || -> Vec<HashVal> {
+            (0..N)
+                .map(|i| e.put(format!("obj {i}").as_bytes(), 2 * DAY))
+                .collect()
+        };
+        let keys = put_all();
+        assert_eq!(r.coord.reclaim_blocker(keys[0]).unwrap(), None);
+        let p = r.pass(SystemTime::now()).unwrap();
+        assert_eq!(p.reclaimed.len(), N, "{:?}", p.failed);
+        put_all();
+        assert_eq!(
+            r.coord.reclaim_blocker(keys[0]).unwrap(),
+            Some(ReclaimBlocker::Quarantined)
+        );
+        let stored = || e.store.list(PREFIX).unwrap().len();
+        let before = stored();
+        let p = r.pass(SystemTime::now()).unwrap();
+        assert_eq!((p.refused, p.reclaimed.len()), (N, 0), "{:?}", p.failed);
+        assert!(p.failed.is_empty(), "{:?}", p.failed);
+        assert_eq!(
+            stored() - before,
+            0,
+            "packs the Warden shipped to claim {N} objects the coordinator would refuse"
+        );
+        // The quarantine over, they are orphans again.
+        e.clock.fetch_add(QUARANTINE + 1, Ordering::SeqCst);
+        assert_eq!(r.coord.reclaim_blocker(keys[0]).unwrap(), None);
+        let p = r.pass(SystemTime::now()).unwrap();
+        assert_eq!(p.reclaimed.len(), N, "{:?}", p.failed);
+        assert!(e.done(keys[0], 1));
+    }
 
     /// An orphan older than the grace period is claimed, deleted and
     /// resolved; a younger one, and what is not a content object, are

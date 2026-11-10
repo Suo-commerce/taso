@@ -42,6 +42,10 @@ one a_subject_longer_than_a_resource_may_have_is_refused $W
 one the_last_turn_number_is_refused_and_later_turns_still_seal $W
 one a_kill_that_did_not_take_is_asked_for_again $W
 one a_failed_append_consumes_no_op_id $W
+one an_effect_request_over_the_limit_is_refused_and_not_recorded $W
+one of_what_an_agent_prints_the_warden_keeps_the_end $W
+# The reclaimer
+one a_pass_claims_nothing_the_coordinator_says_it_would_refuse $W
 # Kubernetes
 one a_field_cleared_by_a_later_event_is_cleared_on_the_resource $W
 one a_failing_list_is_never_answered_as_unchanged $W

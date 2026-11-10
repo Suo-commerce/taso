@@ -57,6 +57,8 @@
 //!  20 purge_projection  chronicle (16)
 //!  21 purge_blocker     chronicle (16)
 //!  22 query_entry       log position (8)
+//!  23 open_work         chronicle (16)
+//!  24 reclaim_blocker   content key (32)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
@@ -172,7 +174,7 @@ use taso_core::coordlog::{
 /// first request, before anything is written.  2 since V4b's format break
 /// (review fix N4a); 3 since the Chronicle view says `sanctioned` (audit
 /// 2026-11-09, A1).
-const WIRE_VERSION: u8 = 3;
+const WIRE_VERSION: u8 = 4;
 
 const OP_REGISTER: u8 = 1;
 const OP_APPEND: u8 = 2;
@@ -197,6 +199,7 @@ const OP_PURGE_PROJECTION: u8 = 20;
 const OP_PURGE_BLOCKER: u8 = 21;
 const OP_QUERY_ENTRY: u8 = 22;
 const OP_OPEN_WORK: u8 = 23;
+const OP_RECLAIM_BLOCKER: u8 = 24;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -331,6 +334,9 @@ enum Request {
     },
     QueryEntry {
         pos: u64,
+    },
+    ReclaimBlocker {
+        key: HashVal,
     },
 }
 
@@ -652,6 +658,7 @@ impl Request {
             Self::OpenWork { chronicle } => o.u8(OP_OPEN_WORK).bytes(chronicle.as_bytes()),
             Self::PurgeBlocker { chronicle } => o.u8(OP_PURGE_BLOCKER).bytes(chronicle.as_bytes()),
             Self::QueryEntry { pos } => o.u8(OP_QUERY_ENTRY).u64(*pos),
+            Self::ReclaimBlocker { key } => o.u8(OP_RECLAIM_BLOCKER).bytes(key.as_bytes()),
         };
         o.0
     }
@@ -786,6 +793,7 @@ impl Request {
                 chronicle: i.chronicle()?,
             },
             OP_QUERY_ENTRY => Self::QueryEntry { pos: i.u64()? },
+            OP_RECLAIM_BLOCKER => Self::ReclaimBlocker { key: i.hash()? },
             _ => return Err(Malformed("unknown operation")),
         };
         i.end()?;
@@ -819,7 +827,8 @@ impl Request {
             | Self::PurgeProjection { .. }
             | Self::OpenWork { .. }
             | Self::PurgeBlocker { .. }
-            | Self::QueryEntry { .. } => None,
+            | Self::QueryEntry { .. }
+            | Self::ReclaimBlocker { .. } => None,
         }
     }
 
@@ -846,7 +855,8 @@ impl Request {
             | Self::PurgeProjection { .. }
             | Self::OpenWork { .. }
             | Self::PurgeBlocker { .. }
-            | Self::QueryEntry { .. } => OkKind::Blob,
+            | Self::QueryEntry { .. }
+            | Self::ReclaimBlocker { .. } => OkKind::Blob,
         }
     }
 }
@@ -1236,6 +1246,17 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
                     c.str(&e.pack);
                 }
             }
+            Reply::Blob(c.into_bytes())
+        }),
+        Request::ReclaimBlocker { key } => coord.reclaim_blocker(key).map(|b| {
+            use taso_core::coordlog::ReclaimBlocker as B;
+            let mut c = Canon::new();
+            c.tag(match b {
+                None => 0,
+                Some(B::Held) => 1,
+                Some(B::Claimed) => 2,
+                Some(B::Quarantined) => 3,
+            });
             Reply::Blob(c.into_bytes())
         }),
         Request::PurgeBlocker { chronicle } => coord.purge_blocker(chronicle).map(|b| {
@@ -2049,6 +2070,21 @@ impl Coord for RemoteCoord {
             _ => Err(JournalError("bad option tag")),
         })
     }
+
+    fn reclaim_blocker(
+        &self,
+        key: HashVal,
+    ) -> Result<Option<taso_core::coordlog::ReclaimBlocker>, CoordError> {
+        use taso_core::coordlog::ReclaimBlocker as B;
+        let r = self.call(Request::ReclaimBlocker { key })?;
+        blob_reply(r, |r| match r.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(B::Held)),
+            2 => Ok(Some(B::Claimed)),
+            3 => Ok(Some(B::Quarantined)),
+            _ => Err(JournalError("bad reclaim blocker tag")),
+        })
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -2343,7 +2379,7 @@ mod tests {
             let mut extra = b.clone();
             extra.push(0);
             assert!(Request::decode(&extra).is_err(), "trailing {r:?}");
-            for other in [1, 2, 4] {
+            for other in [1, 2, 3, 5] {
                 let mut v = b.clone();
                 v[0] = other;
                 assert!(Request::decode(&v).is_err(), "version {other} {r:?}");
@@ -2646,6 +2682,7 @@ mod tests {
                 None,
             ),
             (Request::QueryLogical { logical: h(3) }, None),
+            (Request::ReclaimBlocker { key: h(3) }, None),
             (
                 Request::QueryChronicle {
                     chronicle: chron(1),
