@@ -746,6 +746,16 @@ impl<'v, L: Layers> Session<'v, L> {
                 format!("turn {turn} is the Warden's birth Seal; turns start at 1"),
             );
         }
+        // The last number can have no successor: sealed, it would leave
+        // this Vessel, and every fork and successor that continues its
+        // count, with no turn to seal ever again (audit 2026-11-09, last
+        // turn number).
+        if turn == u64::MAX {
+            return error(
+                ErrorCode::Malformed,
+                format!("turn {turn} is the last number there is; no turn could follow it"),
+            );
+        }
         if self.last_sealed_turn.is_some_and(|last| turn <= last) {
             return error(
                 ErrorCode::Malformed,
@@ -3521,5 +3531,57 @@ mod tests {
         };
         assert_eq!(code, ErrorCode::Malformed);
         assert!(message.len() < 200, "{} bytes", message.len());
+    }
+
+    /// Audit 2026-11-09, the session sealed turn u64::MAX when asked.  No
+    /// turn comes after it, so the Vessel, and every fork and successor
+    /// that continues its count, could never be sealed by its agent again.
+    #[test]
+    fn the_last_turn_number_is_refused_and_later_turns_still_seal() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        s.handle(hello());
+        let first = s.handle(Request::TurnEnd {
+            turn: u64::MAX,
+            quiescent: true,
+        });
+        assert!(
+            matches!(
+                first,
+                Reply::Error {
+                    code: ErrorCode::Malformed,
+                    ..
+                }
+            ),
+            "{first:?}"
+        );
+        // Not quiescent: nothing would be sealed, but the number is no turn.
+        assert!(matches!(
+            s.handle(Request::TurnEnd {
+                turn: u64::MAX,
+                quiescent: false,
+            }),
+            Reply::Error {
+                code: ErrorCode::Malformed,
+                ..
+            }
+        ));
+        // A later ordinary turn still seals.
+        let later = s.handle(Request::TurnEnd {
+            turn: 2,
+            quiescent: true,
+        });
+        assert!(
+            matches!(
+                later,
+                Reply::TurnEnd {
+                    sealed: Some(_),
+                    ..
+                }
+            ),
+            "{later:?}"
+        );
+        assert_eq!(s.last_sealed_turn(), Some(2));
     }
 }
