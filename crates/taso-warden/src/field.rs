@@ -154,6 +154,13 @@ impl Conn {
     }
 }
 
+/// The longest child name a `Promote` request may carry, in bytes: the
+/// longest name the Warden gives a fork.  A fork is named
+/// `<subject>-fork-<uid slot>` ([`crate::daemon::ForksConf::child_name`]),
+/// a subject is at most 256 bytes (the rule for a Vessel resource's
+/// `spec.subject`), and a uid slot has at most 10 digits.
+pub const MAX_CHILD_NAME: usize = 256 + "-fork-".len() + 10;
+
 /// How a session's Fork and Promote requests reach the Warden (the
 /// daemon: [`crate::daemon`]).  A refusal is a reason for the agent;
 /// nothing is made.
@@ -568,6 +575,20 @@ impl<'v, L: Layers> Session<'v, L> {
                 result: self.nominate(seal, &exclude),
             },
             (true, Request::Promote { child, seal }) => {
+                // A name no fork of the Warden's could have is refused
+                // here, before the Warden's hooks see it, and the refusal
+                // does not repeat it (audit 2026-11-09, huge child name:
+                // the Warden's log line for the refusal held the name
+                // twice, 10 MiB for a 1 MiB name).
+                if child.len() > MAX_CHILD_NAME {
+                    return error(
+                        ErrorCode::Malformed,
+                        format!(
+                            "Promote: the child's name is {} bytes; the Warden gives no fork a name longer than {MAX_CHILD_NAME}",
+                            child.len()
+                        ),
+                    );
+                }
                 let result = self.promote(&child, seal);
                 let unfinished = self.adopting && matches!(result, PromoteResult::Refused { .. });
                 if let Some(b) = self.branches.as_deref_mut() {
@@ -3417,5 +3438,88 @@ mod tests {
             }
         ));
         assert!(v.last_seal().is_some());
+    }
+
+    /// Audit 2026-11-09, a `Promote` request's child name had no length
+    /// limit: the session handed it whole to the Warden's hooks, and the
+    /// Warden's log line for the refusal held it twice, each control byte
+    /// written as five (a 1 MiB name made a 10 MiB log line).
+    #[test]
+    fn a_child_name_no_fork_could_have_is_refused_before_the_hooks() {
+        struct Seen {
+            child_log: usize,
+            promoted: usize,
+            line: usize,
+        }
+        impl Branches<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers> for Seen {
+            fn fork(
+                &mut self,
+                _: &Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>,
+                _: SealAt,
+            ) -> Result<(String, u64), String> {
+                Err("no".into())
+            }
+            // The Warden's own `child_log` and `promoted` (daemon.rs), their
+            // formatting copied.
+            fn child_log(
+                &mut self,
+                _: &Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>,
+                child: &str,
+            ) -> Result<ReadLog, String> {
+                self.child_log = child.len();
+                Err(format!(
+                    "the log of {child:?} cannot be read here: no such vessel"
+                ))
+            }
+            fn promoted(&mut self, child: &str, result: &PromoteResult) {
+                self.promoted = child.len();
+                if let PromoteResult::Refused { reason } = result {
+                    self.line = format!("promotion of {child:?} refused: {reason}").len();
+                }
+            }
+        }
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let mut b = Seen {
+            child_log: 0,
+            promoted: 0,
+            line: 0,
+        };
+        let mut s = Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        // 1 MiB here; the frame allows 16 MiB.
+        let child = "\u{1}".repeat(1 << 20);
+        let req = Request::Promote {
+            child: child.clone(),
+            seal: None,
+        };
+        // It comes through the wire's decoder unchanged.
+        let req = Request::decode(&req.encode()).unwrap();
+        let reply = s.handle(req);
+        drop(s);
+        assert!(
+            b.child_log == 0 && b.promoted == 0,
+            "a child name of {} bytes reached child_log ({} bytes) and promoted ({} bytes); \
+             the Warden's log line for it is {} bytes",
+            child.len(),
+            b.child_log,
+            b.promoted,
+            b.line
+        );
+        // The refusal is short: it does not repeat the name.
+        let Reply::Error { code, message } = reply else {
+            panic!("the reply is not an error");
+        };
+        assert_eq!(code, ErrorCode::Malformed);
+        assert!(message.len() < 200, "{} bytes", message.len());
     }
 }
