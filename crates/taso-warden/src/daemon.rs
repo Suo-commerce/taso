@@ -2786,6 +2786,16 @@ impl Branches<BlkLayers> for NodeBranches<'_> {
             ),
         }
     }
+
+    fn promotion_unfinished(&mut self, child: &str) {
+        self.node.log(
+            self.vc,
+            format_args!(
+                "the promotion of {child:?} is recorded and not finished: ending the run; the next start finishes it"
+            ),
+        );
+        self.promoted.request();
+    }
 }
 
 fn has_fs_shipped(vessel: &Vessel<BlkLayers>) -> Result<bool, DaemonError> {

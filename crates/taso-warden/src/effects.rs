@@ -1035,6 +1035,50 @@ mod tests {
         assert_eq!(intents(&p).len(), 3);
     }
 
+    /// Audit 2026-11-09, A3: a promotion of a fork that proposed no
+    /// effects adopts nothing, so no adopted intent ever marked it done:
+    /// it stayed pending across every restart, and each start needed the
+    /// child's log again and was refused without it.  The parent's next
+    /// Seal (its adoption Seal) finishes a promotion: after it nothing is
+    /// pending, and the child's log is not asked for.
+    #[test]
+    fn a_promotion_of_no_effects_is_finished_by_the_adoption_seal() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let c = child(&e, &p, b"c", 0);
+        let log = e.host.read_log_of(c).unwrap();
+        let (mut fx, _) = open_dispatch(&mut p);
+        let (record, adopted) = fx.promote(&mut p, &log, SealAt::Last).unwrap();
+        assert!(adopted.is_empty() && intents(&p).is_empty());
+        assert_eq!(fx.pending_promotion(), None);
+        drop((fx, p));
+        // Before the adoption Seal a restart still sees the Promotion:
+        // finishing it again adopts nothing.
+        let mut p = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut p);
+        assert_eq!(fx.pending_promotion(), Some(record));
+        assert!(fx.finish_promotion(&mut p, &log).unwrap().is_empty());
+        // The adoption Seal, then a restart: done, for good.
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(2),
+        )
+        .unwrap();
+        drop((fx, p));
+        let mut p = vessel(&e);
+        let (fx, _) = open_dispatch(&mut p);
+        assert_eq!(fx.pending_promotion(), None);
+    }
+
     /// The adoption's ship fails: the promotion is done (recorded, nothing
     /// pending, never adopted twice), but nothing is listed until a ship
     /// succeeds — also across a reopen while the store is still down.

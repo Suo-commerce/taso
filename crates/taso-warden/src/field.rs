@@ -168,6 +168,11 @@ pub trait Branches<L: Layers> {
 
     /// A promotion of `child` was answered `result` (for the Warden's log).
     fn promoted(&mut self, _child: &str, _result: &PromoteResult) {}
+
+    /// A promotion of `child` was recorded in the Vessel's log but not
+    /// finished (answered Refused): the Vessel takes no Seal until its
+    /// next start finishes it, so the run should end.
+    fn promotion_unfinished(&mut self, _child: &str) {}
 }
 
 /// How a session's `Nominate` requests reach the Warden (P4 file 6b;
@@ -564,8 +569,12 @@ impl<'v, L: Layers> Session<'v, L> {
             },
             (true, Request::Promote { child, seal }) => {
                 let result = self.promote(&child, seal);
+                let unfinished = self.adopting && matches!(result, PromoteResult::Refused { .. });
                 if let Some(b) = self.branches.as_deref_mut() {
                     b.promoted(&child, &result);
+                    if unfinished {
+                        b.promotion_unfinished(&child);
+                    }
                 }
                 Reply::Promote { child, result }
             }
@@ -666,6 +675,8 @@ impl<'v, L: Layers> Session<'v, L> {
         if self.vessel.tail() != before {
             self.ledger = self.vessel.tail().lsn;
         }
+        // Whether a Promotion record stands unfinished in the log now.
+        let recorded = fx.pending_promotion().is_some();
         match r {
             Ok((record, adopted)) => {
                 self.adopting = true;
@@ -677,9 +688,7 @@ impl<'v, L: Layers> Session<'v, L> {
             // Done; Open lists the adopted ops once a ship succeeds (it
             // retries before each Open).
             Err(crate::effects::PromoteError::AdoptionNotShipped {
-                promotion,
-                adopted,
-                ..
+                promotion, adopted, ..
             }) => {
                 self.adopting = true;
                 PromoteResult::Promoted {
@@ -687,10 +696,25 @@ impl<'v, L: Layers> Session<'v, L> {
                     adopted: adopted.iter().map(|a| a.op.get()).collect(),
                 }
             }
-            Err(crate::effects::PromoteError::Vessel(e)) => refused(e.to_string()),
-            Err(crate::effects::PromoteError::NotShipped(e)) => refused(format!(
-                "the Promotion is recorded but the ledger could not be shipped ({e}); nothing is adopted until it is finished at this vessel's next start"
-            )),
+            // Refused, but the Promotion record may be in the log (the
+            // ship failed, or the adoption did): then this Vessel takes
+            // no Seal until its next start finishes the promotion, as
+            // after one that succeeded (audit 2026-11-09, A4: it sealed
+            // on, and the child's effects were adopted without its files).
+            Err(crate::effects::PromoteError::Vessel(e)) => {
+                self.adopting = recorded;
+                refused(if recorded {
+                    format!("the Promotion is recorded but was not finished ({e}); it is finished at this vessel's next start")
+                } else {
+                    e.to_string()
+                })
+            }
+            Err(crate::effects::PromoteError::NotShipped(e)) => {
+                self.adopting = true;
+                refused(format!(
+                    "the Promotion is recorded but the ledger could not be shipped ({e}); nothing is adopted until it is finished at this vessel's next start"
+                ))
+            }
         }
     }
 
@@ -2092,6 +2116,7 @@ mod tests {
         quota: usize,
         children: Vec<Vessel<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>>,
         promoted: Vec<(String, PromoteResult)>,
+        unfinished: usize,
     }
 
     impl Branches<<crate::vessel::tests::FakePool as crate::vessel::Pool>::Layers>
@@ -2130,6 +2155,10 @@ mod tests {
 
         fn promoted(&mut self, child: &str, result: &PromoteResult) {
             self.promoted.push((child.into(), result.clone()));
+        }
+
+        fn promotion_unfinished(&mut self, _child: &str) {
+            self.unfinished += 1;
         }
     }
 
@@ -2184,6 +2213,7 @@ mod tests {
             quota: 1,
             children: Vec::new(),
             promoted: Vec::new(),
+            unfinished: 0,
         };
         let (mut fx, _) = Effects::open(
             Mode::Dispatch,
@@ -2267,6 +2297,85 @@ mod tests {
     /// child's held proposals as this Vessel's released effects, and a
     /// second promotion at the same fork point — the sibling — is refused
     /// with nothing adopted (C1: the unchosen future touched nothing).
+    /// Audit 2026-11-09, A4: a Promotion that is recorded but could not be
+    /// finished (the ledger's ship failed) is answered Refused.  The
+    /// Vessel must still take no Seal until the promotion is finished at
+    /// its next start: a Seal would move it, the child's effects would be
+    /// adopted later all the same, and its files never.
+    #[test]
+    fn a_promotion_recorded_but_not_shipped_stops_the_seals() {
+        struct StoreDown;
+        impl crate::ledger::Publish for StoreDown {
+            fn publish(
+                &mut self,
+                _: taso_core::envelope::ChronicleId,
+                _: taso_core::envelope::Epoch,
+                _: &[&crate::segment::Segment],
+                _: Position,
+            ) -> Result<(), crate::ledger::PublishError> {
+                Err(crate::ledger::PublishError("store down".into()))
+            }
+        }
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        let fork_seal = p.seal_birth().unwrap().seal;
+        let mut b = FakeBranches {
+            host: &e.host,
+            quota: 1,
+            children: Vec::new(),
+            promoted: Vec::new(),
+            unfinished: 0,
+        };
+        let (mut fx, _) = Effects::open(Mode::Dispatch, Box::new(StoreDown), &mut p).unwrap();
+        {
+            let mut s = Session::new(&mut p, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx)
+                .with_branches(&mut b);
+            s.handle(hello());
+            assert!(matches!(
+                s.handle(Request::Fork { seal: None }),
+                Reply::Fork {
+                    result: ForkResult::Forked { .. }
+                }
+            ));
+        }
+        let mut children = std::mem::take(&mut b.children);
+        propose(&mut children[0], 1);
+        drop(children);
+
+        let mut s = Session::new(&mut p, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        let Reply::Promote {
+            result: PromoteResult::Refused { reason },
+            ..
+        } = s.handle(Request::Promote {
+            child: "c1".into(),
+            seal: None,
+        })
+        else {
+            panic!("the ship failed: not promoted")
+        };
+        assert!(reason.contains("recorded"), "{reason}");
+        // The Promotion is in the log: no Seal, no effect, no fork.
+        for req in [
+            Request::TurnEnd {
+                turn: 1,
+                quiescent: true,
+            },
+            Request::Fork { seal: None },
+        ] {
+            assert!(is_error(&s.handle(req), ErrorCode::Closed));
+        }
+        drop(s);
+        assert_eq!(p.last_seal().unwrap(), fork_seal, "no Seal taken");
+        assert!(p.adoption_pending().unwrap().is_some());
+        assert_eq!(b.unfinished, 1, "the Warden is told, to end the run");
+    }
+
     #[test]
     fn forks_and_promotions_are_asked_for_over_the_field() {
         let e = env();
@@ -2277,6 +2386,7 @@ mod tests {
             quota: 2,
             children: Vec::new(),
             promoted: Vec::new(),
+            unfinished: 0,
         };
         let (mut fx, _) = Effects::open(
             Mode::Dispatch,
@@ -2441,6 +2551,7 @@ mod tests {
             quota: 1,
             children: Vec::new(),
             promoted: Vec::new(),
+            unfinished: 0,
         };
         let up = std::rc::Rc::new(std::cell::Cell::new(false));
         // Ship 1: the Promotion; ship 2: the adoption (down from there).
@@ -2961,6 +3072,7 @@ mod tests {
             quota: 1,
             children: Vec::new(),
             promoted: Vec::new(),
+            unfinished: 0,
         };
         let (mut fx, _) = Effects::open(
             Mode::Dispatch,
@@ -3097,6 +3209,7 @@ mod tests {
             quota: 1,
             children: Vec::new(),
             promoted: Vec::new(),
+            unfinished: 0,
         };
         {
             let mut s = Session::new(&mut v, Verdict::Clean)

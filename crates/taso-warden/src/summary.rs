@@ -161,6 +161,14 @@ impl Summary {
                 }
                 Payload::Succession(s) => self.successor = Some(s),
                 Payload::Seal(s) => {
+                    // A Seal after a Promotion is its adoption Seal: the
+                    // start takes it only once the promotion's effects are
+                    // adopted, and no other Seal is taken in between
+                    // (`Session`'s `adopting`).  So it finishes the
+                    // promotion, also one that adopted no effect and so
+                    // has no adopted intent to say so (audit 2026-11-09,
+                    // A3: such a promotion stayed pending for good).
+                    self.promotion = None;
                     self.seal = Some(CheckpointSeal {
                         lsn,
                         hash: f.envelope.hash,

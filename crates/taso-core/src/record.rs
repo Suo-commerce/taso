@@ -814,7 +814,8 @@ pub struct CheckpointRecord {
     pub next_op: u64,
     /// A Promotion whose adoption is not finished: the last Promotion
     /// record seen, kept until every proposal it names is recorded as
-    /// this Chronicle's own intent (P3).  Carried here so a prune can
+    /// this Chronicle's own intent (P3), or until the next Seal (the
+    /// adoption Seal: a promotion that adopted no effect ends there).  Carried here so a prune can
     /// never hide a half-done promotion from the reopen that finishes it.
     pub promotion: Option<PromotionRecord>,
 }
