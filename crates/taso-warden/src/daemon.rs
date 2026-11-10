@@ -2438,6 +2438,44 @@ impl Verifiers {
         self.poke(s);
     }
 
+    /// The worker gives Vessel `id`, which it took with [`Self::next`],
+    /// a thread of its own (built by `thread`) to be looked at: `look`
+    /// answers when to look at it again, and the id is then given back
+    /// with that answer.  A `look` that panics gives it back for later
+    /// (said in the log under `who`).
+    ///
+    /// The OS may refuse a thread.  `std::thread::spawn` panics then, and
+    /// that panic ended the list's worker for the Warden's life with the
+    /// id still taken, so the Warden's end waited for it for ever (audit
+    /// 2026-11-09, thread spawn).  Here the refusal is an error the
+    /// worker is told: the id is back on the list first, looked at again
+    /// after [`QUEUE_RETRY`] (a cause that may pass is tried again, N5a),
+    /// and what `look` held, its slot too, is dropped with it.
+    fn look_at(
+        self: &Arc<Self>,
+        id: [u8; 16],
+        who: String,
+        thread: std::thread::Builder,
+        look: impl FnOnce() -> Option<Instant> + Send + 'static,
+    ) -> io::Result<()> {
+        let list = self.clone();
+        let spawned = thread.spawn(move || {
+            let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(look))
+                .unwrap_or_else(|_| {
+                    eprintln!("{who}: the verifiers' waiting list: a panic; looked at again later");
+                    Some(Instant::now() + QUEUE_RETRY)
+                });
+            list.done(id, again);
+        });
+        match spawned {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.done(id, Some(Instant::now() + QUEUE_RETRY));
+                Err(e)
+            }
+        }
+    }
+
     /// Sleep until something changes or the next waiting Vessel is due
     /// (at most [`QUEUE_TICK`]).
     fn wait(&self, now: Instant) {
@@ -2634,9 +2672,10 @@ impl<'s, 'e> Verifications<'s, 'e> {
                 "attempt {} of Candidate {}: started",
                 st.attempt_id, cand.candidate_id
             ));
-            self.running.insert(*cand.candidate_id.as_bytes());
+            let (attempt, candidate) = (st.attempt_id, *cand.candidate_id.as_bytes());
+            self.running.insert(candidate);
             let (node, tx) = (self.node, self.tx.clone());
-            self.scope.spawn(move || {
+            let spawned = std::thread::Builder::new().spawn_scoped(self.scope, move || {
                 // However the run ends, its slot is given back and the
                 // session hears of it (B1, B2): a panic is an attempt
                 // stopped, left open for the next open to close.
@@ -2675,6 +2714,18 @@ impl<'s, 'e> Verifications<'s, 'e> {
                     result,
                 });
             });
+            // The OS gave no thread (`scope.spawn` panicked here, on the
+            // session's thread: audit 2026-11-09, thread spawn).  The
+            // attempt is started and nothing ran it: as after a panic of
+            // its thread, it stays open and the next open closes it
+            // (D69).  Its slot came back when the unrun thread's closure
+            // was dropped.
+            if let Err(e) = spawned {
+                self.running.remove(&candidate);
+                self.log(format_args!(
+                    "attempt {attempt}: no thread to run it ({e}); it stays open until the next open closes it"
+                ));
+            }
         }
     }
 
@@ -2774,6 +2825,26 @@ impl<'s, 'e> Verifications<'s, 'e> {
 /// How long an agent that asked for a promotion has to exit by itself
 /// before its container is killed (C7).
 const PROMOTED_GRACE: Duration = Duration::from_secs(2);
+
+/// End an agent the run cannot go on with: the Warden kills container
+/// `id` until `agent`, the thread that runs it, is done (`exited`), and
+/// joins that thread.  A kill can fail while the container is still being
+/// created, so it is sent again every 20 ms, as a stop sends it.
+fn end_agent<R: RuncRunner>(
+    runc: &Runc<R>,
+    id: &str,
+    exited: &AtomicBool,
+    agent: std::thread::JoinHandle<std::io::Result<(bool, String)>>,
+) {
+    while !exited.load(Ordering::SeqCst) && !agent.is_finished() {
+        // Refused while there is no container yet: sent again below.
+        let _ = runc.kill(id);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // How a killed agent ended is not this run's result: the caller
+    // answers the error that made it end the agent.
+    let _ = agent.join();
+}
 
 impl Branches<BlkLayers> for NodeBranches<'_> {
     fn fork(&mut self, vessel: &Vessel<BlkLayers>, at: SealAt) -> Result<(String, u64), String> {
@@ -4024,21 +4095,21 @@ impl Node {
         loop {
             while let Some((id, slot)) = self.verifiers.next(Instant::now()) {
                 let node = self.clone();
-                std::thread::spawn(move || {
-                    let cid = ChronicleId::from_bytes(id);
-                    let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        node.attempt_waiting(cid, slot)
-                    }))
-                    .unwrap_or_else(|_| {
-                        eprintln!(
-                            "taso-wardend[{}] {}: the verifiers' waiting list: a panic; looked at again later",
-                            node.config.warden.get(),
-                            id_hex(cid)
-                        );
-                        Some(Instant::now() + QUEUE_RETRY)
-                    });
-                    node.verifiers.done(id, again);
-                });
+                let cid = ChronicleId::from_bytes(id);
+                let who = format!("taso-wardend[{}] {}", self.config.warden.get(), id_hex(cid));
+                let looked = self.verifiers.look_at(
+                    id,
+                    who.clone(),
+                    std::thread::Builder::new(),
+                    move || node.attempt_waiting(cid, slot),
+                );
+                // No thread for it: the worker goes on, and the Vessel is
+                // on the list again (audit 2026-11-09, thread spawn).
+                if let Err(e) = looked {
+                    eprintln!(
+                        "{who}: the verifiers' waiting list: no thread to look at it ({e}); looked at again later"
+                    );
+                }
             }
             self.verifiers.wait(Instant::now());
         }
@@ -5105,12 +5176,17 @@ impl Node {
         let agent = {
             let (exited, id) = (exited.clone(), spec.id.clone());
             let runc = Runc::new(RuncCli::new(self.config.run_dir.join("runc")));
-            std::thread::spawn(move || {
-                let r = runc.run(&bundle_dir, &id);
-                let _ = runc.delete(&id);
-                exited.store(true, Ordering::SeqCst);
-                r
-            })
+            // The OS may refuse a thread (`std::thread::spawn` panics
+            // then: audit 2026-11-09, thread spawn).  Without this thread
+            // no container was started: the run ends here with the error.
+            std::thread::Builder::new()
+                .spawn(move || {
+                    let r = runc.run(&bundle_dir, &id);
+                    let _ = runc.delete(&id);
+                    exited.store(true, Ordering::SeqCst);
+                    r
+                })
+                .map_err(io("a thread to run the agent"))?
         };
 
         // A stop kills the container from here, whatever the Field loop is
@@ -5127,7 +5203,7 @@ impl Node {
                 spec.id.clone(),
             );
             let runc = Runc::new(RuncCli::new(self.config.run_dir.join("runc")));
-            std::thread::spawn(move || {
+            std::thread::Builder::new().spawn(move || {
                 let mut killed = false;
                 let mut since: Option<std::time::Instant> = None;
                 while !exited.load(Ordering::SeqCst) {
@@ -5142,6 +5218,21 @@ impl Node {
                 }
                 stop.requested() || (killed && !promoted.requested())
             })
+        };
+        // No thread to stop the agent (audit 2026-11-09, thread spawn):
+        // an agent nothing can stop is not served.  Its container, which
+        // the thread above is starting or has started, is killed from
+        // here and that thread joined, so the run ends with the error and
+        // leaves no container and no thread.
+        let stopper = match stopper {
+            Ok(s) => s,
+            Err(e) => {
+                let runc = Runc::new(RuncCli::new(self.config.run_dir.join("runc")));
+                end_agent(&runc, &spec.id, &exited, agent);
+                return Err(DaemonError::Io(format!(
+                    "a thread to stop the agent: {e}; the agent's container was killed and the run ends"
+                )));
+            }
         };
 
         // Both sockets, every connection on its own thread, every request
@@ -7975,5 +8066,147 @@ mod tests {
             assert!(e.contains("not a number"), "{junk:?}: {e}");
             assert_eq!(std::fs::read_to_string(&f).unwrap(), junk, "left as it was");
         }
+    }
+
+    /// A thread builder the OS refuses: no address space holds its stack.
+    fn refused_thread() -> std::thread::Builder {
+        std::thread::Builder::new().stack_size(1 << (usize::BITS - 2))
+    }
+
+    /// Audit 2026-11-09, the waiting list's worker started each look with
+    /// `std::thread::spawn`, which panics when the OS gives no thread:
+    /// the worker was gone for the Warden's life, the Vessel's id stayed
+    /// taken, and the Warden's end (`settle`) never returned.
+    #[test]
+    fn the_queue_settles_after_a_thread_the_os_refused() {
+        let v = Verifiers::new(2);
+        let id = [7u8; 16];
+        v.add(id, Instant::now());
+        let (got, slot) = v.next(Instant::now()).unwrap();
+        assert_eq!(got, id);
+        let e = v
+            .look_at(id, "test".into(), refused_thread(), move || {
+                drop(slot);
+                None
+            })
+            .expect_err("the OS gives no thread with such a stack");
+        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+        {
+            let s = v.lock();
+            assert_eq!(s.used, 0, "the slot came back");
+            assert!(s.taken.is_empty(), "the Vessel is not taken any more");
+            assert!(s.waiting.contains_key(&id), "it is on the list again");
+        }
+        // Not at once, and then it is given again.
+        assert!(v.next(Instant::now()).is_none());
+        let later = Instant::now() + QUEUE_RETRY + Duration::from_secs(1);
+        let (got, slot) = v.next(later).unwrap();
+        assert_eq!(got, id);
+        v.look_at(id, "test".into(), std::thread::Builder::new(), move || {
+            drop(slot);
+            None
+        })
+        .unwrap();
+        settles(&v);
+        assert!(v.lock().waiting.is_empty(), "looked at: nothing is left");
+    }
+
+    /// The same when the look itself panics on its thread: the Vessel is
+    /// given back for later, with its slot, and the Warden's end settles.
+    #[test]
+    fn the_queue_settles_after_a_look_that_panicked() {
+        let v = Verifiers::new(2);
+        let id = [7u8; 16];
+        v.add(id, Instant::now());
+        let (_, slot) = v.next(Instant::now()).unwrap();
+        v.look_at(id, "test".into(), std::thread::Builder::new(), move || {
+            let _slot = slot;
+            panic!("a look that panics")
+        })
+        .unwrap();
+        settles(&v);
+        let s = v.lock();
+        assert_eq!(s.used, 0, "the slot came back");
+        assert!(s.waiting.contains_key(&id), "it is on the list again");
+    }
+
+    /// `settle` (the Warden's end) returns within three seconds.
+    fn settles(v: &Arc<Verifiers>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let v2 = v.clone();
+        std::thread::spawn(move || {
+            v2.settle(false);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "settle (the Warden's shutdown) never returns: {:?} stays taken",
+            v.lock().taken
+        );
+    }
+
+    /// A runc that knows one container: `run` returns when it was killed,
+    /// and the first two kills are refused (it is still being created).
+    #[derive(Clone, Default)]
+    struct OneContainer {
+        kills: Arc<std::sync::atomic::AtomicUsize>,
+        killed: Arc<AtomicBool>,
+        deleted: Arc<AtomicBool>,
+    }
+
+    impl RuncRunner for OneContainer {
+        fn run(&self, args: &[String]) -> std::io::Result<(bool, String, String)> {
+            match args[0].as_str() {
+                "run" => {
+                    while !self.killed.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok((false, String::new(), "killed".into()))
+                }
+                "kill" => {
+                    if self.kills.fetch_add(1, Ordering::SeqCst) < 2 {
+                        return Ok((false, String::new(), "container does not exist".into()));
+                    }
+                    self.killed.store(true, Ordering::SeqCst);
+                    Ok((true, String::new(), String::new()))
+                }
+                "delete" => {
+                    self.deleted.store(true, Ordering::SeqCst);
+                    Ok((true, String::new(), String::new()))
+                }
+                other => panic!("runc {other}"),
+            }
+        }
+    }
+
+    /// Audit 2026-11-09, a run started the thread that stops its agent
+    /// with `std::thread::spawn`, which panics when the OS gives no
+    /// thread, and left the agent's container running.  Now the run ends
+    /// the agent itself: killed until its thread is done, and joined.
+    #[test]
+    fn an_agent_nothing_can_stop_is_ended_before_the_run_returns() {
+        let one = OneContainer::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        // The agent's thread, as a run starts it.
+        let agent = {
+            let (exited, runc) = (exited.clone(), Runc::new(one.clone()));
+            std::thread::spawn(move || {
+                let r = runc.run(Path::new("/bundle"), "c1");
+                let _ = runc.delete("c1");
+                exited.store(true, Ordering::SeqCst);
+                r
+            })
+        };
+        end_agent(&Runc::new(one.clone()), "c1", &exited, agent);
+        assert!(exited.load(Ordering::SeqCst), "its thread is done");
+        assert!(
+            one.killed.load(Ordering::SeqCst),
+            "the container was killed"
+        );
+        assert!(one.deleted.load(Ordering::SeqCst), "and deleted");
+        assert!(
+            one.kills.load(Ordering::SeqCst) >= 3,
+            "kills refused before the container exists are sent again"
+        );
     }
 }
