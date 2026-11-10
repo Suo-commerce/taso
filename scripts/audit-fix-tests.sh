@@ -54,6 +54,8 @@ one a_fork_slot_is_taken_by_a_born_child_not_by_a_directory $W
 one a_restore_walk_cut_short_by_this_nodes_clock_is_interrupted $W
 # Purges
 one a_purge_finished_on_another_node_deletes_that_nodes_dataset $W
+# Genesis
+one a_resume_never_refuses_a_genesis_from_an_object_that_is_not_its_keys $W
 # The reclaimer
 one a_pass_claims_nothing_the_coordinator_says_it_would_refuse $W
 # Kubernetes

@@ -806,6 +806,43 @@ impl<P: Pool> Genesis<P> {
         Ok(map)
     }
 
+    /// The manifest of the source artifact `key`, read from the store and
+    /// checked to be that artifact's: the whole object is hashed, not
+    /// only its head.  The judge's refusal is final, so it must judge the
+    /// object `GenesisStarted` names.  Reading only the head, a resume met
+    /// whatever the store answered under the key (another tree's
+    /// artifact, a damaged one), and a refusal of that was recorded for
+    /// this genesis for good (audit 2026-11-09, `Genesis::resume` refuses
+    /// from an object that is not its key's).  Bytes that do not hash to
+    /// the key are an integrity error: nothing is recorded, and the run
+    /// may be tried again.
+    fn source_manifest(&self, key: HashVal) -> Result<Manifest, GenesisError> {
+        struct Hashed<'a> {
+            r: &'a mut dyn Read,
+            hasher: blake3::Hasher,
+        }
+        impl Read for Hashed<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.r.read(buf)?;
+                self.hasher.update(&buf[..n]);
+                Ok(n)
+            }
+        }
+        let mut stream = self.get_content(ObjectKind::Artifact, key)?;
+        let mut h = Hashed {
+            r: &mut stream,
+            hasher: blake3::Hasher::new_derive_key(ObjectKind::Artifact.prefix()),
+        };
+        let manifest = artifact::read_manifest(&mut h);
+        io::copy(&mut h, &mut io::sink()).map_err(GenesisError::Store)?;
+        if HashVal::from_bytes(*h.hasher.finalize().as_bytes()) != key {
+            return Err(GenesisError::Integrity(
+                object_key_path(&self.prefix, ObjectKind::Artifact, key).expect("a content kind"),
+            ));
+        }
+        Ok(manifest?)
+    }
+
     /// Steps 4–7: judge, materialise, export, publish, from the accepted
     /// `GenesisStarted` `g`.
     fn judge_and_publish(
@@ -818,10 +855,7 @@ impl<P: Pool> Genesis<P> {
         notes: &mut Vec<String>,
     ) -> Result<Outcome, GenesisError> {
         // 4. Judge, from the source artifact in the store.
-        let input = {
-            let mut r = self.get_content(ObjectKind::Artifact, g.source_key)?;
-            artifact::read_manifest(&mut r)?
-        };
+        let input = self.source_manifest(g.source_key)?;
         let input_key = input.key();
         self.put_content(ObjectKind::Manifest, input_key, &mut &input.bytes()[..])?;
         if let Some(reason) = judge(&input, g.hook_waiver.is_some()) {
@@ -2478,6 +2512,70 @@ class = "Scratch"
     }
 
     // ── Resume by id (D48) ──────────────────────────────────────────
+
+    /// The one source artifact in `c`'s store: its path and bytes.
+    fn only_artifact(c: &Cluster) -> (String, Vec<u8>) {
+        let any =
+            object_key_path(PREFIX, ObjectKind::Artifact, HashVal::from_bytes([0; 32])).unwrap();
+        let dir = any.rsplit_once('/').unwrap().0.to_string();
+        let names = c.store.list(&dir).unwrap();
+        assert_eq!(names.len(), 1, "{names:?}");
+        let mut b = Vec::new();
+        c.store
+            .get(&names[0])
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut b)
+            .unwrap();
+        (names[0].clone(), b)
+    }
+
+    /// Audit 2026-11-09, a resume judged whatever the store answered under
+    /// the source artifact's key, reading only its head: another tree's
+    /// artifact there was refused, and the refusal recorded for this
+    /// genesis for good.  Bytes that are not the key's are an integrity
+    /// error and nothing is recorded; the right bytes back, the resume
+    /// finishes the genesis.
+    #[test]
+    fn a_resume_never_refuses_a_genesis_from_an_object_that_is_not_its_keys() {
+        let want = reference();
+        // Another tree's source artifact, one the judge refuses.
+        let bad = Cluster::new();
+        good_tree(&bad.src(), 0);
+        file(&bad.src(), "odd/x", b"?", 0);
+        settle(&bad.src(), 0);
+        let mut g = bad.node(1);
+        g.failpoint = fail_at("genesis.after_source_put");
+        assert!(g.run(&dir_request(&bad)).is_err());
+        let (_, bad_bytes) = only_artifact(&bad);
+        // The genesis: started on node 1, which is then lost.
+        let c = Cluster::new();
+        good_tree(&c.src(), 0);
+        let mut a = c.node(1);
+        a.failpoint = fail_at("genesis.after_started_accept");
+        assert!(a.run(&dir_request(&c)).is_err());
+        let (path, good_bytes) = only_artifact(&c);
+        assert_ne!(good_bytes, bad_bytes);
+        // The store now answers other bytes under the source's key.
+        c.store.delete(&path).unwrap();
+        c.store.put(&path, &mut &bad_bytes[..]).unwrap();
+        let r = c.node(2).resume(want.0);
+        let refused = accepted(&c, LogicalKey::GenesisRefused(want.0));
+        assert!(
+            refused.is_none() && matches!(r, Err(GenesisError::Integrity(_))),
+            "resume answered {:?}; accepted for the genesis: {refused:?}",
+            r.as_ref().map(|r| &r.outcome).map_err(|e| e.to_string())
+        );
+        // The right bytes back: the same resume finishes it.
+        c.store.delete(&path).unwrap();
+        c.store.put(&path, &mut &good_bytes[..]).unwrap();
+        let r = c.node(2).resume(want.0).unwrap();
+        assert!(
+            matches!(r.outcome, Outcome::Ready { .. }),
+            "{:?}",
+            r.outcome
+        );
+    }
 
     #[test]
     fn a_genesis_resumes_by_id_after_its_node_and_its_source_are_gone() {
