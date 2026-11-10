@@ -1540,6 +1540,29 @@ impl Config {
             (Some(Value::Array(a)), SourceConf::Static) => a
                 .iter()
                 .map(|x| {
+                    // A Vessel entry refuses a key the Warden does not
+                    // read, like every other object: "effect" for
+                    // "effects" must not leave the Vessel dispatching
+                    // (audit 2026-11-09, vessel entry keys).
+                    only_keys(
+                        x,
+                        "vessel",
+                        &[
+                            "namespace",
+                            "subject",
+                            "takeover",
+                            "uid_slot",
+                            "restart",
+                            "runtime",
+                            "fork",
+                            "verifier",
+                            "candidate",
+                            "template",
+                            "effects",
+                            "promote",
+                            "forks",
+                        ],
+                    )?;
                     Ok(VesselConf {
                         namespace: namespace(&string(x, "namespace")?)?,
                         subject: string(x, "subject")?,
@@ -1629,7 +1652,10 @@ impl Config {
             }
             vc.effective(&runtime, &quiescence)
                 .map_err(|e| bad(format!("vessel {:?}: {e}", vc.subject)))?;
-            if vc.candidate.is_some() && (vc.verifier.is_none() || v.get("sanction").is_none()) {
+            // `"sanction": null` is no sanction, as where it is read
+            // below (audit 2026-11-09, null sanction).
+            let sanction = !matches!(v.get("sanction"), None | Some(Value::Null));
+            if vc.candidate.is_some() && (vc.verifier.is_none() || !sanction) {
                 return Err(bad(format!(
                     "vessel {:?}: a \"candidate\" needs its \"verifier\" and the node's \"sanction\"",
                     vc.subject
@@ -5974,6 +6000,74 @@ mod tests {
             },
             "sanction",
         );
+    }
+
+    /// Audit 2026-11-09, a Vessel entry was read without refusing the
+    /// keys the Warden does not know: `"effect": "hold"` (for
+    /// `"effects"`) was accepted and the Vessel did not hold.
+    #[test]
+    fn a_vessel_entry_refuses_a_key_it_does_not_know() {
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(GOOD).unwrap();
+            f(&mut v);
+            Config::parse(&v.to_string())
+        };
+        // Control: the key spelt right is read.
+        let c = with(&|v| v["vessels"][0]["effects"] = "hold".into()).unwrap();
+        assert_eq!(c.vessels[0].effects, Some(EffectsConf::Hold));
+        let mut passed = Vec::new();
+        for (key, value) in [
+            ("effect", serde_json::json!("hold")),
+            ("tempalte", serde_json::json!("base@1")),
+            ("uid-slot", serde_json::json!(3)),
+        ] {
+            match with(&|v| v["vessels"][0][key] = value.clone()) {
+                Ok(c) => passed.push(format!(
+                    "{key:?} accepted: effects {:?}, template {:?}",
+                    c.vessels[0].effects, c.vessels[0].template
+                )),
+                Err(e) => assert!(
+                    e.0.contains(&format!("\"vessel\": unknown key {key:?}")),
+                    "{}",
+                    e.0
+                ),
+            }
+        }
+        assert!(passed.is_empty(), "{passed:#?}");
+        // Every key the Warden does read in a Vessel entry is still read.
+        let c = with(&|v| {
+            v["runtime"]["template_slot"] = 9.into();
+            v["sanction"] = serde_json::json!({"classmap": "/etc/taso/map.toml"});
+            v["vessels"][0] = serde_json::json!({
+                "namespace": "01".repeat(16), "subject": "a", "uid_slot": 0,
+                "takeover": null, "restart": "always", "runtime": {"pids": 8},
+                "verifier": {"template": "checks@2", "config": "/etc/taso/v.toml", "version": 3},
+                "candidate": {"seal": "last"}, "template": "base@1",
+                "effects": "hold", "promote": {"child": "a-fork-1"},
+                "forks": {"slots": [3]}
+            });
+            v["vessels"][1]["fork"] = serde_json::json!({"parent": "a"});
+        });
+        assert!(c.is_ok(), "{:?}", c.err().map(|e| e.0));
+    }
+
+    /// Audit 2026-11-09, `"sanction": null` counted as the node's
+    /// sanction: a Vessel's `"candidate"` was accepted on a node that has
+    /// none.
+    #[test]
+    fn a_candidate_needs_a_sanction_that_is_not_null() {
+        let mut v: Value = serde_json::from_str(GOOD).unwrap();
+        v["sanction"] = Value::Null;
+        v["vessels"][0]["verifier"] =
+            serde_json::json!({"template": "checks@2", "config": "/etc/taso/v.toml", "version": 3});
+        v["vessels"][0]["candidate"] = serde_json::json!({"seal": "last", "exclude": []});
+        match Config::parse(&v.to_string()) {
+            Err(e) => assert!(e.0.contains("the node's \"sanction\""), "{}", e.0),
+            Ok(c) => panic!(
+                "accepted: sanction {:?}, vessel candidate {:?}",
+                c.sanction, c.vessels[0].candidate
+            ),
+        }
     }
 
     /// P4 file 5f: `runtime.template_slot` is reserved and a Vessel's
