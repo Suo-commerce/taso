@@ -2155,7 +2155,7 @@ mod tests {
     }
     fn auth() -> Authority {
         Authority {
-            actor: "jarmo".into(),
+            actor: "operator".into(),
             reason: "gate".into(),
         }
     }
@@ -2175,7 +2175,7 @@ mod tests {
     /// T0 by genesis: claim, start, ready.  Its layer is `h(0x30)`.
     fn genesis_t0(w: &mut W) -> ChronicleId {
         let g = GenesisStarted {
-            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo"),
+            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "operator"),
             source_key: h(0x20),
             consistency: Consistency::Immutable,
             classmap_key: h(0x21),
@@ -3147,7 +3147,7 @@ mod tests {
             store: &store,
             now: 100,
         };
-        let t0 = genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo");
+        let t0 = genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "operator");
         for k in [0x20, 0x21] {
             store.put(ObjectId::content(h(k)));
         }
@@ -3217,7 +3217,7 @@ mod tests {
             })
         };
         // Refused after materialisation.
-        let t1 = genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo");
+        let t1 = genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "operator");
         w.log.claim_chronicle(t1, ClaimAuthority::Genesis).unwrap();
         w.ok(
             t1,
@@ -3516,7 +3516,7 @@ mod tests {
             now: 100,
         };
         let g = GenesisStarted {
-            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo"),
+            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "operator"),
             source_key: h(0x20),
             consistency: Consistency::BestEffort,
             classmap_key: h(0x21),

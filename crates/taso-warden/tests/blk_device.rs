@@ -270,7 +270,7 @@ fn succession_on_real_devices() {
             ns,
             b"user-2",
             Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "accounts merged".into(),
             },
             false,

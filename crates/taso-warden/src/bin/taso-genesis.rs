@@ -613,7 +613,7 @@ mod tests {
             "--classmap",
             "/etc/taso/map.toml",
             "--actor",
-            "jarmo",
+            "operator",
             "--reason",
             "T(0)",
             "--hook-waiver",
@@ -630,7 +630,7 @@ mod tests {
             }
         );
         assert_eq!(r.classmap, PathBuf::from("/etc/taso/map.toml"));
-        assert_eq!((r.actor.as_str(), r.reason.as_str()), ("jarmo", "T(0)"));
+        assert_eq!((r.actor.as_str(), r.reason.as_str()), ("operator", "T(0)"));
         assert_eq!(r.hook_waiver.as_deref(), Some("reviewed"));
         assert!(!r.best_effort);
     }

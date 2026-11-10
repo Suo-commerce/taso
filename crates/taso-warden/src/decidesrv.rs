@@ -448,7 +448,7 @@ mod tests {
             result_digest: HashVal::from_bytes([7; 32]),
             decision: Decision::Hold,
             authority: taso_core::record::Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "test".into(),
             },
             policy_digest: None,

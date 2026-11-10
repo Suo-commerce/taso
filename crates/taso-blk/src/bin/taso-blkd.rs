@@ -104,7 +104,7 @@
 //!   It also narrows D92: an agent's acknowledged `fsync` after the last
 //!   Seal is no longer in the log after a crash, so the Warden cannot name
 //!   it (D93 (i) becomes (iii)).
-//! - **`--durable-at fua`**, **the default** (Jarmo, 2026-11-06, D&D-3:
+//! - **`--durable-at fua`**, **the default** (decided 2026-11-06, D&D-3:
 //!   one production configuration, the mode E3 and B3's four power cuts
 //!   passed), answers only FUA writes once appended; every
 //!   flush still syncs.  In a Vessel (ext4 without a journal) an agent's

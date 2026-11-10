@@ -1562,7 +1562,7 @@ class = "Scratch"
             source,
             classmap: MAP.as_bytes().to_vec(),
             authority: Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "T(0)".into(),
             },
             hook_waiver: None,

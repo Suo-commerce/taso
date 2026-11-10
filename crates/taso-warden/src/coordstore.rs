@@ -508,14 +508,14 @@ mod tests {
 
     fn contract() -> ContractRecord {
         ContractRecord::GenesisStarted(Box::new(GenesisStarted {
-            genesis_id: genesis_id(h(1), h(2), 1, None, "jarmo"),
+            genesis_id: genesis_id(h(1), h(2), 1, None, "operator"),
             source_key: h(1),
             consistency: Consistency::Immutable,
             classmap_key: h(2),
             transform_version: 1,
             hook_waiver: None,
             authority: Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "test".into(),
             },
             peer: Peer { uid: 0, pid: 1 },

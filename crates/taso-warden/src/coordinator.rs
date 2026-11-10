@@ -3118,14 +3118,14 @@ mod log_tests {
 
     fn genesis() -> GenesisStarted {
         GenesisStarted {
-            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo"),
+            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "operator"),
             source_key: h(0x20),
             consistency: Consistency::Immutable,
             classmap_key: h(0x21),
             transform_version: TRANSFORM_VERSION,
             hook_waiver: None,
             authority: Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "T(0)".into(),
             },
             peer: Peer { uid: 0, pid: 1 },

@@ -94,7 +94,7 @@
 #     records the last acknowledged seq per stream in ACKED (default
 #     ./p5-facts-acked.txt, rewritten every second) and prints a status
 #     line; it ends by itself after ten seconds without an acknowledgement
-#     (a receiver never learns otherwise that its peer lost power).  Jarmo then cuts the host the provider's way (Scaleway: Stop;
+#     (a receiver never learns otherwise that its peer lost power).  The operator then cuts the host the provider's way (Scaleway: Stop;
 #     also Reboot; UpCloud: stop), without stopping the writer.  After
 #     boot, verify (host) reads each stream's file, finds the longest
 #     valid prefix (consecutive seq from 1, check word right), and prints,

@@ -2568,14 +2568,14 @@ mod tests {
         };
         let h = |n: u8| HashVal::from_bytes([n; 32]);
         Submitted::Contract(ContractRecord::GenesisStarted(Box::new(GenesisStarted {
-            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "jarmo"),
+            genesis_id: genesis_id(h(0x20), h(0x21), TRANSFORM_VERSION, None, "operator"),
             source_key: h(0x20),
             consistency: Consistency::Immutable,
             classmap_key: h(0x21),
             transform_version: TRANSFORM_VERSION,
             hook_waiver: None,
             authority: taso_core::record::Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "T(0)".into(),
             },
             peer: CPeer { uid: 0, pid: 1 },
@@ -2814,7 +2814,7 @@ mod tests {
             g2.classmap_key,
             g2.transform_version,
             None,
-            "jarmo",
+            "operator",
         );
         let r2 = Submitted::Contract(taso_core::contract::ContractRecord::GenesisStarted(
             Box::new(g2),

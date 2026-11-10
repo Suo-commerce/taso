@@ -828,7 +828,7 @@ mod tests {
 
     fn auth() -> Authority {
         Authority {
-            actor: "jarmo".into(),
+            actor: "operator".into(),
             reason: "checked the provider by hand".into(),
         }
     }

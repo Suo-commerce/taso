@@ -2282,7 +2282,7 @@ pub(crate) mod tests {
 
     fn auth() -> Authority {
         Authority {
-            actor: "jarmo".into(),
+            actor: "operator".into(),
             reason: "accounts merged".into(),
         }
     }
@@ -3725,7 +3725,7 @@ pub(crate) mod tests {
         assert!(matches!(r, Err(VesselError::EmptyAuthority)));
         let (v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let no_reason = Authority {
-            actor: "jarmo".into(),
+            actor: "operator".into(),
             reason: String::new(),
         };
         let r = e.host.succeed(v, ns(1), b"n", no_reason, false);
@@ -3946,7 +3946,7 @@ pub(crate) mod tests {
         assert!(old.successor().is_some());
         // A different successor is refused…
         let other = Authority {
-            actor: "jarmo".into(),
+            actor: "operator".into(),
             reason: "something else".into(),
         };
         let r = e.host.succeed(old, ns(1), b"n", other, false);

@@ -1123,14 +1123,14 @@ mod tests {
 
     fn every_op() -> Vec<Op> {
         let g = GenesisStarted {
-            genesis_id: genesis_id(h(1), h(2), TRANSFORM_VERSION, Some("waived"), "jarmo"),
+            genesis_id: genesis_id(h(1), h(2), TRANSFORM_VERSION, Some("waived"), "operator"),
             source_key: h(1),
             consistency: Consistency::BestEffort,
             classmap_key: h(2),
             transform_version: TRANSFORM_VERSION,
             hook_waiver: Some("waived".into()),
             authority: Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "why".into(),
             },
             peer: Peer { uid: 1, pid: 2 },

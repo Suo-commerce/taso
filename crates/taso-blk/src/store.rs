@@ -3647,7 +3647,7 @@ mod tests {
         // (taso-test's temp directory, 2026-10-29) the asks seldom overlap
         // one and each may run its own; the old bound (fewer than asks)
         // failed there 1 run in 3.  Grouping is measured by the bench's
-        // Seals, not here (Jarmo, 2026-10-29: (a)).
+        // Seals, not here (decided 2026-10-29: (a)).
         let dir = tempfile::tempdir().unwrap();
         let store = Store::create(&dir.path().join("log")).unwrap();
         let sync = std::sync::Arc::new(store.syncer().unwrap());

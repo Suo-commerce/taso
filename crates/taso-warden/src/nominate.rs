@@ -1136,7 +1136,7 @@ class = \"Scratch\"
                 source: Source::Dir(src),
                 classmap: MAP.as_bytes().to_vec(),
                 authority: taso_core::record::Authority {
-                    actor: "jarmo".into(),
+                    actor: "operator".into(),
                     reason: "a verifier".into(),
                 },
                 hook_waiver: None,

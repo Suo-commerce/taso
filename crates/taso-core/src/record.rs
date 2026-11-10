@@ -1401,7 +1401,7 @@ mod tests {
             dispatch: Dispatch::Immediate,
             retry: RetryPolicy::UnsafeToRetry,
             consequence: Consequence::Irreversible,
-            authority: b"jarmo".to_vec(),
+            authority: b"operator".to_vec(),
             barrier: Some(BarrierId::new(30)),
         };
         let cp = Payload::Checkpoint(Box::new(CheckpointRecord {
@@ -1441,8 +1441,8 @@ mod tests {
     }
 
     const PIN_CHECKPOINT: [&str; 2] = [
-        "cfd3905def40d7511b24598dcd2ee981b1526b698c145e0a169d5ffe9eaaa622",
-        "2f79df47f43767c538211083219317fca57e0d7956f09fad1060c9b60caa3171",
+        "d4d34303434e26bac356912d981d2edc85e8529dbee84a3bff4721c430fb4efc",
+        "7770a28bb65d7bda4e98e1b20288ca1b85affe37f8f4926ff407726f97de1cae",
     ];
 
     // ── Promotion (P3) ──────────────────────────────────────────────
@@ -1566,7 +1566,7 @@ mod tests {
 
     fn authority() -> Authority {
         Authority {
-            actor: "jarmo".into(),
+            actor: "operator".into(),
             reason: "account merge".into(),
         }
     }

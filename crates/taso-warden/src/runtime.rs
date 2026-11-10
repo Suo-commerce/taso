@@ -63,7 +63,7 @@ pub const AGENT_OOM_SCORE_ADJ: i32 = 0;
 /// Mark this process the last the kernel's out-of-memory killer may pick
 /// (`oom_score_adj` -1000; review fix M3, Kimi's M3).  Vessels run
 /// without memory limits unless the operator sets them (D&D M3-a,
-/// Jarmo 2026-11-07); a runaway agent must then die before the services
+/// decided 2026-11-07); a runaway agent must then die before the services
 /// every Vessel on the node depends on.  Needs root (CAP_SYS_RESOURCE);
 /// an error is the caller's to log, never fatal.
 pub fn protect_from_oom() -> std::io::Result<()> {
@@ -642,7 +642,7 @@ pub fn work_dir_range(work: &Path, host_uid_base: u32, inherited: Option<u32>) -
 pub const LOST_FOUND: &str = "lost+found";
 
 /// Give a `lost+found` that `mkfs` left as `0:0` to the dataset's disk
-/// range (P4 file 4d, Jarmo's decision (a), 2026-10-24).  A reserved entry
+/// range (P4 file 4d, decision (a), 2026-10-24).  A reserved entry
 /// is owned by slot 0 of the range the tree is stored in (spec §4.1.6), so
 /// one left at host `0:0` makes every walk of the Vessel's Seals refuse it
 /// `ReservedMismatch` (found by `scripts/p4-genesis.sh blk`).  Only the

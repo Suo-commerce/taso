@@ -1385,7 +1385,7 @@ mod tests {
                     source: Source::Dir(src),
                     classmap: MAP.as_bytes().to_vec(),
                     authority: Authority {
-                        actor: "jarmo".into(),
+                        actor: "operator".into(),
                         reason: "T(0)".into(),
                     },
                     hook_waiver: None,
@@ -2086,7 +2086,7 @@ mod tests {
                     source: Source::Dir(src.to_path_buf()),
                     classmap: MAP.as_bytes().to_vec(),
                     authority: Authority {
-                        actor: "jarmo".into(),
+                        actor: "operator".into(),
                         reason: "a verifier".into(),
                     },
                     hook_waiver: None,
@@ -3086,7 +3086,7 @@ mod tests {
             result_digest: f.result_digest,
             decision,
             authority: Authority {
-                actor: "jarmo".into(),
+                actor: "operator".into(),
                 reason: "reviewed".into(),
             },
             policy_digest: None,
@@ -3467,7 +3467,10 @@ mod tests {
                 None
             )
         );
-        assert_eq!(t.authority.actor, "jarmo", "the verdict's authority (D79)");
+        assert_eq!(
+            t.authority.actor, "operator",
+            "the verdict's authority (D79)"
+        );
         assert!(completed(&c, s.template_id));
         assert!(fin.unfinished(&v).unwrap().is_empty());
         // Again: nothing more recorded.
@@ -3940,7 +3943,7 @@ mod tests {
             .contains("TemplateReady"));
         assert_eq!(cand["attempts"][0]["outcome"], json!("Exit { code: 0 }"));
         assert_eq!(cand["verdicts"][0]["decision"], json!("sanction"));
-        assert_eq!(cand["verdicts"][0]["actor"], json!("jarmo"));
+        assert_eq!(cand["verdicts"][0]["actor"], json!("operator"));
         assert_eq!(cand["verdicts"][0]["peer"]["pid"], json!(4242));
         finisher(&c, 1).finish(&mut v, &packs, &s).unwrap();
         let e = explained(&c, Subject::Chronicle(v.id()));

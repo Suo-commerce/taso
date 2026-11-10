@@ -289,7 +289,7 @@ def check(r, a):
         else:
             if th.get("acks", 0):
                 fails.append(f"F: after its takeover the old Warden acknowledged {th['acks']} op(s): {th.get('replies')}")
-            # Both: the agent in its reply, the operator in the Warden's own log (Jarmo, 2026-10-29: (a)).
+            # Both: the agent in its reply, the operator in the Warden's own log (decided 2026-10-29: (a)).
             if not told:
                 fails.append(f"F: the old Warden's replies to its agent name no refusal (stale epoch) after it woke: {th.get('replies')}")
             if not th.get("fenced"):
