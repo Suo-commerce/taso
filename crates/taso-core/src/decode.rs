@@ -190,13 +190,28 @@ impl<'a> Reader<'a> {
         if n > self.remaining() as u64 {
             return Err(DecodeError::Truncated { at, need: n });
         }
-        let mut out = Vec::with_capacity(n as usize);
+        let mut out = Vec::with_capacity(first_capacity::<T>(n, self.remaining()));
         for _ in 0..n {
             out.push(f(self)?);
         }
         Ok(out)
     }
+}
 
+/// What a sequence of `n` elements over `remaining` bytes of input
+/// reserves before one element is decoded: at most as many bytes as the
+/// input has left.  An element's encoding can be one byte while its value
+/// is many (an `OpenEffect` is 136), and the count is the input's word:
+/// reserving `n` elements let a crafted Inventory or Checkpoint reserve
+/// over a hundred times its size before failing on its first element
+/// (audit 2026-11-09, a crafted sequence reserves in proportion to its
+/// count).  Past this, the vector grows as elements are decoded.
+fn first_capacity<T>(n: u64, remaining: usize) -> usize {
+    let each = std::mem::size_of::<T>().max(1);
+    (n as usize).min(remaining / each)
+}
+
+impl Reader<'_> {
     pub(crate) fn finish(&self) -> R<()> {
         match self.remaining() {
             0 => Ok(()),
@@ -568,6 +583,33 @@ mod tests {
     use super::*;
     use crate::canon::Canonical;
     use proptest::prelude::*;
+
+    /// Audit 2026-11-09, `seq` reserved `count` elements on the count
+    /// alone.  For a Checkpoint's open effects, a payload of the largest
+    /// size a segment takes (64 MiB) could reserve 136 times that before
+    /// one element was decoded.  What is reserved first is bounded by the
+    /// input left; a sequence that decodes in full still comes out whole.
+    #[test]
+    fn a_sequence_reserves_at_most_its_input_before_it_decodes() {
+        const MAX_PAYLOAD: usize = 64 << 20;
+        let each = std::mem::size_of::<OpenEffect>();
+        assert!(each > 100, "the case that matters: {each}");
+        let n = (MAX_PAYLOAD - 256) as u64;
+        let first = first_capacity::<OpenEffect>(n, MAX_PAYLOAD - 256);
+        assert!(
+            first * each <= MAX_PAYLOAD,
+            "{} bytes reserved for a {MAX_PAYLOAD}-byte payload",
+            first * each
+        );
+        // Bytes are not bounded below their count.
+        assert_eq!(first_capacity::<u8>(10, 10), 10);
+        // A real sequence still decodes whole.
+        let mut c = crate::canon::Canon::default();
+        c.u64(3).u8(7).u8(8).u8(9);
+        let b = c.as_bytes().to_vec();
+        let got: R<Vec<u8>> = Reader::new(&b).seq(|r| r.u8());
+        assert_eq!(got.unwrap(), vec![7, 8, 9]);
+    }
 
     // ── generators ──────────────────────────────────────────────────
 

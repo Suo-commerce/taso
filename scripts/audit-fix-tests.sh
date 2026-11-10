@@ -75,6 +75,8 @@ one the_queue_settles_after_a_look_that_panicked $W
 one an_agent_nothing_can_stop_is_ended_before_the_run_returns $W
 one a_run_that_fails_after_its_agent_started_leaves_no_agent $W
 one one_candidates_error_does_not_end_the_pass_for_the_others -p taso-warden --bin taso-policy
+# Decoding
+one a_sequence_reserves_at_most_its_input_before_it_decodes -p taso-core --lib
 # The block log
 one a_view_left_by_a_killed_warden_does_not_block_destroy $W
 one a_destroy_cut_short_at_any_step_is_finished_by_a_retry $W
