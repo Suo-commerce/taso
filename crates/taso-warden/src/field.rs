@@ -162,6 +162,15 @@ impl Conn {
 /// slot has at most 10 digits.
 pub const MAX_CHILD_NAME: usize = crate::daemon::MAX_SUBJECT + "-fork-".len() + 10;
 
+/// How much transcript a Vessel may record between two Seals, in bytes:
+/// 1 GiB.  Built in, not a setting.  A Seal is what lets the log behind
+/// it be shipped and pruned, so this bounds what one agent can make the
+/// node keep; an agent that ends its turns never meets it.
+pub const MAX_UNSEALED_TRANSCRIPT: u64 = 1 << 30;
+
+/// What the log keeps of a transcript entry beyond its bytes.
+const RAW_RECORD_OVERHEAD: u64 = 9;
+
 /// The largest effect an agent may declare, in bytes: its provider,
 /// request, footprint, authority and retry key or probe together.  1 MiB.  The request is
 /// data Taso records and hands to the sender; it is not a channel for
@@ -220,6 +229,14 @@ pub struct Session<'v, L: Layers> {
     last_sealed_turn: Option<u64>,
     /// Highest `Transcript` lsn so far (the Seal cut).
     transcript: Lsn,
+    /// Bytes of transcript recorded since the last Seal, those of
+    /// earlier runs included ([`MAX_UNSEALED_TRANSCRIPT`]).
+    unsealed_transcript: u64,
+    /// The bound on it: [`MAX_UNSEALED_TRANSCRIPT`], smaller in a test.
+    transcript_budget: u64,
+    /// The Warden's log line about the bound was written since the last
+    /// Seal: one line per time it is met, not one per refused entry.
+    transcript_full_said: bool,
     /// Highest `Effect` lsn so far (the Seal's `ledger_pos`).
     ledger: Lsn,
     /// Verdict for the next Seal; `Clean` after the first.
@@ -264,11 +281,22 @@ impl<'v, L: Layers> Session<'v, L> {
             .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
         let (transcript, ledger) = (summary.transcript, summary.effect);
         let last_sealed_turn = summary.seal.map(|s| s.turn.get());
+        // What an earlier run recorded after the last Seal is still in
+        // the log and still unsealed: a restart is no way round the bound.
+        let sealed = vessel.last_seal().map_or(Lsn::new(0), |p| p.lsn);
+        let unsealed_transcript = frames
+            .iter()
+            .filter(|f| f.envelope.stream == Stream::Transcript && f.envelope.lsn > sealed)
+            .map(|f| f.payload.len() as u64)
+            .sum();
         Ok(Self {
             vessel,
             agent: Conn::new(Socket::Agent),
             last_sealed_turn,
             transcript,
+            unsealed_transcript,
+            transcript_budget: MAX_UNSEALED_TRANSCRIPT,
+            transcript_full_said: false,
             ledger,
             next_verdict: first_verdict,
             effects: None,
@@ -447,8 +475,38 @@ impl<'v, L: Layers> Session<'v, L> {
             ),
             (true, Request::Hello { .. }) => error(ErrorCode::BadHello, "already greeted".into()),
             (true, Request::Transcript { entry }) => {
+                // The transcript since the last Seal is bounded: the log
+                // is pruned only behind a Seal, so an agent that wrote on
+                // without ever ending a turn grew the node's disk without
+                // limit, for every Vessel on it (audit 2026-11-09,
+                // transcript without a turn end; D&D L1).  Refused, not
+                // ended: what is recorded stays, and the agent's next
+                // Seal makes room again.
+                // Counted as the log keeps it (the record's 9 bytes of
+                // framing with it), so that a session started later, which
+                // counts from the log, agrees.
+                let size = entry.len() as u64 + RAW_RECORD_OVERHEAD;
+                if self.unsealed_transcript + size > self.transcript_budget {
+                    if !self.transcript_full_said {
+                        self.transcript_full_said = true;
+                        eprintln!(
+                            "taso-wardend: vessel {:?}: its transcript since the last Seal is {} bytes, at the limit of {}; entries are refused until it ends a turn with a Seal",
+                            self.vessel.id(),
+                            self.unsealed_transcript,
+                            self.transcript_budget
+                        );
+                    }
+                    return error(
+                        ErrorCode::Malformed,
+                        format!(
+                            "the transcript since the last Seal is {} bytes and this entry is {size}; at most {} are kept between two Seals: end the turn, then record again",
+                            self.unsealed_transcript, self.transcript_budget
+                        ),
+                    );
+                }
                 match self.vessel.append(Stream::Transcript, Payload::Raw(entry)) {
                     Ok(head) => {
+                        self.unsealed_transcript += size;
                         self.transcript = head.lsn;
                         Reply::Recorded {
                             lsn: head.lsn.get(),
@@ -828,6 +886,9 @@ impl<'v, L: Layers> Session<'v, L> {
         {
             Ok(sealed) => {
                 self.last_sealed_turn = Some(turn);
+                // The cut took every transcript entry so far.
+                self.unsealed_transcript = 0;
+                self.transcript_full_said = false;
                 // Published after the reply: Session::after_reply.
                 self.pending_seal = Some(sealed.seal);
                 Reply::TurnEnd {
@@ -3485,6 +3546,68 @@ mod tests {
             }
         ));
         assert!(v.last_seal().is_some());
+    }
+
+    /// Audit 2026-11-09, an agent that recorded transcript without ever
+    /// ending a turn grew the log without limit.  With the bound set to
+    /// 1 MiB for the test: three entries of 300 KiB are recorded, the
+    /// fourth is refused and not recorded; a session started anew on the
+    /// same Vessel still counts the three; a Seal makes room again.
+    #[test]
+    fn transcript_between_two_seals_is_bounded_and_a_seal_makes_room() {
+        assert_eq!(MAX_UNSEALED_TRANSCRIPT, 1 << 30);
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        let entry = |k: u8| Request::Transcript {
+            entry: vec![k; 300 << 10],
+        };
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        s.transcript_budget = 1 << 20;
+        s.handle(hello());
+        for k in 0..3 {
+            assert!(matches!(s.handle(entry(k)), Reply::Recorded { .. }));
+        }
+        let before = s.vessel.tail();
+        let Reply::Error { code, message } = s.handle(entry(3)) else {
+            panic!("a fourth entry was recorded: 1200 KiB of transcript since the last Seal, the bound being 1024")
+        };
+        assert_eq!(code, ErrorCode::Malformed);
+        assert!(
+            message.contains("921627 bytes") && message.contains("end the turn"),
+            "{message}"
+        );
+        assert_eq!(s.vessel.tail(), before, "the refused entry is not recorded");
+        // A small entry still fits.
+        assert!(matches!(
+            s.handle(Request::Transcript {
+                entry: vec![9; 1024]
+            }),
+            Reply::Recorded { .. }
+        ));
+        // A new run of the same Vessel: what is unsealed still counts.
+        drop(s);
+        let mut s = Session::new(&mut v, Verdict::Clean).unwrap();
+        s.transcript_budget = 1 << 20;
+        assert_eq!(s.unsealed_transcript, 3 * (300 << 10) + 1024 + 4 * 9);
+        s.handle(hello());
+        assert!(matches!(s.handle(entry(4)), Reply::Error { .. }));
+        // The agent ends its turn; the Seal makes room.
+        assert!(matches!(
+            s.handle(Request::TurnEnd {
+                turn: 1,
+                quiescent: true
+            }),
+            Reply::TurnEnd {
+                sealed: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(s.unsealed_transcript, 0);
+        assert!(matches!(s.handle(entry(5)), Reply::Recorded { .. }));
+        // And a session after that Seal counts only what came after it.
+        drop(s);
+        let s = Session::new(&mut v, Verdict::Clean).unwrap();
+        assert_eq!(s.unsealed_transcript, (300 << 10) + 9);
     }
 
     fn declare_of(call: u64, n: usize) -> Request {

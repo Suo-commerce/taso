@@ -44,6 +44,7 @@ one a_kill_that_did_not_take_is_asked_for_again $W
 one a_failed_append_consumes_no_op_id $W
 one an_effect_request_over_the_limit_is_refused_and_not_recorded $W
 one of_what_an_agent_prints_the_warden_keeps_the_end $W
+one transcript_between_two_seals_is_bounded_and_a_seal_makes_room $W
 one a_full_outbox_refuses_a_new_effect_until_an_outcome_is_reported $W
 one a_promotion_that_would_overfill_the_outbox_is_refused_before_it_is_recorded $W
 # The reclaimer
