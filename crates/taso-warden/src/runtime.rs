@@ -47,7 +47,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::{json, Value};
 
@@ -754,11 +754,22 @@ impl RuncRunner for RuncCli {
                 .mode(0o700)
                 .create(&self.root)?;
         }
-        let out = Command::new(&self.program)
+        // `runc run` stays until the container exits, and its output is
+        // the agent's: of that the Warden keeps the end only.  Every
+        // other subcommand prints runc's own short answer (`list` and
+        // `state` are parsed), kept whole.
+        let keep = match args.first().map(String::as_str) {
+            Some("run") => AGENT_OUTPUT_KEPT,
+            _ => usize::MAX,
+        };
+        let mut child = Command::new(&self.program)
             .arg("--root")
             .arg(&self.root)
             .args(args)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| match e.kind() {
                 io::ErrorKind::NotFound => io::Error::new(
                     io::ErrorKind::NotFound,
@@ -766,12 +777,76 @@ impl RuncRunner for RuncCli {
                 ),
                 _ => e,
             })?;
-        Ok((
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        ))
+        let (stdout, stderr) = (
+            child.stdout.take().expect("piped"),
+            child.stderr.take().expect("piped"),
+        );
+        // Both pipes are read at once, or a child that fills the one
+        // nobody reads would wait for ever.
+        let errs = std::thread::Builder::new()
+            .name("runc-stderr".into())
+            .spawn(move || end_of(stderr, keep));
+        let errs = match errs {
+            Ok(t) => t,
+            Err(e) => {
+                // No thread to read with: the child is not left running
+                // with nobody reading it.
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
+        let out = end_of(stdout, keep);
+        let err = errs
+            .join()
+            .unwrap_or_else(|_| Err(io::Error::other("reading runc's stderr panicked")));
+        let status = child.wait()?;
+        Ok((status.success(), out?, err?))
     }
+}
+
+/// How much of an agent's standard output, and of its standard error,
+/// the Warden keeps: the last 64 KiB of each.  The Warden uses them for
+/// one thing, the reason in its log when a run fails, and a reason is at
+/// the end.  It used to keep all of both in memory until the container
+/// exited, so an agent that printed without end took the Warden's memory
+/// with it, and every Vessel on the node after (audit 2026-11-09, the
+/// agent's output in memory; D&D L3 (a)).
+pub const AGENT_OUTPUT_KEPT: usize = 64 << 10;
+
+/// Read `from` to its end and return its last `keep` bytes as text, with
+/// a first line saying how much came before them if anything did.  What
+/// is not kept is read and dropped, so the writer never waits; at most
+/// twice `keep` (and one read's worth) is held at a time.
+fn end_of(mut from: impl io::Read, keep: usize) -> io::Result<String> {
+    let mut kept: Vec<u8> = Vec::new();
+    let mut dropped: u64 = 0;
+    let mut chunk = [0u8; 16 << 10];
+    loop {
+        let n = match from.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        kept.extend_from_slice(&chunk[..n]);
+        if kept.len() / 2 > keep {
+            let over = kept.len() - keep;
+            kept.drain(..over);
+            dropped += over as u64;
+        }
+    }
+    if kept.len() > keep {
+        let over = kept.len() - keep;
+        kept.drain(..over);
+        dropped += over as u64;
+    }
+    let text = String::from_utf8_lossy(&kept);
+    Ok(if dropped == 0 {
+        text.into_owned()
+    } else {
+        format!("[{dropped} earlier bytes not kept]\n{text}")
+    })
 }
 
 /// The runc driver.
@@ -1761,6 +1836,69 @@ mod tests {
         let r = fake(&[(false, "", "cannot start: rootfs missing\n")]);
         let e = r.start("v1").unwrap_err().to_string();
         assert!(e.contains("rootfs missing"), "{e}");
+    }
+
+    /// Audit 2026-11-09, the Warden kept everything an agent printed on
+    /// its standard output and error in memory until the container
+    /// exited.  A stand-in for `runc run` prints 8 MiB on each: the Warden
+    /// keeps the end of each, where the reason of a failed run is, and
+    /// says how much it did not keep.
+    #[test]
+    fn of_what_an_agent_prints_the_warden_keeps_the_end() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let prog = dir.path().join("runc");
+        std::fs::write(
+            &prog,
+            "#!/bin/sh\nhead -c 8388608 /dev/zero | tr '\\0' o\necho last-out\n\
+             head -c 8388608 /dev/zero | tr '\\0' e >&2\necho the-reason >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cli = RuncCli {
+            program: prog,
+            root: dir.path().join("root"),
+        };
+        let (ok, out, err) = cli.run(&s(&["run", "--bundle", "/b", "x"])).unwrap();
+        assert!(!ok);
+        for (name, text, last) in [
+            ("stdout", &out, "last-out\n"),
+            ("stderr", &err, "the-reason\n"),
+        ] {
+            assert!(
+                text.len() <= AGENT_OUTPUT_KEPT + 64,
+                "the Warden kept {} bytes of the agent's {name} in memory",
+                text.len()
+            );
+            assert!(text.ends_with(last), "the end of {name} is what is kept");
+            let dropped = (8388608 + last.len() - AGENT_OUTPUT_KEPT) as u64;
+            assert!(
+                text.starts_with(&format!("[{dropped} earlier bytes not kept]\n")),
+                "{name} says what was not kept: {:?}",
+                &text[..40]
+            );
+        }
+        // What runc itself answers to another subcommand is kept whole:
+        // `list` and `state` are parsed.
+        let (_, out, _) = cli.run(&s(&["list", "--format", "json"])).unwrap();
+        assert_eq!(out.len(), 8388608 + "last-out\n".len());
+    }
+
+    /// Short output is returned as it is, and the bound is exact.
+    #[test]
+    fn end_of_keeps_short_output_whole_and_long_output_to_the_byte() {
+        assert_eq!(end_of(&b"abc"[..], 8).unwrap(), "abc");
+        assert_eq!(end_of(&b"abcdefgh"[..], 8).unwrap(), "abcdefgh");
+        assert_eq!(
+            end_of(&b"abcdefghi"[..], 8).unwrap(),
+            "[1 earlier bytes not kept]\nbcdefghi"
+        );
+        let long = vec![b'x'; 100_000];
+        let kept = end_of(&long[..], 1000).unwrap();
+        assert_eq!(
+            kept,
+            format!("[99000 earlier bytes not kept]\n{}", "x".repeat(1000))
+        );
     }
 
     // ── a real container ────────────────────────────────────────────
