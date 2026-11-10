@@ -31,8 +31,10 @@
 #   - no panic in any log (Warden, blkd, coordinator, policy);
 #   - the Warden never exited by itself;
 #   - the Warden's open files and threads did not grow: the last third's
-#     largest at most 1.5x the first third's largest, plus 16;
-#   - work was done: Seals, attempts and sanctions each more than zero;
+#     largest at most 1.5x the first third's largest, plus 16 (a run with
+#     fewer than 6 samples of the Warden cannot say, and fails);
+#   - work was done: Seals (the Seal frames in those Chronicles), attempts
+#     and sanctions each more than zero;
 #   - no ublk device left after taso-blkd quits.
 # Exit 0 only if every check passed.  Everything stays in /var/lib/taso-soak
 # (removed at the next start).
@@ -373,14 +375,16 @@ expect "no panic in any log" is "$(cat "$W"/out/*.err "$W"/*.err 2>/dev/null | g
 expect "the Warden exited by itself 0 times" is "$EXITED" 0
 
 say "no growth (predict: the last third's largest open files and threads at most 1.5x the first third's, plus 16)"
-growth() { # growth COLUMN: "ok" or what grew
+# Too few samples is not "ok" (audit 2026-11-09, soak growth): a short run
+# printed "ok (too few samples: N)" and passed, whatever the Warden leaked.
+growth() { # growth COLUMN: "ok", or what grew, or that it cannot say
     python3 - "$W/soak.tsv" "$1" <<'PY'
 import sys
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
 col = int(sys.argv[2])
 vals = [int(r[col]) for r in rows if r[col].isdigit()]
 if len(vals) < 6:
-    print("ok (too few samples: %d)" % len(vals)); sys.exit()
+    print("too few samples to say: %d, at least 6 are needed (a longer run, or a smaller SAMPLE)" % len(vals)); sys.exit()
 third = len(vals) // 3
 first, last = max(vals[:third]), max(vals[-third:])
 print("ok" if last <= first * 1.5 + 16 else "grew from %d to %d" % (first, last))
@@ -389,19 +393,27 @@ PY
 for c in "1 threads" "2 open-files"; do
     set -- $c
     r=$(growth "$1")
-    expect "the Warden's $2: $r" bash -c "[[ '$r' == ok* ]]"
+    expect "the Warden's $2 did not grow" is "$r" ok
 done
 
-say "every Chronicle (predict: explain exit 0 with no failed check; its frames one chain; shipped not past head)"
+# The Seal frames in one Chronicle, as taso-logcheck printed it.  One that
+# cannot be read counts none: its "one chain" check has failed by then.
+seal_frames() { # seal_frames LOGCHECK_JSON
+    python3 -c 'import json, sys
+print(sum(1 for f in json.load(open(sys.argv[1]))["frames"] if f.get("kind") == "seal"))' "$1" 2>/dev/null || echo 0
+}
+
+say "every Chronicle (predict: explain exit 0 with no failed check; its frames one chain; shipped not past head; Seals more than zero)"
 mapfile -t IDS < <(blk names | tr ' ' '\n' | sed -n 's|^soak/n1/v-\([0-9a-f]\{32\}\):.*|\1|p' | sort -u)
 echo "  ${#IDS[@]} Chronicles"
 expect "Chronicles on the node: at least $VESSELS" atleast "${#IDS[@]}" "$VESSELS"
+SEALS=0
 for id in "${IDS[@]}"; do
     XRC=0
     timeout 120 "$BIN/taso-ctl" "$W/soak.json" explain "$id" >"$W/out/explain-$id.json" 2>"$W/out/explain-$id.err" || XRC=$?
     failed=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("checks",{}).get("failed",[])))' "$W/out/explain-$id.json" 2>/dev/null || echo "unreadable")
     expect "$id: explained, no failed check" is "$XRC $failed" "0 0"
-    chain=$("$BIN/taso-logcheck" "$SOCK" "$W/state" "$id" 2>"$W/out/logcheck-$id.err" | python3 -c '
+    chain=$("$BIN/taso-logcheck" "$SOCK" "$W/state" "$id" 2>"$W/out/logcheck-$id.err" | tee "$W/out/logcheck-$id.json" | python3 -c '
 import json, sys
 v = json.load(sys.stdin)
 fr = v["frames"]
@@ -414,7 +426,10 @@ elif shipped and head and shipped["lsn"] > head["lsn"]:
 else:
     print("ok")' 2>/dev/null || echo "unreadable")
     expect "$id: one chain" is "$chain" ok
+    SEALS=$((SEALS + $(seal_frames "$W/out/logcheck-$id.json")))
 done
+echo "  $SEALS Seals"
+expect "Seals" atleast "$SEALS" 1
 
 say "taso-blkd quits clean and leaves no device (predict: after the Vessels' file systems are unmounted, quit answers ok within 60 s and the daemon exits 0)"
 # The Warden leaves its Vessels mounted when it stops (a crash leaves

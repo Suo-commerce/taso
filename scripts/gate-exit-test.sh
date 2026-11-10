@@ -9,6 +9,7 @@
 #    clean run.
 # 2. gate-p2-blk.sh's summary exits 1 when a check says FAIL, 0 when all pass.
 # 3. p5-node.sh's report keeps its FAIL count when its output is saved.
+# 4. soak.sh's growth rule fails a leak, and fails a run too short to judge.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d /tmp/gate-exit-test.XXXXXX); trap 'rm -rf "$T"' EXIT
@@ -44,5 +45,22 @@ p5() { bash -c 'fail=0; REPORT='"$T"'/report.txt; report() { echo "FAIL  x"; fai
 '"$(cat "$T/save.line")"' >/dev/null
 [[ $fail -eq 0 ]]' >/dev/null 2>&1; echo $?; }
 check "p5-node: setup's saved report keeps its FAIL count" 1 "$(p5)"
+
+# 4. soak.sh's growth rule (its expect, its growth and the loop that
+# judges both columns, cut out of the script) over made-up samples of
+# "threads open-files"; the exit is the number of FAILs.
+soak() {
+    bash -c '
+W=$1; shift; PASS=0 FAIL=0
+eval "$(sed -n "/^expect() {/,/^atleast() /p" scripts/soak.sh)"
+eval "$(sed -n "/^growth() {/,/^}/p" scripts/soak.sh)"
+printf "time\tthreads\tfiles\n" > "$W/soak.tsv"
+for v in "$@"; do printf "t\t%s\t%s\n" $v >> "$W/soak.tsv"; done
+eval "$(sed -n "/^for c in \"1 threads\"/,/^done/p" scripts/soak.sh)"
+exit "$FAIL"' soak "$T" "$@" >/dev/null 2>&1; echo $?
+}
+check "soak: steady threads and open files pass" 0 "$(soak "10 20" "12 22" "11 21" "12 20" "10 22" "11 21")"
+check "soak: a leak fails, both columns" 2 "$(soak "10 20" "500 900" "1500 3000" "3000 6000" "5000 9000" "7000 12000")"
+check "soak: too few samples to judge fail, both columns" 2 "$(soak "10 20" "500 900" "1500 3000" "3000 6000" "5000 9000")"
 
 [ "$bad" = 0 ] && echo "gate-exit-test: PASS" || { echo "gate-exit-test: $bad FAILED"; exit 1; }
