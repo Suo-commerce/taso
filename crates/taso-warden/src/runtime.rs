@@ -252,6 +252,16 @@ impl std::error::Error for SpecError {}
 
 const RESERVED_ENV: &[&str] = &["PATH", "HOME", "TASO_FIELD"];
 
+/// Whether `key` steers the dynamic loader (`LD_PRELOAD`,
+/// `LD_LIBRARY_PATH`, `LD_AUDIT`, any `LD_*`).  A Vessel's environment
+/// may hold none (finding 2.10): the Landlock shim runs first in it, and
+/// a library the loader brings in would run in the shim before Landlock
+/// is on.  The environment is the operator's or a Kubernetes user's, not
+/// the agent's; this keeps either from switching the sandbox off.
+pub fn steers_the_loader(key: &str) -> bool {
+    key.starts_with("LD_")
+}
+
 /// The OCI runtime `config.json` for `spec`.
 pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
     let id_ok = !spec.id.is_empty()
@@ -293,6 +303,7 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
             !k.is_empty()
                 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 && !RESERVED_ENV.contains(&k)
+                && !steers_the_loader(k)
         });
         if !ok {
             return Err(SpecError::BadEnv(e.clone()));
@@ -1196,6 +1207,25 @@ mod tests {
             c["linux"]["seccomp"]["syscalls"][0]["action"],
             "SCMP_ACT_ERRNO"
         );
+    }
+
+    /// Finding 2.10 (K1 part 3): a Vessel's environment steers no loader,
+    /// so nothing runs in the Landlock shim before Landlock is on.
+    #[test]
+    fn a_vessel_env_that_steers_the_loader_is_refused() {
+        for e in [
+            "LD_PRELOAD=/work/x.so",
+            "LD_LIBRARY_PATH=/work",
+            "LD_AUDIT=/work/a.so",
+        ] {
+            let mut sp = spec();
+            sp.landlock_shim = Some("/usr/lib/taso/landlock".into());
+            sp.env = vec![e.into()];
+            assert_eq!(oci_config(&sp), Err(SpecError::BadEnv(e.into())), "{e}");
+        }
+        let mut sp = spec();
+        sp.env = vec!["OLD_LD=1".into(), "LDX=1".into()];
+        assert!(oci_config(&sp).is_ok(), "only LD_ names");
     }
 
     /// Finding 2.9 (K1 part 2): of the host, a Vessel sees only its
