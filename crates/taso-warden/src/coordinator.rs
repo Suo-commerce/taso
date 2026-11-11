@@ -1023,9 +1023,19 @@ type Job = Box<
         + Send,
 >;
 
+/// Tells a waiting caller to lead the next group (finding 3.1).
+type Lead = Box<dyn FnOnce() + Send>;
+
+/// What a waiting caller is told: its answer, or to lead.
+enum Wake<T> {
+    Answer(Result<T, CoordError>),
+    Lead,
+}
+
 #[derive(Default)]
 struct Queue {
-    jobs: Vec<Job>,
+    /// Each request, with how to tell its caller to lead.
+    jobs: Vec<(Job, Lead)>,
     leading: bool,
 }
 
@@ -1081,7 +1091,11 @@ impl Coordinator {
         f: impl FnOnce(&mut Tables<'_>) -> Result<T, CoordError> + Send + 'static,
         writes: bool,
     ) -> Result<T, CoordError> {
-        let (tx, rx) = mpsc::channel::<Result<T, CoordError>>();
+        let (tx, rx) = mpsc::channel::<Wake<T>>();
+        let leads = tx.clone();
+        let lead_next: Lead = Box::new(move || {
+            let _ = leads.send(Wake::Lead);
+        });
         let job: Job = Box::new(move |tables| {
             let out = match tables {
                 Ok(tables) => f(tables),
@@ -1099,26 +1113,37 @@ impl Coordinator {
                     (Ok(_), Some(e)) => Err(group_failed(e)),
                     (out, _) => out,
                 };
-                let _ = tx.send(answer);
+                let _ = tx.send(Wake::Answer(answer));
             });
             (wrote, poison, deliver)
         });
         let lead = {
             let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-            q.jobs.push(job);
+            q.jobs.push((job, lead_next));
             !std::mem::replace(&mut q.leading, true)
         };
         if lead {
             self.lead();
         }
-        rx.recv().unwrap_or_else(|_| {
-            Err(CoordError::Unavailable(std::io::Error::other(
-                "the group commit leader is gone",
-            )))
-        })
+        loop {
+            match rx.recv() {
+                Ok(Wake::Answer(a)) => return a,
+                Ok(Wake::Lead) => self.lead(),
+                Err(_) => {
+                    return Err(CoordError::Unavailable(std::io::Error::other(
+                        "the group commit leader is gone",
+                    )))
+                }
+            }
+        }
     }
 
-    /// Commit queued requests, group after group, until the queue is empty.
+    /// Commit what is queued as one group, then hand leading to the
+    /// caller of the next request queued meanwhile, if any.  A caller
+    /// leads at most one group, so none waits on other callers' groups
+    /// after its own answer (finding 3.1: a leader kept leading while the
+    /// queue refilled, and its own caller waited 2.6 s of a 4 s busy
+    /// period).
     fn lead(&self) {
         // If a request panics, give up leading and drop what is queued:
         // dropped requests answer their callers with an error, and the
@@ -1136,16 +1161,23 @@ impl Coordinator {
             }
         }
         let _abdicate = Abdicate(&self.queue, &self.shared);
-        loop {
-            let jobs = {
-                let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-                if q.jobs.is_empty() {
-                    q.leading = false;
-                    return;
-                }
-                std::mem::take(&mut q.jobs)
-            };
-            self.commit_group(jobs);
+        let jobs = {
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut q.jobs)
+        };
+        self.commit_group(jobs.into_iter().map(|(job, _)| job).collect());
+        let next = {
+            let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if q.jobs.is_empty() {
+                q.leading = false;
+                None
+            } else {
+                // Still leading: the first request's caller takes over.
+                Some(std::mem::replace(&mut q.jobs[0].1, Box::new(|| ())))
+            }
+        };
+        if let Some(lead) = next {
+            lead();
         }
     }
 
@@ -2245,6 +2277,59 @@ mod tests {
             assert_eq!(coord.head(chron(t as u8)).unwrap(), *h);
             assert_eq!(h.lsn, Lsn::new(EACH));
         }
+    }
+
+    /// Finding 3.1: a caller leads at most one group.  Its answer comes
+    /// once its own group commits, not after the groups queued behind it.
+    #[test]
+    fn a_leader_hands_over_after_its_own_group() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let (_d, _path, coord) = fresh();
+        let coord = std::sync::Arc::new(coord);
+        let (go_a, wait_a) = channel::<()>();
+        let (go_b, wait_b) = channel::<()>();
+        let (a_done, a_answered) = channel::<()>();
+        // A leads a group whose one request waits for `go_a`.
+        let c = coord.clone();
+        let a = std::thread::spawn(move || {
+            c.queued(
+                move |_| {
+                    let _ = wait_a.recv();
+                    Ok(())
+                },
+                false,
+            )
+            .unwrap();
+            let _ = a_done.send(());
+        });
+        while !coord.queue.lock().unwrap().leading {
+            std::thread::yield_now();
+        }
+        // B queues a request that waits for `go_b`, behind A's group.
+        let c = coord.clone();
+        let b = std::thread::spawn(move || {
+            c.queued(
+                move |_| {
+                    let _ = wait_b.recv();
+                    Ok(())
+                },
+                false,
+            )
+            .unwrap();
+        });
+        while coord.queue.lock().unwrap().jobs.is_empty() {
+            std::thread::yield_now();
+        }
+        go_a.send(()).unwrap();
+        let answered = a_answered.recv_timeout(Duration::from_secs(10));
+        go_b.send(()).unwrap();
+        a.join().unwrap();
+        b.join().unwrap();
+        assert!(
+            answered.is_ok(),
+            "A's group committed, yet A waited for B's group"
+        );
     }
 
     /// Two Wardens racing for every position of one Chronicle (a split
