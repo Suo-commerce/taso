@@ -45,7 +45,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use taso_core::canon::Canonical;
 use taso_core::contract::logical_id;
 use taso_core::contract::{
     candidate_id, facts_hash, object_key, Candidate, ClassCounts, ContractRecord, Facts,
@@ -512,21 +511,14 @@ impl Nominator {
         (self.failpoint)("nominate.after_artifact_put")?;
 
         // 6. The Candidate.
-        // The adopted effects are counted over the whole log up to the
-        // Seal: what pruning took from the local log is read from the
-        // shipped packs (D&D P1 (a1); a Checkpoint will carry the count
-        // at the next format break).
-        let earlier = match frames.first().map(|f| f.envelope.lsn.get()) {
-            Some(first) if first > 1 => packs
-                .shipped_frames(Lsn::new(1), Lsn::new(first - 1))
-                .map_err(|e| NominateError::Vessel(VesselError::Pack(e)))?,
-            _ => Vec::new(),
-        };
+        // The adopted effects up to the Seal: its record carries the
+        // count (format generation 3, G1), so nothing counts over a log
+        // pruning may have cut.
         let facts = Facts {
             input: input.counts(),
             excluded: dropped_counts(&input, &output),
             open_obligations: self.coord.obligations(id)?.len() as u64,
-            effects_adopted: effects_adopted(earlier.iter().chain(frames.iter()), seal.lsn)?,
+            effects_adopted: record.adopted,
             ledger_lsn: record.ledger_pos,
             requirement,
         };
@@ -945,52 +937,6 @@ fn dropped_counts(input: &Manifest, output: &Manifest) -> ClassCounts {
         ..input.clone()
     };
     dropped.counts()
-}
-
-/// The operations adopted by promotion in the log up to `seal` (D63):
-/// intents whose authority is an `AdoptedFrom` naming the child and Seal
-/// of the Promotion record before them, written before the next Seal.
-///
-/// An adoption is written right after its Promotion, and the Vessel takes
-/// no effect from its agent until the next Seal, its adoption Seal (C7,
-/// audit A3/A4).  `authority` is otherwise the agent's own bytes: it used
-/// to count any later intent whose authority began with a promoted
-/// child's id and Seal, so an agent could raise the count by declaring
-/// effects that named them (audit 2026-11-09, an agent-declared
-/// authority inflates the adopted-effects count).
-///
-/// `frames` is the Vessel's log from its first record: a local log that
-/// has lost its prefix to pruning counts only what is left (audit
-/// 2026-11-09, A5), so the caller puts the shipped records before it.
-pub(crate) fn effects_adopted<'a>(
-    frames: impl Iterator<Item = &'a Frame>,
-    seal: Lsn,
-) -> Result<u64, NominateError> {
-    // The Promotion whose adoption may still be written: until the next
-    // Seal.
-    let mut adopting: Option<Vec<u8>> = None;
-    let mut n = 0;
-    for f in frames.take_while(|f| f.envelope.lsn <= seal) {
-        match Payload::decode(&f.payload) {
-            Ok(Payload::Promotion(p)) => {
-                let mut c = taso_core::canon::Canon::default();
-                p.child.canon(&mut c);
-                p.seal.canon(&mut c);
-                adopting = Some(c.as_bytes().to_vec());
-            }
-            Ok(Payload::Seal(_)) => adopting = None,
-            Ok(Payload::Intent(i))
-                if i.authority.len() == 32
-                    && adopting
-                        .as_ref()
-                        .is_some_and(|p| i.authority.starts_with(p)) =>
-            {
-                n += 1;
-            }
-            _ => {}
-        }
-    }
-    Ok(n)
 }
 
 fn hex(b: &[u8]) -> String {
