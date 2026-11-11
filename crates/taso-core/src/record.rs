@@ -377,6 +377,11 @@ pub struct SealRecord {
     pub ledger_pos: Lsn,
     /// The turn that triggered this Seal.
     pub turn: TurnId,
+    /// The effects adopted by promotion in this Chronicle up to this Seal
+    /// (D63; an intent adopted from the Promotion before it, written
+    /// before the next Seal).  A Candidate's fact is read from here, so
+    /// no count runs over a log pruning may have cut (generation 3).
+    pub adopted: u64,
 }
 
 impl Canonical for SealRecord {
@@ -387,6 +392,7 @@ impl Canonical for SealRecord {
         self.verdict.canon(out);
         self.ledger_pos.canon(out);
         self.turn.canon(out);
+        out.u64(self.adopted);
     }
 }
 
@@ -818,6 +824,12 @@ pub struct CheckpointRecord {
     /// adoption Seal: a promotion that adopted no effect ends there).  Carried here so a prune can
     /// never hide a half-done promotion from the reopen that finishes it.
     pub promotion: Option<PromotionRecord>,
+    /// The effects adopted up to here (as [`SealRecord::adopted`]).
+    pub adopted: u64,
+    /// The Promotion whose adoptions still count: the last one, until the
+    /// next Seal.  Unlike `promotion` it is not cleared by the first
+    /// adoption, so a count cut by a Checkpoint goes on after it.
+    pub adopting: Option<PromotionRecord>,
 }
 
 impl Canonical for CheckpointRecord {
@@ -830,6 +842,8 @@ impl Canonical for CheckpointRecord {
         out.seq(self.open.iter());
         out.u64(self.next_op);
         out.option(self.promotion.as_ref());
+        out.u64(self.adopted);
+        out.option(self.adopting.as_ref());
     }
 }
 
@@ -1112,6 +1126,7 @@ mod tests {
             verdict: Verdict::Clean,
             ledger_pos: Lsn::new(2),
             turn: TurnId::new(1),
+            adopted: 0,
         })
     }
 
@@ -1317,7 +1332,7 @@ mod tests {
     #[test]
     fn existing_record_hashes_are_pinned() {
         let pins = [
-            "09bda33c6470f8a91d4fe4517473c16b443e294f3dbcded1f8209f799ee6e6f3",
+            "6ffee82f360f279be61b79f1d096042ade8418cdda0dfd3655fa8bd881f32168",
             "48cc01a42756f90bf98eacbdca8a9bfcdee76948ae835a1693f40010f49ff52a",
             "5a5028714f892e8233b9114a5d539b3037a4c81a9c044f958a453adaa46f8f2c",
             "ac080516e89c43165f8ac222bc801ef16cac440f376eb498fb40c4ef5a1e9a4f",
@@ -1422,6 +1437,8 @@ mod tests {
             }],
             next_op: 5,
             promotion: None,
+            adopted: 0,
+            adopting: None,
         }));
         assert_eq!(
             make_record(cp.clone()).envelope.hash.to_string(),
@@ -1432,17 +1449,28 @@ mod tests {
         };
         pending.promotion = Some(promotion());
         assert_eq!(
-            make_record(Payload::Checkpoint(pending))
+            make_record(Payload::Checkpoint(pending.clone()))
                 .envelope
                 .hash
                 .to_string(),
             PIN_CHECKPOINT[1]
         );
+        // Generation 3: the adopted count and the open adoption window.
+        pending.adopted = 7;
+        pending.adopting = Some(promotion());
+        assert_eq!(
+            make_record(Payload::Checkpoint(pending))
+                .envelope
+                .hash
+                .to_string(),
+            PIN_CHECKPOINT[2]
+        );
     }
 
-    const PIN_CHECKPOINT: [&str; 2] = [
-        "d4d34303434e26bac356912d981d2edc85e8529dbee84a3bff4721c430fb4efc",
-        "7770a28bb65d7bda4e98e1b20288ca1b85affe37f8f4926ff407726f97de1cae",
+    const PIN_CHECKPOINT: [&str; 3] = [
+        "f9a5a4c937ebdef117022512fea37a4303c47abf1005d39130b41307964dc063",
+        "fca9c025fd503aff052b499b748688e8c9039dcbc6cda235f10d9e8b9586ea89",
+        "b951d956d84eeebcac45fb97b353756aed59fd6b062a8090e96e9ddc8b60fded",
     ];
 
     // ── Promotion (P3) ──────────────────────────────────────────────
