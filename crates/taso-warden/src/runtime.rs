@@ -23,8 +23,11 @@
 //! - **seccomp**: default allow, with an explicit deny list of syscalls an
 //!   agent never needs and that widen the attack surface (namespaces and
 //!   mounts, kernel modules, BPF, ptrace and cross-process memory, keyring,
-//!   clock and reboot).  Phase 3 hardens further; this is the pilot's
-//!   threat model (v1.0 §3).
+//!   clock and reboot), and no new namespace however asked (`clone` with
+//!   a namespace flag, `clone3`; see `seccomp`).  The Vessel is the
+//!   agent's sandbox: one it builds itself (a browser's) runs without
+//!   it.  Phase 3 hardens further; this is the pilot's threat model
+//!   (v1.0 §3).
 //! - **Landlock** is not part of the OCI spec and runc does not apply it.
 //!   If [`VesselSpec::landlock_shim`] is set, the shim (a binary in the
 //!   rootfs) runs first, restricts writes to `/work` and `/tmp`, and execs
@@ -132,6 +135,57 @@ pub const DENIED_SYSCALLS: &[&str] = &[
     "userfaultfd",
     "lookup_dcookie",
 ];
+
+/// `clone` flags that make a namespace: mount, cgroup, uts, ipc, user,
+/// pid, net.  (`CLONE_NEWTIME` exists only for `clone3`.)
+pub const CLONE_NAMESPACE_FLAGS: &[u64] = &[
+    0x0002_0000, // CLONE_NEWNS
+    0x0200_0000, // CLONE_NEWCGROUP
+    0x0400_0000, // CLONE_NEWUTS
+    0x0800_0000, // CLONE_NEWIPC
+    0x1000_0000, // CLONE_NEWUSER
+    0x2000_0000, // CLONE_NEWPID
+    0x4000_0000, // CLONE_NEWNET
+];
+
+/// `ENOSYS`: what `clone3` answers, as under Docker's default profile.
+const ENOSYS: u32 = 38;
+
+/// The seccomp profile of a Vessel and of a verifier: allow by default,
+/// refuse [`DENIED_SYSCALLS`] with `EPERM`, and refuse new namespaces
+/// however asked (finding 2.8, decision K1-1 (c), as Docker's default
+/// profile does).  The agent holds no capabilities; a new user namespace
+/// would give it every one again inside it, and with them kernel code
+/// (netfilter, for one) the Vessel keeps out of its reach.  So:
+///
+/// - `unshare` and `setns` are in the list;
+/// - `clone` with any of [`CLONE_NAMESPACE_FLAGS`] is refused with `EPERM`
+///   (one rule per flag: the rules are or-ed, a rule's conditions and-ed);
+///   a `clone` for a thread or a process is allowed;
+/// - `clone3` answers `ENOSYS`: its flags are behind a pointer seccomp
+///   cannot read, and on `ENOSYS` libc falls back to `clone`.
+///
+/// An agent that builds its own sandbox (a browser's, bubblewrap) runs
+/// without it: the Vessel is its sandbox (Chromium: `--no-sandbox`).
+fn seccomp() -> serde_json::Value {
+    let mut rules = vec![
+        json!({ "names": DENIED_SYSCALLS, "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }),
+        json!({ "names": ["clone3"], "action": "SCMP_ACT_ERRNO", "errnoRet": ENOSYS }),
+    ];
+    for flag in CLONE_NAMESPACE_FLAGS {
+        rules.push(json!({
+            "names": ["clone"],
+            "action": "SCMP_ACT_ERRNO",
+            "errnoRet": 1,
+            "args": [{ "index": 0, "value": flag, "valueTwo": flag, "op": "SCMP_CMP_MASKED_EQ" }]
+        }));
+    }
+    json!({
+        "defaultAction": "SCMP_ACT_ALLOW",
+        "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_AARCH64"],
+        "syscalls": rules
+    })
+}
 
 /// Everything needed to run one Vessel.
 #[derive(Clone, Debug)]
@@ -333,11 +387,7 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
             "uidMappings": [{ "containerID": 0, "hostID": spec.host_uid_base, "size": ID_RANGE }],
             "gidMappings": [{ "containerID": 0, "hostID": spec.host_uid_base, "size": ID_RANGE }],
             "resources": resources,
-            "seccomp": {
-                "defaultAction": "SCMP_ACT_ALLOW",
-                "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_AARCH64"],
-                "syscalls": [{ "names": DENIED_SYSCALLS, "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }]
-            },
+            "seccomp": seccomp(),
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
                 "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi",
@@ -472,11 +522,7 @@ pub fn verifier_config(spec: &VerifierSpec) -> Result<Value, SpecError> {
                 "memory": { "limit": spec.memory_bytes, "swap": spec.memory_bytes },
                 "pids": { "limit": spec.pids }
             },
-            "seccomp": {
-                "defaultAction": "SCMP_ACT_ALLOW",
-                "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_AARCH64"],
-                "syscalls": [{ "names": DENIED_SYSCALLS, "action": "SCMP_ACT_ERRNO", "errnoRet": 1 }]
-            },
+            "seccomp": seccomp(),
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
                 "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi",
@@ -1151,6 +1197,80 @@ mod tests {
             c["linux"]["seccomp"]["syscalls"][0]["action"],
             "SCMP_ACT_ERRNO"
         );
+    }
+
+    /// Finding 2.8 (K1-1 (c)): a Vessel and a verifier make no namespace:
+    /// `clone` with any namespace flag is refused (`EPERM`), `clone3`
+    /// answers `ENOSYS`, and a plain `clone` (a thread, a process) passes.
+    #[test]
+    fn no_new_namespace_is_made_by_clone_or_clone3() {
+        let verifier = VerifierSpec {
+            id: "a-0123".into(),
+            rootfs: "/mnt/t-77/.view".into(),
+            candidate: "/mnt/a-0123".into(),
+            uid_base: 789_824,
+            args: vec!["/bin/check".into()],
+            env: vec![],
+            memory_bytes: 1 << 30,
+            cpu_seconds: 60,
+            pids: 64,
+        };
+        for c in [
+            oci_config(&spec()).unwrap(),
+            verifier_config(&verifier).unwrap(),
+        ] {
+            let rules = c["linux"]["seccomp"]["syscalls"].as_array().unwrap();
+            let names = |r: &Value| -> Vec<String> {
+                r["names"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n.as_str().unwrap().to_string())
+                    .collect()
+            };
+            // What a rule set answers a call with these clone flags.
+            let answer = |call: &str, flags: u64| -> Option<u64> {
+                rules
+                    .iter()
+                    .filter(|r| names(r).iter().any(|n| n == call))
+                    .find(|r| {
+                        r["args"].as_array().is_none_or(|args| {
+                            args.iter().all(|a| {
+                                assert_eq!(a["op"], "SCMP_CMP_MASKED_EQ");
+                                assert_eq!(a["index"], 0);
+                                let (v, v2) = (
+                                    a["value"].as_u64().unwrap(),
+                                    a["valueTwo"].as_u64().unwrap(),
+                                );
+                                flags & v == v2
+                            })
+                        })
+                    })
+                    .map(|r| r["errnoRet"].as_u64().unwrap())
+            };
+            for (name, flag) in [
+                ("NEWNS", 0x0002_0000u64),
+                ("NEWCGROUP", 0x0200_0000),
+                ("NEWUTS", 0x0400_0000),
+                ("NEWIPC", 0x0800_0000),
+                ("NEWUSER", 0x1000_0000),
+                ("NEWPID", 0x2000_0000),
+                ("NEWNET", 0x4000_0000),
+            ] {
+                // As Chromium asks: a user and a network namespace at once,
+                // with SIGCHLD in the low byte.
+                assert_eq!(answer("clone", flag | 17), Some(1), "clone {name}");
+            }
+            assert_eq!(answer("clone", 0x1000_0000 | 0x4000_0000 | 17), Some(1));
+            // A thread (CLONE_VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|SETTLS|
+            // PARENT_SETTID|CHILD_CLEARTID) and a fork pass.
+            assert_eq!(answer("clone", 0x003d_0f00), None, "a thread");
+            assert_eq!(answer("clone", 17), None, "a fork");
+            assert_eq!(answer("clone3", 0), Some(38), "clone3: ENOSYS");
+            for call in ["unshare", "setns"] {
+                assert_eq!(answer(call, 0), Some(1), "{call}");
+            }
+        }
     }
 
     #[test]
