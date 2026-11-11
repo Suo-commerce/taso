@@ -869,6 +869,50 @@ impl CoordLog {
         }
     }
 
+    /// Make the store reads [`CoordLog::accept`] would make now, changing
+    /// nothing: steps 1 to 7 as they stand, without their answer.  The
+    /// coordinator runs this before its write transaction, so the reads
+    /// are answered when the transaction runs `accept` (finding 3.2: one
+    /// slow store read held every other Chronicle's append).  What it
+    /// reads is only a guess at what `accept` will read: the log can move
+    /// in between, and `accept` reads anything else itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_reads(
+        &self,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        expected_head: Head,
+        pack: &str,
+        record: &Submitted,
+        store: &dyn StoreView,
+        now: u64,
+    ) {
+        let s = *submission.as_bytes();
+        let logical = record.logical_id();
+        let digest = record.digest();
+        if self.logical.contains_key(logical.as_bytes())
+            || self.refused_subs.contains_key(&(*chronicle.as_bytes(), s))
+        {
+            return;
+        }
+        let Some(ch) = self.chrons.get(chronicle.as_bytes()) else {
+            return;
+        };
+        let announced = ch.pending.as_ref().is_some_and(|p| {
+            p.submission == s && p.logical == *logical.as_bytes() && p.digest == *digest.as_bytes()
+        });
+        if ch.epoch != epoch || !announced || ch.head != expected_head {
+            return;
+        }
+        if !store.carries(chronicle, pack, digest) {
+            return;
+        }
+        let _ = self
+            .plan(chronicle, record, pack, store, now)
+            .and_then(|fx| self.check_effects(fx, store, now));
+    }
+
     // ── Queries (§1.3) ──────────────────────────────────────────────
 
     /// `query { submission }` of `chronicle`.
@@ -3278,6 +3322,70 @@ mod tests {
                 Final::Predicate("held".into())
             );
         }
+    }
+
+    /// Finding 3.2: `accept_reads` makes the reads `accept` makes, in
+    /// order, and changes nothing.
+    #[test]
+    fn accept_reads_reads_what_accept_reads_and_changes_nothing() {
+        struct Counting<'a>(&'a Store, RefCell<Vec<String>>);
+        impl StoreView for Counting<'_> {
+            fn carries(&self, c: ChronicleId, name: &str, d: HashVal) -> bool {
+                self.1
+                    .borrow_mut()
+                    .push(format!("carries {c:?} {name} {d:?}"));
+                self.0.carries(c, name, d)
+            }
+            fn lookup(&self, o: &ObjectId) -> Lookup<()> {
+                self.1.borrow_mut().push(format!("lookup {o:?}"));
+                self.0.lookup(o)
+            }
+            fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+                self.1.borrow_mut().push(format!("inventory {key:?}"));
+                self.0.lookup_inventory(key)
+            }
+            fn fs_packs(&self, c: ChronicleId) -> Option<Vec<InventoryItem>> {
+                self.1.borrow_mut().push(format!("fs_packs {c:?}"));
+                self.0.fs_packs(c)
+            }
+            fn seal_closure(&self, c: ChronicleId, seal: Lsn) -> Lookup<Vec<ObjectId>> {
+                self.1.borrow_mut().push(format!("closure {c:?} {seal:?}"));
+                self.0.seal_closure(c, seal)
+            }
+            fn lookup_replacement(&self, c: ChronicleId, it: &InventoryItem) -> Lookup<HashVal> {
+                self.1
+                    .borrow_mut()
+                    .push(format!("replacement {c:?} {it:?}"));
+                self.0.lookup_replacement(c, it)
+            }
+        }
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let (pc, _inv) = purge_inventory(&mut w, f.v);
+        let r = Submitted::Contract(ContractRecord::PurgeCommitted(pc));
+        let e = w.epoch(f.v);
+        let s = sub(&r, e, 7);
+        w.log
+            .announce(f.v, e, s, r.logical_id(), r.digest(), w.now)
+            .unwrap();
+        w.store.ship(f.v, "p7", &r);
+        let head = w.head(f.v);
+        let before = w.log.query_chronicle(f.v);
+        let rehearsed = Counting(&store, RefCell::default());
+        log.accept_reads(f.v, e, s, head, "p7", &r, &rehearsed, 100);
+        assert_eq!(log.query_chronicle(f.v), before, "nothing changed");
+        let real = Counting(&store, RefCell::default());
+        let a = log.accept(f.v, e, s, head, "p7", r, &real, 100);
+        assert!(matches!(a, Answer::Accepted { .. }), "{a:?}");
+        let (rehearsed, real) = (rehearsed.1.into_inner(), real.1.into_inner());
+        assert!(real.len() > 2, "a purge reads the store: {real:?}");
+        assert_eq!(rehearsed, real);
     }
 
     /// A replacement is held from its acceptance, so a stalled purge
