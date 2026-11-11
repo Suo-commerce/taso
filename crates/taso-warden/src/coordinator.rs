@@ -760,8 +760,10 @@ const META: TableDefinition<&str, u32> = TableDefinition::new("taso.coordinator.
 const GENERATION_KEY: &str = "generation";
 const QUARANTINE_KEY: &str = "deleted_quarantine";
 /// The coordinator state's generation: 2 since V4b's format break (the
-/// records the journal holds changed shape).
-pub const GENERATION: u32 = 2;
+/// records the journal holds changed shape); 3 since generation 3 (2026-11,
+/// before v0.1: a Seal record carries the adopted count, and the log's
+/// rules changed).  An older database is refused, not converted.
+pub const GENERATION: u32 = 3;
 
 /// Whether a table exists and holds a row.
 fn holds<K: redb::Key + 'static, V: redb::Value + 'static>(
@@ -4077,8 +4079,8 @@ mod log_tests {
         .expect("refused");
         assert!(e.to_string().contains("before V4b's format break"), "{e}");
         assert_eq!(generation(&path), None, "nothing written");
-        // Another generation.
-        set(&path, Some(1));
+        // Another generation: the one before this one.
+        set(&path, Some(GENERATION - 1));
         let e = Coordinator::open_with(
             &path,
             LogConfig {
