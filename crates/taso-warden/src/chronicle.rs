@@ -490,6 +490,9 @@ pub struct Chronicle<L: Layers> {
     /// The newest segment: the only one written.
     segment: Segment,
     layers: L,
+    /// The effects adopted so far (format generation 3, G1): each Seal
+    /// record carries the count; kept up to date as records are accepted.
+    adoption: crate::summary::Adoption,
     last_seal: Option<Position>,
     /// Accepted Seals whose layer was not there at open.
     missing_layers: HashSet<Lsn>,
@@ -711,6 +714,7 @@ impl<L: Layers> Chronicle<L> {
             segment,
             layers,
             last_seal: None,
+            adoption: crate::summary::Adoption::default(),
             missing_layers: HashSet::new(),
             health: Health::Live,
             roll_at: SEGMENT_MAX,
@@ -764,6 +768,7 @@ impl<L: Layers> Chronicle<L> {
             .collect();
         let summary = crate::summary::Summary::of(&frames)
             .map_err(|(lsn, error)| ChronicleError::Decode { lsn, error })?;
+        chronicle.adoption = summary.adoption;
         if let Some(cs) = summary.seal {
             if !seals.iter().any(|p| p.lsn == cs.lsn) {
                 seals.insert(
@@ -937,6 +942,7 @@ impl<L: Layers> Chronicle<L> {
                 verdict,
                 ledger_pos,
                 turn,
+                adopted: self.adoption.adopted,
             }),
         );
         let hash = rec.envelope.hash;
@@ -1363,7 +1369,12 @@ impl<L: Layers> Chronicle<L> {
         };
         drop(cas);
         match accepted {
-            Ok(head) => Ok(head),
+            Ok(head) => {
+                for r in recs {
+                    self.adoption.see(r.envelope.stream, &r.payload);
+                }
+                Ok(head)
+            }
             // The CAS may have landed: keep the frame, let reopen decide.
             Err(e) if e.outcome_unknown() => {
                 self.health = Health::Poisoned;
@@ -2354,6 +2365,7 @@ mod tests {
                 verdict: Verdict::Clean,
                 ledger_pos: Lsn::new(0),
                 turn: TurnId::new(2),
+                adopted: 0,
             }),
         );
         assert_eq!(expected.envelope.hash, s2.seal.hash);
@@ -2653,6 +2665,7 @@ mod tests {
                 verdict: Verdict::Clean,
                 ledger_pos: Lsn::new(0),
                 turn: TurnId::new(1),
+                adopted: 0,
             }),
         );
         let mut layers = e.layers.clone();
