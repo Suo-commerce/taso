@@ -202,7 +202,9 @@ requests: the Warden picks the child's uid slot from the Vessel's
 config entry (`"forks": {"slots": [...]}`, one child per slot), the
 child always holds, and only one child is promoted per fork point.  A
 sender is not involved in either; it only ever sees the adopted
-effects, on the parent's `Open` list, like any other.
+effects, on the parent's `Open` list, like any other.  A child outlives
+its parent's entry: if the parent is taken off the Warden's list, the
+child runs to its end and its files stay until its own TTL.
 
 ## Building a relay
 
