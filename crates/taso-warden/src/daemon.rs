@@ -2949,6 +2949,33 @@ impl<R: RuncRunner> Drop for RunningAgent<R> {
     }
 }
 
+/// The first Vessel of `children` that is a fork of `parent` and whose
+/// own purge has not ended: `(id, its Lineage as read from its local log,
+/// whether its purge ended)`.  A Lineage that cannot be read is an error:
+/// the parent is not purged on a guess.
+fn live_fork(
+    parent: ChronicleId,
+    children: impl IntoIterator<
+        Item = (
+            ChronicleId,
+            Result<Option<taso_core::record::LineageRecord>, String>,
+            bool,
+        ),
+    >,
+) -> Result<Option<ChronicleId>, String> {
+    for (c, lineage, ended) in children {
+        let lineage = lineage.map_err(|e| format!("the Lineage of {}: {e}", id_hex(c)))?;
+        let of_parent = lineage
+            .as_ref()
+            .and_then(|l| l.origin.parent())
+            .is_some_and(|p| p.chronicle == parent);
+        if of_parent && !ended {
+            return Ok(Some(c));
+        }
+    }
+    Ok(None)
+}
+
 /// The first of `slots` that no child of `vc` has taken: not asked for
 /// in this Warden's life, no child of that name born (`born`: the
 /// coordinator accepted a record of it), and no files of anyone's owned
@@ -4138,7 +4165,7 @@ impl Node {
                 return;
             }
         };
-        for id in vessels {
+        for &id in &vessels {
             let label = id_hex(id);
             let log =
                 |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
@@ -4161,6 +4188,30 @@ impl Node {
                 Ok(Some(why)) => log(format!("purge: {why}")),
                 Err(e) => {
                     log(format!("purge: not checked: {e}"));
+                    continue;
+                }
+            }
+            // A fork of it on this node restores from its Seal's packs,
+            // and the coordinator knows nothing of forks (a fork submits
+            // no Birth): the Warden does not purge a parent while a fork
+            // of it lives here (audit 2026-11-09, finding 1.2; D&D F1).
+            let children = vessels.iter().filter(|c| **c != id).map(|&c| {
+                let lineage =
+                    crate::vessel::lineage_in(&self.host().dir_for(c)).map_err(|e| e.to_string());
+                let ended = matches!(self.purger().ended(c), Ok(Some(_)));
+                (c, lineage, ended)
+            });
+            match live_fork(id, children) {
+                Ok(None) => {}
+                Ok(Some(child)) => {
+                    log(format!(
+                        "purge: a fork of it, {}, lives on this node; checked again at the next pass",
+                        id_hex(child)
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    log(format!("purge: not checked for forks: {e}"));
                     continue;
                 }
             }
@@ -8190,6 +8241,56 @@ mod tests {
         // The real question, through the coordinator: nothing of slot 4's
         // child was ever registered.
         assert!(!host.is_born(child(4)).unwrap());
+    }
+
+    /// Audit 2026-11-09 (finding 1.2), a fork submits no Birth, so the
+    /// coordinator let its parent be purged while the fork lived and
+    /// needed the parent's packs.  The Warden's TTL pass does not purge a
+    /// parent while a fork of it lives on this node (D&D F1).
+    #[test]
+    fn a_parent_with_a_live_fork_on_this_node_is_not_purged() {
+        use taso_core::record::{Origin, ParentSeal};
+        let parent = ChronicleId::from_bytes([1; 16]);
+        let lineage = |of: Option<ChronicleId>| {
+            Ok(Some(taso_core::record::LineageRecord {
+                origin: match of {
+                    Some(chronicle) => Origin::Fork {
+                        parent: ParentSeal {
+                            chronicle,
+                            seal: Lsn::new(4),
+                            seal_hash: taso_core::envelope::HashVal::from_bytes([4; 32]),
+                        },
+                    },
+                    None => Origin::Void,
+                },
+                namespace: taso_core::record::Namespace::from_bytes([1; 16]),
+                ledger_pos: Lsn::new(0),
+            }))
+        };
+        let other = ChronicleId::from_bytes([9; 16]);
+        let a = ChronicleId::from_bytes([2; 16]);
+        let b = ChronicleId::from_bytes([3; 16]);
+        let none: Vec<(
+            ChronicleId,
+            Result<Option<taso_core::record::LineageRecord>, String>,
+            bool,
+        )> = vec![(a, lineage(None), false), (b, lineage(Some(other)), false)];
+        assert_eq!(live_fork(parent, none), Ok(None));
+        assert_eq!(
+            live_fork(
+                parent,
+                vec![(a, lineage(None), false), (b, lineage(Some(parent)), false)]
+            ),
+            Ok(Some(b)),
+            "the parent of a live fork would be purged"
+        );
+        // A fork whose own purge ended holds nothing.
+        assert_eq!(
+            live_fork(parent, vec![(b, lineage(Some(parent)), true)]),
+            Ok(None)
+        );
+        // A Lineage that cannot be read: no guess.
+        assert!(live_fork(parent, vec![(b, Err("torn".to_string()), false)]).is_err());
     }
 
     /// Audit 2026-11-09, a Nominate refused for an unknown class quoted the
