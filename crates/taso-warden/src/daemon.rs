@@ -3606,8 +3606,9 @@ pub fn read_object_file(path: &Path, kind: taso_core::contract::ObjectKind) -> i
 
 /// The local state's format generation: 2 since V4b's format break (the
 /// Vessels' local logs and the Warden Chronicle hold the records that
-/// break changed).  Read as written, `"2\n"`.
-pub const STATE_GENERATION: u32 = 2;
+/// break changed); 3 since generation 3 (a Seal and a Checkpoint carry the
+/// adopted count).  Read as written, `"3\n"`.
+pub const STATE_GENERATION: u32 = 3;
 
 /// Check `dir`'s generation before anything reads it (review G-a).  A
 /// directory with this generation's file passes; an empty (or missing)
@@ -5759,7 +5760,7 @@ mod tests {
         check_state_generation(&fresh).unwrap();
         assert_eq!(
             std::fs::read_to_string(fresh.join(STATE_GENERATION_FILE)).unwrap(),
-            "2\n"
+            "3\n"
         );
         std::fs::create_dir(fresh.join("some-vessel")).unwrap();
         check_state_generation(&fresh).unwrap();
@@ -5773,9 +5774,9 @@ mod tests {
         // Another generation.
         let other = tmp.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
-        std::fs::write(other.join(STATE_GENERATION_FILE), "1\n").unwrap();
+        std::fs::write(other.join(STATE_GENERATION_FILE), "2\n").unwrap();
         let e = check_state_generation(&other).unwrap_err().to_string();
-        assert!(e.contains("generation \"1\""), "{e}");
+        assert!(e.contains("generation \"2\""), "{e}");
         // A filesystem's root: lost+found is not state.
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("lost+found")).unwrap();
@@ -5783,14 +5784,14 @@ mod tests {
         // Round 2, R2-06 (Kimi): a first start stopped after creating its
         // temporary, before the rename (empty, or partly written): the
         // next start finishes it.  Then a restart is as usual.
-        for left in ["", "2"] {
+        for left in ["", "3"] {
             let cut = tmp.path().join(format!("cut{}", left.len()));
             std::fs::create_dir_all(&cut).unwrap();
             std::fs::write(cut.join(format!("{STATE_GENERATION_FILE}.tmp")), left).unwrap();
             check_state_generation(&cut).unwrap();
             assert_eq!(
                 std::fs::read_to_string(cut.join(STATE_GENERATION_FILE)).unwrap(),
-                "2\n"
+                "3\n"
             );
             assert!(!cut.join(format!("{STATE_GENERATION_FILE}.tmp")).exists());
             check_state_generation(&cut).unwrap();
