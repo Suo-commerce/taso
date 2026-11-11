@@ -1048,6 +1048,11 @@ impl CoordLog {
         }
     }
 
+    /// What a Chronicle was claimed under, if it is known.
+    pub fn claimed_by(&self, chronicle: ChronicleId) -> Option<ClaimAuthority> {
+        self.chrons.get(chronicle.as_bytes()).map(|c| c.claimed_by)
+    }
+
     /// Whether `template` is registered (its `TemplateReady` accepted).
     pub fn is_template(&self, template: ChronicleId) -> bool {
         self.templates.contains_key(template.as_bytes())
