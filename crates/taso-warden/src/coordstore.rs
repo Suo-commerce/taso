@@ -485,6 +485,7 @@ mod tests {
                     verdict: Verdict::Clean,
                     ledger_pos: Lsn::new(0),
                     turn: TurnId::new(1),
+                    adopted: 0,
                 }),
             );
             let snap = Snapshot {
