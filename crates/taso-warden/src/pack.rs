@@ -2355,6 +2355,7 @@ mod tests {
                     verdict: Verdict::Clean,
                     ledger_pos: Lsn::new(0),
                     turn: TurnId::new(lsn.get()),
+                    adopted: 0,
                 });
                 (Stream::Ctl, p)
             } else {
