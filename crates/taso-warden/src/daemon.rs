@@ -2079,6 +2079,36 @@ struct NodeNominations<'n, 's, 'e> {
     verif: &'n std::cell::RefCell<Verifications<'s, 'e>>,
 }
 
+/// The path classes a Nominate's `exclude` names, or why not.  A name is
+/// the agent's: the refusal quotes at most its first 64 bytes.  It used
+/// to quote it whole, and the refusal of one Field frame of name was
+/// written into the Warden's log at ten times its size (audit 2026-11-09,
+/// a huge name logged at ten times its size).
+fn exclude_classes(exclude: &[String]) -> Result<std::collections::BTreeSet<PathClass>, String> {
+    let mut ex = std::collections::BTreeSet::new();
+    for name in exclude {
+        match crate::nominate::class_named(name) {
+            Some(c) if ex.insert(c) => {}
+            Some(_) => return Err(format!("{} is listed twice", quoted_name(name))),
+            None => return Err(format!("{} is not a class", quoted_name(name))),
+        }
+    }
+    Ok(ex)
+}
+
+/// `name` quoted, at most its first 64 bytes, and its length if longer.
+fn quoted_name(name: &str) -> String {
+    const SHOWN: usize = 64;
+    if name.len() <= SHOWN {
+        return format!("{name:?}");
+    }
+    let mut end = SHOWN;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{:?}... ({} bytes)", &name[..end], name.len())
+}
+
 impl crate::field::Nominations<BlkLayers> for NodeNominations<'_, '_, '_> {
     fn nominate(
         &mut self,
@@ -2086,22 +2116,10 @@ impl crate::field::Nominations<BlkLayers> for NodeNominations<'_, '_, '_> {
         seal: Option<u64>,
         exclude: &[String],
     ) -> NominateResult {
-        let mut ex = std::collections::BTreeSet::new();
-        for name in exclude {
-            match crate::nominate::class_named(name) {
-                Some(c) if ex.insert(c) => {}
-                Some(_) => {
-                    return NominateResult::Refused {
-                        reason: format!("{name:?} is listed twice"),
-                    }
-                }
-                None => {
-                    return NominateResult::Refused {
-                        reason: format!("{name:?} is not a class"),
-                    }
-                }
-            }
-        }
+        let ex = match exclude_classes(exclude) {
+            Ok(ex) => ex,
+            Err(reason) => return NominateResult::Refused { reason },
+        };
         let answer =
             self.node
                 .nominate(self.vc, vessel, seal.map(Lsn::new), ex, NominatedBy::Agent);
@@ -8172,6 +8190,27 @@ mod tests {
         // The real question, through the coordinator: nothing of slot 4's
         // child was ever registered.
         assert!(!host.is_born(child(4)).unwrap());
+    }
+
+    /// Audit 2026-11-09, a Nominate refused for an unknown class quoted the
+    /// agent's name whole, Debug-escaped: a 1 MiB name of control bytes
+    /// made a refusal (and a Warden log line) several MiB long.  The
+    /// refusal quotes the start of it and says how long it was.
+    #[test]
+    fn a_nominate_refusal_quotes_only_the_start_of_a_name() {
+        let huge = "\u{1}".repeat(1 << 20);
+        let e = exclude_classes(&[huge]).unwrap_err();
+        assert!(e.len() < 512, "a refusal of {} bytes", e.len());
+        assert!(
+            e.contains("(1048576 bytes)") && e.contains("is not a class"),
+            "{e}"
+        );
+        let e = exclude_classes(&["Scratch".into(), "Scratch".into()]).unwrap_err();
+        assert_eq!(e, "\"Scratch\" is listed twice");
+        assert!(exclude_classes(&["Scratch".into()]).is_ok());
+        // A cut never falls inside a character.
+        let wide = "ä".repeat(100);
+        assert!(quoted_name(&wide).contains("(200 bytes)"));
     }
 
     /// Audit 2026-11-09, the decider's pending list skipped every Vessel
