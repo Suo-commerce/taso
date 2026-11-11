@@ -119,6 +119,14 @@ impl VesselSource for StaticSource {
 /// Children asked for over the Field (P3 D1), by the Warden's Vessels'
 /// sessions: entries the Warden made itself ([`crate::daemon::ForksConf`]).
 /// Shared by clones; [`WithRequested`] adds them to a source's set.
+///
+/// A child outlives its parent's entry (finding 4.7, decision F2 b):
+/// when the source stops listing the parent, the child stays in the set.
+/// Its agent's work is its own, so it runs to its end (a child is never
+/// restarted), and its files stay until the TTL pass purges them like any
+/// Vessel's.  Nothing takes an entry out of this registry while the
+/// Warden runs; a restarted Warden starts with it empty, so it runs the
+/// child again only if a source lists it.
 #[derive(Clone, Debug, Default)]
 pub struct Requested(std::sync::Arc<std::sync::Mutex<RequestedState>>);
 
@@ -1216,5 +1224,39 @@ mod tests {
         let a = g.admit(vec![changed.clone()]);
         assert_eq!(a.set, vec![changed]);
         assert!(a.refused.is_empty());
+    }
+
+    /// Finding 4.7 (decision F2 b): a requested child stays in the set
+    /// after the source stops listing its parent.
+    #[test]
+    fn a_requested_child_outlives_its_parents_entry() {
+        struct Script(std::collections::VecDeque<Option<Vec<VesselConf>>>);
+        impl VesselSource for Script {
+            fn poll(&mut self, _: Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+                Ok(self.0.pop_front().flatten())
+            }
+            fn is_finite(&self) -> bool {
+                false
+            }
+        }
+        let z = Duration::ZERO;
+        let req = Requested::new();
+        let parent = with_forks("p", 1, &[5]);
+        let child = crate::daemon::ForksConf::child(&parent, 5, taso_core::envelope::Lsn::new(3));
+        let mut inner = Script([Some(vec![parent.clone()]), None, Some(vec![])].into());
+        let mut src = WithRequested::new(&mut inner, req.clone());
+        assert_eq!(names(&src.poll(z).unwrap().unwrap()), vec!["p"]);
+        assert!(req.add(child.clone()));
+        assert_eq!(src.poll(z).unwrap().unwrap().len(), 2, "parent and child");
+        // The parent's entry is deleted from the source.
+        let set = src.poll(z).unwrap().unwrap();
+        assert_eq!(names(&set), vec!["p-fork-5"]);
+        let mut guard = Guard::new(runtime());
+        let admitted = guard.admit(set);
+        assert_eq!(
+            names(&admitted.set),
+            vec!["p-fork-5"],
+            "the guard admits the child"
+        );
     }
 }
