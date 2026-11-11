@@ -112,9 +112,13 @@ if [[ $status -eq 0 ]]; then
     TASO_BLK_SOCKET=$SOCK TASO_BLK_SOCKET_B=$SOCK_B TASO_BLK_MOUNTS=$MNT \
         cargo test -q -p taso-sim --test daemon_on_node -- --ignored --test-threads=1 || status=$?
 fi
+if [[ $status -eq 0 ]]; then
+    say "clone_probe: no namespace is made inside a Vessel (K1)"
+    cargo test -q -p taso-warden --test clone_probe -- --ignored --test-threads=1 || status=$?
+fi
 
 if [[ $status -eq 0 ]]; then
-    echo "BLKPOOL PASS: Vessels born, sealed, forked, reopened, rolled back and succeeded on real devices; reborn on node B from packs; the daemon end to end with runc agents"
+    echo "BLKPOOL PASS: Vessels born, sealed, forked, reopened, rolled back and succeeded on real devices; reborn on node B from packs; the daemon end to end with runc agents; no namespace made inside a Vessel"
 else
     echo "BLKPOOL FAIL (test exit $status; daemon logs: $ERR, $ERR_B)"
     exit 1
