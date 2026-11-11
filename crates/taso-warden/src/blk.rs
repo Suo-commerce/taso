@@ -542,6 +542,8 @@ pub struct BlkPool<D: Blkd = Daemon, M: Mounts = System> {
     /// The word in this process's Seal view names: `view` for the Warden,
     /// `gview` for taso-genesis (review fix S1, [`BlkPool::for_genesis`]).
     view_kind: &'static str,
+    /// The process whose views these are: in a genesis view's name.
+    pid: u32,
 }
 
 impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
@@ -554,6 +556,7 @@ impl<D: Blkd, M: Mounts> Clone for BlkPool<D, M> {
             spool: self.spool.clone(),
             views: self.views.clone(),
             view_kind: self.view_kind,
+            pid: self.pid,
         }
     }
 }
@@ -588,17 +591,20 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             spool: spool.into(),
             views: Arc::default(),
             view_kind: "view",
+            pid: std::process::id(),
         }
     }
 
     /// Name this process's Seal views as taso-genesis's, `<dataset>.gview-
-    /// <lsn>` (review fix S1).  G-a shares a view within one process; a
-    /// view's count is the process's own, so another process meeting its
-    /// name would take it for a crash's and take it down under its user.
-    /// With a word per kind of process, a genesis and the Warden never
-    /// meet each other's views (a genesis from a Vessel's Seal while the
-    /// Warden views it for a nomination or an attempt), and each process
-    /// takes down only its own kind's leftovers.
+    /// <pid>-<lsn>` (review fix S1).  G-a shares a view within one
+    /// process; a view's count is the process's own, so another process
+    /// meeting its name would take it for a crash's and take it down
+    /// under its user.  With a word per kind of process, a genesis and the
+    /// Warden never meet each other's views.  One Warden runs on a node,
+    /// but two taso-genesis may run at once (two geneses from one Seal):
+    /// a genesis view's name carries its process, and only a view whose
+    /// process is gone is a leftover (audit 2026-11-09, two genesis runs
+    /// take down each other's view).
     pub fn for_genesis(mut self) -> Self {
         self.view_kind = "gview";
         self
@@ -973,7 +979,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     /// found in the block log but not in this process's count is a
     /// crash's.
     fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError> {
-        let name = format!("{}.{}-{}", dataset.as_str(), self.view_kind, lsn.get());
+        let name = self.view_name(dataset, lsn);
         let dir = self.mount_root.join(".views").join(&name);
         let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((users, _)) = views.get_mut(&name) {
@@ -1027,7 +1033,6 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     fn destroy(&self, dataset: &Dataset, guid: u64) -> Result<bool, LayerError> {
         // The views before the connection, as `seal_view` takes them.
         let views = self.views.lock().unwrap_or_else(|e| e.into_inner());
-        let my_views = format!("{}.{}-", dataset.as_str(), self.view_kind);
         let mut d = conn(&self.maker, &self.blkd);
         let Some(b) = d.find(dataset.as_str())? else {
             return Ok(false);
@@ -1069,13 +1074,12 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             if x == b {
                 continue;
             }
-            // A view of this dataset this process's kind makes, that no
-            // view of this process holds: a killed Warden's, which no
-            // process counts any more.  It kept the dataset from being
+            // A view of this dataset whose process is gone, which no
+            // process counts any more: it kept the dataset from being
             // destroyed for good (audit 2026-11-09, a Seal view left by a
-            // killed Warden).  Another kind's (a genesis running now) is
-            // left to its process, and refuses below.
-            if name.starts_with(&my_views) && !views.contains_key(&name) {
+            // killed Warden).  A view a running process holds refuses
+            // below.
+            if self.left_over(dataset, &name) && !views.contains_key(&name) {
                 take_down(
                     &mut *d,
                     &*self.mounts,
@@ -1503,6 +1507,43 @@ impl<D: Blkd> Sender for BlkSend<D> {
         let f = std::fs::File::open(&file.0)?;
         drop(file);
         Ok(Box::new(io::BufReader::with_capacity(1 << 20, f)))
+    }
+}
+
+impl<D: Blkd, M: Mounts> BlkPool<D, M> {
+    /// The name of this process's view of `dataset`'s Seal at `lsn`.
+    fn view_name(&self, dataset: &Dataset, lsn: Lsn) -> String {
+        match self.view_kind {
+            "gview" => format!("{}.gview-{}-{}", dataset.as_str(), self.pid, lsn.get()),
+            kind => format!("{}.{kind}-{}", dataset.as_str(), lsn.get()),
+        }
+    }
+
+    /// Whether `name` is a view of `dataset` that no running process
+    /// holds, as far as this process can tell (its own views it checks
+    /// against its count): the Warden's when this is the Warden (one runs
+    /// on a node), a genesis's whose process is not running.
+    fn left_over(&self, dataset: &Dataset, name: &str) -> bool {
+        let Some(rest) = name.strip_prefix(dataset.as_str()) else {
+            return false;
+        };
+        if rest
+            .strip_prefix(".view-")
+            .is_some_and(|l| l.parse::<u64>().is_ok())
+        {
+            return self.view_kind == "view";
+        }
+        let Some(rest) = rest.strip_prefix(".gview-") else {
+            return false;
+        };
+        let mut parts = rest.split('-');
+        let (Some(pid), Some(lsn), None) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        let (Ok(pid), Ok(_)) = (pid.parse::<u32>(), lsn.parse::<u64>()) else {
+            return false;
+        };
+        pid == self.pid || !Path::new(&format!("/proc/{pid}")).exists()
     }
 }
 
@@ -2784,8 +2825,11 @@ mod tests {
         // The process dies holding it.
         std::mem::forget(held);
         let p = after_a_crash(&p);
-        // A genesis's view, held by a process that is alive.
-        let gen = after_a_crash(&p).for_genesis();
+        // A genesis's view, held by a process that is alive (pid 1).
+        let gen = BlkPool {
+            pid: 1,
+            ..after_a_crash(&p).for_genesis()
+        };
         let gview = gen.seal_view(&a, Lsn::new(1)).unwrap();
         assert!(Pool::destroy(&p, &a, g).is_err(), "a genesis's view");
         drop(gview);
@@ -2808,6 +2852,54 @@ mod tests {
             names.iter().all(|n| !n.starts_with("tank/a-1")),
             "{names:?}"
         );
+    }
+
+    /// Audit 2026-11-09, two taso-genesis processes viewing one Seal at
+    /// once used one name: the second took the first's view for a
+    /// crash's and took it down under it.  A genesis view's name carries
+    /// its process; a view of a process that is gone is still a leftover.
+    #[test]
+    fn two_genesis_processes_never_take_down_each_others_views() {
+        let warden = pool();
+        let a = ds("tank/v-a");
+        warden.create(&a).unwrap();
+        warden
+            .layers(&a)
+            .snapshot(Lsn::new(3), h(3))
+            .unwrap()
+            .run()
+            .unwrap();
+        let process = |pid: u32| {
+            BlkPool {
+                views: Arc::default(),
+                pid,
+                ..Clone::clone(&warden)
+            }
+            .for_genesis()
+        };
+        // Two running processes (pids 1 and this test's).
+        let first = process(1);
+        let second = process(std::process::id());
+        let held = first.seal_view(&a, Lsn::new(3)).unwrap();
+        calls(&warden);
+        let other = second.seal_view(&a, Lsn::new(3)).unwrap();
+        let c = calls(&warden);
+        assert!(
+            !c.iter().any(|c| c.starts_with("umount ")),
+            "the first genesis's view was taken down under it: {c:?}"
+        );
+        assert_ne!(held.path(), other.path());
+        drop(other);
+        // A genesis killed holding a view: a later one takes it down.
+        std::mem::forget(held);
+        let gone: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .map_or(4_194_304, |s| s.trim().parse().unwrap())
+            + 1;
+        assert!(!second.left_over(&a, "tank/v-a.gview-1-3"));
+        assert!(second.left_over(&a, &format!("tank/v-a.gview-{gone}-3")));
+        assert!(!second.left_over(&a, "tank/v-a.view-3"), "the Warden's");
+        assert!(warden.left_over(&a, "tank/v-a.view-3"));
+        assert!(!warden.left_over(&a, "tank/v-a.viewer-3"));
     }
 
     #[test]
@@ -2905,6 +2997,7 @@ mod tests {
         // Another process: the same daemon and mounts, its own count.
         let genesis = BlkPool {
             views: Arc::default(),
+            pid: 1,
             ..Clone::clone(&warden)
         }
         .for_genesis();
@@ -2917,12 +3010,15 @@ mod tests {
         );
         assert_eq!(c.len(), 1, "one mount: {c:?}");
         assert!(
-            c[0].starts_with("mount-ro ") && c[0].ends_with("/tank/v-a.gview-3"),
+            c[0].starts_with("mount-ro ") && c[0].ends_with("/tank/v-a.gview-1-3"),
             "{c:?}"
         );
-        assert_eq!(g.path(), Path::new("/mnt/taso/.views/tank/v-a.gview-3"));
+        assert_eq!(g.path(), Path::new("/mnt/taso/.views/tank/v-a.gview-1-3"));
         drop(g);
-        assert_eq!(calls(&warden), ["umount /mnt/taso/.views/tank/v-a.gview-3"]);
+        assert_eq!(
+            calls(&warden),
+            ["umount /mnt/taso/.views/tank/v-a.gview-1-3"]
+        );
         assert!(
             warden
                 .blkd

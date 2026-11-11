@@ -89,6 +89,7 @@ one a_sequence_reserves_at_most_its_input_before_it_decodes -p taso-core --lib
 # taso-ctl
 one the_run_directories_are_kept_at_boot -p taso-warden --bin taso-ctl
 # The block log
+one two_genesis_processes_never_take_down_each_others_views $W
 one spool_files_of_a_process_that_is_gone_are_swept $W
 one a_view_left_by_a_killed_warden_does_not_block_destroy $W
 one a_destroy_cut_short_at_any_step_is_finished_by_a_retry $W
