@@ -224,7 +224,23 @@ impl LocalStore {
                 let Ok(name) = entry.file_name().to_str().map(str::to_string) else {
                     continue;
                 };
-                if name == "." || name == ".." || name.starts_with(TMP_PREFIX) {
+                if name == "." || name == ".." {
+                    continue;
+                }
+                if name.starts_with(TMP_PREFIX) {
+                    // A put's temp file.  One whose process is gone was
+                    // left by a kill between write and rename, and nothing
+                    // else ever removed it (audit 2026-11-09, temp files
+                    // of a dead process): removed here, as a walk meets it.
+                    if tmp_of_a_dead_process(&name) {
+                        match unlinkat(&fd, name.as_str(), AtFlags::empty()) {
+                            Ok(()) => eprintln!(
+                                "taso: removed {key}/{name}, a temp file of a process that is gone"
+                            ),
+                            Err(rustix::io::Errno::NOENT) => {}
+                            Err(e) => eprintln!("taso: removing {key}/{name}: {e}"),
+                        }
+                    }
                     continue;
                 }
                 let child = format!("{key}/{name}");
@@ -248,6 +264,22 @@ impl LocalStore {
         keys.sort();
         Ok(keys)
     }
+}
+
+/// Whether `name` is a put's temp file (`.tmp-<pid>-<n>`) whose process
+/// is not running.
+fn tmp_of_a_dead_process(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TMP_PREFIX) else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let (Some(pid), Some(n), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let (Ok(pid), Ok(_)) = (pid.parse::<u32>(), n.parse::<u64>()) else {
+        return false;
+    };
+    pid != std::process::id() && !std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
 /// Resolution under the store's root: beneath it, through no symlink.
@@ -495,6 +527,30 @@ mod tests {
         assert_eq!(store.list("nothing/here").unwrap(), Vec::<String>::new());
         assert!(store.list("../up").is_err());
         assert!(store.list("").is_err());
+    }
+
+    /// Audit 2026-11-09, a put's temp file left by a process killed
+    /// between write and rename stayed for good.  A walk that meets one
+    /// whose process is gone removes it; a running process's is left.
+    #[test]
+    fn a_dead_process_temp_file_is_removed_by_a_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("v/a/1", &mut &b"x"[..]).unwrap();
+        let max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .map_or(4_194_304, |s| s.trim().parse().unwrap());
+        let gone = dir
+            .path()
+            .join("v/a")
+            .join(format!("{TMP_PREFIX}{}-7", max + 1));
+        let alive = dir.path().join("v/a").join(format!("{TMP_PREFIX}1-7"));
+        std::fs::write(&gone, b"partial").unwrap();
+        std::fs::write(&alive, b"partial").unwrap();
+        assert_eq!(store.list("v").unwrap(), vec!["v/a/1"]);
+        assert!(!gone.exists(), "a dead process's temp file stayed");
+        assert!(alive.exists());
+        assert!(!tmp_of_a_dead_process(&format!("{TMP_PREFIX}x-1")));
+        assert!(!tmp_of_a_dead_process("v-1"));
     }
 
     #[test]
