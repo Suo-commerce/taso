@@ -1259,6 +1259,41 @@ impl Coordinator {
         State::decode(chronicle, guard.value())
     }
 
+    /// Make the store reads `reads` makes, before the request joins the
+    /// queue (finding 3.2: a read inside the one write transaction held
+    /// every other Chronicle's request; one append waited 1.3 s behind a
+    /// 1.5 s read).  `reads` runs on the log as it is now, each time with
+    /// the answers so far; a read it has no answer for yet is made with
+    /// the log unlocked, and `reads` runs again, until it asks for nothing
+    /// new.  The request then runs in the transaction with these answers;
+    /// a read it makes that is not among them (the log moved meanwhile) is
+    /// made there.  Without a log in memory nothing is read ahead.
+    fn read_ahead(&self, reads: impl Fn(&CoordLog, &dyn StoreView)) -> ReadAhead {
+        let mut read = ReadAhead::default();
+        // Each round adds one answer; a request makes a few reads (a
+        // purge one per pack), so this bounds only a runaway.
+        for _ in 0..READ_AHEAD_ROUNDS {
+            let missed = {
+                let g = self.shared.log.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(log) = g.as_ref() else {
+                    break;
+                };
+                let rehearsal = Rehearsal {
+                    read: &read,
+                    missed: std::cell::RefCell::new(None),
+                };
+                reads(log, &rehearsal);
+                rehearsal.missed.into_inner()
+            };
+            let Some(call) = missed else {
+                break;
+            };
+            let reply = call.make(&*self.shared.config.store);
+            read.0.push((call, reply));
+        }
+        read
+    }
+
     /// Read the coordinator log, in the queue's order.
     fn read_log<T: Send + 'static>(
         &self,
@@ -1316,6 +1351,21 @@ fn journal(shared: &Shared, t: &mut Tables<'_>, op: Op) -> Result<Done, CoordErr
     journal_if(shared, t, op, |_| true)
 }
 
+/// As [`journal`], with the store reads answered from `read` first
+/// (made before the transaction, [`Coordinator::read_ahead`]).
+fn journal_read(
+    shared: &Shared,
+    t: &mut Tables<'_>,
+    op: Op,
+    read: ReadAhead,
+) -> Result<Done, CoordError> {
+    let store = Served {
+        read,
+        live: &*shared.config.store,
+    };
+    journal_with(shared, t, op, &store, |_| true)
+}
+
 /// Run `op` on the log; journal it if `keep` says so.  An operation not
 /// kept must not have changed the log (a refused claim or takeover).
 fn journal_if(
@@ -1324,9 +1374,20 @@ fn journal_if(
     op: Op,
     keep: impl FnOnce(&Done) -> bool,
 ) -> Result<Done, CoordError> {
+    journal_with(shared, t, op, &*shared.config.store, keep)
+}
+
+/// Run `op` on the log, reading `store`; journal it if `keep` says so.
+fn journal_with(
+    shared: &Shared,
+    t: &mut Tables<'_>,
+    op: Op,
+    store: &dyn StoreView,
+    keep: impl FnOnce(&Done) -> bool,
+) -> Result<Done, CoordError> {
     let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
     let log = loaded(&mut g, shared, &t.journal)?;
-    let (done, entry) = coordjournal::run(log, op, &*shared.config.store);
+    let (done, entry) = coordjournal::run(log, op, store);
     if keep(&done) {
         let seq = match t.journal.last().map_err(storage)? {
             Some((k, _)) => k.value() + 1,
@@ -1817,6 +1878,22 @@ impl Coord for Coordinator {
         pack: String,
         record: Submitted,
     ) -> Result<Answer, CoordError> {
+        let read = {
+            let (pack, record) = (&pack, &record);
+            let now = (self.shared.config.clock)();
+            self.read_ahead(move |log, store| {
+                log.accept_reads(
+                    chronicle,
+                    epoch,
+                    submission,
+                    expected_head,
+                    pack,
+                    record,
+                    store,
+                    now,
+                )
+            })
+        };
         let shared = self.shared.clone();
         self.write(move |t| {
             holder_synced(&shared, t, warden, chronicle)?;
@@ -1857,7 +1934,7 @@ impl Coord for Coordinator {
                 record,
                 now,
             };
-            match journal(&shared, t, op)? {
+            match journal_read(&shared, t, op, read)? {
                 Done::Answer(a) => Ok(a),
                 _ => unreachable!("an accept answers"),
             }
@@ -1937,17 +2014,23 @@ impl Coord for Coordinator {
     }
 
     fn purge_projection(&self, chronicle: ChronicleId) -> Result<Vec<InventoryItem>, CoordError> {
+        let read = self.read_ahead(move |log, store| {
+            let _ = log.purge_projection(chronicle, store);
+        });
         let shared = self.shared.clone();
         self.queued(
             move |t| {
                 let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
                 let log = loaded(&mut g, &shared, &t.journal)?;
-                log.purge_projection(chronicle, &*shared.config.store)
-                    .ok_or_else(|| {
-                        CoordError::Unavailable(std::io::Error::other(format!(
-                            "the store could not account for every pack of {chronicle:?}"
-                        )))
-                    })
+                let store = Served {
+                    read,
+                    live: &*shared.config.store,
+                };
+                log.purge_projection(chronicle, &store).ok_or_else(|| {
+                    CoordError::Unavailable(std::io::Error::other(format!(
+                        "the store could not account for every pack of {chronicle:?}"
+                    )))
+                })
             },
             false,
         )
@@ -1970,6 +2053,172 @@ impl Coord for Coordinator {
     ) -> Result<Option<taso_core::coordlog::ReclaimBlocker>, CoordError> {
         let now = (self.shared.config.clock)();
         self.read_log(move |log| log.reclaim_blocker(key, now))
+    }
+}
+
+// ── Store reads made ahead of the transaction (finding 3.2) ──────────
+
+/// How many reads [`Coordinator::read_ahead`] makes at most for one request.
+const READ_AHEAD_ROUNDS: usize = 4096;
+
+/// One store read the log makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Call {
+    Carries(ChronicleId, String, HashVal),
+    Lookup(ObjectId),
+    Inventory(HashVal),
+    FsPacks(ChronicleId),
+    Closure(ChronicleId, Lsn),
+    Replacement(ChronicleId, InventoryItem),
+}
+
+/// The store's answer to a [`Call`].
+#[derive(Clone, Debug)]
+enum Reply {
+    Carries(bool),
+    Lookup(Lookup<()>),
+    Inventory(Lookup<Inventory>),
+    FsPacks(Option<Vec<InventoryItem>>),
+    Closure(Lookup<Vec<ObjectId>>),
+    Replacement(Lookup<HashVal>),
+}
+
+impl Call {
+    /// Ask `store`.
+    fn make(&self, store: &dyn StoreView) -> Reply {
+        match self {
+            Call::Carries(c, name, d) => Reply::Carries(store.carries(*c, name, *d)),
+            Call::Lookup(o) => Reply::Lookup(store.lookup(o)),
+            Call::Inventory(k) => Reply::Inventory(store.lookup_inventory(*k)),
+            Call::FsPacks(c) => Reply::FsPacks(store.fs_packs(*c)),
+            Call::Closure(c, seal) => Reply::Closure(store.seal_closure(*c, *seal)),
+            Call::Replacement(c, it) => Reply::Replacement(store.lookup_replacement(*c, it)),
+        }
+    }
+}
+
+/// The answers read ahead for one request.
+#[derive(Default)]
+struct ReadAhead(Vec<(Call, Reply)>);
+
+impl ReadAhead {
+    fn get(&self, call: &Call) -> Option<&Reply> {
+        self.0.iter().find(|(c, _)| c == call).map(|(_, r)| r)
+    }
+}
+
+/// The store as [`Coordinator::read_ahead`] shows it to the log: the
+/// answers so far; the first read without one is noted, and it and every
+/// read after it answer as a failed read, which only ends the rehearsal.
+struct Rehearsal<'a> {
+    read: &'a ReadAhead,
+    missed: std::cell::RefCell<Option<Call>>,
+}
+
+impl Rehearsal<'_> {
+    fn ask(&self, call: Call) -> Option<Reply> {
+        if self.missed.borrow().is_some() {
+            return None;
+        }
+        let r = self.read.get(&call).cloned();
+        if r.is_none() {
+            *self.missed.borrow_mut() = Some(call);
+        }
+        r
+    }
+}
+
+impl StoreView for Rehearsal<'_> {
+    fn carries(&self, chronicle: ChronicleId, name: &str, digest: HashVal) -> bool {
+        match self.ask(Call::Carries(chronicle, name.to_string(), digest)) {
+            Some(Reply::Carries(b)) => b,
+            _ => false,
+        }
+    }
+    fn lookup(&self, object: &ObjectId) -> Lookup<()> {
+        match self.ask(Call::Lookup(object.clone())) {
+            Some(Reply::Lookup(l)) => l,
+            _ => Lookup::Unreadable,
+        }
+    }
+    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+        match self.ask(Call::Inventory(key)) {
+            Some(Reply::Inventory(l)) => l,
+            _ => Lookup::Unreadable,
+        }
+    }
+    fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>> {
+        match self.ask(Call::FsPacks(chronicle)) {
+            Some(Reply::FsPacks(p)) => p,
+            _ => None,
+        }
+    }
+    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Lookup<Vec<ObjectId>> {
+        match self.ask(Call::Closure(chronicle, seal)) {
+            Some(Reply::Closure(l)) => l,
+            _ => Lookup::Unreadable,
+        }
+    }
+    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
+        match self.ask(Call::Replacement(chronicle, item.clone())) {
+            Some(Reply::Replacement(l)) => l,
+            _ => Lookup::Unreadable,
+        }
+    }
+}
+
+/// The store as a request sees it in the transaction: the answers read
+/// ahead, and `live` for anything else.
+struct Served<'a> {
+    read: ReadAhead,
+    live: &'a dyn StoreView,
+}
+
+impl Served<'_> {
+    fn answer(&self, call: Call) -> Reply {
+        match self.read.get(&call) {
+            Some(r) => r.clone(),
+            None => call.make(self.live),
+        }
+    }
+}
+
+impl StoreView for Served<'_> {
+    fn carries(&self, chronicle: ChronicleId, name: &str, digest: HashVal) -> bool {
+        match self.answer(Call::Carries(chronicle, name.to_string(), digest)) {
+            Reply::Carries(b) => b,
+            _ => unreachable!("a carries call answers carries"),
+        }
+    }
+    fn lookup(&self, object: &ObjectId) -> Lookup<()> {
+        match self.answer(Call::Lookup(object.clone())) {
+            Reply::Lookup(l) => l,
+            _ => unreachable!("a lookup answers a lookup"),
+        }
+    }
+    fn lookup_inventory(&self, key: HashVal) -> Lookup<Inventory> {
+        match self.answer(Call::Inventory(key)) {
+            Reply::Inventory(l) => l,
+            _ => unreachable!("an inventory call answers an inventory"),
+        }
+    }
+    fn fs_packs(&self, chronicle: ChronicleId) -> Option<Vec<InventoryItem>> {
+        match self.answer(Call::FsPacks(chronicle)) {
+            Reply::FsPacks(p) => p,
+            _ => unreachable!("an fs_packs call answers packs"),
+        }
+    }
+    fn seal_closure(&self, chronicle: ChronicleId, seal: Lsn) -> Lookup<Vec<ObjectId>> {
+        match self.answer(Call::Closure(chronicle, seal)) {
+            Reply::Closure(l) => l,
+            _ => unreachable!("a closure call answers a closure"),
+        }
+    }
+    fn lookup_replacement(&self, chronicle: ChronicleId, item: &InventoryItem) -> Lookup<HashVal> {
+        match self.answer(Call::Replacement(chronicle, item.clone())) {
+            Reply::Replacement(l) => l,
+            _ => unreachable!("a replacement call answers a replacement"),
+        }
     }
 }
 
@@ -3191,6 +3440,19 @@ mod log_tests {
     struct Fake {
         objects: Mutex<BTreeSet<ObjectId>>,
         carried: Mutex<Carried>,
+        /// When set, the next pack listing or `carries` says it started,
+        /// then waits to be let go.
+        slow_read: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    }
+
+    impl Fake {
+        fn maybe_slow(&self) {
+            let slow = self.slow_read.lock().unwrap().take();
+            if let Some((started, go)) = slow {
+                let _ = started.send(());
+                let _ = go.recv();
+            }
+        }
     }
 
     impl Fake {
@@ -3208,6 +3470,7 @@ mod log_tests {
 
     impl StoreView for Fake {
         fn carries(&self, c: ChronicleId, name: &str, digest: HashVal) -> bool {
+            self.maybe_slow();
             self.carried.lock().unwrap().contains(&(
                 *c.as_bytes(),
                 name.to_string(),
@@ -3225,6 +3488,7 @@ mod log_tests {
             Lookup::NotFound
         }
         fn fs_packs(&self, _: ChronicleId) -> Option<Vec<InventoryItem>> {
+            self.maybe_slow();
             Some(Vec::new())
         }
         fn seal_closure(&self, _: ChronicleId, _: Lsn) -> Lookup<Vec<ObjectId>> {
@@ -3233,6 +3497,84 @@ mod log_tests {
         fn lookup_replacement(&self, _: ChronicleId, _: &InventoryItem) -> Lookup<HashVal> {
             Lookup::NotFound
         }
+    }
+
+    /// Run `slow` with the store's next read held until another
+    /// Chronicle has registered (or 10 s passed): whether it registered.
+    fn others_go_on_during_a_slow_read<T: Send + 'static>(
+        coord: &Arc<Coordinator>,
+        store: &Fake,
+        slow: impl FnOnce(&Coordinator) -> T + Send + 'static,
+    ) -> (T, bool) {
+        let (started, wait_started) = mpsc::channel();
+        let (go, wait_go) = mpsc::channel();
+        *store.slow_read.lock().unwrap() = Some((started, wait_go));
+        let c = coord.clone();
+        let slow = std::thread::spawn(move || slow(&c));
+        wait_started.recv().unwrap();
+        let c = coord.clone();
+        let (done, registered) = mpsc::channel();
+        let other = std::thread::spawn(move || {
+            c.register(chron(0x77), WardenId::new(7)).unwrap();
+            let _ = done.send(());
+        });
+        let answered = registered.recv_timeout(std::time::Duration::from_secs(10));
+        go.send(()).unwrap();
+        let out = slow.join().unwrap();
+        other.join().unwrap();
+        (out, answered.is_ok())
+    }
+
+    /// Finding 3.2: a slow store read holds only its own request.  While
+    /// one Chronicle's purge projection waits on the store, another
+    /// Chronicle registers.
+    #[test]
+    fn a_slow_store_read_does_not_hold_other_requests() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Arc::new(Fake::default());
+        let coord = Arc::new(open(&d.path().join("coord.redb"), store.clone()));
+        let (packs, went_on) =
+            others_go_on_during_a_slow_read(&coord, &store, |c| c.purge_projection(chron(1)));
+        assert_eq!(packs.unwrap(), Vec::new());
+        assert!(
+            went_on,
+            "another Chronicle's register waited for the store read"
+        );
+    }
+
+    /// Finding 3.2, an accept: its readability check waits on the store
+    /// while another Chronicle registers, and the record is accepted.
+    #[test]
+    fn a_slow_read_of_an_accept_does_not_hold_other_requests() {
+        let d = tempfile::tempdir().unwrap();
+        let store = Arc::new(Fake::default());
+        let coord = Arc::new(open(&d.path().join("coord.redb"), store.clone()));
+        let g = genesis();
+        let t0 = g.genesis_id;
+        store.put(ObjectId::content(h(0x20)));
+        store.put(ObjectId::content(h(0x21)));
+        coord
+            .claim_chronicle(t0, A, ClaimAuthority::Genesis)
+            .unwrap();
+        let r = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(g)));
+        let s = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 1);
+        coord
+            .announce(A, t0, Epoch::FIRST, s, r.logical_id(), r.digest())
+            .unwrap()
+            .unwrap();
+        store.ship(t0, "pack-1", &r);
+        let head = coord.query_chronicle(t0).unwrap().unwrap().head;
+        let (answer, went_on) = others_go_on_during_a_slow_read(&coord, &store, move |c| {
+            c.accept(A, t0, Epoch::FIRST, s, head, "pack-1".into(), r)
+        });
+        assert!(
+            matches!(answer.unwrap(), Answer::Accepted { log_pos: 1, .. }),
+            "accepted"
+        );
+        assert!(
+            went_on,
+            "another Chronicle's register waited for the store read"
+        );
     }
 
     fn config(store: Arc<Fake>, now: u64) -> LogConfig {
