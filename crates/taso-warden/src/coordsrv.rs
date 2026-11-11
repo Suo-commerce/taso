@@ -173,8 +173,9 @@ use taso_core::coordlog::{
 /// new coordinator, or the other way round, refuse each other at the
 /// first request, before anything is written.  2 since V4b's format break
 /// (review fix N4a); 3 since the Chronicle view says `sanctioned` (audit
-/// 2026-11-09, A1).
-const WIRE_VERSION: u8 = 4;
+/// 2026-11-09, A1); 4 with the `reclaim_blocker` query (R1); 5 with
+/// generation 3 (the records it carries changed shape).
+const WIRE_VERSION: u8 = 5;
 
 const OP_REGISTER: u8 = 1;
 const OP_APPEND: u8 = 2;
@@ -2379,7 +2380,7 @@ mod tests {
             let mut extra = b.clone();
             extra.push(0);
             assert!(Request::decode(&extra).is_err(), "trailing {r:?}");
-            for other in [1, 2, 3, 5] {
+            for other in [1, 2, 3, 4, 6] {
                 let mut v = b.clone();
                 v[0] = other;
                 assert!(Request::decode(&v).is_err(), "version {other} {r:?}");
