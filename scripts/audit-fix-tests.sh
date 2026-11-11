@@ -51,6 +51,7 @@ one a_full_outbox_refuses_a_new_effect_until_an_outcome_is_reported $W
 one a_promotion_that_would_overfill_the_outbox_is_refused_before_it_is_recorded $W
 # Forks
 one a_parent_with_a_live_fork_on_this_node_is_not_purged $W
+one a_requested_child_outlives_its_parents_entry $W
 one an_agents_declared_authority_is_not_an_adoption $W
 one a_fork_asked_again_from_a_newer_seal_replaces_the_interrupted_clone $W
 one a_fork_slot_is_taken_by_a_born_child_not_by_a_directory $W
