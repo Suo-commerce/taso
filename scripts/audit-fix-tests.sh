@@ -61,6 +61,7 @@ one a_refused_record_retried_does_not_grow_the_log $W
 one a_purge_finished_on_another_node_deletes_that_nodes_dataset $W
 # Genesis
 one a_resume_never_refuses_a_genesis_from_an_object_that_is_not_its_keys $W
+one a_genesis_finished_elsewhere_does_not_leave_the_first_nodes_scratch $W
 # The reclaimer
 one a_pass_claims_nothing_the_coordinator_says_it_would_refuse $W
 # The object store

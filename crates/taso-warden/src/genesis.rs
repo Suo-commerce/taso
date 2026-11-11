@@ -638,6 +638,23 @@ impl<P: Pool> Genesis<P> {
             }
         };
         if let Some((outcome, needs_cleanup)) = &decided {
+            if cleaned && *needs_cleanup {
+                // Cleaned up by a run on another node.  This node's own
+                // scratch, if a run here stopped before its cleanup, is
+                // nobody's now: it used to stay for good (audit
+                // 2026-11-09, a genesis finished elsewhere leaves the
+                // first node's scratch).  Destroyed under this node's run
+                // of the genesis, by the guid it has here.
+                if let Some(g) = self.pool.guid(&scratch).map_err(GenesisError::Pool)? {
+                    let _run = self.open(gid, started.is_some(), notes)?;
+                    if self.pool.guid(&scratch).map_err(GenesisError::Pool)? == Some(g) {
+                        self.pool.destroy(&scratch, g).map_err(GenesisError::Pool)?;
+                        notes.push(format!(
+                            "{scratch}: this node's scratch of a genesis cleaned up elsewhere, destroyed"
+                        ));
+                    }
+                }
+            }
             if cleaned || !needs_cleanup {
                 return Ok((outcome.clone(), cleaned));
             }
@@ -2574,6 +2591,34 @@ class = "Scratch"
             matches!(r.outcome, Outcome::Ready { .. }),
             "{:?}",
             r.outcome
+        );
+    }
+
+    /// Audit 2026-11-09, a genesis interrupted on node 1 before its
+    /// cleanup and finished on node 2 left node 1's scratch for good:
+    /// every later run there answered "cleaned" and stopped.  A later run
+    /// on node 1 destroys it.
+    #[test]
+    fn a_genesis_finished_elsewhere_does_not_leave_the_first_nodes_scratch() {
+        let want = reference();
+        let c = Cluster::new();
+        good_tree(&c.src(), 0);
+        let mut a = c.node(1);
+        a.failpoint = fail_at("genesis.before_cleanup");
+        assert!(a.run(&dir_request(&c)).is_err());
+        let scratch = a.scratch(want.0).unwrap();
+        assert!(a.pool.guid(&scratch).unwrap().is_some());
+        let r = c.node(2).resume(want.0).unwrap();
+        assert!(r.cleaned);
+        a.failpoint = no_failpoints();
+        let again = a.run(&dir_request(&c)).unwrap();
+        assert!(again.cleaned);
+        let by_id = a.resume(want.0).unwrap();
+        assert!(by_id.cleaned);
+        assert_eq!(
+            a.pool.guid(&scratch).unwrap(),
+            None,
+            "{scratch} is still on node 1 after the genesis was cleaned up (GenesisCleanedUp accepted) and node 1 ran it again twice"
         );
     }
 
