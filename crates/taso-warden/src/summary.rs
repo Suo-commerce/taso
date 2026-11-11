@@ -20,8 +20,8 @@ use taso_core::canon::Canonical;
 use taso_core::decode::DecodeError;
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{
-    CheckpointRecord, CheckpointSeal, FsShippedRecord, LineageRecord, OpId, OpenEffect,
-    OutcomeState, Payload, PromotionRecord, SuccessionRecord,
+    CheckpointRecord, CheckpointSeal, FsShippedRecord, IntentRecord, LineageRecord, OpId,
+    OpenEffect, OutcomeState, Payload, PromotionRecord, SuccessionRecord,
 };
 
 use crate::segment::Frame;
@@ -54,6 +54,54 @@ pub struct Summary {
     pub promotion: Option<PromotionRecord>,
     /// The lsn of the Checkpoint the fold started from, if any.
     pub from_checkpoint: Option<Lsn>,
+    /// The effects adopted by promotion so far, and the Promotion whose
+    /// adoptions still count.
+    pub adoption: Adoption,
+}
+
+/// The effects adopted by promotion (D63), counted as the log is written
+/// (format generation 3, G1): each Seal record carries the count up to
+/// it, and a Checkpoint carries it on, so nothing ever counts over a log
+/// that pruning may have cut.
+///
+/// An adoption is an intent whose authority (32 bytes, an `AdoptedFrom`)
+/// names the child and Seal of the last Promotion, written before the
+/// next Seal: a Promotion's adoptions are written right after it, and the
+/// Vessel takes no effect from its agent until its adoption Seal (C7,
+/// audit A3/A4).  Any other intent's authority is the agent's own bytes,
+/// so an intent the agent declares naming a promoted child after that
+/// Seal is not an adoption (audit 2026-11-09, 2.7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Adoption {
+    /// Effects adopted so far.
+    pub adopted: u64,
+    /// The Promotion whose adoptions still count: the last one, until
+    /// the next Seal.
+    pub adopting: Option<PromotionRecord>,
+}
+
+impl Adoption {
+    /// Count `payload`, written to `stream`, in.
+    pub fn see(&mut self, stream: Stream, payload: &Payload) {
+        match (stream, payload) {
+            (Stream::Effect, Payload::Intent(i)) => self.intent(i),
+            (Stream::Ctl, Payload::Promotion(p)) => self.adopting = Some(*p),
+            (Stream::Ctl, Payload::Seal(_)) => self.adopting = None,
+            _ => {}
+        }
+    }
+
+    fn intent(&mut self, intent: &IntentRecord) {
+        let Some(p) = self.adopting else {
+            return;
+        };
+        let mut from = taso_core::canon::Canon::default();
+        p.child.canon(&mut from);
+        p.seal.canon(&mut from);
+        if intent.authority.len() == 32 && intent.authority.starts_with(from.as_bytes()) {
+            self.adopted += 1;
+        }
+    }
 }
 
 impl Default for Summary {
@@ -69,6 +117,7 @@ impl Default for Summary {
             next_op: 0,
             promotion: None,
             from_checkpoint: None,
+            adoption: Adoption::default(),
         }
     }
 }
@@ -118,6 +167,7 @@ impl Summary {
                 self.effect = lsn;
                 match decode()? {
                     Payload::Intent(intent) => {
+                        self.adoption.intent(&intent);
                         // Round 3, R3-02: after an op of u64::MAX (never
                         // assigned here, so from elsewhere) every id is used:
                         // the next is the exhausted mark, never a reuse.
@@ -169,6 +219,7 @@ impl Summary {
                     // has no adopted intent to say so (audit 2026-11-09,
                     // A3: such a promotion stayed pending for good).
                     self.promotion = None;
+                    self.adoption.adopting = None;
                     self.seal = Some(CheckpointSeal {
                         lsn,
                         hash: f.envelope.hash,
@@ -177,7 +228,10 @@ impl Summary {
                     })
                 }
                 Payload::FsShipped(r) => self.fs_shipped = Some(r),
-                Payload::Promotion(p) => self.promotion = Some(p),
+                Payload::Promotion(p) => {
+                    self.promotion = Some(p);
+                    self.adoption.adopting = Some(p);
+                }
                 Payload::Checkpoint(c) => {
                     *self = Summary {
                         lineage: Some(c.lineage),
@@ -190,6 +244,10 @@ impl Summary {
                         next_op: c.next_op,
                         promotion: c.promotion,
                         from_checkpoint: Some(lsn),
+                        adoption: Adoption {
+                            adopted: c.adopted,
+                            adopting: c.adopting,
+                        },
                     }
                 }
                 _ => {}
@@ -210,6 +268,8 @@ impl Summary {
             open: self.open.values().cloned().collect(),
             next_op: self.next_op,
             promotion: self.promotion,
+            adopted: self.adoption.adopted,
+            adopting: self.adoption.adopting,
         })
     }
 
@@ -360,6 +420,7 @@ mod tests {
                         verdict: Verdict::Clean,
                         ledger_pos: Lsn::new(*turn),
                         turn: TurnId::new(*turn),
+                        adopted: 0,
                     }),
                 ),
                 Step::Shipped => {
