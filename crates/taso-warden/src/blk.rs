@@ -1516,6 +1516,7 @@ impl SpoolFile {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         std::fs::create_dir_all(dir)?;
+        sweep_spool_once(dir);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1525,6 +1526,58 @@ impl SpoolFile {
             std::process::id()
         ))))
     }
+}
+
+/// Remove the spool files of processes that are gone, the first time
+/// this process spools in `dir`.  A spool file is removed when its guard
+/// drops; a process killed while it held one (a Warden, a taso-genesis)
+/// never dropped it, and nothing removed it after: whole Seal streams
+/// stayed on the disk for good (audit 2026-11-09, spool files of a dead
+/// process).  A file's name carries its process's id; one whose process
+/// is not running is a leftover.  A running process's are left alone,
+/// and so is anything not named as a spool file.
+fn sweep_spool_once(dir: &Path) {
+    static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    {
+        let mut swept = SWEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if swept.iter().any(|d| d == dir) {
+            return;
+        }
+        swept.push(dir.to_path_buf());
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = spool_pid(&name.to_string_lossy()) else {
+            continue;
+        };
+        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
+            match std::fs::remove_file(e.path()) {
+                Ok(()) => eprintln!(
+                    "taso: removed {}, a spool file of process {pid}, which is gone",
+                    e.path().display()
+                ),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => eprintln!("taso: removing {}: {err}", e.path().display()),
+            }
+        }
+    }
+}
+
+/// The process id in a spool file's name (`<kind>-<pid>-<n>-<nanos>.blks`).
+fn spool_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_suffix(".blks")?;
+    let mut parts = rest.split('-');
+    let kind = parts.next()?;
+    if kind != "recv" && kind != "send" {
+        return None;
+    }
+    let pid = parts.next()?.parse().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next()?.parse::<u128>().ok()?;
+    parts.next().is_none().then_some(pid)
 }
 
 impl Drop for SpoolFile {
@@ -2182,6 +2235,49 @@ mod tests {
     }
 
     type TestPool = BlkPool<StoreBlkd, FakeMounts>;
+
+    /// Audit 2026-11-09, spool files a killed process left (its guards
+    /// never ran) stayed for good.  The first spool of a process in a
+    /// directory removes those of processes that are gone, and leaves a
+    /// running process's and anything else.
+    #[test]
+    fn spool_files_of_a_process_that_is_gone_are_swept() {
+        let spool = tempfile::tempdir().unwrap();
+        // A process id that is not running: one past the kernel's limit.
+        let max: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+            .map_or(4_194_304, |s| s.trim().parse().unwrap());
+        let gone = max + 1;
+        let stale = [
+            spool.path().join(format!("recv-{gone}-0-1.blks")),
+            spool.path().join(format!("send-{gone}-1-2.blks")),
+        ];
+        // A running process's (pid 1), and a file that is no spool file.
+        let alive = spool.path().join("send-1-0-3.blks");
+        let other = spool.path().join(format!("notes-{gone}-0-1.blks"));
+        for f in stale.iter().chain([&alive, &other]) {
+            std::fs::write(f, vec![0u8; 4096]).unwrap();
+        }
+        let p: TestPool = BlkPool::with(
+            StoreBlkd::new(),
+            FakeMounts::default(),
+            "/mnt/taso",
+            spool.path(),
+        );
+        let a = ds("tank/v-a");
+        p.create(&a).unwrap();
+        p.layers(&a)
+            .snapshot(Lsn::new(2), h(2))
+            .unwrap()
+            .run()
+            .unwrap();
+        drop(p.sender().send(&a, None, Lsn::new(2)).unwrap());
+        let left: Vec<_> = stale.iter().filter(|f| f.exists()).collect();
+        assert!(left.is_empty(), "left in the spool: {left:?}");
+        assert!(alive.exists() && other.exists());
+        assert_eq!(spool_pid("recv-12-3-4.blks"), Some(12));
+        assert_eq!(spool_pid("recv-12-3.blks"), None);
+        assert_eq!(spool_pid("recv-x-3-4.blks"), None);
+    }
 
     /// Audit 2026-11-09, a destroy took the branch (and its name) first
     /// and then its Seals; cut short after that, it left the Seals with no

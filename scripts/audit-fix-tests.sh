@@ -86,6 +86,7 @@ one expiry_does_not_walk_every_chronicle -p taso-core --lib
 # Decoding
 one a_sequence_reserves_at_most_its_input_before_it_decodes -p taso-core --lib
 # The block log
+one spool_files_of_a_process_that_is_gone_are_swept $W
 one a_view_left_by_a_killed_warden_does_not_block_destroy $W
 one a_destroy_cut_short_at_any_step_is_finished_by_a_retry $W
 one a_mount_root_written_any_way_names_the_mount_points_the_kernel_lists $W
