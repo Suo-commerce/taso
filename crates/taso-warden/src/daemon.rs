@@ -375,8 +375,10 @@ pub struct Effective {
     pub quiescence: Vec<String>,
 }
 
-/// Check an environment: each entry `NAME=value`, the name a C identifier,
-/// no NUL anywhere.
+/// Check an environment: each entry `NAME=value`, the name a C identifier
+/// that steers no loader ([`crate::runtime::steers_the_loader`], finding
+/// 2.10), no NUL anywhere.  A config or a Kubernetes resource with an
+/// `LD_*` entry is refused where it is read, not at the Vessel's launch.
 pub fn check_env(env: &[String]) -> Result<(), String> {
     for e in env {
         let name = e
@@ -389,6 +391,11 @@ pub fn check_env(env: &[String]) -> Result<(), String> {
             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
         if !first_ok || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!("env {e:?}: {name:?} is not a valid variable name"));
+        }
+        if crate::runtime::steers_the_loader(name) {
+            return Err(format!(
+                "env {name:?} steers the dynamic loader; a Vessel's environment may not"
+            ));
         }
         if e.contains('\0') {
             return Err(format!("env {name:?} contains a NUL byte"));
@@ -7518,6 +7525,30 @@ mod tests {
         assert!(effective_of(&c, 1).is_ok());
     }
 
+    /// Finding 2.10 (K1 part 3): an environment that steers the loader is
+    /// refused where it is read: a Vessel entry, the node's runtime, a
+    /// Kubernetes resource (all through `check_env`).
+    #[test]
+    fn an_env_that_steers_the_loader_is_refused_when_read() {
+        for e in [
+            "LD_PRELOAD=/w/x.so",
+            "LD_LIBRARY_PATH=/w",
+            "LD_AUDIT=/w/a.so",
+        ] {
+            let err = check_env(&[e.to_string()]).unwrap_err();
+            assert!(err.contains("loader"), "{e}: {err}");
+            assert!(
+                with(|v| v["vessels"][0]["runtime"] = serde_json::json!({ "env": [e] })).is_err(),
+                "{e} in a Vessel entry"
+            );
+            assert!(
+                with(|v| v["runtime"]["env"] = serde_json::json!([e])).is_err(),
+                "{e} in the node's runtime"
+            );
+        }
+        assert!(check_env(&["OLD_LD=1".into(), "LDX=1".into()]).is_ok());
+    }
+
     #[test]
     fn bad_vessel_runtimes_are_refused() {
         let cases: Vec<(&str, Value)> = vec![
@@ -7533,6 +7564,10 @@ mod tests {
             ("env empty name", serde_json::json!({ "env": ["=1"] })),
             ("env dash", serde_json::json!({ "env": ["A-B=1"] })),
             ("NUL in env", serde_json::json!({ "env": ["X=a\0"] })),
+            (
+                "LD_PRELOAD",
+                serde_json::json!({ "env": ["LD_PRELOAD=/w/x.so"] }),
+            ),
             ("landlock not bool", serde_json::json!({ "landlock": "no" })),
             ("zero memory", serde_json::json!({ "memory_bytes": 0 })),
             ("zero pids", serde_json::json!({ "pids": 0 })),
