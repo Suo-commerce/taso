@@ -37,6 +37,9 @@ one a_panicking_worker_closes_its_connection_and_frees_its_place $W
 one a_cancel_of_an_unowned_chronicle_refuses_nothing_of_its_later_holder $W
 one a_cancel_under_a_stale_epoch_refuses_nothing_of_the_pending_submission $W
 one a_record_refused_before_the_log_leaves_nothing_pending $W
+one a_leader_hands_over_after_its_own_group $W
+one a_slow_store_read_does_not_hold_other_requests $W
+one a_slow_read_of_an_accept_does_not_hold_other_requests $W
 # The agent's side: the session, the verifier, the ledger
 one a_child_name_no_fork_could_have_is_refused_before_the_hooks $W
 one a_subject_longer_than_a_resource_may_have_is_refused $W
@@ -92,6 +95,7 @@ one a_birth_of_a_retired_chronicle_is_refused -p taso-core --lib
 one a_sanction_target_not_yet_ready_is_not_purged -p taso-core --lib
 one expiry_by_time_expires_what_the_walk_did -p taso-core --lib
 one expiry_does_not_walk_every_chronicle -p taso-core --lib
+one accept_reads_reads_what_accept_reads_and_changes_nothing -p taso-core --lib
 # Decoding
 one a_sequence_reserves_at_most_its_input_before_it_decodes -p taso-core --lib
 # taso-ctl
