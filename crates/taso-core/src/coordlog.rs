@@ -1048,6 +1048,72 @@ impl CoordLog {
         }
     }
 
+    /// Why the coordinator refuses `record` for `chronicle` before this log
+    /// runs it, if it does (D&D C1 (a), audit 2026-11-09).  The log accepts
+    /// these; tightening its own rules would change answers that journals
+    /// already hold, and replay compares them, so they are checked here and
+    /// the log's rules wait for the next planned format break.
+    ///
+    /// - A Birth of a Chronicle whose purge is committed: its hold on the
+    ///   layer it names would never be released.
+    /// - A verdict whose facts, artifact, requirement or exclusion set are
+    ///   not the Candidate's (they "must equal the Candidate's").
+    /// - A `Never` close naming anything but an accepted `Never` verdict of
+    ///   that Candidate.
+    /// - A purge of a sanction's target that is not ready yet: its
+    ///   `TemplateReady` would be refused for good, and the source's
+    ///   sanction would never end.
+    pub fn refused_before_accept(
+        &self,
+        chronicle: ChronicleId,
+        record: &Submitted,
+    ) -> Option<&'static str> {
+        use crate::contract::{logical_id, CloseKind, Decision};
+        let log = self;
+        let accepted = |key: LogicalKey| match log.query_logical(logical_id(&key)) {
+            Some((_, Submitted::Contract(r))) => Some(r),
+            _ => None,
+        };
+        match record {
+            Submitted::Birth { chronicle: c, .. } => log
+                .query_chronicle(*c)
+                .is_some_and(|v| v.retired)
+                .then_some("the Chronicle is retired: its purge is committed"),
+            Submitted::Contract(ContractRecord::VerdictSubmitted(v)) => {
+                let Some(ContractRecord::Candidate(k)) =
+                    accepted(LogicalKey::Candidate(v.request.candidate_id))
+                else {
+                    return None; // the log's own rule: no such Candidate
+                };
+                let r = &v.request;
+                (r.facts_hash != k.facts_hash
+                    || r.artifact_key != k.artifact_key
+                    || r.requirement != k.requirement
+                    || r.exclude != k.exclude)
+                    .then_some("the verdict's facts, artifact, requirement or exclusion set are not the Candidate's")
+            }
+            Submitted::Contract(ContractRecord::CandidateClosed(c)) => match &c.how {
+                CloseKind::Never { verdict, .. } => match log.query_logical(*verdict) {
+                    Some((_, Submitted::Contract(ContractRecord::VerdictSubmitted(v))))
+                        if v.request.candidate_id == c.candidate_id
+                            && matches!(v.request.decision, Decision::Never { .. }) =>
+                    {
+                        None
+                    }
+                    _ => Some("no such verdict: a Never close names an accepted Never verdict of its Candidate"),
+                },
+                _ => None,
+            },
+            Submitted::Contract(ContractRecord::PurgeCommitted(_)) => match log.claimed_by(chronicle) {
+                Some(ClaimAuthority::Sanction { .. }) if !log.is_template(chronicle) => {
+                    Some("the Chronicle is a sanction's target that is not ready yet")
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// What a Chronicle was claimed under, if it is known.
     pub fn claimed_by(&self, chronicle: ChronicleId) -> Option<ClaimAuthority> {
         self.chrons.get(chronicle.as_bytes()).map(|c| c.claimed_by)
@@ -2575,6 +2641,164 @@ mod tests {
                     || *o == ObjectId::content(pc_keys.1)
             ),
             "only the replacements and the purge's own record (R2-07) stay held"
+        );
+    }
+
+    // ── Refused before the log runs it (audit 2026-11-09, D&D C1 (a)) ─
+
+    fn world<'a>(log: &'a mut CoordLog, store: &'a Store) -> W<'a> {
+        W {
+            log,
+            store,
+            now: 100,
+        }
+    }
+
+    /// A `Never` close names an accepted `Never` verdict of its Candidate;
+    /// the log accepted any accepted logical id.
+    #[test]
+    fn a_never_close_needs_a_never_verdict_of_its_candidate() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = world(&mut log, &store);
+        let f = vessel(&mut w);
+        let cand = ContractRecord::Candidate(Box::new(f.k.clone()));
+        w.ok(f.v, cand.clone());
+        let close = |verdict: HashVal| {
+            Submitted::Contract(ContractRecord::CandidateClosed(CandidateClosed {
+                candidate_id: f.k.candidate_id,
+                how: CloseKind::Never {
+                    verdict,
+                    reason: "r".into(),
+                },
+            }))
+        };
+        // The Candidate's own logical id is no verdict.
+        assert!(
+            w.log
+                .refused_before_accept(f.v, &close(cand.logical_id()))
+                .is_some(),
+            "a Never close naming no verdict"
+        );
+        // A real Never verdict of the Candidate.
+        let st = started(&f.k, 11);
+        w.ok(f.v, ContractRecord::VerificationStarted(st));
+        let fin = finished(&st, 0);
+        w.ok(f.v, ContractRecord::VerificationFinished(fin.clone()));
+        let vd = verdict(
+            &f.k,
+            &fin,
+            Decision::Never {
+                reason: "no".into(),
+            },
+        );
+        let vr = ContractRecord::VerdictSubmitted(Box::new(vd));
+        w.ok(f.v, vr.clone());
+        assert_eq!(
+            w.log.refused_before_accept(f.v, &close(vr.logical_id())),
+            None
+        );
+    }
+
+    /// A verdict's facts, artifact, requirement and exclusion set must be
+    /// the Candidate's; the log accepted others.
+    #[test]
+    fn a_verdict_over_other_facts_than_the_candidates_is_refused() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = world(&mut log, &store);
+        let f = vessel(&mut w);
+        w.ok(f.v, ContractRecord::Candidate(Box::new(f.k.clone())));
+        let st = started(&f.k, 11);
+        w.ok(f.v, ContractRecord::VerificationStarted(st));
+        let fin = finished(&st, 0);
+        w.ok(f.v, ContractRecord::VerificationFinished(fin.clone()));
+        let good = verdict(&f.k, &fin, Decision::Sanction);
+        let as_rec = |v: &VerdictSubmitted| {
+            Submitted::Contract(ContractRecord::VerdictSubmitted(Box::new(v.clone())))
+        };
+        assert_eq!(w.log.refused_before_accept(f.v, &as_rec(&good)), None);
+        let mut facts = good.clone();
+        facts.request.facts_hash = h(0xEE);
+        let mut artifact = good.clone();
+        artifact.request.artifact_key = h(0xEF);
+        let mut exclude = good.clone();
+        exclude.request.exclude = BTreeSet::new();
+        assert_ne!(exclude.request.exclude, f.k.exclude, "the case is real");
+        for bad in [facts, artifact, exclude] {
+            assert!(w.log.refused_before_accept(f.v, &as_rec(&bad)).is_some());
+        }
+    }
+
+    /// A Birth of a Chronicle whose purge is committed added a hold that
+    /// nothing would release.
+    #[test]
+    fn a_birth_of_a_retired_chronicle_is_refused() {
+        use crate::contract::LayerShipped;
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = world(&mut log, &store);
+        let t0 = genesis_t0(&mut w);
+        let layer = h(0x1A);
+        store.put(ObjectId::content(layer));
+        let v = cid(0x0A);
+        w.log.claim_chronicle(v, ClaimAuthority::Vessel).unwrap();
+        w.ok(
+            v,
+            ContractRecord::LayerShipped(LayerShipped {
+                template_id: t0,
+                layer_key: layer,
+                guid: 7,
+            }),
+        );
+        let birth = Submitted::Birth {
+            chronicle: v,
+            lineage: LineageRecord {
+                origin: Origin::Template {
+                    template_id: t0,
+                    layer_key: layer,
+                    asked: None,
+                },
+                namespace: Namespace::from_bytes([1; 16]),
+                ledger_pos: Lsn::new(0),
+            },
+        };
+        assert_eq!(
+            w.log.refused_before_accept(v, &birth),
+            None,
+            "not retired yet"
+        );
+        let (pc, _) = purge_inventory(&mut w, v);
+        w.ok(v, ContractRecord::PurgeCommitted(pc));
+        assert!(w.log.refused_before_accept(v, &birth).is_some());
+    }
+
+    /// A purge of a sanction's target that is not ready yet would make its
+    /// TemplateReady refused for good, and the source's sanction never end.
+    #[test]
+    fn a_sanction_target_not_yet_ready_is_not_purged() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = world(&mut log, &store);
+        let f = vessel(&mut w);
+        let (fin, vd) = to_verdict(&mut w, &f);
+        let s = commit(&f.k, &fin, &vd, f.t0);
+        w.ok(f.v, ContractRecord::SanctionCommitted(s));
+        let commit_lid = ContractRecord::SanctionCommitted(s).logical_id();
+        w.log
+            .claim_chronicle(
+                s.template_id,
+                ClaimAuthority::Sanction { commit: commit_lid },
+            )
+            .unwrap();
+        let (pc, _) = purge_inventory(&mut w, s.template_id);
+        let purge = Submitted::Contract(ContractRecord::PurgeCommitted(pc));
+        assert!(w.log.refused_before_accept(s.template_id, &purge).is_some());
+        w.ok(s.template_id, ready(&s, f.v));
+        assert_eq!(
+            w.log.refused_before_accept(s.template_id, &purge),
+            None,
+            "once ready, a purge is the log's to decide"
         );
     }
 
