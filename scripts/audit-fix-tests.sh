@@ -67,6 +67,10 @@ one a_refused_record_retried_does_not_grow_the_log $W
 one a_purge_finished_on_another_node_deletes_that_nodes_dataset $W
 # Genesis
 one a_layer_record_never_accepted_gives_way_to_a_rebuild $W
+one no_new_namespace_is_made_by_clone_or_clone3 $W
+one nothing_of_the_host_is_bound_in_but_the_vessels_own $W
+one a_vessel_env_that_steers_the_loader_is_refused $W
+one an_env_that_steers_the_loader_is_refused_when_read $W
 one a_resume_never_refuses_a_genesis_from_an_object_that_is_not_its_keys $W
 one a_genesis_finished_elsewhere_does_not_leave_the_first_nodes_scratch $W
 # The reclaimer
