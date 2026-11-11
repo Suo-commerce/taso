@@ -26,14 +26,17 @@
 //! Then it sets the two things a Taso host needs (P5-14, lever 4; A1 does
 //! the same on a measurement host) and keeps them at boot: `ublk_drv`
 //! loaded (`/etc/modules-load.d/taso.conf`) and `rcu_expedited=1`
-//! (`/etc/tmpfiles.d/taso-rcu.conf`); makes the directories; writes the
+//! (`/etc/tmpfiles.d/taso-rcu.conf`), and the run directories under
+//! `/run/taso` made at boot (`/etc/tmpfiles.d/taso-run.conf`: `/run` is
+//! emptied at every boot); makes the directories; writes the
 //! single-node config to `/etc/taso/warden.json` — the local coordinator,
 //! the block log, `"effects": "hold"` (D4-5: a Vessel acts outward only
 //! once its entry says so) — after parsing it as the Warden would, so it
 //! never writes a config the Warden refuses; and prints the two commands
 //! that start the block log and the Warden, in order, and the three
 //! sentences a stranger must read (D91, A2, L2).  Idempotent: run again it
-//! says "already set up" and changes nothing.
+//! says "already set up", leaves the config as it is, and only makes the
+//! run directories again if a reboot took them.
 //!
 //! # `status`
 //!
@@ -93,6 +96,34 @@ const RUN: &str = "/run/taso";
 const LANDLOCK: &str = "/usr/lib/taso/landlock";
 const MODULES_CONF: &str = "/etc/modules-load.d/taso.conf";
 const RCU_CONF: &str = "/etc/tmpfiles.d/taso-rcu.conf";
+/// Keeps the run directories at boot: `/run` is emptied at every boot.
+const RUN_CONF: &str = "/etc/tmpfiles.d/taso-run.conf";
+
+/// The directories under [`RUN`] the block log's socket and the Warden's
+/// run directory live in.  `/run` is a tmpfs, emptied at every boot.
+fn run_dirs() -> [PathBuf; 2] {
+    [PathBuf::from(RUN), PathBuf::from(RUN).join("run")]
+}
+
+/// The tmpfiles.d lines that make [`run_dirs`] at boot.
+fn run_conf() -> String {
+    run_dirs()
+        .iter()
+        .map(|d| format!("d {} 0755 root root -\n", d.display()))
+        .collect()
+}
+
+/// Make [`run_dirs`] if a boot took them; `true` if one was made.
+fn make_run_dirs() -> Result<bool, String> {
+    let mut made = false;
+    for d in run_dirs() {
+        if !d.is_dir() {
+            std::fs::create_dir_all(&d).map_err(|e| format!("mkdir {}: {e}", d.display()))?;
+            made = true;
+        }
+    }
+    Ok(made)
+}
 const RCU: &str = "/sys/kernel/rcu_expedited";
 
 fn usage(why: &str) -> ExitCode {
@@ -268,9 +299,24 @@ fn init(args: &[String]) -> ExitCode {
             return ExitCode::from(3);
         }
         Ok(true) => {
+            // After a reboot `/run` is empty: the block log's socket
+            // directory is made again here, the one thing a set-up host
+            // may lack.  `init` used to say "nothing changed" and point at
+            // --force, which writes a new config over the operator's and
+            // loses its Vessel entries (audit 2026-11-09, taso-ctl init
+            // after a reboot).
+            match make_run_dirs() {
+                Ok(true) => println!("  {RUN} made again (a reboot empties /run)"),
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("taso-ctl init: {e}");
+                    return ExitCode::from(1);
+                }
+            }
             println!(
-                "taso-ctl init: already set up ({CONFIG} or {} exists): nothing changed. \
-                 --force rewrites the config; taso-ctl status says what runs.",
+                "taso-ctl init: already set up ({CONFIG} or {} exists): the config is left as it is. \
+                 taso-ctl status says what runs. (--force writes a new config over it, \
+                 and its Vessel entries are lost.)",
                 a.data.join("blk.log").display()
             );
             return ExitCode::SUCCESS;
@@ -300,6 +346,10 @@ fn init(args: &[String]) -> ExitCode {
             Box::new(|| write_file(RCU_CONF, "w /sys/kernel/rcu_expedited - - - - 1\n")),
         ),
         ("rcu_expedited set", Box::new(|| write_file(RCU, "1"))),
+        (
+            "/run/taso kept at boot",
+            Box::new(|| write_file(RUN_CONF, &run_conf())),
+        ),
     ];
     if let Err(e) = run_steps(&mut steps, |what| println!("  {what}")) {
         eprintln!("taso-ctl init: {e}");
@@ -312,7 +362,7 @@ fn init(args: &[String]) -> ExitCode {
         a.data.join("store"),
         a.data.join("spool"),
         a.data.join("mnt"),
-        PathBuf::from(RUN).join("run"),
+        run_dirs()[1].clone(),
         PathBuf::from(CONFIG)
             .parent()
             .expect("a file path")
@@ -755,6 +805,22 @@ fn demo(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit 2026-11-09, `init` made the block log's socket directory under
+    /// `/run`, which a reboot empties, and nothing made it again at boot.
+    /// It is kept by a tmpfiles.d entry, for both run directories.
+    #[test]
+    fn the_run_directories_are_kept_at_boot() {
+        assert_eq!(
+            run_conf(),
+            "d /run/taso 0755 root root -\nd /run/taso/run 0755 root root -\n"
+        );
+        // The block log's socket is in the first.
+        assert_eq!(
+            PathBuf::from(RUN).join("blk.sock").parent(),
+            Some(run_dirs()[0].as_path())
+        );
+    }
 
     /// Review fix M5 (Kimi's M5): the first failing step stops the rest,
     /// and the error names what was already done.

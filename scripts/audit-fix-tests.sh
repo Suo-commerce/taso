@@ -86,6 +86,8 @@ one expiry_by_time_expires_what_the_walk_did -p taso-core --lib
 one expiry_does_not_walk_every_chronicle -p taso-core --lib
 # Decoding
 one a_sequence_reserves_at_most_its_input_before_it_decodes -p taso-core --lib
+# taso-ctl
+one the_run_directories_are_kept_at_boot -p taso-warden --bin taso-ctl
 # The block log
 one spool_files_of_a_process_that_is_gone_are_swept $W
 one a_view_left_by_a_killed_warden_does_not_block_destroy $W
