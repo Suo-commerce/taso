@@ -52,7 +52,9 @@
 //! held by another Warden stops.
 //!
 //! A record goes logical lookup, append once, then the Warden's one
-//! submit path ([`crate::submit`], D89): ship, announce, accept.
+//! submit path ([`crate::submit`], D89): ship, announce, accept.  A record
+//! never accepted gives way to a different one for its logical id, which
+//! is appended after it ([`WardenLog::submit`], finding 1.8).
 //!
 //! # Failpoints (§10.2)
 //!
@@ -943,7 +945,8 @@ impl WardenLog {
         Ok(out)
     }
 
-    /// A record with this logical id already in the local log.
+    /// The newest record with this logical id in the local log: a newer
+    /// one took the place of any before it ([`WardenLog::submit`]).
     pub(crate) fn prepared(
         &self,
         logical: HashVal,
@@ -951,6 +954,7 @@ impl WardenLog {
         Ok(self
             .records()?
             .into_iter()
+            .rev()
             .find(|r| r.logical_id() == logical))
     }
 
@@ -973,24 +977,25 @@ impl WardenLog {
     /// Submit `rec` (logical lookup, append once, then the Warden's one
     /// submit path, [`crate::submit`], D89): the record accepted for its
     /// logical id, this one or another.
+    ///
+    /// Nothing is accepted for its logical id yet, so a different record
+    /// for it in the local log was never accepted, and `rec` is appended
+    /// to take its place (finding 1.8, decision a).  Such a record is left
+    /// when its submission failed and what it names went away: a
+    /// `LayerShipped` whose layer object the reclaimer took, after which
+    /// the rebuild has another key (mkfs makes a new UUID and hash seed).
+    /// Refusing `rec` left the Template stuck on this node for good.  Only
+    /// this Warden submits from its Chronicle (its directory is locked),
+    /// and only the newest record, so the old one is never accepted.
     pub(crate) fn submit(&mut self, rec: ContractRecord) -> Result<ContractRecord, TemplateError> {
         let logical = rec.logical_id();
         if let Some(r) = self.accepted(logical)? {
             return Ok(r);
         }
-        let rec = match self.prepared(logical)? {
-            Some(p) if p == rec => p,
-            Some(p) => {
-                return Err(TemplateError::Inconsistent(format!(
-                    "the Warden Chronicle already holds another {p:?} for this logical id"
-                )))
-            }
-            None => {
-                self.chronicle
-                    .append(Stream::Ctl, Payload::Contract(Box::new(rec.clone())))?;
-                rec
-            }
-        };
+        if self.prepared(logical)?.as_ref() != Some(&rec) {
+            self.chronicle
+                .append(Stream::Ctl, Payload::Contract(Box::new(rec.clone())))?;
+        }
         let rec = Submitted::Contract(rec);
         let coord = self.coord.as_ref();
         let pack = submit::put(coord, self.warden, &self.chronicle, &self.packs, &rec)?;
@@ -1627,6 +1632,47 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{fp} on node 2: {e}"));
             present(&c, &n2, &l);
         }
+    }
+
+    /// Finding 1.8: this node's Warden Chronicle holds a `LayerShipped`
+    /// the coordinator never accepted, whose layer object is gone (the
+    /// reclaimer took it).  A rebuild gives another key; its record takes
+    /// the old one's place, and the Template is no longer stuck.
+    #[test]
+    fn a_layer_record_never_accepted_gives_way_to_a_rebuild() {
+        let c = Cluster::new();
+        let n1 = c.node(1);
+        let stale = LayerShipped {
+            template_id: c.t0,
+            layer_key: HashVal::from_bytes([0x5a; 32]),
+            guid: 7,
+        };
+        {
+            let mut notes = Vec::new();
+            let mut w = n1.open_warden(&mut notes).unwrap();
+            w.chronicle
+                .append(
+                    Stream::Ctl,
+                    Payload::Contract(Box::new(ContractRecord::LayerShipped(stale))),
+                )
+                .unwrap();
+        }
+        let l = n1.ensure(c.t0).unwrap_or_else(|e| panic!("stuck: {e}"));
+        assert_ne!(l.layer_key, stale.layer_key);
+        assert_eq!(c.shipped().unwrap().layer_key, l.layer_key);
+        present(&c, &n1, &l);
+        // Its Warden Chronicle holds both; the newer is the one looked up.
+        let mut notes = Vec::new();
+        let w = n1.open_warden(&mut notes).unwrap();
+        let logical = logical_id(&LogicalKey::Layer(c.t0));
+        assert_eq!(
+            w.prepared(logical).unwrap(),
+            Some(ContractRecord::LayerShipped(LayerShipped {
+                template_id: c.t0,
+                layer_key: l.layer_key,
+                guid: l.guid,
+            }))
+        );
     }
 
     #[test]
