@@ -1141,12 +1141,97 @@ mod tests {
             ));
         }
         let all = p.chronicle().frames().unwrap();
-        let tail = all.last().unwrap().envelope.lsn;
         assert_eq!(
-            crate::nominate::effects_adopted(all.iter(), tail).unwrap(),
+            crate::summary::Summary::of(&all).unwrap().adoption.adopted,
             2,
             "two effects were adopted; three more were declared by the agent"
         );
+    }
+
+    /// Each Seal record carries the effects adopted up to it (format
+    /// generation 3, G1): a nomination reads the count from the Seal it
+    /// names, never by counting a log pruning may have cut.  Only an
+    /// adoption counts, not an intent the agent declares naming the child
+    /// (2.7); the count goes on across a reopen.
+    #[test]
+    fn each_seal_carries_the_effects_adopted_up_to_it() {
+        let seal_counts = |v: &Vessel<FakeLayers>| -> Vec<u64> {
+            v.chronicle()
+                .frames()
+                .unwrap()
+                .iter()
+                .filter_map(|f| match Payload::decode(&f.payload) {
+                    Ok(Payload::Seal(s)) => Some(s.adopted),
+                    _ => None,
+                })
+                .collect()
+        };
+        let e = env();
+        let mut p = vessel(&e);
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let c = child(&e, &p, b"c", 2);
+        let log = e.host.read_log_of(c).unwrap();
+        let (mut fx, _) = open_dispatch(&mut p);
+        let (record, adopted) = fx.promote(&mut p, &log, SealAt::Last).unwrap();
+        assert_eq!(adopted.len(), 2);
+        let pos = ledger_pos(&p).unwrap();
+        p.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(2))
+            .unwrap();
+        // The agent declares effects naming the child: not adoptions.
+        let mut d = pay("the agent's own");
+        d.authority = crate::ledger::AdoptedFrom {
+            child: record.child,
+            seal: record.seal,
+            op: OpId::new(1000),
+        }
+        .canon_bytes();
+        fx.ask(&mut p, &d).unwrap();
+        let pos = ledger_pos(&p).unwrap();
+        p.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(3))
+            .unwrap();
+        assert_eq!(seal_counts(&p), vec![0, 2, 2]);
+        // Reopened, a second promotion adds to the count.
+        drop((fx, p));
+        let mut p = vessel(&e);
+        let c2 = child(&e, &p, b"d", 3);
+        let log2 = e.host.read_log_of(c2).unwrap();
+        let (mut fx, _) = open_dispatch(&mut p);
+        fx.promote(&mut p, &log2, SealAt::Last).unwrap();
+        let pos = ledger_pos(&p).unwrap();
+        p.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(4))
+            .unwrap();
+        assert_eq!(seal_counts(&p), vec![0, 2, 2, 5]);
+        // A Checkpoint anywhere carries the count on: inside a promotion's
+        // adoptions too (between its first and its last), where pruning
+        // up to it would cut the earlier ones from the local log.
+        use crate::summary::Summary;
+        let all = p.chronicle().frames().unwrap();
+        let full = Summary::of(&all).unwrap().adoption;
+        assert_eq!(full.adopted, 5);
+        for k in 1..all.len() {
+            let cp = Summary::of(&all[..k]).unwrap().checkpoint().unwrap();
+            let mut envelope = all[k - 1].envelope;
+            envelope.stream = taso_core::envelope::Stream::Ctl;
+            let checkpoint = crate::segment::Frame {
+                envelope,
+                payload: Payload::Checkpoint(Box::new(cp)).canon_bytes(),
+            };
+            let pruned: Vec<_> = std::iter::once(checkpoint)
+                .chain(all[k..].iter().cloned())
+                .collect();
+            assert_eq!(
+                Summary::of(&pruned).unwrap().adoption,
+                full,
+                "pruned up to a Checkpoint after lsn {}",
+                all[k - 1].envelope.lsn.get()
+            );
+        }
     }
 
     /// A crash after the Promotion, before the adoption: on reopen the
@@ -1189,21 +1274,14 @@ mod tests {
         assert_eq!(fx.pending_promotion(), None);
         assert_eq!(fx.released(&p).unwrap().len(), 3);
         assert!(fx.finish_promotion(&mut p, &log).unwrap().is_empty());
-        // The Candidate fact "effects adopted" counts them over the whole
-        // log; a log cut by pruning counts only what is left (audit
-        // 2026-11-09, A5), so a nomination puts the shipped records
-        // before it.
+        // The Candidate fact "effects adopted" is carried by the log
+        // (generation 3, G1): the next Seal records the three.
         let all = p.chronicle().frames().unwrap();
-        let tail = all.last().unwrap().envelope.lsn;
-        let count =
-            |f: &[crate::segment::Frame]| crate::nominate::effects_adopted(f.iter(), tail).unwrap();
-        let cut = all.len() - 1;
-        assert_eq!((count(&all), count(&all[cut..])), (3, 0));
-        let (shipped, local) = all.split_at(cut);
         assert_eq!(
-            crate::nominate::effects_adopted(shipped.iter().chain(local.iter()), tail).unwrap(),
+            crate::summary::Summary::of(&all).unwrap().adoption.adopted,
             3
         );
+        let cut = all.len() - 1;
         // Whether the child was promoted before is read the same way: a
         // configured promotion whose record was pruned is found in the
         // shipped records after the Seal the child was forked at, and the
