@@ -291,6 +291,7 @@ impl Reader<'_> {
             verdict: self.verdict()?,
             ledger_pos: self.lsn()?,
             turn: TurnId::new(self.u64()?),
+            adopted: self.u64()?,
         })
     }
 
@@ -415,6 +416,8 @@ impl Reader<'_> {
             })?,
             next_op: self.u64()?,
             promotion: self.option(Self::promotion)?,
+            adopted: self.u64()?,
+            adopting: self.option(Self::promotion)?,
         })
     }
 
@@ -656,9 +659,10 @@ mod tests {
             verdict(),
             lsn(),
             any::<u64>(),
+            any::<u64>(),
         )
             .prop_map(
-                |(parent, fs, db, transcript, layer, verdict, ledger_pos, turn)| {
+                |(parent, fs, db, transcript, layer, verdict, ledger_pos, turn, adopted)| {
                     Payload::Seal(SealRecord {
                         parent,
                         cut: StreamCut { fs, db, transcript },
@@ -666,6 +670,7 @@ mod tests {
                         verdict,
                         ledger_pos,
                         turn: TurnId::new(turn),
+                        adopted,
                     })
                 },
             )
@@ -860,10 +865,12 @@ mod tests {
             Just(OutcomeState::OutcomeUnknown),
             Just(OutcomeState::Proposed),
         ];
-        let promo = promotion().prop_map(|p| match p {
-            Payload::Promotion(r) => r,
-            _ => unreachable!(),
-        });
+        let promo = || {
+            promotion().prop_map(|p| match p {
+                Payload::Promotion(r) => r,
+                _ => unreachable!(),
+            })
+        };
         let open =
             (lsn(), intent(), proptest::option::of(state)).prop_map(|(lsn, i, state)| match i {
                 Payload::Intent(intent) => OpenEffect { lsn, intent, state },
@@ -877,10 +884,23 @@ mod tests {
             proptest::option::of(fs),
             proptest::collection::vec(open, 0..3),
             any::<u64>(),
-            proptest::option::of(promo),
+            proptest::option::of(promo()),
+            any::<u64>(),
+            proptest::option::of(promo()),
         )
             .prop_map(
-                |(lineage, transcript, effect, seal, fs_shipped, open, next_op, promotion)| {
+                |(
+                    lineage,
+                    transcript,
+                    effect,
+                    seal,
+                    fs_shipped,
+                    open,
+                    next_op,
+                    promotion,
+                    adopted,
+                    adopting,
+                )| {
                     Payload::Checkpoint(Box::new(CheckpointRecord {
                         lineage,
                         transcript,
@@ -890,6 +910,8 @@ mod tests {
                         open,
                         next_op,
                         promotion,
+                        adopted,
+                        adopting,
                     }))
                 },
             )
@@ -1072,6 +1094,7 @@ mod tests {
                     verdict: Verdict::Clean,
                     ledger_pos: Lsn::new(0),
                     turn: TurnId::new(0),
+                    adopted: 0,
                 }),
                 34,
                 "verdict",
