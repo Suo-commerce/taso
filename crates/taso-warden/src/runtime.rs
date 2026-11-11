@@ -17,6 +17,8 @@
 //!   bind-mounted at [`FIELD_SOCKET`].
 //! - **A read-only root filesystem.**  Writable: `/work` (the Vessel's
 //!   dataset, bind-mounted, `nosuid,nodev`) and `/tmp` (tmpfs).
+//! - **Nothing of the host's `/sys`.**  Of the host, a Vessel sees its
+//!   dataset and its socket; a verifier its Candidate (finding 2.9).
 //! - **No host environment.**  The process gets `PATH`, `HOME=/work` and
 //!   `TASO_FIELD`; nothing from the Warden's environment, so no
 //!   credentials can leak in.
@@ -371,8 +373,6 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
               "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] },
             { "destination": "/dev/mqueue", "type": "mqueue", "source": "mqueue",
               "options": ["nosuid", "noexec", "nodev"] },
-            { "destination": "/sys", "type": "none", "source": "/sys",
-              "options": ["rbind", "nosuid", "noexec", "nodev", "ro"] },
             { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
               "options": ["nosuid", "nodev", "mode=1777", "size=1g"] },
             work_mount,
@@ -390,8 +390,7 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
             "seccomp": seccomp(),
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
-                "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi",
-                "/sys/firmware", "/sys/devices/virtual/powercap"
+                "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi"
             ],
             "readonlyPaths": [
                 "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"
@@ -404,7 +403,8 @@ pub fn oci_config(spec: &VesselSpec) -> Result<Value, SpecError> {
 pub const CANDIDATE_DIR: &str = "/candidate";
 
 /// Directories a verifier Template must contain at its root (D65): its
-/// root is read-only, so every mount target must exist in it.
+/// root is read-only, so every mount target must exist in it.  `sys` as
+/// in [`REQUIRED_DIRS`]: nothing is mounted on it.
 pub const VERIFIER_DIRS: &[&str] = &["proc", "dev", "sys", "tmp", "candidate"];
 
 /// A verifier container (P4 spec rev. 20 §3.4, D65): its Template's layer
@@ -503,8 +503,6 @@ pub fn verifier_config(spec: &VerifierSpec) -> Result<Value, SpecError> {
               "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"] },
             { "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
               "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] },
-            { "destination": "/sys", "type": "none", "source": "/sys",
-              "options": ["rbind", "nosuid", "noexec", "nodev", "ro"] },
             { "destination": "/tmp", "type": "tmpfs", "source": "tmpfs",
               "options": ["nosuid", "nodev", "mode=1777", "size=1g"] },
             { "destination": CANDIDATE_DIR, "type": "bind", "source": spec.candidate,
@@ -525,8 +523,7 @@ pub fn verifier_config(spec: &VerifierSpec) -> Result<Value, SpecError> {
             "seccomp": seccomp(),
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
-                "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi",
-                "/sys/firmware", "/sys/devices/virtual/powercap"
+                "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/proc/scsi"
             ],
             "readonlyPaths": [
                 "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"
@@ -545,7 +542,9 @@ pub fn write_verifier_bundle(bundle: &Path, spec: &VerifierSpec) -> Result<PathB
     Ok(path)
 }
 
-/// Directories every Vessel image must contain.
+/// Directories every Vessel image must contain.  Nothing is mounted on
+/// `sys` (finding 2.9: the host's `/sys` is not bound in); it stays
+/// required so that images made for earlier Wardens are still valid.
 pub const REQUIRED_DIRS: &[&str] = &["proc", "dev", "sys", "tmp", "work", "run/taso"];
 
 /// Files every Vessel image must contain (bind-mount targets).
@@ -1197,6 +1196,48 @@ mod tests {
             c["linux"]["seccomp"]["syscalls"][0]["action"],
             "SCMP_ACT_ERRNO"
         );
+    }
+
+    /// Finding 2.9 (K1 part 2): of the host, a Vessel sees only its
+    /// dataset and its socket, a verifier only its Candidate: no host
+    /// `/sys`.  A bind is known by its options (`bind`, `rbind`), whatever
+    /// its type says; the verifier's own test looked at the type only.
+    #[test]
+    fn nothing_of_the_host_is_bound_in_but_the_vessels_own() {
+        let verifier = VerifierSpec {
+            id: "a-0123".into(),
+            rootfs: "/mnt/t-77/.view".into(),
+            candidate: "/mnt/a-0123".into(),
+            uid_base: 789_824,
+            args: vec!["/bin/check".into()],
+            env: vec![],
+            memory_bytes: 1 << 30,
+            cpu_seconds: 60,
+            pids: 64,
+        };
+        for (c, own) in [
+            (oci_config(&spec()).unwrap(), vec![WORK_DIR, FIELD_SOCKET]),
+            (verifier_config(&verifier).unwrap(), vec![CANDIDATE_DIR]),
+        ] {
+            for m in c["mounts"].as_array().unwrap() {
+                let bind = m["type"] == "bind"
+                    || m["options"]
+                        .as_array()
+                        .is_some_and(|o| o.contains(&json!("bind")) || o.contains(&json!("rbind")));
+                let dest = m["destination"].as_str().unwrap();
+                assert!(
+                    !bind || own.contains(&dest),
+                    "the host's {dest} is bound in"
+                );
+                assert_ne!(m["type"], "sysfs", "{dest}: a sysfs");
+            }
+            for p in c["linux"]["maskedPaths"].as_array().unwrap() {
+                assert!(
+                    !p.as_str().unwrap().starts_with("/sys"),
+                    "{p}: nothing there to mask"
+                );
+            }
+        }
     }
 
     /// Finding 2.8 (K1-1 (c)): a Vessel and a verifier make no namespace:
