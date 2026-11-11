@@ -725,6 +725,7 @@ mod tests {
                 verdict,
                 ledger_pos,
                 turn: TurnId::new(self.turn),
+                adopted: 0,
             };
             let head = self
                 .warden
@@ -1189,6 +1190,7 @@ mod tests {
             verdict: Verdict::Clean,
             ledger_pos: Lsn::new(0),
             turn: TurnId::new(99),
+            adopted: 0,
         };
         let bad = sim.append(Stream::Ctl, Payload::Seal(rec));
         assert_eq!(
