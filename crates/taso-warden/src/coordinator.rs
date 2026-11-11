@@ -1788,6 +1788,33 @@ impl Coord for Coordinator {
         let shared = self.shared.clone();
         self.write(move |t| {
             holder_synced(&shared, t, warden, chronicle)?;
+            // What the log accepts but must not (D&D C1 (a)): refused here,
+            // before the log runs the record.  The submission is cancelled
+            // through the log, an operation journals already replay, so
+            // the Chronicle is not left with it pending; the Warden is
+            // told why.
+            let refusal = {
+                let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
+                let log = loaded(&mut g, &shared, &t.journal)?;
+                log.refused_before_accept(chronicle, &record)
+            };
+            if let Some(why) = refusal {
+                let op = Op::Cancel {
+                    chronicle,
+                    epoch,
+                    submission,
+                };
+                return match journal(&shared, t, op)? {
+                    // Cancelled now, or the answer was final already.
+                    Done::Answer(Answer::FinalRefused(taso_core::coordlog::Final::Cancelled)) => {
+                        Ok(Answer::FinalRefused(taso_core::coordlog::Final::Predicate(
+                            why.into(),
+                        )))
+                    }
+                    Done::Answer(a) => Ok(a),
+                    _ => unreachable!("a cancel answers"),
+                };
+            }
             let now = (shared.config.clock)();
             let op = Op::Accept {
                 chronicle,
@@ -3762,6 +3789,52 @@ mod log_tests {
              was discarded: the next request replays the whole journal",
             e.outcome_unknown()
         );
+    }
+
+    /// D&D C1 (a): a record the log would accept but must not (here a
+    /// `Never` close naming no verdict) is refused before the log runs
+    /// it, with the reason, and the submission is cancelled through the
+    /// log: the Chronicle's next submission is not held up by it.
+    #[test]
+    fn a_record_refused_before_the_log_leaves_nothing_pending() {
+        use taso_core::contract::{CandidateClosed, CloseKind, ContractRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Fake::default());
+        let coord = open(&dir.path().join("c.redb"), store.clone());
+        let g = genesis();
+        let t0 = g.genesis_id;
+        coord
+            .claim_chronicle(t0, A, ClaimAuthority::Genesis)
+            .unwrap();
+        let r = Submitted::Contract(ContractRecord::CandidateClosed(CandidateClosed {
+            candidate_id: h(0x31),
+            how: CloseKind::Never {
+                verdict: h(0x32),
+                reason: "no verdict".into(),
+            },
+        }));
+        let s = submission_id(r.logical_id(), r.digest(), Epoch::FIRST, 1);
+        coord
+            .announce(A, t0, Epoch::FIRST, s, r.logical_id(), r.digest())
+            .unwrap()
+            .unwrap();
+        store.ship(t0, "pack-1", &r);
+        let head = coord.query_chronicle(t0).unwrap().unwrap().head;
+        let a = coord
+            .accept(A, t0, Epoch::FIRST, s, head, "pack-1".into(), r)
+            .unwrap();
+        assert!(
+            matches!(&a, Answer::FinalRefused(taso_core::coordlog::Final::Predicate(why)) if why.contains("no such verdict")),
+            "{a:?}"
+        );
+        assert_eq!(coord.query_chronicle(t0).unwrap().unwrap().pending, None);
+        // The next submission of the Chronicle is announced at once.
+        let r2 = Submitted::Contract(ContractRecord::GenesisStarted(Box::new(g)));
+        let s2 = submission_id(r2.logical_id(), r2.digest(), Epoch::FIRST, 2);
+        assert!(coord
+            .announce(A, t0, Epoch::FIRST, s2, r2.logical_id(), r2.digest())
+            .unwrap()
+            .is_ok());
     }
 
     /// Audit 2026-11-09, a `cancel` under an epoch that is not the

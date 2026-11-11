@@ -36,6 +36,7 @@ one a_panicking_worker_closes_its_connection $W
 one a_panicking_worker_closes_its_connection_and_frees_its_place $W
 one a_cancel_of_an_unowned_chronicle_refuses_nothing_of_its_later_holder $W
 one a_cancel_under_a_stale_epoch_refuses_nothing_of_the_pending_submission $W
+one a_record_refused_before_the_log_leaves_nothing_pending $W
 # The agent's side: the session, the verifier, the ledger
 one a_child_name_no_fork_could_have_is_refused_before_the_hooks $W
 one a_subject_longer_than_a_resource_may_have_is_refused $W
@@ -83,6 +84,10 @@ one an_agent_nothing_can_stop_is_ended_before_the_run_returns $W
 one a_run_that_fails_after_its_agent_started_leaves_no_agent $W
 one one_candidates_error_does_not_end_the_pass_for_the_others -p taso-warden --bin taso-policy
 # The coordinator's log
+one a_never_close_needs_a_never_verdict_of_its_candidate -p taso-core --lib
+one a_verdict_over_other_facts_than_the_candidates_is_refused -p taso-core --lib
+one a_birth_of_a_retired_chronicle_is_refused -p taso-core --lib
+one a_sanction_target_not_yet_ready_is_not_purged -p taso-core --lib
 one expiry_by_time_expires_what_the_walk_did -p taso-core --lib
 one expiry_does_not_walk_every_chronicle -p taso-core --lib
 # Decoding
