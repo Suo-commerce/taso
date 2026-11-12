@@ -1954,33 +1954,17 @@ impl Coord for Coordinator {
         let shared = self.shared.clone();
         self.write(move |t| {
             holder_synced(&shared, t, warden, chronicle)?;
-            // A cancel under an epoch that is not the Chronicle's is
-            // refused here, before the log runs it and before anything
-            // is journalled, unless the submission's answer is final
-            // already (then the log repeats that answer and changes
-            // nothing).  The log's own `cancel` leaves the pending
-            // submission alone under another epoch but still keeps the
-            // id as refused for good, so the holder's accept of its
-            // pending submission was then refused `Cancelled` (audit
-            // 2026-11-09, cancel under a stale epoch).  The log's rule
-            // is not changed: the journal keeps each answer and replay
-            // compares them, so journals written before this still
-            // open (D&D Y5 (c)).
-            {
-                let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
-                let log = loaded(&mut g, &shared, &t.journal)?;
-                let open =
-                    log.query_submission(chronicle, submission) == SubmissionStatus::AbsentAtRead;
-                if open && log.epoch(chronicle) != Some(epoch) {
-                    return Ok(Answer::FinalRefused(taso_core::coordlog::Final::StaleEpoch));
-                }
-            }
             let op = Op::Cancel {
                 chronicle,
                 epoch,
                 submission,
             };
-            match journal(&shared, t, op)? {
+            // A cancel under a stale epoch changes nothing in the log
+            // (generation 3, G2): it is not journalled.
+            let changed = |d: &Done| {
+                *d != Done::Answer(Answer::FinalRefused(taso_core::coordlog::Final::StaleEpoch))
+            };
+            match journal_if(&shared, t, op, changed)? {
                 Done::Answer(a) => Ok(a),
                 _ => unreachable!("a cancel answers"),
             }
