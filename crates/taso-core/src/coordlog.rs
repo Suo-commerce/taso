@@ -312,7 +312,15 @@ pub struct Config {
     pub announce_ttl: u64,
     /// `store.deleted_quarantine`, same unit.
     pub deleted_quarantine: u64,
+    /// How long a refusal is kept and answered the same, same unit
+    /// (generation 3, G3: 30 days, built in).  Far past any Warden's retry
+    /// of one submission (minutes); a refusal forgotten after it is a
+    /// submission never seen, checked against every rule again.
+    pub refusal_kept: u64,
 }
+
+/// [`Config::refusal_kept`] in seconds: 30 days.
+pub const REFUSAL_KEPT_SECONDS: u64 = 30 * 86_400;
 
 // ── State ───────────────────────────────────────────────────────────
 
@@ -415,7 +423,10 @@ pub struct CoordLog {
     /// (chronicle, submission) → position.
     accepted_subs: BTreeMap<(C16, H32), u64>,
     /// (chronicle, submission) → why it can never be accepted.
-    refused_subs: BTreeMap<(C16, H32), Final>,
+    refused_subs: BTreeMap<(C16, H32), (Final, u64)>,
+    /// The kept refusals by the time they were made, for
+    /// [`CoordLog::expire`] (generation 3, G3).
+    refused_at: BTreeSet<(u64, C16, H32)>,
     holds: BTreeMap<H32, Hold>,
     claims: BTreeMap<ObjectId, ClaimBy>,
     quarantine: BTreeMap<ObjectId, u64>,
@@ -532,6 +543,7 @@ impl CoordLog {
             logical: BTreeMap::new(),
             accepted_subs: BTreeMap::new(),
             refused_subs: BTreeMap::new(),
+            refused_at: BTreeSet::new(),
             holds: BTreeMap::new(),
             claims: BTreeMap::new(),
             quarantine: BTreeMap::new(),
@@ -632,7 +644,8 @@ impl CoordLog {
         ch.epoch = ch.epoch.next();
         let e = ch.epoch;
         if let Some(p) = ch.pending.take() {
-            self.refused_subs.insert((c, p.submission), Final::Expired);
+            // Kept from its announce's time: no clock reaches a fence.
+            self.keep_refusal(c, p.submission, Final::Expired, p.at);
         }
         Some(e)
     }
@@ -646,6 +659,21 @@ impl CoordLog {
     /// order of their time, and stops at the first that is not past the
     /// TTL: the same submissions expire, at the same calls.
     pub fn expire(&mut self, now: u64) {
+        // Refusals older than `refusal_kept` are forgotten (G3).
+        let kept = self.config.refusal_kept;
+        while let Some(&(at, c, s)) = self.refused_at.first() {
+            if now.saturating_sub(at) <= kept {
+                break;
+            }
+            self.refused_at.pop_first();
+            if self
+                .refused_subs
+                .get(&(c, s))
+                .is_some_and(|(_, t)| *t == at)
+            {
+                self.refused_subs.remove(&(c, s));
+            }
+        }
         let ttl = self.config.announce_ttl;
         while let Some(&(at, c)) = self.pending_at.first() {
             if now.saturating_sub(at) <= ttl {
@@ -658,7 +686,7 @@ impl CoordLog {
             };
             if ch.pending.as_ref().is_some_and(|p| p.at == at) {
                 let p = ch.pending.take().expect("checked");
-                self.refused_subs.insert((c, p.submission), Final::Expired);
+                self.keep_refusal(c, p.submission, Final::Expired, now);
             }
         }
     }
@@ -698,7 +726,7 @@ impl CoordLog {
     ) -> Result<(), Answer> {
         self.expire(now);
         let key = (*chronicle.as_bytes(), *submission.as_bytes());
-        if let Some(f) = self.refused_subs.get(&key) {
+        if let Some((f, _)) = self.refused_subs.get(&key) {
             return Err(Answer::FinalRefused(f.clone()));
         }
         let Some(ch) = self.chrons.get_mut(chronicle.as_bytes()) else {
@@ -737,7 +765,13 @@ impl CoordLog {
     /// changes nothing (generation 3, G2; audit 2026-11-09, Y5): it used to
     /// keep the id as cancelled, so the holder's accept of its pending
     /// submission was refused `Cancelled`.
-    pub fn cancel(&mut self, chronicle: ChronicleId, epoch: Epoch, submission: HashVal) -> Answer {
+    pub fn cancel(
+        &mut self,
+        chronicle: ChronicleId,
+        epoch: Epoch,
+        submission: HashVal,
+        now: u64,
+    ) -> Answer {
         let s = *submission.as_bytes();
         let key = (*chronicle.as_bytes(), s);
         if let Some(&pos) = self.accepted_subs.get(&key) {
@@ -746,7 +780,7 @@ impl CoordLog {
                 record_digest: HashVal::from_bytes(self.log[pos as usize - 1].digest),
             };
         }
-        if let Some(f) = self.refused_subs.get(&key) {
+        if let Some((f, _)) = self.refused_subs.get(&key) {
             return Answer::FinalRefused(f.clone());
         }
         if let Some(ch) = self.chrons.get_mut(chronicle.as_bytes()) {
@@ -757,11 +791,17 @@ impl CoordLog {
                 ch.pending = None;
             }
         }
-        self.refused_subs.insert(key, Final::Cancelled);
+        self.keep_refusal(key.0, key.1, Final::Cancelled, now);
         Answer::FinalRefused(Final::Cancelled)
     }
 
-    fn finalize(&mut self, chronicle: ChronicleId, submission: H32, reason: Final) -> Answer {
+    fn finalize(
+        &mut self,
+        chronicle: ChronicleId,
+        submission: H32,
+        reason: Final,
+        now: u64,
+    ) -> Answer {
         if let Some(ch) = self.chrons.get_mut(chronicle.as_bytes()) {
             if ch
                 .pending
@@ -771,9 +811,21 @@ impl CoordLog {
                 ch.pending = None;
             }
         }
-        self.refused_subs
-            .insert((*chronicle.as_bytes(), submission), reason.clone());
+        self.keep_refusal(*chronicle.as_bytes(), submission, reason.clone(), now);
         Answer::FinalRefused(reason)
+    }
+
+    /// Keep `reason` as the answer to `submission`, made at `at`, until
+    /// `refusal_kept` has passed (G3).  A stale-epoch refusal is not kept:
+    /// the epoch check gives it again by itself.
+    fn keep_refusal(&mut self, c: C16, submission: H32, reason: Final, at: u64) {
+        if reason == Final::StaleEpoch {
+            return;
+        }
+        if let Some((_, old)) = self.refused_subs.insert((c, submission), (reason, at)) {
+            self.refused_at.remove(&(old, c, submission));
+        }
+        self.refused_at.insert((at, c, submission));
     }
 
     /// Accept a submission (§1.2), in the order of the spec: logical
@@ -810,23 +862,23 @@ impl CoordLog {
                     record_digest: digest,
                 };
             }
-            return self.finalize(chronicle, s, Final::Conflict);
+            return self.finalize(chronicle, s, Final::Conflict, now);
         }
-        if let Some(f) = self.refused_subs.get(&(*chronicle.as_bytes(), s)) {
+        if let Some((f, _)) = self.refused_subs.get(&(*chronicle.as_bytes(), s)) {
             return Answer::FinalRefused(f.clone());
         }
         // 2. Epoch.
         let Some(ch) = self.chrons.get(chronicle.as_bytes()) else {
-            return self.finalize(chronicle, s, Final::StaleEpoch);
+            return self.finalize(chronicle, s, Final::StaleEpoch, now);
         };
         if ch.epoch != epoch {
-            return self.finalize(chronicle, s, Final::StaleEpoch);
+            return self.finalize(chronicle, s, Final::StaleEpoch, now);
         }
         // 3. Pending guard.
         match &ch.pending {
             Some(p) if p.submission == s => {
                 if p.logical != *logical.as_bytes() || p.digest != *digest.as_bytes() {
-                    return self.finalize(chronicle, s, Final::NotAnnounced);
+                    return self.finalize(chronicle, s, Final::NotAnnounced, now);
                 }
             }
             Some(p) => {
@@ -834,7 +886,7 @@ impl CoordLog {
                     submission: HashVal::from_bytes(p.submission),
                 })
             }
-            None => return self.finalize(chronicle, s, Final::NotAnnounced),
+            None => return self.finalize(chronicle, s, Final::NotAnnounced, now),
         }
         // 4. Head.
         if ch.head != expected_head {
@@ -842,7 +894,7 @@ impl CoordLog {
         }
         // 4b. Rules that hold whatever the store says (generation 3, G4).
         if let Some(why) = self.refused_by_rule(chronicle, &record) {
-            return self.finalize(chronicle, s, Final::Predicate(why.into()));
+            return self.finalize(chronicle, s, Final::Predicate(why.into()), now);
         }
         // 5. Readability.
         if !store.carries(chronicle, pack, digest) {
@@ -855,7 +907,7 @@ impl CoordLog {
             .and_then(|fx| self.check_effects(fx, store, now));
         let fx = match plan {
             Ok(fx) => fx,
-            Err(Stop::Final(f)) => return self.finalize(chronicle, s, f),
+            Err(Stop::Final(f)) => return self.finalize(chronicle, s, f, now),
             // As step 5: the pending submission stays; the Warden retries it.
             Err(Stop::Unreadable) => return Answer::Refused(Transient::NotReadable),
             Err(Stop::Quarantined(o)) => return Answer::Refused(Transient::Quarantined(o)),
@@ -935,7 +987,7 @@ impl CoordLog {
         let key = (*chronicle.as_bytes(), *submission.as_bytes());
         if let Some(&p) = self.accepted_subs.get(&key) {
             SubmissionStatus::Accepted(p)
-        } else if let Some(f) = self.refused_subs.get(&key) {
+        } else if let Some((f, _)) = self.refused_subs.get(&key) {
             SubmissionStatus::FinalRefused(f.clone())
         } else {
             SubmissionStatus::AbsentAtRead
@@ -2339,6 +2391,7 @@ mod tests {
         Config {
             announce_ttl: 600,
             deleted_quarantine: 7 * 86400,
+            refusal_kept: REFUSAL_KEPT_SECONDS,
         }
     }
     fn pname(end: u64, base: u64, to: u64) -> String {
@@ -2889,7 +2942,9 @@ mod tests {
                 .is_some_and(|p| now.saturating_sub(p.at) > ttl)
             {
                 let p = ch.pending.take().expect("checked");
-                log.refused_subs.insert((*c, p.submission), Final::Expired);
+                log.refused_subs
+                    .insert((*c, p.submission), (Final::Expired, now));
+                log.refused_at.insert((now, *c, p.submission));
             }
         }
     }
@@ -2938,7 +2993,11 @@ mod tests {
                         .as_ref()
                         .map(|p| HashVal::from_bytes(p.submission));
                     if let Some(p) = pending {
-                        assert_eq!(a.cancel(c, e, p), b.cancel(c, e, p), "step {step}");
+                        assert_eq!(
+                            a.cancel(c, e, p, now),
+                            b.cancel(c, e, p, now),
+                            "step {step}"
+                        );
                     }
                 }
                 4 => {
@@ -2959,7 +3018,7 @@ mod tests {
             assert_eq!(a.refused_subs, b.refused_subs, "step {step}");
         }
         assert!(
-            a.refused_subs.values().any(|f| *f == Final::Expired),
+            a.refused_subs.values().any(|(f, _)| *f == Final::Expired),
             "the sequence expired something"
         );
     }
@@ -3076,7 +3135,7 @@ mod tests {
             Err(Answer::Refused(Transient::Pending { .. }))
         ));
         assert_eq!(
-            w.log.cancel(f.v, e, s1),
+            w.log.cancel(f.v, e, s1, w.now),
             Answer::FinalRefused(Final::Cancelled)
         );
         store.ship(f.v, "late", &r);
@@ -3343,6 +3402,57 @@ mod tests {
         }
     }
 
+    /// Generation 3, G3: a refusal is kept with its time and answered the
+    /// same until `refusal_kept` has passed, then forgotten; a stale-epoch
+    /// refusal is not kept at all (the epoch check gives it again).
+    #[test]
+    fn a_refusal_is_answered_the_same_until_it_is_forgotten() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let kept = cfg().refusal_kept;
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let e = w.epoch(f.v);
+        let r = Submitted::Contract(ContractRecord::Candidate(Box::new(f.k.clone())));
+        let s = sub(&r, e, 1);
+        assert_eq!(
+            w.log.cancel(f.v, e, s, 100),
+            Answer::FinalRefused(Final::Cancelled)
+        );
+        let refused = SubmissionStatus::FinalRefused(Final::Cancelled);
+        assert_eq!(w.log.query_submission(f.v, s), refused);
+        w.log.expire(100 + kept);
+        assert_eq!(w.log.query_submission(f.v, s), refused, "kept that long");
+        w.log.expire(100 + kept + 1);
+        assert_eq!(
+            w.log.query_submission(f.v, s),
+            SubmissionStatus::AbsentAtRead,
+            "then forgotten"
+        );
+        // A stale epoch's refusal is not kept.
+        let stale = Epoch::new(e.get() + 3);
+        let s2 = sub(&r, stale, 2);
+        let head = w.head(f.v);
+        assert_eq!(
+            w.log
+                .accept(f.v, stale, s2, head, "p", r.clone(), w.store, 200),
+            Answer::FinalRefused(Final::StaleEpoch)
+        );
+        assert_eq!(
+            w.log.query_submission(f.v, s2),
+            SubmissionStatus::AbsentAtRead
+        );
+        assert_eq!(
+            w.log.refused_at.len(),
+            w.log.refused_subs.len(),
+            "one time per refusal"
+        );
+    }
+
     /// Generation 3, G2 (audit 2026-11-09, Y5): a cancel under an epoch
     /// that is not the Chronicle's is refused `StaleEpoch` by the log
     /// itself and changes nothing: the pending submission is still
@@ -3366,7 +3476,7 @@ mod tests {
             .announce(f.v, e, s, r.logical_id(), r.digest(), w.now)
             .unwrap();
         assert_eq!(
-            w.log.cancel(f.v, stale, s),
+            w.log.cancel(f.v, stale, s, w.now),
             Answer::FinalRefused(Final::StaleEpoch)
         );
         assert_eq!(
@@ -3382,13 +3492,13 @@ mod tests {
         assert!(matches!(a, Answer::Accepted { .. }), "{a:?}");
         // Final now: any epoch's cancel repeats the answer.
         assert!(matches!(
-            w.log.cancel(f.v, stale, s),
+            w.log.cancel(f.v, stale, s, w.now),
             Answer::AlreadyAccepted { .. }
         ));
         // Under the current epoch a cancel cancels.
         let s2 = sub(&r, e, 2);
         assert_eq!(
-            w.log.cancel(f.v, e, s2),
+            w.log.cancel(f.v, e, s2, w.now),
             Answer::FinalRefused(Final::Cancelled)
         );
     }
