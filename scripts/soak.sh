@@ -10,8 +10,12 @@
 # store.  T(0) and V (the verifier Template) by taso-genesis.  VESSELS
 # Vessels born from T(0), each agent (taso-sim) restarted whenever it
 # exits ("restart": "always"); every run: a few sealed turns of database
-# writes, then a nomination dropping Scratch; the even Vessels also ask
-# for a fork each run.  V verifies each Candidate (it passes); taso-policy
+# writes; every NOMINATE_EVERY-th run then a nomination dropping Scratch;
+# the even Vessels also ask for a fork each run.  The load is steady
+# (D&D SOAK2 (a), 2026-11-10: the mechanism is tested, not how long a
+# disk lasts): each agent keeps only its newest KEEP_ROWS rows, so its
+# database, and so each Candidate's full artifact and Template's full
+# layer, stays the same size and the store grows linearly.  V verifies each Candidate (it passes); taso-policy
 # runs every 5 s and sanctions what passed, so Templates are finished
 # while the Vessels write.  The Warden is killed (SIGKILL) at random,
 # every KILL_EVERY seconds on average (default 60), and started again:
@@ -33,13 +37,30 @@
 #   - the Warden's open files and threads did not grow: the last third's
 #     largest at most 1.5x the first third's largest, plus 16 (a run with
 #     fewer than 6 samples of the Warden cannot say, and fails);
+#   - taso-blkd's memory did not grow, by the same rule;
+#   - free space never fell below FLOOR_GIB: the soak stops there and
+#     fails, rather than run on with a full disk (taso-test 2026-11-09: a
+#     24 h run filled it in 2 h and sat stalled for 19 h);
 #   - work was done: Seals (the Seal frames in those Chronicles), attempts
 #     and sanctions each more than zero;
-#   - no ublk device left after taso-blkd quits.
+#   - nothing left mounted under /mnt/soak, and no ublk device left after
+#     taso-blkd quits.
 # Exit 0 only if every check passed.  Everything stays in /var/lib/taso-soak
 # (removed at the next start).
 #
-# Env: KILL_EVERY (60), SAMPLE (15), TURNS (4: turns per agent run).
+# Env: KILL_EVERY (60), SAMPLE (15), TURNS (4: turns per agent run),
+# KEEP_ROWS (400), NOMINATE_EVERY (10), FLOOR_GIB (10).
+#
+# Stopped early (a TERM), bash runs the EXIT trap: it cleans up first, as
+# at its end.  Under systemd, run it with KillMode=mixed, so the TERM
+# reaches this script alone and its taso-blkd is stopped by the cleanup,
+# after the Vessels' file systems are unmounted (with the default, every
+# process got the TERM at once, taso-blkd's devices went first, and 24
+# mounts were left, 2026-11-10):
+#
+#   systemd-run --unit taso-soak --working-directory=/root/taso \
+#     -E PATH="$PATH" -E HOME=/root -p KillMode=mixed -p TimeoutStopSec=300 \
+#     scripts/soak.sh 86400 8
 #
 # Touches, and nothing else: /var/lib/taso-soak, /run/taso-soak-*.sock,
 # /mnt/soak and mounts under it, the /dev/ublkb* devices its taso-blkd
@@ -52,6 +73,9 @@ VESSELS=${2:-4}
 KILL_EVERY=${KILL_EVERY:-60}
 SAMPLE=${SAMPLE:-15}
 TURNS=${TURNS:-4}
+KEEP_ROWS=${KEEP_ROWS:-400}
+NOMINATE_EVERY=${NOMINATE_EVERY:-10}
+FLOOR_GIB=${FLOOR_GIB:-10}
 [[ "$SECS" =~ ^[1-9][0-9]*$ && "$VESSELS" =~ ^[1-9][0-9]*$ ]] || { echo "usage: $0 [SECONDS] [VESSELS]" >&2; exit 2; }
 [[ "$VESSELS" -le 40 ]] || { echo "at most 40 Vessels (uid slots)" >&2; exit 2; }
 
@@ -272,10 +296,11 @@ for ((i = 0; i < VESSELS; i++)); do
 import json, sys
 i, turns = int(sys.argv[1]), sys.argv[2]
 a = ["/usr/bin/taso-sim", "--turns", turns, "--txns", "2", "--rows", "8", "--turn-sleep-ms", "200",
-     "--db", "/work/state.db", "--stats", "/work/sim-stats.json", "--nominate", "Scratch"]
+     "--db", "/work/state.db", "--stats", "/work/sim-stats.json", "--nominate", "Scratch",
+     "--keep-rows", sys.argv[3], "--nominate-every", sys.argv[4]]
 if i % 2 == 0:
     a += ["--forks", "1"]
-print(json.dumps(a))' "$i" "$TURNS")
+print(json.dumps(a))' "$i" "$TURNS" "$KEEP_ROWS" "$NOMINATE_EVERY")
     forks=""
     (( i % 2 == 0 )) && forks=", \"forks\": {\"slots\": [$((41 + i / 2))]}"
     entries+=("$(printf '{"subject": "s%d", "uid_slot": %d, "template": "%s", "restart": "always", "verifier": {"template": "%s", "config": "%s", "version": 1}, "runtime": {"args": %s}%s}' \
@@ -335,11 +360,18 @@ POLICY_PID=$!
 sampler &
 SAMPLER_PID=$!
 
+free_gib() { df --output=avail -BG "$W" | tail -1 | tr -dc 0-9; }
 END=$((SECONDS + SECS))
-EXITED=0 KILLS=0
+EXITED=0 KILLS=0 FLOOR_AT=
 next_kill=$((SECONDS + KILL_EVERY / 2 + RANDOM % (KILL_EVERY + 1)))
 while [[ $SECONDS -lt $END ]]; do
     sleep 1
+    if [[ "$(free_gib)" -lt "$FLOOR_GIB" ]]; then
+        FLOOR_AT=$SECONDS
+        echo "$(date +%s) free space below $FLOOR_GIB GiB: stopped" >>"$W/out/events"
+        echo "  free space below $FLOOR_GIB GiB after $SECONDS s: the soak stops"
+        break
+    fi
     if ! kill -0 "$DPID" 2>/dev/null; then
         wait "$DPID" 2>/dev/null && rc=0 || rc=$?
         EXITED=$((EXITED + 1))
@@ -395,6 +427,8 @@ for c in "1 threads" "2 open-files"; do
     r=$(growth "$1")
     expect "the Warden's $2 did not grow" is "$r" ok
 done
+expect "taso-blkd's memory did not grow" is "$(growth 4)" ok
+expect "free space stayed above $FLOOR_GIB GiB" is "${FLOOR_AT:+fell below at ${FLOOR_AT} s}" ""
 
 # The Seal frames in one Chronicle, as taso-logcheck printed it.  One that
 # cannot be read counts none: its "one chain" check has failed by then.
@@ -463,7 +497,7 @@ if [[ $FAIL -eq 0 ]]; then
     # GB after 5 h on taso-test 2026-11-09: the night's xfstests then found
     # 18 GiB free, wanting 20).
     rm -rf "$W/blk.log" "$W/store" "$W/spool"
-    echo "SOAK PASS: $SECS s, $VESSELS Vessels, $KILLS kills, $ATTEMPTS attempts, $SANCTIONS sanctions; $PASS checks"
+    echo "SOAK PASS: $SECS s, $VESSELS Vessels, $KILLS kills, $ATTEMPTS attempts, $SANCTIONS sanctions, $SEALS Seals; $PASS checks"
     exit 0
 else
     echo "SOAK FAIL: $FAIL of $((PASS + FAIL)) checks failed; logs in $W/out, samples in $W/soak.tsv"
