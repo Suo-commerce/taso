@@ -22,8 +22,8 @@ use crate::record::{
     Authority, BarrierId, CheckpointRecord, CheckpointSeal, Consequence, Dispatch, FsShippedRecord,
     GapRecord, GroupId, GroupRecord, IntentRecord, LayerRef, LineageRecord, Member, Namespace,
     OpId, OpenEffect, Origin, OutcomeRecord, OutcomeState, ParentSeal, Payload, PromotionRecord,
-    RetryPolicy, SealRecord, StreamBase, StreamCut, SuccessionRecord, TaintKind, TemplateAsked,
-    TurnId, Verdict,
+    RetryPolicy, SealRecord, StreamBase, StreamCut, SuccessionRecord, TaintKind, TakenRecord,
+    TaskRecord, TemplateAsked, TurnId, Verdict,
 };
 
 // ── Errors ──────────────────────────────────────────────────────────
@@ -555,6 +555,12 @@ impl Reader<'_> {
                 let rest = self.take(self.remaining() as u64)?;
                 Payload::Contract(Box::new(ContractRecord::decode(rest)?))
             }
+            (_, 12) => Payload::Task(TaskRecord {
+                seq: self.u64()?,
+                id: self.bytes()?,
+                body: self.bytes()?,
+            }),
+            (_, 13) => Payload::Taken(TakenRecord { seq: self.u64()? }),
             (at, tag) => {
                 return Err(DecodeError::BadTag {
                     at,
@@ -926,6 +932,10 @@ mod tests {
             })
         })
     }
+    fn task() -> impl Strategy<Value = Payload> {
+        (any::<u64>(), blob(), blob())
+            .prop_map(|(seq, id, body)| Payload::Task(TaskRecord { seq, id, body }))
+    }
     fn payload() -> impl Strategy<Value = Payload> {
         prop_oneof![
             seal(),
@@ -938,7 +948,9 @@ mod tests {
             gap(),
             fs_shipped(),
             checkpoint(),
-            promotion()
+            promotion(),
+            task(),
+            any::<u64>().prop_map(|seq| Payload::Taken(TakenRecord { seq }))
         ]
     }
 
@@ -1004,11 +1016,11 @@ mod tests {
     #[test]
     fn unknown_payload_tag() {
         assert_eq!(
-            Payload::decode(&[12]),
+            Payload::decode(&[14]),
             Err(DecodeError::BadTag {
                 at: 0,
                 what: "payload",
-                tag: 12
+                tag: 14
             })
         );
         assert_eq!(
