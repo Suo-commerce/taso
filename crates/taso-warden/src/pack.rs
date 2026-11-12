@@ -2132,6 +2132,22 @@ impl<S: ObjectStore, X: Sender> Packs<S, X> {
         let (key, _) = self.key_of(&item.pack.name)?;
         Ok(self.store.delete(&key)?)
     }
+
+    /// Delete the file pack `name` a purge leaves no room for
+    /// (generation 3, G5): one of a purged Chronicle that no other
+    /// Chronicle holds, inventoried or not (a pack a fenced Warden put
+    /// after the commit).  The caller has it from the coordinator's purge
+    /// projection; anything but a file pack is refused, so a replacement
+    /// (`<end>-<base>-0`) is never touched.  `Ok(false)` if already gone.
+    pub fn delete_purged_file_pack(&self, name: &str) -> Result<bool, PackError> {
+        let (key, n) = self.key_of(name)?;
+        if n.fs_to.is_none() {
+            return Err(PackError::Refused(format!(
+                "pack {name} is not a file pack: a purge leaves it"
+            )));
+        }
+        Ok(self.store.delete(&key)?)
+    }
 }
 
 /// [`FRAMES_DOMAIN`] digest of frames as a pack stores them.
@@ -2798,6 +2814,30 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![6, 9]
         );
+    }
+
+    /// Generation 3, G5: a purge's leftover file pack is deleted; a pack
+    /// that is not a file pack (a replacement, a log pack) is refused.
+    #[test]
+    fn a_purge_deletes_file_packs_only() {
+        let e = env();
+        let mut log = Log::new();
+        log.fill(6, &[6]);
+        log.publish(&e, 6, 100, None).unwrap();
+        let names = e.packs.pack_names().unwrap();
+        let fs = names
+            .iter()
+            .find(|n| name_bounds(n).is_some_and(|(_, _, f)| f.is_some()))
+            .unwrap()
+            .clone();
+        let replacement = taso_core::contract::replacement_name(&fs).unwrap();
+        assert!(matches!(
+            e.packs.delete_purged_file_pack(&replacement),
+            Err(PackError::Refused(_))
+        ));
+        assert!(e.packs.delete_purged_file_pack(&fs).unwrap());
+        assert!(!e.packs.delete_purged_file_pack(&fs).unwrap(), "gone");
+        assert!(!e.packs.pack_names().unwrap().contains(&fs));
     }
 
     /// F4 (fencing review 2026-10-17): a dispatch flush cannot ship the
