@@ -300,6 +300,18 @@ impl Purger {
                 n_lost += 1;
             }
         }
+        // 5b. What is left of the Chronicle's file packs, inventoried or not
+        // (generation 3, G5; finding 1.6): a pack an old holder put after
+        // the commit (its put asks nobody).  The purge's claim covers it,
+        // and its end is refused while one is left.
+        for it in self.coord.purge_projection(id)? {
+            if packs.delete_purged_file_pack(&it.pack.name)? {
+                eprintln!(
+                    "taso-warden: purge of {id:?}: deleted {}, a file pack put after the commit",
+                    it.pack.name
+                );
+            }
+        }
         // 6.
         self.stop("purge.before_history_verify")?;
         let attestation = if n_lost == 0 {
