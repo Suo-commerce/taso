@@ -978,6 +978,7 @@ impl Default for LogConfig {
             timing: coordlog::Config {
                 announce_ttl: 600,
                 deleted_quarantine: DELETED_QUARANTINE,
+                refusal_kept: coordlog::REFUSAL_KEPT_SECONDS,
             },
             clock: Arc::new(|| {
                 std::time::SystemTime::now()
@@ -1931,6 +1932,7 @@ impl Coord for Coordinator {
                 chronicle,
                 epoch,
                 submission,
+                now: (shared.config.clock)(),
             };
             // A cancel under a stale epoch changes nothing in the log
             // (generation 3, G2): it is not journalled.
