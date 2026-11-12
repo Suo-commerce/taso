@@ -64,6 +64,12 @@ rm -rf /var/tmp/taso-p2blk.* /var/tmp/taso-p3.* /var/tmp/taso-f6fork.* \
 find /root -maxdepth 1 -mtime +"$KEEP_DAYS" \
      \( -name 'taso-gate-*' -o -name 'taso-f6-fork-*' -o -name 'release-*-quick-*' -o -name 'release-*-full-*' \) \
      -exec rm -rf {} +
+# The full gates' large logs and images (2026-11-10: 14 GB left): each
+# gate makes its own again at its start.
+if [ "$TIER" = clean ]; then
+    rm -f /var/lib/taso-blk/crash.log /var/lib/taso-blk/bench.log \
+          /var/lib/taso-blk/bench-base.img /var/lib/taso-blk/fst.log
+fi
 if [ "$TIER" = clean ]; then echo "release-gate: cleaned; $(free_gib) GiB free"; exit 0; fi
 need=$MIN_FREE_QUICK; [ "$TIER" = full ] && need=$MIN_FREE_FULL
 [ "$(free_gib)" -ge "$need" ] || die "$(free_gib) GiB free, $TIER needs $need (old clones' target/ folders: cargo clean)"
