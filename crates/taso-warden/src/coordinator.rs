@@ -632,6 +632,14 @@ pub trait Coord: Send + Sync {
         let _ = key;
         Err(no_log())
     }
+
+    /// The Chronicles whose purge ended within the last `within` seconds,
+    /// at the coordinator's clock ([`taso_core::coordlog::CoordLog::purged_since`],
+    /// generation 3, G5-2).  Read-only.
+    fn purged_within(&self, within: u64) -> Result<Vec<ChronicleId>, CoordError> {
+        let _ = within;
+        Err(no_log())
+    }
 }
 
 /// The answer of a coordinator with no coordinator log.
@@ -2014,6 +2022,11 @@ impl Coord for Coordinator {
     ) -> Result<Option<taso_core::coordlog::ReclaimBlocker>, CoordError> {
         let now = (self.shared.config.clock)();
         self.read_log(move |log| log.reclaim_blocker(key, now))
+    }
+
+    fn purged_within(&self, within: u64) -> Result<Vec<ChronicleId>, CoordError> {
+        let since = (self.shared.config.clock)().saturating_sub(within);
+        self.read_log(move |log| log.purged_since(since))
     }
 }
 
