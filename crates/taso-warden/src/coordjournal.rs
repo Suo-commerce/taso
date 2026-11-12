@@ -103,6 +103,9 @@ pub enum Op {
         epoch: Epoch,
         /// The submission.
         submission: HashVal,
+        /// The coordinator's time (generation 3, G3: a refusal is kept
+        /// with its time).
+        now: u64,
     },
     /// An effect obligation opened or closed by an accepted append
     /// (tag 6, §1.5, D33).
@@ -191,7 +194,8 @@ pub fn apply(log: &mut CoordLog, op: &Op, store: &dyn StoreView) -> Done {
             chronicle,
             epoch,
             submission,
-        } => Done::Answer(log.cancel(*chronicle, *epoch, *submission)),
+            now,
+        } => Done::Answer(log.cancel(*chronicle, *epoch, *submission, *now)),
         Op::Obligation {
             chronicle,
             op,
@@ -711,11 +715,13 @@ fn put_op(o: &mut Canon, op: &Op) {
             chronicle,
             epoch,
             submission,
+            now,
         } => {
             o.tag(5)
                 .fixed(chronicle.as_bytes())
                 .u64(epoch.get())
-                .fixed(submission.as_bytes());
+                .fixed(submission.as_bytes())
+                .u64(*now);
         }
         Op::Obligation {
             chronicle,
@@ -769,6 +775,7 @@ fn get_op(r: &mut Rd<'_>) -> Result<Op, JournalError> {
             chronicle: chron(r)?,
             epoch: epoch(r)?,
             submission: hash(r)?,
+            now: r.u64()?,
         },
         6 => Op::Obligation {
             chronicle: chron(r)?,
@@ -1189,6 +1196,7 @@ mod tests {
                 chronicle: c(1),
                 epoch: Epoch::FIRST,
                 submission: h(4),
+                now: 83,
             },
             Op::Obligation {
                 chronicle: c(1),
