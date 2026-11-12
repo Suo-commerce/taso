@@ -732,7 +732,11 @@ impl CoordLog {
     }
 
     /// Cancel a submission: `FinalRefused { Cancelled }`, or the existing
-    /// answer if it was accepted or refused already.  Idempotent.
+    /// answer if it was accepted or refused already.  Idempotent.  Under an
+    /// epoch that is not the Chronicle's it is refused `StaleEpoch` and
+    /// changes nothing (generation 3, G2; audit 2026-11-09, Y5): it used to
+    /// keep the id as cancelled, so the holder's accept of its pending
+    /// submission was refused `Cancelled`.
     pub fn cancel(&mut self, chronicle: ChronicleId, epoch: Epoch, submission: HashVal) -> Answer {
         let s = *submission.as_bytes();
         let key = (*chronicle.as_bytes(), s);
@@ -746,7 +750,10 @@ impl CoordLog {
             return Answer::FinalRefused(f.clone());
         }
         if let Some(ch) = self.chrons.get_mut(chronicle.as_bytes()) {
-            if ch.epoch == epoch && ch.pending.as_ref().is_some_and(|p| p.submission == s) {
+            if ch.epoch != epoch {
+                return Answer::FinalRefused(Final::StaleEpoch);
+            }
+            if ch.pending.as_ref().is_some_and(|p| p.submission == s) {
                 ch.pending = None;
             }
         }
@@ -3322,6 +3329,56 @@ mod tests {
                 Final::Predicate("held".into())
             );
         }
+    }
+
+    /// Generation 3, G2 (audit 2026-11-09, Y5): a cancel under an epoch
+    /// that is not the Chronicle's is refused `StaleEpoch` by the log
+    /// itself and changes nothing: the pending submission is still
+    /// accepted under the current epoch.  A cancel under the current epoch
+    /// cancels; a final answer is repeated whatever the epoch.
+    #[test]
+    fn a_cancel_under_a_stale_epoch_changes_nothing() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let e = w.epoch(f.v);
+        let stale = Epoch::new(e.get() + 7);
+        let r = Submitted::Contract(ContractRecord::Candidate(Box::new(f.k.clone())));
+        let s = sub(&r, e, 1);
+        w.log
+            .announce(f.v, e, s, r.logical_id(), r.digest(), w.now)
+            .unwrap();
+        assert_eq!(
+            w.log.cancel(f.v, stale, s),
+            Answer::FinalRefused(Final::StaleEpoch)
+        );
+        assert_eq!(
+            w.log.query_submission(f.v, s),
+            SubmissionStatus::AbsentAtRead,
+            "not final"
+        );
+        w.store.ship(f.v, "p1", &r);
+        let head = w.head(f.v);
+        let a = w
+            .log
+            .accept(f.v, e, s, head, "p1", r.clone(), w.store, w.now);
+        assert!(matches!(a, Answer::Accepted { .. }), "{a:?}");
+        // Final now: any epoch's cancel repeats the answer.
+        assert!(matches!(
+            w.log.cancel(f.v, stale, s),
+            Answer::AlreadyAccepted { .. }
+        ));
+        // Under the current epoch a cancel cancels.
+        let s2 = sub(&r, e, 2);
+        assert_eq!(
+            w.log.cancel(f.v, e, s2),
+            Answer::FinalRefused(Final::Cancelled)
+        );
     }
 
     /// Finding 3.2: `accept_reads` makes the reads `accept` makes, in
