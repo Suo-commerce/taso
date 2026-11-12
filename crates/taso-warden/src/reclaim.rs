@@ -29,7 +29,11 @@
 //! (a claim accepted and a crash before its delete or its resolution:
 //! otherwise the key could never be held again), then looks at every
 //! content object.  Packs are never reclaimed: a pack is deleted only by
-//! its purge's claim.  Tombstones are retained history, never orphans.
+//! its purge's claim.  Last, under that claim, it deletes every file pack
+//! of a Chronicle whose purge ended within the last week that no other
+//! Chronicle holds: one put after the purge ended, by a Warden cut off
+//! from the coordinator (generation 3, G5-2).  Tombstones are retained
+//! history, never orphans.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,7 +41,7 @@ use std::time::{Duration, SystemTime};
 
 use taso_core::contract::{logical_id, ContractRecord, LogicalKey, ObjectKind, ReclaimOutcome};
 use taso_core::coordlog::ReclaimBlocker;
-use taso_core::envelope::HashVal;
+use taso_core::envelope::{ChronicleId, HashVal};
 use taso_core::model::WardenId;
 
 use crate::coordinator::Coord;
@@ -81,6 +85,11 @@ pub struct Reclaimer {
     pub grace: Duration,
 }
 
+/// How long after a purge's end the reclaimer looks for its file packs
+/// (step 3, generation 3, G5-2): a week.  A Warden cut off from the
+/// coordinator that long has stopped its Vessels long before.
+pub const STRAY_PACK_WINDOW: Duration = Duration::from_secs(7 * 86_400);
+
 /// What one pass did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pass {
@@ -92,6 +101,9 @@ pub struct Pass {
     pub reclaimed: Vec<(HashVal, ReclaimOutcome)>,
     /// Claims refused: held, claimed, quarantined, or not the next number.
     pub refused: usize,
+    /// File packs of a purged Chronicle deleted (step 3, generation 3,
+    /// G5-2): (Chronicle, pack name).
+    pub swept: Vec<(ChronicleId, String)>,
     /// What went wrong, by object; each is tried again at the next pass.
     pub failed: Vec<String>,
 }
@@ -204,7 +216,49 @@ impl Reclaimer {
                 self.reclaim(l, key, kind, &mut pass);
             }
         }
+
+        // 3. File packs that landed after a purge ended (generation 3,
+        //    G5-2; finding 1.6): a Warden that reached the store but not
+        //    the coordinator never learnt it was fenced, and each of its
+        //    publishes puts a pack again.  Every file pack of a purged
+        //    Chronicle that no other Chronicle holds is the purge's to
+        //    delete, so no claim is made: the coordinator's purge
+        //    projection names them, as it did for the purge's own end.
+        //    Only purges that ended within the last week are looked at.
+        let purged = self
+            .coord
+            .purged_within(STRAY_PACK_WINDOW.as_secs())
+            .map_err(|e| format!("the coordinator: {e}"))?;
+        for id in purged {
+            if let Err(e) = self.sweep(id, &mut pass) {
+                pass.failed.push(format!("{id:?}: {e}"));
+            }
+        }
         Ok(pass)
+    }
+
+    /// Step 3 for one purged Chronicle.
+    fn sweep(&self, id: ChronicleId, pass: &mut Pass) -> Result<(), String> {
+        let left = self.coord.purge_projection(id).map_err(|e| e.to_string())?;
+        if left.is_empty() {
+            return Ok(());
+        }
+        let packs =
+            crate::pack::Packs::new(self.store.clone(), crate::ship::NoSend, &self.prefix, id)
+                .map_err(|e| e.to_string())?;
+        for it in left {
+            if packs
+                .delete_purged_file_pack(&it.pack.name)
+                .map_err(|e| e.to_string())?
+            {
+                eprintln!(
+                    "taso-warden: reclaim: deleted {} of purged {id:?}, put after its purge ended",
+                    it.pack.name
+                );
+                pass.swept.push((id, it.pack.name));
+            }
+        }
+        Ok(())
     }
 
     /// This Warden's Chronicle's local directory (as [`WardenLog::open`]
