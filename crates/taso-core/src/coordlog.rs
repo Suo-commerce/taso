@@ -840,6 +840,10 @@ impl CoordLog {
         if ch.head != expected_head {
             return Answer::Refused(Transient::HeadMoved { head: ch.head });
         }
+        // 4b. Rules that hold whatever the store says (generation 3, G4).
+        if let Some(why) = self.refused_by_rule(chronicle, &record) {
+            return self.finalize(chronicle, s, Final::Predicate(why.into()));
+        }
         // 5. Readability.
         if !store.carries(chronicle, pack, digest) {
             return Answer::Refused(Transient::NotReadable);
@@ -1099,11 +1103,10 @@ impl CoordLog {
         }
     }
 
-    /// Why the coordinator refuses `record` for `chronicle` before this log
-    /// runs it, if it does (D&D C1 (a), audit 2026-11-09).  The log accepts
-    /// these; tightening its own rules would change answers that journals
-    /// already hold, and replay compares them, so they are checked here and
-    /// the log's rules wait for the next planned format break.
+    /// Why `record` is refused for `chronicle`, whatever the store says
+    /// (step 4b of [`CoordLog::accept`]; audit 2026-11-09, D&D C1 (a)).  These
+    /// were the coordinator's checks before generation 3; they are the log's
+    /// own rules since (G4).
     ///
     /// - A Birth of a Chronicle whose purge is committed: its hold on the
     ///   layer it names would never be released.
@@ -1114,11 +1117,7 @@ impl CoordLog {
     /// - A purge of a sanction's target that is not ready yet: its
     ///   `TemplateReady` would be refused for good, and the source's
     ///   sanction would never end.
-    pub fn refused_before_accept(
-        &self,
-        chronicle: ChronicleId,
-        record: &Submitted,
-    ) -> Option<&'static str> {
+    fn refused_by_rule(&self, chronicle: ChronicleId, record: &Submitted) -> Option<&'static str> {
         use crate::contract::{logical_id, CloseKind, Decision};
         let log = self;
         let accepted = |key: LogicalKey| match log.query_logical(logical_id(&key)) {
@@ -2726,9 +2725,7 @@ mod tests {
         };
         // The Candidate's own logical id is no verdict.
         assert!(
-            w.log
-                .refused_before_accept(f.v, &close(cand.logical_id()))
-                .is_some(),
+            by_rule(&mut w, f.v, close(cand.logical_id())),
             "a Never close naming no verdict"
         );
         // A real Never verdict of the Candidate.
@@ -2745,10 +2742,10 @@ mod tests {
         );
         let vr = ContractRecord::VerdictSubmitted(Box::new(vd));
         w.ok(f.v, vr.clone());
-        assert_eq!(
-            w.log.refused_before_accept(f.v, &close(vr.logical_id())),
-            None
-        );
+        let Submitted::Contract(ok) = close(vr.logical_id()) else {
+            unreachable!()
+        };
+        w.ok(f.v, ok);
     }
 
     /// A verdict's facts, artifact, requirement and exclusion set must be
@@ -2768,17 +2765,23 @@ mod tests {
         let as_rec = |v: &VerdictSubmitted| {
             Submitted::Contract(ContractRecord::VerdictSubmitted(Box::new(v.clone())))
         };
-        assert_eq!(w.log.refused_before_accept(f.v, &as_rec(&good)), None);
-        let mut facts = good.clone();
-        facts.request.facts_hash = h(0xEE);
-        let mut artifact = good.clone();
-        artifact.request.artifact_key = h(0xEF);
-        let mut exclude = good.clone();
-        exclude.request.exclude = BTreeSet::new();
-        assert_ne!(exclude.request.exclude, f.k.exclude, "the case is real");
-        for bad in [facts, artifact, exclude] {
-            assert!(w.log.refused_before_accept(f.v, &as_rec(&bad)).is_some());
+        // Each a whole, consistent verdict over a Candidate that differs
+        // in one thing.
+        let mut facts = f.k.clone();
+        facts.facts_hash = h(0xEE);
+        let mut artifact = f.k.clone();
+        artifact.artifact_key = h(0xEF);
+        let mut exclude = f.k.clone();
+        exclude.exclude = BTreeSet::new();
+        assert_ne!(exclude.exclude, f.k.exclude, "the case is real");
+        for other in [facts, artifact, exclude] {
+            let bad = verdict(&other, &fin, Decision::Sanction);
+            assert!(by_rule(&mut w, f.v, as_rec(&bad)));
         }
+        let Submitted::Contract(good) = as_rec(&good) else {
+            unreachable!()
+        };
+        w.ok(f.v, good);
     }
 
     /// A Birth of a Chronicle whose purge is committed added a hold that
@@ -2814,14 +2817,9 @@ mod tests {
                 ledger_pos: Lsn::new(0),
             },
         };
-        assert_eq!(
-            w.log.refused_before_accept(v, &birth),
-            None,
-            "not retired yet"
-        );
         let (pc, _) = purge_inventory(&mut w, v);
         w.ok(v, ContractRecord::PurgeCommitted(pc));
-        assert!(w.log.refused_before_accept(v, &birth).is_some());
+        assert!(by_rule(&mut w, v, birth));
     }
 
     /// A purge of a sanction's target that is not ready yet would make its
@@ -2844,14 +2842,28 @@ mod tests {
             .unwrap();
         let (pc, _) = purge_inventory(&mut w, s.template_id);
         let purge = Submitted::Contract(ContractRecord::PurgeCommitted(pc));
-        assert!(w.log.refused_before_accept(s.template_id, &purge).is_some());
+        assert!(by_rule(&mut w, s.template_id, purge));
         w.ok(s.template_id, ready(&s, f.v));
-        assert_eq!(
-            w.log.refused_before_accept(s.template_id, &purge),
-            None,
-            "once ready, a purge is the log's to decide"
-        );
+        // Once ready, the purge is accepted.
+        w.ok(s.template_id, ContractRecord::PurgeCommitted(pc));
     }
+
+    /// Submit `r` through the log: whether it was refused for good by one
+    /// of the rules C1 named (generation 3, G4: the log's own rules).
+    fn by_rule(w: &mut W<'_>, c: ChronicleId, r: Submitted) -> bool {
+        match w.submit(c, r) {
+            Answer::FinalRefused(Final::Predicate(why)) => C1_RULES.iter().any(|r| *r == &*why),
+            _ => false,
+        }
+    }
+
+    /// The reasons of the rules C1 named.
+    const C1_RULES: [&str; 4] = [
+        "the Chronicle is retired: its purge is committed",
+        "the verdict's facts, artifact, requirement or exclusion set are not the Candidate's",
+        "no such verdict: a Never close names an accepted Never verdict of its Candidate",
+        "the Chronicle is a sanction's target that is not ready yet",
+    ];
 
     // ── Expiry (audit 2026-11-09) ───────────────────────────────────
 
