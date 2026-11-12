@@ -56,6 +56,12 @@
 //! fdatasyncs, timed, before anything else, into `--first-write-samples`
 //! (microseconds, one line).
 //!
+//! The soak's steady load (D&D SOAK2 (a), 2026-11-10): `--keep-rows N`
+//! deletes, in each transaction, the rows older than the newest N, so the
+//! database stays flat (0: keep every row); `--nominate-every N` asks for
+//! the nominations on every N-th run only, the run whose last turn is a
+//! multiple of N times `--turns` (1: every run).
+//!
 //! `--bare` runs the same writes with no Field at all: the baseline the
 //! gate compares against ("p95 write latency ≤ 1.5× bare local NVMe").
 //!
@@ -106,6 +112,10 @@ struct Opts {
     promote: Vec<String>,
     /// Nominations asked for after the last turn: the classes each drops.
     nominate: Vec<Vec<String>>,
+    /// Keep only the newest this many rows (0: all).
+    keep_rows: u64,
+    /// Nominate on every this-many-th run only (1: every run).
+    nominate_every: u64,
     /// Driven one operation at a time through files in this directory
     /// (P5 E3); no turns of its own.
     step: Option<PathBuf>,
@@ -133,6 +143,8 @@ impl Default for Opts {
             forks: 0,
             promote: Vec::new(),
             nominate: Vec::new(),
+            keep_rows: 0,
+            nominate_every: 1,
             step: None,
             big_file_mib: 0,
             first_write_samples: None,
@@ -173,6 +185,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                     .map(str::to_string)
                     .collect(),
             ),
+            "--keep-rows" => o.keep_rows = num(val()?)?,
+            "--nominate-every" => o.nominate_every = num(val()?)?,
             "--step" => o.step = Some(val()?.into()),
             "--big-file-mib" => o.big_file_mib = num(val()?)?,
             "--first-write-samples" => o.first_write_samples = Some(val()?.into()),
@@ -187,6 +201,9 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     }
     if o.turns == 0 || o.txns == 0 || o.rows == 0 {
         return Err("--turns, --txns and --rows must be positive".into());
+    }
+    if o.nominate_every == 0 {
+        return Err("--nominate-every must be positive".into());
     }
     Ok(o)
 }
@@ -357,6 +374,7 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
                         .map_err(|e| e.to_string())?;
                 }
             }
+            keep_newest(&tx, o.keep_rows).map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
             writes.push(t.elapsed());
         }
@@ -409,7 +427,13 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
         }
     }
     let mut nominations = Vec::new();
-    for exclude in if promoted { &[][..] } else { &o.nominate[..] } {
+    let nominate_now =
+        !promoted && turns > 0 && nominates(first + turns - 1, o.turns, o.nominate_every);
+    for exclude in if nominate_now {
+        &o.nominate[..]
+    } else {
+        &[][..]
+    } {
         nominations.push(
             match field.ask(Request::Nominate {
                 seal: None,
@@ -461,6 +485,23 @@ fn run(o: &Opts, field: Option<&std::path::Path>) -> Result<serde_json::Value, S
         "forks": forks,
         "first_write_ms": first_write.map(|d| d.as_secs_f64() * 1000.0),
     }))
+}
+
+/// `--keep-rows`: delete every row older than the newest `keep` (by rowid,
+/// the order they were written in); 0 keeps them all.  The rows deleted.
+fn keep_newest(db: &rusqlite::Connection, keep: u64) -> rusqlite::Result<usize> {
+    if keep == 0 {
+        return Ok(0);
+    }
+    db.execute(
+        "DELETE FROM events WHERE rowid <= (SELECT max(rowid) FROM events) - ?1",
+        [i64::try_from(keep).unwrap_or(i64::MAX)],
+    )
+}
+
+/// `--nominate-every`: whether a run whose last turn is `last` nominates.
+fn nominates(last: u64, turns: u64, every: u64) -> bool {
+    (last / turns).is_multiple_of(every)
 }
 
 fn main() -> ExitCode {
@@ -771,6 +812,47 @@ mod step {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The soak's steady load (SOAK2 (a)): `--keep-rows` keeps the newest
+    /// rows only, so the database stays flat; 0 keeps them all.
+    #[test]
+    fn keep_rows_keeps_the_newest_only() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE events (turn INTEGER, n INTEGER, body BLOB)")
+            .unwrap();
+        let count = |db: &rusqlite::Connection| -> i64 {
+            db.query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+                .unwrap()
+        };
+        for t in 0..10i64 {
+            for n in 0..8i64 {
+                db.execute("INSERT INTO events VALUES (?1, ?2, x'00')", [t, n])
+                    .unwrap();
+            }
+            keep_newest(&db, 20).unwrap();
+            assert!(count(&db) <= 20, "turn {t}: {}", count(&db));
+        }
+        assert_eq!(count(&db), 20);
+        let oldest: i64 = db
+            .query_row("SELECT min(turn * 100 + n) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(oldest, 7 * 100 + 4, "the newest 20 of 80: turn 7 row 4 on");
+        assert_eq!(keep_newest(&db, 0).unwrap(), 0);
+        assert_eq!(count(&db), 20);
+    }
+
+    /// `--nominate-every N`: one run in N nominates (the run whose last
+    /// turn is a multiple of N times `--turns`); 1 is every run.
+    #[test]
+    fn nominate_every_nominates_one_run_in_n() {
+        let runs: Vec<bool> = (1..=20).map(|r| nominates(r * 4, 4, 10)).collect();
+        assert_eq!(runs.iter().filter(|n| **n).count(), 2);
+        assert!(runs[9] && runs[19]);
+        assert!((1..=7).all(|r| nominates(r * 4, 4, 1)));
+        let o = parse(&s(&["--keep-rows", "400", "--nominate-every", "10"])).unwrap();
+        assert_eq!((o.keep_rows, o.nominate_every), (400, 10));
+        assert!(parse(&s(&["--nominate-every", "0"])).is_err());
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
