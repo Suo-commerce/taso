@@ -4024,57 +4024,60 @@ mod tests {
         }
     }
 
+    /// The file pack an old holder ships after a purge's commit: made by
+    /// the Vessel of [`nominated`] (`b"a"`) in another cluster, one Seal
+    /// further on.  Its store key, its name and its bytes.
+    fn late_pack() -> (String, String, Vec<u8>) {
+        use std::io::Read;
+        let c2 = Cluster::new();
+        let (_h, mut v, packs, _cand) = nominated(&c2, b"a", c2.t0, VCONF);
+        let (before, _) = fs_pack_names(&packs);
+        v.append(Stream::Fs, Payload::Raw(vec![2; 8])).unwrap();
+        let s2 = v
+            .seal(
+                StreamCut::EMPTY,
+                Verdict::Clean,
+                Lsn::new(0),
+                TurnId::new(2),
+            )
+            .unwrap()
+            .seal;
+        let snap = crate::storage::Snapshot {
+            dataset: v.dataset().clone(),
+            seal: s2.lsn,
+            guid: crate::vessel::tests::fake_guid(s2.lsn),
+            seal_hash: Some(s2.hash),
+        };
+        v.publish_seal(&packs, &snap, None).unwrap();
+        let name = fs_pack_names(&packs)
+            .0
+            .into_iter()
+            .find(|n| !before.contains(n))
+            .unwrap();
+        let key = c2
+            .store
+            .list(PREFIX)
+            .unwrap()
+            .into_iter()
+            .find(|k| k.ends_with(&name))
+            .unwrap();
+        let mut bytes = Vec::new();
+        c2.store
+            .get(&key)
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        (key, name, bytes)
+    }
+
     /// Generation 3, G5 (finding 1.6): a file pack that lands after the
     /// commit (a fenced Warden's put, here the original put again after
     /// its delete) is deleted by the purge before its end, and the purge
     /// ends Complete with only the replacement left.
     #[test]
     fn a_pack_put_after_the_commit_is_deleted_by_the_purge() {
-        use std::io::Read;
-        // The pack an old holder ships after the commit: made here by the
-        // same Vessel in another cluster, one Seal further on.
-        let late = {
-            let c2 = Cluster::new();
-            let (_h, mut v, packs, _cand) = nominated(&c2, b"a", c2.t0, VCONF);
-            let (before, _) = fs_pack_names(&packs);
-            v.append(Stream::Fs, Payload::Raw(vec![2; 8])).unwrap();
-            let s2 = v
-                .seal(
-                    StreamCut::EMPTY,
-                    Verdict::Clean,
-                    Lsn::new(0),
-                    TurnId::new(2),
-                )
-                .unwrap()
-                .seal;
-            let snap = crate::storage::Snapshot {
-                dataset: v.dataset().clone(),
-                seal: s2.lsn,
-                guid: crate::vessel::tests::fake_guid(s2.lsn),
-                seal_hash: Some(s2.hash),
-            };
-            v.publish_seal(&packs, &snap, None).unwrap();
-            let name = fs_pack_names(&packs)
-                .0
-                .into_iter()
-                .find(|n| !before.contains(n))
-                .unwrap();
-            let key = c2
-                .store
-                .list(PREFIX)
-                .unwrap()
-                .into_iter()
-                .find(|k| k.ends_with(&name))
-                .unwrap();
-            let mut bytes = Vec::new();
-            c2.store
-                .get(&key)
-                .unwrap()
-                .unwrap()
-                .read_to_end(&mut bytes)
-                .unwrap();
-            (key, name, bytes)
-        };
+        let late = late_pack();
         let c = Cluster::new();
         let (h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
         let (fs_before, _) = fs_pack_names(&packs);
@@ -4095,6 +4098,34 @@ mod tests {
         let out = purger(&c).purge(&h.pool, &mut v, &packs).unwrap();
         assert!(matches!(out, Purged::Complete { items: 1, .. }), "{out:?}");
         assert!(fs_pack_names(&packs).0.is_empty(), "deleted by the purge");
+        let replacement = taso_core::contract::replacement_name(&fs_before[0]).unwrap();
+        assert!(packs.has_pack(&replacement).unwrap());
+    }
+
+    /// Generation 3, G5-2: a file pack that lands after the purge ended
+    /// is deleted by the next reclaim pass (within a week of the end); the
+    /// replacement stays.
+    #[test]
+    fn a_pack_put_after_the_purge_ended_is_deleted_by_the_reclaimer() {
+        let c = Cluster::new();
+        let (h, mut v, packs, _cand) = nominated(&c, b"a", c.t0, VCONF);
+        let (fs_before, _) = fs_pack_names(&packs);
+        let out = purger(&c).purge(&h.pool, &mut v, &packs).unwrap();
+        assert!(matches!(out, Purged::Complete { .. }), "{out:?}");
+        let (key, name, bytes) = late_pack();
+        c.store.put(&key, &mut std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(fs_pack_names(&packs).0, vec![name.clone()]);
+        let r = crate::reclaim::Reclaimer {
+            coord: c.coord.clone(),
+            store: c.store.clone(),
+            prefix: PREFIX.into(),
+            warden: WardenId::new(9),
+            state_dir: c.dir.path().join("reclaimer"),
+            grace: Duration::from_secs(3600),
+        };
+        let pass = r.pass(SystemTime::now()).unwrap();
+        assert_eq!(pass.swept, vec![(v.id(), name)]);
+        assert!(fs_pack_names(&packs).0.is_empty());
         let replacement = taso_core::contract::replacement_name(&fs_before[0]).unwrap();
         assert!(packs.has_pack(&replacement).unwrap());
     }
