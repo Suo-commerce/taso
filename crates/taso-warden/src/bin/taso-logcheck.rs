@@ -207,6 +207,14 @@ fn describe(v: &mut Value, payload: Option<Payload>) {
             o.insert("digest".into(), json!(r.digest().to_string()));
             "contract"
         }
+        Some(Payload::Task(t)) => {
+            o.insert("seq".into(), json!(t.seq));
+            "task"
+        }
+        Some(Payload::Taken(t)) => {
+            o.insert("seq".into(), json!(t.seq));
+            "taken"
+        }
         Some(Payload::Promotion(p)) => {
             let child: String = p
                 .child
