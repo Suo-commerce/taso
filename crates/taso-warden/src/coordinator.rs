@@ -1899,33 +1899,6 @@ impl Coord for Coordinator {
         let shared = self.shared.clone();
         self.write(move |t| {
             holder_synced(&shared, t, warden, chronicle)?;
-            // What the log accepts but must not (D&D C1 (a)): refused here,
-            // before the log runs the record.  The submission is cancelled
-            // through the log, an operation journals already replay, so
-            // the Chronicle is not left with it pending; the Warden is
-            // told why.
-            let refusal = {
-                let mut g = shared.log.lock().unwrap_or_else(|e| e.into_inner());
-                let log = loaded(&mut g, &shared, &t.journal)?;
-                log.refused_before_accept(chronicle, &record)
-            };
-            if let Some(why) = refusal {
-                let op = Op::Cancel {
-                    chronicle,
-                    epoch,
-                    submission,
-                };
-                return match journal(&shared, t, op)? {
-                    // Cancelled now, or the answer was final already.
-                    Done::Answer(Answer::FinalRefused(taso_core::coordlog::Final::Cancelled)) => {
-                        Ok(Answer::FinalRefused(taso_core::coordlog::Final::Predicate(
-                            why.into(),
-                        )))
-                    }
-                    Done::Answer(a) => Ok(a),
-                    _ => unreachable!("a cancel answers"),
-                };
-            }
             let now = (shared.config.clock)();
             let op = Op::Accept {
                 chronicle,
@@ -4204,10 +4177,12 @@ mod log_tests {
         );
     }
 
-    /// D&D C1 (a): a record the log would accept but must not (here a
-    /// `Never` close naming no verdict) is refused before the log runs
-    /// it, with the reason, and the submission is cancelled through the
-    /// log: the Chronicle's next submission is not held up by it.
+    /// D&D C1 (a): a record that breaks one of C1's rules (here a `Never`
+    /// close naming no verdict) is refused for good, with the reason, and
+    /// leaves nothing pending: the Chronicle's next submission is not held
+    /// up by it.  The coordinator refused these before the log ran them
+    /// until generation 3; the log's own rule does since (G4), and the
+    /// name of the test is kept.
     #[test]
     fn a_record_refused_before_the_log_leaves_nothing_pending() {
         use taso_core::contract::{CandidateClosed, CloseKind, ContractRecord};
