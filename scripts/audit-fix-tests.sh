@@ -74,6 +74,11 @@ one an_env_that_steers_the_loader_is_refused_when_read $W
 one each_seal_carries_the_effects_adopted_up_to_it $W
 one a_cancel_under_a_stale_epoch_changes_nothing -p taso-core --lib
 one a_refusal_is_answered_the_same_until_it_is_forgotten -p taso-core --lib
+one a_purge_ends_only_with_no_file_pack_of_the_chronicle_left -p taso-core --lib
+one a_purge_deletes_file_packs_only $W
+one a_pack_put_after_the_commit_is_deleted_by_the_purge $W
+one a_pack_put_after_the_purge_ended_is_deleted_by_the_reclaimer $W
+one purged_within_crosses_the_socket $W
 one a_resume_never_refuses_a_genesis_from_an_object_that_is_not_its_keys $W
 one a_genesis_finished_elsewhere_does_not_leave_the_first_nodes_scratch $W
 # The reclaimer
