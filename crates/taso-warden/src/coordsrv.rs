@@ -59,6 +59,7 @@
 //!  22 query_entry       log position (8)
 //!  23 open_work         chronicle (16)
 //!  24 reclaim_blocker   content key (32)
+//!  25 purged_within     seconds (8)
 //!
 //! reply    status (1) · body
 //!   0 ok         head (48) | epoch (8) | ownership: epoch · holder · sealed_prefix (64)
@@ -201,6 +202,7 @@ const OP_PURGE_BLOCKER: u8 = 21;
 const OP_QUERY_ENTRY: u8 = 22;
 const OP_OPEN_WORK: u8 = 23;
 const OP_RECLAIM_BLOCKER: u8 = 24;
+const OP_PURGED_WITHIN: u8 = 25;
 
 /// The most envelopes one batched append carries.
 const MAX_BATCH: u32 = 4096;
@@ -338,6 +340,9 @@ enum Request {
     },
     ReclaimBlocker {
         key: HashVal,
+    },
+    PurgedWithin {
+        within: u64,
     },
 }
 
@@ -660,6 +665,7 @@ impl Request {
             Self::PurgeBlocker { chronicle } => o.u8(OP_PURGE_BLOCKER).bytes(chronicle.as_bytes()),
             Self::QueryEntry { pos } => o.u8(OP_QUERY_ENTRY).u64(*pos),
             Self::ReclaimBlocker { key } => o.u8(OP_RECLAIM_BLOCKER).bytes(key.as_bytes()),
+            Self::PurgedWithin { within } => o.u8(OP_PURGED_WITHIN).u64(*within),
         };
         o.0
     }
@@ -795,6 +801,7 @@ impl Request {
             },
             OP_QUERY_ENTRY => Self::QueryEntry { pos: i.u64()? },
             OP_RECLAIM_BLOCKER => Self::ReclaimBlocker { key: i.hash()? },
+            OP_PURGED_WITHIN => Self::PurgedWithin { within: i.u64()? },
             _ => return Err(Malformed("unknown operation")),
         };
         i.end()?;
@@ -829,7 +836,8 @@ impl Request {
             | Self::OpenWork { .. }
             | Self::PurgeBlocker { .. }
             | Self::QueryEntry { .. }
-            | Self::ReclaimBlocker { .. } => None,
+            | Self::ReclaimBlocker { .. }
+            | Self::PurgedWithin { .. } => None,
         }
     }
 
@@ -857,7 +865,8 @@ impl Request {
             | Self::OpenWork { .. }
             | Self::PurgeBlocker { .. }
             | Self::QueryEntry { .. }
-            | Self::ReclaimBlocker { .. } => OkKind::Blob,
+            | Self::ReclaimBlocker { .. }
+            | Self::PurgedWithin { .. } => OkKind::Blob,
         }
     }
 }
@@ -1258,6 +1267,14 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
                 Some(B::Claimed) => 2,
                 Some(B::Quarantined) => 3,
             });
+            Reply::Blob(c.into_bytes())
+        }),
+        Request::PurgedWithin { within } => coord.purged_within(within).map(|ids| {
+            let mut c = Canon::new();
+            c.u64(ids.len() as u64);
+            for id in ids {
+                c.fixed(id.as_bytes());
+            }
             Reply::Blob(c.into_bytes())
         }),
         Request::PurgeBlocker { chronicle } => coord.purge_blocker(chronicle).map(|b| {
@@ -2086,6 +2103,16 @@ impl Coord for RemoteCoord {
             _ => Err(JournalError("bad reclaim blocker tag")),
         })
     }
+
+    fn purged_within(&self, within: u64) -> Result<Vec<ChronicleId>, CoordError> {
+        let r = self.call(Request::PurgedWithin { within })?;
+        blob_reply(r, |r| {
+            let n = r.count()?;
+            (0..n)
+                .map(|_| r.fixed::<16>().map(ChronicleId::from_bytes))
+                .collect()
+        })
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -2144,6 +2171,14 @@ mod tests {
     }
 
     // ── through the socket ──────────────────────────────────────────
+
+    /// Generation 3, G5-2: `purged_within` crosses the socket (no purge
+    /// has ended here: an empty list, decoded as one).
+    #[test]
+    fn purged_within_crosses_the_socket() {
+        let e = Env::new();
+        assert_eq!(e.client().purged_within(7 * 86400).unwrap(), Vec::new());
+    }
 
     #[test]
     fn calls_round_trip() {
@@ -2684,6 +2719,7 @@ mod tests {
             ),
             (Request::QueryLogical { logical: h(3) }, None),
             (Request::ReclaimBlocker { key: h(3) }, None),
+            (Request::PurgedWithin { within: 7 * 86400 }, None),
             (
                 Request::QueryChronicle {
                     chronicle: chron(1),
