@@ -49,7 +49,11 @@
 # (removed at the next start).
 #
 # Env: KILL_EVERY (60), SAMPLE (15), TURNS (4: turns per agent run),
-# KEEP_ROWS (400), NOMINATE_EVERY (10), FLOOR_GIB (10).
+# KEEP_ROWS (400), NOMINATE_EVERY (10), FLOOR_GIB (10), TURN_SLEEP_MS
+# (2000: each turn's sleep; every turn ends in a Seal, and every Seal stays
+# in the block log and the store for as long as its Vessel lives, so this
+# sets the growth: at 200 ms, 8 Vessels made 3 Seals a second and 3.6 GB
+# an hour, taso-test 2026-11-12).
 #
 # Stopped early (a TERM), bash runs the EXIT trap: it cleans up first, as
 # at its end.  Under systemd, run it with KillMode=mixed, so the TERM
@@ -73,6 +77,7 @@ VESSELS=${2:-4}
 KILL_EVERY=${KILL_EVERY:-60}
 SAMPLE=${SAMPLE:-15}
 TURNS=${TURNS:-4}
+TURN_SLEEP_MS=${TURN_SLEEP_MS:-2000}
 KEEP_ROWS=${KEEP_ROWS:-400}
 NOMINATE_EVERY=${NOMINATE_EVERY:-10}
 FLOOR_GIB=${FLOOR_GIB:-10}
@@ -295,12 +300,12 @@ for ((i = 0; i < VESSELS; i++)); do
     args=$(python3 -c '
 import json, sys
 i, turns = int(sys.argv[1]), sys.argv[2]
-a = ["/usr/bin/taso-sim", "--turns", turns, "--txns", "2", "--rows", "8", "--turn-sleep-ms", "200",
+a = ["/usr/bin/taso-sim", "--turns", turns, "--txns", "2", "--rows", "8", "--turn-sleep-ms", sys.argv[5],
      "--db", "/work/state.db", "--stats", "/work/sim-stats.json", "--nominate", "Scratch",
      "--keep-rows", sys.argv[3], "--nominate-every", sys.argv[4]]
 if i % 2 == 0:
     a += ["--forks", "1"]
-print(json.dumps(a))' "$i" "$TURNS" "$KEEP_ROWS" "$NOMINATE_EVERY")
+print(json.dumps(a))' "$i" "$TURNS" "$KEEP_ROWS" "$NOMINATE_EVERY" "$TURN_SLEEP_MS")
     forks=""
     (( i % 2 == 0 )) && forks=", \"forks\": {\"slots\": [$((41 + i / 2))]}"
     entries+=("$(printf '{"subject": "s%d", "uid_slot": %d, "template": "%s", "restart": "always", "verifier": {"template": "%s", "config": "%s", "version": 1}, "runtime": {"args": %s}%s}' \
