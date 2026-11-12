@@ -404,7 +404,9 @@ struct PurgeState {
     inventory_key: H32,
     items: Vec<InventoryItem>,
     progressed: BTreeMap<String, Progress>,
-    ended: bool,
+    /// When its end (Complete or Damaged) was accepted, at the
+    /// coordinator's clock.
+    ended_at: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1224,6 +1226,19 @@ impl CoordLog {
     /// Whether `template` is registered (its `TemplateReady` accepted).
     pub fn is_template(&self, template: ChronicleId) -> bool {
         self.templates.contains_key(template.as_bytes())
+    }
+
+    /// The Chronicles whose purge ended at `since` or later (generation 3,
+    /// G5-2), in id order.  The reclaimer looks there for file packs that
+    /// landed after the end: a Warden that reached the store but not the
+    /// coordinator never learnt it was fenced, and put again.  Every such
+    /// pack is the purge's to delete.
+    pub fn purged_since(&self, since: u64) -> Vec<ChronicleId> {
+        self.purges
+            .iter()
+            .filter(|(_, p)| p.ended_at.is_some_and(|t| t >= since))
+            .map(|(c, _)| ChronicleId::from_bytes(*c))
+            .collect()
     }
 
     /// What keeps `chronicle` from being purged now (§6.3 step 2, the
@@ -2124,7 +2139,7 @@ impl CoordLog {
                             inventory_key: key,
                             items,
                             progressed: BTreeMap::new(),
-                            ended: false,
+                            ended_at: None,
                         },
                     );
                 }
@@ -2135,7 +2150,7 @@ impl CoordLog {
                 }
                 Change::PurgeEnd(c) => {
                     if let Some(ps) = self.purges.get_mut(&c) {
-                        ps.ended = true;
+                        ps.ended_at = Some(now);
                     }
                 }
                 Change::ReclaimDone(k) => *self.reclaims.entry(k).or_default() += 1,
@@ -3513,6 +3528,9 @@ mod tests {
         );
         w.store.del(&ObjectId::pack(f.v, &late));
         assert!(matches!(again(&mut w), Answer::Accepted { .. }));
+        // G5-2: it is among the purges ended since a time before its end.
+        assert_eq!(w.log.purged_since(w.now), vec![f.v]);
+        assert_eq!(w.log.purged_since(w.now + 1), vec![]);
     }
 
     /// Generation 3, G3: a refusal is kept with its time and answered the
