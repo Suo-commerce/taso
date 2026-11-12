@@ -710,6 +710,42 @@ pub struct PromotionRecord {
     pub ledger_pos: Lsn,
 }
 
+/// A task handed to the Vessel through its inbox (format generation 3,
+/// reserved: the inbox itself comes after v0.1, and nothing writes this
+/// record yet; design note 2026-11-09, 5a).  The Warden appends it when the
+/// outside puts a task, numbered in the order of arrival.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskRecord {
+    /// The task's number in this Vessel's inbox, from 1.
+    pub seq: u64,
+    /// The putter's idempotency key (the inbox takes at most 64 bytes).
+    pub id: Vec<u8>,
+    /// The task, opaque (the inbox takes at most 1 MiB).
+    pub body: Vec<u8>,
+}
+
+impl Canonical for TaskRecord {
+    fn canon(&self, out: &mut Canon) {
+        out.u64(self.seq);
+        out.bytes(&self.id);
+        out.bytes(&self.body);
+    }
+}
+
+/// The agent took task `seq` from its inbox (format generation 3,
+/// reserved, as [`TaskRecord`]).  A Seal that covers it delivers the task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakenRecord {
+    /// The task taken.
+    pub seq: u64,
+}
+
+impl Canonical for TakenRecord {
+    fn canon(&self, out: &mut Canon) {
+        out.u64(self.seq);
+    }
+}
+
 impl Canonical for PromotionRecord {
     fn canon(&self, out: &mut Canon) {
         self.child.canon(out);
@@ -985,6 +1021,10 @@ pub enum Payload {
     /// ([`crate::contract`]).  Encoded as the tag, then the record's own
     /// canonical bytes; the record is always the payload's last field.
     Contract(Box<ContractRecord>),
+    /// An inbox Task record (tag 12; generation 3, reserved).
+    Task(TaskRecord),
+    /// An inbox Taken record (tag 13; generation 3, reserved).
+    Taken(TakenRecord),
 }
 
 impl Payload {
@@ -992,7 +1032,8 @@ impl Payload {
     /// append of one is refused: Lineage, Succession, Gap, FsShipped,
     /// Checkpoint, Promotion and contract records describe the
     /// Chronicle's own structure and the coordinator's decisions, not the
-    /// agent's work.  The one list every enforcement point uses.
+    /// agent's work; Task and Taken are the inbox's, the Warden's to write.
+    /// The one list every enforcement point uses.
     pub fn is_reserved(&self) -> bool {
         matches!(
             self,
@@ -1003,6 +1044,8 @@ impl Payload {
                 | Self::Checkpoint(_)
                 | Self::Promotion(_)
                 | Self::Contract(_)
+                | Self::Task(_)
+                | Self::Taken(_)
         )
     }
 }
@@ -1056,6 +1099,14 @@ impl Canonical for Payload {
             }
             Self::Contract(r) => {
                 out.tag(11);
+                r.canon(out);
+            }
+            Self::Task(r) => {
+                out.tag(12);
+                r.canon(out);
+            }
+            Self::Taken(r) => {
+                out.tag(13);
                 r.canon(out);
             }
         }
@@ -1351,6 +1402,30 @@ mod tests {
             .collect();
         assert_eq!(got, pins);
     }
+
+    /// Generation 3: the inbox's two record kinds, reserved (nothing
+    /// writes them before the inbox lands), pinned so their encoding is
+    /// fixed in v0.1's format; both are the Warden's alone to write.
+    #[test]
+    fn task_and_taken_hashes_are_pinned() {
+        let task = Payload::Task(TaskRecord {
+            seq: 3,
+            id: b"job-17".to_vec(),
+            body: b"summarise the report".to_vec(),
+        });
+        let taken = Payload::Taken(TakenRecord { seq: 3 });
+        assert!(task.is_reserved() && taken.is_reserved());
+        let got: Vec<String> = [task, taken]
+            .into_iter()
+            .map(|p| make_record(p).envelope.hash.to_string())
+            .collect();
+        assert_eq!(got, PIN_INBOX);
+    }
+
+    const PIN_INBOX: [&str; 2] = [
+        "1aacc983a41799a999197e59b65502dd090b9312c231a78d3e9cbbb3ed20617b",
+        "244832714eda3bfbb248456195c8cf34e9d0bbd94f002b2913c91468080e6c76",
+    ];
 
     /// The two record kinds added after v2 are additive: the existing pins
     /// above are unchanged, and these pin the new encodings.
