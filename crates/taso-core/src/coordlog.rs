@@ -1299,6 +1299,36 @@ impl CoordLog {
 
     // ── Predicates and effects (§1.2) ───────────────────────────────
 
+    /// A purge's end, Complete or Damaged, needs every file pack of
+    /// `chronicle` that no other Chronicle holds gone, inventoried or not
+    /// (generation 3, G5; finding 1.6): its replacements, which are not
+    /// file packs, are all that is left of its file history.  The purge's
+    /// claim covers such a pack whether the inventory names it or not: an
+    /// original a damaged purge left, or a pack a fenced Warden put after
+    /// the commit (its put asks nobody).  One still there is "not yet":
+    /// the purging Warden deletes it and tries again; a store that cannot
+    /// list is no proof either way.  Each inventoried original is then
+    /// looked up too, as before: a listing that leaves out an object the
+    /// store still answers for is no proof of its absence (review fix 5a).
+    fn nothing_left(
+        &self,
+        chronicle: ChronicleId,
+        store: &dyn StoreView,
+        purge: &PurgeState,
+    ) -> Result<(), Stop> {
+        match self.purge_projection(chronicle, store) {
+            Some(left) if left.is_empty() => {}
+            _ => return Err(Stop::Unreadable),
+        }
+        for i in &purge.items {
+            gone(
+                store.lookup(&ObjectId::pack(chronicle, &i.pack.name)),
+                "originals not deleted",
+            )?;
+        }
+        Ok(())
+    }
+
     fn entry(&self, logical: &LogicalKey) -> Option<(u64, &Entry)> {
         let id = crate::contract::logical_id(logical);
         self.logical
@@ -1757,12 +1787,7 @@ impl CoordLog {
                         && p.items_replaced == ps.items.len() as u64,
                     "history damaged",
                 )?;
-                for i in &ps.items {
-                    gone(
-                        store.lookup(&ObjectId::pack(chronicle, &i.pack.name)),
-                        "originals not deleted",
-                    )?;
-                }
+                self.nothing_left(chronicle, store, ps)?;
                 self.purge_end(&mut fx, chronicle, ps);
             }
             ContractRecord::PurgeDamaged(p) => {
@@ -1788,6 +1813,7 @@ impl CoordLog {
                     p.items_lost == lost && p.items_replaced == ps.items.len() as u64 - lost,
                     "counts differ",
                 )?;
+                self.nothing_left(chronicle, store, ps)?;
                 self.purge_end(&mut fx, chronicle, ps);
             }
             ContractRecord::GenesisStarted(g) => {
@@ -3402,6 +3428,93 @@ mod tests {
         }
     }
 
+    /// Generation 3, G5 (finding 1.6): a purge ends, Complete or Damaged,
+    /// only when no file pack of the Chronicle is left that no other
+    /// Chronicle holds, inventoried or not: a pack a fenced Warden put
+    /// after the commit holds the end back ("not yet", so the purging
+    /// Warden deletes it and tries again), as does a replaced item's
+    /// original a damaged purge left.
+    #[test]
+    fn a_purge_ends_only_with_no_file_pack_of_the_chronicle_left() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let (pc, inv) = purge_inventory(&mut w, f.v);
+        w.ok(f.v, ContractRecord::PurgeCommitted(pc));
+        // A fenced Warden's pack lands after the commit.
+        let late = pname(12, 9, 12);
+        w.store.put(ObjectId::pack(f.v, &late));
+        let mut item = inv.items()[0].clone();
+        item.pack.name = late.clone();
+        w.store
+            .fs
+            .borrow_mut()
+            .get_mut(f.v.as_bytes())
+            .unwrap()
+            .push(item);
+        // The inventory's items: the first replaced, the second lost.
+        let first = &inv.items()[0];
+        let rname = replacement_name(&first.pack.name).unwrap();
+        w.store.put(ObjectId::pack(f.v, &rname));
+        w.store
+            .replacements
+            .borrow_mut()
+            .insert((*f.v.as_bytes(), rname.clone()), h(0xB0));
+        w.ok(
+            f.v,
+            ContractRecord::ReplacementInstalled(ReplacementInstalled {
+                chronicle: f.v,
+                pack: first.pack.clone(),
+                replacement_key: h(0xB0),
+                replacement_name: rname,
+            }),
+        );
+        let second = &inv.items()[1];
+        w.store.del(&ObjectId::pack(f.v, &second.pack.name));
+        w.ok(
+            f.v,
+            ContractRecord::ItemLost(ItemLost {
+                chronicle: f.v,
+                pack: second.pack.clone(),
+            }),
+        );
+        let damaged = ContractRecord::PurgeDamaged(crate::contract::PurgeDamaged {
+            chronicle: f.v,
+            inventory_key: inv.key(),
+            items_replaced: 1,
+            items_lost: 1,
+        });
+        // As a Warden does after "not yet": cancel, then submit again.
+        let again = |w: &mut W<'_>| {
+            let a = w.submit(f.v, Submitted::Contract(damaged.clone()));
+            if let Answer::Refused(Transient::NotReadable) = a {
+                let e = w.epoch(f.v);
+                let p = w.log.chrons[f.v.as_bytes()]
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .submission;
+                w.log.cancel(f.v, e, HashVal::from_bytes(p), w.now);
+            }
+            a
+        };
+        // The replaced item's original is still there, and the late pack.
+        assert_eq!(again(&mut w), Answer::Refused(Transient::NotReadable));
+        w.store.del(&ObjectId::pack(f.v, &first.pack.name));
+        assert_eq!(
+            again(&mut w),
+            Answer::Refused(Transient::NotReadable),
+            "the late pack"
+        );
+        w.store.del(&ObjectId::pack(f.v, &late));
+        assert!(matches!(again(&mut w), Answer::Accepted { .. }));
+    }
+
     /// Generation 3, G3: a refusal is kept with its time and answered the
     /// same until `refusal_kept` has passed, then forgotten; a stale-epoch
     /// refusal is not kept at all (the epoch check gives it again).
@@ -3771,7 +3884,9 @@ mod tests {
             history_attestation: h(0xC0),
         });
         w.not_readable(f.v, 2, &done);
-        // Still there (a delete that did not happen): refused for good.
+        // Still there (a delete that did not happen): "not yet", since
+        // generation 3 (G5): the purging Warden deletes what is left of
+        // the Chronicle's file packs and tries again.
         store.unreadable.borrow_mut().clear();
         store.put(first.clone());
         assert_eq!(
@@ -3785,8 +3900,15 @@ mod tests {
                 &store,
                 w.now,
             ),
-            Answer::FinalRefused(Final::Predicate("originals not deleted".into()))
+            Answer::Refused(Transient::NotReadable)
         );
+        let e = w.epoch(f.v);
+        let p = w.log.chrons[f.v.as_bytes()]
+            .pending
+            .as_ref()
+            .unwrap()
+            .submission;
+        w.log.cancel(f.v, e, HashVal::from_bytes(p), w.now);
         store.del(&first);
         w.retried_ok(f.v, 3, &done);
     }
