@@ -12,6 +12,9 @@
 # 4. soak.sh's growth rule fails a leak, and fails a run too short to judge.
 # 5. release-gate.sh's lock is free again when the run ends, whatever a
 #    gate left running.
+# 6. soak.sh runs its cleanup when it is sent TERM (systemctl stop), and
+#    stops at its free-space floor; release-gate.sh clean names the large
+#    files the gates leave in /var/lib/taso-blk.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d /tmp/gate-exit-test.XXXXXX); trap 'rm -rf "$T"' EXIT
@@ -81,5 +84,34 @@ run gate 20 bash -c "$2"' gate "$T" "$1" >/dev/null 2>&1; echo $?
 check "release-gate: a first run takes the lock" 0 "$(gate "sleep 60 & echo \$! > $T/left.pid")"
 check "release-gate: what a gate left running does not keep the lock" 0 "$(gate true)"
 [ -s "$T/left.pid" ] && kill "$(cat "$T/left.pid")" 2>/dev/null
+
+# 6. soak.sh's trap, cut out of the script, around a stand-in cleanup and
+# a long sleep: a TERM (systemctl stop, with KillMode=mixed) must end it
+# through the cleanup.
+grep -E "^trap cleanup EXIT\$" scripts/soak.sh > "$T/traps"
+[ -s "$T/traps" ] || { echo "FAIL  soak: its EXIT trap was not found"; bad=$((bad + 1)); }
+bash -c 'D=$1; cleanup() { echo cleaned > "$D/cleaned"; }
+'"$(cat "$T/traps")"'
+while :; do sleep 1; done' term "$T" & tp=$!
+sleep 1; kill -TERM "$tp"; wait "$tp"; trc=$?
+check "soak: a TERM ends it with 143" 143 "$trc"
+check "soak: a TERM runs the cleanup" 0 "$([ "$(cat "$T/cleaned" 2>/dev/null)" = cleaned ]; echo $?)"
+# The floor: the loop's check, cut out, with free space faked below it.
+awk '/^while \[\[ \$SECONDS -lt \$END \]\]; do/ {on=1; next} on && /^    fi$/ {print; exit} on' scripts/soak.sh > "$T/floor"
+grep -q FLOOR_GIB "$T/floor" || { echo "FAIL  soak: the floor check was not found"; bad=$((bad + 1)); }
+floor() { # floor FREE: the loop body's floor check with FREE GiB free; exit 0 when it stopped
+    bash -c 'W=$1 FREE=$2 FLOOR_GIB=10 FLOOR_AT= SECONDS=5; mkdir -p "$W/out"; free_gib() { echo "$FREE"; }
+for _ in 1; do
+'"$(cat "$T/floor")"'
+done
+[[ -n "$FLOOR_AT" ]]' floor "$T" "$1" >/dev/null 2>&1; echo $?
+}
+check "soak: below the floor it stops" 0 "$(floor 9)"
+check "soak: above the floor it goes on" 1 "$(floor 11)"
+# release-gate.sh clean: the gates' large leftovers in /var/lib/taso-blk.
+for f in crash.log bench.log bench-base.img fst.log; do
+    grep -q "/var/lib/taso-blk/$f" scripts/release-gate.sh && r=0 || r=1
+    check "release-gate clean: removes /var/lib/taso-blk/$f" 0 "$r"
+done
 
 [ "$bad" = 0 ] && echo "gate-exit-test: PASS" || { echo "gate-exit-test: $bad FAILED"; exit 1; }
