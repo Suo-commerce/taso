@@ -150,7 +150,7 @@
 //! All devices share one store behind one lock.  Simple first; the
 //! measurements say whether contention matters.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::mem::ManuallyDrop;
@@ -537,6 +537,12 @@ const OP_WFUA: usize = 4;
 /// wait for the store's lock (`wait`), the work under it (`store`).  Off
 /// unless set; costs a write per request.
 static OPLOG: Mutex<Option<std::io::BufWriter<File>>> = Mutex::new(None);
+
+/// Device ids this daemon deleted without waiting (a device that ended,
+/// a leftover reaped at the start) and has not seen start again: those
+/// whose char device is still there are what `stats` counts as
+/// `zombies=` ([`zombies`]).
+static DELETED: Mutex<BTreeSet<i32>> = Mutex::new(BTreeSet::new());
 
 /// `--durable-at`: what a device request waits for (the module docs say
 /// when each is right); `fua` unless set.  Set once in `main`.
@@ -1437,6 +1443,8 @@ impl Daemon {
         let answer = match started {
             Ok(dev) => {
                 let path = format!("/dev/ublkb{}", dev.dev_id);
+                // The id is a new device's now, not a deleted one's.
+                lock(&DELETED).remove(&dev.dev_id);
                 devices.insert(branch, Slot::Running(dev));
                 Ok(path)
             }
@@ -1681,7 +1689,7 @@ impl Daemon {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} threads={} rss_kib={}{}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={} durable_at={} lock={}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} zombies={} threads={} rss_kib={}{}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={} durable_at={} lock={}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
@@ -1689,6 +1697,9 @@ impl Daemon {
             s.lsn(),
             layers,
             devices,
+            zombies(&DELETED, |id| {
+                std::path::Path::new(&format!("/sys/class/ublk-char/ublkc{id}")).exists()
+            }),
             field("Threads:"),
             field("VmRSS:"),
             op("op_read", ops[OP_READ]),
@@ -1739,7 +1750,10 @@ fn reap_dead_devices() -> (usize, usize) {
             continue;
         }
         match ctrl.del_dev_async() {
-            Ok(_) => removed += 1,
+            Ok(_) => {
+                lock(&DELETED).insert(id);
+                removed += 1
+            }
             Err(e) => {
                 log!("taso-blkd: cannot remove leftover device {id}: {e:?}");
                 failed += 1;
@@ -1875,7 +1889,7 @@ fn run_device(
     if let Err(e) = ctrl.run_target(init, queue, on_start) {
         let _ = ready.send(Err(format!("{e:?}")));
     }
-    end_device(&ctrl);
+    end_device(&ctrl, &DELETED);
 }
 
 /// What ending a device needs of its control (a test's is fake).
@@ -1883,6 +1897,8 @@ trait Ending {
     /// The kernel's delete that returns at once (never the one that
     /// waits until the device is freed: see [`end_device`]).
     fn delete(&self) -> Result<(), String>;
+    /// The device's id.
+    fn id(&self) -> i32;
     /// The control no longer deletes its device when it drops.
     fn disown(&self);
 }
@@ -1896,6 +1912,9 @@ impl Ending for UblkCtrl {
     fn disown(&self) {
         UblkCtrl::disown(self)
     }
+    fn id(&self) -> i32 {
+        self.dev_info().dev_id as i32
+    }
 }
 
 /// Delete a device whose serving has ended, never waiting for the
@@ -1908,12 +1927,24 @@ impl Ending for UblkCtrl {
 /// 2026-11-12, ublk_ctrl_del_dev).  The kernel frees the device when the
 /// last reference goes; a start's reap removes one left behind.  If even
 /// this delete fails, the control is disowned, so its drop does not try
-/// the waiting delete instead.
-fn end_device(c: &impl Ending) {
+/// the waiting delete instead.  Either way the id goes into `deleted`,
+/// so `stats` shows the device while the kernel keeps it.
+fn end_device(c: &impl Ending, deleted: &Mutex<BTreeSet<i32>>) {
     if let Err(e) = c.delete() {
-        log!("taso-blkd: cannot delete a stopped device: {e}");
+        log!("taso-blkd: cannot delete a stopped device {}: {e}", c.id());
         c.disown();
     }
+    lock(deleted).insert(c.id());
+}
+
+/// How many of the `deleted` ids the kernel still keeps (`still_there`:
+/// its char device exists); the freed are forgotten.  A device the
+/// kernel never frees is a leak to see, not a hang (soak 2026-11-12):
+/// the soak checks this stays 0.
+fn zombies(deleted: &Mutex<BTreeSet<i32>>, still_there: impl Fn(i32) -> bool) -> usize {
+    let mut d = lock(deleted);
+    d.retain(|&id| still_there(id));
+    d.len()
 }
 
 /// Serve one queue: every request becomes one store call.
@@ -2442,6 +2473,21 @@ mod detach_test {
         assert_eq!(during, Some(true), "Stopping while the kill runs");
     }
 
+    /// A device deleted without waiting is counted while the kernel
+    /// keeps it, so a soak sees a leak instead of a hang; the freed are
+    /// forgotten, so a reused id is never counted.
+    #[test]
+    fn a_deleted_device_the_kernel_keeps_is_counted_until_freed() {
+        let deleted = Mutex::new(BTreeSet::new());
+        end_device(&FakeEnd::default(), &deleted);
+        lock(&deleted).insert(9);
+        assert_eq!(zombies(&deleted, |_| true), 2, "both kept");
+        assert_eq!(zombies(&deleted, |id| id == 7), 1, "9 freed");
+        assert_eq!(*lock(&deleted), BTreeSet::from([7]), "9 forgotten");
+        assert_eq!(zombies(&deleted, |_| true), 1, "a freed id stays forgotten");
+        assert_eq!(zombies(&deleted, |_| false), 0);
+    }
+
     /// Soak, taso-test 2026-11-12: a branch left `Stopping` for good held
     /// every later call about it, each in its own thread, until 482 of
     /// them waited and every Warden start hung.  Such a call is refused
@@ -2485,6 +2531,9 @@ mod detach_test {
         fn disown(&self) {
             lock(&self.calls).push("disown");
         }
+        fn id(&self) -> i32 {
+            7
+        }
     }
 
     /// Soak, taso-test 2026-11-12: a device's thread ended in the
@@ -2501,7 +2550,7 @@ mod detach_test {
             let (tx, rx) = mpsc::channel();
             let c2 = c.clone();
             std::thread::spawn(move || {
-                end_device(&*c2);
+                end_device(&*c2, &Mutex::new(BTreeSet::new()));
                 let _ = tx.send(());
             });
             rx.recv_timeout(std::time::Duration::from_secs(5))
