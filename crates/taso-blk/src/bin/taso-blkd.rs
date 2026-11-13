@@ -1848,7 +1848,45 @@ fn run_device(
     if let Err(e) = ctrl.run_target(init, queue, on_start) {
         let _ = ready.send(Err(format!("{e:?}")));
     }
-    let _ = ctrl.del_dev();
+    end_device(&ctrl);
+}
+
+/// What ending a device needs of its control (a test's is fake).
+trait Ending {
+    /// The kernel's delete that returns at once (never the one that
+    /// waits until the device is freed: see [`end_device`]).
+    fn delete(&self) -> Result<(), String>;
+    /// The control no longer deletes its device when it drops.
+    fn disown(&self);
+}
+
+impl Ending for UblkCtrl {
+    fn delete(&self) -> Result<(), String> {
+        self.del_dev_async()
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
+    }
+    fn disown(&self) {
+        UblkCtrl::disown(self)
+    }
+}
+
+/// Delete a device whose serving has ended, never waiting for the
+/// kernel to free it.  The waiting delete returns only once the last
+/// reference to the device is gone, and one the daemon cannot see (not
+/// a descriptor, not a mapping, nothing mounted in its namespace) kept
+/// it waiting for good: the device's thread never ended, `detach` never
+/// returned, its branch stayed `Stopping`, and every later call that
+/// settled the branch waited behind it, 482 of them (soak, taso-test
+/// 2026-11-12, ublk_ctrl_del_dev).  The kernel frees the device when the
+/// last reference goes; a start's reap removes one left behind.  If even
+/// this delete fails, the control is disowned, so its drop does not try
+/// the waiting delete instead.
+fn end_device(c: &impl Ending) {
+    if let Err(e) = c.delete() {
+        log!("taso-blkd: cannot delete a stopped device: {e}");
+        c.disown();
+    }
 }
 
 /// Serve one queue: every request becomes one store call.
@@ -2374,5 +2412,53 @@ mod detach_test {
         })
         .unwrap();
         assert_eq!(during, Some(true), "Stopping while the kill runs");
+    }
+
+    /// A control that records what ending its device did.
+    #[derive(Default)]
+    struct FakeEnd {
+        fails: bool,
+        calls: Mutex<Vec<&'static str>>,
+    }
+    impl Ending for FakeEnd {
+        fn delete(&self) -> Result<(), String> {
+            lock(&self.calls).push("delete");
+            if self.fails {
+                Err("injected".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn disown(&self) {
+            lock(&self.calls).push("disown");
+        }
+    }
+
+    /// Soak, taso-test 2026-11-12: a device's thread ended in the
+    /// waiting delete, which never returned, and the daemon stopped
+    /// answering.  Ending a device returns, whatever the kernel waits
+    /// for; a failed delete disowns, so the drop does not wait instead.
+    #[test]
+    fn ending_a_device_never_waits_for_the_kernel_to_free_it() {
+        for fails in [false, true] {
+            let c = Arc::new(FakeEnd {
+                fails,
+                ..Default::default()
+            });
+            let (tx, rx) = mpsc::channel();
+            let c2 = c.clone();
+            std::thread::spawn(move || {
+                end_device(&*c2);
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("ending the device returned");
+            let want: &[&str] = if fails {
+                &["delete", "disown"]
+            } else {
+                &["delete"]
+            };
+            assert_eq!(*lock(&c.calls), want);
+        }
     }
 }
