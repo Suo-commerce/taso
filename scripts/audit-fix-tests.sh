@@ -123,6 +123,10 @@ one a_mount_root_written_any_way_names_the_mount_points_the_kernel_lists $W
 one a_poisoned_store_does_not_answer_from_a_map_ahead_of_the_file -p taso-blk --lib
 one a_poisoned_store_answers_err_to_find_seals_names_and_info -p taso-blk --bin taso-blkd
 one a_refused_connection_thread_is_logged_and_the_loop_goes_on -p taso-blk --bin taso-blkd
+# The soak's stall (taso-test 2026-11-12, blkd-del)
+one ending_a_device_never_waits_for_the_kernel_to_free_it -p taso-blk --bin taso-blkd
+one a_device_that_never_stops_refuses_calls_instead_of_holding_them -p taso-blk --bin taso-blkd
+one a_deleted_device_the_kernel_keeps_is_counted_until_freed -p taso-blk --bin taso-blkd
 
 if [ "$bad" = 0 ]; then
     echo "audit-fix-tests: PASS, $n of $n ($OUT)"
