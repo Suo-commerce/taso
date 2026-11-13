@@ -24,7 +24,7 @@
 #
 # Every SAMPLE seconds (default 15) one line in soak.tsv: the Warden's
 # threads, open files and memory, taso-blkd's memory, ublk devices,
-# GiB free, the block log's size.
+# GiB free, the block log's size, taso-blkd's threads.
 #
 # At the end the Warden is stopped and every Chronicle on the node (each
 # Vessel, each fork) is checked:
@@ -37,7 +37,11 @@
 #   - the Warden's open files and threads did not grow: the last third's
 #     largest at most 1.5x the first third's largest, plus 16 (a run with
 #     fewer than 6 samples of the Warden cannot say, and fails);
-#   - taso-blkd's memory did not grow, by the same rule;
+#   - taso-blkd's memory and threads did not grow, by the same rule (a
+#     device that never stopped held a thread per call, 482 by morning:
+#     taso-test 2026-11-12);
+#   - no device taso-blkd deleted is still kept by the kernel (stats
+#     zombies=0);
 #   - free space never fell below FLOOR_GIB: the soak stops there and
 #     fails, rather than run on with a full disk (taso-test 2026-11-09: a
 #     24 h run filled it in 2 h and sat stalled for 19 h);
@@ -340,9 +344,9 @@ start_warden() {
 }
 
 sampler() {
-    printf 'time\twarden_threads\twarden_fds\twarden_rss_kib\tblkd_rss_kib\tublk\tfree_gib\tlog_mib\n' >"$W/soak.tsv"
+    printf 'time\twarden_threads\twarden_fds\twarden_rss_kib\tblkd_rss_kib\tublk\tfree_gib\tlog_mib\tblkd_threads\n' >"$W/soak.tsv"
     while :; do
-        local p t=- f=- r=- b
+        local p t=- f=- r=- b bt
         p=$(pgrep -f "taso-wardend $W/soak.json" | head -1 || true)
         if [[ -n "$p" ]]; then
             t=$(ls "/proc/$p/task" 2>/dev/null | wc -l)
@@ -350,8 +354,9 @@ sampler() {
             r=$(awk '/^VmRSS/ {print $2}' "/proc/$p/status" 2>/dev/null || echo -)
         fi
         b=$(awk '/^VmRSS/ {print $2}' "/proc/$BLKD_PID/status" 2>/dev/null || echo -)
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$t" "$f" "$r" "$b" "$(ublk_devices)" \
-            "$(df --output=avail -BG "$W" | tail -1 | tr -dc 0-9)" "$(( $(stat -c %s "$W/blk.log") >> 20 ))" >>"$W/soak.tsv"
+        bt=$(ls "/proc/$BLKD_PID/task" 2>/dev/null | wc -l)
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$t" "$f" "$r" "$b" "$(ublk_devices)" \
+            "$(df --output=avail -BG "$W" | tail -1 | tr -dc 0-9)" "$(( $(stat -c %s "$W/blk.log") >> 20 ))" "$bt" >>"$W/soak.tsv"
         sleep "$SAMPLE"
     done
 }
@@ -433,6 +438,14 @@ for c in "1 threads" "2 open-files"; do
     expect "the Warden's $2 did not grow" is "$r" ok
 done
 expect "taso-blkd's memory did not grow" is "$(growth 4)" ok
+# A device that never stopped held one taso-blkd thread for every call
+# about its branch, 482 by morning, and every Warden start hung (soak,
+# taso-test 2026-11-12): its threads grow, by the same rule.
+expect "taso-blkd's threads did not grow" is "$(growth 8)" ok
+# A device deleted without waiting that the kernel never freed (blkd-del
+# d): a leak to see, never a hang.
+ZOMBIES=$(blk stats | tr ' ' '\n' | sed -n 's/^zombies=//p' || true)
+expect "no deleted device kept by the kernel" is "${ZOMBIES:-unknown}" 0
 expect "free space stayed above $FLOOR_GIB GiB" is "${FLOOR_AT:+fell below at ${FLOOR_AT} s}" ""
 
 # The Seal frames in one Chronicle, as taso-logcheck printed it.  One that
