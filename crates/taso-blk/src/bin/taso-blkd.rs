@@ -613,6 +613,9 @@ struct Daemon {
     devices: Mutex<HashMap<LayerId, Slot>>,
     /// Signalled when a `Starting` entry becomes `Running` or goes.
     settle: Condvar,
+    /// How long a call waits for its branch's entry to settle
+    /// ([`Daemon::settled`]); [`SETTLE_WAIT`] but in tests.
+    settle_wait: std::time::Duration,
     geometry: Geometry,
     /// A compaction is running.
     compacting: AtomicBool,
@@ -735,6 +738,7 @@ fn main() {
         sync,
         devices: Mutex::new(HashMap::new()),
         settle: Condvar::new(),
+        settle_wait: SETTLE_WAIT,
         geometry: g,
         compacting: AtomicBool::new(false),
     });
@@ -771,6 +775,10 @@ fn main() {
         }
     }
 }
+
+/// How long a call waits for a device of its branch to finish starting
+/// or stopping: well under the Warden's 120 s for an answer.
+const SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long the accept loop waits after an accept that failed.
 const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1095,7 +1103,7 @@ impl Daemon {
                 // An orphan Seal, taken but its record never accepted, that the
                 // branch stands on (F1, 2026-10-28).  As `reset`: detached only.
                 let branch = layer(1)?;
-                let devices = self.settled(branch);
+                let devices = self.settled(branch)?;
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -1109,7 +1117,7 @@ impl Daemon {
                 let branch = layer(1)?;
                 // Hold the device table so no attach can start in between;
                 // the table is always taken before the store, never after.
-                let devices = self.settled(branch);
+                let devices = self.settled(branch)?;
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -1160,7 +1168,7 @@ impl Daemon {
                     .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
                 let mut r = std::io::BufReader::with_capacity(1 << 20, file);
                 // As for reset: the device table first, so no attach starts.
-                let devices = self.settled(branch);
+                let devices = self.settled(branch)?;
                 if devices.contains_key(&branch) {
                     return Err(format!("{branch} is attached; unmount and detach it first"));
                 }
@@ -1241,7 +1249,7 @@ impl Daemon {
         // The device table first, then the store: never both at once.
         // Settled for this layer only: a device starting for another
         // branch is not waited for.
-        let dev = match self.settled(l).get(&l) {
+        let dev = match self.settled(l)?.get(&l) {
             Some(Slot::Running(d)) => Some(format!("/dev/ublkb{}", d.dev_id)),
             _ => None,
         };
@@ -1369,12 +1377,12 @@ impl Daemon {
                 .drop_seal(l)
                 .map_err(|e| e.to_string());
         }
-        let attached = matches!(self.settled(l).get(&l), Some(Slot::Running(_)));
+        let attached = matches!(self.settled(l)?.get(&l), Some(Slot::Running(_)));
         if attached {
             self.detach_with(l, kill)?;
         }
         // The table, then the store, never the other way round.
-        let devices = self.settled(l);
+        let devices = self.settled(l)?;
         if devices.contains_key(&l) {
             return Err(format!("{l} is attached; detach it first"));
         }
@@ -1465,16 +1473,35 @@ impl Daemon {
         }
     }
 
-    /// The device table, once `branch`'s entry is not `Starting`.
-    fn settled(&self, branch: LayerId) -> MutexGuard<'_, HashMap<LayerId, Slot>> {
+    /// The device table, once `branch`'s entry is neither `Starting` nor
+    /// `Stopping`; refused if it is still one of them after
+    /// [`Daemon::settle_wait`].  A start or a stop takes milliseconds; one
+    /// that never ends held every later call about its branch, each in a
+    /// thread of its own, for good (soak, taso-test 2026-11-12: 482 of
+    /// them, and every Warden start hung).  Refused, the caller hears why
+    /// and the thread ends; the other branches are served meanwhile.
+    fn settled(&self, branch: LayerId) -> Result<MutexGuard<'_, HashMap<LayerId, Slot>>, String> {
+        let deadline = std::time::Instant::now() + self.settle_wait;
         let mut devices = lock(&self.devices);
-        while matches!(devices.get(&branch), Some(Slot::Starting | Slot::Stopping)) {
+        loop {
+            let state = match devices.get(&branch) {
+                Some(Slot::Starting) => "starting",
+                Some(Slot::Stopping) => "stopping",
+                _ => return Ok(devices),
+            };
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "{branch}'s device is still {state} after {} s",
+                    self.settle_wait.as_secs()
+                ));
+            }
             devices = self
                 .settle
-                .wait(devices)
-                .unwrap_or_else(PoisonError::into_inner);
+                .wait_timeout(devices, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
-        devices
     }
 
     /// Stop `branch`'s device and wait for its thread.
@@ -1494,7 +1521,7 @@ impl Daemon {
         kill: impl FnOnce(i32) -> Result<(), String>,
     ) -> Result<(), String> {
         let d = {
-            let mut devices = self.settled(branch);
+            let mut devices = self.settled(branch)?;
             match devices.remove(&branch) {
                 Some(Slot::Running(d)) => {
                     devices.insert(branch, Slot::Stopping);
@@ -1587,7 +1614,7 @@ impl Daemon {
     /// (R2-03).  Never one a device runs on: under the table's hold, as
     /// `drop` does (the table, then the store).
     fn unfork(&self, branch: LayerId) -> Result<(), String> {
-        let devices = self.settled(branch);
+        let devices = self.settled(branch)?;
         if devices.contains_key(&branch) {
             return Err(format!("{branch} is attached"));
         }
@@ -2172,6 +2199,7 @@ mod detach_test {
             sync,
             devices: Mutex::new(devices),
             settle: Condvar::new(),
+            settle_wait: SETTLE_WAIT,
             geometry: Geometry {
                 size: 1 << 30,
                 depth: 1,
@@ -2412,6 +2440,31 @@ mod detach_test {
         })
         .unwrap();
         assert_eq!(during, Some(true), "Stopping while the kill runs");
+    }
+
+    /// Soak, taso-test 2026-11-12: a branch left `Stopping` for good held
+    /// every later call about it, each in its own thread, until 482 of
+    /// them waited and every Warden start hung.  Such a call is refused
+    /// once the wait is over, naming why; nothing waits for good.
+    #[test]
+    fn a_device_that_never_stops_refuses_calls_instead_of_holding_them() {
+        let (_dir, mut d, branch, stop) = daemon_with_a_running_branch();
+        stop.store(true, Ordering::Relaxed);
+        d.settle_wait = std::time::Duration::from_millis(200);
+        lock(&d.devices).insert(branch, Slot::Stopping);
+        let (tx, rx) = mpsc::channel();
+        let answer = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = tx.send(d.command(&["info", &branch.to_string()]));
+            });
+            let answer = rx.recv_timeout(std::time::Duration::from_secs(5));
+            // Settle the entry, so the call ends even if it never answered.
+            lock(&d.devices).remove(&branch);
+            d.settle.notify_all();
+            answer
+        });
+        let e = answer.expect("the call answered").unwrap_err();
+        assert!(e.contains("still stopping"), "{e}");
     }
 
     /// A control that records what ending its device did.
