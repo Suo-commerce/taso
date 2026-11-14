@@ -509,6 +509,9 @@ pub struct Chronicle<L: Layers> {
     last_seal: Option<Position>,
     /// Accepted Seals whose layer was not there at open.
     missing_layers: HashSet<Lsn>,
+    /// Accepted Seals whose layer was folded away (S-c): shipped, and
+    /// older than a Seal whose layer is here.  Not a loss: in the bucket.
+    in_bucket_only: HashSet<Lsn>,
     health: Health,
     /// Roll to a new segment once the current one has this many bytes.
     roll_at: u64,
@@ -729,6 +732,7 @@ impl<L: Layers> Chronicle<L> {
             last_seal: None,
             adoption: crate::summary::Adoption::default(),
             missing_layers: HashSet::new(),
+            in_bucket_only: HashSet::new(),
             health: Health::Live,
             roll_at: SEGMENT_MAX,
             _lock: lock,
@@ -814,12 +818,28 @@ impl<L: Layers> Chronicle<L> {
                 orphan_layers.push(lsn);
             }
         }
-        // The other way round: a Seal record whose layer is not there.
-        let missing_layers: Vec<Position> = seals
+        // The other way round: a Seal record whose layer is not there.  A
+        // shipped one older than a Seal whose layer is here was folded away
+        // (S-c, F-1 (a), decided 2026-11-14): its content is in the bucket
+        // and in the newer layers, so it is no loss of the state, and only
+        // a fork from it is refused.  The rest is missing, as before.
+        let newest_present = seals.iter().rev().find(|p| present.contains(&p.lsn));
+        let shipped = match newest_present {
+            Some(_) => {
+                chronicle
+                    .coord
+                    .shipped(id)
+                    .map_err(ChronicleError::Coord)?
+                    .lsn
+            }
+            None => Lsn::new(0),
+        };
+        let (in_bucket, missing_layers): (Vec<Position>, Vec<Position>) = seals
             .iter()
             .filter(|p| !present.contains(&p.lsn))
             .copied()
-            .collect();
+            .partition(|p| newest_present.is_some_and(|n| p.lsn < n.lsn) && p.lsn <= shipped);
+        chronicle.in_bucket_only = in_bucket.iter().map(|p| p.lsn).collect();
         let last_seal = seals.last().copied();
         chronicle.last_seal = last_seal;
         chronicle.missing_layers = missing_layers.iter().map(|p| p.lsn).collect();
@@ -1126,6 +1146,19 @@ impl<L: Layers> Chronicle<L> {
     /// Chronicle was opened (see [`Recovery::missing_layers`]).
     pub fn layer_missing(&self, seal: Lsn) -> bool {
         self.missing_layers.contains(&seal)
+    }
+
+    /// Whether the accepted Seal at `seal` had its layer folded away when
+    /// this Chronicle was opened: shipped, so in the bucket only (S-c).
+    /// Not a loss, so not in [`Recovery::missing_layers`]; a fork from it
+    /// is refused all the same (R-a: a fork starts from the newest Seal).
+    pub fn in_bucket_only(&self, seal: Lsn) -> bool {
+        self.in_bucket_only.contains(&seal)
+    }
+
+    /// How many accepted Seals had their layer folded away at open.
+    pub fn seals_in_bucket_only(&self) -> usize {
+        self.in_bucket_only.len()
     }
 
     /// Roll the state back to the newest Seal whose layer is here,
@@ -2324,6 +2357,55 @@ mod tests {
         let (c, r) = e.open(A);
         assert!(r.missing_layers.is_empty());
         assert!(!c.layer_missing(s.lsn));
+    }
+
+    /// S-c, F-1 (a): a shipped Seal older than one whose layer is here was
+    /// folded away: in the bucket only, not a loss, so not reported
+    /// missing (the next Seal stays Clean).  Unshipped, or with no newer
+    /// layer here, it is missing as before.
+    #[test]
+    fn a_folded_seal_is_in_the_bucket_only_not_missing() {
+        let e = env();
+        let mut c = e.create();
+        let s1 = seal(&mut c, 1).unwrap().seal;
+        let s2 = seal(&mut c, 2).unwrap().seal;
+        let s3 = seal(&mut c, 3).unwrap().seal;
+        e.coord.advance_shipped(A, cid(), c.epoch(), s2).unwrap();
+        drop(c);
+        e.layers.clone().destroy(s1.lsn).unwrap(); // folded: shipped
+        e.layers.clone().destroy(s2.lsn).unwrap(); // folded: shipped
+        let (c, r) = e.open(A);
+        assert!(r.missing_layers.is_empty(), "{:?}", r.missing_layers);
+        assert!(c.in_bucket_only(s1.lsn) && c.in_bucket_only(s2.lsn));
+        assert!(!c.layer_missing(s1.lsn) && !c.in_bucket_only(s3.lsn));
+        assert_eq!(c.seals_in_bucket_only(), 2);
+        assert_eq!(r.last_seal, Some(s3));
+        drop(c);
+
+        // Shipped only up to s1: s2's layer gone is a loss.
+        let e = env();
+        let mut c = e.create();
+        let s1 = seal(&mut c, 1).unwrap().seal;
+        let s2 = seal(&mut c, 2).unwrap().seal;
+        seal(&mut c, 3).unwrap();
+        e.coord.advance_shipped(A, cid(), c.epoch(), s1).unwrap();
+        drop(c);
+        e.layers.clone().destroy(s1.lsn).unwrap();
+        e.layers.clone().destroy(s2.lsn).unwrap();
+        let (c, r) = e.open(A);
+        assert_eq!(r.missing_layers, vec![s2]);
+        assert!(c.in_bucket_only(s1.lsn));
+
+        // No newer layer here: even a shipped Seal is missing.
+        let e = env();
+        let mut c = e.create();
+        let s1 = seal(&mut c, 1).unwrap().seal;
+        e.coord.advance_shipped(A, cid(), c.epoch(), s1).unwrap();
+        drop(c);
+        e.layers.clone().destroy(s1.lsn).unwrap();
+        let (c, r) = e.open(A);
+        assert_eq!(r.missing_layers, vec![s1]);
+        assert_eq!(c.seals_in_bucket_only(), 0);
     }
 
     /// A layer is a Seal's only: one bound to an accepted record that is
