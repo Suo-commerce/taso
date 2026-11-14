@@ -16,7 +16,8 @@
 //! 4. node A again, not taking over: refused.
 //!
 //! Also W1 (the supervisor on a real node) and P3 file 11 (forks and a
-//! promotion asked for over the Field).
+//! promotion asked for over the Field).  Every node keeps 4 Seal layers
+//! per Vessel (`local_seals`, S-c), so all of it runs with folds under it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -147,6 +148,10 @@ fn config_with(
             "socket": env_path(if node == "b" { "TASO_BLK_SOCKET_B" } else { "TASO_BLK_SOCKET" }),
             "mounts": env_path("TASO_BLK_MOUNTS"),
             "spool": tmp.join(node).join("spool"),
+            // The floor, so every test here also folds old Seal layers
+            // (S-c): a takeover, a rebirth, forks and a promotion with
+            // folds under them.
+            "local_seals": 4,
         } },
         "root": format!("{base}/{node}"),
         "state_dir": tmp.join(node).join("state"),
@@ -586,6 +591,14 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
     shutdown.request();
     sup.join().unwrap();
     assert_eq!(taso_sim_processes(), 0);
+    // S-c: dozens of Seals over these runs, every one shipped; at most
+    // local_seals of their layers stay on the node (nothing nominated, no
+    // fork: nothing else is held).
+    let left = seals(&node, &dataset);
+    assert!(
+        (1..=4).contains(&left),
+        "{left} Seal layers on the node, local_seals is 4"
+    );
 }
 
 // ── P3 file 11: forks and a promotion asked for over the Field ────────
