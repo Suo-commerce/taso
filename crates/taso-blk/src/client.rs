@@ -186,6 +186,17 @@ impl Client {
             .map_err(|_| ClientError::Protocol(format!("unseal answered {a:?}")))
     }
 
+    /// Fold `seal` into the one Seal on top of it: nothing reads
+    /// differently, the chain is one shorter.  Refused for the newest Seal
+    /// (its branch is on top) and a Seal a fork or a view stands on.
+    /// Returns the Seal on top and the blocks that became garbage.
+    pub fn fold(&mut self, seal: LayerId) -> Result<(LayerId, u64)> {
+        let a = self.call(&["fold", &seal.to_string()])?;
+        let bad = || ClientError::Protocol(format!("fold answered {a:?}"));
+        let (top, blocks) = a.split_once(' ').ok_or_else(bad)?;
+        Ok((layer(top)?, blocks.parse().map_err(|_| bad())?))
+    }
+
     /// Write Seal `to` as a stream into the new file `path` (absolute;
     /// must not exist), incremental from the Seal `from` below it, or full.
     /// Returns the blocks written.
@@ -457,6 +468,30 @@ mod tests {
             got
         });
         (dir, path, h)
+    }
+
+    #[test]
+    fn fold_is_sent_and_its_answer_parsed() {
+        let (_d, path, h) = fake(&[
+            "ok L9 12",
+            "ok L9",
+            "err L4 has no Seal alone on top of it to fold into",
+        ]);
+        let mut c = Client::connect(&path).unwrap();
+        assert_eq!(
+            c.fold(LayerId::from_raw(4)).unwrap(),
+            (LayerId::from_raw(9), 12)
+        );
+        assert!(matches!(
+            c.fold(LayerId::from_raw(4)),
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(matches!(
+            c.fold(LayerId::from_raw(4)),
+            Err(ClientError::Daemon(_))
+        ));
+        drop(c);
+        assert_eq!(h.join().unwrap(), vec!["fold L4"; 3]);
     }
 
     #[test]
