@@ -266,6 +266,19 @@ pub trait Layers {
     fn discarded_blocks(&self) -> Option<u64> {
         None
     }
+    /// Fold the layer at `lsn` into the next layer, if the store can (S-c,
+    /// 2026-11-14: `claude/Taso_design_seal_retention_2026-11-14.md`).
+    /// Nothing reads differently and the layer leaves [`Layers::list`];
+    /// its Seal is then in the bucket only.  `Ok(false)` when the layer
+    /// stays: the store never folds (the default: a records-only store
+    /// has no layers, a test's keeps them), there is no such layer, or
+    /// something stands on it (a fork, a view, the current state: the
+    /// newest).  The caller decides which layers may go; the store only
+    /// refuses what would change a read.
+    fn fold(&mut self, lsn: Lsn) -> Result<bool, LayerError> {
+        let _ = lsn;
+        Ok(false)
+    }
 }
 
 /// [`Layers`] of a Chronicle that has records only -- a Template's log,
@@ -1712,6 +1725,20 @@ mod tests {
 
     const A: WardenId = WardenId::new(1);
     const B: WardenId = WardenId::new(2);
+
+    /// S-c: a store that does not fold keeps every layer; only the block
+    /// log folds (`blk.rs`).
+    #[test]
+    fn a_store_that_does_not_fold_keeps_its_layers() {
+        let mut l = FakeLayers::default();
+        l.snapshot(Lsn::new(3), HashVal::from_bytes([3; 32]))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert!(!l.fold(Lsn::new(3)).unwrap());
+        assert_eq!(l.list().unwrap().len(), 1);
+        assert!(!NoLayers.fold(Lsn::new(3)).unwrap());
+    }
 
     fn cid() -> ChronicleId {
         ChronicleId::from_bytes([5; 16])
