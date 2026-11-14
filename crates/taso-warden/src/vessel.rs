@@ -244,6 +244,16 @@ pub enum VesselError {
     SealNotLocal(Position),
     /// The Seal is accepted but its layer is not on this node.
     LayerMissing(Position),
+    /// A fork asked from a Seal whose layer this node folded into a newer
+    /// one once shipped (S-c, R-a (a), decided 2026-11-14): a fork starts
+    /// from the newest Seal, so ask again.  `oldest`: the oldest Seal
+    /// whose layer is here.
+    SealFolded {
+        /// The Seal asked for.
+        seal: Position,
+        /// The oldest Seal this node still has a layer for.
+        oldest: Option<Lsn>,
+    },
     /// A fork from a parent's local log ([`Host::fork_from_log`]) or a
     /// promotion ([`Vessel::promote`]): the Seal cannot be proven accepted
     /// from that log (why).
@@ -363,6 +373,12 @@ impl fmt::Display for VesselError {
             Self::NotASeal(p) => write!(f, "lsn {} is not an accepted Seal", p.lsn.get()),
             Self::SealNotLocal(p) => write!(f, "the Seal at lsn {} was pruned from the local log", p.lsn.get()),
             Self::LayerMissing(p) => write!(f, "the layer of Seal {} is not on this node", p.lsn.get()),
+            Self::SealFolded { seal, oldest } => write!(
+                f,
+                "Seal {} is in the bucket only: this node folded its layer into a newer Seal; a fork starts from the newest Seal, ask again{}",
+                seal.lsn.get(),
+                oldest.map_or(String::new(), |o| format!(" (the oldest Seal here is {})", o.get()))
+            ),
             Self::ParentNotProven(why) => write!(f, "cannot prove the Seal: {why}"),
             Self::NotMyFork(c) => write!(f, "{} is not a fork of this vessel", hex(c)),
             Self::ParentMoved { fork, last } => match last {
@@ -853,6 +869,20 @@ impl<P: Pool> Host<P> {
         subject: &[u8],
     ) -> Result<Vessel<P::Layers>, VesselError> {
         let id = vessel_id(namespace, subject);
+        // R-a (a): a Seal whose layer was folded away is refused by name,
+        // before anything is made (a half-made fork stands on its Seal, so
+        // that Seal is never folded under a retry).
+        let present = self
+            .pool
+            .layers(parent_dataset)
+            .list()
+            .map_err(VesselError::Pool)?;
+        if !present.contains(&(seal.lsn, seal.hash)) {
+            return Err(VesselError::SealFolded {
+                seal,
+                oldest: present.first().map(|(l, _)| *l),
+            });
+        }
         let ps = ParentSeal {
             chronicle: parent,
             seal: seal.lsn,
@@ -1863,6 +1893,13 @@ impl<L: Layers> Vessel<L> {
         Ok(SealPublished { record, anchor })
     }
 
+    /// Fold away the layers of old Seals this node no longer needs, at
+    /// most `max` ([`Chronicle::fold_old_seals`]; S-c).  Returns how many.
+    pub fn fold_old_seals(&mut self, keep: usize, max: usize) -> Result<usize, VesselError> {
+        self.writable()?;
+        Ok(self.chronicle.fold_old_seals(keep, max)?)
+    }
+
     /// Refuse a Seal whose layer was missing at open.
     fn layer_present(&self, seal: Position) -> Result<(), VesselError> {
         if self.chronicle.layer_missing(seal.lsn) {
@@ -2297,6 +2334,15 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+        /// As the block log: never the newest layer (forks are not tracked).
+        fn fold(&mut self, lsn: Lsn) -> Result<bool, LayerError> {
+            let mut p = self.pool.0.borrow_mut();
+            let d = p.get_mut(&self.ds).ok_or("no dataset")?;
+            if d.snaps.keys().next_back() == Some(&lsn) {
+                return Ok(false);
+            }
+            Ok(d.snaps.remove(&lsn).is_some())
+        }
         /// Like the block log's rollback: the layer must be there with this hash,
         /// and nothing later may exist.
         fn rollback(&mut self, lsn: Lsn, hash: HashVal) -> Result<(), LayerError> {
@@ -2539,6 +2585,45 @@ pub(crate) mod tests {
         assert!(matches!(old.seal_birth(), Err(VesselError::Closed { .. })));
         assert!(matches!(old.rollback(), Err(VesselError::Closed { .. })));
         assert!(e.host.pool.rolled_back(old.dataset()).is_empty());
+    }
+
+    /// S-c, R-a (a): once old Seals are folded away, a fork from one is
+    /// refused by name (no dataset made), naming the oldest Seal here; a
+    /// fork from a Seal still here works.  Nothing unshipped is folded.
+    #[test]
+    fn a_fork_from_a_folded_seal_is_refused_and_one_from_the_newest_works() {
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"user-1").unwrap();
+        let s1 = seal(&mut v);
+        let s2 = seal(&mut v);
+        let s3 = seal(&mut v);
+        assert_eq!(v.fold_old_seals(1, 10).unwrap(), 0, "nothing shipped");
+        e.host
+            .coord
+            .advance_shipped(e.host.warden, v.id(), v.chronicle().epoch(), s3)
+            .unwrap();
+        assert_eq!(v.fold_old_seals(1, 10).unwrap(), 2);
+        assert!(v.chronicle().in_bucket_only(s1.lsn));
+        match e.host.fork(&v, s1, b"child") {
+            Err(VesselError::SealFolded { seal, oldest }) => {
+                assert_eq!((seal, oldest), (s1, Some(s3.lsn)));
+            }
+            other => panic!("{:?}", other.map(|c| c.id())),
+        }
+        let child = vessel_id(v.namespace(), b"child");
+        assert!(
+            e.host
+                .pool
+                .info(&e.host.dataset_for(child))
+                .unwrap()
+                .is_none(),
+            "nothing made"
+        );
+        assert!(matches!(
+            e.host.fork(&v, s2, b"child"),
+            Err(VesselError::SealFolded { .. })
+        ));
+        assert!(e.host.fork(&v, s3, b"child").is_ok());
     }
 
     // ── void birth and find ─────────────────────────────────────────
