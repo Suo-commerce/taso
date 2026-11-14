@@ -127,6 +127,19 @@ one a_refused_connection_thread_is_logged_and_the_loop_goes_on -p taso-blk --bin
 one ending_a_device_never_waits_for_the_kernel_to_free_it -p taso-blk --bin taso-blkd
 one a_device_that_never_stops_refuses_calls_instead_of_holding_them -p taso-blk --bin taso-blkd
 one a_deleted_device_the_kernel_keeps_is_counted_until_freed -p taso-blk --bin taso-blkd
+# Local Seal retention (S-c, 2026-11-14, seal-fold)
+one a_folded_seal_reads_the_same_and_shortens_the_chain -p taso-blk --lib
+one depth_max_is_the_longest_chain_and_folds_shorten_it -p taso-blk --lib
+one a_fold_is_replayed_from_the_log_and_from_a_checkpoint -p taso-blk --lib
+one fold_is_sent_and_its_answer_parsed -p taso-blk --lib
+one fold_takes_an_old_seal_out_and_stats_shows_the_shorter_chain -p taso-blk --bin taso-blkd
+one a_store_that_does_not_fold_keeps_its_layers $W
+one an_old_seal_is_folded_and_the_newest_and_a_forked_one_stay $W
+one a_folded_seal_is_in_the_bucket_only_not_missing $W
+one old_seals_fold_only_when_nothing_here_needs_them $W
+one the_fold_plan_keeps_the_newest_the_unshipped_and_the_pinned $W
+one a_fork_from_a_folded_seal_is_refused_and_one_from_the_newest_works $W
+one storage_is_the_block_log_and_zfs_is_refused $W
 
 if [ "$bad" = 0 ]; then
     echo "audit-fix-tests: PASS, $n of $n ($OUT)"
