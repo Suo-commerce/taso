@@ -308,6 +308,21 @@ impl Layers for NoLayers {
     }
 }
 
+/// Which of a Vessel's Seal layers (`layers`, in lsn order) may be folded
+/// away, oldest first: not among the newest `keep` (at least one), the
+/// next layer's Seal at or below `shipped`, and not `pinned` (an open
+/// Candidate's Seal).  The store may still refuse one (a fork on it).
+fn fold_plan(layers: &[Lsn], keep: usize, shipped: Lsn, pinned: &HashSet<Lsn>) -> Vec<Lsn> {
+    let old = layers.len().saturating_sub(keep.max(1));
+    layers[..old]
+        .iter()
+        .zip(&layers[1..])
+        .take_while(|(_, next)| **next <= shipped)
+        .map(|(seal, _)| *seal)
+        .filter(|seal| !pinned.contains(seal))
+        .collect()
+}
+
 // ── Errors and reports ──────────────────────────────────────────────
 
 /// Why a Chronicle operation failed.
@@ -1161,6 +1176,50 @@ impl<L: Layers> Chronicle<L> {
         self.in_bucket_only.len()
     }
 
+    /// Fold away the layers of old Seals this node no longer needs (S-c,
+    /// `claude/Taso_design_seal_retention_2026-11-14.md`), at most `max`
+    /// of them, oldest first.  A Seal's layer folds into the next one only
+    /// when it is not among the newest `keep` layers, the next Seal is
+    /// shipped (so both are in the bucket and the next one's pack is
+    /// made), and no open Candidate names it (the coordinator's open
+    /// work).  The store refuses one a fork or a view stands on.  Nothing
+    /// is folded if the coordinator cannot answer.  Returns how many were.
+    pub fn fold_old_seals(&mut self, keep: usize, max: usize) -> Result<usize, ChronicleError> {
+        let layers = self.layers.list().map_err(ChronicleError::Layer)?;
+        if layers.len() <= keep.max(1) || max == 0 {
+            return Ok(0);
+        }
+        let shipped = self
+            .coord
+            .shipped(self.id)
+            .map_err(ChronicleError::Coord)?
+            .lsn;
+        let pinned: HashSet<Lsn> = self
+            .coord
+            .open_work(self.id)
+            .map_err(ChronicleError::Coord)?
+            .into_iter()
+            .filter_map(|(_, r)| match r {
+                taso_core::coordlog::Submitted::Contract(
+                    taso_core::contract::ContractRecord::Candidate(c),
+                ) => Some(c.seal.lsn),
+                _ => None,
+            })
+            .collect();
+        let lsns: Vec<Lsn> = layers.iter().map(|(l, _)| *l).collect();
+        let mut folded = 0;
+        for seal in fold_plan(&lsns, keep, shipped, &pinned) {
+            if self.layers.fold(seal).map_err(ChronicleError::Layer)? {
+                self.in_bucket_only.insert(seal);
+                folded += 1;
+                if folded == max {
+                    break;
+                }
+            }
+        }
+        Ok(folded)
+    }
+
     /// Roll the state back to the newest Seal whose layer is here,
     /// discarding everything written after it (a restart resumes from a
     /// Seal, as a rebirth does).  Returns that Seal, or `None` if no Seal
@@ -1680,6 +1739,9 @@ mod tests {
         /// `destroy` refuses, as the block log's does while the state
         /// stands on the layer; `destroy_orphan` (at open) still works.
         refuse_destroy: Rc<RefCell<bool>>,
+        /// `Some`: folds as the block log does (never the newest layer,
+        /// never one in the set: a fork stands on it); `None`: keeps all.
+        folds: Rc<RefCell<Option<std::collections::BTreeSet<Lsn>>>>,
         /// Every snapshot hands back a thaw, as the block log's does, so
         /// every Seal here runs its thaw beside its commit (bite 2).  The
         /// thaw counts itself, sleeps `thaw_ms`, then fails if told to.
@@ -1736,6 +1798,18 @@ mod tests {
         fn destroy_orphan(&mut self, lsn: Lsn) -> Result<(), LayerError> {
             self.snaps.borrow_mut().remove(&lsn);
             Ok(())
+        }
+        fn fold(&mut self, lsn: Lsn) -> Result<bool, LayerError> {
+            let Some(forked) = self.folds.borrow().clone() else {
+                return Ok(false);
+            };
+            let mut s = self.snaps.borrow_mut();
+            let newest = s.keys().next_back().copied();
+            if !s.contains_key(&lsn) || Some(lsn) == newest || forked.contains(&lsn) {
+                return Ok(false);
+            }
+            s.remove(&lsn);
+            Ok(true)
         }
         /// Like the block log's rollback: the layer must be there with this hash,
         /// and nothing later may exist.
@@ -2406,6 +2480,74 @@ mod tests {
         let (c, r) = e.open(A);
         assert_eq!(r.missing_layers, vec![s1]);
         assert_eq!(c.seals_in_bucket_only(), 0);
+    }
+
+    /// S-c, R-b (a), R-c (a): old layers fold away, oldest first, up to
+    /// `max`; never the newest `keep`, never one whose next Seal is not
+    /// shipped, never one a fork stands on (an open Candidate's Seal: the
+    /// plan's test).  Reopened, the folded Seals are in the bucket only.
+    #[test]
+    fn old_seals_fold_only_when_nothing_here_needs_them() {
+        let e = env();
+        *e.layers.folds.borrow_mut() = Some([Lsn::new(4)].into_iter().collect());
+        let mut c = e.create();
+        let s: Vec<Position> = (1..=8).map(|t| seal(&mut c, t).unwrap().seal).collect();
+        let lsns = |e: &Env| {
+            e.layers
+                .snaps()
+                .into_iter()
+                .map(|(l, _)| l.get())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lsns(&e), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(c.fold_old_seals(3, 100).unwrap(), 0, "nothing shipped");
+
+        // Shipped to s[4]: s[0..4] may go (their next Seals are shipped);
+        // a fork stands on s[3].
+        e.coord.advance_shipped(A, cid(), c.epoch(), s[4]).unwrap();
+        assert_eq!(c.fold_old_seals(3, 1).unwrap(), 1, "at most max");
+        assert_eq!(lsns(&e), [2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(c.fold_old_seals(3, 100).unwrap(), 2);
+        assert_eq!(lsns(&e), [4, 5, 6, 7, 8], "the fork's stays");
+        assert!(c.in_bucket_only(Lsn::new(1)) && c.in_bucket_only(Lsn::new(3)));
+
+        // All shipped: only the newest 3 stay, and the fork's.
+        e.coord.advance_shipped(A, cid(), c.epoch(), s[7]).unwrap();
+        assert_eq!(c.fold_old_seals(3, 100).unwrap(), 1);
+        assert_eq!(lsns(&e), [4, 6, 7, 8]);
+        drop(c);
+        let (c, r) = e.open(A);
+        assert!(r.missing_layers.is_empty(), "{:?}", r.missing_layers);
+        assert_eq!(c.seals_in_bucket_only(), 4);
+    }
+
+    /// The plan: oldest first, never the newest `keep` (nor all of them
+    /// with `keep` 0), stops at the first whose next Seal is not shipped,
+    /// skips an open Candidate's Seal.
+    #[test]
+    fn the_fold_plan_keeps_the_newest_the_unshipped_and_the_pinned() {
+        let l = |v: &[u64]| v.iter().map(|n| Lsn::new(*n)).collect::<Vec<_>>();
+        let none = HashSet::new();
+        let all = Lsn::new(u64::MAX);
+        assert_eq!(
+            fold_plan(&l(&[1, 2, 3, 4, 5]), 2, all, &none),
+            l(&[1, 2, 3])
+        );
+        assert_eq!(fold_plan(&l(&[1, 2, 3]), 0, all, &none), l(&[1, 2]));
+        assert_eq!(fold_plan(&l(&[1, 2, 3]), 5, all, &none), l(&[]));
+        assert_eq!(
+            fold_plan(&l(&[1, 2, 3, 4, 5]), 1, Lsn::new(3), &none),
+            l(&[1, 2])
+        );
+        assert_eq!(
+            fold_plan(&l(&[1, 2, 3, 4, 5]), 1, Lsn::new(1), &none),
+            l(&[])
+        );
+        let pinned = [Lsn::new(2)].into_iter().collect();
+        assert_eq!(
+            fold_plan(&l(&[1, 2, 3, 4, 5]), 1, all, &pinned),
+            l(&[1, 3, 4])
+        );
     }
 
     /// A layer is a Seal's only: one bound to an accepted record that is
