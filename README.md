@@ -95,6 +95,31 @@ the child's `/work` idmapped over its parent's files. Then it ends.
 explain <id>` rebuilds every decision about a Vessel, a Template or a
 Candidate from the records.
 
+**How much of each Vessel's history stays on the node.** Every Seal is
+shipped to the bucket, and the bucket keeps the Vessel's whole history.
+The node keeps only the newest **16 Seals' layers per Vessel** by
+default; an older Seal's layer is folded into the next one once both are
+shipped, so the block log stays bounded and reads stay fast. Set it in
+`/etc/taso/warden.json`:
+
+```
+"storage": { "blk": { …, "local_seals": 16 } }
+```
+
+At least 4. Higher keeps more forkable history on the node at the cost
+of block-log space; lower saves space. What it means for you:
+
+- **A fork starts from the newest Seal.** A fork asked for from a Seal
+  whose layer was folded away is refused with a message naming the
+  oldest Seal the node still has; ask again from the newest.
+- A Seal that an open Candidate names, or that a fork stands on, is
+  never folded while it is needed.
+- A folded Seal is not lost: it is in the bucket, and the Vessel's
+  state does not change. A Warden restart does not count it as a Seal
+  without its layer.
+- `taso-blkd`'s `stats` reports `depth_max=`, the longest chain of layers
+  a read may walk, which folding keeps near `local_seals`.
+
 **Read before running an agent:**
 
 - Taso records; it does not police. Its guarantee holds only when every
