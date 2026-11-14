@@ -412,6 +412,13 @@ impl Map {
         Ok(self.layer(layer)?.depth + 1)
     }
 
+    /// The deepest chain of any live layer ([`Map::depth`]): the longest
+    /// walk a cold read may make.  0 for an empty map.  What folding keeps
+    /// bounded.
+    pub fn depth_max(&self) -> u32 {
+        self.layers.values().map(|l| l.depth + 1).max().unwrap_or(0)
+    }
+
     /// How many blocks `layer` itself holds.
     pub fn len(&self, layer: LayerId) -> Result<usize, MapError> {
         Ok(self.layer(layer)?.blocks.len())
@@ -988,6 +995,26 @@ mod tests {
         m.drop_branch(f).unwrap();
         assert_eq!(m.fold(s2).unwrap().0, s3);
         assert_eq!(m.fold(b), Err(MapError::NotASeal(b)));
+    }
+
+    /// `stats` reports the deepest chain, so a soak can see that folding
+    /// keeps it bounded.
+    #[test]
+    fn depth_max_is_the_longest_chain_and_folds_shorten_it() {
+        let mut m = Map::new();
+        assert_eq!(m.depth_max(), 0);
+        let root = m.root_seal(0);
+        let b = m.fork(root).unwrap();
+        let other = m.fork(root).unwrap();
+        let seals: Vec<_> = (1..=5).map(|i| m.seal(b, i).unwrap()).collect();
+        assert_eq!(
+            (m.depth_max(), m.depth(b).unwrap(), m.depth(other).unwrap()),
+            (7, 7, 2)
+        );
+        for s in &seals[..4] {
+            m.fold(*s).unwrap();
+        }
+        assert_eq!(m.depth_max(), 3, "root, the newest Seal, the branch");
     }
 
     // ── model-based property test ───────────────────────────────────
