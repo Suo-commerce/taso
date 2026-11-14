@@ -27,6 +27,7 @@
 //! | `detach <branch>`| stop the branch's device                         | `ok`                 |
 //! | `reset <branch>` | back to the Seal it stands on (detached only)    | `ok`                 |
 //! | `unseal <branch>`| take away the Seal it alone stands on (an orphan), standing on that Seal's parent (detached only) | `ok <blocks>` |
+//! | `fold <seal>`     | fold the Seal into the one Seal on top of it: nothing reads differently, the chain is one shorter; refused for the newest Seal or one with a fork or view on it | `ok <seal on top> <blocks>` |
 //! | `export <seal> <base>\|- <file>` | the Seal as a stream into a new file | `ok <blocks>`  |
 //! | `import <branch> <file>` | apply a stream (detached, clean branch)  | `ok <blocks>`        |
 //! | `names`          | every named branch                               | `ok <name>:<branch> ...` |
@@ -325,6 +326,7 @@ enum Site {
     Seals,
     Seal,
     Unseal,
+    Fold,
     Reset,
     Export,
     Import,
@@ -360,6 +362,7 @@ const SITES: [&str; Site::N as usize] = [
     "seals",
     "seal",
     "unseal",
+    "fold",
     "reset",
     "export",
     "import",
@@ -1119,6 +1122,16 @@ impl Daemon {
                 drop(devices);
                 Ok(freed.to_string())
             }
+            "fold" => {
+                // No device to detach: a fold changes no layer's reads,
+                // and the Seal it takes away has nothing but the Seal on
+                // top standing on it (S-c, 2026-11-14).
+                let seal = layer(1)?;
+                let (top, freed) = lock_store(&self.store, Site::Fold)
+                    .fold(seal)
+                    .map_err(store_err)?;
+                Ok(format!("{top} {freed}"))
+            }
             "reset" => {
                 let branch = layer(1)?;
                 // Hold the device table so no attach can start in between;
@@ -1675,9 +1688,9 @@ impl Daemon {
         // reads), and the operator still needs the rest of this line, so
         // the count is shown as unknown, as threads= and rss_kib= are
         // when they cannot be read.
-        let layers = match s.map() {
-            Ok(map) => map.layers().to_string(),
-            Err(_) => "?".to_string(),
+        let (layers, depth_max) = match s.map() {
+            Ok(map) => (map.layers().to_string(), map.depth_max().to_string()),
+            Err(_) => ("?".to_string(), "?".to_string()),
         };
         let (sync_us, sync_max_us) = self.sync.sync_time();
         let held = *lock(&HELD);
@@ -1689,13 +1702,14 @@ impl Daemon {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} devices={} zombies={} threads={} rss_kib={}{}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={} durable_at={} lock={}",
+            "log_bytes={} garbage_bytes={} records={} syncs={} lsn={} layers={} depth_max={} devices={} zombies={} threads={} rss_kib={}{}{}{}{}{} op_wsplit={}:{}:{}:{} sync_us={}:{}:{} flushes_joined={} durable_at={} lock={}",
             st.log_bytes,
             st.garbage_bytes,
             st.records,
             st.syncs + self.sync.syncs(),
             s.lsn(),
             layers,
+            depth_max,
             devices,
             zombies(&DELETED, |id| {
                 std::path::Path::new(&format!("/sys/class/ublk-char/ublkc{id}")).exists()
@@ -2511,6 +2525,45 @@ mod detach_test {
         });
         let e = answer.expect("the call answered").unwrap_err();
         assert!(e.contains("still stopping"), "{e}");
+    }
+
+    /// S-c (soak 2026-11-13): `fold` takes an old Seal out of the chain
+    /// while the branch's device runs; reads do not change, and `stats`
+    /// shows the chain one shorter.  The newest Seal is refused.
+    #[test]
+    fn fold_takes_an_old_seal_out_and_stats_shows_the_shorter_chain() {
+        let (_dir, d, branch, stop) = daemon_with_a_running_branch();
+        stop.store(true, Ordering::Relaxed);
+        let (s1, s2) = {
+            let mut s = lock(&d.store);
+            s.write(branch, 0, &vec![1u8; 2 * BLOCK as usize], false)
+                .unwrap();
+            let s1 = s.seal(branch).unwrap();
+            s.write(branch, 1, &vec![2u8; BLOCK as usize], false)
+                .unwrap();
+            (s1, s.seal(branch).unwrap())
+        };
+        let depth = |d: &Daemon| {
+            d.stats()
+                .split(' ')
+                .find_map(|w| w.strip_prefix("depth_max="))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(depth(&d), "4");
+        assert!(
+            d.command(&["fold", &s2.to_string()]).is_err(),
+            "the newest Seal"
+        );
+        assert_eq!(
+            d.command(&["fold", &s1.to_string()]).unwrap(),
+            format!("{s2} 1")
+        );
+        assert_eq!(depth(&d), "3");
+        let mut buf = vec![0u8; 2 * BLOCK as usize];
+        lock(&d.store).read(branch, 0, &mut buf).unwrap();
+        assert!(buf[..BLOCK as usize].iter().all(|b| *b == 1));
+        assert!(buf[BLOCK as usize..].iter().all(|b| *b == 2));
     }
 
     /// A control that records what ending its device did.
