@@ -955,7 +955,26 @@ pub struct StorageConf {
     /// Where shipped streams pass through files (shared with the daemon,
     /// on this host).
     pub spool: PathBuf,
+    /// `storage.blk.local_seals`: how many of each Vessel's newest Seal
+    /// layers stay on this node (S-c, R-b (a)); older ones fold into the
+    /// next once shipped and are then in the bucket only.  At least
+    /// [`MIN_LOCAL_SEALS`], [`DEFAULT_LOCAL_SEALS`] if absent.
+    pub local_seals: usize,
 }
+
+/// The default `storage.blk.local_seals` (R-b (a), decided 2026-11-14).
+pub const DEFAULT_LOCAL_SEALS: usize = 16;
+/// The smallest `storage.blk.local_seals`: a Seal just nominated stays
+/// within it until its Candidate is accepted and pinned.
+pub const MIN_LOCAL_SEALS: usize = 4;
+/// Old Seal layers folded after each published Seal, at most: one falls
+/// out of `local_seals` per Seal, the rest of the allowance works off what
+/// a fork or a Candidate held back (R-c (a)).
+pub const FOLDS_PER_SEAL: usize = 8;
+/// Old Seal layers folded when a Vessel's run starts, at most: an upgraded
+/// node works off its backlog over several starts, never stalling one
+/// (R-d (a)).
+pub const FOLDS_AT_START: usize = 256;
 
 impl StorageConf {
     /// The block log this configuration names.
@@ -974,7 +993,20 @@ fn storage_conf(v: &Value) -> Result<StorageConf, ConfigError> {
     };
     only_keys(o, "storage", &["blk"])?;
     let b = &o["blk"];
-    only_keys(b, "storage.blk", &["socket", "mounts", "spool"])?;
+    only_keys(
+        b,
+        "storage.blk",
+        &["socket", "mounts", "spool", "local_seals"],
+    )?;
+    let local_seals = match opt_u64(b, "local_seals")? {
+        None => DEFAULT_LOCAL_SEALS,
+        Some(n) if n >= MIN_LOCAL_SEALS as u64 => usize::try_from(n).unwrap_or(usize::MAX),
+        Some(n) => {
+            return Err(bad(format!(
+                "\"storage.blk.local_seals\" must be at least {MIN_LOCAL_SEALS}, not {n}"
+            )))
+        }
+    };
     let mounts = abs_path(b, "mounts")?;
     if mounts == Path::new("/") {
         return Err(bad("\"storage.blk.mounts\" must not be /"));
@@ -983,6 +1015,7 @@ fn storage_conf(v: &Value) -> Result<StorageConf, ConfigError> {
         socket: abs_path(b, "socket")?,
         mounts,
         spool: abs_path(b, "spool")?,
+        local_seals,
     })
 }
 
@@ -2023,6 +2056,13 @@ pub struct SealPublisher {
     pub prune_failures: u64,
     /// The last prune failure.
     pub prune_error: Option<String>,
+    /// `storage.blk.local_seals`.
+    pub local_seals: usize,
+    /// Old Seal layers folded after a publish (S-c).
+    pub folded: u64,
+    /// Folds that failed (the publish stood; the next one tries again),
+    /// and the last reason.
+    pub fold_failures: (u64, Option<String>),
 }
 
 /// Closed segment files kept on local disk after a prune: the newest
@@ -2062,6 +2102,15 @@ impl AfterSeal<BlkLayers> for SealPublisher {
             Err(e) => {
                 self.prune_failures += 1;
                 self.prune_error = Some(e.to_string());
+            }
+        }
+        // Nor need old Seal layers once shipped (S-c, R-c (a)).  A failed
+        // fold leaves them; the next publish tries again.
+        match vessel.fold_old_seals(self.local_seals, FOLDS_PER_SEAL) {
+            Ok(n) => self.folded += n as u64,
+            Err(e) => {
+                self.fold_failures.0 += 1;
+                self.fold_failures.1 = Some(e.to_string());
             }
         }
         Ok(())
@@ -5008,6 +5057,9 @@ impl Node {
             pruned: 0,
             prune_failures: 0,
             prune_error: None,
+            local_seals: self.config.storage.local_seals,
+            folded: 0,
+            fold_failures: (0, None),
         };
         // A crash between taking a Seal and publishing it, or the birth
         // Seal just taken: publish now.  Counted only if this shipped it (a
@@ -5030,6 +5082,19 @@ impl Node {
                     unpublished = Some((seal, e.to_string()));
                 }
             }
+        }
+        // Old Seal layers this node no longer needs, a bounded number per
+        // start (S-c, R-d (a)): an upgraded node's backlog goes over a few
+        // starts.  A failure is logged and the run goes on.
+        match vessel.fold_old_seals(self.config.storage.local_seals, FOLDS_AT_START) {
+            Ok(0) => {}
+            Ok(n) => self.log(
+                vc,
+                format_args!(
+                    "folded {n} old Seal layer(s) into newer ones (in the bucket only now)"
+                ),
+            ),
+            Err(e) => self.log(vc, format_args!("folding old Seal layers failed: {e}")),
         }
         // Open attempts closed, leftovers destroyed (D69, D66).
         self.settle_attempts(vc, &mut vessel)?;
@@ -5567,6 +5632,22 @@ impl Node {
             .map_err(|_| DaemonError::Io("the stop thread panicked".into()))?;
         if stopped {
             self.log(vc, "stopped on request: the agent's container was killed");
+        }
+        if publisher.folded > 0 || publisher.fold_failures.0 > 0 {
+            self.log(
+                vc,
+                format_args!(
+                    "{} old Seal layer(s) folded after publishing, {} fold failure(s){}",
+                    publisher.folded,
+                    publisher.fold_failures.0,
+                    publisher
+                        .fold_failures
+                        .1
+                        .as_deref()
+                        .map(|e| format!(" (last: {e})"))
+                        .unwrap_or_default()
+                ),
+            );
         }
         Ok(Report {
             subject: vc.subject.clone(),
@@ -6714,9 +6795,25 @@ mod tests {
             StorageConf {
                 socket: "/run/b.sock".into(),
                 mounts: "/srv/b".into(),
-                spool: "/var/lib/b".into()
+                spool: "/var/lib/b".into(),
+                local_seals: DEFAULT_LOCAL_SEALS,
             }
         );
+        // S-c, R-b (a): local_seals, at least 4.
+        let n = |k: Value| {
+            let mut b = serde_json::json!({"blk": {"socket": "/run/b.sock", "mounts": "/srv/b", "spool": "/var/lib/b"}});
+            b["blk"]["local_seals"] = k;
+            with(b).map(|c| c.storage.local_seals)
+        };
+        assert_eq!(n(serde_json::json!(4)).unwrap(), 4);
+        assert_eq!(n(serde_json::json!(64)).unwrap(), 64);
+        for bad in [
+            serde_json::json!(3),
+            serde_json::json!(0),
+            serde_json::json!("16"),
+        ] {
+            assert!(n(bad.clone()).is_err(), "{bad}");
+        }
         let mut none: Value = serde_json::from_str(GOOD).unwrap();
         none.as_object_mut().unwrap().remove("storage");
         let e = Config::parse(&none.to_string()).unwrap_err().to_string();
