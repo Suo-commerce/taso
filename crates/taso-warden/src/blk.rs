@@ -142,6 +142,10 @@ pub trait Blkd {
     /// taken, its record never accepted); the branch stands on that Seal's
     /// parent with nothing of its own.  Returns the blocks discarded.
     fn unseal(&mut self, branch: LayerId) -> Result<u64, LayerError>;
+    /// Fold `seal` into the one Seal on top of it (S-c): nothing reads
+    /// differently.  `None` when the daemon refuses: the newest Seal, one
+    /// a fork or a view stands on, or one no longer there.
+    fn fold(&mut self, seal: LayerId) -> Result<Option<LayerId>, LayerError>;
     /// Write Seal `to` (incremental from the Seal `from`, or full) as a
     /// stream into the new file `path`.
     fn export(
@@ -231,6 +235,15 @@ impl Blkd for Daemon {
     }
     fn unseal(&mut self, branch: LayerId) -> Result<u64, LayerError> {
         self.call(|c| c.unseal(branch))
+    }
+    fn fold(&mut self, seal: LayerId) -> Result<Option<LayerId>, LayerError> {
+        match self.call(|c| c.fold(seal)) {
+            Ok((top, _)) => Ok(Some(top)),
+            Err(e) => match e.downcast_ref::<ClientError>() {
+                Some(ClientError::Daemon(_)) => Ok(None),
+                _ => Err(e),
+            },
+        }
     }
     fn export(
         &mut self,
@@ -1670,6 +1683,18 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
     fn discarded_blocks(&self) -> Option<u64> {
         self.discarded
     }
+    /// Fold the Seal at `lsn` into the one Seal on top of it: no flush (a
+    /// fold lost to a crash is done again by the next pass), no device
+    /// stopped (a fold changes no read).  The daemon refuses the newest
+    /// Seal and one a fork or a view stands on: `Ok(false)`.
+    fn fold(&mut self, lsn: Lsn) -> Result<bool, LayerError> {
+        let mut d = conn(&self.maker, &self.blkd);
+        let b = self.branch(&mut *d)?;
+        let Some((layer, _)) = seal_at(&mut *d, b, lsn)? else {
+            return Ok(false);
+        };
+        Ok(d.fold(layer)?.is_some())
+    }
     fn snapshot(&mut self, lsn: Lsn, hash: HashVal) -> Result<Thaw, LayerError> {
         // On this Vessel's own connection, with the branch and its device
         // cached: a Seal is two commands (the Seals of the branch, to
@@ -2067,6 +2092,14 @@ mod tests {
             self.seal_goes()?;
             Ok(self.store.unseal(branch)?)
         }
+        fn fold(&mut self, seal: LayerId) -> Result<Option<LayerId>, LayerError> {
+            // As the daemon: a refusal of the map is an answer, not an error.
+            match self.store.fold(seal) {
+                Ok((top, _)) => Ok(Some(top)),
+                Err(taso_blk::store::StoreError::Map(_)) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        }
         fn export(
             &mut self,
             to: LayerId,
@@ -2174,6 +2207,9 @@ mod tests {
         }
         fn unseal(&mut self, branch: LayerId) -> Result<u64, LayerError> {
             self.0.lock().unwrap().unseal(branch)
+        }
+        fn fold(&mut self, seal: LayerId) -> Result<Option<LayerId>, LayerError> {
+            self.0.lock().unwrap().fold(seal)
         }
         fn export(
             &mut self,
@@ -3739,6 +3775,47 @@ mod tests {
             0,
             "the write after the last Seal is gone"
         );
+    }
+
+    /// S-c (soak 2026-11-13): a Vessel's old Seal is folded on the block
+    /// log; it leaves the list, the Vessel reads the same, and the newest
+    /// Seal (its branch on it) and a Seal a fork stands on stay.
+    #[test]
+    fn an_old_seal_is_folded_and_the_newest_and_a_forked_one_stay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = host(tmp.path());
+        let ns = Namespace::from_bytes([1; 16]);
+        let (mut v, _) = host.ensure(ns, b"user-1").unwrap();
+        let birth = v.seal_birth().unwrap().seal;
+        write0(&host.pool, v.dataset(), 7);
+        let s1 = seal(&mut v, 1);
+        let s2 = seal(&mut v, 2);
+        let s3 = seal(&mut v, 3);
+        let mut layers = host.pool.layers(v.dataset());
+        assert!(
+            !layers.fold(s3.lsn).unwrap(),
+            "the newest: its branch stands on it"
+        );
+        let child = host.fork(&v, s2, b"child-1").unwrap();
+        assert!(!layers.fold(s2.lsn).unwrap(), "a fork stands on it");
+        assert!(layers.fold(s1.lsn).unwrap());
+        assert!(layers.fold(birth.lsn).unwrap());
+        assert!(!layers.fold(s1.lsn).unwrap(), "no longer there");
+        assert_eq!(
+            layers.list().unwrap(),
+            [(s2.lsn, s2.hash), (s3.lsn, s3.hash)]
+        );
+        assert_eq!(
+            block0(&host.pool, v.dataset()),
+            7,
+            "the Vessel reads the same"
+        );
+        assert_eq!(block0(&host.pool, child.dataset()), 7, "so does the fork");
+        drop(child);
+        let id = v.id();
+        drop(v);
+        let (v, _) = host.open(id).unwrap();
+        assert_eq!(v.last_seal(), Some(s3));
     }
 
     #[test]
