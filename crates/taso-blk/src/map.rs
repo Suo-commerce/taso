@@ -27,6 +27,9 @@
 //!   block: the device reads zeros there.
 //! - **Drop** a branch, or a Seal with no children: its own blocks are
 //!   returned as garbage for the store to reclaim.
+//! - **Fold** a Seal into the one Seal on top of it: the blocks the Seal
+//!   on top did not rewrite move up into it, the rest are garbage, and the
+//!   chain is one layer shorter.  No remaining layer reads differently.
 //!
 //! Every log location the store hands to [`Map::write`] belongs to exactly
 //! one layer.  It comes back as garbage exactly once: when it is
@@ -99,6 +102,9 @@ pub enum MapError {
     NotASeal(LayerId),
     /// The Seal still has branches or Seals on top of it.
     HasChildren(LayerId),
+    /// A fold needs exactly one layer on top of the Seal, and that layer a
+    /// Seal: this one has none, or a branch.
+    NoSealOnTop(LayerId),
     /// The Seal is a root Seal: a branch must stand on a Seal, so it cannot
     /// be taken from under one.
     Root(LayerId),
@@ -113,6 +119,7 @@ impl fmt::Display for MapError {
             Self::NotABranch(l) => write!(f, "{l} is a Seal; Seals never change"),
             Self::NotASeal(l) => write!(f, "{l} is a branch; fork from a Seal"),
             Self::HasChildren(l) => write!(f, "{l} still has layers on top of it"),
+            Self::NoSealOnTop(l) => write!(f, "{l} has no Seal alone on top of it to fold into"),
             Self::Root(l) => write!(f, "{l} is a root Seal; a branch cannot stand below it"),
             Self::Overflow => write!(f, "block range overflows"),
         }
@@ -325,6 +332,68 @@ impl Map {
             Kind::Seal { .. } => {}
         }
         Ok(self.remove(seal))
+    }
+
+    /// Fold `seal` into the one layer on top of it, which must be a Seal:
+    /// the blocks the Seal on top holds itself win; `seal`'s other blocks
+    /// move up into it; the Seal on top then stands on `seal`'s parent, and
+    /// `seal` is gone.  No remaining layer reads differently, for any
+    /// block: only the chain is shorter (a read walks it), and the blocks
+    /// the Seal on top had rewritten become garbage.  Returns the Seal on
+    /// top and the log locations, now garbage.
+    ///
+    /// Refused for a branch, a Seal with more than one layer on top (a
+    /// fork, a view, a branch beside its next Seal), and a Seal whose one
+    /// layer on top is a branch (the newest Seal: the branch stands on it).
+    pub fn fold(&mut self, seal: LayerId) -> Result<(LayerId, Vec<u64>), MapError> {
+        let l = self.layer(seal)?;
+        match l.kind {
+            Kind::Branch => return Err(MapError::NotASeal(seal)),
+            Kind::Seal { .. } if l.children > 1 => return Err(MapError::HasChildren(seal)),
+            Kind::Seal { .. } if l.children == 0 => return Err(MapError::NoSealOnTop(seal)),
+            Kind::Seal { .. } => {}
+        }
+        let below = l.parent;
+        let top = self
+            .layers
+            .iter()
+            .find(|(_, x)| x.parent == Some(seal))
+            .map(|(id, _)| *id)
+            .expect("a layer counted on top of the Seal is there");
+        if self.layers[&top].kind == Kind::Branch {
+            return Err(MapError::NoSealOnTop(seal));
+        }
+        let old = self.layers.remove(&seal).expect("checked above");
+        let t = self.layers.get_mut(&top).expect("found above");
+        let mut garbage = Vec::new();
+        for (lba, loc) in old.blocks {
+            match t.blocks.entry(lba) {
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    if let Loc::Log(off) = loc {
+                        garbage.push(off);
+                    }
+                }
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(loc);
+                }
+            }
+        }
+        // The Seal on top takes the folded Seal's place on `below`, whose
+        // child count is unchanged.
+        t.parent = below;
+        // Everything from the Seal on top up stands one layer lower.
+        let mut on_top: HashMap<LayerId, Vec<LayerId>> = HashMap::new();
+        for (id, x) in &self.layers {
+            if let Some(p) = x.parent {
+                on_top.entry(p).or_default().push(*id);
+            }
+        }
+        let mut walk = vec![top];
+        while let Some(id) = walk.pop() {
+            self.layers.get_mut(&id).expect("live").depth -= 1;
+            walk.extend(on_top.get(&id).into_iter().flatten().copied());
+        }
+        Ok((top, garbage))
     }
 
     /// What `layer` is.
@@ -875,6 +944,52 @@ mod tests {
         assert_eq!(m.read(f, 99_999).unwrap(), Some(log(99_999 * BLOCK)));
     }
 
+    /// S-c (soak 2026-11-13): every Seal stayed in the chain for good, so
+    /// the block log grew without end and a cold read walked every Seal.
+    /// A fold takes one Seal out: nothing reads differently, the chain is
+    /// one shorter, and only what the Seal on top rewrote is garbage.
+    #[test]
+    fn a_folded_seal_reads_the_same_and_shortens_the_chain() {
+        let mut m = Map::new();
+        let root = m.root_seal(0);
+        let b = m.fork(root).unwrap();
+        m.write(b, 1, log(10)).unwrap();
+        m.write(b, 2, log(20)).unwrap();
+        let s1 = m.seal(b, 1).unwrap();
+        m.write(b, 2, log(30)).unwrap(); // rewrites block 2
+        m.write(b, 3, log(40)).unwrap();
+        let s2 = m.seal(b, 2).unwrap();
+        m.write(b, 4, log(50)).unwrap();
+        let before: Vec<_> = (0..6).map(|l| m.read(b, l).unwrap()).collect();
+        let s2_before: Vec<_> = (0..6).map(|l| m.read(s2, l).unwrap()).collect();
+        assert_eq!(m.depth(b).unwrap(), 4);
+
+        // The newest Seal has the branch on top: never folded.
+        assert_eq!(m.fold(s2), Err(MapError::NoSealOnTop(s2)));
+        let (top, garbage) = m.fold(s1).unwrap();
+        assert_eq!(top, s2);
+        assert_eq!(garbage, vec![20], "only the block S2 rewrote");
+        assert!(m.kind(s1).is_err());
+        assert_eq!(m.parent(s2).unwrap(), Some(root));
+        assert_eq!(m.depth(b).unwrap(), 3, "one layer shorter");
+        assert_eq!(
+            (0..6).map(|l| m.read(b, l).unwrap()).collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(
+            (0..6).map(|l| m.read(s2, l).unwrap()).collect::<Vec<_>>(),
+            s2_before
+        );
+
+        // A Seal a fork stands on beside the next Seal is not folded.
+        let f = m.fork(s2).unwrap();
+        let s3 = m.seal(b, 3).unwrap();
+        assert_eq!(m.fold(s2), Err(MapError::HasChildren(s2)));
+        m.drop_branch(f).unwrap();
+        assert_eq!(m.fold(s2).unwrap().0, s3);
+        assert_eq!(m.fold(b), Err(MapError::NotASeal(b)));
+    }
+
     // ── model-based property test ───────────────────────────────────
     //
     // The model materialises every layer: a branch is a full copy of what
@@ -891,6 +1006,7 @@ mod tests {
         DropSeal(usize),
         Reset(usize),
         Unseal(usize),
+        Fold(usize),
     }
 
     fn op() -> impl Strategy<Value = Op> {
@@ -904,7 +1020,8 @@ mod tests {
             1 => ix.clone().prop_map(Op::DropBranch),
             1 => ix.clone().prop_map(Op::DropSeal),
             1 => ix.clone().prop_map(Op::Reset),
-            1 => ix.prop_map(Op::Unseal),
+            1 => ix.clone().prop_map(Op::Unseal),
+            2 => ix.prop_map(Op::Fold),
         ]
     }
 
@@ -932,7 +1049,8 @@ mod tests {
             for o in ops {
                 let Some(id) = (match &o {
                     Op::Fork(i) | Op::Write(i, _) | Op::Discard(i, _, _) | Op::Seal(i)
-                    | Op::DropBranch(i) | Op::DropSeal(i) | Op::Reset(i) | Op::Unseal(i) => pick(*i, &model),
+                    | Op::DropBranch(i) | Op::DropSeal(i) | Op::Reset(i) | Op::Unseal(i)
+                    | Op::Fold(i) => pick(*i, &model),
                 }) else { break };
                 let is_branch = m.kind(id).unwrap() == Kind::Branch;
                 match o {
@@ -990,7 +1108,31 @@ mod tests {
                             }
                             Err(MapError::NotABranch(x)) => prop_assert!(!is_branch && x == id),
                             Err(MapError::HasChildren(x)) => prop_assert!(is_branch && Some(x) == seal),
-                            Err(MapError::Root(x)) => prop_assert!(is_branch && Some(x) == seal && x == root),
+                            // A fold of a root Seal leaves the Seal on top as a root.
+                            Err(MapError::Root(x)) => prop_assert!(is_branch && Some(x) == seal && m.parent(x).unwrap().is_none()),
+                            Err(e) => prop_assert!(false, "unexpected {e}"),
+                        }
+                    }
+                    Op::Fold(_) => {
+                        let on_top: Vec<LayerId> = model.keys().copied()
+                            .filter(|l| m.parent(*l).unwrap() == Some(id)).collect();
+                        let below = m.parent(id).unwrap();
+                        match m.fold(id) {
+                            Ok((top, g)) => {
+                                prop_assert!(!is_branch);
+                                prop_assert_eq!(&on_top, &vec![top]);
+                                prop_assert!(m.kind(top).unwrap() != Kind::Branch);
+                                prop_assert_eq!(m.parent(top).unwrap(), below);
+                                prop_assert!(m.kind(id).is_err(), "the folded Seal is gone");
+                                free(g, &mut freed);
+                                // Every other layer reads as before: the
+                                // checks below compare against the model.
+                                model.remove(&id);
+                            }
+                            Err(MapError::NotASeal(x)) => prop_assert!(is_branch && x == id),
+                            Err(MapError::HasChildren(x)) => prop_assert!(!is_branch && x == id && on_top.len() > 1),
+                            Err(MapError::NoSealOnTop(x)) => prop_assert!(!is_branch && x == id && (on_top.is_empty()
+                                || (on_top.len() == 1 && m.kind(on_top[0]).unwrap() == Kind::Branch))),
                             Err(e) => prop_assert!(false, "unexpected {e}"),
                         }
                     }
@@ -1025,6 +1167,12 @@ mod tests {
                         "location {} live={} freed={}", off, live.contains(off), freed.contains(off));
                 }
                 prop_assert_eq!(m.layers(), model.len());
+                // Each layer's depth is its chain's length (folds change it).
+                for layer in model.keys() {
+                    let (mut n, mut l) = (1u32, *layer);
+                    while let Some(p) = m.parent(l).unwrap() { n += 1; l = p; }
+                    prop_assert_eq!(m.depth(*layer).unwrap(), n, "depth of {}", layer);
+                }
             }
         }
     }
