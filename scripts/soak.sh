@@ -24,7 +24,9 @@
 #
 # Every SAMPLE seconds (default 15) one line in soak.tsv: the Warden's
 # threads, open files and memory, taso-blkd's memory, ublk devices,
-# GiB free, the block log's size, taso-blkd's threads.
+# GiB free, the block log's size, taso-blkd's threads, the deepest chain
+# of layers (taso-blkd's depth_max) and the block log's live MiB (its
+# size less its garbage).
 #
 # At the end the Warden is stopped and every Chronicle on the node (each
 # Vessel, each fork) is checked:
@@ -42,6 +44,11 @@
 #     taso-test 2026-11-12);
 #   - no device taso-blkd deleted is still kept by the kernel (stats
 #     zombies=0);
+#   - the deepest chain of layers did not grow, by the same rule: old Seal
+#     layers fold away once shipped (local_seals, S-c; before, every Seal
+#     deepened the chain, and the soak of 2026-11-13 grew the block log by
+#     12 GB in 8 h).  The live size is sampled for a person to read, not
+#     judged: each sanction's Template layer stays by design;
 #   - free space never fell below FLOOR_GIB: the soak stops there and
 #     fails, rather than run on with a full disk (taso-test 2026-11-09: a
 #     24 h run filled it in 2 h and sat stalled for 19 h);
@@ -54,10 +61,12 @@
 #
 # Env: KILL_EVERY (60), SAMPLE (15), TURNS (4: turns per agent run),
 # KEEP_ROWS (400), NOMINATE_EVERY (10), FLOOR_GIB (10), TURN_SLEEP_MS
-# (2000: each turn's sleep; every turn ends in a Seal, and every Seal stays
-# in the block log and the store for as long as its Vessel lives, so this
-# sets the growth: at 200 ms, 8 Vessels made 3 Seals a second and 3.6 GB
-# an hour, taso-test 2026-11-12).
+# (8000: each turn's sleep; every turn ends in a Seal.  The node keeps
+# only its newest Seal layers, but this soak's bucket is a directory on
+# the same disk and keeps every Seal, about 170 KB each, with about 6.5 KB
+# each in the coordinator: at 8000 ms, 8 Vessels make about 0.85 Seals a
+# second, about 13 GB a day; at 2000 ms they made 2.3 a second and the
+# bucket and the block log filled 22 GB in 8 h, taso-test 2026-11-13).
 #
 # Stopped early (a TERM), bash runs the EXIT trap: it cleans up first, as
 # at its end.  Under systemd, run it with KillMode=mixed, so the TERM
@@ -81,7 +90,7 @@ VESSELS=${2:-4}
 KILL_EVERY=${KILL_EVERY:-60}
 SAMPLE=${SAMPLE:-15}
 TURNS=${TURNS:-4}
-TURN_SLEEP_MS=${TURN_SLEEP_MS:-2000}
+TURN_SLEEP_MS=${TURN_SLEEP_MS:-8000}
 KEEP_ROWS=${KEEP_ROWS:-400}
 NOMINATE_EVERY=${NOMINATE_EVERY:-10}
 FLOOR_GIB=${FLOOR_GIB:-10}
@@ -344,9 +353,9 @@ start_warden() {
 }
 
 sampler() {
-    printf 'time\twarden_threads\twarden_fds\twarden_rss_kib\tblkd_rss_kib\tublk\tfree_gib\tlog_mib\tblkd_threads\n' >"$W/soak.tsv"
+    printf 'time\twarden_threads\twarden_fds\twarden_rss_kib\tblkd_rss_kib\tublk\tfree_gib\tlog_mib\tblkd_threads\tdepth_max\tlive_mib\n' >"$W/soak.tsv"
     while :; do
-        local p t=- f=- r=- b bt
+        local p t=- f=- r=- b bt st dm=- lm=-
         p=$(pgrep -f "taso-wardend $W/soak.json" | head -1 || true)
         if [[ -n "$p" ]]; then
             t=$(ls "/proc/$p/task" 2>/dev/null | wc -l)
@@ -355,8 +364,18 @@ sampler() {
         fi
         b=$(awk '/^VmRSS/ {print $2}' "/proc/$BLKD_PID/status" 2>/dev/null || echo -)
         bt=$(ls "/proc/$BLKD_PID/task" 2>/dev/null | wc -l)
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$t" "$f" "$r" "$b" "$(ublk_devices)" \
-            "$(df --output=avail -BG "$W" | tail -1 | tr -dc 0-9)" "$(( $(stat -c %s "$W/blk.log") >> 20 ))" "$bt" >>"$W/soak.tsv"
+        # The deepest chain and the live bytes, from taso-blkd's stats (a
+        # sample it does not answer in time shows "-").
+        st=$(python3 -c 'import socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]); s.sendall(b"stats\n")
+print(s.makefile().readline().strip())' "$BLK_SOCK" 2>/dev/null || true)
+        if [[ "$st" == ok* ]]; then
+            dm=$(tr ' ' '\n' <<<"$st" | sed -n 's/^depth_max=//p')
+            lm=$(tr ' ' '\n' <<<"$st" | awk -F= '$1=="log_bytes"{l=$2} $1=="garbage_bytes"{g=$2} END{if(l!="")print int((l-g)/1048576)}')
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$t" "$f" "$r" "$b" "$(ublk_devices)" \
+            "$(df --output=avail -BG "$W" | tail -1 | tr -dc 0-9)" "$(( $(stat -c %s "$W/blk.log") >> 20 ))" "$bt" \
+            "${dm:--}" "${lm:--}" >>"$W/soak.tsv"
         sleep "$SAMPLE"
     done
 }
@@ -444,6 +463,12 @@ expect "taso-blkd's memory did not grow" is "$(growth 4)" ok
 expect "taso-blkd's threads did not grow" is "$(growth 8)" ok
 # A device deleted without waiting that the kernel never freed (blkd-del
 # d): a leak to see, never a hang.
+# Old Seal layers fold once shipped (S-c): the chain and the live data
+# stop growing once each Vessel has local_seals of them.
+expect "the deepest chain of layers did not grow" is "$(growth 9)" ok
+# The live size (column 10) is sampled, not judged: every sanction adds a
+# Template's layer, which the node keeps by design, so it grows with the
+# work done even when no Seal layer is kept too long.
 ZOMBIES=$(blk stats | tr ' ' '\n' | sed -n 's/^zombies=//p' || true)
 expect "no deleted device kept by the kernel" is "${ZOMBIES:-unknown}" 0
 expect "free space stayed above $FLOOR_GIB GiB" is "${FLOOR_AT:+fell below at ${FLOOR_AT} s}" ""
