@@ -167,7 +167,10 @@ const K_BASE: u8 = 12;
 /// A branch moved down past the Seal it alone stood on (an orphan, F1,
 /// 2026-10-28).  A log with one is refused by a store older than this kind.
 const K_UNSEAL: u8 = 13;
-const K_LAST: u8 = K_UNSEAL;
+/// A Seal folded into the one Seal on top of it (S-c, 2026-11-14).  A log
+/// with one is refused by a store older than this kind.
+const K_FOLD: u8 = 14;
+const K_LAST: u8 = K_FOLD;
 
 const CKPT_MAGIC: &[u8; 8] = b"TASOCKP1";
 
@@ -1113,6 +1116,20 @@ impl Store {
         Ok(v)
     }
 
+    /// Fold `seal` into the one Seal on top of it ([`Map::fold`]): nothing
+    /// reads differently, the chain is one shorter, and the blocks the Seal
+    /// on top had rewritten become garbage.  `seal`'s tag goes with it.
+    /// Durable at the next flush.  Returns the Seal on top and how many
+    /// blocks became garbage.
+    pub fn fold(&mut self, seal: LayerId) -> Result<(LayerId, u64), StoreError> {
+        self.check()?;
+        let (top, freed) = self.map.fold(seal)?;
+        self.meta.seals.remove(&seal);
+        self.stats.garbage_bytes += freed.len() as u64 * BLOCK;
+        self.append(K_FOLD, &seal.get().to_le_bytes())?;
+        Ok((top, freed.len() as u64))
+    }
+
     /// Drop a Seal nothing stands on; its blocks become garbage.
     pub fn drop_seal(&mut self, seal: LayerId) -> Result<(), StoreError> {
         self.check()?;
@@ -1365,6 +1382,12 @@ fn replay(map: &mut Map, meta: &mut Meta, p: &Pending) -> Result<u64, StoreError
         K_RESET => {
             need(8)?;
             map.reset(layer(0)).map_err(bad)?.len() as u64
+        }
+        K_FOLD => {
+            need(8)?;
+            let freed = map.fold(layer(0)).map_err(bad)?.1.len() as u64;
+            meta.seals.remove(&layer(0));
+            freed
         }
         K_UNSEAL => {
             need(8)?;
@@ -2007,6 +2030,54 @@ mod tests {
             0,
             "the Seal never sees a branch's writes"
         );
+    }
+
+    /// S-c (soak 2026-11-13): a fold is journalled, so a reopened store,
+    /// from the log or from a checkpoint, reads the same as before it, the
+    /// folded Seal is gone, and the garbage it made is counted.
+    #[test]
+    fn a_fold_is_replayed_from_the_log_and_from_a_checkpoint() {
+        for checkpointed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("log");
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            let b = s.fork(root).unwrap();
+            s.write(b, 0, &blocks(1, 2), false).unwrap();
+            let s1 = s.seal_tagged(b, b"one").unwrap();
+            s.write(b, 1, &blocks(2, 2), false).unwrap(); // rewrites block 1
+            let s2 = s.seal_tagged(b, b"two").unwrap();
+            s.write(b, 3, &blocks(3, 1), false).unwrap();
+            let reads = |s: &Store| -> Vec<u8> {
+                (0..4)
+                    .flat_map(|l| [read1(s, b, l), read1(s, s2, l)])
+                    .collect()
+            };
+            let before = reads(&s);
+            let garbage = s.stats().garbage_bytes;
+            assert_eq!(s.fold(s1).unwrap(), (s2, 1), "block 1 of S1 was rewritten");
+            assert_eq!(s.stats().garbage_bytes, garbage + BLOCK);
+            assert_eq!(reads(&s), before);
+            assert_eq!(s.seals_of(b).unwrap(), vec![s2]);
+            assert!(
+                matches!(s.fold(s2), Err(StoreError::Map(_))),
+                "the branch is on top"
+            );
+            if checkpointed {
+                s.checkpoint().unwrap();
+            } else {
+                s.flush().unwrap();
+            }
+            drop(s);
+            let (s, _) = Store::open(&path).unwrap();
+            assert_eq!(reads(&s), before, "checkpointed {checkpointed}");
+            assert_eq!(s.seals_of(b).unwrap(), vec![s2]);
+            assert_eq!(
+                (s.tag(s1).unwrap(), s.tag(s2).unwrap()),
+                (None, Some(&b"two"[..]))
+            );
+            assert_eq!(s.map().unwrap().depth(b).unwrap(), 3);
+        }
     }
 
     /// Audit 2026-11-09, a poisoned store still answered its read
