@@ -62,6 +62,13 @@
 //! `TASO_TIMING_RAW=<file>` also writes every sample, `<span>
 //! <microseconds>` per line (for quantiles across runs).
 
+/// The static musl build's allocator (P5 C2, 2026-11-15): musl's own made
+/// the P=64 turn pause's p95 146 ms against glibc's 68-80 on taso-test.
+/// glibc builds keep glibc's.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::sync::Arc;
