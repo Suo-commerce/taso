@@ -151,6 +151,13 @@
 //! All devices share one store behind one lock.  Simple first; the
 //! measurements say whether contention matters.
 
+/// The static musl build's allocator (P5 C2, 2026-11-15): musl's own made
+/// the P=64 turn pause's p95 146 ms against glibc's 68-80 on taso-test.
+/// glibc builds keep glibc's.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
