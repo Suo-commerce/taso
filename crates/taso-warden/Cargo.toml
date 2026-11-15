@@ -28,6 +28,13 @@ rustix = { version = "1", features = ["fs", "net", "process", "time"] }
 # The classification map (spec §8, D28); shared later with taso-policy.
 toml = "0.9"
 
+# The static musl build's allocator for the long-running binaries,
+# taso-wardend and taso-coordd (P5 C2, 2026-11-15): musl's own made the
+# P=64 turn pause's p95 146 ms against glibc's 68-80 on taso-test.  glibc
+# builds keep glibc's.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }
