@@ -75,6 +75,12 @@
 # workload above.  Its commits and turn pauses are reported apart; the
 # seal and publish spans pool every Vessel (they carry no Vessel).
 #
+# DAEMON_BIN=DIR (default: none): run taso-wardend and taso-blkd from DIR
+# instead of this build's target/release, e.g. the static musl build
+# (target/x86_64-unknown-linux-musl/release, P5 C2: is musl's allocator a
+# cost under load?).  The agent's taso-sim and the Landlock shim stay this
+# build's; the table's header names DIR.
+#
 # Environment (gate-p1's): TXNS (4) ROWS (8) ROW_BYTES (512) SYNC (normal)
 # LANDLOCK (1); OUT (results directory, default
 # /root/taso-p5-bench-blk[-DURABLE_AT]-<time>, kept); KEEP=1 keeps the work
@@ -157,7 +163,7 @@ trap cleanup EXIT
 # ---- preflight ----------------------------------------------------------------
 [[ $EUID -eq 0 ]] || die "run as root"
 [[ -f Cargo.toml && -d crates/taso-warden && -d bench/p5 ]] || die "run from the repository root"
-for t in runc ldd python3 cargo; do command -v "$t" >/dev/null || die "$t is missing"; done
+for t in runc ldd python3 cargo file; do command -v "$t" >/dev/null || die "$t is missing"; done
 modprobe ublk_drv; [[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing"
 [[ ! -S "$BLK_SOCK" ]] || die "$BLK_SOCK exists: another run's block log? (pgrep -x taso-blkd)"
 mkdir -p "$MNT"; [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
@@ -172,6 +178,10 @@ cargo build --release -q -p taso-warden -p taso-sim -p taso-landlock
 cargo build --release -q -p taso-blk --bin taso-blkd
 BIN=$PWD/target/release
 for b in taso-wardend taso-sim taso-landlock taso-blkd; do [[ -x "$BIN/$b" ]] || die "$BIN/$b was not built"; done
+# The Warden and taso-blkd from another build (DAEMON_BIN), or this one's.
+DBIN=${DAEMON_BIN:-$BIN}
+for b in taso-wardend taso-blkd; do [[ -x "$DBIN/$b" ]] || die "$DBIN/$b is missing (DAEMON_BIN)"; done
+HOST_NOTE="$HOST_NOTE; taso-wardend and taso-blkd from $DBIN ($(file -b "$DBIN/taso-blkd" | cut -d, -f1-2,6 | tr -s ' '))"
 
 rm -rf "$DIR"; mkdir -p "$DIR/store" "$DIR/state" "$DIR/run" "$OUT"; chmod 755 "$DIR"
 
@@ -186,7 +196,7 @@ copy_with_libs "$BIN/taso-landlock" /usr/lib/taso/landlock
 mkdir -p "$ROOTFS"/{proc,dev,sys,tmp,work,run/taso}; : >"$ROOTFS/run/taso/field.sock"
 
 # the storage: the block log
-"$BIN/taso-blkd" "$DIR/blk.log" "$BLK_SOCK" --durable-at "$DURABLE_AT" 2>>"$DIR/blkd.err" &
+"$DBIN/taso-blkd" "$DIR/blk.log" "$BLK_SOCK" --durable-at "$DURABLE_AT" 2>>"$DIR/blkd.err" &
 BLKD_PID=$!
 for _ in $(seq 100); do [[ -S "$BLK_SOCK" ]] && break; sleep 0.1; done
 [[ -S "$BLK_SOCK" ]] || die "taso-blkd socket did not appear; see $DIR/blkd.err"
@@ -261,7 +271,7 @@ PY
     log_lock >"$OUT/warden-$r.lock0"
     # The Warden, timed: wall time, and its CPU time and peak RSS from the
     # kernel's rusage of the child (no /usr/bin/time on a stock Ubuntu).
-    TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$BIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
+    TASO_TIMING_RAW="$OUT/warden-$r.spans" python3 - "$DBIN/taso-wardend" "$cfg" "$OUT/warden-$r" <<'PY' || rc=$?
 import resource, subprocess, sys, time
 bin, cfg, out = sys.argv[1:4]
 t0 = time.time()
