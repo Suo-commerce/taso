@@ -2,22 +2,34 @@
 # Build from the repository root, which is the context:
 #
 #   docker build -f deploy/docker/Dockerfile --target wardend -t taso-wardend .
+#   docker build -f deploy/docker/Dockerfile --target blkd    -t taso-blkd    .
 #   docker build -f deploy/docker/Dockerfile --target coordd  -t taso-coordd  .
 #   docker build -f deploy/docker/Dockerfile --target agent-demo -t taso-agent-demo .
 #
+# deploy/docker/compose.yaml runs wardend, blkd and coordd together.
+#
 # Targets
 #
-#   wardend   taso-wardend + taso-logcheck, runc and e2fsprogs (the Warden
-#             makes ext4 on each new branch of the block log: mkfs.ext4,
-#             then mount).  The storage is the block log only (ZFS was
-#             removed, V4b, 2026-11-06); taso-blkd, /dev/ublk-control and
-#             this image's compose and Kubernetes wiring are P5 C3's Warden
-#             image rewrite, not here.  taso-landlock is at /usr/lib/taso/landlock, to copy into agent
+#   wardend   taso-wardend, taso-ctl and taso-logcheck, runc and e2fsprogs
+#             (the Warden makes ext4 on each new branch of the block log:
+#             mkfs.ext4, then mount).  The storage is the block log only
+#             (ZFS was removed, V4b, 2026-11-06); taso-blkd serves it from
+#             its own image (blkd).  The Warden mounts the ublk devices
+#             taso-blkd makes, so it runs privileged with the host's /dev
+#             (compose.yaml says how).  taso-ctl is here for `taso-ctl
+#             status` (compose's healthcheck; `docker compose exec`).
+#             taso-landlock is at /usr/lib/taso/landlock, to copy into agent
 #             rootfs images (it runs inside the agent's container, not here).
 #             The entrypoint is /usr/lib/taso/cgroup-init, which prepares
 #             the container's cgroup for the agents' cgroups (cgroup v2)
 #             and then runs taso-wardend; a command run in this image that
 #             starts runc must go through it too.
+#   blkd      taso-blkd alone: the block log, served as ublk devices.  It
+#             needs the host's ublk_drv loaded (the host's job, once; the
+#             README's container section), runs privileged with the host's
+#             /dev so the devices it makes after start appear in it and in
+#             the Warden's container, and keeps its log and socket on
+#             volumes (/var/lib/taso, /run/taso).
 #   coordd    taso-coordd alone.  It serves a Unix socket; mount the
 #             directory holding it where the Wardens can reach it.  Over a
 #             network it needs authentication first (fencing review, F3).
@@ -33,7 +45,8 @@
 #             the mount points (the bench's rootfs, bench/p5/bench.sh).
 #
 # The build stage uses the same base as the runtime stages, so the binaries
-# link the same glibc they run with (they need only libc and libgcc_s).
+# link the same glibc they run with (they need only libc and libgcc_s;
+# C3-d's test checks each with ldd).
 
 ARG BASE=ubuntu:26.04
 ARG RUST_VERSION=1.97.0
@@ -42,8 +55,10 @@ ARG RUST_VERSION=1.97.0
 
 FROM ${BASE} AS builder
 ARG RUST_VERSION
+# libclang-dev: taso-blkd's ublk bindings are generated at build time
+# (libublk's bindgen), as in the README's build line.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config \
+ && apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -55,11 +70,12 @@ COPY . .
 # image), so the binaries are copied out in the same step.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p taso-warden -p taso-landlock -p taso-sim --bins \
+    cargo build --release --locked -p taso-warden -p taso-landlock -p taso-sim -p taso-blk --bins \
  && mkdir -p /out \
  && cp target/release/taso-wardend target/release/taso-coordd \
-       target/release/taso-logcheck target/release/taso-landlock \
-       target/release/taso-sim /out/
+       target/release/taso-ctl target/release/taso-logcheck \
+       target/release/taso-landlock target/release/taso-sim \
+       target/release/taso-blkd /out/
 
 # ── taso-wardend ──────────────────────────────────────────────────────
 
@@ -70,7 +86,7 @@ LABEL org.opencontainers.image.title="taso-wardend" \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends e2fsprogs runc ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /out/taso-wardend /out/taso-logcheck /usr/local/bin/
+COPY --from=builder /out/taso-wardend /out/taso-ctl /out/taso-logcheck /usr/local/bin/
 COPY --from=builder /out/taso-landlock /usr/lib/taso/landlock
 # Makes the container's cgroup able to hold the agents' cgroups (cgroup v2
 # nesting, measured in D2), then execs the command.
@@ -82,6 +98,20 @@ RUN mkdir -p /var/lib/taso /run/taso
 # Vessels; mount it here.
 ENTRYPOINT ["/usr/lib/taso/cgroup-init", "/usr/local/bin/taso-wardend"]
 CMD ["/etc/taso/wardend.json"]
+
+# ── taso-blkd ─────────────────────────────────────────────────────────
+
+FROM ${BASE} AS blkd
+LABEL org.opencontainers.image.title="taso-blkd" \
+      org.opencontainers.image.source="https://github.com/Suo-commerce/taso" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY --from=builder /out/taso-blkd /usr/local/bin/
+# /var/lib/taso holds blk.log (a volume; it is every Vessel's data, so put
+# it on the node's data disk); /run/taso holds the socket the Warden
+# reaches it by.
+VOLUME ["/var/lib/taso", "/run/taso"]
+ENTRYPOINT ["/usr/local/bin/taso-blkd"]
+CMD ["/var/lib/taso/blk.log", "/run/taso/blk.sock", "--size-gib", "64"]
 
 # ── taso-coordd ───────────────────────────────────────────────────────
 
