@@ -97,6 +97,46 @@ leftovers() {
     [[ -z "$mnts" ]] && grade "$1: nothing of ublk mounted" ok || grade "$1: nothing of ublk mounted" fail "$mnts"
 }
 
+# watch_devices TAG SECONDS: once a second, into TAG-devices.txt, each
+# busy /dev/ublkb* (an exclusive open fails), every process whose mount
+# namespace lists a ublk mount, every open descriptor that pins a mount
+# namespace (a namespace with no process left in it stays alive through
+# one), nsfs mounts on the host (the same, through a bind), and any
+# taso-sim alive.  Ends when no device is busy (0) or after SECONDS (1).
+watch_devices() {
+    local f="$OUT/$1-devices.txt" i busy
+    for i in $(seq "$2"); do
+        busy=$(python3 -I - <<'PY'
+import glob, os
+for d in sorted(glob.glob("/dev/ublkb*")):
+    try: os.close(os.open(d, os.O_RDONLY | os.O_EXCL))
+    except OSError as e: print(os.path.basename(d), e.strerror)
+PY
+)
+        {
+            echo "--- +${i}s $(date +%T)"
+            echo "${busy:-all free}"
+            if [[ -n "$busy" ]]; then
+                for m in $(grep -l ublkb /proc/[0-9]*/mountinfo 2>/dev/null); do
+                    p=${m#/proc/}; p=${p%/mountinfo}
+                    echo "  ublk mount in the namespace of: $p $(cat /proc/"$p"/comm 2>/dev/null) $(readlink /proc/"$p"/ns/mnt 2>/dev/null) ($(grep -o 'ublkb[0-9]*' "$m" 2>/dev/null | sort -u | tr '\n' ' '))"
+                done | head -n 8
+                for l in /proc/[0-9]*/fd/*; do
+                    t=$(readlink "$l" 2>/dev/null) || continue
+                    [[ "$t" == mnt:* ]] || continue
+                    p=${l#/proc/}; p=${p%%/*}
+                    echo "  a descriptor pins $t: $p $(cat /proc/"$p"/comm 2>/dev/null)"
+                done | head -n 8
+                findmnt -rn -t nsfs -o TARGET,SOURCE 2>/dev/null | sed 's/^/  nsfs mount: /' | head -n 8
+                pgrep -a -x taso-sim | sed 's/^/  taso-sim alive: /' || true
+            fi
+        } >>"$f"
+        [[ -z "$busy" ]] && { echo "$i" >"$f.free"; return 0; }
+        sleep 1
+    done
+    return 1
+}
+
 # stop TAG: stop the stack (the Warden first, then taso-blkd by SIGTERM),
 # keep both logs and taso-blkd's exit, grade the clean quit and the host.
 stop() {
@@ -197,11 +237,16 @@ pgrep -x taso-sim >/dev/null || harness "4: the long Vessel's agent never ran (s
 sleep 5
 before=$(pgrep -c -x taso-sim || true)
 docker kill "$("${COMPOSE[@]}" ps -q wardend)" >>"$OUT/compose.txt" 2>&1 || harness "4: docker kill failed"
+# Recorded beside the stop below, which still comes at once (C3-l).
+watch_devices 4 20 & WATCH4=$!
 for _ in $(seq 10); do pgrep -x taso-sim >/dev/null || break; sleep 1; done
 left=$(pgrep -a -x taso-sim || true)
 [[ -z "$left" ]] && grade "4: the killed Warden's agents ended within 10 s ($before running before)" ok \
     || grade "4: the killed Warden's agents ended within 10 s" fail "$left"
 stop 4
+wait "$WATCH4" || true
+[[ -f "$OUT/4-devices.txt.free" ]] && say "4: the dead Warden's devices free after $(cat "$OUT/4-devices.txt.free") s" \
+    || say "4: a dead Warden's device still busy 20 s after the kill (see 4-devices.txt)"
 
 # ── 5 a killed taso-blkd ────────────────────────────────────────────
 say "5: the long Vessel again; the Warden killed, then taso-blkd killed"
@@ -212,32 +257,9 @@ sleep 3
 docker kill "$("${COMPOSE[@]}" ps -q wardend)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of the Warden failed"
 # Its devices free (no opener) before taso-blkd dies: a device still
 # mounted when its server dies would wait in the kernel's delete.
-# Once a second, into 5-devices.txt: each busy device, the processes
-# whose mount namespace lists it (pid, name, namespace), any taso-sim.
 say "5: the Warden killed at $(date +%T); waiting for its devices (up to 60 s, $OUT/5-devices.txt)"
-free=no
-for i in $(seq 60); do
-    busy=$(python3 -I - <<'PY'
-import glob, os
-for d in sorted(glob.glob("/dev/ublkb*")):
-    try: os.close(os.open(d, os.O_RDONLY | os.O_EXCL))
-    except OSError as e: print(os.path.basename(d), e.strerror)
-PY
-)
-    {
-        echo "--- +${i}s $(date +%T)"
-        echo "${busy:-all free}"
-        for f in $(grep -l ublkb /proc/[0-9]*/mountinfo 2>/dev/null); do
-            p=${f#/proc/}; p=${p%/mountinfo}
-            echo "  holds $(grep -o 'ublkb[0-9]*' "$f" 2>/dev/null | sort -u | tr '\n' ' ')in: $p $(cat /proc/"$p"/comm 2>/dev/null) $(readlink /proc/"$p"/ns/mnt 2>/dev/null)"
-        done | head -n 8
-        pgrep -a -x taso-sim | sed 's/^/  taso-sim alive: /' || true
-    } >>"$OUT/5-devices.txt"
-    [[ -z "$busy" ]] && { free=yes; break; }
-    sleep 1
-done
-[[ "$free" == yes ]] || harness "5: the dead Warden's devices stayed busy for 60 s (see 5-devices.txt)"
-say "5: its devices free after ${i} s"
+watch_devices 5 60 || harness "5: the dead Warden's devices stayed busy for 60 s (see 5-devices.txt)"
+say "5: its devices free after $(cat "$OUT/5-devices.txt.free") s"
 made=$(comm -13 <(printf '%s\n' "$BEFORE") <(ublk_devices) | grep -c ublkc || true)
 docker kill "$("${COMPOSE[@]}" ps -q blkd)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of taso-blkd failed"
 sleep 1
