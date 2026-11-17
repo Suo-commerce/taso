@@ -456,3 +456,72 @@ fn quit_reports_a_failed_final_checkpoint() {
     );
     assert!(!d.wait(), "and exit non-zero");
 }
+
+/// C3-h: SIGTERM and SIGINT do what `quit` does (`docker stop`, a
+/// Kubernetes pod's end and Ctrl-C send them).  The daemon ends through
+/// the same shutdown: exit 0, its socket removed, the final checkpoint
+/// written, and the branch made before the signal still there when it
+/// starts again on the same log, from that checkpoint.  Without the signal
+/// thread the daemon dies by the signal, as a kill, with none of these.
+#[test]
+fn a_stop_signal_quits_as_quit_does() {
+    use std::os::unix::process::ExitStatusExt;
+    for sig in ["TERM", "INT"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, sock) = (dir.path().join("log"), dir.path().join("sock"));
+        let said = |n: &str| std::fs::read_to_string(dir.path().join(n)).unwrap();
+        let stderr = |n: &str| std::fs::File::create(dir.path().join(n)).unwrap();
+        let mut d = Daemon::spawn(
+            Command::new(env!("CARGO_BIN_EXE_taso-blkd"))
+                .arg(&log)
+                .arg(&sock)
+                .stderr(stderr("first.err")),
+            &sock,
+        );
+        let mut c = Client::connect(&sock).unwrap();
+        let root = c.root().unwrap();
+        let a = c.branch(root, Some("tank/signal")).unwrap();
+        drop(c);
+
+        let pid = d.0.id().to_string();
+        assert!(Command::new("kill")
+            .args(["-s", sig, &pid])
+            .status()
+            .unwrap()
+            .success());
+        let status = d.0.wait().unwrap();
+        assert_eq!(
+            (status.code(), status.signal()),
+            (Some(0), None),
+            "SIG{sig} must end taso-blkd through quit's shutdown, not as a kill"
+        );
+        assert!(!sock.exists(), "SIG{sig}: the socket is removed");
+        assert!(
+            dir.path().join("log.ckpt").exists(),
+            "SIG{sig}: the final checkpoint is written"
+        );
+        let first = said("first.err");
+        assert!(
+            first.contains(&format!("taso-blkd: quit (SIG{sig})")),
+            "{first}"
+        );
+
+        let d = Daemon::spawn(
+            Command::new(env!("CARGO_BIN_EXE_taso-blkd"))
+                .arg(&log)
+                .arg(&sock)
+                .stderr(stderr("second.err")),
+            &sock,
+        );
+        let mut c = Client::connect(&sock).unwrap();
+        assert_eq!(
+            c.find("tank/signal").unwrap(),
+            Some(a),
+            "SIG{sig}: nothing lost"
+        );
+        c.quit().unwrap();
+        assert!(d.wait());
+        let second = said("second.err");
+        assert!(second.contains("from the checkpoint at record"), "{second}");
+    }
+}
