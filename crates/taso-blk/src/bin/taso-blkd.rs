@@ -38,6 +38,12 @@
 //! | `stats`          | counters, for measurements                       | `ok key=value ...`   |
 //! | `quit`           | stop every device, flush, then exit              | `ok`                 |
 //!
+//! SIGTERM and SIGINT do what `quit` does (C3-h: `docker stop`, a
+//! Kubernetes pod's end and Ctrl-C send them): every device stopped, the
+//! final checkpoint, the socket removed, exit 0 (1 if the final checkpoint
+//! failed).  Refused, as `quit` is, while a device is in use: the daemon
+//! logs why and serves on, and a later signal tries again.  `quit` and a
+//! signal never run a shutdown at the same time.
 //! Names are dataset names (`A-Z a-z 0-9 _ . : / -`, unique among live
 //! branches); tags are opaque bytes in lowercase hex (at most 64 bytes).
 //! A name given with `branch` or `fork` is checked before the branch is
@@ -141,7 +147,8 @@
 //!
 //! # Leftover devices
 //!
-//! A daemon killed without `quit` (kill -9, a crash) leaves its ublk
+//! A daemon killed without `quit` or a stop signal (kill -9, a crash, a
+//! container runtime's SIGKILL after a refused SIGTERM) leaves its ublk
 //! devices behind in the kernel; they would pile up and count against
 //! the module's `ublks_max`.  At start, before serving, the daemon deletes
 //! the ones that are its kind (libublk's record says target `taso-blk`)
@@ -631,6 +638,14 @@ struct Daemon {
 }
 
 fn main() {
+    // First, before any thread starts (the stream copiers, the devices',
+    // upkeep, the connections'): every thread inherits the block, so a
+    // stop signal reaches only the signal thread, never one that would
+    // end the process on the spot (C3-h).
+    let stop_signals = signals::block().unwrap_or_else(|e| {
+        log!("taso-blkd: cannot block SIGTERM and SIGINT: {e}");
+        std::process::exit(1);
+    });
     let args: Vec<String> = std::env::args().collect();
     let usage = "usage: taso-blkd LOG SOCKET [--size-gib N] [--depth N] [--queues N] [--io-kib N] [--checkpoint-mib N] [--compact-pct N] [--compact-min-mib N] [--durable-at flush|fua|seal]";
     if args.len() < 3 {
@@ -757,6 +772,13 @@ fn main() {
             .name("upkeep".into())
             .spawn(move || upkeep(&d))
             .unwrap_or_else(|e| fail(&format!("cannot start the upkeep thread: {e}")));
+    }
+    // A signal that came during the start (the log's replay) waited,
+    // blocked: it is taken now, with the daemon serving.
+    {
+        let d = daemon.clone();
+        signals::stop_on(stop_signals, socket.clone(), move || d.shutdown())
+            .unwrap_or_else(|e| fail(&format!("cannot start the signal thread: {e}")));
     }
     for conn in listener.incoming() {
         let Ok(conn) = conn else {
@@ -979,8 +1001,14 @@ fn serve(d: &Daemon, conn: UnixStream) -> Option<i32> {
         let mut quit = words[0] == "quit";
         let poisoned_before = lock_store(&d.store, Site::Poisoned).is_poisoned();
         let result = if quit {
+            let one_quit = lock(&QUITTING);
             match d.shutdown() {
-                Quit::Done(r) => r,
+                Quit::Done(r) => {
+                    // The process exits after the answer: no other quit
+                    // or signal starts a second shutdown meanwhile.
+                    std::mem::forget(one_quit);
+                    r
+                }
                 // Nothing stopped: the daemon serves on (busy devices).
                 Quit::Refused(e) => {
                     quit = false;
@@ -1014,6 +1042,125 @@ fn serve(d: &Daemon, conn: UnixStream) -> Option<i32> {
         }
     }
     None
+}
+
+/// Held while a shutdown runs, by `quit` and by a stop signal alike, so
+/// one runs at a time; a shutdown that went through keeps it (its guard
+/// forgotten) until the process exits.
+static QUITTING: Mutex<()> = Mutex::new(());
+
+/// SIGTERM and SIGINT (C3-h): blocked in every thread by [`block`], first
+/// thing in `main`, and taken by one thread ([`stop_on`]) that does what
+/// `quit` does.  taso-blkd runs no programs (outside its tests), so no
+/// child starts with them blocked.
+///
+/// [`block`]: signals::block
+/// [`stop_on`]: signals::stop_on
+mod signals {
+    use super::{lock, Quit, QUITTING};
+    use std::io;
+    use std::path::PathBuf;
+
+    /// The signals asking for a stop.
+    pub const STOP: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
+
+    /// The set of [`STOP`], blocked in the calling thread (and so in every
+    /// thread it starts from now on).
+    pub fn block() -> io::Result<libc::sigset_t> {
+        // SAFETY: sigset_t is plain data, initialised by sigemptyset before use.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&mut set) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for s in STOP {
+                if libc::sigaddset(&mut set, s) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc));
+            }
+            Ok(set)
+        }
+    }
+
+    fn name(sig: libc::c_int) -> &'static str {
+        match sig {
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGINT => "SIGINT",
+            _ => "a stop signal",
+        }
+    }
+
+    /// A thread that waits for the signals in `set` (blocked: [`block`])
+    /// and runs `shutdown` for each, as `quit` does: done, the socket is
+    /// removed and the process exits (0, or 1 if the shutdown failed);
+    /// refused (a device in use), the daemon logs why and serves on.
+    pub fn stop_on(
+        set: libc::sigset_t,
+        socket: PathBuf,
+        shutdown: impl Fn() -> Quit + Send + 'static,
+    ) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("signals".into())
+            .spawn(move || loop {
+                let mut sig: libc::c_int = 0;
+                // SAFETY: set is a valid, initialised signal set.
+                if unsafe { libc::sigwait(&set, &mut sig) } != 0 {
+                    continue; // EINTR and the like: wait again
+                }
+                let name = name(sig);
+                let one_quit = lock(&QUITTING);
+                match exit_code(name, shutdown()) {
+                    None => drop(one_quit),
+                    Some(code) => {
+                        std::mem::forget(one_quit);
+                        let _ = std::fs::remove_file(&socket);
+                        log!("taso-blkd: quit ({name})");
+                        super::streams::drained_exit(code);
+                    }
+                }
+            })
+            .map(|_| ())
+    }
+
+    /// What a stop signal does with the shutdown's answer, as `quit` does:
+    /// `None`, refused (a device in use), the daemon serves on; else the
+    /// process's exit code, 0, or 1 if the shutdown failed.
+    pub fn exit_code(name: &str, quit: Quit) -> Option<i32> {
+        match quit {
+            Quit::Refused(e) => {
+                log!("taso-blkd: {name}: {e}; serving on (another {name} tries again)");
+                None
+            }
+            Quit::Done(Ok(_)) => Some(0),
+            Quit::Done(Err(e)) => {
+                log!("taso-blkd: {name}: {e}");
+                Some(1)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{exit_code, Quit};
+
+        /// A refused shutdown serves on; one that went through ends the
+        /// process, 1 if it failed (the signal thread itself, against the
+        /// real daemon: tests/client_daemon.rs).
+        #[test]
+        fn a_signal_serves_on_when_refused_and_exits_as_quit_answers() {
+            let busy = Quit::Refused("not quitting, 1 device(s) in use: L1: mounted".into());
+            assert_eq!(exit_code("SIGTERM", busy), None);
+            assert_eq!(exit_code("SIGTERM", Quit::Done(Ok(String::new()))), Some(0));
+            assert_eq!(
+                exit_code("SIGINT", Quit::Done(Err("final checkpoint: x".into()))),
+                Some(1)
+            );
+        }
+    }
 }
 
 /// What `quit` did.
