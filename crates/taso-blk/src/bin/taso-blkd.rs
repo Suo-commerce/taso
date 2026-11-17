@@ -41,8 +41,12 @@
 //! SIGTERM and SIGINT do what `quit` does (C3-h: `docker stop`, a
 //! Kubernetes pod's end and Ctrl-C send them): every device stopped, the
 //! final checkpoint, the socket removed, exit 0 (1 if the final checkpoint
-//! failed).  Refused, as `quit` is, while a device is in use: the daemon
-//! logs why and serves on, and a later signal tries again.  `quit` and a
+//! failed).  Refused, as `quit` is, while a device is in use, but a
+//! container runtime sends one SIGTERM, and when a pod ends the Warden may
+//! still be unmounting (C3-l: C3-d's step 4, a device busy for under a
+//! second after the Warden's container died): so the daemon logs why, serves
+//! on, and tries the same shutdown again every 250 ms until it goes through
+//! or the runtime kills it.  A device in use is never forced.  `quit` and a
 //! signal never run a shutdown at the same time.
 //! Names are dataset names (`A-Z a-z 0-9 _ . : / -`, unique among live
 //! branches); tags are opaque bytes in lowercase hex (at most 64 bytes).
@@ -1060,6 +1064,8 @@ mod signals {
     use super::{lock, Quit, QUITTING};
     use std::io;
     use std::path::PathBuf;
+    use std::sync::MutexGuard;
+    use std::time::Duration;
 
     /// The signals asking for a stop.
     pub const STOP: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGINT];
@@ -1095,9 +1101,9 @@ mod signals {
     }
 
     /// A thread that waits for the signals in `set` (blocked: [`block`])
-    /// and runs `shutdown` for each, as `quit` does: done, the socket is
-    /// removed and the process exits (0, or 1 if the shutdown failed);
-    /// refused (a device in use), the daemon logs why and serves on.
+    /// and runs `shutdown` until it goes through ([`until_done`]): then the
+    /// socket is removed and the process exits (0, or 1 if the shutdown
+    /// failed).
     pub fn stop_on(
         set: libc::sigset_t,
         socket: PathBuf,
@@ -1112,53 +1118,101 @@ mod signals {
                     continue; // EINTR and the like: wait again
                 }
                 let name = name(sig);
-                let one_quit = lock(&QUITTING);
-                match exit_code(name, shutdown()) {
-                    None => drop(one_quit),
-                    Some(code) => {
-                        std::mem::forget(one_quit);
-                        let _ = std::fs::remove_file(&socket);
-                        log!("taso-blkd: quit ({name})");
-                        super::streams::drained_exit(code);
-                    }
-                }
+                let (code, one_quit) = until_done(name, &shutdown, RETRY);
+                // Held until the process exits: no `quit` starts another.
+                std::mem::forget(one_quit);
+                let _ = std::fs::remove_file(&socket);
+                log!("taso-blkd: quit ({name})");
+                super::streams::drained_exit(code);
             })
             .map(|_| ())
     }
 
-    /// What a stop signal does with the shutdown's answer, as `quit` does:
-    /// `None`, refused (a device in use), the daemon serves on; else the
-    /// process's exit code, 0, or 1 if the shutdown failed.
-    pub fn exit_code(name: &str, quit: Quit) -> Option<i32> {
-        match quit {
-            Quit::Refused(e) => {
-                log!("taso-blkd: {name}: {e}; serving on (another {name} tries again)");
-                None
-            }
-            Quit::Done(Ok(_)) => Some(0),
-            Quit::Done(Err(e)) => {
-                log!("taso-blkd: {name}: {e}");
-                Some(1)
+    /// How long a refused shutdown waits before it is tried again.
+    pub const RETRY: Duration = Duration::from_millis(250);
+
+    /// Runs `shutdown` until it goes through, `retry` apart, each try
+    /// holding [`QUITTING`] so a socket `quit` never runs beside it (and
+    /// between tries the daemon serves on).  A refusal (a device in use) is
+    /// logged once, and how many tries it took when it goes through.  The
+    /// exit code (0, or 1 if the shutdown failed) and [`QUITTING`], still
+    /// held: the caller keeps it while the process exits.
+    pub fn until_done(
+        name: &str,
+        shutdown: &impl Fn() -> Quit,
+        retry: Duration,
+    ) -> (i32, MutexGuard<'static, ()>) {
+        let mut tries = 0u64;
+        loop {
+            tries += 1;
+            let one_quit = lock(&QUITTING);
+            match shutdown() {
+                Quit::Refused(e) => {
+                    drop(one_quit);
+                    if tries == 1 {
+                        log!(
+                            "taso-blkd: {name}: {e}; serving on, trying again every {} ms",
+                            retry.as_millis()
+                        );
+                    }
+                    std::thread::sleep(retry);
+                }
+                Quit::Done(r) => {
+                    if tries > 1 {
+                        log!("taso-blkd: {name}: the shutdown went through at try {tries}");
+                    }
+                    let code = match r {
+                        Ok(_) => 0,
+                        Err(e) => {
+                            log!("taso-blkd: {name}: {e}");
+                            1
+                        }
+                    };
+                    return (code, one_quit);
+                }
             }
         }
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{exit_code, Quit};
+        use super::{until_done, Quit};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
 
-        /// A refused shutdown serves on; one that went through ends the
-        /// process, 1 if it failed (the signal thread itself, against the
-        /// real daemon: tests/client_daemon.rs).
-        #[test]
-        fn a_signal_serves_on_when_refused_and_exits_as_quit_answers() {
-            let busy = Quit::Refused("not quitting, 1 device(s) in use: L1: mounted".into());
-            assert_eq!(exit_code("SIGTERM", busy), None);
-            assert_eq!(exit_code("SIGTERM", Quit::Done(Ok(String::new()))), Some(0));
-            assert_eq!(
-                exit_code("SIGINT", Quit::Done(Err("final checkpoint: x".into()))),
-                Some(1)
+        /// A shutdown refused for `refusals` tries, then done with `end`:
+        /// the exit code until_done answers, and how many tries it took.
+        fn tries(refusals: u32, end: Result<String, String>) -> (i32, u32) {
+            let calls = AtomicU32::new(0);
+            let code = until_done(
+                "SIGTERM",
+                &|| {
+                    if calls.fetch_add(1, Ordering::SeqCst) < refusals {
+                        Quit::Refused("not quitting, 1 device(s) in use: L1: mounted".into())
+                    } else {
+                        Quit::Done(end.clone())
+                    }
+                },
+                Duration::from_millis(1),
             );
+            // The lock until_done hands back is dropped: this process goes on.
+            drop(code.1);
+            (code.0, calls.load(Ordering::SeqCst))
+        }
+
+        /// C3-l: one SIGTERM is all a container runtime sends.  A shutdown
+        /// refused while a device is still in use (the Warden unmounting)
+        /// is tried again until it goes through, not dropped; its exit code
+        /// is quit's: 0, or 1 if it failed.
+        #[test]
+        fn one_signal_retries_a_refused_shutdown_until_it_goes_through() {
+            assert_eq!(tries(0, Ok(String::new())), (0, 1));
+            assert_eq!(
+                tries(3, Ok(String::new())),
+                (0, 4),
+                "refused 3 times, then through"
+            );
+            assert_eq!(tries(2, Err("final checkpoint: x".into())), (1, 3));
         }
     }
 }
