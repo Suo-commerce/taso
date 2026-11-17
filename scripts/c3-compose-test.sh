@@ -76,7 +76,12 @@ VERDICT=0
 grade() { # grade WHAT ok|fail [DETAIL]
     if [[ "$2" == ok ]]; then say "PASS  $1"; else say "FAIL  $1${3:+: $3}"; VERDICT=1; fi
 }
-harness() { say "HARNESS  $*"; down_all; exit 2; }
+harness() { say "HARNESS  $*"; save_logs harness; down_all; exit 2; }
+# save_logs TAG: both containers' logs, before a teardown removes them.
+save_logs() {
+    "${COMPOSE[@]}" logs --no-color blkd >"$OUT/$1-blkd.log" 2>&1 || true
+    "${COMPOSE[@]}" logs --no-color wardend >"$OUT/$1-wardend.log" 2>&1 || true
+}
 down_all() { "${COMPOSE[@]}" down -v >>"$OUT/compose.txt" 2>&1 || true; }
 
 ublk_devices() { ls /dev/ublkb* /dev/ublkc* 2>/dev/null | sort || true; }
@@ -207,18 +212,32 @@ sleep 3
 docker kill "$("${COMPOSE[@]}" ps -q wardend)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of the Warden failed"
 # Its devices free (no opener) before taso-blkd dies: a device still
 # mounted when its server dies would wait in the kernel's delete.
+# Once a second, into 5-devices.txt: each busy device, the processes
+# whose mount namespace lists it (pid, name, namespace), any taso-sim.
+say "5: the Warden killed at $(date +%T); waiting for its devices (up to 60 s, $OUT/5-devices.txt)"
 free=no
-for _ in $(seq 30); do
-    if python3 -I - <<'PY'
-import glob, os, sys
-for d in glob.glob("/dev/ublkb*"):
+for i in $(seq 60); do
+    busy=$(python3 -I - <<'PY'
+import glob, os
+for d in sorted(glob.glob("/dev/ublkb*")):
     try: os.close(os.open(d, os.O_RDONLY | os.O_EXCL))
-    except OSError: sys.exit(1)
+    except OSError as e: print(os.path.basename(d), e.strerror)
 PY
-    then free=yes; break; fi
+)
+    {
+        echo "--- +${i}s $(date +%T)"
+        echo "${busy:-all free}"
+        for f in $(grep -l ublkb /proc/[0-9]*/mountinfo 2>/dev/null); do
+            p=${f#/proc/}; p=${p%/mountinfo}
+            echo "  holds $(grep -o 'ublkb[0-9]*' "$f" 2>/dev/null | sort -u | tr '\n' ' ')in: $p $(cat /proc/"$p"/comm 2>/dev/null) $(readlink /proc/"$p"/ns/mnt 2>/dev/null)"
+        done | head -n 8
+        pgrep -a -x taso-sim | sed 's/^/  taso-sim alive: /' || true
+    } >>"$OUT/5-devices.txt"
+    [[ -z "$busy" ]] && { free=yes; break; }
     sleep 1
 done
-[[ "$free" == yes ]] || harness "5: the dead Warden's devices stayed busy for 30 s"
+[[ "$free" == yes ]] || harness "5: the dead Warden's devices stayed busy for 60 s (see 5-devices.txt)"
+say "5: its devices free after ${i} s"
 made=$(comm -13 <(printf '%s\n' "$BEFORE") <(ublk_devices) | grep -c ublkc || true)
 docker kill "$("${COMPOSE[@]}" ps -q blkd)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of taso-blkd failed"
 sleep 1
