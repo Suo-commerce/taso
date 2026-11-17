@@ -956,6 +956,35 @@ mod tests {
         assert!(add_demo(r#"{"runtime": {"rootfs": "/srv/a"}}"#).is_err());
     }
 
+    /// C3-i: deploy/docker/warden.json, the Warden's config in compose, is
+    /// what `init` and then `demo` write, with the container's paths (the
+    /// data under /var/lib/taso, the agent at /srv/taso/agent with the
+    /// shim) and one difference: taso-blkd's socket is in /run/taso-blk,
+    /// the volume compose shares between the two containers.  A key renamed
+    /// or a demo changed here fails this test, not a later `compose up`.
+    #[test]
+    fn the_compose_config_is_what_init_and_demo_write() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/docker/warden.json");
+        let text = std::fs::read_to_string(&path).expect("deploy/docker/warden.json");
+        Config::parse(&text).expect("the Warden reads deploy/docker/warden.json");
+        let a = InitArgs {
+            data: PathBuf::from("/var/lib/taso"),
+            size_gib: 64,
+            rootfs: Some(PathBuf::from("/srv/taso/agent")),
+            force: false,
+        };
+        let written = add_demo(&init_config(&a, true)).unwrap().expect("added");
+        let mut want: serde_json::Value = serde_json::from_str(&written).unwrap();
+        want["storage"]["blk"]["socket"] = json!("/run/taso-blk/blk.sock");
+        let got: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            got,
+            want,
+            "deploy/docker/warden.json differs from init + demo:\n{}",
+            serde_json::to_string_pretty(&want).unwrap()
+        );
+    }
+
     /// The shim is looked for inside the rootfs, never on the host.
     #[test]
     fn the_landlock_shim_is_looked_for_in_the_rootfs() {
