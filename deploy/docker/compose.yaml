@@ -1,0 +1,107 @@
+# Taso on one host with Docker Compose: the block log and the Warden.
+#
+#   modprobe ublk_drv; echo 1 > /sys/kernel/rcu_expedited    (the host, once)
+#   docker build -f deploy/docker/Dockerfile --target agent-demo -t taso-agent-demo .
+#   mkdir -p /var/lib/taso/agent
+#   docker create --name taso-agent-demo taso-agent-demo
+#   docker export taso-agent-demo | tar -x -C /var/lib/taso/agent
+#   docker rm taso-agent-demo
+#   docker compose -f deploy/docker/compose.yaml up --build
+#
+# Two containers (C3, K-a): taso-blkd, which serves the block log as ublk
+# devices, and the Warden, which runs the Vessels on them.  The coordinator
+# runs inside the Warden (`"coordinator": {"local": …}` in warden.json, as
+# `taso-ctl init` writes for one node; C3-f).  The taso-coordd image is for
+# more than one node (Kubernetes), not used here.
+#
+# Needs: Docker Compose >= 2.23, cgroup v2, no SELinux, and the host's
+# ublk_drv loaded with rcu_expedited set to 1 (above; the README's container
+# section).  Neither container loads kernel modules or changes the host's
+# kernel settings (C3-b).
+#
+# The host's directories, all under TASO_DATA (default /var/lib/taso):
+#   $TASO_DATA/blk      taso-blkd's /var/lib/taso: the block log, every
+#                       Vessel's data (put TASO_DATA on the data disk)
+#   $TASO_DATA/warden   the Warden's /var/lib/taso: its coordinator, local
+#                       Chronicle state, store and spool
+#   $TASO_DATA/agent    the agent's root filesystem, unpacked from an image
+#                       (above), read-only in the Warden at /srv/taso/agent
+# The volume taso-run carries taso-blkd's socket to the Warden.
+#
+# What each container gets, and why:
+#   privileged, the host's /dev bound in (both; C3-a)
+#       taso-blkd makes ublk devices after it starts; a container's own
+#       /dev is copied once at its start, so without the host's /dev the
+#       new /dev/ublkb* and /dev/ublkc* would appear in neither container.
+#       The Warden mounts those devices and starts agents with runc.
+#   init (both)
+#       an init as PID 1 passes docker's SIGTERM on and reaps children.
+#
+# The Warden starts after taso-blkd answers (C3-g): its command asks
+# `taso-ctl status` once a second, up to 60 s (exit 0 only when the block
+# log answers), then runs taso-wardend.  If taso-blkd never answers, the
+# Warden's container ends with taso-ctl's last line, not a hang.  It goes
+# through the image's entrypoint (cgroup-init) like the image's own command.
+#
+# With the config's static Vessels taso-wardend runs them until their agents
+# exit, then exits, so no restart policy.  `docker compose stop` stops the
+# Warden first (it depends on blkd): SIGTERM stops every agent, then the
+# Warden; then taso-blkd.
+#
+# Tested by scripts/c3-compose-test.sh (C3-d).
+
+name: taso
+
+services:
+  blkd:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: blkd
+    image: taso-blkd:dev
+    init: true
+    privileged: true
+    volumes:
+      - /dev:/dev
+      - ${TASO_DATA:-/var/lib/taso}/blk:/var/lib/taso
+      - taso-run:/run/taso
+
+  wardend:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: wardend
+    image: taso-wardend:dev
+    init: true
+    privileged: true
+    depends_on:
+      blkd:
+        condition: service_started
+    stop_grace_period: 60s
+    volumes:
+      - /dev:/dev
+      - ${TASO_DATA:-/var/lib/taso}/warden:/var/lib/taso
+      - type: bind
+        source: ${TASO_DATA:-/var/lib/taso}/agent
+        target: /srv/taso/agent
+        read_only: true
+      - ./warden.json:/etc/taso/wardend.json:ro
+      - taso-run:/run/taso-blk
+    command:
+      - sh
+      - -c
+      - |
+        i=0
+        until taso-ctl status /etc/taso/wardend.json > /tmp/blk-status 2>&1; do
+          i=$$((i + 1))
+          if [ "$$i" -ge 60 ]; then
+            echo "wardend: taso-blkd did not answer in 60 s; taso-ctl status said:" >&2
+            tail -n 3 /tmp/blk-status >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        exec taso-wardend /etc/taso/wardend.json
+
+volumes:
+  taso-run:
