@@ -21,18 +21,22 @@
 #                          Warden has ended, `taso-ctl explain` of both
 #                          Vessels holds every check.  Then 2's checks.
 #   4 the Warden killed    a long-running Vessel (TASO_WARDEN_CONFIG, C3-j);
-#                          once its agent runs, `docker kill` of the
+#      and started again   once its agent runs, `docker kill` of the
 #                          Warden's container: within 10 s no taso-sim is
-#                          left on the host.  Then 2's checks at once:
-#                          taso-blkd quits although the dead Warden's
-#                          device may still be busy for a moment (C3-l).
-#   5 a killed taso-blkd   the long Vessel again; the Warden's container
-#                          killed, its device free, then taso-blkd's
-#                          container killed (SIGKILL: its devices stay in
-#                          the kernel).  taso-blkd started again must log
-#                          "removed N leftover devices" (N >= 1) and leave
-#                          none (C3-m: its records on the host).  Then 2's
-#                          checks.
+#                          left on the host.  Then the Warden is started
+#                          again, as Kubernetes restarts a container: it
+#                          must reopen the long Vessel (its agent runs),
+#                          and if a device was still held 3 s after the
+#                          kill (the kill landed in a Seal's freeze) it
+#                          must say it thawed what the dead one left
+#                          frozen (C3-n).  Then 2's checks.
+#   5 a killed taso-blkd   the long Vessel again; the Warden stopped (its
+#                          devices stay attached, unmounted), then
+#                          taso-blkd's container killed (SIGKILL: its
+#                          devices stay in the kernel).  taso-blkd started
+#                          again must log "removed N leftover devices"
+#                          (N >= 1) and leave none (C3-m: its records on
+#                          the host).  Then 2's checks.
 #
 # Devices on the host before the run (another taso-blkd's leftovers, from
 # before this test) are listed in the summary and not counted: the checks
@@ -237,30 +241,47 @@ pgrep -x taso-sim >/dev/null || harness "4: the long Vessel's agent never ran (s
 sleep 5
 before=$(pgrep -c -x taso-sim || true)
 docker kill "$("${COMPOSE[@]}" ps -q wardend)" >>"$OUT/compose.txt" 2>&1 || harness "4: docker kill failed"
-# Recorded beside the stop below, which still comes at once (C3-l).
-watch_devices 4 20 & WATCH4=$!
 for _ in $(seq 10); do pgrep -x taso-sim >/dev/null || break; sleep 1; done
 left=$(pgrep -a -x taso-sim || true)
 [[ -z "$left" ]] && grade "4: the killed Warden's agents ended within 10 s ($before running before)" ok \
     || grade "4: the killed Warden's agents ended within 10 s" fail "$left"
-stop 4
-wait "$WATCH4" || true
-[[ -f "$OUT/4-devices.txt.free" ]] && say "4: the dead Warden's devices free after $(cat "$OUT/4-devices.txt.free") s" \
-    || say "4: a dead Warden's device still busy 20 s after the kill (see 4-devices.txt)"
+# A device still held 3 s after the kill is a file system the dead Warden
+# left frozen (the kill landed in a Seal's freeze): teardown alone takes
+# under a second.  Recorded before the restart, which mounts it.
+watch_devices 4 3 || true
+held=yes
+[[ -f "$OUT/4-devices.txt.free" ]] && held=no
+say "4: a dead Warden's device still held 3 s after the kill: $held (4-devices.txt)"
+"${COMPOSE[@]}" up -d wardend >>"$OUT/compose.txt" 2>&1 || harness "4: the Warden did not start again"
+sleep 2
+for _ in $(seq 120); do pgrep -x taso-sim >/dev/null && break; sleep 1; done
+"${COMPOSE[@]}" logs --no-color --no-log-prefix wardend >"$OUT/4-wardend-again.log" 2>&1
+pgrep -x taso-sim >/dev/null && grade "4: the Warden started again reopened the long Vessel" ok \
+    || grade "4: the Warden started again reopened the long Vessel" fail "$(tail -n 3 "$OUT/4-wardend-again.log" | tr '\n' ' ')"
+released=$(grep -c 'left frozen by a dead incarnation' "$OUT/4-wardend-again.log" || true)
+if [[ "$held" == yes ]]; then
+    [[ "$released" -ge 1 ]] && grade "4: it thawed what the dead Warden left frozen ($released)" ok \
+        || grade "4: it thawed what the dead Warden left frozen" fail "a device was held, no release logged"
+else
+    say "4: no device held at the restart (the kill missed a freeze); released $released (recorded)"
+fi
 
 # ── 5 a killed taso-blkd ────────────────────────────────────────────
-say "5: the long Vessel again; the Warden killed, then taso-blkd killed"
+say "5: the long Vessel again; the Warden stopped, then taso-blkd killed"
 "${COMPOSE[@]}" up -d >>"$OUT/compose.txt" 2>&1 || harness "5: compose up failed"
 for _ in $(seq 120); do pgrep -x taso-sim >/dev/null && break; sleep 1; done
 pgrep -x taso-sim >/dev/null || harness "5: the long Vessel's agent never ran"
 sleep 3
-docker kill "$("${COMPOSE[@]}" ps -q wardend)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of the Warden failed"
+# Stopped, not killed: step 4 tests the kill; here the devices are to stay
+# attached and free, whatever moment the stop lands on.
+"${COMPOSE[@]}" stop wardend >>"$OUT/compose.txt" 2>&1 || harness "5: stopping the Warden failed"
 # Its devices free (no opener) before taso-blkd dies: a device still
 # mounted when its server dies would wait in the kernel's delete.
-say "5: the Warden killed at $(date +%T); waiting for its devices (up to 60 s, $OUT/5-devices.txt)"
-watch_devices 5 60 || harness "5: the dead Warden's devices stayed busy for 60 s (see 5-devices.txt)"
+say "5: the Warden stopped at $(date +%T); waiting for its devices (up to 60 s, $OUT/5-devices.txt)"
+watch_devices 5 60 || harness "5: the stopped Warden's devices stayed busy for 60 s (see 5-devices.txt)"
 say "5: its devices free after $(cat "$OUT/5-devices.txt.free") s"
 made=$(comm -13 <(printf '%s\n' "$BEFORE") <(ublk_devices) | grep -c ublkc || true)
+[[ "$made" -ge 1 ]] || harness "5: the stopped Warden left no device attached: nothing for a killed taso-blkd to leave"
 docker kill "$("${COMPOSE[@]}" ps -q blkd)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of taso-blkd failed"
 sleep 1
 "${COMPOSE[@]}" logs --no-color blkd >"$OUT/5-blkd-killed.log" 2>&1
