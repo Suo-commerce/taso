@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# scripts/c3-compose-test.sh: C3-d, the containers tested on one host
+# (deploy/docker/compose.yaml; plan claude/Taso_plan_v01_2026-11-15.md).
+#
+#   sudo scripts/c3-compose-test.sh            from the repository root
+#
+# Builds the images, unpacks the demo agent, and runs the stack in
+# deploy/docker on a fresh TASO_DATA (default /var/lib/taso-c3; an earlier
+# run's is moved aside, never deleted).  Graded, in order:
+#
+#   1 born, seals, forks   `compose up`: the Warden ends with `demo` and
+#                          `demo-fork-2` each "21 Seals published ... agent
+#                          ok", and exits 0.  The devices taso-blkd makes
+#                          after its start appear in the Warden's container
+#                          (C3-a), or nothing would mount.
+#   2 a clean stop         `compose stop`: taso-blkd logs "quit (SIGTERM)"
+#                          (C3-h) and exits 0; no ublk device left on the
+#                          host, nothing of ublk mounted.
+#   3 the Seals intact     `compose up` again on the same TASO_DATA:
+#                          taso-blkd starts "from the checkpoint"; once the
+#                          Warden has ended, `taso-ctl explain` of both
+#                          Vessels holds every check.  Then 2's checks.
+#   4 the Warden killed    a long-running Vessel (TASO_WARDEN_CONFIG, C3-j);
+#                          once its agent runs, `docker kill` of the
+#                          Warden's container: within 10 s no taso-sim is
+#                          left on the host.  Then 2's checks (taso-blkd
+#                          quits with the dead Warden's device not in use).
+#
+# Recorded, not graded: the second run's Warden lines, image sizes.
+# Exit 0 PASS, 1 FAIL, 2 HARNESS (a setup step failed: no grade).
+#
+# Refuses to start if /dev/ublk-control is missing, rcu_expedited is not 1
+# (the host's job, C3-b: the README's two lines), a taso-blkd, taso-wardend
+# or taso-sim already runs (stop the host's own taso-blkd.service first),
+# or compose project "taso" has containers.  Touches: TASO_DATA (and its
+# moved-aside predecessors), OUT, the images taso-{blkd,wardend}:dev and
+# taso-agent-demo:c3, compose project "taso" (removed at the end with its
+# volume).  Env: TASO_DATA, OUT (/root/c3-compose/<time>).
+
+set -Eeuo pipefail
+
+die() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
+say() { printf '== %s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$OUT/summary.txt"; }
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ -f deploy/docker/compose.yaml ]] || die "run from the repository root"
+for t in docker python3 findmnt pgrep timeout; do command -v "$t" >/dev/null || die "$t is missing"; done
+docker compose version >/dev/null 2>&1 || die "docker compose is missing"
+[[ -c /dev/ublk-control ]] || die "/dev/ublk-control missing: the host loads ublk_drv (modprobe ublk_drv)"
+[[ "$(cat /sys/kernel/rcu_expedited 2>/dev/null)" == 1 ]] || die "rcu_expedited is not 1: the host sets it (echo 1 > /sys/kernel/rcu_expedited)"
+[[ -f /sys/fs/cgroup/cgroup.controllers ]] || die "cgroup v2 is needed"
+if pgrep -a -x 'taso-blkd|taso-wardend|taso-sim'; then die "the above already run: not ours to share"; fi
+
+export TASO_DATA=${TASO_DATA:-/var/lib/taso-c3}
+unset TASO_WARDEN_CONFIG   # steps 1-3 run the demo, warden.json; step 4 sets it
+COMPOSE=(docker compose -f deploy/docker/compose.yaml -p taso)
+[[ -z "$("${COMPOSE[@]}" ps -a -q 2>/dev/null)" ]] || die "compose project \"taso\" has containers (docker compose -p taso ps -a)"
+OUT=${OUT:-/root/c3-compose/$(date +%Y%m%d-%H%M%S)}
+mkdir -p "$OUT"
+: >"$OUT/summary.txt"
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo '?')
+
+VERDICT=0
+grade() { # grade WHAT ok|fail [DETAIL]
+    if [[ "$2" == ok ]]; then say "PASS  $1"; else say "FAIL  $1${3:+: $3}"; VERDICT=1; fi
+}
+harness() { say "HARNESS  $*"; down_all; exit 2; }
+down_all() { "${COMPOSE[@]}" down -v >>"$OUT/compose.txt" 2>&1 || true; }
+
+# leftovers TAG: no ublk device on the host, nothing of ublk mounted.
+leftovers() {
+    local devs mnts
+    devs=$(ls /dev/ublkb* /dev/ublkc* 2>/dev/null | tr '\n' ' ' || true)
+    mnts=$(findmnt -rn -o SOURCE,TARGET | grep ublk || true)
+    printf '%s\n%s\n' "devices: ${devs:-none}" "mounts: ${mnts:-none}" >"$OUT/$1-leftovers.txt"
+    [[ -z "$devs" ]] && grade "$1: no ublk device left" ok || grade "$1: no ublk device left" fail "$devs"
+    [[ -z "$mnts" ]] && grade "$1: nothing of ublk mounted" ok || grade "$1: nothing of ublk mounted" fail "$mnts"
+}
+
+# stop TAG: stop the stack (the Warden first, then taso-blkd by SIGTERM),
+# keep both logs and taso-blkd's exit, grade the clean quit and the host.
+stop() {
+    local blkd rc
+    blkd=$("${COMPOSE[@]}" ps -a -q blkd)
+    "${COMPOSE[@]}" stop >>"$OUT/compose.txt" 2>&1
+    "${COMPOSE[@]}" logs --no-color blkd >"$OUT/$1-blkd.log" 2>&1
+    "${COMPOSE[@]}" logs --no-color wardend >"$OUT/$1-wardend.log" 2>&1
+    rc=$(docker inspect -f '{{.State.ExitCode}}' "$blkd")
+    grep -q 'taso-blkd: quit (SIGTERM)' "$OUT/$1-blkd.log" && [[ "$rc" == 0 ]] \
+        && grade "$1: taso-blkd quit on SIGTERM, exit 0" ok \
+        || grade "$1: taso-blkd quit on SIGTERM, exit 0" fail "exit $rc; $(tail -n 2 "$OUT/$1-blkd.log" | tr '\n' ' ')"
+    "${COMPOSE[@]}" down >>"$OUT/compose.txt" 2>&1
+    leftovers "$1"
+}
+
+# warden_ended TAG SECONDS: wait for the Warden's container to exit; its code.
+warden_ended() {
+    local id
+    id=$("${COMPOSE[@]}" ps -a -q wardend)
+    [[ -n "$id" ]] || harness "$1: no Warden container"
+    timeout "$2" docker wait "$id" 2>/dev/null || echo timeout
+}
+
+say "C3-d at $COMMIT: TASO_DATA=$TASO_DATA, results in $OUT"
+
+# ── setup ────────────────────────────────────────────────────────────
+if [[ -e "$TASO_DATA" ]]; then mv "$TASO_DATA" "$TASO_DATA-$(date +%Y%m%d-%H%M%S)"; say "the earlier TASO_DATA moved aside"; fi
+mkdir -p "$TASO_DATA/agent" "$TASO_DATA/blk" "$TASO_DATA/warden"
+say "building the images (build log: $OUT/build.txt)"
+"${COMPOSE[@]}" build >"$OUT/build.txt" 2>&1 || harness "compose build failed (tail $OUT/build.txt)"
+docker build -f deploy/docker/Dockerfile --target agent-demo -t taso-agent-demo:c3 . >>"$OUT/build.txt" 2>&1 \
+    || harness "the agent-demo image did not build"
+docker rm -f taso-agent-demo-c3 >/dev/null 2>&1 || true
+docker create --name taso-agent-demo-c3 taso-agent-demo:c3 >/dev/null || harness "docker create of the demo agent"
+docker export taso-agent-demo-c3 | tar -x -C "$TASO_DATA/agent" || harness "unpacking the demo agent"
+docker rm taso-agent-demo-c3 >/dev/null
+docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep -E '^taso-(blkd|wardend):dev|^taso-agent-demo:c3' >"$OUT/images.txt" || true
+
+# ── 1 born, seals, forks ─────────────────────────────────────────────
+say "1: compose up, the demo (20 turns, a fork, 20 turns)"
+"${COMPOSE[@]}" up -d >>"$OUT/compose.txt" 2>&1 || harness "1: compose up failed"
+rc=$(warden_ended 1 600)
+"${COMPOSE[@]}" logs --no-color --no-log-prefix wardend >"$OUT/1-wardend.log" 2>&1
+[[ "$rc" == 0 ]] && grade "1: the Warden ended, exit 0" ok || grade "1: the Warden ended, exit 0" fail "$rc"
+for v in demo demo-fork-2; do
+    line=$(grep -E "^$v: .* Seals published" "$OUT/1-wardend.log" | tail -n 1 || true)
+    [[ "$line" =~ \ 21\ Seals\ published,\ 0\ publish\ failures.*agent\ ok$ ]] \
+        && grade "1: $v, 21 Seals, agent ok" ok || grade "1: $v, 21 Seals, agent ok" fail "${line:-no line}"
+done
+declare -A ID
+for v in demo demo-fork-2; do
+    ds=$(grep -o "\] $v: dataset [^ ]*\$" "$OUT/1-wardend.log" | head -n 1 | sed 's/.*: dataset //' || true)
+    ID[$v]=${ds##*/v-}
+    [[ "${ID[$v]}" =~ ^[0-9a-f]{32}$ ]] || { ID[$v]=; say "1: no dataset line for $v in the Warden's log (step 3 cannot explain it)"; }
+done
+stop 2
+
+# ── 3 the Seals intact ───────────────────────────────────────────────
+say "3: compose up again on the same TASO_DATA"
+"${COMPOSE[@]}" up -d >>"$OUT/compose.txt" 2>&1 || harness "3: compose up failed"
+rc=$(warden_ended 3 600)
+"${COMPOSE[@]}" logs --no-color --no-log-prefix blkd >"$OUT/3-blkd-start.log" 2>&1
+grep -q 'recovered .*from the checkpoint at record' "$OUT/3-blkd-start.log" \
+    && grade "3: taso-blkd started from the checkpoint" ok \
+    || grade "3: taso-blkd started from the checkpoint" fail "$(grep 'recovered' "$OUT/3-blkd-start.log" || echo 'no recovered line')"
+say "3: the second run's Warden ended: $rc (recorded)"
+# explain opens the Warden's local coordinator, which a running Warden holds.
+[[ "$rc" == timeout ]] && "${COMPOSE[@]}" stop wardend >>"$OUT/compose.txt" 2>&1
+for v in demo demo-fork-2; do
+    [[ -n "${ID[$v]}" ]] || { grade "3: explain $v, every check holds" fail "no id (step 1)"; continue; }
+    xrc=0
+    "${COMPOSE[@]}" run --rm --no-deps -T --entrypoint taso-ctl wardend \
+        /etc/taso/wardend.json explain "${ID[$v]}" >"$OUT/3-explain-$v.json" 2>"$OUT/3-explain-$v.err" || xrc=$?
+    failed=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("checks",{}).get("failed","?"))' \
+        "$OUT/3-explain-$v.json" 2>/dev/null || echo '?')
+    [[ "$xrc" == 0 && "$failed" == "[]" ]] && grade "3: explain $v, every check holds" ok \
+        || grade "3: explain $v, every check holds" fail "exit $xrc, failed $failed"
+done
+stop 3
+
+# ── 4 the Warden killed ──────────────────────────────────────────────
+say "4: a long-running Vessel, then docker kill of the Warden's container"
+python3 -I - deploy/docker/warden.json "$OUT/long.json" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+c["vessels"] = [{"namespace": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3", "subject": "c3-long", "uid_slot": 3,
+                 "runtime": {"args": ["/usr/bin/taso-sim", "--turns", "100000", "--txns", "4", "--rows", "8",
+                                      "--row-bytes", "256", "--synchronous", "normal"]}}]
+json.dump(c, open(sys.argv[2], "w"), indent=1)
+PY
+export TASO_WARDEN_CONFIG=$OUT/long.json
+"${COMPOSE[@]}" up -d >>"$OUT/compose.txt" 2>&1 || harness "4: compose up failed"
+for _ in $(seq 120); do pgrep -x taso-sim >/dev/null && break; sleep 1; done
+pgrep -x taso-sim >/dev/null || harness "4: the long Vessel's agent never ran (see compose logs wardend)"
+sleep 5
+before=$(pgrep -c -x taso-sim || true)
+docker kill "$("${COMPOSE[@]}" ps -q wardend)" >>"$OUT/compose.txt" 2>&1 || harness "4: docker kill failed"
+for _ in $(seq 10); do pgrep -x taso-sim >/dev/null || break; sleep 1; done
+left=$(pgrep -a -x taso-sim || true)
+[[ -z "$left" ]] && grade "4: the killed Warden's agents ended within 10 s ($before running before)" ok \
+    || grade "4: the killed Warden's agents ended within 10 s" fail "$left"
+stop 4
+
+down_all
+total=$([[ $VERDICT == 0 ]] && echo PASS || echo FAIL)
+say "C3-d $total at $COMMIT (results in $OUT)"
+exit "$VERDICT"
