@@ -7,17 +7,24 @@
 //!
 //! Every PUT is signed over the SHA-256 of its body
 //! (`x-amz-content-sha256`), and Garage refuses a body that does not match
-//! it; the same digest goes in `x-amz-checksum-sha256`, so Garage keeps it
-//! with the object.  A pack is also verified end to end on read
-//! ([`crate::pack`]), so the store is not trusted for content either way:
-//! the checksum turns a corrupted upload into a failed put instead of a
-//! pack that fails later.
+//! it.  A whole-object PUT also sends the digest in `x-amz-checksum-sha256`,
+//! so Garage keeps it with the object; the parts of a multipart upload
+//! send only the signed digest (each part is refused if it does not match
+//! its own), which every S3 store checks.  A pack is also verified end to
+//! end on read ([`crate::pack`]), so the store is not trusted for content
+//! either way.
+//!
+//! # Memory
+//!
+//! A put holds at most one part ([`PART`], 16 MiB) of the body: an object
+//! that fits in one is sent with one PUT, a larger one as a multipart
+//! upload, a part at a time (audit 2026-11-16, S3: the whole pack was read
+//! into memory first, outside every agent's memory limit, and a pack over
+//! S3's 5 GB single-PUT limit could not ship at all).  An upload that
+//! fails is aborted, so its parts do not stay in the bucket.
 //!
 //! # Limits (Phase 1)
 //!
-//! - A put reads the whole body into memory to hash it before sending.
-//!   Packs are small (a Template's full stream ~1 MB, a Vessel's
-//!   incremental a few KB); multipart upload comes when they are not.
 //! - HTTP or HTTPS.  `http://` is for Garage on the node's private
 //!   network.  `https://` verifies the server against the public web roots,
 //!   or, with [`S3Config::ca_file`], against that CA alone (a Garage behind
@@ -373,20 +380,151 @@ impl S3Store {
     }
 }
 
+/// The most of a body a put holds: one part.  S3's parts are 5 MiB at
+/// least (but the last) and 10,000 at most, so an object may be up to
+/// about 156 GiB.
+pub const PART: usize = 16 << 20;
+
+/// S3's most parts in one upload.
+const MAX_PARTS: u32 = 10_000;
+
+/// The next part of `data` into `buf`: [`PART`] bytes, fewer only where
+/// the body ends.  `buf` grows to what is read, so a small body costs
+/// only its own size.
+fn read_part(data: &mut dyn Read, buf: &mut Vec<u8>) -> io::Result<()> {
+    buf.clear();
+    Read::take(&mut *data, PART as u64).read_to_end(buf)?;
+    Ok(())
+}
+
+impl S3Store {
+    /// One PUT of a body that fits in a part.
+    fn put_whole(&self, key: &str, body: &[u8]) -> io::Result<u64> {
+        let digest = Sha256::digest(body);
+        let hash = hex(&digest);
+        let extra = [("x-amz-checksum-sha256", base64(&digest))];
+        let what = format!("put {key}");
+        let req = self.request("PUT", &self.path(key), &[], &hash, &extra);
+        success(&what, self.send(&what, req, body)?)?;
+        Ok(body.len() as u64)
+    }
+
+    /// A multipart upload of `first` (a full part) and the rest of
+    /// `data`; aborted if any step fails.
+    fn put_parts(&self, key: &str, first: Vec<u8>, data: &mut dyn Read) -> io::Result<u64> {
+        let what = format!("put {key}");
+        let path = self.path(key);
+        let req = self.request("POST", &path, &[("uploads", "")], EMPTY_SHA256, &[]);
+        let start = format!("{what}: start a multipart upload");
+        let body = success(&start, self.send(&start, req, ())?)?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{start}: {e}")))?;
+        let id = between(&body, "<UploadId>", "</UploadId>")
+            .filter(|i| !i.is_empty())
+            .map(xml_unescape)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("{start}: no UploadId"))
+            })?;
+        let sent = self.upload_parts(&what, &path, &id, first, data);
+        if sent.is_err() {
+            // Best effort: an upload left open keeps its parts (and their
+            // space) until the bucket's own lifecycle rule, if any, ends it.
+            let req = self.request("DELETE", &path, &[("uploadId", &id)], EMPTY_SHA256, &[]);
+            match self.send(&what, req, ()) {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => eprintln!(
+                    "taso: {what}: could not abort the multipart upload {id}: HTTP {}",
+                    r.status().as_u16()
+                ),
+                Err(e) => eprintln!("taso: {what}: could not abort the multipart upload {id}: {e}"),
+            }
+        }
+        sent
+    }
+
+    /// Every part, then the upload's completion.
+    fn upload_parts(
+        &self,
+        what: &str,
+        path: &str,
+        id: &str,
+        mut buf: Vec<u8>,
+        data: &mut dyn Read,
+    ) -> io::Result<u64> {
+        let mut etags: Vec<String> = Vec::new();
+        let mut total = 0u64;
+        while !buf.is_empty() {
+            let n = etags.len() as u32 + 1;
+            if n > MAX_PARTS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{what}: more than {MAX_PARTS} parts of {} MiB", PART >> 20),
+                ));
+            }
+            let part = format!("{what}: part {n}");
+            let num = n.to_string();
+            let hash = hex(&Sha256::digest(&buf));
+            let req = self.request(
+                "PUT",
+                path,
+                &[("partNumber", &num), ("uploadId", id)],
+                &hash,
+                &[],
+            );
+            let resp = success(&part, self.send(&part, req, &buf[..])?)?;
+            let etag = resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .filter(|e| !e.is_empty())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("{part}: no ETag"))
+                })?;
+            etags.push(etag.to_string());
+            total += buf.len() as u64;
+            if buf.len() < PART {
+                break; // a short part: the body has ended
+            }
+            read_part(data, &mut buf)?;
+        }
+        let mut xml = String::from("<CompleteMultipartUpload>");
+        for (i, e) in etags.iter().enumerate() {
+            let _ = write!(
+                xml,
+                "<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                i + 1,
+                xml_escape(e)
+            );
+        }
+        xml.push_str("</CompleteMultipartUpload>");
+        let done = format!("{what}: complete the multipart upload");
+        let hash = hex(&Sha256::digest(xml.as_bytes()));
+        let req = self.request("POST", path, &[("uploadId", id)], &hash, &[]);
+        let body = success(&done, self.send(&done, req, xml.as_bytes())?)?
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{done}: {e}")))?;
+        // S3 may answer 200 and still fail the completion, in the body.
+        if body.contains("<Error>") {
+            let code = between(&body, "<Code>", "</Code>").unwrap_or_default();
+            return Err(io::Error::other(format!("{done}: {code}")));
+        }
+        Ok(total)
+    }
+}
+
 impl ObjectStore for S3Store {
     fn put(&self, key: &str, data: &mut dyn Read) -> io::Result<u64> {
         if !valid_key(key) {
             return Err(bad_key(key));
         }
-        let mut body = Vec::new();
-        data.read_to_end(&mut body)?;
-        let digest = Sha256::digest(&body);
-        let hash = hex(&digest);
-        let extra = [("x-amz-checksum-sha256", base64(&digest))];
-        let what = format!("put {key}");
-        let req = self.request("PUT", &self.path(key), &[], &hash, &extra);
-        success(&what, self.send(&what, req, &body[..])?)?;
-        Ok(body.len() as u64)
+        let mut first = Vec::new();
+        read_part(data, &mut first)?;
+        if first.len() < PART {
+            return self.put_whole(key, &first);
+        }
+        self.put_parts(key, first, data)
     }
 
     /// `None` for a key that is not there.  A 404 that says the bucket is
@@ -501,6 +639,13 @@ fn xml_unescape(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+/// Text for an XML element (an ETag in a multipart completion).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// The keys and the continuation token of one `ListObjectsV2` page.  Keys
@@ -1231,6 +1376,153 @@ class H(http.server.BaseHTTPRequestHandler):
             "no server: a transport error"
         );
     }
+    /// A reader that hands out at most 7,777 bytes a call, as a pipe or
+    /// a stream producer may: a part must still be read whole.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.0.len()).min(7_777);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    /// Audit 2026-11-16, S3: a body over one part goes as a multipart
+    /// upload, no request larger than a part (the stand-in refuses one);
+    /// it reads back byte for byte; one that fits a part is still one
+    /// PUT; a failed part and a completion refused in a 200's body are
+    /// errors, and the upload is aborted.
+    #[test]
+    fn a_large_object_goes_in_parts_and_a_failed_upload_is_aborted() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = TestServer::start(
+            false,
+            &r#"
+import hashlib, urllib.parse
+PART = @PART@
+objs, uploads = {}, {}
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def reply(self, code, body=b"", ctype="application/xml", etag=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        if etag: self.send_header("ETag", etag)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD": self.wfile.write(body)
+    def error(self, code, name):
+        self.reply(code, ("<Error><Code>%s</Code><Message>m</Message></Error>" % name).encode())
+    def parse(self):
+        u = urllib.parse.urlparse(self.path)
+        k = urllib.parse.unquote(u.path).split("/", 2)[2]
+        q = {a: b[0] for a, b in urllib.parse.parse_qs(u.query, keep_blank_values=True).items()}
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n)
+        if n > PART: return k, q, None
+        if self.headers.get("x-amz-content-sha256") not in (hashlib.sha256(body).hexdigest(), None):
+            return k, q, None
+        return k, q, body
+    def do_PUT(self):
+        k, q, body = self.parse()
+        if body is None: return self.error(400, "EntityTooLarge or BadDigest")
+        if "uploadId" not in q:
+            objs[k] = body
+            return self.reply(200)
+        n = int(q["partNumber"])
+        if k.startswith("fail/") and n == 2: return self.error(500, "InternalError")
+        etag = '"%s"' % hashlib.md5(body).hexdigest()
+        uploads[q["uploadId"]][1][n] = (etag, body)
+        self.reply(200, etag=etag)
+    def do_POST(self):
+        k, q, body = self.parse()
+        if "uploads" in q:
+            uid = "u&%d" % len(uploads)
+            uploads[uid] = (k, {})
+            return self.reply(200, ("<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>" % uid.replace("&", "&amp;")).encode())
+        key, parts = uploads[q["uploadId"]]
+        listed = body.decode()
+        want = "".join("<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>" % (n, parts[n][0]) for n in sorted(parts))
+        if listed != "<CompleteMultipartUpload>%s</CompleteMultipartUpload>" % want:
+            return self.error(400, "InvalidPart")
+        if k.startswith("late/"):
+            return self.reply(200, b"<Error><Code>InternalError</Code></Error>")
+        objs[k] = b"".join(parts[n][1] for n in sorted(parts))
+        objs["parts/" + k] = str(len(parts)).encode()
+        del uploads[q["uploadId"]]
+        self.reply(200, b"<CompleteMultipartUploadResult/>")
+    def do_DELETE(self):
+        k, q, _ = self.parse()
+        if "uploadId" in q:
+            uploads.pop(q["uploadId"], None)
+            objs["aborted/" + k] = b""
+        else:
+            objs.pop(k, None)
+        self.reply(204)
+    def do_HEAD(self):
+        k = urllib.parse.unquote(urllib.parse.urlparse(self.path).path).split("/", 2)
+        self.reply(200 if len(k) < 3 or k[2] in objs else 404)
+    def do_GET(self):
+        k, q, _ = self.parse()
+        if k not in objs: return self.error(404, "NoSuchKey")
+        self.reply(200, objs[k], "application/octet-stream")
+    def log_message(self, *a): pass
+"#
+            .replace("@PART@", &PART.to_string()),
+        );
+        let store = store_at(srv.port);
+        let read = |k: &str| {
+            let mut got = Vec::new();
+            store
+                .get(k)
+                .unwrap()
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            got
+        };
+        let big: Vec<u8> = (0..2 * PART + 12_345)
+            .map(|i| (i * 31 + i / 997) as u8)
+            .collect();
+        let n = store.put("d/big", &mut Trickle(&big)).unwrap();
+        assert_eq!(n, big.len() as u64);
+        assert!(read("d/big") == big, "read back byte for byte");
+        assert_eq!(read("parts/d/big"), b"3");
+        // Exactly one part: a multipart upload of one part.
+        store.put("d/one", &mut Trickle(&big[..PART])).unwrap();
+        assert!(read("d/one") == big[..PART]);
+        assert_eq!(read("parts/d/one"), b"1");
+        // A byte less: one PUT.
+        store
+            .put("d/small", &mut Trickle(&big[..PART - 1]))
+            .unwrap();
+        assert!(read("d/small") == big[..PART - 1]);
+        assert!(!store.exists("parts/d/small").unwrap());
+        // A part refused: an error, and the upload aborted.
+        let e = store.put("fail/x", &mut Trickle(&big)).unwrap_err();
+        assert!(
+            e.to_string().contains("part 2: HTTP 500 InternalError"),
+            "{e}"
+        );
+        assert!(!store.exists("fail/x").unwrap());
+        assert!(
+            store.exists("aborted/fail/x").unwrap(),
+            "the upload was aborted"
+        );
+        // The completion refused in a 200's body: the same.
+        let e = store.put("late/x", &mut Trickle(&big)).unwrap_err();
+        assert!(e.to_string().contains("InternalError"), "{e}");
+        assert!(!store.exists("late/x").unwrap());
+        assert!(
+            store.exists("aborted/late/x").unwrap(),
+            "the upload was aborted"
+        );
+    }
+
     /// The same contract tests as `LocalStore`, against a real Garage:
     /// set TASO_S3_ENDPOINT, TASO_S3_BUCKET, TASO_S3_KEY_ID, TASO_S3_SECRET
     /// (TASO_S3_REGION defaults to `garage`).
@@ -1268,6 +1560,21 @@ class H(http.server.BaseHTTPRequestHandler):
             .read_to_end(&mut got)
             .unwrap();
         assert_eq!(got, big);
+        // Over one part: a multipart upload (audit 2026-11-16, S3).
+        let huge: Vec<u8> = (0..2 * PART + 5).map(|i| (i / 3) as u8).collect();
+        assert_eq!(
+            store.put(&k("huge"), &mut &huge[..]).unwrap(),
+            huge.len() as u64
+        );
+        let mut got = Vec::new();
+        store
+            .get(&k("huge"))
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert!(got == huge, "the multipart object reads back whole");
+        assert!(store.delete(&k("huge")).unwrap());
         store.put(&k("a"), &mut &b"again"[..]).unwrap();
         let mut a = String::new();
         store
