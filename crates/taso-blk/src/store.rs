@@ -119,7 +119,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -302,6 +302,11 @@ pub struct Recovered {
     /// The sequence number of the checkpoint the replay started from, or
     /// `None` for a full replay.
     pub checkpoint: Option<u64>,
+    /// The log's mode before `open` took away others' access to it (and
+    /// to its checkpoint), or `None` if they had none: a log made before
+    /// the store made its files private (audit 2026-11-16, S1).  The
+    /// caller says so in its own log.
+    pub tightened: Option<u32>,
 }
 
 /// Counters for measurements.
@@ -375,10 +380,13 @@ impl Store {
     /// its existence durable.
     pub fn create(path: &Path) -> Result<Self, StoreError> {
         let lock = lock_log(path)?;
+        // Private from the start: a Vessel's file modes do not protect its
+        // bytes here (audit 2026-11-16, S1).
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
+            .mode(PRIVATE)
             .open(path)?;
         // A checkpoint of an earlier log under this name is not ours, nor
         // is an unfinished compaction of one.
@@ -437,6 +445,13 @@ impl Store {
         let compacted = &header[..8] == COMPACT_MAGIC;
         if &header[..8] != FILE_MAGIC && !compacted {
             return Err(StoreError::NotALog);
+        }
+        // A log made before the store made its files private: others'
+        // access goes, the owner's and the group's stay (an operator's
+        // group setting is theirs).  Its checkpoint goes with it.
+        let tightened = no_others(&file)?;
+        if let Ok(ck) = File::open(ckpt_path(path)) {
+            no_others(&ck)?;
         }
         // A compaction that did not finish left its new log beside this
         // one; this one is still the log.
@@ -546,6 +561,7 @@ impl Store {
                 groups,
                 cut,
                 checkpoint: from,
+                tightened,
             },
         ))
     }
@@ -1538,12 +1554,32 @@ fn lock_log(path: &Path) -> Result<File, StoreError> {
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(PRIVATE)
         .open(&p)?;
     match f.try_lock() {
         Ok(()) => Ok(f),
         Err(std::fs::TryLockError::WouldBlock) => Err(StoreError::Locked(p)),
         Err(std::fs::TryLockError::Error(e)) => Err(StoreError::Io(e)),
     }
+}
+
+/// The mode a store's new files get: the owner's alone.
+const PRIVATE: u32 = 0o600;
+
+/// The mode for a file holding what the log at `log` holds: the log's
+/// own, without others' access or any execute bit.
+fn mode_of_log(log: &Path) -> io::Result<u32> {
+    Ok(std::fs::metadata(log)?.permissions().mode() & 0o660)
+}
+
+/// Take others' access to `f` away; its mode before, if there was any.
+fn no_others(f: &File) -> io::Result<Option<u32>> {
+    let mode = f.metadata()?.permissions().mode() & 0o7777;
+    if mode & 0o007 == 0 {
+        return Ok(None);
+    }
+    f.set_permissions(std::fs::Permissions::from_mode(mode & !0o007))?;
+    Ok(Some(mode))
 }
 
 fn ckpt_path(path: &Path) -> PathBuf {
@@ -1592,11 +1628,17 @@ fn write_checkpoint(
     let path = ckpt_path(log);
     let tmp = path.with_extension("ckpt.tmp");
     {
+        // The checkpoint holds the log's map and names: the log's mode.
+        // Set on the descriptor too, since a leftover temporary file keeps
+        // the mode it was made with (audit 2026-11-16, S1).
+        let mode = mode_of_log(log)?;
         let f = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(mode)
             .open(&tmp)?;
+        f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         f.write_all_at(&b, 0)?;
         f.sync_all()?;
     }
@@ -2007,6 +2049,76 @@ mod tests {
 
     fn new_store(dir: &tempfile::TempDir) -> Store {
         Store::create(&dir.path().join("log")).unwrap()
+    }
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn chmod(p: &Path, m: u32) {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    /// Audit 2026-11-16, S1: a Vessel's bytes sit in the log and its
+    /// checkpoint whatever the file modes inside the Vessel say, and they
+    /// were made 0644 under the usual umask.  Now the log, its lock and
+    /// its checkpoint give nobody but the owner access (whatever the
+    /// umask, which this test leaves alone: the process shares it).
+    #[test]
+    fn a_new_logs_files_are_the_owners_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(7, 1), false).unwrap();
+        s.checkpoint().unwrap();
+        for p in [path.clone(), lock_path(&path), ckpt_path(&path)] {
+            assert_eq!(mode(&p) & 0o077, 0, "{}: {:o}", p.display(), mode(&p));
+        }
+    }
+
+    /// Audit 2026-11-16, S1 (D&D S1-a b, S1-b b): a log made before,
+    /// readable by others, loses others' access to it and to its
+    /// checkpoint when opened, and `open` says what the mode was; a group
+    /// the operator gave access keeps it, and a new checkpoint takes the
+    /// log's mode, exactly.
+    #[test]
+    fn opening_an_old_log_takes_others_access_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(7, 1), false).unwrap();
+        s.checkpoint().unwrap();
+        drop(s);
+        chmod(&path, 0o644);
+        chmod(&ckpt_path(&path), 0o644);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.tightened, Some(0o644));
+        assert_eq!(mode(&path), 0o640);
+        assert_eq!(mode(&ckpt_path(&path)), 0o640);
+        assert_eq!(read1(&s, b, 0), 7, "the data is untouched");
+        drop(s);
+        // The group's access stays: nothing to say.
+        let (mut s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.tightened, None);
+        assert_eq!(mode(&path), 0o640);
+        // A checkpoint written now has the log's mode, whatever the umask.
+        std::fs::remove_file(ckpt_path(&path)).unwrap();
+        s.checkpoint().unwrap();
+        assert_eq!(mode(&ckpt_path(&path)), 0o640);
+        drop(s);
+        chmod(&path, 0o600);
+        let (mut s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.tightened, None);
+        s.checkpoint().unwrap();
+        assert_eq!(
+            mode(&ckpt_path(&path)),
+            0o600,
+            "the operator took the group's access away"
+        );
     }
 
     #[test]
