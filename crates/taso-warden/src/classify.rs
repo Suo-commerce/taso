@@ -31,8 +31,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rustix::fs::{
-    flistxattr, llistxattr, openat2, readlinkat, statat, AtFlags, FileType, Mode, OFlags,
-    ResolveFlags, CWD,
+    flistxattr_query, llistxattr_query, openat2, readlinkat, statat, AtFlags, FileType, Mode,
+    OFlags, ResolveFlags, CWD,
 };
 use taso_core::canon::Canon;
 use taso_core::contract::{object_key, ClassCounts, ObjectKind, PathClass};
@@ -128,32 +128,67 @@ impl Glob {
     /// directory glob also matches every path below what it matches.
     pub fn matches(&self, path: &[u8]) -> bool {
         let comps: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
-        if self.dir {
-            (1..=comps.len()).any(|n| match_parts(&self.parts, &comps[..n]))
-        } else {
-            match_parts(&self.parts, &comps)
-        }
-    }
-}
-
-fn match_parts(parts: &[Part], comps: &[&[u8]]) -> bool {
-    match parts.split_first() {
-        None => comps.is_empty(),
-        Some((Part::Any, rest)) => (0..=comps.len()).any(|k| match_parts(rest, &comps[k..])),
-        Some((Part::Pat(p), rest)) => {
-            !comps.is_empty() && match_comp(p, comps[0]) && match_parts(rest, &comps[1..])
-        }
+        // A directory glob matches what its parts match and everything
+        // below it: its parts with a `**` after them.  (The parts are
+        // never empty and `comps` always holds a component, so the empty
+        // prefix the trailing `**` allows changes nothing.)
+        wild(
+            &self.parts,
+            &comps,
+            self.dir,
+            |p| matches!(p, Part::Any),
+            |p, c| matches!(p, Part::Pat(p) if match_comp(p, c)),
+        )
     }
 }
 
 /// `*` any run, `?` one byte, everything else itself (within a component).
 fn match_comp(p: &[u8], s: &[u8]) -> bool {
-    match p.split_first() {
-        None => s.is_empty(),
-        Some((b'*', rest)) => (0..=s.len()).any(|k| match_comp(rest, &s[k..])),
-        Some((b'?', rest)) => !s.is_empty() && match_comp(rest, &s[1..]),
-        Some((c, rest)) => s.first() == Some(c) && match_comp(rest, &s[1..]),
+    wild(p, s, false, |b| *b == b'*', |b, c| *b == b'?' || b == c)
+}
+
+/// Whether pattern `pat` matches all of `s`: a `star` item matches any
+/// run of items of `s`, any other pattern item one item that `one`
+/// accepts; `then_star` reads the pattern as if a star followed it.
+///
+/// The usual two-pointer match: on a miss it goes back only to the last
+/// star, giving it one more item.  That is enough, because a later star
+/// can absorb whatever an earlier one could, so at most |pat| × |s| steps
+/// (S2, audit 2026-11-16: the recursive form it replaces tried every
+/// split for every star and took seconds for a 48-byte name under a rule
+/// with seven stars, past the walk's deadline).
+fn wild<P, T>(
+    pat: &[P],
+    s: &[T],
+    then_star: bool,
+    star: impl Fn(&P) -> bool,
+    one: impl Fn(&P, &T) -> bool,
+) -> bool {
+    let (mut p, mut i) = (0, 0);
+    // Where to go back to: the pattern after the last star, and the item
+    // of `s` that star's run would end at next.
+    let mut back: Option<(usize, usize)> = None;
+    while i < s.len() {
+        if p < pat.len() && star(&pat[p]) {
+            p += 1;
+            back = Some((p, i));
+        } else if p < pat.len() && one(&pat[p], &s[i]) {
+            p += 1;
+            i += 1;
+        } else if p == pat.len() && then_star {
+            return true;
+        } else if let Some((bp, bi)) = back {
+            p = bp;
+            i = bi + 1;
+            back = Some((bp, bi + 1));
+        } else {
+            return false;
+        }
     }
+    while p < pat.len() && star(&pat[p]) {
+        p += 1;
+    }
+    p == pat.len()
 }
 
 /// A classification map: ordered rules, and the key of its bytes.
@@ -765,6 +800,10 @@ pub fn walk(
         stop: None,
     };
     let root_entries = w.dir(&fd, &[], 1)?;
+    // The deadline is checked before each entry; one that ends past it
+    // (its hash, say) must not let the walk say it completed (S2, audit
+    // 2026-11-16).
+    w.stopped();
     // Review fix N1a: a link whose target runs through another link is
     // not contained, whatever its text says.  One pass: the test is
     // whether a path is a symlink on disk, not whether it was kept.
@@ -838,9 +877,12 @@ fn is_empty(dir: &OwnedFd) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Whether an xattr list (asked with an empty buffer, so the answer is
-/// the list's length) names any attribute.  A filesystem without xattrs
-/// has none.
+/// Whether an xattr list, asked for its length (`*listxattr_query`),
+/// names any attribute.  A filesystem without xattrs has none.
+///
+/// Not `*listxattr` with an empty buffer: from rustix 1.1.6 that answers
+/// 0 whatever the file holds, and every attribute would pass unseen
+/// (audit 2026-11-16, the rustix upgrade).
 fn has_xattr(list: rustix::io::Result<usize>) -> Result<bool, ()> {
     match list {
         Ok(n) => Ok(n > 0),
@@ -1049,7 +1091,7 @@ impl Walker<'_> {
                     Ok(f) => f,
                     Err(_) => return self.unsupported(path, Unsupported::Unreadable),
                 };
-                match has_xattr(flistxattr(&sub, &mut [0u8; 0][..])) {
+                match has_xattr(flistxattr_query(&sub)) {
                     Ok(false) => {}
                     Ok(true) => return self.unsupported(path, Unsupported::Xattr),
                     Err(()) => return self.unsupported(path, Unsupported::Unreadable),
@@ -1069,7 +1111,7 @@ impl Walker<'_> {
                     Ok(f) => f,
                     Err(_) => return self.unsupported(path, Unsupported::Unreadable),
                 };
-                match has_xattr(flistxattr(&f, &mut [0u8; 0][..])) {
+                match has_xattr(flistxattr_query(&f)) {
                     Ok(false) => {}
                     Ok(true) => return self.unsupported(path, Unsupported::Xattr),
                     Err(()) => return self.unsupported(path, Unsupported::Unreadable),
@@ -1084,6 +1126,13 @@ impl Walker<'_> {
                 let mut buf = vec![0u8; 1 << 16];
                 let mut read = 0u64;
                 loop {
+                    // Each chunk checks the deadline: a large file took
+                    // the walk far past it (S2, audit 2026-11-16).  A
+                    // read the kernel blocks is not cut short by this.
+                    if Instant::now() > self.deadline {
+                        self.over(Incomplete::WalkTime);
+                        return;
+                    }
                     match file.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
@@ -1117,7 +1166,7 @@ impl Walker<'_> {
                     Ok(c) => c,
                     Err(_) => return self.unsupported(path, Unsupported::Unreadable),
                 };
-                match has_xattr(llistxattr(cfull.as_c_str(), &mut [0u8; 0][..])) {
+                match has_xattr(llistxattr_query(cfull.as_c_str())) {
                     Ok(false) => {}
                     Ok(true) => return self.unsupported(path, Unsupported::Xattr),
                     Err(()) => return self.unsupported(path, Unsupported::Unreadable),
@@ -1528,6 +1577,192 @@ class = "Hook"
         assert!(m
             .unsupported
             .contains(&(b"Cargo.toml".to_vec(), Unsupported::Xattr)));
+    }
+
+    /// The rustix upgrade (audit 2026-11-16): a directory and a symlink
+    /// with an attribute are refused as a file is.  A symlink cannot take
+    /// a `user.` attribute, so it gets a `trusted.` one, which needs
+    /// root: without root that half is skipped.
+    #[test]
+    fn an_xattr_on_a_directory_or_symlink_makes_it_unsupported() {
+        let d = tree();
+        let dir = d.path().join("build");
+        if let Err(e) =
+            rustix::fs::setxattr(&dir, "user.taso", b"x", rustix::fs::XattrFlags::empty())
+        {
+            eprintln!("skipped: user xattrs not supported here ({e})");
+            return;
+        }
+        let link = d.path().join("main");
+        let on_link =
+            rustix::fs::lsetxattr(&link, "trusted.taso", b"x", rustix::fs::XattrFlags::empty());
+        let m = walk_it(d.path());
+        assert!(m
+            .unsupported
+            .contains(&(b"build".to_vec(), Unsupported::Xattr)));
+        assert!(
+            !m.entries.iter().any(|e| e.path.starts_with(b"build")),
+            "nothing below a refused directory is listed"
+        );
+        match on_link {
+            Ok(()) => assert!(m
+                .unsupported
+                .contains(&(b"main".to_vec(), Unsupported::Xattr))),
+            Err(e) => eprintln!("symlink half skipped: no trusted xattrs here ({e})"),
+        }
+    }
+
+    /// The matcher S2 replaced: every split tried for every star.  The
+    /// reference the new one must agree with.
+    fn old_matches(g: &Glob, path: &[u8]) -> bool {
+        fn parts(ps: &[Part], cs: &[&[u8]]) -> bool {
+            match ps.split_first() {
+                None => cs.is_empty(),
+                Some((Part::Any, rest)) => (0..=cs.len()).any(|k| parts(rest, &cs[k..])),
+                Some((Part::Pat(p), rest)) => {
+                    !cs.is_empty() && comp(p, cs[0]) && parts(rest, &cs[1..])
+                }
+            }
+        }
+        fn comp(p: &[u8], s: &[u8]) -> bool {
+            match p.split_first() {
+                None => s.is_empty(),
+                Some((b'*', rest)) => (0..=s.len()).any(|k| comp(rest, &s[k..])),
+                Some((b'?', rest)) => !s.is_empty() && comp(rest, &s[1..]),
+                Some((c, rest)) => s.first() == Some(c) && comp(rest, &s[1..]),
+            }
+        }
+        let cs: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
+        if g.dir {
+            (1..=cs.len()).any(|n| parts(&g.parts, &cs[..n]))
+        } else {
+            parts(&g.parts, &cs)
+        }
+    }
+
+    /// Every string over `alphabet` of length `0..=max`.
+    fn all(alphabet: &[&str], max: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut last = vec![String::new()];
+        for _ in 0..max {
+            last = last
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |a| format!("{s}{a}")))
+                .collect();
+            out.extend(last.iter().cloned());
+        }
+        out
+    }
+
+    /// S2: within a component, every pattern of up to five items over
+    /// `a`, `b`, `*`, `?` against every name of up to five bytes.
+    #[test]
+    fn the_matcher_agrees_with_the_old_one_within_a_component() {
+        let names = all(&["a", "b"], 5);
+        let mut checked = 0;
+        for text in all(&["a", "b", "*", "?"], 5) {
+            let Ok(g) = Glob::parse(&text) else { continue };
+            for n in &names {
+                if n.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    g.matches(n.as_bytes()),
+                    old_matches(&g, n.as_bytes()),
+                    "{text} {n}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 50_000, "{checked}");
+    }
+
+    /// S2: across components, every glob of up to four components over
+    /// `a`, `*`, `a*`, `**`, file or directory form, against every path
+    /// of up to four components over `a`, `b`, `ab`.
+    #[test]
+    fn the_matcher_agrees_with_the_old_one_across_components() {
+        let comps = ["a", "*", "a*", "**"];
+        let mut globs = vec![Vec::<&str>::new()];
+        let mut last = globs.clone();
+        for _ in 0..4 {
+            last = last
+                .iter()
+                .flat_map(|g| comps.iter().map(move |c| [g.as_slice(), &[*c]].concat()))
+                .collect();
+            globs.extend(last.iter().cloned());
+        }
+        let mut paths = vec![Vec::<&str>::new()];
+        let mut last = paths.clone();
+        for _ in 0..4 {
+            last = last
+                .iter()
+                .flat_map(|p| {
+                    ["a", "b", "ab"]
+                        .iter()
+                        .map(move |c| [p.as_slice(), &[*c]].concat())
+                })
+                .collect();
+            paths.extend(last.iter().cloned());
+        }
+        let mut checked = 0;
+        for g in globs.iter().filter(|g| !g.is_empty()) {
+            for text in [g.join("/"), format!("{}/", g.join("/"))] {
+                let glob = Glob::parse(&text).unwrap();
+                for p in paths.iter().filter(|p| !p.is_empty()) {
+                    let path = p.join("/");
+                    assert_eq!(
+                        glob.matches(path.as_bytes()),
+                        old_matches(&glob, path.as_bytes()),
+                        "{text} {path}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 50_000, "{checked}");
+    }
+
+    /// S2: the audit's case, at ext4's longest name and with more stars,
+    /// answers at once (the old matcher took seconds at 48 bytes).
+    #[test]
+    fn a_many_star_glob_against_a_long_name_answers_at_once() {
+        let name = vec![b'a'; 255];
+        let t = Instant::now();
+        for stars in [7, 10, 20] {
+            let g = Glob::parse(&format!("{}b", "*a".repeat(stars))).unwrap();
+            assert!(!g.matches(&name));
+            let g = Glob::parse(&format!("**/{}/**/x/", "*a".repeat(stars))).unwrap();
+            let path = [&name[..], b"/", &name[..], b"/", &name[..]].concat();
+            assert!(!g.matches(&path));
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    /// S2: a file whose hash runs past the deadline stops the walk with
+    /// `WalkTime`; the walk does not finish and say it completed.
+    #[test]
+    fn a_hash_past_the_deadline_stops_the_walk() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fs::File::create(d.path().join("big")).unwrap();
+        f.set_len(256 << 20).unwrap();
+        let m = walk(
+            d.path(),
+            &map(MAP),
+            me(),
+            &Limits {
+                max_walk: Duration::from_millis(10),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(m.incomplete, Some(Incomplete::WalkTime));
+        assert!(m.entries.is_empty(), "the unfinished file is not listed");
     }
 
     #[test]
