@@ -26,6 +26,9 @@
 #                       Chronicle state, store and spool
 #   $TASO_DATA/agent    the agent's root filesystem, unpacked from an image
 #                       (above), read-only in the Warden at /srv/taso/agent
+# The Warden's config is warden.json beside this file (the demo), or the
+# file TASO_WARDEN_CONFIG names (your own Vessels; C3-j).  Its paths are
+# the containers' (warden.json shows them).
 # The volume taso-run carries taso-blkd's socket to the Warden.
 #
 # What each container gets, and why:
@@ -85,7 +88,7 @@ services:
         source: ${TASO_DATA:-/var/lib/taso}/agent
         target: /srv/taso/agent
         read_only: true
-      - ./warden.json:/etc/taso/wardend.json:ro
+      - ${TASO_WARDEN_CONFIG:-./warden.json}:/etc/taso/wardend.json:ro
       - taso-run:/run/taso-blk
     command:
       - sh
