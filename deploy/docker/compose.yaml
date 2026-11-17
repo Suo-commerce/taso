@@ -31,6 +31,19 @@
 # the containers' (warden.json shows them).
 # The volume taso-run carries taso-blkd's socket to the Warden.
 #
+# Two places must be the same in both containers, at the same path, because
+# taso-blkd and the Warden name them to each other over the socket:
+#   the host's /dev     `fork` and `attach` answer a device path
+#                       (/dev/ublkb<N>), which the Warden then mounts
+#   the Warden's spool  the Warden asks taso-blkd to `export` a Seal into
+#                       a file there (and to `import` one from it), named by
+#                       the Warden's path: /var/lib/taso/spool, which is
+#                       $TASO_DATA/warden/spool, mounted at that same path in
+#                       taso-blkd's container (C3-k; C3-d's second run:
+#                       "cannot create /var/lib/taso/spool/send-...": no
+#                       Seal published, no fork)
+# A Kubernetes pod with the two containers needs the same two (step 4).
+#
 # What each container gets, and why:
 #   privileged, the host's /dev bound in (both; C3-a)
 #       taso-blkd makes ublk devices after it starts; a container's own
@@ -71,6 +84,8 @@ services:
     volumes:
       - /dev:/dev
       - ${TASO_DATA:-/var/lib/taso}/blk:/var/lib/taso
+      # The Warden's spool, at the Warden's own path (C3-k): see the header.
+      - ${TASO_DATA:-/var/lib/taso}/warden/spool:/var/lib/taso/spool
       - taso-run:/run/taso
 
   wardend:
