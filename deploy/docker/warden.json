@@ -1,0 +1,33 @@
+{
+  "warden": 1,
+  "coordinator": {"local": "/var/lib/taso/coord.redb"},
+  "root": "taso/vessels",
+  "storage": {"blk": {
+    "socket": "/run/taso-blk/blk.sock",
+    "mounts": "/var/lib/taso/mnt",
+    "spool": "/var/lib/taso/spool"
+  }},
+  "state_dir": "/var/lib/taso/state",
+  "store": "/var/lib/taso/store",
+  "prefix": "vessels",
+  "run_dir": "/run/taso/run",
+  "runtime": {
+    "host_uid_base": 200000,
+    "landlock_shim": "/usr/lib/taso/landlock",
+    "rootfs": "/srv/taso/agent"
+  },
+  "effects": "hold",
+  "vessels": [
+    {
+      "namespace": "de0de0de0de0de0de0de0de0de0de0de",
+      "subject": "demo",
+      "uid_slot": 1,
+      "forks": {"slots": [2]},
+      "runtime": {"args": [
+        "/usr/bin/taso-sim", "--turns", "20", "--txns", "4", "--rows", "8",
+        "--row-bytes", "256", "--synchronous", "normal", "--forks", "1",
+        "--stats", "/work/sim-stats.json"
+      ]}
+    }
+  ]
+}
