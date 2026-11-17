@@ -43,8 +43,12 @@
 # The Warden starts after taso-blkd answers (C3-g): its command asks
 # `taso-ctl status` once a second, up to 60 s (exit 0 only when the block
 # log answers), then runs taso-wardend.  If taso-blkd never answers, the
-# Warden's container ends with taso-ctl's last line, not a hang.  It goes
-# through the image's entrypoint (cgroup-init) like the image's own command.
+# Warden's container ends with taso-ctl's last line, not a hang.  The
+# entrypoint is set here to cgroup-init alone: the image's own entrypoint
+# is cgroup-init then taso-wardend, so a command given with it would reach
+# taso-wardend as its arguments (C3-d's first run: "unexpected argument
+# -c").  cgroup-init prepares the cgroup, then runs the command, whose last
+# step execs taso-wardend.
 #
 # With the config's static Vessels taso-wardend runs them until their agents
 # exit, then exits, so no restart policy.  `docker compose stop` stops the
@@ -90,20 +94,17 @@ services:
         read_only: true
       - ${TASO_WARDEN_CONFIG:-./warden.json}:/etc/taso/wardend.json:ro
       - taso-run:/run/taso-blk
+    entrypoint: ["/usr/lib/taso/cgroup-init"]
     command:
       - sh
       - -c
+      # No `$` in this script: compose would read it as its own variable.
       - |
-        i=0
-        until taso-ctl status /etc/taso/wardend.json > /tmp/blk-status 2>&1; do
-          i=$$((i + 1))
-          if [ "$$i" -ge 60 ]; then
-            echo "wardend: taso-blkd did not answer in 60 s; taso-ctl status said:" >&2
-            tail -n 3 /tmp/blk-status >&2
-            exit 1
-          fi
-          sleep 1
-        done
+        if ! timeout 60 sh -c 'until taso-ctl status /etc/taso/wardend.json > /tmp/blk-status 2>&1; do sleep 1; done'; then
+          echo "wardend: taso-blkd did not answer in 60 s; taso-ctl status said:" >&2
+          tail -n 3 /tmp/blk-status >&2
+          exit 1
+        fi
         exec taso-wardend /etc/taso/wardend.json
 
 volumes:
