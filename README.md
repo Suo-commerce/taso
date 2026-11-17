@@ -135,6 +135,89 @@ of block-log space; lower saves space. What it means for you:
 A small thing on Ubuntu 26.04: its coreutils are the Rust uutils, which
 take `tail -n 3`, not `tail -3`.
 
+## Run in containers
+
+The same node in two containers with Docker Compose: `taso-blkd`, which
+serves the block log as ublk devices, and the Warden, which runs the
+Vessels on them (with the coordinator inside it, as on one machine).
+Tested on Ubuntu 26.04 with Docker 29 and Compose v2 on 2026-11-17 by
+`scripts/c3-compose-test.sh`, which also kills each container and checks
+what is left (below).
+
+**What the host needs:** what one machine needs above (Linux with
+`ublk_drv`, cgroup v2, no SELinux), Docker with Compose 2.23 or later,
+and two settings the containers do not make for you. A container that
+could load kernel modules or change kernel settings could do anything to
+the host, so these stay the host's, once:
+
+```
+modprobe ublk_drv
+echo 1 > /sys/kernel/rcu_expedited
+```
+
+To keep them across reboots, do what `taso-ctl init` does on one
+machine: `ublk_drv` in a file in `/etc/modules-load.d/`, and the
+setting in `/etc/tmpfiles.d/` (`w /sys/kernel/rcu_expedited - - - - 1`).
+
+**Run the demo:**
+
+```
+git clone https://github.com/Suo-commerce/taso.git && cd taso
+docker build -f deploy/docker/Dockerfile --target agent-demo -t taso-agent-demo .
+mkdir -p /var/lib/taso/agent
+docker create --name taso-agent-demo taso-agent-demo
+docker export taso-agent-demo | tar -x -C /var/lib/taso/agent
+docker rm taso-agent-demo
+docker compose -f deploy/docker/compose.yaml up --build
+```
+
+Compose builds the two images (`taso-blkd:dev`, `taso-wardend:dev`) and
+starts both. The Warden waits until the block log answers (up to 60 s;
+then it stops with the reason), runs the demo, and ends with the same
+two lines as on one machine: `demo` and `demo-fork-2`, each 21 Seals
+published and `agent ok`. `docker compose -f deploy/docker/compose.yaml
+stop` then stops the block log too.
+
+**What you can set:**
+
+- `TASO_DATA` (default `/var/lib/taso`): the host directory everything
+  lives in. `blk/` is the block log, every Vessel's data (put it on the
+  data disk); `warden/` is the Warden's coordinator, state and store;
+  `agent/` is the agent's root filesystem, read-only to the Warden.
+- `TASO_WARDEN_CONFIG` (default `deploy/docker/warden.json`, the demo):
+  your own Warden config. Its paths are the containers' paths, as
+  `warden.json` shows them; your Vessels go in its `"vessels"` as on one
+  machine.
+
+**What the containers get, and why:**
+
+- Both run **privileged with the host's `/dev`**. `taso-blkd` makes a
+  device for each Vessel after it starts, and a container's own `/dev`
+  is copied once when it starts, so the new devices would appear in
+  neither.
+- Both see the Warden's spool at the same path. The Warden asks
+  `taso-blkd` to write each Seal into a file there, by the Warden's own
+  path, before shipping it.
+- `taso-blkd` keeps its record of each device in the host's
+  `/run/ublksrvd`, so a `taso-blkd` started again can remove the devices
+  a killed one left behind.
+- **One `taso-blkd` per host.** Stop any other first (a host install's,
+  for example).
+
+**Stopping and failures:**
+
+- `docker compose stop` stops the Warden first (every agent stopped),
+  then `taso-blkd`, which stops cleanly on SIGTERM: every device removed,
+  the log checkpointed. If a device is still in use for a moment (the
+  Warden just went), it tries again every 250 ms until it can.
+- A Warden container killed or crashed: its agents end with it. Started
+  again, the Warden reopens each Vessel from its last Seal, and releases
+  a Vessel's filesystem the dead one left frozen in the middle of a Seal
+  (the log says `thawed …, left frozen by a dead incarnation`).
+- A `taso-blkd` container killed: its devices stay in the kernel until
+  the next `taso-blkd` starts and removes them (`removed N leftover
+  devices`); nothing is lost that a Seal or a flush acknowledged.
+
 ## Supported hosts
 
 Taso runs on **Linux without SELinux**, for example Ubuntu and Debian.
