@@ -282,6 +282,9 @@ pub trait Mounts: Send + Sync + 'static {
     fn freeze(&self, dir: &Path) -> io::Result<()>;
     /// Thaw it.
     fn thaw(&self, dir: &Path) -> io::Result<()>;
+    /// Whether something holds the block device `dev` (an exclusive open
+    /// fails with `EBUSY`), mounted where this process can see it or not.
+    fn in_use(&self, dev: &Path) -> io::Result<bool>;
 }
 
 /// The real [`Mounts`]: `mkfs.ext4`, `mount`, the kernel's freeze and thaw
@@ -392,6 +395,23 @@ impl Mounts for System {
     }
     fn thaw(&self, dir: &Path) -> io::Result<()> {
         fs_freeze_call(dir, FITHAW)
+    }
+    fn in_use(&self, dev: &Path) -> io::Result<bool> {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_EXCL on a block device without O_CREAT: open it only if no
+        // file system or other exclusive holder has it (taso-blkd's own
+        // in-use test).
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_EXCL)
+            .open(dev)
+        {
+            Ok(_) => Ok(false),
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => Ok(true),
+            // No device node: nothing can hold it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -721,11 +741,24 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// point, from one of the block log's devices, is thawed (never what
     /// holds a plain directory: the freeze's rule); one not frozen answers
     /// `EINVAL` and is left as it is.
+    ///
+    /// In a container the dead Warden's mounts went with its mount
+    /// namespace, but a file system it left frozen does not: the kernel
+    /// keeps it, frozen, mounted nowhere, and it holds the branch's device
+    /// (C3-n: C3-d's step 4 and 5, a device busy until taso-blkd died; the
+    /// same on a loop device with no Taso, taso-test 2026-11-17).  So a
+    /// dataset not mounted here whose branch has a device in use is mounted
+    /// at its mount point (the kernel gives back that same file system),
+    /// thawed, and unmounted again; a device in use but not frozen is
+    /// unmounted and left as it is (its detach then says it is in use).
     pub fn thaw_left_frozen(&self, root: &Dataset) -> Result<Vec<PathBuf>, LayerError> {
         let mut thawed = Vec::new();
         for ds in self.children(root)? {
             let dir = self.mountpoint(&ds);
             let Some(dev) = self.mounts.source(&dir).map_err(|e| e.to_string())? else {
+                if self.release_unmounted_frozen(&ds, &dir)? {
+                    thawed.push(dir);
+                }
                 continue;
             };
             if !dev.to_string_lossy().starts_with("/dev/ublkb") {
@@ -741,6 +774,35 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             }
         }
         Ok(thawed)
+    }
+
+    /// For [`thaw_left_frozen`](Self::thaw_left_frozen): `dataset`, not
+    /// mounted on `dir` here, if its branch has a device that something
+    /// holds, mounted on `dir`, thawed and unmounted.  Whether it was
+    /// frozen (thawed).
+    fn release_unmounted_frozen(&self, dataset: &Dataset, dir: &Path) -> Result<bool, LayerError> {
+        let dev = {
+            let mut d = self.conn();
+            let Some(b) = d.find(dataset.as_str())? else {
+                return Ok(false);
+            };
+            match d.info(b)?.dev {
+                Some(dev) => dev,
+                None => return Ok(false),
+            }
+        };
+        let name = |e: io::Error| format!("releasing {} held on {}: {e}", dataset, dev.display());
+        if !self.mounts.in_use(&dev).map_err(name)? {
+            return Ok(false);
+        }
+        self.mounts.mount(&dev, dir).map_err(name)?;
+        let thaw = self.mounts.thaw(dir);
+        self.mounts.umount(dir).map_err(name)?;
+        match thaw {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(false),
+            Err(e) => Err(name(e).into()),
+        }
     }
 
     /// Where `dataset` is mounted.
@@ -2152,6 +2214,10 @@ mod tests {
         fail_mkfs: Shared<bool>,
         busy: Shared<bool>,
         fail_thaw: Shared<bool>,
+        /// Devices a frozen file system holds with no mount (a dead
+        /// Warden's container went with its mounts): in use; a mount of one
+        /// gives back that file system, frozen; its thaw lets the device go.
+        held_frozen: Shared<Vec<PathBuf>>,
         /// Asked at every mkfs, mount and umount: true notes the call in
         /// `held` (the shared connection is held across it).
         probe: Shared<Option<Box<dyn Fn() -> bool + Send + Sync>>>,
@@ -2249,6 +2315,9 @@ mod tests {
             self.table
                 .borrow_mut()
                 .insert(dir.to_path_buf(), dev.to_path_buf());
+            if self.held_frozen.borrow().iter().any(|d| d == dev) {
+                self.frozen.borrow_mut().push(dir.to_path_buf());
+            }
             Ok(())
         }
         fn mount_ro(&self, dev: &Path, dir: &Path) -> io::Result<()> {
@@ -2307,7 +2376,14 @@ mod tests {
                 ));
             }
             frozen.retain(|d| d != dir);
+            if let Some(dev) = self.table.borrow().get(dir) {
+                self.held_frozen.borrow_mut().retain(|d| d != dev);
+            }
             Ok(())
+        }
+        fn in_use(&self, dev: &Path) -> io::Result<bool> {
+            Ok(self.held_frozen.borrow().iter().any(|d| d == dev)
+                || self.table.borrow().values().any(|d| d == dev))
         }
     }
 
@@ -3187,6 +3263,51 @@ mod tests {
         *p.mounts.fail_thaw.borrow_mut() = true;
         let e = p.thaw_left_frozen(&ds("tank")).unwrap_err().to_string();
         assert!(e.contains("thawing /mnt/taso/tank/v-"), "{e}");
+    }
+
+    /// C3-n.  In a container the dead Warden's mounts went with it, but a
+    /// file system it left frozen stays in the kernel, mounted nowhere,
+    /// holding its device.  The start finds it by the device in use, mounts
+    /// it at its mount point (the same file system, frozen), thaws it and
+    /// unmounts it; one not mounted whose device is free is left alone.
+    #[test]
+    fn a_start_thaws_what_a_dead_wardens_container_left_frozen_and_unmounted() {
+        let p = pool();
+        let (a, b) = (ds("tank/v-a"), ds("tank/v-b"));
+        for d in [&a, &b] {
+            p.create(d).unwrap();
+        }
+        let dev_a = p.mounts.source(&p.mountpoint(&a)).unwrap().unwrap();
+        // a: frozen, then its container gone; b: unmounted, its device free.
+        p.mounts.freeze(&p.mountpoint(&a)).unwrap();
+        p.mounts.table.borrow_mut().remove(&p.mountpoint(&a));
+        p.mounts.frozen.borrow_mut().clear();
+        p.mounts.held_frozen.borrow_mut().push(dev_a.clone());
+        p.mounts.table.borrow_mut().remove(&p.mountpoint(&b));
+        calls(&p);
+        assert_eq!(
+            p.thaw_left_frozen(&ds("tank")).unwrap(),
+            vec![p.mountpoint(&a)]
+        );
+        assert!(
+            p.mounts.held_frozen.borrow().is_empty(),
+            "a's device let go"
+        );
+        assert!(!p.mounts.in_use(&dev_a).unwrap());
+        assert_eq!(
+            p.mounts.source(&p.mountpoint(&a)).unwrap(),
+            None,
+            "unmounted again"
+        );
+        assert_eq!(
+            calls(&p),
+            [
+                format!("mount {} /mnt/taso/tank/v-a", dev_a.display()),
+                "thaw /mnt/taso/tank/v-a".to_string(),
+                "umount /mnt/taso/tank/v-a".to_string(),
+            ],
+            "a released; b left alone"
+        );
     }
 
     /// The kernel's side, through the real [`System`] (as root, on a loop
