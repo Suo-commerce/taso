@@ -52,6 +52,14 @@
 #       The Warden mounts those devices and starts agents with runc.
 #   init (both)
 #       an init as PID 1 passes docker's SIGTERM on and reaps children.
+#   the host's /run/ublksrvd (blkd)
+#       libublk keeps a record of each device there (its kind, its owner).
+#       A taso-blkd that was killed (SIGKILL after its grace period, a
+#       crash) leaves its devices in the kernel; the next taso-blkd removes
+#       those of its kind at its start, by these records.  In the
+#       container's own /run they died with it, and the devices stayed
+#       (C3-m; C3-d's step 4: /dev/ublkc0-2 left).  So the records live on
+#       the host, as without containers.  One taso-blkd per host.
 #
 # The Warden starts after taso-blkd answers (C3-g): its command asks
 # `taso-ctl status` once a second, up to 60 s (exit 0 only when the block
@@ -86,6 +94,8 @@ services:
       - ${TASO_DATA:-/var/lib/taso}/blk:/var/lib/taso
       # The Warden's spool, at the Warden's own path (C3-k): see the header.
       - ${TASO_DATA:-/var/lib/taso}/warden/spool:/var/lib/taso/spool
+      # libublk's record of each device (C3-m): see the header.
+      - /run/ublksrvd:/run/ublksrvd
       - taso-run:/run/taso
 
   wardend:
