@@ -23,8 +23,20 @@
 #   4 the Warden killed    a long-running Vessel (TASO_WARDEN_CONFIG, C3-j);
 #                          once its agent runs, `docker kill` of the
 #                          Warden's container: within 10 s no taso-sim is
-#                          left on the host.  Then 2's checks (taso-blkd
-#                          quits with the dead Warden's device not in use).
+#                          left on the host.  Then 2's checks at once:
+#                          taso-blkd quits although the dead Warden's
+#                          device may still be busy for a moment (C3-l).
+#   5 a killed taso-blkd   the long Vessel again; the Warden's container
+#                          killed, its device free, then taso-blkd's
+#                          container killed (SIGKILL: its devices stay in
+#                          the kernel).  taso-blkd started again must log
+#                          "removed N leftover devices" (N >= 1) and leave
+#                          none (C3-m: its records on the host).  Then 2's
+#                          checks.
+#
+# Devices on the host before the run (another taso-blkd's leftovers, from
+# before this test) are listed in the summary and not counted: the checks
+# grade what this run leaves.
 #
 # Recorded, not graded: the second run's Warden lines, image sizes.
 # Exit 0 PASS, 1 FAIL, 2 HARNESS (a setup step failed: no grade).
@@ -67,10 +79,13 @@ grade() { # grade WHAT ok|fail [DETAIL]
 harness() { say "HARNESS  $*"; down_all; exit 2; }
 down_all() { "${COMPOSE[@]}" down -v >>"$OUT/compose.txt" 2>&1 || true; }
 
-# leftovers TAG: no ublk device on the host, nothing of ublk mounted.
+ublk_devices() { ls /dev/ublkb* /dev/ublkc* 2>/dev/null | sort || true; }
+
+# leftovers TAG: no ublk device on the host but those before the run
+# (BEFORE), nothing of ublk mounted.
 leftovers() {
     local devs mnts
-    devs=$(ls /dev/ublkb* /dev/ublkc* 2>/dev/null | tr '\n' ' ' || true)
+    devs=$(comm -13 <(printf '%s\n' "$BEFORE") <(ublk_devices) | grep . | tr '\n' ' ' || true)
     mnts=$(findmnt -rn -o SOURCE,TARGET | grep ublk || true)
     printf '%s\n%s\n' "devices: ${devs:-none}" "mounts: ${mnts:-none}" >"$OUT/$1-leftovers.txt"
     [[ -z "$devs" ]] && grade "$1: no ublk device left" ok || grade "$1: no ublk device left" fail "$devs"
@@ -102,6 +117,8 @@ warden_ended() {
 }
 
 say "C3-d at $COMMIT: TASO_DATA=$TASO_DATA, results in $OUT"
+BEFORE=$(ublk_devices)
+[[ -z "$BEFORE" ]] || say "ublk devices on the host before the run, not counted: $(echo $BEFORE)"
 
 # ── setup ────────────────────────────────────────────────────────────
 if [[ -e "$TASO_DATA" ]]; then mv "$TASO_DATA" "$TASO_DATA-$(date +%Y%m%d-%H%M%S)"; say "the earlier TASO_DATA moved aside"; fi
@@ -180,6 +197,41 @@ left=$(pgrep -a -x taso-sim || true)
 [[ -z "$left" ]] && grade "4: the killed Warden's agents ended within 10 s ($before running before)" ok \
     || grade "4: the killed Warden's agents ended within 10 s" fail "$left"
 stop 4
+
+# ── 5 a killed taso-blkd ────────────────────────────────────────────
+say "5: the long Vessel again; the Warden killed, then taso-blkd killed"
+"${COMPOSE[@]}" up -d >>"$OUT/compose.txt" 2>&1 || harness "5: compose up failed"
+for _ in $(seq 120); do pgrep -x taso-sim >/dev/null && break; sleep 1; done
+pgrep -x taso-sim >/dev/null || harness "5: the long Vessel's agent never ran"
+sleep 3
+docker kill "$("${COMPOSE[@]}" ps -q wardend)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of the Warden failed"
+# Its devices free (no opener) before taso-blkd dies: a device still
+# mounted when its server dies would wait in the kernel's delete.
+free=no
+for _ in $(seq 30); do
+    if python3 -I - <<'PY'
+import glob, os, sys
+for d in glob.glob("/dev/ublkb*"):
+    try: os.close(os.open(d, os.O_RDONLY | os.O_EXCL))
+    except OSError: sys.exit(1)
+PY
+    then free=yes; break; fi
+    sleep 1
+done
+[[ "$free" == yes ]] || harness "5: the dead Warden's devices stayed busy for 30 s"
+made=$(comm -13 <(printf '%s\n' "$BEFORE") <(ublk_devices) | grep -c ublkc || true)
+docker kill "$("${COMPOSE[@]}" ps -q blkd)" >>"$OUT/compose.txt" 2>&1 || harness "5: docker kill of taso-blkd failed"
+sleep 1
+"${COMPOSE[@]}" logs --no-color blkd >"$OUT/5-blkd-killed.log" 2>&1
+say "5: taso-blkd killed with $made device(s) of this run in the kernel"
+"${COMPOSE[@]}" rm -f blkd >>"$OUT/compose.txt" 2>&1
+"${COMPOSE[@]}" up -d blkd >>"$OUT/compose.txt" 2>&1 || harness "5: taso-blkd did not start again"
+for _ in $(seq 60); do "${COMPOSE[@]}" logs --no-color blkd 2>/dev/null | grep -q 'taso-blkd: serving' && break; sleep 1; done
+"${COMPOSE[@]}" logs --no-color blkd >"$OUT/5-blkd-again.log" 2>&1
+n=$(grep -o 'removed [0-9]* leftover devices' "$OUT/5-blkd-again.log" | grep -o '[0-9]*' | head -n 1 || true)
+[[ "${n:-0}" -ge 1 ]] && grade "5: taso-blkd started again removed the killed one's devices ($n)" ok \
+    || grade "5: taso-blkd started again removed the killed one's devices" fail "$(grep -E 'removed|reload|leftover' "$OUT/5-blkd-again.log" | head -n 3 | tr '\n' ' ')"
+stop 5
 
 down_all
 total=$([[ $VERDICT == 0 ]] && echo PASS || echo FAIL)
