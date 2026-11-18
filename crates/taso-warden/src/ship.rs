@@ -16,11 +16,13 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use rustix::fs::{
-    fstat, fsync, mkdirat, openat2, renameat, statat, unlinkat, AtFlags, Dir, FileType, Mode,
-    OFlags, ResolveFlags, CWD,
+    fchmod, fstat, fsync, mkdirat, openat2, renameat, statat, unlinkat, AtFlags, Dir, FileType,
+    Mode, OFlags, ResolveFlags, CWD,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -114,9 +116,53 @@ fn bad_key(key: &str) -> io::Error {
 }
 
 /// An [`ObjectStore`] in a local directory.
+///
+/// Its objects are every Vessel's packs, whatever the file modes inside
+/// a Vessel say, so they are the owner's alone: files 0600, directories
+/// 0700, and a root made before that is closed to others when the store
+/// first opens it (audit 2026-11-16, S1: packs were 0644 in 0755
+/// directories, readable by any local user).
 #[derive(Debug)]
 pub struct LocalStore {
     root: PathBuf,
+    /// Whether the root has been checked for others' access.
+    closed: Once,
+}
+
+/// The mode of the store's directories and of its files.
+const DIR_MODE: u32 = 0o700;
+const FILE_MODE: u32 = 0o600;
+
+/// Take others' access to the store's root away, keeping the owner's and
+/// the group's (an operator's group setting is theirs): once others cannot
+/// enter the root, nothing below it is theirs to read, however old.  Said
+/// in the Warden's log; a root it cannot change (another owner's) is said
+/// too, and the store goes on.
+fn close_to_others(root: &Path, fd: &OwnedFd) {
+    let mode = match fstat(fd) {
+        Ok(st) => st.st_mode & 0o7777,
+        Err(e) => {
+            eprintln!(
+                "taso: pack store {}: cannot read its mode: {e}",
+                root.display()
+            );
+            return;
+        }
+    };
+    if mode & 0o007 == 0 {
+        return;
+    }
+    let to = mode & !0o007;
+    match fchmod(fd, Mode::from_raw_mode(to)) {
+        Ok(()) => eprintln!(
+            "taso: pack store {}: closed to others ({mode:o} -> {to:o}); packs hold Vessels' data",
+            root.display()
+        ),
+        Err(e) => eprintln!(
+            "taso: pack store {}: open to others ({mode:o}) and cannot be closed: {e}",
+            root.display()
+        ),
+    }
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -127,20 +173,25 @@ const TMP_PREFIX: &str = ".tmp-";
 impl LocalStore {
     /// A store rooted at `root`, which must exist.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            closed: Once::new(),
+        }
     }
 
     /// The root, opened.  The root itself is the operator's path and may
     /// be a symlink; everything under it is resolved beneath it and never
     /// through a symlink (round 2, R2-08, Kimi; D&D a).
     fn root(&self) -> io::Result<OwnedFd> {
-        Ok(openat2(
+        let fd = openat2(
             CWD,
             &self.root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::empty(),
-        )?)
+        )?;
+        self.closed.call_once(|| close_to_others(&self.root, &fd));
+        Ok(fd)
     }
 
     /// The directory `rel` under the root, opened beneath it with no
@@ -148,8 +199,12 @@ impl LocalStore {
     /// absent); with `create`, missing directories are made, one by one.
     fn dir(&self, rel: &str, create: bool) -> io::Result<OwnedFd> {
         if create {
-            // The root is the operator's path: made as a put always made it.
-            std::fs::create_dir_all(&self.root)?;
+            // The root is the operator's path: made as a put always made it,
+            // but private (with any parents it needs).
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(DIR_MODE)
+                .create(&self.root)?;
         }
         let mut fd = self.root()?;
         for c in rel.split('/').filter(|c| !c.is_empty()) {
@@ -165,7 +220,7 @@ impl LocalStore {
             fd = match open(&fd) {
                 Ok(next) => next,
                 Err(rustix::io::Errno::NOENT) if create => {
-                    match mkdirat(&fd, c, Mode::from_raw_mode(0o755)) {
+                    match mkdirat(&fd, c, Mode::from_raw_mode(DIR_MODE)) {
                         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                         Err(e) => return Err(e.into()),
                     }
@@ -299,7 +354,7 @@ impl ObjectStore for LocalStore {
                 &dir,
                 tmp.as_str(),
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::from_raw_mode(0o644),
+                Mode::from_raw_mode(FILE_MODE),
                 BENEATH,
             )?;
             let mut f = File::from(f);
@@ -498,6 +553,70 @@ mod tests {
             .read_to_end(&mut v)
             .unwrap();
         assert_eq!(v, b"bye");
+    }
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn chmod(p: &Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    /// Audit 2026-11-16, S1: packs hold Vessels' data and were 0644 in
+    /// 0755 directories.  A new store's root (and the parents it makes),
+    /// directories and packs give nobody but the owner access, whatever
+    /// the umask (which this test leaves alone: the process shares it).
+    #[test]
+    fn a_new_stores_packs_and_directories_are_the_owners_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("made/store");
+        let store = LocalStore::new(&root);
+        store.put("p/c/pack-1", &mut &b"data"[..]).unwrap();
+        for p in [
+            dir.path().join("made"),
+            root.clone(),
+            root.join("p"),
+            root.join("p/c"),
+            root.join("p/c/pack-1"),
+        ] {
+            assert_eq!(mode(&p) & 0o077, 0, "{}: {:o}", p.display(), mode(&p));
+        }
+    }
+
+    /// Audit 2026-11-16, S1 (D&D S1-a b): a store made before, open to
+    /// others, is closed to them when it is first used: its root loses
+    /// others' access (the group's stays), which is enough for everything
+    /// below it, and its packs read back as before.  A root already closed
+    /// is left as it is.
+    #[test]
+    fn an_old_store_is_closed_to_others_when_first_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::write(root.join("p/pack-1"), b"old").unwrap();
+        chmod(&root, 0o755);
+        chmod(&root.join("p"), 0o755);
+        chmod(&root.join("p/pack-1"), 0o644);
+        let store = LocalStore::new(&root);
+        let mut v = Vec::new();
+        store
+            .get("p/pack-1")
+            .unwrap()
+            .unwrap()
+            .read_to_end(&mut v)
+            .unwrap();
+        assert_eq!(v, b"old");
+        assert_eq!(mode(&root), 0o750, "others cannot enter the root");
+        // A group setting the operator made later stays: checked once.
+        chmod(&root, 0o770);
+        assert!(store.exists("p/pack-1").unwrap());
+        assert_eq!(mode(&root), 0o770);
+        let again = LocalStore::new(&root);
+        assert!(again.exists("p/pack-1").unwrap());
+        assert_eq!(mode(&root), 0o770, "no others' access: nothing to change");
     }
 
     #[test]
