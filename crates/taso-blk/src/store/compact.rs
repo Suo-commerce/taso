@@ -49,13 +49,13 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    ckpt_path, encode_record, read_record, remove_if_there, sync_dir, write_checkpoint, FlushPoint,
-    Meta, ReadAt, Stats, Store, StoreError, COMPACT_MAGIC, HASH, HEADER_LEN, K_BASE, K_DATA,
-    K_FLUSH, MAX_BODY, REC_HEAD,
+    ckpt_path, encode_record, mode_of_log, read_record, remove_if_there, sync_dir,
+    write_checkpoint, FlushPoint, Meta, ReadAt, Stats, Store, StoreError, COMPACT_MAGIC, HASH,
+    HEADER_LEN, K_BASE, K_DATA, K_FLUSH, MAX_BODY, REC_HEAD,
 };
 use crate::map::{Map, BLOCK};
 
@@ -152,12 +152,20 @@ impl Store {
 
         let temp = temp_path(&self.path);
         remove_if_there(&ckpt_path(&temp))?;
+        // The new file replaces the log, so it takes the log's mode (the
+        // owner's and group's access, never others'); set on the
+        // descriptor too, since an unfinished compaction's file keeps the
+        // mode it was made with.  Made with the default mode, it undid a
+        // private log at every compaction (audit 2026-11-16, S1).
+        let mode = mode_of_log(&self.path)?;
         let new = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(mode)
             .open(&temp)?;
+        new.set_permissions(std::fs::Permissions::from_mode(mode))?;
         let mut header = [0u8; HEADER_LEN as usize];
         header[..8].copy_from_slice(COMPACT_MAGIC);
         new.write_all_at(&header, 0)?;
@@ -446,5 +454,66 @@ impl Drop for Compaction {
             let _ = std::fs::remove_file(&self.temp);
             let _ = std::fs::remove_file(ckpt_path(&self.temp));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::temp_path;
+    use crate::map::BLOCK;
+    use crate::store::Store;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn mode(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn chmod(p: &Path, m: u32) {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    fn ckpt(p: &Path) -> std::path::PathBuf {
+        let mut s = p.as_os_str().to_owned();
+        s.push(".ckpt");
+        s.into()
+    }
+
+    /// Audit 2026-11-16, S1, the audit's own case: a log made private by
+    /// hand stayed private only until the next compaction, whose new file
+    /// came with the default mode (0644 under umask 022).  Now the
+    /// compacted log and its checkpoint keep the log's mode (D&D S1-b b:
+    /// a group the operator gave access keeps it), also over a leftover
+    /// file of an unfinished compaction, and the data reads back.
+    #[test]
+    fn a_compacted_log_keeps_the_logs_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &[7u8; BLOCK as usize], false).unwrap();
+        s.flush().unwrap();
+        let read = |s: &Store| {
+            let mut buf = vec![0u8; BLOCK as usize];
+            s.read(b, 0, &mut buf).unwrap();
+            buf[0]
+        };
+        for want in [0o600, 0o640] {
+            chmod(&path, want);
+            // An unfinished compaction's file, readable by everyone.
+            std::fs::write(temp_path(&path), b"left over").unwrap();
+            chmod(&temp_path(&path), 0o644);
+            let mut c = s.compaction().unwrap();
+            c.copy().unwrap();
+            c.finish(&mut s).unwrap();
+            assert_eq!(mode(&path), want, "the compacted log");
+            assert_eq!(mode(&ckpt(&path)), want, "its checkpoint");
+            assert_eq!(read(&s), 7);
+        }
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.tightened, None);
+        assert_eq!(read(&s), 7);
     }
 }
