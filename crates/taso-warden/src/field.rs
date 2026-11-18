@@ -79,7 +79,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use taso_core::envelope::{Lsn, Stream};
 use taso_core::record::{OpId, Payload, StreamCut, TurnId, Verdict};
@@ -1030,6 +1031,119 @@ pub enum ServeEvent<'a> {
 /// accepted and closed at once: the agent sees the connection end.
 pub const MAX_CONNECTIONS_PER_SOCKET: usize = 16;
 
+/// The most bytes of requests one of a Vessel's sockets holds at once,
+/// over all its connections: frames still arriving, and requests read but
+/// not yet answered (audit 2026-11-16, S5, D&D S5-a a).  Before it, each
+/// connection could announce a full frame (16 MiB) and send part of it,
+/// 256 MiB a socket outside the agent's memory limit.  Two full frames;
+/// the agent's socket and the sender's have one each, so an agent cannot
+/// take the sender's.  A frame that would go over it closes its connection.
+pub const FRAME_BUDGET: usize = 2 * taso_core::frame::MAX_FRAME as usize;
+
+/// How long a frame may take from its length to its last byte (audit
+/// 2026-11-16, S5).  Waiting for the next frame has no limit: an idle
+/// connection is fine.  A stalled frame held its connection's thread and
+/// its memory without end; now it closes its connection.  Far above what
+/// a Seal's filesystem freeze or a slow agent takes.
+pub const FRAME_TIME: Duration = Duration::from_secs(60);
+
+/// A socket's [`FRAME_BUDGET`], shared by its connections.
+#[derive(Default)]
+struct Budget(Mutex<usize>);
+
+/// Bytes taken from a [`Budget`], given back when dropped.
+struct Taken<'a>(&'a Budget, usize);
+
+impl Budget {
+    fn take(&self, n: usize) -> Option<Taken<'_>> {
+        let mut used = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if *used + n > FRAME_BUDGET {
+            return None;
+        }
+        *used += n;
+        Some(Taken(self, n))
+    }
+}
+
+impl Drop for Taken<'_> {
+    fn drop(&mut self) {
+        *self.0 .0.lock().unwrap_or_else(|p| p.into_inner()) -= self.1;
+    }
+}
+
+/// A request as [`recv_bounded`] read it (or why its body is not one),
+/// and its bytes, taken from the socket's budget.
+type Bounded<'b> = (Result<Request, ProtocolError>, Taken<'b>);
+
+/// The next request on `stream` as [`recv_request`] reads it, within
+/// `budget` and [`FRAME_TIME`]: `Ok(None)` at a clean end.  The bytes
+/// stay taken until the returned [`Taken`] is dropped (after the reply).
+fn recv_bounded<'b>(
+    stream: &mut UnixStream,
+    budget: &'b Budget,
+    frame_time: Duration,
+) -> Result<Option<Bounded<'b>>, ProtocolError> {
+    let mut len = [0u8; 4];
+    let mut got = 0;
+    while got < 4 {
+        match stream.read(&mut len[got..]) {
+            Ok(0) if got == 0 => return Ok(None),
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let len = u32::from_be_bytes(len);
+    if len > taso_core::frame::MAX_FRAME {
+        return Err(ProtocolError::TooLarge(len));
+    }
+    let len = len as usize;
+    let taken = budget.take(len).ok_or_else(|| {
+        io::Error::other(format!(
+            "a frame of {len} bytes would take its socket past {} MiB of requests at once",
+            FRAME_BUDGET >> 20
+        ))
+    })?;
+    // The body grows as it arrives, never ahead of what was sent.
+    let deadline = Instant::now() + frame_time;
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    let result = (|| {
+        while body.len() < len {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "a frame of {len} bytes not whole within {}s ({} arrived)",
+                        frame_time.as_secs(),
+                        body.len()
+                    ),
+                ));
+            }
+            stream.set_read_timeout(Some(left))?;
+            let want = (len - body.len()).min(chunk.len());
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Ok(n) => body.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {} // the deadline is checked above
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    })();
+    // Between frames, a connection waits without limit.
+    stream.set_read_timeout(None)?;
+    result?;
+    Ok(Some((Request::decode(&body), taken)))
+}
+
 enum Msg {
     Request {
         id: u64,
@@ -1066,6 +1180,8 @@ pub fn serve_vessel<L: Layers>(
     agent.listener.set_nonblocking(true)?;
     sender.listener.set_nonblocking(true)?;
     let (tx, rx) = mpsc::channel::<Msg>();
+    let budgets = [Budget::default(), Budget::default()];
+    let budgets = &budgets;
     std::thread::scope(|scope| -> io::Result<()> {
         let mut conns: BTreeMap<u64, (Conn, UnixStream)> = BTreeMap::new();
         let mut next_id = 0u64;
@@ -1088,9 +1204,15 @@ pub fn serve_vessel<L: Layers>(
                                     let id = next_id;
                                     let kept = stream.try_clone()?;
                                     let tx = tx.clone();
+                                    let budget = match socket {
+                                        Socket::Agent => &budgets[0],
+                                        Socket::Sender => &budgets[1],
+                                    };
                                     std::thread::Builder::new()
                                         .name(format!("field-{id}"))
-                                        .spawn_scoped(scope, move || connection(id, stream, tx))
+                                        .spawn_scoped(scope, move || {
+                                            connection(id, stream, tx, budget, FRAME_TIME)
+                                        })
                                         .ok()
                                         .map(|_| (id, kept))
                                 };
@@ -1177,12 +1299,23 @@ pub fn serve_vessel<L: Layers>(
     Ok(())
 }
 
-/// One connection's thread: frames in, requests to the owner, replies out.
-fn connection(id: u64, mut stream: UnixStream, tx: std::sync::mpsc::Sender<Msg>) {
+/// One connection's thread: frames in, requests to the owner, replies out,
+/// within its socket's `budget` and `frame_time` ([`recv_bounded`]).
+fn connection(
+    id: u64,
+    mut stream: UnixStream,
+    tx: std::sync::mpsc::Sender<Msg>,
+    budget: &Budget,
+    frame_time: Duration,
+) {
     let ended = loop {
-        let reply = match recv_request(&mut stream) {
+        let (req, _taken) = match recv_bounded(&mut stream, budget, frame_time) {
             Ok(None) => break Ended::Closed,
-            Ok(Some(req)) => {
+            Ok(Some(got)) => got,
+            Err(e) => break Ended::Broken(e),
+        };
+        let reply = match req {
+            Ok(req) => {
                 let (rtx, rrx) = std::sync::mpsc::channel();
                 if tx
                     .send(Msg::Request {
@@ -2950,6 +3083,110 @@ mod tests {
     /// Review fix M2 (Kimi's M2): an agent opening connections without end
     /// gets at most MAX_CONNECTIONS_PER_SOCKET; the next is closed at once
     /// and reported, and the Warden's threads stay bounded.
+    fn used(b: &Budget) -> usize {
+        *b.0.lock().unwrap()
+    }
+
+    /// Audit 2026-11-16, S5: a request reads back whole, its bytes stay
+    /// taken from the socket's budget until it is answered (dropped), and
+    /// a connection idle between frames waits without limit.
+    #[test]
+    fn a_request_is_read_within_the_budget_and_gives_it_back() {
+        let budget = Budget::default();
+        let (mut agent, mut warden) = UnixStream::pair().unwrap();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300)); // idle, longer than the frame time
+            send_request(&mut agent, &hello()).unwrap();
+            agent
+        });
+        let (req, taken) = recv_bounded(&mut warden, &budget, Duration::from_millis(100))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(req, Ok(Request::Hello { .. })));
+        assert!(used(&budget) > 0);
+        drop(taken);
+        assert_eq!(used(&budget), 0);
+        drop(t.join().unwrap());
+        assert!(
+            recv_bounded(&mut warden, &budget, Duration::from_millis(100))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Audit 2026-11-16, S5: a frame that stops halfway closes its
+    /// connection once its time is up (it held a thread and its memory
+    /// without end), and gives its bytes back.
+    #[test]
+    fn a_frame_that_stalls_halfway_ends_its_connection() {
+        let budget = Budget::default();
+        let (mut agent, mut warden) = UnixStream::pair().unwrap();
+        agent.write_all(&1_000u32.to_be_bytes()).unwrap();
+        agent.write_all(&[0u8; 10]).unwrap();
+        let t = Instant::now();
+        let e = match recv_bounded(&mut warden, &budget, Duration::from_millis(200)) {
+            Err(e) => e,
+            Ok(_) => panic!("a stalled frame was read"),
+        };
+        assert!(t.elapsed() >= Duration::from_millis(200));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(
+            matches!(&e, ProtocolError::Io(io) if io.kind() == io::ErrorKind::TimedOut),
+            "{e}"
+        );
+        assert!(e.to_string().contains("10 arrived"), "{e}");
+        assert_eq!(used(&budget), 0);
+    }
+
+    /// Audit 2026-11-16, S5: half-sent full-size frames on a socket's
+    /// connections hold at most its budget; one more is refused at once
+    /// (its connection ends) before anything is allocated, and once the
+    /// stalled ones time out the socket takes requests again.
+    #[test]
+    fn half_sent_frames_hold_no_more_than_the_budget() {
+        let budget = Budget::default();
+        let max = taso_core::frame::MAX_FRAME;
+        let mut agents = Vec::new();
+        let stalled = std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..FRAME_BUDGET / max as usize {
+                let (mut agent, mut warden) = UnixStream::pair().unwrap();
+                agent.write_all(&max.to_be_bytes()).unwrap();
+                agent.write_all(&[1u8; 4096]).unwrap();
+                agents.push(agent);
+                let budget = &budget;
+                threads.push(scope.spawn(move || {
+                    recv_bounded(&mut warden, budget, Duration::from_millis(500)).is_err()
+                }));
+            }
+            // Wait until both have taken their share.
+            let t = Instant::now();
+            while used(&budget) < FRAME_BUDGET && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(used(&budget), FRAME_BUDGET);
+            let (mut agent, mut warden) = UnixStream::pair().unwrap();
+            agent.write_all(&1u32.to_be_bytes()).unwrap();
+            let t = Instant::now();
+            let e = match recv_bounded(&mut warden, &budget, Duration::from_millis(500)) {
+                Err(e) => e,
+                Ok(_) => panic!("a frame past the budget was taken"),
+            };
+            assert!(t.elapsed() < Duration::from_millis(100), "refused at once");
+            assert!(e.to_string().contains("MiB of requests at once"), "{e}");
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(stalled, [true, true], "both stalled frames timed out");
+        assert_eq!(used(&budget), 0);
+        let (mut agent, mut warden) = UnixStream::pair().unwrap();
+        send_request(&mut agent, &hello()).unwrap();
+        let got = recv_bounded(&mut warden, &budget, Duration::from_millis(500)).unwrap();
+        assert!(matches!(got, Some((Ok(Request::Hello { .. }), _))));
+    }
+
     #[test]
     fn connections_beyond_the_cap_are_refused_and_reported() {
         use std::sync::atomic::{AtomicBool, Ordering};
