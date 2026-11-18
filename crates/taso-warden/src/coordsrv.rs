@@ -144,19 +144,19 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use taso_core::envelope::{
     BranchId, ChronicleHead, ChronicleId, Envelope, Epoch, HashVal, Lsn, Stream,
 };
-use taso_core::frame::{read_frame, write_frame, FrameError};
+use taso_core::frame::{read_frame, read_frame_max, write_frame, FrameError, MAX_FRAME};
 use taso_core::model::{Ownership, WardenId};
 
 use crate::coordinator::{Coord, CoordError, EffectFault};
@@ -230,6 +230,37 @@ const R_CLAIM: u8 = 15;
 
 /// How often the accept loop checks whether it should stop.
 const ACCEPT_POLL: Duration = Duration::from_millis(10);
+
+/// The most connections a [`Server`] holds at once (audit 2026-11-16,
+/// S5, D&D S5-b): each costs a thread, and there was no limit.  Its
+/// clients are a few Wardens, each keeping up to [`MAX_IDLE`] connections
+/// for reuse, and `taso-ctl`; far below this.  One beyond it is closed at
+/// once and said in the coordinator's log.
+const MAX_CONNECTIONS: usize = if cfg!(test) { 8 } else { 1024 };
+
+/// How long a frame may take from its first byte to its last (audit
+/// 2026-11-16, S5).  Waiting for the next frame has no limit.  Long,
+/// because a Warden on another node comes through an ssh forward and a
+/// batch can be megabytes; a frame that stalls past it closes its
+/// connection instead of holding its thread without end.
+const FRAME_TIME: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(300)
+};
+
+/// What a uid the peer map does not know may send: a request is answered
+/// [`CoordError::UnknownPeer`] (the operator learns which uid to map), but
+/// the connection costs at most this and [`UNKNOWN_TIME`] a frame (audit
+/// 2026-11-16, S5, D&D S5-b b: it was read like a Warden's, 16 MiB a
+/// frame without a deadline).  Every request fits in it but appends,
+/// which such a peer cannot make anyway.
+const UNKNOWN_FRAME: u32 = 64 * 1024;
+const UNKNOWN_TIME: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(5)
+};
 
 /// Default time a client waits for an answer before giving up.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1325,10 +1356,60 @@ fn peer_refusal(peer: Peer, req: &Request) -> Option<CoordError> {
     }
 }
 
+/// A connection that gives each frame `time` from its first byte, and
+/// waits without limit before it.
+struct Timed<'a> {
+    stream: &'a mut UnixStream,
+    time: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Read for Timed<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(d) = self.deadline {
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.stream.set_read_timeout(Some(left))?;
+        }
+        let n = self.stream.read(buf)?;
+        if n > 0 && self.deadline.is_none() {
+            self.deadline = Some(Instant::now() + self.time);
+        }
+        Ok(n)
+    }
+}
+
+/// The next frame on `stream`, at most `max` bytes and within `time`
+/// from its first byte ([`Timed`]).  A frame past its time is an
+/// [`FrameError::Io`]: its connection ends.
+fn read_frame_within(
+    stream: &mut UnixStream,
+    max: u32,
+    time: Duration,
+) -> Result<Option<Vec<u8>>, FrameError> {
+    let got = read_frame_max(
+        &mut Timed {
+            stream: &mut *stream,
+            time,
+            deadline: None,
+        },
+        max,
+    );
+    // Between frames, a connection waits without limit.
+    stream.set_read_timeout(None)?;
+    got
+}
+
 /// Serve one connection until it closes, breaks, or sends garbage.
 fn serve_conn(coord: &dyn Coord, mut stream: UnixStream, peer: Peer) {
+    let (max, time) = match peer {
+        Peer::Unknown(_) => (UNKNOWN_FRAME, UNKNOWN_TIME),
+        Peer::Anyone | Peer::Warden(_) => (MAX_FRAME, FRAME_TIME),
+    };
     loop {
-        let body = match read_frame(&mut stream) {
+        let body = match read_frame_within(&mut stream, max, time) {
             Ok(Some(b)) => b,
             // Clean end, or a broken connection: nothing to answer.
             Ok(None) | Err(FrameError::Io(_)) => return,
@@ -1491,6 +1572,7 @@ impl Server {
             // a panic (audit 2026-11-09, accept loop).
             let spawned = std::thread::Builder::new().spawn(move || {
                 let mut next_id = 0u64;
+                let (mut refused, mut unknown) = (0u64, 0u64);
                 while !stop.load(Ordering::SeqCst) {
                     let stream = match listener.accept() {
                         Ok((s, _)) => s,
@@ -1523,6 +1605,29 @@ impl Server {
                             Err(_) => continue,
                         },
                     };
+                    if let Peer::Unknown(uid) = peer {
+                        unknown += 1;
+                        if unknown.is_power_of_two() {
+                            eprintln!(
+                                "taso coordinator on {}: uid {uid} is not in the peer map: \
+                                 its requests are refused ({unknown} such connections so far)",
+                                sock.display()
+                            );
+                        }
+                    }
+                    let open = conns.lock().expect("conns").len();
+                    if open >= MAX_CONNECTIONS {
+                        // Closed now (dropped): the client sees it end.
+                        refused += 1;
+                        if refused.is_power_of_two() {
+                            eprintln!(
+                                "taso coordinator on {}: connection refused: {open} open \
+                                 (at most {MAX_CONNECTIONS}), {refused} refused so far",
+                                sock.display()
+                            );
+                        }
+                        continue;
+                    }
                     let Ok(handle) = stream.try_clone() else {
                         continue;
                     };
@@ -2528,7 +2633,119 @@ mod tests {
         assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
     }
 
+    /// Whether the server closes `s` within `within` (a read ends or
+    /// fails), and how long it took.
+    fn closed_within(s: &mut UnixStream, within: Duration) -> (bool, Duration) {
+        s.set_read_timeout(Some(within)).unwrap();
+        let t = Instant::now();
+        let mut b = [0u8; 64];
+        let closed = loop {
+            match s.read(&mut b) {
+                Ok(0) => break true,
+                Ok(_) => continue, // a reply; the end comes after it
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break false
+                }
+                Err(_) => break true,
+            }
+        };
+        (closed, t.elapsed())
+    }
+
+    /// Audit 2026-11-16, S5: a frame that stops halfway ends its
+    /// connection once its time is up (it held a thread without end); a
+    /// connection idle between frames for longer is fine.
+    #[test]
+    fn a_frame_that_stalls_ends_its_connection_an_idle_one_does_not() {
+        let e = Env::new();
+        let mut s = UnixStream::connect(e.sock()).unwrap();
+        s.write_all(&1_000u32.to_be_bytes()).unwrap();
+        s.write_all(&[0u8; 10]).unwrap();
+        let (closed, took) = closed_within(&mut s, Duration::from_secs(5));
+        assert!(closed, "the stalled frame's connection was not closed");
+        assert!(took >= FRAME_TIME / 2, "{took:?}");
+        // Idle for twice the frame time, then a request: answered.
+        let mut s = UnixStream::connect(e.sock()).unwrap();
+        std::thread::sleep(FRAME_TIME * 2);
+        write_frame(
+            &mut s,
+            &Request::Head {
+                chronicle: chron(1),
+            }
+            .encode(),
+        )
+        .unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert!(read_frame(&mut s).unwrap().is_some(), "answered");
+    }
+
+    /// Audit 2026-11-16, S5 (D&D S5-b): at most MAX_CONNECTIONS at once;
+    /// one more is closed at once, and a place freed is taken again.
+    #[test]
+    fn connections_beyond_the_cap_are_closed() {
+        let e = Env::new();
+        let mut held: Vec<UnixStream> = (0..MAX_CONNECTIONS)
+            .map(|_| UnixStream::connect(e.sock()).unwrap())
+            .collect();
+        // Every held connection is served (answers a request).
+        for s in &mut held {
+            write_frame(
+                s,
+                &Request::Head {
+                    chronicle: chron(1),
+                }
+                .encode(),
+            )
+            .unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert!(read_frame(s).unwrap().is_some());
+        }
+        let mut extra = UnixStream::connect(e.sock()).unwrap();
+        let (closed, took) = closed_within(&mut extra, Duration::from_secs(5));
+        assert!(closed && took < Duration::from_secs(1), "{closed} {took:?}");
+        drop(held.pop());
+        let c = e.client();
+        let t = Instant::now();
+        let ok = loop {
+            match c.head(chron(1)) {
+                Err(CoordError::Unavailable(_)) if t.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        assert!(!matches!(ok, Err(CoordError::Unavailable(_))), "{ok:?}");
+    }
+
     // ── who is asking ───────────────────────────────────────────────
+
+    /// Audit 2026-11-16, S5 (D&D S5-b b): an unmapped uid is still told
+    /// `UnknownPeer` (unmapped_peer_is_nobody), but its connection costs
+    /// little: a frame over UNKNOWN_FRAME is refused before anything is
+    /// allocated, and one that stalls ends at UNKNOWN_TIME.
+    #[test]
+    fn an_unmapped_peer_costs_little() {
+        let dir = tempfile::tempdir().unwrap();
+        let _server = spawn_mapped(dir.path(), &[(my_uid().wrapping_add(1), A)]);
+        let sock = dir.path().join("coord.sock");
+        let mut s = UnixStream::connect(&sock).unwrap();
+        s.write_all(&(UNKNOWN_FRAME + 1).to_be_bytes()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(read_frame(&mut s).unwrap().unwrap()[0], ST_BAD);
+        assert_eq!(read_frame(&mut s).unwrap(), None, "closed");
+        let mut s = UnixStream::connect(&sock).unwrap();
+        s.write_all(&100u32.to_be_bytes()).unwrap();
+        s.write_all(&[0u8; 10]).unwrap();
+        let (closed, took) = closed_within(&mut s, Duration::from_secs(5));
+        assert!(closed, "the stalled frame's connection was not closed");
+        assert!(took >= UNKNOWN_TIME / 2, "{took:?}");
+    }
 
     fn my_uid() -> u32 {
         let (a, _b) = UnixStream::pair().unwrap();
