@@ -655,6 +655,37 @@ fn storage<E: Into<redb::Error>>(e: E) -> CoordError {
     CoordError::Storage(e.into())
 }
 
+/// Make the coordinator's file the owner's before redb opens it (audit
+/// 2026-11-16, S1, D&D C-1 a): it holds every accepted record's payload,
+/// an effect's exact request bytes among them, and it sits in `--data`,
+/// which others may pass through to reach the Vessels' mounts, so a
+/// file made with the default mode (0644 under umask 022) could be read
+/// by any local user who knows its name.
+///
+/// A new file is made empty and 0600 (redb starts a database in an empty
+/// file).  One made before loses others' access, keeps the owner's and the
+/// group's (the operator's), and the Warden's log says so (D&D S1-a b).
+fn private_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    let now = f.metadata()?.permissions().mode() & 0o7777;
+    if now & 0o007 != 0 {
+        let to = now & !0o007;
+        f.set_permissions(std::fs::Permissions::from_mode(to))?;
+        eprintln!(
+            "taso: coordinator {}: closed to others ({now:o} -> {to:o}); it holds every record's payload",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 // ── State (one row) ─────────────────────────────────────────────────
 
 /// Everything the coordinator holds for one Chronicle.
@@ -1060,6 +1091,7 @@ impl Coordinator {
     /// Open the coordinator at `path` with `config`; the coordinator log
     /// is replayed from its journal, and every journalled answer checked.
     pub fn open_with(path: impl AsRef<Path>, config: LogConfig) -> Result<Self, CoordError> {
+        private_file(path.as_ref()).map_err(storage)?;
         let db = Database::create(path).map_err(storage)?;
         check_generation(&db)?;
         check_quarantine(&db, config.timing.deleted_quarantine)?;
@@ -2263,6 +2295,34 @@ mod tests {
         let path = dir.path().join("coordinator.redb");
         let coord = Coordinator::open(&path).unwrap();
         (dir, path, coord)
+    }
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// Audit 2026-11-16, S1 (D&D C-1 a): a new coordinator file gives
+    /// nobody but the owner access, whatever the umask; one made before
+    /// (0644) loses others' access on open, the group's stays, and what it
+    /// holds is still there.
+    #[test]
+    fn the_coordinators_file_is_the_owners() {
+        let (_dir, path, coord) = fresh();
+        assert_eq!(mode(&path) & 0o077, 0, "{:o}", mode(&path));
+        let c = chron(1);
+        let h = coord.register(c, A).unwrap();
+        drop(coord);
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let coord = Coordinator::open(&path).unwrap();
+        assert_eq!(mode(&path), 0o640);
+        let o = coord.ownership(c).unwrap();
+        assert_eq!(
+            (o.holder, o.sealed_prefix),
+            (A, h),
+            "what it holds is still there"
+        );
     }
 
     /// A Warden that picks up the coordinator's current epoch and head.
