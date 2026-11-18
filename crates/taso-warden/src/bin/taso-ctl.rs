@@ -313,6 +313,11 @@ fn init(args: &[String]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             }
+            // A host set up before the data directories were private.
+            if let Err(e) = make_data_dirs(&a.data, |line| println!("  {line}")) {
+                eprintln!("taso-ctl init: {e}");
+                return ExitCode::from(1);
+            }
             println!(
                 "taso-ctl init: already set up ({CONFIG} or {} exists): the config is left as it is. \
                  taso-ctl status says what runs. (--force writes a new config over it, \
@@ -356,12 +361,11 @@ fn init(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     // The directories, the config.
+    if let Err(e) = make_data_dirs(&a.data, |line| println!("  {line}")) {
+        eprintln!("taso-ctl init: {e}");
+        return ExitCode::from(1);
+    }
     for d in [
-        a.data.clone(),
-        a.data.join("state"),
-        a.data.join("store"),
-        a.data.join("spool"),
-        a.data.join("mnt"),
         run_dirs()[1].clone(),
         PathBuf::from(CONFIG)
             .parent()
@@ -415,6 +419,62 @@ fn init(args: &[String]) -> ExitCode {
         },
     );
     ExitCode::SUCCESS
+}
+
+/// The directories under `--data` and their modes (audit 2026-11-16, S1:
+/// they were made with the default mode, 0755 under umask 022, and every
+/// Vessel's data under them was readable by any local user).
+///
+/// `state`, `store` and `spool` hold Vessels' data and nothing an agent
+/// reaches through them: the owner's alone.  `data` itself and `mnt` hold
+/// the Vessels' mounts, and an agent's mapped uids must pass through
+/// their parents to reach its work directory: others may pass, not list
+/// (0711).  The block log in `data` is private itself (taso-blk).
+fn data_dirs(data: &Path) -> [(PathBuf, u32); 5] {
+    [
+        (data.to_path_buf(), 0o711),
+        (data.join("state"), 0o700),
+        (data.join("store"), 0o700),
+        (data.join("spool"), 0o700),
+        (data.join("mnt"), 0o711),
+    ]
+}
+
+/// Make [`data_dirs`] with their modes.  One already there only loses
+/// what others have beyond its mode (the owner's and the group's access
+/// are the operator's), and `said` hears of each change (D&D S1-a b).
+fn make_data_dirs(data: &Path, mut said: impl FnMut(&str)) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    for (d, mode) in data_dirs(data) {
+        let set = |m: u32| {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(m))
+                .map_err(|e| format!("chmod {}: {e}", d.display()))
+        };
+        if !d.is_dir() {
+            // Any parents `--data` needs are made passable, as `data` is.
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o711)
+                .create(&d)
+                .map_err(|e| format!("mkdir {}: {e}", d.display()))?;
+            set(mode)?; // exactly, whatever the umask
+            continue;
+        }
+        let now = std::fs::metadata(&d)
+            .map_err(|e| format!("{}: {e}", d.display()))?
+            .permissions()
+            .mode()
+            & 0o7777;
+        let to = now & !(0o007 & !mode);
+        if to != now {
+            set(to)?;
+            said(&format!(
+                "{}: others' access taken away ({now:o} -> {to:o}); it holds Vessels' data",
+                d.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether the agents' rootfs carries the Landlock shim at [`LANDLOCK`]:
@@ -805,6 +865,75 @@ fn demo(args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn chmod(p: &Path, m: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    /// Audit 2026-11-16, S1: `init`'s directories were made with the
+    /// default mode.  Now `state`, `store` and `spool` are the owner's
+    /// alone, and `data` and `mnt` let others pass (an agent's mapped uids
+    /// reach its mount through them) but not list, exactly, whatever the
+    /// umask; a parent `--data` needs is made passable too.  Nothing is
+    /// said for a new layout.
+    #[test]
+    fn init_makes_the_data_directories_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("new/taso");
+        let mut said = Vec::new();
+        make_data_dirs(&data, |l| said.push(l.to_string())).unwrap();
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(mode(&dir.path().join("new")) & 0o007, 0o001);
+        for (d, want) in [
+            ("", 0o711),
+            ("state", 0o700),
+            ("store", 0o700),
+            ("spool", 0o700),
+            ("mnt", 0o711),
+        ] {
+            assert_eq!(mode(&data.join(d)), want, "{d:?}");
+        }
+    }
+
+    /// Audit 2026-11-16, S1 (D&D S1-a b): on a host set up before, `init`
+    /// only takes away what others have beyond each directory's mode,
+    /// keeps the owner's and the group's, and says each change; run again
+    /// it has nothing to say.
+    #[test]
+    fn init_takes_others_access_away_from_an_old_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("taso");
+        for d in ["state", "store", "spool", "mnt"] {
+            std::fs::create_dir_all(data.join(d)).unwrap();
+        }
+        chmod(&data, 0o755);
+        chmod(&data.join("state"), 0o775);
+        chmod(&data.join("store"), 0o755);
+        chmod(&data.join("spool"), 0o750);
+        chmod(&data.join("mnt"), 0o755);
+        let mut said = Vec::new();
+        make_data_dirs(&data, |l| said.push(l.to_string())).unwrap();
+        for (d, want) in [
+            ("", 0o751),
+            ("state", 0o770),
+            ("store", 0o750),
+            ("spool", 0o750),
+            ("mnt", 0o751),
+        ] {
+            assert_eq!(mode(&data.join(d)), want, "{d:?}");
+        }
+        assert_eq!(said.len(), 4, "spool had nothing to take: {said:?}");
+        assert!(said[0].contains("755 -> 751"), "{said:?}");
+        let mut again = Vec::new();
+        make_data_dirs(&data, |l| again.push(l.to_string())).unwrap();
+        assert!(again.is_empty(), "{again:?}");
+    }
 
     /// Audit 2026-11-09, `init` made the block log's socket directory under
     /// `/run`, which a reboot empties, and nothing made it again at boot.
