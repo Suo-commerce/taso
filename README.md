@@ -65,9 +65,22 @@ node, a local coordinator, the block log, effects **held** by default
 "dispatch"`), and no Vessels yet. `--data DIR` moves the data
 directory, `--size-gib N` sizes the block log, `--rootfs DIR` names the
 agents' root filesystem, `--force` rewrites the config. Run again it
-says "already set up" and changes nothing. It starts no process and
-installs no service: the two commands below are yours, and `systemd`
-units, if you want them, are yours too.
+says "already set up" and changes nothing but the directory modes
+below. It starts no process and installs no service: the two commands
+below are yours, and `systemd` units, if you want them, are yours too.
+
+**Who can read the data.** Every Vessel's files live in the block log,
+the packs and the Warden's state, whatever their modes inside the Vessel
+say, so these are root's alone. `init` makes `state`, `store` and
+`spool` under the data directory `0700`, and the data directory and its
+`mnt` `0711`: others may pass through them to reach the Vessels' mounts
+(an agent's mapped uids must), but not list them. The block log, its
+checkpoint, the coordinator's database and every pack are made `0600`;
+if one made before is open to others, `taso-blkd`, the Warden and `init`
+take that access away (keeping the group's; for old packs, from the
+store's top directory) and say so. If your config
+puts `state_dir`, `spool` or the store somewhere else, give those
+directories the same modes yourself.
 
 **Run:**
 
@@ -78,7 +91,9 @@ units, if you want them, are yours too.
    entry needs a root filesystem for its agent (an unpacked OCI image),
    either as the node's `"runtime": {"rootfs": …}` or on the entry.
 2. Start the block log: `taso-blkd /var/lib/taso/blk.log
-   /run/taso/blk.sock --size-gib 64`.
+   /run/taso/blk.sock --size-gib 64`. It keeps `blk.sock.lock` beside
+   its socket: while it runs, another `taso-blkd` on the same socket is
+   refused.
 3. When `taso-ctl status` says the block log answers, start the Warden:
    `taso-wardend /etc/taso/warden.json`. On a static config the Warden
    runs the Vessels listed and ends when they are done; with none
@@ -184,6 +199,16 @@ stop` then stops the block log too.
   lives in. `blk/` is the block log, every Vessel's data (put it on the
   data disk); `warden/` is the Warden's coordinator, state and store;
   `agent/` is the agent's root filesystem, read-only to the Warden.
+  `taso-ctl init` does not make these, so give them the modes it gives
+  its own (see "Who can read the data" above) once, before the first
+  start:
+
+  ```
+  D=${TASO_DATA:-/var/lib/taso}
+  mkdir -p $D/blk $D/warden/{mnt,state,store,spool}
+  chmod 0711 $D $D/warden $D/warden/mnt
+  chmod 0700 $D/blk $D/warden/state $D/warden/store $D/warden/spool
+  ```
 - `TASO_WARDEN_CONFIG` (default `deploy/docker/warden.json`, the demo):
   your own Warden config. Its paths are the containers' paths, as
   `warden.json` shows them; your Vessels go in its `"vessels"` as on one
