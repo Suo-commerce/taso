@@ -169,7 +169,7 @@ use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -714,6 +714,12 @@ fn main() {
     let store = if log.exists() {
         match Store::open(&log) {
             Ok((s, rec)) => {
+                if let Some(was) = rec.tightened {
+                    log!(
+                        "taso-blkd: {}: others' access taken away (was {was:o}); the log holds every Vessel's data",
+                        log.display()
+                    );
+                }
                 log!(
                     "taso-blkd: recovered {}: {} records, {} groups, {} bytes cut ({})",
                     log.display(),
@@ -739,13 +745,14 @@ fn main() {
         log!("taso-blkd: removed {removed} leftover devices of dead daemons ({failed} could not be removed)");
     }
 
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)
-        .unwrap_or_else(|e| fail(&format!("cannot bind {}: {e}", socket.display())));
+    // Held until the process exits: while it is, no other taso-blkd
+    // takes this socket.
+    let (listener, socket, _socket_lock) = bind_socket(&socket)
+        .unwrap_or_else(|e| fail(&format!("cannot serve on {}: {e}", socket.display())));
     log!(
         "taso-blkd: serving {} on {} (open-file limit {}, durable at {})",
         log.display(),
-        socket.display(),
+        socket.path.display(),
         raise_open_files(),
         durable_at_name()
     );
@@ -800,7 +807,7 @@ fn main() {
         // and every Vessel's disk with it (audit 2026-11-09, accept loop).
         let spawned = std::thread::Builder::new().spawn(move || {
             if let Some(code) = serve(&d, conn) {
-                let _ = std::fs::remove_file(&socket);
+                socket.remove();
                 log!("taso-blkd: quit");
                 streams::drained_exit(code);
             }
@@ -809,6 +816,101 @@ fn main() {
             log!("{line}");
         }
     }
+}
+
+/// The control socket this daemon bound: its path and which file it was,
+/// so that quitting removes it only while it is still this daemon's.
+#[derive(Clone, Debug)]
+struct OwnSocket {
+    path: PathBuf,
+    /// Device, inode and change time (s, ns): a freed inode number is
+    /// given again at once, so the inode alone does not tell two sockets
+    /// apart.
+    id: (u64, u64, i64, i64),
+}
+
+/// [`OwnSocket::id`] of `m`.
+fn socket_id(m: &std::fs::Metadata) -> (u64, u64, i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino(), m.ctime(), m.ctime_nsec())
+}
+
+impl OwnSocket {
+    /// Remove the socket if it is still the one bound: a daemon started
+    /// on the same path after this one keeps its own (audit 2026-11-16,
+    /// S6: quit removed whatever was at the path).
+    fn remove(&self) {
+        if let Ok(m) = std::fs::symlink_metadata(&self.path) {
+            if socket_id(&m) == self.id {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+/// Take the control socket at `path` for this daemon (audit 2026-11-16,
+/// S6: the path was removed unconditionally, so a second daemon with
+/// another log took a live daemon's control connections, and an ordinary
+/// file at the path was deleted).
+///
+/// An exclusive lock on `<path>.lock`, held as long as the returned file
+/// is (the process's life), says which daemon owns the path: a second is
+/// refused while the first lives, and a crashed one's lock goes with it.
+/// At the path itself only a socket nobody answers on (a dead daemon's)
+/// is replaced; a live one (a daemon from before this lock) and anything
+/// that is not a socket are refused, never removed.  The socket is the
+/// owner's alone (0600: the Warden runs as root).
+fn bind_socket(path: &Path) -> std::io::Result<(UnixListener, OwnSocket, File)> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+    // SAFETY: a valid descriptor, owned by `lock` for this call.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = Error::last_os_error();
+        return Err(if e.kind() == ErrorKind::WouldBlock {
+            Error::new(
+                ErrorKind::AddrInUse,
+                "another taso-blkd owns this socket (it holds its .lock)",
+            )
+        } else {
+            e
+        });
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => {
+            if UnixStream::connect(path).is_ok() {
+                return Err(Error::new(
+                    ErrorKind::AddrInUse,
+                    "a live daemon answers on this socket",
+                ));
+            }
+            std::fs::remove_file(path)?; // a dead daemon's
+        }
+        Ok(_) => {
+            return Err(Error::new(
+                ErrorKind::AlreadyExists,
+                "it exists and is not a socket: not removed",
+            ))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let listener = UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let own = OwnSocket {
+        path: path.to_path_buf(),
+        id: socket_id(&std::fs::symlink_metadata(path)?),
+    };
+    Ok((listener, own, lock))
 }
 
 /// How long a call waits for a device of its branch to finish starting
@@ -1063,7 +1165,6 @@ static QUITTING: Mutex<()> = Mutex::new(());
 mod signals {
     use super::{lock, Quit, QUITTING};
     use std::io;
-    use std::path::PathBuf;
     use std::sync::MutexGuard;
     use std::time::Duration;
 
@@ -1106,7 +1207,7 @@ mod signals {
     /// failed).
     pub fn stop_on(
         set: libc::sigset_t,
-        socket: PathBuf,
+        socket: super::OwnSocket,
         shutdown: impl Fn() -> Quit + Send + 'static,
     ) -> io::Result<()> {
         std::thread::Builder::new()
@@ -1121,7 +1222,7 @@ mod signals {
                 let (code, one_quit) = until_done(name, &shutdown, RETRY);
                 // Held until the process exits: no `quit` starts another.
                 std::mem::forget(one_quit);
-                let _ = std::fs::remove_file(&socket);
+                socket.remove();
                 log!("taso-blkd: quit ({name})");
                 super::streams::drained_exit(code);
             })
@@ -2816,5 +2917,76 @@ mod detach_test {
             };
             assert_eq!(*lock(&c.calls), want);
         }
+    }
+}
+
+/// Audit 2026-11-16, S6: who owns the control socket.
+#[cfg(test)]
+mod socket_test {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A first daemon binds (0600); a second on the same path is refused
+    /// while the first holds it, and the first's socket still answers.
+    /// Once the first is gone, its dead socket is replaced.
+    #[test]
+    fn one_daemon_owns_a_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blk.sock");
+        let (listener, own, lock) = bind_socket(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let e = bind_socket(&path).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the first still answers"
+        );
+        // The first dies: its lock goes, its socket file stays, dead.
+        drop((listener, lock));
+        assert!(path.exists());
+        let (_l2, own2, _k2) = bind_socket(&path).unwrap();
+        assert_ne!(own.id, own2.id, "a new socket");
+        assert!(UnixStream::connect(&path).is_ok());
+    }
+
+    /// A daemon from before the lock (no .lock held) answering on the
+    /// path is not displaced; an ordinary file there is not removed.
+    #[test]
+    fn a_live_socket_or_a_file_at_the_path_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blk.sock");
+        let _old = UnixListener::bind(&path).unwrap();
+        let e = bind_socket(&path).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+        assert!(
+            UnixStream::connect(&path).is_ok(),
+            "the old one still answers"
+        );
+        let file = dir.path().join("notes");
+        std::fs::write(&file, b"keep me").unwrap();
+        let e = bind_socket(&file).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+    }
+
+    /// Quitting removes the socket only while it is this daemon's: one a
+    /// later daemon bound at the path is left to it.
+    #[test]
+    fn quitting_removes_only_its_own_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blk.sock");
+        let (l1, own1, k1) = bind_socket(&path).unwrap();
+        own1.remove();
+        assert!(!path.exists(), "its own is removed");
+        drop((l1, k1));
+        let (_l2, own2, _k2) = bind_socket(&path).unwrap();
+        own1.remove(); // a late quit of the first
+        assert!(path.exists(), "the successor's socket stays");
+        assert!(UnixStream::connect(&path).is_ok());
+        own2.remove();
+        assert!(!path.exists());
     }
 }
