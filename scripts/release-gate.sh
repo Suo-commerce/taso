@@ -101,7 +101,14 @@ run() {
     [ "$rc" = 0 ] || FAILED=$((FAILED + 1))
     printf '%-10s exit %-3s %6ss  %-90s  %sG free\n' "$n" "$rc" "$(( $(date +%s) - s ))" \
         "$(grep -v '^[[:space:]]*$' "$OUT/$n.txt" | tail -1 | cut -c1-90)" "$(free_gib)" | tee -a "$S"
+    return "$rc"
 }
+
+# A heavy gate's large files (a block log and its .ckpt, .lock and
+# compaction siblings), once it passed: kept, they starved the next
+# (2026-11-18, full on 7a9a8b7: crash left 9 GiB, and fstests stopped at
+# 18 GiB free of its 20).  A failed gate's stay, as its evidence.
+drop() { rm -f "$@"; }
 
 echo "== release gate ($TIER) on $COMMIT, output in $OUT"
 # taso-blkd is built on its own, as every script and the README build it:
@@ -136,7 +143,7 @@ run fmt      5m       bash -c 'cargo fmt --all --check && echo clean'
 run gates    5m       scripts/gate-exit-test.sh
 run smoke    "$LIMIT" scripts/blk-smoke.sh
 run contract "$LIMIT" scripts/blk-contract.sh
-run crash    "$LIMIT" scripts/blk-crash.sh "$CRASH"
+run crash    "$LIMIT" scripts/blk-crash.sh "$CRASH" && drop /var/lib/taso-blk/crash.log*
 run blkpool  "$LIMIT" scripts/blk-warden-test.sh
 run genesis  "$LIMIT" scripts/p4-genesis.sh blk
 run births   "$LIMIT" scripts/p4-births.sh blk
@@ -149,8 +156,9 @@ run f6fork   "$LIMIT" scripts/f6-fork-blk.sh
 run p3       "$LIMIT" env N="$P3N" scripts/p3-no-trace.sh
 run p2       "$LIMIT" env N="$P2N" scripts/gate-p2-blk.sh
 if [ "$TIER" = full ]; then
-    run fstests 6h scripts/blk-fstests.sh run
-    run bench   1h scripts/blk-bench.sh
+    run fstests 6h scripts/blk-fstests.sh run && drop /var/lib/taso-blk/fst.log*
+    run bench   1h scripts/blk-bench.sh \
+        && drop /var/lib/taso-blk/bench.log* /var/lib/taso-blk/bench-base.img
 fi
 
 NOW=$(git rev-parse --short HEAD)
