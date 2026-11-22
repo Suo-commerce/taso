@@ -2222,7 +2222,12 @@ enum Job {
         Peer,
         std::sync::mpsc::Sender<Result<VerdictAnswer, String>>,
     ),
+    /// Its held proposals and the Seal that says which are sealed (4a).
+    Proposals(std::sync::mpsc::Sender<Result<HeldProposals, String>>),
 }
+
+/// A Vessel's held proposals, in op order, and its last accepted Seal.
+type HeldProposals = (Vec<taso_core::decider::ProposalItem>, Option<Lsn>);
 
 /// Who has a Vessel on this node, for the decider (D74).
 enum DSlot {
@@ -2352,6 +2357,39 @@ impl crate::decidesrv::Decide for NodeDecider {
                 "Vessel {} is being opened or closed on this node: ask again",
                 id_hex(id)
             )))),
+        }
+    }
+
+    /// 4a.  A running Vessel's session answers from its own log, between
+    /// two of its requests, so the answer is never of a half-written
+    /// record.  A Vessel that is not running is read from its local log
+    /// under its slot (no run starts meanwhile), without opening it:
+    /// nothing is claimed and nothing recorded.  Whatever keeps the
+    /// Warden from answering is an error that says so, never an empty
+    /// list (rule R).
+    fn proposals(&self, vessel: ChronicleId) -> Result<HeldProposals, String> {
+        let node = &*self.0;
+        match node.hold_for_decider(*vessel.as_bytes()) {
+            Ok(_slot) => {
+                node.mine_here(vessel)?;
+                node.host()
+                    .read_log_of(vessel)
+                    .and_then(|log| log.held_proposals())
+                    .map_err(|e| format!("Vessel {}: its log cannot be read: {e}", id_hex(vessel)))
+            }
+            Err(Some(tx)) => match Node::ask_session(&tx, Job::Proposals) {
+                Ok(r) => r.map_err(|e| format!("Vessel {}: {e}", id_hex(vessel))),
+                Err(why) if why == "timeout" => Err(format!(
+                    "the session of Vessel {} has not answered within {}s: ask again",
+                    id_hex(vessel),
+                    SESSION_WAIT.as_secs()
+                )),
+                Err(why) => Err(format!("Vessel {}: {why}: ask again", id_hex(vessel))),
+            },
+            Err(None) => Err(format!(
+                "Vessel {} is being opened or closed on this node: ask again",
+                id_hex(vessel)
+            )),
         }
     }
 }
@@ -4488,6 +4526,9 @@ impl Node {
                 let r = crate::verdict::pending(self.coord.as_ref(), vessel.id())
                     .map_err(|e| format!("coordinator: {e}"));
                 let _ = tx.send(r);
+            }
+            Job::Proposals(tx) => {
+                let _ = tx.send(vessel.held_proposals().map_err(|e| e.to_string()));
             }
             Job::Verdict(req, peer, tx) => {
                 let r = self
@@ -8326,6 +8367,99 @@ mod tests {
             attempt_failpoint: crate::attempt::no_failpoints(),
             decide_slots: Default::default(),
         }
+    }
+
+    /// 4a: whatever keeps the Warden from listing a Vessel's held
+    /// proposals is an error that says so, never an empty list (rule R):
+    /// a Vessel with no log here, another Warden's, one whose log cannot
+    /// be read, and one being opened or closed; and the slot taken for a
+    /// read is given back.
+    #[test]
+    fn proposals_of_a_vessel_the_warden_cannot_read_are_an_error() {
+        use crate::decidesrv::Decide;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = NodeDecider(Arc::new(bare_node(tmp.path())));
+        let node = &*d.0;
+        let id = vessel_id(ns(1), b"u");
+        let e = d.proposals(id).unwrap_err();
+        assert!(e.contains("has no local log on this node"), "{e}");
+        // Its directory is here, the coordinator does not know it.
+        std::fs::create_dir_all(node.host().dir_for(id)).unwrap();
+        let e = d.proposals(id).unwrap_err();
+        assert!(e.contains("coordinator"), "{e}");
+        // Another Warden's.
+        let other = WardenId::new(node.config.warden.get() + 1);
+        node.coord.register(id, other).unwrap();
+        let e = d.proposals(id).unwrap_err();
+        assert!(e.contains("is held by Warden"), "{e}");
+        // This Warden's, with a log directory that holds no log.
+        let mine = vessel_id(ns(1), b"w");
+        std::fs::create_dir_all(node.host().dir_for(mine)).unwrap();
+        node.coord.register(mine, node.config.warden).unwrap();
+        let e = d.proposals(mine).unwrap_err();
+        assert!(e.contains("its log cannot be read"), "{e}");
+        assert!(node.slots().is_empty(), "each read gave its slot back");
+        // Being opened or closed.
+        node.slots().insert(*mine.as_bytes(), DSlot::Busy);
+        let e = d.proposals(mine).unwrap_err();
+        assert!(
+            e.contains("being opened or closed") && e.contains("ask again"),
+            "{e}"
+        );
+    }
+
+    /// 4a: a running Vessel's session answers, and its answer is passed
+    /// on as it is (an empty list is its own: it holds nothing); its error
+    /// and a run that has ended are errors.
+    #[test]
+    fn proposals_of_a_running_vessel_are_its_sessions_answer() {
+        use crate::decidesrv::Decide;
+        use taso_core::decider::ProposalItem;
+        use taso_core::record::{Consequence, Dispatch, IntentRecord, OpId, RetryPolicy};
+        let tmp = tempfile::tempdir().unwrap();
+        let d = NodeDecider(Arc::new(bare_node(tmp.path())));
+        let id = vessel_id(ns(1), b"u");
+        let item = ProposalItem {
+            lsn: Lsn::new(12),
+            intent: IntentRecord {
+                op: OpId::new(2),
+                provider: "fetch".into(),
+                request: b"https://example.org/".to_vec(),
+                footprint: Vec::new(),
+                dispatch: Dispatch::Immediate,
+                retry: RetryPolicy::UnsafeToRetry,
+                consequence: Consequence::Irreversible,
+                authority: Vec::new(),
+                barrier: None,
+            },
+            sealed: true,
+        };
+        let answers: Vec<Result<HeldProposals, String>> = vec![
+            Ok((vec![item.clone()], Some(Lsn::new(20)))),
+            Ok((Vec::new(), None)),
+            Err("its log: a torn record".into()),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        d.0.slots().insert(*id.as_bytes(), DSlot::Running(tx));
+        // The session's thread: one answer per job, then its run ends.
+        let session = std::thread::spawn(move || {
+            for a in answers {
+                match rx.recv().unwrap() {
+                    Job::Proposals(tx) => tx.send(a).unwrap(),
+                    _ => panic!("not a Proposals job"),
+                }
+            }
+        });
+        assert_eq!(d.proposals(id), Ok((vec![item], Some(Lsn::new(20)))));
+        assert_eq!(d.proposals(id), Ok((Vec::new(), None)));
+        let e = d.proposals(id).unwrap_err();
+        assert!(e.contains("a torn record"), "{e}");
+        session.join().unwrap();
+        let e = d.proposals(id).unwrap_err();
+        assert!(
+            e.contains("the Vessel's run ended") && e.contains("ask again"),
+            "{e}"
+        );
     }
 
     /// Audit 2026-11-09, an interrupted fork used up its uid slot: the
