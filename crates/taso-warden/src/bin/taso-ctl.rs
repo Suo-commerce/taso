@@ -6,6 +6,7 @@
 //! taso-ctl init [--data DIR] [--size-gib N] [--rootfs DIR] [--force]
 //! taso-ctl status [<warden-config>]
 //! taso-ctl demo [--config PATH]
+//! taso-ctl proposals <vessel> [--config PATH]
 //! taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>
 //! ```
 //!
@@ -65,12 +66,31 @@
 //! daemon is not running: redb locks the file).  Output: one JSON object,
 //! `{"explain": {…}, "checks": {"passed": n, "failed": ["…", …]}}`.
 //!
+//! # `proposals`
+//!
+//! Asks the running Warden, on its decider socket (as root, or as the
+//! Warden's uid), what one Vessel holds: the actions its agent asked for
+//! that nothing has released (design `Taso_design_proposals_inbox`, 4a).
+//! A read: nothing is recorded, released or refused.  `<vessel>` is its
+//! `subject` in the config, a fork's name (`<subject>-fork-<n>`), or its
+//! id (32 hex).  Output: one JSON object a line for each held action, in
+//! the order they were asked,
+//! `{"op", "lsn", "provider", "request_hex", "request_text", "footprint_hex",
+//! "retry", "consequence", "sealed"}` (`request_hex` is the exact bytes;
+//! `request_text` the same as text, `null` if they are not UTF-8;
+//! `sealed`: the Vessel's last Seal covers it, so it survives a restart),
+//! then one last line `{"vessel", "held", "last_seal"}`.  A held action
+//! is what an agent asked for, not a licence to send: only the sender
+//! socket's `Open` list is.
+//!
 //! # Exit status
 //!
-//! 0 done (`explain`: every check held; `status`: the block log answers);
+//! 0 done (`explain`: every check held; `status`: the block log answers;
+//! `proposals`: the Warden answered);
 //! 1 it could not be done (`explain`: no such id, the coordinator or the
 //! store unreachable; `status`: the block log does not answer; `init`,
-//! `demo`: a write failed); 2 a bad command line or configuration (`demo`:
+//! `demo`: a write failed; `proposals`: the Warden does not answer, or
+//! cannot answer for that Vessel: its line says why); 2 a bad command line or configuration (`demo`:
 //! no config, or no rootfs in it); 3 `init`
 //! refused the host; 4 `explain`ed, a check failed (something changed
 //! after it was accepted).
@@ -88,6 +108,7 @@ use taso_warden::explain::{explain, Subject};
 const USAGE: &str = "usage: taso-ctl init [--data DIR] [--size-gib N] [--rootfs DIR] [--force]
        taso-ctl status [<warden-config>]
        taso-ctl demo [--config PATH]
+       taso-ctl proposals <vessel> [--config PATH]
        taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>";
 
 const CONFIG: &str = "/etc/taso/warden.json";
@@ -137,6 +158,7 @@ fn main() -> ExitCode {
         Some("init") => init(&args[1..]),
         Some("status") => status(args.get(1).map(String::as_str)),
         Some("demo") => demo(&args[1..]),
+        Some("proposals") => proposals(&args[1..]),
         Some(_) if args.len() == 3 && args[1] == "explain" => explain_cmd(&args[0], &args[2]),
         Some(_) => usage("unknown command"),
         None => usage("a command is needed"),
@@ -763,6 +785,112 @@ fn explain_cmd(cfg: &str, id: &str) -> ExitCode {
     }
 }
 
+// ── the decider socket: proposals ─────────────────────────────────────
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// `<vessel> [--config PATH]`: the Vessel's argument and the config's
+/// path.
+fn vessel_args(args: &[String]) -> Result<(&str, &str), String> {
+    match args {
+        [v] => Ok((v, CONFIG)),
+        [v, flag, path] if flag == "--config" => Ok((v, path)),
+        [flag, path, v] if flag == "--config" => Ok((v, path)),
+        _ => Err("a Vessel is needed: its subject, a fork's name or its id".into()),
+    }
+}
+
+/// The id of the Vessel `arg` names: an id (32 hex) as it is; a
+/// configured `subject`; or a fork's name (`<subject>-fork-<n>`), which
+/// lives in its parent's namespace.  A name that fits no entry, or
+/// entries in two namespaces, is refused: never guessed.
+fn vessel_of(config: &Config, arg: &str) -> Result<taso_core::envelope::ChronicleId, String> {
+    if arg.len() == 32 {
+        if let Some(Subject::Chronicle(id)) = Subject::parse(arg) {
+            return Ok(id);
+        }
+    }
+    let parent = arg
+        .rsplit_once("-fork-")
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+        .map(|(p, _)| p);
+    let mut ids: Vec<_> = config
+        .vessels
+        .iter()
+        .filter(|v| v.subject == arg || Some(v.subject.as_str()) == parent)
+        .map(|v| taso_core::record::vessel_id(v.namespace, arg.as_bytes()))
+        .collect();
+    ids.dedup();
+    match ids.as_slice() {
+        [id] => Ok(*id),
+        [] => Err(format!(
+            "{arg:?} is not a Vessel of this config, a fork of one, or an id (32 hex)"
+        )),
+        _ => Err(format!(
+            "{arg:?} names Vessels in more than one namespace: give its id (32 hex)"
+        )),
+    }
+}
+
+/// One held action as `proposals` prints it.
+fn proposal_json(i: &taso_core::decider::ProposalItem) -> serde_json::Value {
+    json!({
+        "op": i.intent.op.get(),
+        "lsn": i.lsn.get(),
+        "provider": i.intent.provider,
+        "request_hex": hex(&i.intent.request),
+        "request_text": std::str::from_utf8(&i.intent.request).ok(),
+        "footprint_hex": hex(&i.intent.footprint),
+        "retry": format!("{:?}", i.intent.retry),
+        "consequence": format!("{:?}", i.intent.consequence),
+        "sealed": i.sealed,
+    })
+}
+
+fn proposals(args: &[String]) -> ExitCode {
+    let (arg, path) = match vessel_args(args) {
+        Ok(a) => a,
+        Err(e) => return usage(&e),
+    };
+    let config = match read_config(path) {
+        Ok(c) => c,
+        Err(e) => return usage(&format!("{path}: {e}")),
+    };
+    let vessel = match vessel_of(&config, arg) {
+        Ok(v) => v,
+        Err(e) => return usage(&e),
+    };
+    let socket = &config.decider.socket;
+    let answer = taso_warden::decidesrv::DeciderClient::connect(socket)
+        .map_err(|e| format!("the Warden's decider socket {}: {e}", socket.display()))
+        .and_then(|mut c| c.proposals_all(vessel));
+    match answer {
+        Ok((items, last_seal)) => {
+            for i in &items {
+                println!("{}", proposal_json(i));
+            }
+            println!(
+                "{}",
+                json!({
+                    "vessel": hex(vessel.as_bytes()),
+                    "held": items.len(),
+                    "last_seal": last_seal.map(|l| l.get()),
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        Err(why) => {
+            println!(
+                "{}",
+                json!({"vessel": hex(vessel.as_bytes()), "error": why})
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
 // ── demo ──────────────────────────────────────────────────────────────
 
 /// The demo Vessel's subject, and its namespace (32 hex: any fixed value;
@@ -1039,6 +1167,74 @@ mod tests {
             agent_limits(&c),
             "agent limits: memory unlimited, processes 512 (runtime.memory_bytes, runtime.pids); demo: memory 256 MiB, processes 512"
         );
+    }
+
+    /// 4a: a Vessel is named by its subject, a fork's name or its id;
+    /// anything else is refused, never guessed.
+    #[test]
+    fn a_vessel_is_named_by_subject_fork_name_or_id() {
+        use taso_core::record::vessel_id;
+        let a = init_args(&["--rootfs".into(), "/srv/rootfs".into()]).unwrap();
+        let text = add_demo(&init_config(&a, false)).unwrap().unwrap();
+        let config = Config::parse(&text).unwrap();
+        let ns = config.vessels[0].namespace;
+        let demo = vessel_id(ns, DEMO_SUBJECT.as_bytes());
+        assert_eq!(vessel_of(&config, DEMO_SUBJECT), Ok(demo));
+        assert_eq!(vessel_of(&config, &hex(demo.as_bytes())), Ok(demo));
+        assert_eq!(
+            vessel_of(&config, "demo-fork-11"),
+            Ok(vessel_id(ns, b"demo-fork-11"))
+        );
+        for bad in ["other", "other-fork-1", "demo-fork-", "demo-fork-x", ""] {
+            assert!(vessel_of(&config, bad).is_err(), "{bad:?}");
+        }
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(vessel_args(&s(&["demo"])), Ok(("demo", CONFIG)));
+        assert_eq!(
+            vessel_args(&s(&["demo", "--config", "/c"])),
+            Ok(("demo", "/c"))
+        );
+        assert_eq!(
+            vessel_args(&s(&["--config", "/c", "demo"])),
+            Ok(("demo", "/c"))
+        );
+        assert!(vessel_args(&s(&[])).is_err());
+        assert!(vessel_args(&s(&["demo", "extra"])).is_err());
+    }
+
+    /// 4a: a held action is printed with its exact request bytes, and as
+    /// text only when they are text.
+    #[test]
+    fn a_held_action_prints_its_exact_request() {
+        use taso_core::decider::ProposalItem;
+        use taso_core::envelope::Lsn;
+        use taso_core::record::{Consequence, Dispatch, IntentRecord, OpId, RetryPolicy};
+        let mut i = ProposalItem {
+            lsn: Lsn::new(12),
+            intent: IntentRecord {
+                op: OpId::new(3),
+                provider: "fetch".into(),
+                request: b"https://example.org/a".to_vec(),
+                footprint: b"web".to_vec(),
+                dispatch: Dispatch::Immediate,
+                retry: RetryPolicy::UnsafeToRetry,
+                consequence: Consequence::Irreversible,
+                authority: Vec::new(),
+                barrier: None,
+            },
+            sealed: true,
+        };
+        let j = proposal_json(&i);
+        assert_eq!(j["op"], 3);
+        assert_eq!(j["lsn"], 12);
+        assert_eq!(j["request_text"], "https://example.org/a");
+        assert_eq!(j["request_hex"], hex(b"https://example.org/a"));
+        assert_eq!(j["footprint_hex"], "776562");
+        assert_eq!(j["sealed"], true);
+        i.intent.request = vec![0xff, 0x00];
+        let j = proposal_json(&i);
+        assert_eq!(j["request_hex"], "ff00");
+        assert!(j["request_text"].is_null());
     }
 
     #[test]
