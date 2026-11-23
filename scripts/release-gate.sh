@@ -59,7 +59,7 @@ flock -n 9 || { echo "release-gate: another release gate is running" >&2; exit 3
 free_gib() { df --output=avail -B1G /root | tail -1 | tr -d ' '; }
 # Nothing else runs (the lock): what a killed gate left is safe to remove.
 # Not /var/lib/taso*: the node's installed services keep their state there.
-rm -rf /var/tmp/taso-p2blk.* /var/tmp/taso-p3.* /var/tmp/taso-f6fork.* \
+rm -rf /var/tmp/taso-p2blk.* /var/tmp/taso-p3.* /var/tmp/taso-f6fork.* /var/tmp/taso-review.* \
        /var/tmp/taso-k2e2e.* /var/tmp/e3check.*
 find /root -maxdepth 1 -mtime +"$KEEP_DAYS" \
      \( -name 'taso-gate-*' -o -name 'taso-f6-fork-*' -o -name 'release-*-quick-*' -o -name 'release-*-full-*' \) \
@@ -154,6 +154,7 @@ run sanction "$LIMIT" scripts/p4-sanction.sh blk
 run purge    "$LIMIT" scripts/p4-purge.sh blk
 run f6fork   "$LIMIT" scripts/f6-fork-blk.sh
 run p3       "$LIMIT" env N="$P3N" scripts/p3-no-trace.sh
+run review   "$LIMIT" scripts/p3-review.sh
 run p2       "$LIMIT" env N="$P2N" scripts/gate-p2-blk.sh
 if [ "$TIER" = full ]; then
     run fstests 6h scripts/blk-fstests.sh run && drop /var/lib/taso-blk/fst.log*
