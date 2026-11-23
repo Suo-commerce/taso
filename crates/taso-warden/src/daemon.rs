@@ -2198,11 +2198,11 @@ struct NodeTick<'n, 's, 'e> {
 }
 
 impl crate::field::Tick<BlkLayers> for NodeTick<'_, '_, '_> {
-    fn tick(&mut self, vessel: &mut Vessel<BlkLayers>) {
+    fn tick(&mut self, vessel: &mut Vessel<BlkLayers>, mut effects: Option<&mut Effects>) {
         self.verif.borrow_mut().tick(vessel);
         while let Ok(job) = self.jobs.try_recv() {
             let verdict = matches!(job, Job::Verdict(..));
-            self.node.do_job(vessel, job);
+            self.node.do_job(vessel, effects.as_deref_mut(), job);
             // A Never closes, a Sanction commits: nothing more to attempt
             // may be the case; a look is cheap.
             if verdict {
@@ -2224,6 +2224,13 @@ enum Job {
     ),
     /// Its held proposals and the Seal that says which are sealed (4a).
     Proposals(std::sync::mpsc::Sender<Result<HeldProposals, String>>),
+    /// A reviewer's decision on its held proposal `op` (Approve, Deny).
+    Decide(
+        u64,
+        crate::decidesrv::Ruling,
+        Peer,
+        std::sync::mpsc::Sender<Result<crate::decidesrv::Ruled, String>>,
+    ),
 }
 
 /// A Vessel's held proposals, in op order, and its last accepted Seal.
@@ -2357,6 +2364,47 @@ impl crate::decidesrv::Decide for NodeDecider {
                 "Vessel {} is being opened or closed on this node: ask again",
                 id_hex(id)
             )))),
+        }
+    }
+
+    /// Approve, Deny.  A running Vessel's session takes the decision
+    /// between two of its requests, through the effect engine it answers
+    /// its sender from.  A Vessel that is not running is opened under its
+    /// slot for a denial; an approval of it is refused (see
+    /// [`Node::do_job`]).  A session that does not answer in time may
+    /// still take it: the same request, sent again, is answered the same.
+    fn decide(
+        &self,
+        vessel: ChronicleId,
+        op: u64,
+        ruling: &crate::decidesrv::Ruling,
+        peer: Peer,
+    ) -> Result<crate::decidesrv::Ruled, String> {
+        let node = &*self.0;
+        let job = |tx| Job::Decide(op, ruling.clone(), peer, tx);
+        match node.hold_for_decider(*vessel.as_bytes()) {
+            Ok(_slot) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                match node.open_for(vessel, job(tx)) {
+                    Ok(()) => rx
+                        .recv()
+                        .map_err(|_| "the decision was not answered".to_string())?,
+                    Err((why, _)) => Err(why),
+                }
+            }
+            Err(Some(tx)) => match Node::ask_session(&tx, job) {
+                Ok(r) => r,
+                Err(why) if why == "timeout" => Err(format!(
+                    "the session of Vessel {} has not answered within {}s; it may still take the decision: send the same request again",
+                    id_hex(vessel),
+                    SESSION_WAIT.as_secs()
+                )),
+                Err(why) => Err(format!("Vessel {}: {why}: ask again", id_hex(vessel))),
+            },
+            Err(None) => Err(format!(
+                "Vessel {} is being opened or closed on this node: ask again",
+                id_hex(vessel)
+            )),
         }
     }
 
@@ -4518,10 +4566,70 @@ impl Node {
         }
     }
 
-    /// Do a decider job on `vessel` (its session's thread, or an open of
-    /// the decider's).
-    fn do_job(&self, vessel: &mut Vessel<BlkLayers>, job: Job) {
+    /// Do a decider job on `vessel` (its session's thread, with the
+    /// session's effect engine if it has one; or an open of the
+    /// decider's, with none).
+    fn do_job(&self, vessel: &mut Vessel<BlkLayers>, effects: Option<&mut Effects>, job: Job) {
         match job {
+            Job::Decide(op, ruling, peer, tx) => {
+                use crate::decidesrv::{Ruled, Ruling};
+                use crate::effects::{DecideError, Decided};
+                use taso_core::record::OpId;
+                let id = vessel.id();
+                let done = |r: Result<Decided, DecideError>| match r {
+                    Ok(d) => Ok(Ruled::Done {
+                        before: d == Decided::Before,
+                    }),
+                    // It could not be recorded: not an answer about the
+                    // action.
+                    Err(DecideError::Vessel(e)) => Err(format!("Vessel {}: {e}", id_hex(id))),
+                    Err(e) => Ok(Ruled::Refused(e.to_string())),
+                };
+                let r = match (&ruling, effects) {
+                    (Ruling::Approve, Some(fx)) => done(fx.approve(vessel, OpId::new(op))),
+                    (Ruling::Deny(why), Some(fx)) => done(fx.deny(vessel, OpId::new(op), why)),
+                    // An approved action is handed to the Vessel's sender,
+                    // and that is served only while the Vessel runs with
+                    // its effect engine: approved now it would be an
+                    // obligation nobody could be handed.
+                    (Ruling::Approve, None) => Ok(Ruled::Refused(format!(
+                        "Vessel {} is not running on this node: an approved action is handed to its sender, which is served while it runs; approve it while it runs",
+                        id_hex(id)
+                    ))),
+                    // A denial sends nothing: the ledger is opened for it
+                    // (as a start opens it: a lost turn's proposals are
+                    // withdrawn first).
+                    (Ruling::Deny(why), None) => self
+                        .packs(id)
+                        .map_err(|e| e.to_string())
+                        .and_then(|packs| {
+                            let publisher =
+                                PackPublisher::new(packs, self.coord.clone(), self.config.warden);
+                            Effects::open(Mode::Hold, Box::new(publisher), vessel)
+                                .map_err(|e| e.to_string())
+                        })
+                        .map_err(|e| format!("Vessel {}: its ledger: {e}", id_hex(id)))
+                        .and_then(|(mut fx, _)| done(fx.deny(vessel, OpId::new(op), why))),
+                };
+                eprintln!(
+                    "taso-wardend[{}] {}: {} of held op {op} from uid {} pid {}: {}",
+                    self.config.warden.get(),
+                    id_hex(id),
+                    match &ruling {
+                        Ruling::Approve => "approval".to_string(),
+                        Ruling::Deny(why) => format!("denial ({why:?})"),
+                    },
+                    peer.uid,
+                    peer.pid,
+                    match &r {
+                        Ok(Ruled::Done { before: false }) => "recorded".to_string(),
+                        Ok(Ruled::Done { before: true }) => "recorded before".to_string(),
+                        Ok(Ruled::Refused(why)) => format!("refused: {why}"),
+                        Err(e) => format!("failed: {e}"),
+                    }
+                );
+                let _ = tx.send(r);
+            }
             Job::Pending(tx) => {
                 let r = crate::verdict::pending(self.coord.as_ref(), vessel.id())
                     .map_err(|e| format!("coordinator: {e}"));
@@ -4607,7 +4715,7 @@ impl Node {
             return Err((format!("Vessel {label}: {e}"), job));
         }
         self.finish_sanctions(&mut vessel, &log);
-        self.do_job(&mut vessel, job);
+        self.do_job(&mut vessel, None, job);
         Ok(())
     }
 
@@ -8404,6 +8512,71 @@ mod tests {
         let e = d.proposals(mine).unwrap_err();
         assert!(
             e.contains("being opened or closed") && e.contains("ask again"),
+            "{e}"
+        );
+    }
+
+    /// Approve, Deny: a running Vessel's session takes the decision and
+    /// its answer is passed on; a Vessel the Warden cannot reach now is an
+    /// error to ask again with, never a refusal; and a Vessel with no log
+    /// here is an error by name.
+    #[test]
+    fn a_decision_is_the_running_sessions_and_an_unreachable_vessel_is_an_error() {
+        use crate::decidesrv::{Decide, Ruled, Ruling};
+        let tmp = tempfile::tempdir().unwrap();
+        let d = NodeDecider(Arc::new(bare_node(tmp.path())));
+        let id = vessel_id(ns(1), b"u");
+        let peer = Peer { uid: 0, pid: 7 };
+        let deny = Ruling::Deny("no".into());
+        // Not running, no log here: neither can be answered.
+        for r in [&Ruling::Approve, &deny] {
+            let e = d.decide(id, 1, r, peer).unwrap_err();
+            assert!(e.contains("has no local log on this node"), "{e}");
+        }
+        assert!(d.0.slots().is_empty(), "the slot was given back");
+        d.0.slots().insert(*id.as_bytes(), DSlot::Busy);
+        let e = d.decide(id, 1, &Ruling::Approve, peer).unwrap_err();
+        assert!(
+            e.contains("being opened or closed") && e.contains("ask again"),
+            "{e}"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        d.0.slots().insert(*id.as_bytes(), DSlot::Running(tx));
+        let want = deny.clone();
+        let session = std::thread::spawn(move || {
+            for (op, ruling, answer) in [
+                (1, Ruling::Approve, Ok(Ruled::Done { before: false })),
+                (2, want, Ok(Ruled::Refused("not held".into()))),
+                (
+                    3,
+                    Ruling::Approve,
+                    Err("its log: a torn record".to_string()),
+                ),
+            ] {
+                match rx.recv().unwrap() {
+                    Job::Decide(o, r, p, tx) => {
+                        assert_eq!((o, r, p), (op, ruling, Peer { uid: 0, pid: 7 }));
+                        tx.send(answer).unwrap();
+                    }
+                    _ => panic!("not a Decide job"),
+                }
+            }
+        });
+        assert_eq!(
+            d.decide(id, 1, &Ruling::Approve, peer),
+            Ok(Ruled::Done { before: false })
+        );
+        assert_eq!(
+            d.decide(id, 2, &deny, peer),
+            Ok(Ruled::Refused("not held".into()))
+        );
+        let e = d.decide(id, 3, &Ruling::Approve, peer).unwrap_err();
+        assert!(e.contains("a torn record"), "{e}");
+        session.join().unwrap();
+        let e = d.decide(id, 4, &Ruling::Approve, peer).unwrap_err();
+        assert!(
+            e.contains("the Vessel's run ended") && e.contains("ask again"),
             "{e}"
         );
     }

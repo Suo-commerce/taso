@@ -218,8 +218,11 @@ pub trait Nominations<L: Layers> {
 /// Work the Warden does on the Vessel between requests, on the
 /// session's thread (P4 file 7c: verification attempts' records, D68).
 pub trait Tick<L: Layers> {
-    /// Called between requests, at least every serving tick.
-    fn tick(&mut self, vessel: &mut Vessel<L>);
+    /// Called between requests, at least every serving tick, with the
+    /// session's effect engine if it has one: a reviewer's decision on a
+    /// held action is taken through the engine the session answers
+    /// from, so what the sender is listed stays true.
+    fn tick(&mut self, vessel: &mut Vessel<L>, effects: Option<&mut Effects>);
 }
 
 /// One conversation with a Vessel's harness.
@@ -341,7 +344,7 @@ impl<'v, L: Layers> Session<'v, L> {
     /// Run the work between requests ([`Tick`]), if any.
     pub fn tick(&mut self) {
         if let Some(t) = self.ticker.as_deref_mut() {
-            t.tick(self.vessel);
+            t.tick(self.vessel, self.effects.as_deref_mut());
         }
     }
 

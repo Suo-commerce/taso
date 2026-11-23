@@ -12,6 +12,9 @@
 //! | `Verdict { request }` | 2 | `Verdict { answer }` | 2 |
 //! | | | `Error { message }` | 3 |
 //! | `Proposals { vessel, after }` | 3 | `Proposals { items, more, last_seal }` | 4 |
+//! | `Approve { vessel, op }` | 4 | `Approved { op, before }` | 5 |
+//! | `Deny { vessel, op, reason }` | 5 | `Denied { op, before }` | 6 |
+//! | | | `Refused { op, why }` | 7 |
 //!
 //! Answers (D77, D86): `Committed { template_id }` 0, `Held` 1,
 //! `ClosedNever` 2, `Refused { rule }` 3, `Retry { reason }` 4.  A Retry's
@@ -30,6 +33,21 @@
 //! nothing and changes nothing; it never releases, adopts or refuses.
 //! A proposal is what an agent asked for on a branch that may never be
 //! promoted: only the sender socket's `Open` list says what may be sent.
+//!
+//! `Approve` and `Deny` (version 3 too: no version 3 was released without
+//! them) decide one held proposal, by its op.  `Approve` releases it: the
+//! Warden records the release on the same op and ships it before it
+//! answers `Approved`, and from then on the Vessel's sender finds it on
+//! `Open`.  Only a proposal the Vessel's last Seal covers can be
+//! approved.  `Deny` closes it as not applied with `reason` (at most
+//! [`MAX_DENY_REASON`] bytes), sealed or not; nothing is sent.  Either,
+//! asked again, answers the same with `before` set and writes nothing, so
+//! a lost reply is answered by asking again.  `Refused` is the Warden's
+//! answer that the decision cannot be taken (not a held action, not
+//! sealed yet, an earlier effect unresolved, not shipped): for good or
+//! until the state it names changes.  `Error` is not an answer about the
+//! action: the request was malformed, or the Warden could not reach the
+//! Vessel now ("ask again").
 
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
@@ -42,6 +60,10 @@ use crate::record::IntentRecord;
 /// The protocol version.  2: `Pending` in pages (review fix N3b-a).  3:
 /// `Proposals`.  A peer speaking another version is refused at `Hello`.
 pub const VERSION: u32 = 3;
+
+/// The most bytes of a `Deny`'s reason: it is recorded with the action
+/// and read by the agent.
+pub const MAX_DENY_REASON: usize = 1024;
 
 /// The most items in one `Pending` page.
 pub const PENDING_PAGE: usize = 64;
@@ -71,8 +93,9 @@ pub struct ProposalItem {
     pub intent: IntentRecord,
     /// Whether the Vessel's last Seal covers it (the intent is at or
     /// before that Seal's ledger position): what a promotion at that Seal
-    /// would adopt.  One that is not is of a turn that has not ended, and
-    /// cannot be promoted yet.
+    /// would adopt, and what can be approved.  One that is not is of a
+    /// turn that has not ended: if that turn is lost (a Warden restart),
+    /// the proposal is withdrawn with it and its agent asks again.
     pub sealed: bool,
 }
 
@@ -191,6 +214,22 @@ pub enum Request {
         /// The last op of the page before; `None`: from the first.
         after: Option<u64>,
     },
+    /// Release one held proposal of a Vessel.
+    Approve {
+        /// The Vessel's Chronicle id.
+        vessel: ChronicleId,
+        /// The proposal's op, as `Proposals` listed it.
+        op: u64,
+    },
+    /// Close one held proposal of a Vessel as not applied.
+    Deny {
+        /// The Vessel's Chronicle id.
+        vessel: ChronicleId,
+        /// The proposal's op.
+        op: u64,
+        /// Why, for the agent and the history ([`MAX_DENY_REASON`]).
+        reason: String,
+    },
 }
 
 /// A reply from the decider socket.
@@ -227,6 +266,28 @@ pub enum Reply {
         /// The Vessel's last Seal, by which `sealed` was decided; `None`:
         /// it has none.
         last_seal: Option<Lsn>,
+    },
+    /// The proposal is released: recorded and shipped.
+    Approved {
+        /// Its op.
+        op: u64,
+        /// It was approved before this request: nothing was written.
+        before: bool,
+    },
+    /// The proposal is closed as not applied.
+    Denied {
+        /// Its op.
+        op: u64,
+        /// It was denied before this request: nothing was written.
+        before: bool,
+    },
+    /// The decision cannot be taken; the action is as it was, unless
+    /// `why` says it was closed.
+    Refused {
+        /// The op.
+        op: u64,
+        /// Why, for a person.
+        why: String,
     },
 }
 
@@ -347,6 +408,16 @@ impl Request {
                     Some(op) => c.tag(1).u64(*op),
                 };
             }
+            Self::Approve { vessel, op } => {
+                c.tag(4);
+                vessel.canon(&mut c);
+                c.u64(*op);
+            }
+            Self::Deny { vessel, op, reason } => {
+                c.tag(5);
+                vessel.canon(&mut c);
+                c.u64(*op).str(reason);
+            }
         }
         c.into_bytes()
     }
@@ -365,6 +436,15 @@ impl Request {
             (_, 3) => Self::Proposals {
                 vessel: r.chronicle()?,
                 after: r.option(Reader::u64)?,
+            },
+            (_, 4) => Self::Approve {
+                vessel: r.chronicle()?,
+                op: r.u64()?,
+            },
+            (_, 5) => Self::Deny {
+                vessel: r.chronicle()?,
+                op: r.u64()?,
+                reason: r.string()?,
             },
             (at, t) => return Reader::bad(at, "decider request", t),
         };
@@ -401,6 +481,15 @@ impl Reply {
                     .bool(*more)
                     .option(last_seal.as_ref());
             }
+            Self::Approved { op, before } => {
+                c.tag(5).u64(*op).bool(*before);
+            }
+            Self::Denied { op, before } => {
+                c.tag(6).u64(*op).bool(*before);
+            }
+            Self::Refused { op, why } => {
+                c.tag(7).u64(*op).str(why);
+            }
         }
         c.into_bytes()
     }
@@ -435,6 +524,18 @@ impl Reply {
                 })?,
                 more: r.bool()?,
                 last_seal: r.option(Reader::lsn)?,
+            },
+            (_, 5) => Self::Approved {
+                op: r.u64()?,
+                before: r.bool()?,
+            },
+            (_, 6) => Self::Denied {
+                op: r.u64()?,
+                before: r.bool()?,
+            },
+            (_, 7) => Self::Refused {
+                op: r.u64()?,
+                why: r.string()?,
             },
             (at, t) => return Reader::bad(at, "decider reply", t),
         };
@@ -530,7 +631,7 @@ mod tests {
             }
         }
         assert!(matches!(
-            Request::decode(&[4]),
+            Request::decode(&[6]),
             Err(DecodeError::BadTag { .. })
         ));
         for p in every_reply() {
@@ -690,6 +791,73 @@ mod tests {
             assert!(Reply::decode(&t).is_err());
             assert!(Reply::decode(&b[..b.len() - 1]).is_err());
         }
+    }
+
+    /// Approve and Deny, and their three replies, round-trip under their
+    /// own tags, and decoding stays strict.
+    #[test]
+    fn decisions_round_trip_and_decoding_is_strict() {
+        let vessel = ChronicleId::from_bytes([5; 16]);
+        for (q, tag) in [
+            (Request::Approve { vessel, op: 7 }, 4),
+            (
+                Request::Deny {
+                    vessel,
+                    op: 7,
+                    reason: "not on the list".into(),
+                },
+                5,
+            ),
+            (
+                Request::Deny {
+                    vessel,
+                    op: u64::MAX,
+                    reason: String::new(),
+                },
+                5,
+            ),
+        ] {
+            let b = q.encode();
+            assert_eq!(b[0], tag);
+            assert_eq!(Request::decode(&b).unwrap(), q);
+            let mut t = b.clone();
+            t.push(0);
+            assert!(Request::decode(&t).is_err());
+            assert!(Request::decode(&b[..b.len() - 1]).is_err());
+        }
+        for (p, tag) in [
+            (
+                Reply::Approved {
+                    op: 7,
+                    before: false,
+                },
+                5,
+            ),
+            (
+                Reply::Denied {
+                    op: 7,
+                    before: true,
+                },
+                6,
+            ),
+            (
+                Reply::Refused {
+                    op: 7,
+                    why: "op 7 is held but not sealed yet".into(),
+                },
+                7,
+            ),
+        ] {
+            let b = p.encode();
+            assert_eq!(b[0], tag);
+            assert_eq!(Reply::decode(&b).unwrap(), p);
+            let mut t = b.clone();
+            t.push(0);
+            assert!(Reply::decode(&t).is_err());
+            assert!(Reply::decode(&b[..b.len() - 1]).is_err());
+        }
+        assert!(Request::decode(&[6]).is_err(), "no request 6");
+        assert!(Reply::decode(&[8]).is_err(), "no reply 8");
     }
 
     /// 4a: 150 proposals, given in any order, are each seen once, in op

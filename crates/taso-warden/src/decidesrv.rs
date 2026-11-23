@@ -83,6 +83,43 @@ pub trait Decide: Send + Sync {
         let _ = vessel;
         Err("this Warden lists no proposals".into())
     }
+    /// `peer`'s decision on the held proposal `op` of `vessel` (design
+    /// `Taso_design_proposals_inbox` §1b, §1c).  `Ok`: taken, or refused
+    /// with why (the action is as it was unless that says it was closed).
+    /// `Err`: this node could not answer for the Vessel now; the same
+    /// request may be sent again (a decision asked twice is taken once).
+    fn decide(
+        &self,
+        vessel: ChronicleId,
+        op: u64,
+        ruling: &Ruling,
+        peer: Peer,
+    ) -> Result<Ruled, String> {
+        let _ = (vessel, op, ruling, peer);
+        Err("this Warden decides no proposals".into())
+    }
+}
+
+/// A reviewer's decision on one held proposal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ruling {
+    /// Release it.
+    Approve,
+    /// Close it as not applied, with this reason.
+    Deny(String),
+}
+
+/// What became of a [`Ruling`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ruled {
+    /// Taken; `before`: the same decision was recorded before this
+    /// request, and nothing was written.
+    Done {
+        /// See above.
+        before: bool,
+    },
+    /// Not taken, and why.
+    Refused(String),
 }
 
 /// The serving socket.  Dropping it stops it.
@@ -351,10 +388,39 @@ fn serve_conn(d: &dyn Decide, mut s: UnixStream, peer: Peer, max_frame: u32) {
                 }
                 Err(e) => (err(e), false),
             },
+            Ok(Request::Deny { reason, .. })
+                if reason.len() > taso_core::decider::MAX_DENY_REASON =>
+            {
+                (
+                    err(format!(
+                        "a reason of {} bytes is over {}",
+                        reason.len(),
+                        taso_core::decider::MAX_DENY_REASON
+                    )),
+                    false,
+                )
+            }
+            Ok(Request::Approve { vessel, op }) => (
+                ruled(op, true, d.decide(vessel, op, &Ruling::Approve, peer)),
+                false,
+            ),
+            Ok(Request::Deny { vessel, op, reason }) => (
+                ruled(op, false, d.decide(vessel, op, &Ruling::Deny(reason), peer)),
+                false,
+            ),
         };
         if send(&mut s, &reply).is_err() || close {
             return;
         }
+    }
+}
+
+fn ruled(op: u64, approval: bool, r: Result<Ruled, String>) -> Reply {
+    match r {
+        Ok(Ruled::Done { before }) if approval => Reply::Approved { op, before },
+        Ok(Ruled::Done { before }) => Reply::Denied { op, before },
+        Ok(Ruled::Refused(why)) => Reply::Refused { op, why },
+        Err(e) => err(e),
     }
 }
 
@@ -412,6 +478,37 @@ impl DeciderClient {
             if !more {
                 return Ok(all);
             }
+        }
+    }
+
+    /// Approve or deny the held proposal `op` of `vessel`.  `Ok`: the
+    /// Warden's answer ([`Ruled`]); `Err`: it could not answer for the
+    /// Vessel now, or the socket failed: the same request may be sent
+    /// again.
+    pub fn decide(
+        &mut self,
+        vessel: ChronicleId,
+        op: u64,
+        ruling: &Ruling,
+    ) -> Result<Ruled, String> {
+        let request = match ruling {
+            Ruling::Approve => Request::Approve { vessel, op },
+            Ruling::Deny(reason) => Request::Deny {
+                vessel,
+                op,
+                reason: reason.clone(),
+            },
+        };
+        match self.call(&request).map_err(|e| e.to_string())? {
+            Reply::Approved { op: o, before } if o == op && *ruling == Ruling::Approve => {
+                Ok(Ruled::Done { before })
+            }
+            Reply::Denied { op: o, before } if o == op && *ruling != Ruling::Approve => {
+                Ok(Ruled::Done { before })
+            }
+            Reply::Refused { op: o, why } if o == op => Ok(Ruled::Refused(why)),
+            Reply::Error { message } => Err(message),
+            other => Err(format!("unexpected reply {other:?}")),
         }
     }
 
@@ -874,6 +971,94 @@ mod tests {
         let mut c2 = DeciderClient::connect(&conf2.socket).unwrap();
         let e = c2.proposals_all(vessel).unwrap_err();
         assert!(e.contains("lists no proposals"), "{e}");
+    }
+
+    /// A Decide that answers each decision by its op: 1 taken, 2 taken
+    /// before, 3 refused, anything else it cannot answer now; and keeps
+    /// what it was asked, with the peer.
+    #[derive(Default)]
+    struct Decider(Mutex<Vec<(ChronicleId, u64, Ruling, Peer)>>);
+
+    impl Decide for Decider {
+        fn pending(&self) -> Result<Vec<PendingItem>, String> {
+            Ok(Vec::new())
+        }
+        fn verdict(&self, _: &VerdictRequest, _: Peer) -> Result<VerdictAnswer, String> {
+            Err("no verdicts here".into())
+        }
+        fn decide(
+            &self,
+            vessel: ChronicleId,
+            op: u64,
+            ruling: &Ruling,
+            peer: Peer,
+        ) -> Result<Ruled, String> {
+            lock(&self.0).push((vessel, op, ruling.clone(), peer));
+            match op {
+                1 => Ok(Ruled::Done { before: false }),
+                2 => Ok(Ruled::Done { before: true }),
+                3 => Ok(Ruled::Refused("op 3 is held but not sealed yet".into())),
+                _ => Err("the Vessel is being opened: ask again".into()),
+            }
+        }
+    }
+
+    /// Approve and Deny: each reaches the Warden with the Vessel, the op,
+    /// the reason and the kernel's word on the peer, and its answer comes
+    /// back as it is: taken, taken before, refused with why, or (an
+    /// Error) not answerable now.  A reason over the limit is refused
+    /// before the Warden sees it, and the connection goes on.  A Warden
+    /// that decides nothing says so.
+    #[test]
+    fn decisions_reach_the_warden_and_its_answer_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf = DeciderConf {
+            socket: dir.path().join("d").join("decide.sock"),
+            max_frame_bytes: 64 * 1024,
+            max_connections: 8,
+        };
+        let d = Arc::new(Decider::default());
+        let _srv = DeciderServer::spawn(&conf, d.clone()).unwrap();
+        let mut c = DeciderClient::connect(&conf.socket).unwrap();
+        let vessel = ChronicleId::from_bytes([5; 16]);
+        let deny = Ruling::Deny("not on the list".into());
+        assert_eq!(
+            c.decide(vessel, 1, &Ruling::Approve),
+            Ok(Ruled::Done { before: false })
+        );
+        assert_eq!(c.decide(vessel, 2, &deny), Ok(Ruled::Done { before: true }));
+        assert_eq!(
+            c.decide(vessel, 3, &Ruling::Approve),
+            Ok(Ruled::Refused("op 3 is held but not sealed yet".into()))
+        );
+        let e = c.decide(vessel, 4, &deny).unwrap_err();
+        assert!(e.contains("ask again"), "{e}");
+        let long = Ruling::Deny("x".repeat(taso_core::decider::MAX_DENY_REASON + 1));
+        let e = c.decide(vessel, 1, &long).unwrap_err();
+        assert!(e.contains("is over 1024"), "{e}");
+        assert_eq!(
+            c.decide(vessel, 1, &Ruling::Approve),
+            Ok(Ruled::Done { before: false }),
+            "the connection goes on"
+        );
+        let seen = lock(&d.0);
+        assert_eq!(seen.len(), 5, "the long reason never reached the Warden");
+        assert_eq!((seen[1].0, seen[1].1, &seen[1].2), (vessel, 2, &deny));
+        assert!(seen.iter().all(
+            |s| s.3.uid == rustix::process::getuid().as_raw() && s.3.pid == std::process::id()
+        ));
+        drop(seen);
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let conf2 = DeciderConf {
+            socket: dir2.path().join("d").join("decide.sock"),
+            max_frame_bytes: 4096,
+            max_connections: 8,
+        };
+        let _srv2 = DeciderServer::spawn(&conf2, Arc::new(NoProposals)).unwrap();
+        let mut c2 = DeciderClient::connect(&conf2.socket).unwrap();
+        let e = c2.decide(vessel, 1, &Ruling::Approve).unwrap_err();
+        assert!(e.contains("decides no proposals"), "{e}");
     }
 
     /// 4a: Proposals before Hello is out of order, as any request is.
