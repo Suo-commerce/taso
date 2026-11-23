@@ -5722,14 +5722,17 @@ impl Node {
         // Both sockets, every connection on its own thread, every request
         // handled here, one at a time (C5).
         let mut connections = 0;
-        // A Vessel that is not started again (`"restart": "never"`: every
-        // fork, and a one-run entry) has its sender's last chance to
-        // report in this run: once its agent is gone, the sender's socket
+        // A fork made on its agent's request is run in this life of the
+        // Warden and in no later one, so this run is its sender's last
+        // chance to report: once its agent is gone, the sender's socket
         // stays served until every released action has its outcome
         // (design §1f).  Not when the run ends to start again at once (a
-        // promotion), nor when this Warden is stopping; and a Vessel that
-        // is restarted serves its sender again in its next run.
-        let last_run = vc.restart == Restart::Never;
+        // promotion), nor when this Warden is stopping.  A Vessel the
+        // source lists does not wait: it is started again with the Warden
+        // and serves its sender then (waiting here kept a Warden with a
+        // fixed list from ever ending when no sender came: taso-test
+        // 2026-11-23, blkpool and f6fork timed out on 3280f34).
+        let last_run = vc.restart == Restart::Never && self.requested.runs_once(id.as_bytes());
         let (warden_stop, promoted_now) = (stop.clone(), promoted.clone());
         let linger = move || last_run && !warden_stop.requested() && !promoted_now.requested();
         let stop = || exited.load(Ordering::SeqCst);

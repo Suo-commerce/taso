@@ -187,6 +187,15 @@ impl Requested {
         st.waiting.contains(key) && !st.listed.contains(key)
     }
 
+    /// True if `key` is run by this registry alone: a fork made on an
+    /// agent's request (or added for its sender), which no later life of
+    /// the Warden starts by itself.  Not a Vessel the source lists: that
+    /// one is started again whenever the Warden is.
+    pub fn runs_once(&self, key: &VesselKey) -> bool {
+        let st = self.lock();
+        st.entries.contains_key(key) && !st.listed.contains(key)
+    }
+
     /// True if an entry with Vessel id `key` is here.
     pub fn contains(&self, key: &VesselKey) -> bool {
         self.lock().entries.contains_key(key)
@@ -785,6 +794,9 @@ mod tests {
         let set = src.poll(z).unwrap().unwrap();
         assert_eq!(set.iter().find(|v| v.subject == "b").unwrap().uid_slot, 2);
         assert!(req.sender_only(&key(&a)) && !req.sender_only(&key(&b)));
+        // What runs once: the registry's own, not the source's.
+        assert!(req.runs_once(&key(&a)) && req.runs_once(&key(&c)));
+        assert!(!req.runs_once(&key(&b)) && !req.runs_once(&key(&vc("p", 1))));
     }
 
     fn with_forks(subject: &str, slot: u32, forks: &[u32]) -> VesselConf {
