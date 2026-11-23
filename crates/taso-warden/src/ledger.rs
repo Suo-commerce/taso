@@ -22,6 +22,12 @@
 //!   parent may adopt it ([`Ledger::adopt`]): a released intent of the
 //!   parent's own, with a new op id, whose `authority` names the child,
 //!   its Seal and the child's op ([`AdoptedFrom`]).
+//! - **Released or closed from outside.**  A reviewer may release one
+//!   held proposal ([`Ledger::approve`]: `DispatchAuthorized` on the same
+//!   op, from then on a release like any other) or close it
+//!   ([`Ledger::deny`]: `ConfirmedNotApplied`, [`DENIED`] and the reason).
+//!   Which proposals may be approved is the engine's to check
+//!   ([`crate::effects::Effects::approve`]).
 //! - **Off the node before anything is sent.**
 //!   [`Ledger::ship_before_send`] publishes the ledger up to its tail
 //!   ([`Publish`]): shipped and recorded as the coordinator's shipped
@@ -75,6 +81,11 @@ pub struct Reconciled {
 /// start, closed `ConfirmedNotApplied` (it was never released, so never
 /// sent).
 pub const WITHDRAWN: &str = "withdrawn: its turn was reset";
+
+/// How the evidence of a denial begins: a held proposal a reviewer closed
+/// `ConfirmedNotApplied` ([`Ledger::deny`]); the reviewer's reason
+/// follows.
+pub const DENIED: &str = "denied: ";
 
 // ── Publishing ──────────────────────────────────────────────────────
 
@@ -323,6 +334,46 @@ impl Ledger {
         d: &Declared,
     ) -> Result<Authorized, VesselError> {
         self.write(vessel, d, OutcomeState::Proposed, "effect.propose")
+    }
+
+    /// Release a held proposal of this Vessel (design
+    /// `Taso_design_proposals_inbox` §1b): `DispatchAuthorized` on its
+    /// own op, one write.  The caller has checked that `op` is held and
+    /// sealed, and ships the ledger before anyone may act on it
+    /// ([`Ledger::ship_before_send`]), as for a release.
+    pub fn approve<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        op: OpId,
+    ) -> Result<(), VesselError> {
+        let _t = crate::timing::span("effect.approve");
+        vessel.append(
+            Stream::Effect,
+            outcome(op, OutcomeState::DispatchAuthorized, None),
+        )?;
+        Ok(())
+    }
+
+    /// Close a held proposal of this Vessel as not applied (§1c):
+    /// `ConfirmedNotApplied` with [`DENIED`] and `reason`.  It was never
+    /// released, so nothing was sent.  The caller has checked that `op`
+    /// is held.
+    pub fn deny<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        op: OpId,
+        reason: &str,
+    ) -> Result<(), VesselError> {
+        let _t = crate::timing::span("effect.deny");
+        vessel.append(
+            Stream::Effect,
+            outcome(
+                op,
+                OutcomeState::ConfirmedNotApplied,
+                Some(format!("{DENIED}{reason}").into_bytes()),
+            ),
+        )?;
+        Ok(())
     }
 
     /// Adopt a child's proposals, all in one write, one fsync, one CAS:

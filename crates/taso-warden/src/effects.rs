@@ -26,6 +26,20 @@
 //!    `Proposed`, durable together) and answers *held*.  Nothing is ever
 //!    released from this Chronicle; only its parent may adopt it.
 //!
+//! # Deciding from outside ([`Effects::approve`], [`Effects::deny`])
+//!
+//! A reviewer on the decider socket may release one held proposal or
+//! close it (design `Taso_design_proposals_inbox` §1b, §1c).  An approval
+//! is refused unless the proposal is held and its Vessel's last Seal
+//! covers it (an unsealed one belongs to a turn that may be run again,
+//! and would then be declared and sent twice), and while effect authority
+//! is withheld.  It is a release from then on: recorded
+//! (`DispatchAuthorized` on the same op), shipped before it is answered,
+//! listed for the sender; a failed ship closes it as not applied, as for
+//! a release.  A denial closes a held proposal, sealed or not, as not
+//! applied with the reviewer's reason; nothing is sent, and it makes
+//! room in the outbox.  Each is answered the same when asked again.
+//!
 //! # Reporting ([`Effects::report`])
 //!
 //! The sender reports `Applied`, `NotApplied` or `Unknown` for a released
@@ -167,6 +181,66 @@ fn weight_of(i: &IntentRecord) -> usize {
         &i.authority,
         &i.retry,
     )
+}
+
+/// A reviewer's decision on a held proposal, done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decided {
+    /// Recorded now.
+    Now,
+    /// The same decision was recorded before: nothing was written.
+    Before,
+}
+
+/// Why a reviewer's decision on a held proposal was refused.
+#[derive(Debug)]
+pub enum DecideError {
+    /// The op is not a held proposal of this Vessel; what it is instead.
+    NotHeld {
+        /// The op.
+        op: OpId,
+        /// "no such action", "released", "closed as not applied: …".
+        is: String,
+    },
+    /// Held, but past the Vessel's last Seal: it can be approved once a
+    /// Seal covers it.
+    NotSealed(OpId),
+    /// Effect authority is withheld: an earlier effect is unresolved.
+    NoAuthority(usize),
+    /// Approved and recorded, but the ledger could not be shipped: the
+    /// action is closed as not applied (with this reason) and nothing may
+    /// be sent.  The agent may ask for it again.
+    NotShipped(String),
+    /// Recording it failed.
+    Vessel(VesselError),
+}
+
+impl std::fmt::Display for DecideError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotHeld { op, is } => write!(f, "op {} is not a held action: {is}", op.get()),
+            Self::NotSealed(op) => write!(
+                f,
+                "op {} is held but not sealed yet: it can be approved once its turn has ended",
+                op.get()
+            ),
+            Self::NoAuthority(n) => write!(
+                f,
+                "no effect authority: {n} unresolved effect(s) of this Vessel wait for their outcome"
+            ),
+            Self::NotShipped(why) => write!(
+                f,
+                "not released, and closed as not applied: {why}; the agent may ask for it again"
+            ),
+            Self::Vessel(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<VesselError> for DecideError {
+    fn from(e: VesselError) -> Self {
+        Self::Vessel(e)
+    }
 }
 
 /// Why a sender's report was refused.
@@ -515,6 +589,137 @@ impl Effects {
             self.released.remove(&op);
         }
         Ok(())
+    }
+
+    /// Every outcome of `op` in the local log, oldest first; `None` if
+    /// its intent is not there.
+    fn outcomes<L: Layers>(
+        &self,
+        vessel: &Vessel<L>,
+        op: OpId,
+    ) -> Result<Option<Vec<taso_core::record::OutcomeRecord>>, VesselError> {
+        let frames = vessel
+            .chronicle()
+            .frames()
+            .map_err(|e| VesselError::Chronicle(crate::chronicle::ChronicleError::Segment(e)))?;
+        let mut found = None;
+        for f in &frames {
+            if f.envelope.stream != taso_core::envelope::Stream::Effect {
+                continue;
+            }
+            let p = taso_core::record::Payload::decode(&f.payload).map_err(|error| {
+                VesselError::Decode {
+                    lsn: f.envelope.lsn,
+                    error,
+                }
+            })?;
+            match p {
+                taso_core::record::Payload::Intent(i) if i.op == op => found = Some(Vec::new()),
+                taso_core::record::Payload::Outcome(o) if o.op == op => {
+                    if let Some(v) = found.as_mut() {
+                        v.push(o);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(found)
+    }
+
+    /// What `op` is, for a reviewer whose decision found it not held; and
+    /// whether that same decision (`approval`, or a denial) was recorded
+    /// for it before.
+    fn not_held<L: Layers>(
+        &self,
+        vessel: &Vessel<L>,
+        op: OpId,
+        approval: bool,
+    ) -> Result<Result<Decided, DecideError>, VesselError> {
+        use OutcomeState as S;
+        let not = |is: String| Ok(Err(DecideError::NotHeld { op, is }));
+        let Some(outcomes) = self.outcomes(vessel, op)? else {
+            return not(match self.result(vessel, op)? {
+                // Its intent is behind a Checkpoint: open, but not held.
+                Some(_) => "released, waiting for its outcome".into(),
+                None => "no such action in this Vessel's log".into(),
+            });
+        };
+        // Approved before: held, then released.
+        let approved = outcomes
+            .windows(2)
+            .any(|w| w[0].state == S::Proposed && w[1].state == S::DispatchAuthorized);
+        let last = outcomes.last();
+        let text = |o: &taso_core::record::OutcomeRecord| {
+            String::from_utf8_lossy(o.evidence.as_deref().unwrap_or_default()).into_owned()
+        };
+        match last {
+            Some(o) if o.state == S::ConfirmedNotApplied => {
+                let why = text(o);
+                if !approval && !approved && why.starts_with(crate::ledger::DENIED) {
+                    return Ok(Ok(Decided::Before));
+                }
+                not(format!("closed as not applied: {why}"))
+            }
+            Some(_) if approved && approval => Ok(Ok(Decided::Before)),
+            Some(_) if approved => not("approved before, and released".into()),
+            Some(o) if o.state == S::ConfirmedApplied => not("applied".into()),
+            Some(_) => not("released by its own Vessel, not held".into()),
+            None => not("recorded but never released or held".into()),
+        }
+    }
+
+    /// A reviewer releases the held proposal `op` (module docs).
+    pub fn approve<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        op: OpId,
+    ) -> Result<Decided, DecideError> {
+        let (held, _) = vessel.held_proposals()?;
+        let Some(item) = held.into_iter().find(|i| i.intent.op == op) else {
+            return self.not_held(vessel, op, true)?;
+        };
+        if !item.sealed {
+            return Err(DecideError::NotSealed(op));
+        }
+        if !self.ledger.authorized() {
+            return Err(DecideError::NoAuthority(
+                self.ledger.open_obligations().len(),
+            ));
+        }
+        self.ledger.approve(vessel, op)?;
+        let a = Authorized {
+            op,
+            barrier: item.intent.barrier,
+        };
+        // Off the node before anyone may act on it, as a release.
+        match self.ledger.ship_before_send(vessel, &a)? {
+            Ok(()) => {
+                self.released.append(&mut self.unlisted);
+                self.released.insert(op, a.barrier);
+                Ok(Decided::Now)
+            }
+            Err(reason) => {
+                self.waiting = self.waiting.saturating_sub(weight_of(&item.intent));
+                Err(DecideError::NotShipped(reason))
+            }
+        }
+    }
+
+    /// A reviewer closes the held proposal `op` as not applied, with its
+    /// `reason` (module docs).
+    pub fn deny<L: Layers>(
+        &mut self,
+        vessel: &mut Vessel<L>,
+        op: OpId,
+        reason: &str,
+    ) -> Result<Decided, DecideError> {
+        let (held, _) = vessel.held_proposals()?;
+        let Some(item) = held.into_iter().find(|i| i.intent.op == op) else {
+            return self.not_held(vessel, op, false)?;
+        };
+        self.ledger.deny(vessel, op, reason)?;
+        self.waiting = self.waiting.saturating_sub(weight_of(&item.intent));
+        Ok(Decided::Now)
     }
 
     /// Operator resolution of an open effect: record what really happened.
@@ -1019,6 +1224,324 @@ mod tests {
         c.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(1))
             .unwrap();
         c.id()
+    }
+
+    // ── a reviewer's decisions (Approve, Deny) ──────────────────────
+
+    fn open_hold(
+        v: &mut Vessel<FakeLayers>,
+        published: &Rc<Cell<u32>>,
+        fails: &Rc<Cell<u32>>,
+    ) -> Effects {
+        Effects::open(Mode::Hold, counting(published, fails), v)
+            .unwrap()
+            .0
+    }
+
+    fn seal(v: &mut Vessel<FakeLayers>, turn: u64) {
+        let pos = ledger_pos(v).unwrap();
+        v.seal(StreamCut::EMPTY, Verdict::Clean, pos, TurnId::new(turn))
+            .unwrap();
+    }
+
+    fn held(v: &Vessel<FakeLayers>) -> Vec<(u64, bool)> {
+        v.held_proposals()
+            .unwrap()
+            .0
+            .iter()
+            .map(|i| (i.intent.op.get(), i.sealed))
+            .collect()
+    }
+
+    fn text(fx: &Effects, v: &Vessel<FakeLayers>, op: u64) -> (Option<OutcomeState>, String) {
+        let r = fx.result(v, OpId::new(op)).unwrap().unwrap();
+        (
+            r.state,
+            String::from_utf8_lossy(&r.evidence.unwrap_or_default()).into_owned(),
+        )
+    }
+
+    /// Approve (design §1b): a held action can be released only once its
+    /// Vessel's Seal covers it; then it is recorded on its own op,
+    /// shipped before it is answered, listed for the sender, and no
+    /// longer held; the sender's report settles it as any release.
+    /// Approving it again answers the same and writes nothing.
+    #[test]
+    fn a_sealed_held_action_is_released_by_an_approval() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (published, fails) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let mut fx = open_hold(&mut v, &published, &fails);
+        assert_eq!(
+            fx.ask(&mut v, &pay("a")).unwrap(),
+            Asked::Held { op: OpId::new(1) }
+        );
+        assert_eq!(held(&v), [(1, false)]);
+        assert!(matches!(
+            fx.approve(&mut v, OpId::new(1)),
+            Err(DecideError::NotSealed(op)) if op == OpId::new(1)
+        ));
+        assert_eq!(states(&v), [(1, OutcomeState::Proposed)], "nothing written");
+        seal(&mut v, 1);
+        assert_eq!(held(&v), [(1, true)]);
+        assert_eq!(published.get(), 0, "a holder has shipped nothing yet");
+
+        assert_eq!(fx.approve(&mut v, OpId::new(1)).unwrap(), Decided::Now);
+        assert_eq!(published.get(), 1, "shipped before it is answered");
+        assert_eq!(
+            states(&v),
+            [
+                (1, OutcomeState::Proposed),
+                (1, OutcomeState::DispatchAuthorized)
+            ]
+        );
+        assert!(held(&v).is_empty(), "no longer held");
+        let listed = fx.released(&v).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].intent.request, b"a");
+        assert_eq!(listed[0].state, OutcomeState::DispatchAuthorized);
+        assert_eq!(text(&fx, &v, 1).0, Some(OutcomeState::DispatchAuthorized));
+
+        let before = v.tail();
+        assert_eq!(fx.approve(&mut v, OpId::new(1)).unwrap(), Decided::Before);
+        assert_eq!(v.tail(), before, "nothing written");
+        assert!(matches!(
+            fx.deny(&mut v, OpId::new(1), "late"),
+            Err(DecideError::NotHeld { .. })
+        ));
+
+        fx.report(
+            &mut v,
+            OpId::new(1),
+            &Answer::Applied {
+                receipt: b"page".to_vec(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            text(&fx, &v, 1),
+            (Some(OutcomeState::ConfirmedApplied), "page".into())
+        );
+        assert!(fx.released(&v).unwrap().is_empty());
+        assert_eq!(fx.approve(&mut v, OpId::new(1)).unwrap(), Decided::Before);
+    }
+
+    /// Approve: what is not a held action is refused by name and nothing
+    /// is written: an op the Vessel never had, one its own Vessel
+    /// released, one withdrawn with its lost turn, one denied.
+    #[test]
+    fn an_approval_of_what_is_not_held_is_refused_by_name() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut v);
+        fx.ask(&mut v, &pay("own")).unwrap();
+        let is = |r: Result<Decided, DecideError>| match r {
+            Err(DecideError::NotHeld { is, .. }) => is,
+            other => panic!("{other:?}"),
+        };
+        assert!(is(fx.approve(&mut v, OpId::new(9))).contains("no such action"));
+        assert!(is(fx.approve(&mut v, OpId::new(1))).contains("released by its own Vessel"));
+        assert!(is(fx.deny(&mut v, OpId::new(1), "no")).contains("released by its own Vessel"));
+        fx.report(
+            &mut v,
+            OpId::new(1),
+            &Answer::Applied {
+                receipt: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(is(fx.approve(&mut v, OpId::new(1))).contains("applied"));
+        drop(fx);
+
+        // A holder: op 2 sealed, op 3 of a turn that is lost.
+        let (published, fails) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let mut fx = open_hold(&mut v, &published, &fails);
+        fx.ask(&mut v, &pay("kept")).unwrap();
+        seal(&mut v, 1);
+        fx.ask(&mut v, &pay("lost")).unwrap();
+        drop(fx);
+        let mut fx = open_hold(&mut v, &published, &fails);
+        assert_eq!(held(&v), [(2, true)]);
+        assert!(is(fx.approve(&mut v, OpId::new(3))).contains(crate::ledger::WITHDRAWN));
+        assert_eq!(
+            fx.deny(&mut v, OpId::new(2), "not this").unwrap(),
+            Decided::Now
+        );
+        let before = v.tail();
+        assert!(is(fx.approve(&mut v, OpId::new(2))).contains("denied: not this"));
+        assert_eq!(v.tail(), before, "nothing written");
+    }
+
+    /// Approve: a ship that fails releases nothing.  The action is closed
+    /// as not applied with the reason, never listed, and the reviewer is
+    /// told; the agent may ask again.
+    #[test]
+    fn an_approval_that_cannot_be_shipped_releases_nothing() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (published, fails) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let mut fx = open_hold(&mut v, &published, &fails);
+        fx.ask(&mut v, &pay("a")).unwrap();
+        seal(&mut v, 1);
+        fails.set(1);
+        let err = fx.approve(&mut v, OpId::new(1)).unwrap_err();
+        assert!(
+            matches!(&err, DecideError::NotShipped(why) if why.contains("ledger not shipped")),
+            "{err}"
+        );
+        assert!(fx.released(&v).unwrap().is_empty());
+        assert!(held(&v).is_empty());
+        let (state, why) = text(&fx, &v, 1);
+        assert_eq!(state, Some(OutcomeState::ConfirmedNotApplied));
+        assert!(why.contains("ledger not shipped"), "{why}");
+        // Asked again by the agent, sealed, approved: released.
+        assert_eq!(
+            fx.ask(&mut v, &pay("a")).unwrap(),
+            Asked::Held { op: OpId::new(2) }
+        );
+        seal(&mut v, 2);
+        assert_eq!(fx.approve(&mut v, OpId::new(2)).unwrap(), Decided::Now);
+        assert_eq!(fx.released(&v).unwrap().len(), 1);
+    }
+
+    /// Approve: an approved action is a release from then on.  After a
+    /// restart it is not withdrawn with a lost turn; it is listed again
+    /// for the sender as possibly acted on, and it withholds effect
+    /// authority (an approval too) until the sender reports.
+    #[test]
+    fn an_approved_action_survives_a_restart_as_a_release() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (published, fails) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let mut fx = open_hold(&mut v, &published, &fails);
+        fx.ask(&mut v, &pay("a")).unwrap();
+        fx.ask(&mut v, &pay("b")).unwrap();
+        seal(&mut v, 1);
+        assert_eq!(fx.approve(&mut v, OpId::new(1)).unwrap(), Decided::Now);
+        drop(fx);
+        let mut fx = open_hold(&mut v, &published, &fails);
+        let listed = fx.hand_out(&v).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.intent.op, OpId::new(1));
+        assert!(listed[0].1, "may have been acted on");
+        assert_eq!(held(&v), [(2, true)], "the other is still held");
+        assert!(matches!(
+            fx.approve(&mut v, OpId::new(2)),
+            Err(DecideError::NoAuthority(1))
+        ));
+        fx.report(
+            &mut v,
+            OpId::new(1),
+            &Answer::NotApplied {
+                reason: "timed out".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(fx.approve(&mut v, OpId::new(2)).unwrap(), Decided::Now);
+    }
+
+    /// Deny (design §1c): a held action, sealed or not, is closed as not
+    /// applied with the reviewer's reason: the agent reads it, it is no
+    /// longer held, nothing is listed or shipped for it, and denying it
+    /// again answers the same and writes nothing.
+    #[test]
+    fn a_denied_action_is_closed_with_its_reason() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (published, fails) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let mut fx = open_hold(&mut v, &published, &fails);
+        fx.ask(&mut v, &pay("a")).unwrap();
+        seal(&mut v, 1);
+        fx.ask(&mut v, &pay("b")).unwrap();
+        assert_eq!(held(&v), [(1, true), (2, false)]);
+        for op in [1, 2] {
+            assert_eq!(
+                fx.deny(&mut v, OpId::new(op), "not allowed").unwrap(),
+                Decided::Now
+            );
+            assert_eq!(
+                text(&fx, &v, op),
+                (
+                    Some(OutcomeState::ConfirmedNotApplied),
+                    "denied: not allowed".into()
+                )
+            );
+        }
+        assert!(held(&v).is_empty());
+        assert!(fx.released(&v).unwrap().is_empty());
+        assert_eq!(published.get(), 0, "nothing became sendable");
+        let before = v.tail();
+        assert_eq!(
+            fx.deny(&mut v, OpId::new(1), "again").unwrap(),
+            Decided::Before
+        );
+        assert_eq!(v.tail(), before, "nothing written");
+        assert!(fx.authorized(), "a denial is no obligation");
+    }
+
+    /// Deny: held actions fill the outbox (nothing else closes them in a
+    /// root that holds); a denial makes room for the next.
+    #[test]
+    fn a_denial_makes_room_in_a_full_outbox() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (published, fails) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let mut fx = open_hold(&mut v, &published, &fails);
+        for k in 1..=7 {
+            assert_eq!(
+                fx.ask(&mut v, &big(k)).unwrap(),
+                Asked::Held { op: OpId::new(k) }
+            );
+        }
+        assert!(matches!(
+            fx.ask(&mut v, &big(8)).unwrap(),
+            Asked::Refused { .. }
+        ));
+        assert_eq!(
+            fx.deny(&mut v, OpId::new(3), "too many").unwrap(),
+            Decided::Now
+        );
+        assert_eq!(
+            fx.ask(&mut v, &big(8)).unwrap(),
+            Asked::Held { op: OpId::new(8) }
+        );
+    }
+
+    /// A-4 (b): a fork's sealed held action can be approved on the fork's
+    /// own ledger; its parent's promotion then adopts only what the fork
+    /// still holds, so the approved (and a denied) action is never sent
+    /// by that road too.
+    #[test]
+    fn a_promotion_adopts_only_what_the_fork_still_holds() {
+        let e = env();
+        let mut p = vessel(&e);
+        p.append(Stream::Fs, Payload::Raw(vec![1])).unwrap();
+        p.seal(
+            StreamCut::EMPTY,
+            Verdict::Clean,
+            Lsn::new(0),
+            TurnId::new(1),
+        )
+        .unwrap();
+        let kid = child(&e, &p, b"c1", 3);
+        {
+            let (mut c, _) = e.host.open(kid).unwrap();
+            let (mut cfx, _) = Effects::open(Mode::Hold, Box::new(AlwaysPublish), &mut c).unwrap();
+            assert_eq!(cfx.approve(&mut c, OpId::new(1)).unwrap(), Decided::Now);
+            assert_eq!(cfx.deny(&mut c, OpId::new(2), "no").unwrap(), Decided::Now);
+            assert_eq!(
+                cfx.released(&c).unwrap().len(),
+                1,
+                "the fork's own sender's"
+            );
+        }
+        let (mut fx, _) = Effects::open(Mode::Dispatch, Box::new(AlwaysPublish), &mut p).unwrap();
+        let log = e.host.read_log_of(kid).unwrap();
+        let (_, adopted) = fx.promote(&mut p, &log, SealAt::Last).unwrap();
+        assert_eq!(adopted.len(), 1);
+        let released = fx.released(&p).unwrap();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].intent.request, b"c1: pay 3");
     }
 
     /// N children fork, each proposes; one is promoted: the parent's
