@@ -5651,6 +5651,16 @@ impl Node {
         // Both sockets, every connection on its own thread, every request
         // handled here, one at a time (C5).
         let mut connections = 0;
+        // A Vessel that is not started again (`"restart": "never"`: every
+        // fork, and a one-run entry) has its sender's last chance to
+        // report in this run: once its agent is gone, the sender's socket
+        // stays served until every released action has its outcome
+        // (design §1f).  Not when the run ends to start again at once (a
+        // promotion), nor when this Warden is stopping; and a Vessel that
+        // is restarted serves its sender again in its next run.
+        let last_run = vc.restart == Restart::Never;
+        let (warden_stop, promoted_now) = (stop.clone(), promoted.clone());
+        let linger = move || last_run && !warden_stop.requested() && !promoted_now.requested();
         let stop = || exited.load(Ordering::SeqCst);
         let watch = if rt.quiescence.is_empty() {
             None
@@ -5698,6 +5708,7 @@ impl Node {
                     &socket,
                     &sender,
                     &stop,
+                    &linger,
                     Duration::from_millis(20),
                     &mut |e| match e {
                         ServeEvent::Ended(c) => {
@@ -5712,6 +5723,12 @@ impl Node {
                             vc,
                             format_args!(
                                 "fenced: {request} refused, another Warden holds this Vessel now: {message}"
+                            ),
+                        ),
+                        ServeEvent::Waiting { unanswered } => self.log(
+                            vc,
+                            format_args!(
+                                "its agent is gone and {unanswered} released action(s) have no outcome yet: the sender's socket stays open until its sender has answered each"
                             ),
                         ),
                         ServeEvent::Refused {

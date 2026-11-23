@@ -591,6 +591,26 @@ impl ReadLog {
         Ok(proposals)
     }
 
+    /// The released effects in this log that have no terminal outcome
+    /// yet, in op order: what its sender still has to answer.  A fork
+    /// with any is not promoted (design `Taso_design_proposals_inbox`
+    /// §1f): its result is not in, and the fork stays open for it.
+    pub fn unanswered(&self) -> Result<Vec<OpId>, VesselError> {
+        use taso_core::record::OutcomeState as S;
+        let summary = crate::summary::Summary::of(&self.frames)
+            .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+        Ok(summary
+            .obligations()
+            .filter(|e| {
+                matches!(
+                    e.state,
+                    Some(S::DispatchAuthorized | S::OutcomeUnknown | S::AcceptedUnknown)
+                )
+            })
+            .map(|e| e.intent.op)
+            .collect())
+    }
+
     /// Every held proposal in this log, in op order, each marked by
     /// whether the last accepted Seal covers it, and that Seal (4a).  A
     /// Seal past the anchored head is not accepted and covers nothing.

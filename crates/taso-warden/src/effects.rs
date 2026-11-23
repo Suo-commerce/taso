@@ -668,6 +668,14 @@ impl Effects {
         }
     }
 
+    /// How many released effects of this session still wait for a
+    /// terminal outcome from the sender (an `Unknown` report leaves one
+    /// waiting).  What a run that will not be started again waits for
+    /// before it closes the sender's socket.
+    pub fn unanswered(&self) -> usize {
+        self.released.len() + self.unlisted.len()
+    }
+
     /// A reviewer releases the held proposal `op` (module docs).
     pub fn approve<L: Layers>(
         &mut self,

@@ -348,6 +348,12 @@ impl<'v, L: Layers> Session<'v, L> {
         }
     }
 
+    /// The released effects of this session without a terminal outcome
+    /// ([`Effects::unanswered`]); none without an engine.
+    pub fn unanswered(&self) -> usize {
+        self.effects.as_deref().map_or(0, Effects::unanswered)
+    }
+
     /// A Seal whose publish failed before this session started (the
     /// Warden's start, or an adoption): counted as a failed publish and
     /// retried before the next effect, as a turn's Seal is (round 2,
@@ -781,6 +787,21 @@ impl<'v, L: Layers> Session<'v, L> {
             Ok(l) => l,
             Err(reason) => return refused(reason),
         };
+        // A fork whose sender has not answered a released action is not
+        // finished: its result is not in (design §1f).  The fork stays
+        // open for its sender; its parent waits, or goes on without it.
+        match log.unanswered() {
+            Ok(ops) if ops.is_empty() => {}
+            Ok(ops) => {
+                let list: Vec<String> = ops.iter().map(|o| o.get().to_string()).collect();
+                return refused(format!(
+                    "{child:?} still waits for its sender's answer to {} released action(s) (op {}): promote it once they are answered, or go on without it",
+                    ops.len(),
+                    list.join(", ")
+                ));
+            }
+            Err(e) => return refused(format!("the log of {child:?} cannot be read: {e}")),
+        }
         let before = self.vessel.tail();
         let r = fx.promote(self.vessel, &log, at(seal));
         if self.vessel.tail() != before {
@@ -1023,6 +1044,13 @@ pub enum ServeEvent<'a> {
         /// Refusals so far in this serve.
         refused: u64,
     },
+    /// The agent is gone and the serve goes on for the sender alone:
+    /// released actions wait for their outcome (design §1f).  Reported
+    /// once, when the wait begins.
+    Waiting {
+        /// How many wait.
+        unanswered: usize,
+    },
 }
 
 /// The most connections one of a Vessel's sockets holds at once (review
@@ -1162,6 +1190,13 @@ enum Msg {
 /// Serve a Vessel's two sockets (C5) until `stop` says so and the agent's
 /// connections have ended; then the sender's connections are closed.
 ///
+/// Unless `linger` says to wait and released actions still have no
+/// terminal outcome ([`Effects::unanswered`]): then the sender's socket
+/// goes on being served, the agent's no more, until the sender has
+/// answered each or `linger` says no (design §1f: a run that will not be
+/// started again is the sender's last chance to report, and an action
+/// nobody could report on stays open for good).
+///
 /// Each connection has its own thread, which only reads and writes
 /// frames; every request is handled here, by the one thread that owns
 /// `session`, one at a time, so the Vessel's Chronicle keeps one writer.
@@ -1175,6 +1210,7 @@ pub fn serve_vessel<L: Layers>(
     agent: &FieldSocket,
     sender: &FieldSocket,
     stop: &dyn Fn() -> bool,
+    linger: &dyn Fn() -> bool,
     tick: Duration,
     on_event: &mut dyn FnMut(ServeEvent<'_>),
 ) -> io::Result<()> {
@@ -1191,10 +1227,30 @@ pub fn serve_vessel<L: Layers>(
         let mut refused = 0u64;
         let mut closing = false;
         let mut failed: Option<io::Error> = None;
+        let mut said_waiting = false;
+        let mut closed_at: Option<Instant> = None;
         loop {
-            // New connections, unless stopping (or accepting failed).
-            if !stop() && failed.is_none() {
-                for (listener, socket) in [(agent, Socket::Agent), (sender, Socket::Sender)] {
+            let stopped = stop();
+            let agent_open = conns.values().any(|(c, _)| c.socket == Socket::Agent);
+            // The agent is gone; the sender still owes answers.
+            let waiting = stopped
+                && !agent_open
+                && !closing
+                && failed.is_none()
+                && linger()
+                && session.unanswered() > 0;
+            if waiting && !said_waiting {
+                said_waiting = true;
+                on_event(ServeEvent::Waiting {
+                    unanswered: session.unanswered(),
+                });
+            }
+            // New connections, unless stopping (or accepting failed);
+            // while waiting, the sender's only.
+            if (!stopped || waiting) && failed.is_none() {
+                let both = [(agent, Socket::Agent), (sender, Socket::Sender)];
+                let listeners = if stopped { &both[1..] } else { &both[..] };
+                for &(listener, socket) in listeners {
                     loop {
                         match listener.listener.accept() {
                             Ok((stream, _)) => {
@@ -1252,9 +1308,19 @@ pub fn serve_vessel<L: Layers>(
                         }
                     }
                 }
-            } else if !closing && !conns.values().any(|(c, _)| c.socket == Socket::Agent) {
-                // The agent is done: close the senders' connections.
+            } else if !closing && !agent_open {
+                // The agent is done: close the senders' connections.  Only
+                // their reading side at first, so that a reply already on
+                // its way (to the report that ended a wait) still arrives.
                 closing = true;
+                closed_at = Some(Instant::now());
+                for (_, stream) in conns.values() {
+                    let _ = stream.shutdown(std::net::Shutdown::Read);
+                }
+            }
+            // A connection that does not take its reply is cut.
+            if closed_at.is_some_and(|t| t.elapsed() >= CLOSE_GRACE) {
+                closed_at = None;
                 for (_, stream) in conns.values() {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
@@ -1301,6 +1367,10 @@ pub fn serve_vessel<L: Layers>(
     session.after_reply();
     Ok(())
 }
+
+/// How long a connection being closed has to take a reply already
+/// written for it, before it is cut.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// One connection's thread: frames in, requests to the owner, replies out,
 /// within its socket's `budget` and `frame_time` ([`recv_bounded`]).
@@ -3009,6 +3079,7 @@ mod tests {
                 &agent,
                 &sender,
                 &|| done.load(Ordering::SeqCst),
+                &|| false,
                 Duration::from_millis(5),
                 &mut |e| {
                     if let ServeEvent::Ended(c) = e {
@@ -3020,6 +3091,164 @@ mod tests {
         });
         ends.sort_by_key(|s| *s == Socket::Sender);
         assert_eq!(ends, [Socket::Agent, Socket::Sender]);
+    }
+
+    /// Design §1f: the agent goes with a released action unanswered.
+    /// With `linger`, the sender's socket stays served (said once, as
+    /// `Waiting`): a sender that connects only then lists the action and
+    /// reports it, and serving returns once it has; the agent's socket
+    /// takes no one meanwhile.  Without `linger` the serve ends with the
+    /// agent, as before, and the action stays unanswered.
+    #[test]
+    fn a_sender_can_still_answer_after_the_agent_is_gone() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for linger in [true, false] {
+            let e = env();
+            let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+            v.seal_birth().unwrap();
+            let (mut fx, _) = Effects::open(
+                Mode::Dispatch,
+                Box::new(crate::effects::AlwaysPublish),
+                &mut v,
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let agent = FieldSocket::bind(dir.path().join("agent.sock")).unwrap();
+            let sender = FieldSocket::bind(dir.path().join("sender.sock")).unwrap();
+            let done = AtomicBool::new(false);
+            let mut waited = Vec::new();
+            std::thread::scope(|scope| {
+                let (a, snd) = (agent.path().to_path_buf(), sender.path().to_path_buf());
+                let done = &done;
+                scope.spawn(move || {
+                    let ask = |c: &mut UnixStream, r: Request| {
+                        send_request(c, &r).unwrap();
+                        recv_reply(c).unwrap().unwrap()
+                    };
+                    let mut ag = UnixStream::connect(&a).unwrap();
+                    assert!(matches!(ask(&mut ag, hello()), Reply::Hello { .. }));
+                    assert!(matches!(
+                        ask(&mut ag, declare(1, "fetch", b"https://example.org/")),
+                        Reply::Effect {
+                            result: EffectResult::Released { op: 1 },
+                            ..
+                        }
+                    ));
+                    // The agent dies before any sender came.
+                    drop(ag);
+                    done.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(150));
+                    if !linger {
+                        return;
+                    }
+                    // A late agent connection is not taken ...
+                    let mut late = UnixStream::connect(&a).unwrap();
+                    send_request(&mut late, &hello()).unwrap();
+                    late.set_read_timeout(Some(Duration::from_millis(100)))
+                        .unwrap();
+                    assert!(
+                        recv_reply(&mut late).is_err(),
+                        "nobody answers the agent's socket"
+                    );
+                    // ... the sender is, and its report ends the wait.
+                    let mut se = UnixStream::connect(&snd).unwrap();
+                    assert!(matches!(ask(&mut se, hello()), Reply::Hello { .. }));
+                    let Reply::Open { effects } = ask(&mut se, Request::Open) else {
+                        panic!()
+                    };
+                    assert_eq!(effects.len(), 1);
+                    assert!(matches!(
+                        ask(
+                            &mut se,
+                            Request::Outcome {
+                                op: 1,
+                                result: Outcome::NotApplied {
+                                    reason: "timed out".into()
+                                }
+                            }
+                        ),
+                        Reply::Outcome { refused: None, .. }
+                    ));
+                    assert!(recv_reply(&mut se).unwrap().is_none(), "then it is closed");
+                });
+                let mut session = Session::new(&mut v, Verdict::Clean)
+                    .unwrap()
+                    .with_effects(&mut fx);
+                serve_vessel(
+                    &mut session,
+                    &agent,
+                    &sender,
+                    &|| done.load(Ordering::SeqCst),
+                    &|| linger,
+                    Duration::from_millis(5),
+                    &mut |e| {
+                        if let ServeEvent::Waiting { unanswered } = e {
+                            waited.push(unanswered)
+                        }
+                    },
+                )
+                .unwrap();
+            });
+            if linger {
+                assert_eq!(waited, [1], "said once");
+                assert_eq!(fx.unanswered(), 0);
+            } else {
+                assert!(waited.is_empty());
+                assert_eq!(fx.unanswered(), 1, "ended with its agent, unanswered");
+            }
+        }
+    }
+
+    /// Design §1f: with `linger`, a wait ends when `linger` says no (the
+    /// Warden is stopping), though the action is still unanswered.
+    #[test]
+    fn a_wait_for_the_sender_ends_when_told() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let e = env();
+        let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
+        v.seal_birth().unwrap();
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let agent = FieldSocket::bind(dir.path().join("agent.sock")).unwrap();
+        let sender = FieldSocket::bind(dir.path().join("sender.sock")).unwrap();
+        let stopping = AtomicBool::new(false);
+        let t = Instant::now();
+        std::thread::scope(|scope| {
+            let stopping = &stopping;
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                stopping.store(true, Ordering::SeqCst);
+            });
+            let mut session = Session::new(&mut v, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx);
+            assert!(matches!(session.handle(hello()), Reply::Hello { .. }));
+            assert!(matches!(
+                session.handle(declare(1, "fetch", b"x")),
+                Reply::Effect {
+                    result: EffectResult::Released { op: 1 },
+                    ..
+                }
+            ));
+            serve_vessel(
+                &mut session,
+                &agent,
+                &sender,
+                &|| true,
+                &|| !stopping.load(Ordering::SeqCst),
+                Duration::from_millis(5),
+                &mut |_| {},
+            )
+            .unwrap();
+        });
+        assert!(t.elapsed() >= Duration::from_millis(200), "it waited");
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert_eq!(fx.unanswered(), 1);
     }
 
     /// E3-4 (taso-test 2026-10-29): a Warden whose Vessel another Warden
@@ -3070,6 +3299,7 @@ mod tests {
                 &agent,
                 &sender,
                 &|| done.load(Ordering::SeqCst),
+                &|| false,
                 Duration::from_millis(5),
                 &mut |ev| {
                     if let ServeEvent::Fenced { request, message } = ev {
@@ -3239,6 +3469,7 @@ mod tests {
                 &agent,
                 &sender,
                 &|| done.load(Ordering::SeqCst),
+                &|| false,
                 Duration::from_millis(5),
                 &mut |ev| match ev {
                     ServeEvent::Refused {
@@ -3247,7 +3478,7 @@ mod tests {
                         refused,
                     } => refusals.push((socket, open, refused)),
                     ServeEvent::Ended(_) => ended += 1,
-                    ServeEvent::Fenced { .. } => {}
+                    ServeEvent::Fenced { .. } | ServeEvent::Waiting { .. } => {}
                 },
             )
             .unwrap();
@@ -3426,6 +3657,109 @@ mod tests {
         s.handle(hello());
         s.handle(declare(1, "mail", b"send bob"));
         assert_eq!(result(&mut s, 1), OpState::Held);
+    }
+
+    /// Design §1f: a fork with a released action its sender has not
+    /// answered is not promoted (the refusal names the op and what to
+    /// do), and nothing is recorded in the parent; once the sender has
+    /// answered, it is, with what is still held.
+    #[test]
+    fn a_fork_that_waits_for_its_sender_is_not_promoted() {
+        use crate::effects::Decided;
+        use crate::ledger::Answer;
+        use taso_core::record::OpId;
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.seal_birth().unwrap();
+        let mut b = FakeBranches {
+            host: &e.host,
+            quota: 1,
+            children: Vec::new(),
+            promoted: Vec::new(),
+            unfinished: 0,
+        };
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut p,
+        )
+        .unwrap();
+        {
+            let mut s = Session::new(&mut p, Verdict::Clean)
+                .unwrap()
+                .with_effects(&mut fx)
+                .with_branches(&mut b);
+            s.handle(hello());
+            assert!(matches!(
+                s.handle(Request::TurnEnd {
+                    turn: 1,
+                    quiescent: true
+                }),
+                Reply::TurnEnd {
+                    sealed: Some(_),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                s.handle(Request::Fork { seal: None }),
+                Reply::Fork {
+                    result: ForkResult::Forked { .. }
+                }
+            ));
+        }
+        // The fork holds two actions; a reviewer approves the first.
+        let mut children = std::mem::take(&mut b.children);
+        propose(&mut children[0], 2);
+        let c = &mut children[0];
+        let (mut cfx, _) =
+            Effects::open(Mode::Hold, Box::new(crate::effects::AlwaysPublish), c).unwrap();
+        let op = c.held_proposals().unwrap().0[0].intent.op;
+        assert_eq!(cfx.approve(c, op).unwrap(), Decided::Now);
+
+        let promote = |s: &mut Session<'_, _>| {
+            let Reply::Promote { result, .. } = s.handle(Request::Promote {
+                child: "c1".into(),
+                seal: None,
+            }) else {
+                panic!("no reply to the promotion")
+            };
+            result
+        };
+        let mut s = Session::new(&mut p, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        let PromoteResult::Refused { reason } = promote(&mut s) else {
+            panic!("a waiting fork was promoted")
+        };
+        assert!(
+            reason.contains("still waits for its sender's answer to 1 released action(s)")
+                && reason.contains(&format!("(op {})", op.get())),
+            "{reason}"
+        );
+        drop(s);
+        assert!(fx.pending_promotion().is_none(), "nothing recorded");
+        assert_eq!(b.unfinished, 0);
+
+        // Its sender answers: now it is promoted, with the held action.
+        cfx.report(
+            c,
+            OpId::new(op.get()),
+            &Answer::Applied {
+                receipt: b"page".to_vec(),
+            },
+        )
+        .unwrap();
+        let mut s = Session::new(&mut p, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx)
+            .with_branches(&mut b);
+        s.handle(hello());
+        let PromoteResult::Promoted { adopted, .. } = promote(&mut s) else {
+            panic!("an answered fork was not promoted")
+        };
+        assert_eq!(adopted.len(), 1, "what it still held");
     }
 
     /// M7 over the Field (C8): a parent that sealed again since the fork
