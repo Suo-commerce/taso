@@ -135,6 +135,11 @@ struct RequestedState {
     entries: BTreeMap<VesselKey, VesselConf>,
     /// Added since the source last reported them.
     unreported: bool,
+    /// Entries added only for their senders ([`Requested::add_waiting`]).
+    waiting: std::collections::BTreeSet<VesselKey>,
+    /// The Vessels the source lists itself ([`WithRequested`]): theirs
+    /// are the source's entries, whatever is here.
+    listed: std::collections::BTreeSet<VesselKey>,
 }
 
 impl Requested {
@@ -159,6 +164,27 @@ impl Requested {
         st.entries.insert(key, vc);
         st.unreported = true;
         true
+    }
+
+    /// Add `vc`, a fork of an earlier life of this Warden whose agent is
+    /// not run again: only its sender is served, until it has answered
+    /// every released action ([`Requested::sender_only`]).  False (and
+    /// nothing changed) if an entry with its Vessel id is already here.
+    pub fn add_waiting(&self, vc: VesselConf) -> bool {
+        let key = *vc.id().as_bytes();
+        let added = self.add(vc);
+        if added {
+            self.lock().waiting.insert(key);
+        }
+        added
+    }
+
+    /// True if the entry of `key` is run for its sender only: added by
+    /// [`Requested::add_waiting`], and not an entry the source lists
+    /// itself (that one is run as the source says).
+    pub fn sender_only(&self, key: &VesselKey) -> bool {
+        let st = self.lock();
+        st.waiting.contains(key) && !st.listed.contains(key)
     }
 
     /// True if an entry with Vessel id `key` is here.
@@ -227,6 +253,7 @@ impl VesselSource for WithRequested<'_> {
         };
         let listed: std::collections::BTreeSet<VesselKey> =
             last.iter().map(|vc| *vc.id().as_bytes()).collect();
+        self.requested.lock().listed.clone_from(&listed);
         let mut set = last.clone();
         set.extend(
             children
@@ -720,6 +747,44 @@ mod tests {
         let set = src.poll(z).unwrap().unwrap();
         assert_eq!(names(&set), vec!["p", "p-fork-5"]);
         assert_eq!(set.iter().find(|v| v.subject == "p").unwrap().uid_slot, 1);
+    }
+
+    /// A fork added for its sender only is run so, unless the source
+    /// lists that Vessel itself: then it is the source's entry, run as
+    /// the source says.  A fork asked for over the Field is never
+    /// sender-only.
+    #[test]
+    fn a_fork_added_for_its_sender_is_sender_only_unless_the_source_lists_it() {
+        let key = |v: &VesselConf| *v.id().as_bytes();
+        let z = Duration::ZERO;
+        let req = Requested::new();
+        /// A source that answers each of its sets in turn.
+        struct Sets(std::collections::VecDeque<Vec<VesselConf>>);
+        impl VesselSource for Sets {
+            fn poll(&mut self, _: Duration) -> Result<Option<Vec<VesselConf>>, SourceError> {
+                Ok(self.0.pop_front())
+            }
+            fn is_finite(&self) -> bool {
+                false
+            }
+        }
+        let mut inner = Sets([vec![vc("p", 1)], vec![vc("p", 1), vc("b", 2)]].into());
+        let mut src = WithRequested::new(&mut inner, req.clone());
+        let (a, b, c) = (vc("a", 4), vc("b", 5), vc("c", 6));
+        assert!(req.add_waiting(a.clone()) && req.add_waiting(b.clone()));
+        assert!(!req.add_waiting(a.clone()), "once");
+        assert!(req.add(c.clone()));
+        assert!(!req.add_waiting(c.clone()), "already here, as asked for");
+        assert_eq!(
+            names(&src.poll(z).unwrap().unwrap()),
+            vec!["a", "b", "c", "p"]
+        );
+        assert!(req.sender_only(&key(&a)) && req.sender_only(&key(&b)));
+        assert!(!req.sender_only(&key(&c)) && !req.sender_only(&key(&vc("p", 1))));
+        // The source lists b itself now.
+        let set = src.poll(z).unwrap().unwrap();
+        assert_eq!(set.iter().find(|v| v.subject == "b").unwrap().uid_slot, 2);
+        assert!(req.sender_only(&key(&a)) && !req.sender_only(&key(&b)));
     }
 
     fn with_forks(subject: &str, slot: u32, forks: &[u32]) -> VesselConf {

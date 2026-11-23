@@ -3741,6 +3741,13 @@ mod tests {
         drop(s);
         assert!(fx.pending_promotion().is_none(), "nothing recorded");
         assert_eq!(b.unfinished, 0);
+        // What a later life of the Warden reads, from the fork's log on
+        // this node alone: the op, and the parent's Seal it was forked at.
+        let (cid, forked_at) = (c.id(), c.lineage().origin.parent().unwrap().seal);
+        assert_eq!(
+            e.host.waiting_fork(cid).unwrap(),
+            Some((vec![op], forked_at))
+        );
 
         // Its sender answers: now it is promoted, with the held action.
         cfx.report(
@@ -3751,6 +3758,10 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(e.host.waiting_fork(cid).unwrap(), Some((vec![], forked_at)));
+        let (pid, nobody) = (p.id(), taso_core::record::vessel_id(ns(1), b"nobody"));
+        assert_eq!(e.host.waiting_fork(pid).unwrap(), None, "no fork");
+        assert_eq!(e.host.waiting_fork(nobody).unwrap(), None, "no log");
         let mut s = Session::new(&mut p, Verdict::Clean)
             .unwrap()
             .with_effects(&mut fx)

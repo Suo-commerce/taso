@@ -5097,6 +5097,59 @@ impl Node {
         }
     }
 
+    /// The forks of `vc` that an earlier life of this Warden left
+    /// waiting for their senders are run again, for their senders only
+    /// (design `Taso_design_proposals_inbox` §1f).
+    ///
+    /// A fork an agent asked for is run in the Warden's life that made
+    /// it and never again ([`Requested`] starts empty).  If that life
+    /// ended while one of its released actions had no outcome, its
+    /// sender would have nowhere to report: the action stayed open for
+    /// good, and with it the fork (not promoted, not purged).  So at
+    /// each start of a Vessel that may fork, every fork slot of its is
+    /// looked at: a fork with a log on this node and a released action
+    /// without a terminal outcome is added to the set, marked
+    /// [`Requested::sender_only`].  Its run starts no agent; it serves
+    /// the sender's socket until each action is answered.
+    ///
+    /// A fork this life already runs or ran is in the registry and is
+    /// left alone.  A log that cannot be read is logged, and looked at
+    /// again at the Vessel's next start.
+    fn reopen_waiting_forks(&self, vc: &VesselConf) {
+        let Some(forks) = &vc.forks else {
+            return;
+        };
+        for &slot in &forks.slots {
+            let name = ForksConf::child_name(&vc.subject, slot);
+            let id = vessel_id(vc.namespace, name.as_bytes());
+            if self.requested.contains(id.as_bytes()) {
+                continue;
+            }
+            match self.host().waiting_fork(id) {
+                Ok(Some((ops, seal))) if !ops.is_empty() => {
+                    if self.requested.add_waiting(ForksConf::child(vc, slot, seal)) {
+                        let list: Vec<String> = ops.iter().map(|o| o.get().to_string()).collect();
+                        self.log(
+                            vc,
+                            format_args!(
+                                "its fork {name:?} still waits for its sender's answer to {} released action(s) (op {}): running it again for its sender only",
+                                ops.len(),
+                                list.join(", ")
+                            ),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => self.log(
+                    vc,
+                    format_args!(
+                        "whether its fork {name:?} waits for its sender cannot be read ({e}): looked at again at the next start"
+                    ),
+                ),
+            }
+        }
+    }
+
     /// Run one Vessel until its agent exits (see the module docs).
     pub fn run_vessel(&self, vc: &VesselConf) -> Result<Report, DaemonError> {
         self.run_vessel_until(vc, &Stop::new())
@@ -5153,6 +5206,7 @@ impl Node {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(*id.as_bytes());
+        self.reopen_waiting_forks(vc);
         if let Some(b) = settled.birth {
             self.log(
                 vc,
@@ -5577,6 +5631,19 @@ impl Node {
             });
         }
 
+        // A fork of an earlier life of this Warden, here again for its
+        // sender only (design §1f, [`Node::reopen_waiting_forks`]): no
+        // agent is started, and the run is the wait for its sender.
+        let sender_only = self.requested.sender_only(id.as_bytes());
+        if sender_only {
+            self.log(
+                vc,
+                format_args!(
+                    "here for its sender only: {} released action(s) have no outcome yet, and its agent is not run again",
+                    effects.unanswered()
+                ),
+            );
+        }
         let exited = Arc::new(AtomicBool::new(false));
         let agent = {
             let (exited, id) = (exited.clone(), spec.id.clone());
@@ -5586,6 +5653,10 @@ impl Node {
             // no container was started: the run ends here with the error.
             std::thread::Builder::new()
                 .spawn(move || {
+                    if sender_only {
+                        exited.store(true, Ordering::SeqCst);
+                        return Ok((true, String::new()));
+                    }
                     let r = runc.run(&bundle_dir, &id);
                     let _ = runc.delete(&id);
                     exited.store(true, Ordering::SeqCst);
@@ -5783,7 +5854,15 @@ impl Node {
             return Err(DaemonError::Io("the runc thread panicked".into()));
         }
         let agent = agent.ok().and_then(Result::ok);
-        if let Some((ok, err)) = &agent {
+        if sender_only {
+            self.log(
+                vc,
+                format_args!(
+                    "its sender's socket is closed: {} released action(s) still without an outcome",
+                    effects.unanswered()
+                ),
+            );
+        } else if let Some((ok, err)) = &agent {
             self.log(
                 vc,
                 format_args!(

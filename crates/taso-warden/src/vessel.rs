@@ -596,19 +596,7 @@ impl ReadLog {
     /// with any is not promoted (design `Taso_design_proposals_inbox`
     /// §1f): its result is not in, and the fork stays open for it.
     pub fn unanswered(&self) -> Result<Vec<OpId>, VesselError> {
-        use taso_core::record::OutcomeState as S;
-        let summary = crate::summary::Summary::of(&self.frames)
-            .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
-        Ok(summary
-            .obligations()
-            .filter(|e| {
-                matches!(
-                    e.state,
-                    Some(S::DispatchAuthorized | S::OutcomeUnknown | S::AcceptedUnknown)
-                )
-            })
-            .map(|e| e.intent.op)
-            .collect())
+        unanswered_in(&self.frames)
     }
 
     /// Every held proposal in this log, in op order, each marked by
@@ -895,6 +883,32 @@ impl<P: Pool> Host<P> {
             lineage,
             head: head.into(),
         })
+    }
+
+    /// What the fork `chronicle` still waits for from its sender, from
+    /// its local log alone (no coordinator is asked): its released
+    /// effects without a terminal outcome, in op order, and the Seal of
+    /// its parent it was forked at.  `None`: no log of it on this node,
+    /// or it is no fork.  What a Warden reads at a parent's start to
+    /// open the sender's socket of such a fork again (design
+    /// `Taso_design_proposals_inbox` §1f).
+    pub fn waiting_fork(
+        &self,
+        chronicle: ChronicleId,
+    ) -> Result<Option<(Vec<OpId>, Lsn)>, VesselError> {
+        let dir = self.dir_for(chronicle);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let frames = crate::chronicle::read_log(&dir)?;
+        if frames.is_empty() {
+            return Ok(None);
+        }
+        let (lineage, _) = read_lineage(&frames)?;
+        let Some(parent) = lineage.origin.parent() else {
+            return Ok(None);
+        };
+        Ok(Some((unanswered_in(&frames)?, parent.seal)))
     }
 
     /// The common end of [`Host::fork`] and [`Host::fork_from_log`].
@@ -2001,6 +2015,24 @@ pub fn lineage_in(dir: &std::path::Path) -> Result<Option<LineageRecord>, Vessel
 
 /// The Lineage record (lsn 1) and the Succession record, if it ends the
 /// Chronicle.  Refuses a second Lineage and anything after a Succession.
+/// The released effects in `frames` without a terminal outcome, in op
+/// order ([`ReadLog::unanswered`]).
+fn unanswered_in(frames: &[Frame]) -> Result<Vec<OpId>, VesselError> {
+    use taso_core::record::OutcomeState as S;
+    let summary = crate::summary::Summary::of(frames)
+        .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
+    Ok(summary
+        .obligations()
+        .filter(|e| {
+            matches!(
+                e.state,
+                Some(S::DispatchAuthorized | S::OutcomeUnknown | S::AcceptedUnknown)
+            )
+        })
+        .map(|e| e.intent.op)
+        .collect())
+}
+
 fn read_lineage(
     frames: &[Frame],
 ) -> Result<(LineageRecord, Option<SuccessionRecord>), VesselError> {
