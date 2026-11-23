@@ -175,8 +175,7 @@ and keeps it at boot (`/etc/modules-load.d/taso.conf`), sets
 without it every Seal's freeze pays three slow RCU grace periods), makes
 `/var/lib/taso` and `/run/taso`, and writes `/etc/taso/warden.json`: one
 node, a local coordinator, the block log, effects **held** by default
-(a Vessel acts outward only once its entry says `"effects":
-"dispatch"`), and no Vessels yet. `--data DIR` moves the data
+(see "What an agent may send" below), and no Vessels yet. `--data DIR` moves the data
 directory, `--size-gib N` sizes the block log, `--rootfs DIR` names the
 agents' root filesystem, `--force` rewrites the config. Run again it
 says "already set up" and changes nothing but the directory modes
@@ -248,6 +247,25 @@ of block-log space; lower saves space. What it means for you:
   without its layer.
 - `taso-blkd`'s `stats` reports `depth_max=`, the longest chain of layers
   a read may walk, which folding keeps near `local_seals`.
+
+**What an agent may send.** Taso never sends: an agent asks for an
+action, the Warden records the exact request, and a sender of yours
+sends what the Warden has released ([docs/relay.md](docs/relay.md)).
+Each Vessel's entry says which:
+
+- `"effects": "hold"` (what `init` writes, and what every fork has):
+  the action is recorded and held. **Nothing goes out by itself.** You
+  release it or refuse it, one action at a time: `taso-ctl proposals
+  <vessel>` lists what is held, `taso-ctl approve <vessel> <op>`
+  releases one to the sender, `taso-ctl deny <vessel> <op> reason…`
+  closes one. A program of yours can do the same on the Warden's
+  decider socket. An action can be approved once the turn that asked
+  for it has ended; the agent reads the result in a later turn.
+- `"effects": "dispatch"`: every action is released at once and the
+  sender sends it; nobody is asked.
+
+A held action that nobody decides stays held and fills the Vessel's
+outbox (8 MiB), so decide each one.
 
 **Read before running an agent:**
 

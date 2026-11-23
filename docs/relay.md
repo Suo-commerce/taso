@@ -150,11 +150,13 @@ they match what `authority` names.
    only source of truth.  An effect not on it was never released, was
    already settled, or was held as a proposal.
 
-2. **Send for a held Vessel.**  A Vessel in `Hold` mode never has
-   anything on its `Open` list.  Its effects are proposals, visible
-   only to its parent through `ReadLog::proposals`.  Only the parent's
-   promotion can turn them into released effects in the parent's own
-   outbox.
+2. **Send what a Vessel only holds.**  In `Hold` mode a Vessel's
+   effects are proposals, and a proposal is on no `Open` list.  Two
+   things turn one into a released effect: its parent's promotion (in
+   the parent's own outbox), or a reviewer's approval (in the Vessel's
+   own; see "The reviewer" below).  A sender that reads proposals from
+   anywhere else and sends them has sent what may be approved or
+   promoted later, and is then sent twice.
 
 3. **Retry an `UnsafeToRetry` effect after `Unknown`.**  This is the
    one case where duplicating in the outside world is possible.  The
@@ -205,6 +207,83 @@ sender is not involved in either; it only ever sees the adopted
 effects, on the parent's `Open` list, like any other.  A child outlives
 its parent's entry: if the parent is taken off the Warden's list, the
 child runs to its end and its files stay until its own TTL.
+
+## The reviewer
+
+A Vessel that holds releases nothing by itself.  Whoever decides what
+may go out is the **reviewer**: a process of yours (root, or the
+Warden's uid) on the Warden's decider socket (`"decider": {"socket":
+…}` in the config), speaking `taso_core::decider`, or the three
+`taso-ctl` commands that do.  Taso does not read a request: what is
+allowed, and whether a person is asked, is the reviewer's.
+
+1. **List.**  `Proposals { vessel, after }` (`taso-ctl proposals
+   <vessel>`): the actions the Vessel holds, in the order they were
+   asked, each with its `op`, the exact request bytes, and `sealed`.  A
+   read: nothing is recorded.  A Vessel the Warden cannot answer for is
+   an error, never an empty list.
+2. **Approve.**  `Approve { vessel, op }` (`taso-ctl approve <vessel>
+   <op>`): the Warden records the release on the same op, ships it, and
+   answers `Approved`; the Vessel's sender then finds it on `Open` like
+   any released effect, and reports its outcome.  Refused, with the
+   reason, unless the action is held, **sealed** (its turn has ended:
+   an unsealed action belongs to a turn that may be run again, and
+   would be asked for and sent twice), its Vessel is running (an
+   approved action is handed to the Vessel's sender, which is served
+   while it runs) and no earlier effect of the Vessel is unresolved.
+   If the ship fails nothing is released: the action is closed as not
+   applied, and its agent may ask again.
+3. **Deny.**  `Deny { vessel, op, reason }` (`taso-ctl deny <vessel>
+   <op> reason…`): the Warden closes the action as not applied with
+   `denied: <reason>`, which its agent reads with `Result`.  Sealed or
+   not, running or not; nothing is sent.
+
+What follows from that:
+
+- **What was approved is what is sent.**  The request bytes were
+  recorded when the agent asked; an approval names the op.  The agent
+  cannot change them afterwards.  A reviewer that puts requests in a
+  canonical form approves only those already in it, so the sender sends
+  the recorded bytes as they are.
+- **An answer comes a turn later.**  The agent asks, ends its turn (the
+  Seal), and reads `Result { op }` in a later one: `Held`, then
+  `Pending` once approved, then `Applied` with the receipt or
+  `NotApplied` with the reason.  Nothing is approved inside the turn
+  that asked for it.
+- **Decide every held action.**  A held action counts against its
+  Vessel's 8 MiB outbox until it is approved and reported, denied,
+  adopted by a promotion, or withdrawn with a lost turn.  A reviewer
+  that leaves them fills the outbox, and the Vessel's later actions are
+  refused.
+- **A sender that times out reports `NotApplied`.**  An approved action
+  is an obligation until its outcome is reported: an outcome left
+  `Unknown` withholds the Vessel's further effects, and the coordinator
+  refuses a purge or a sanction of the Vessel meanwhile.
+- **The receipt is history.**  It is recorded in the Vessel's Chronicle,
+  shipped, and inherited by its forks.  Bound it in the sender; put
+  nothing in it that the Vessel's history should not hold.
+- **A fork's held action can be approved** on the fork's own socket
+  pair, and is then sent whether or not the fork is ever promoted:
+  right for something a sub-agent needs back, wrong for an action that
+  should exist only if the branch is kept (leave that held; the
+  promotion carries it up).  A promotion adopts only what the fork
+  still holds.
+- **Asked twice, taken once.**  `Approve` or `Deny` of an action already
+  approved or denied answers the same with `before` set and writes
+  nothing, so a lost reply is answered by asking again.  The first
+  decision stands: an approved action cannot be denied, nor a denied
+  one approved.
+- **Whoever may open the decider socket** reads every Vessel's held
+  requests on the node and can release them.  It is one socket per
+  Warden; its owner and mode are the only control.  Every decision is
+  in the Warden's log with the peer's uid and pid, and in the Vessel's
+  Chronicle as the outcome it wrote.
+
+A promotion is the parent agent's own request, not the reviewer's: a
+parent that dispatches releases what it adopts at once.  A parent that
+holds adopts as held, and the reviewer decides those in the parent.  A
+parent that sealed after a fork was made can no longer promote that
+fork (`ParentMoved`).
 
 ## Building a relay
 
