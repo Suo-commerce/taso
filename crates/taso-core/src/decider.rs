@@ -643,7 +643,7 @@ mod tests {
             assert!(Reply::decode(&b[..b.len() - 1]).is_err());
         }
         assert!(matches!(
-            Reply::decode(&[5]),
+            Reply::decode(&[8]),
             Err(DecodeError::BadTag { .. })
         ));
         assert!(Reply::decode(&[2, 5]).is_err(), "no answer tag 5 (D86)");
