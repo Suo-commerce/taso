@@ -268,6 +268,20 @@ What follows from that:
   should exist only if the branch is kept (leave that held; the
   promotion carries it up).  A promotion adopts only what the fork
   still holds.
+- **A fork stays open for its sender.**  A fork is run once.  If its
+  agent exits while an approved action has no outcome yet, the Warden
+  keeps the fork's sender socket served (its agent socket is closed)
+  until the sender has reported each one as `Applied` or `NotApplied`,
+  and says so in its log.  After a Warden restart it does the same:
+  when the fork's parent starts, a fork with an approved, unanswered
+  action is run again for its sender only, with no agent; the action
+  is listed `unknown`, as after any restart.  Nobody resolves anything
+  by hand; the sender only has to come back and answer.  An `Unknown`
+  report is not an answer and keeps the fork waiting.
+- **A waiting fork is not promoted.**  `Promote` of a fork that still
+  waits for its sender is refused, with the ops named: its result is
+  not in.  The parent agent asks again later, or goes on without that
+  fork (a new fork can do the work again).
 - **Asked twice, taken once.**  `Approve` or `Deny` of an action already
   approved or denied answers the same with `before` set and writes
   nothing, so a lost reply is answered by asking again.  The first
