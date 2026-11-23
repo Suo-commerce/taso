@@ -695,6 +695,8 @@ impl Effects {
             ));
         }
         self.ledger.approve(vessel, op)?;
+        // E3-3c: recorded here, not yet off the node (p3-review.sh, D).
+        taso_core::hold("effect.approved");
         let a = Authorized {
             op,
             barrier: item.intent.barrier,
@@ -726,6 +728,7 @@ impl Effects {
             return self.not_held(vessel, op, false)?;
         };
         self.ledger.deny(vessel, op, reason)?;
+        taso_core::hold("effect.denied");
         self.waiting = self.waiting.saturating_sub(weight_of(&item.intent));
         Ok(Decided::Now)
     }

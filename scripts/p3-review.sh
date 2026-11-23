@@ -181,9 +181,11 @@ NS="7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b7b"
 P="rv-$RUN"
 F1="$P-fork-1"
 F2="$P-fork-2"
-python3 - "$CFG" "$P" "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$NS" "$LANDLOCK" "$BLK_SOCK" "$MNT" <<'PY'
+# write_config <file> <the "vessels" array, JSON>
+write_config() {
+    python3 - "$1" "$2" "$SOCK" "$BASE" "$WORK" "$ROOTFS" "$LANDLOCK" "$BLK_SOCK" "$MNT" <<'PY'
 import json, sys
-out, subject, sock, base, work, rootfs, ns, landlock, blk_sock, mnt = sys.argv[1:11]
+out, vessels, sock, base, work, rootfs, landlock, blk_sock, mnt = sys.argv[1:10]
 rt = {
     "rootfs": rootfs,
     "host_uid_base": 200000,
@@ -203,10 +205,11 @@ json.dump({
     "prefix": "vessels",
     "run_dir": f"{work}/run",
     "runtime": rt,
-    "vessels": [{"namespace": ns, "subject": subject, "uid_slot": 0,
-                 "effects": "hold", "forks": {"slots": [1, 2]}}],
+    "vessels": json.loads(vessels),
 }, open(out, "w"), indent=1)
 PY
+}
+write_config "$CFG" "[{\"namespace\": \"$NS\", \"subject\": \"$P\", \"uid_slot\": 0, \"effects\": \"hold\", \"forks\": {\"slots\": [1, 2]}}]"
 
 # ── helpers ───────────────────────────────────────────────────────────
 CHECKS=0
@@ -278,10 +281,26 @@ hello() { $HAND hello --dir "$MNT/$1" --host "$(host_of "$1")" --seen "$SEEN"; }
 tell() { local ds=$1 nonce=$2 js=$3; shift 3; $HAND cmd --dir "$MNT/$ds" --nonce "$nonce" --json "$js" "$@"; }
 ctl()  { "$WORK/bin/taso-ctl" "$@" --config "$CFG" 2>>"$OUT/ctl.err" || true; }
 
-start_warden() {   # $1: the log's number
+start_warden() {   # $1: the log's name; then: environment for it (NAME=value ...)
     WLOG=$OUT/warden-$1.err
-    "$WORK/bin/taso-wardend" "$CFG" >"$OUT/warden-$1.out" 2>"$WLOG" &
+    shift
+    env "$@" "$WORK/bin/taso-wardend" "$CFG" >"${WLOG%.err}.out" 2>"$WLOG" &
     WPID=$!
+}
+# warden_ends <what>: the Warden ends by itself within 60 s, exit 0
+warden_ends() {
+    local ended="" rc=0
+    for _ in $(seq 600); do
+        kill -0 "$WPID" 2>/dev/null || { ended=1; break; }
+        sleep 0.1
+    done
+    if [ -n "$ended" ]; then
+        wait "$WPID" || rc=$?
+        WPID=""
+        if [ "$rc" = 0 ]; then ok "$1"; else bad "$1" "exit $rc: $(tail -3 "$WLOG")"; fi
+    else
+        bad "$1" "still running after 60 s: $(tail -3 "$WLOG")"
+    fi
 }
 
 # ── A: a root Vessel that holds ───────────────────────────────────────
@@ -465,19 +484,78 @@ PN=$(hello "$PDS") || die "P's agent never said hello after the second promotion
 check "17 P runs on the second fork's files" "$(cat "$MNT/$PDS/made-by-fork-2" 2>&1)" 's.strip() == "fork 2 was here"'
 
 tell "$PDS" "$PN" '{"do":"exit","code":0}' >/dev/null
-ended=""
-for _ in $(seq 600); do
-    kill -0 "$WPID" 2>/dev/null || { ended=1; break; }
-    sleep 0.1
-done
-if [ -n "$ended" ]; then
-    rc=0; wait "$WPID" || rc=$?
-    WPID=""
-    if [ "$rc" = 0 ]; then ok "18 the Warden ends by itself, exit 0"
-    else bad "18 the Warden ends by itself, exit 0" "exit $rc: $(tail -3 "$WLOG")"; fi
-else
-    bad "18 the Warden ends by itself, exit 0" "still running after 60 s: $(tail -3 "$WLOG")"
-fi
+warden_ends "18 the Warden ends by itself, exit 0"
+
+# ── D: the Warden is killed in the middle of a decision ───────────────
+# One Vessel a round, one held and sealed action.  The Warden runs with
+# a hold (taso_core::hold, E3-3c) at the named place, the reviewer
+# decides, and the Warden is SIGKILLed while it stands there:
+#   effect.approved   the approval is recorded on the node, not shipped
+#   ledger.shipped    the approval is shipped, the reviewer not answered
+#   effect.denied     the denial is recorded, the reviewer not answered
+# The next Warden must leave one consistent story, whichever side of the
+# kill the record fell on: the reviewer asks again and is answered; an
+# approved action is offered to the sender exactly once and the agent
+# reads its receipt; a denied one is never offered and the agent reads
+# the reason; nothing stays held.
+echo "== D: the Warden is killed in the middle of a decision"
+mkdir -p "$WORK/hold"
+round() {   # round <n> <hold> <approve|deny>
+    local n=$1 hold=$2 what=$3 v="rk-$1-$RUN" ds nonce r op l
+    CFG=$WORK/warden-d$n.json
+    write_config "$CFG" "[{\"namespace\": \"$NS\", \"subject\": \"$v\", \"uid_slot\": $((4 + n)), \"effects\": \"hold\"}]"
+    rm -f "$WORK/hold/$hold".*
+    start_warden "d$n-a" "TASO_E3_HOLD=$hold" "TASO_E3_HOLD_DIR=$WORK/hold"
+    ds=$(ds_of "$v") || die "round $n: the Vessel never started"
+    nonce=$(hello "$ds") || die "round $n: its agent never said hello"
+    r=$(tell "$ds" "$nonce" "{\"do\":\"effect\",\"call\":1,\"request\":\"GET https://example.org/k$n\"}")
+    op=$(j "$r" 'd["op"]')
+    r=$(tell "$ds" "$nonce" '{"do":"turn_end"}')
+    check "D$n the action is held and sealed" "$r" 'd["sealed"] is not None'
+    : > "$WORK/hold/$hold.arm"
+    if [ "$what" = approve ]; then ctl approve "$v" "$op" >"$OUT/d$n-first.txt" &
+    else ctl deny "$v" "$op" not wanted >"$OUT/d$n-first.txt" & fi
+    local cpid=$!
+    local held=""
+    for _ in $(seq 300); do [ -e "$WORK/hold/$hold.held" ] && { held=1; break; }; sleep 0.1; done
+    if [ -n "$held" ]; then ok "D$n the Warden stands at $hold"; else bad "D$n the Warden stands at $hold" "$(tail -3 "$WLOG")"; fi
+    kill -KILL "$WPID"; wait "$WPID" 2>/dev/null || true
+    kill "$cpid" 2>/dev/null || true; wait "$cpid" 2>/dev/null || true
+    kill_runc
+    check "D$n the reviewer was not answered" "$(cat "$OUT/d$n-first.txt")" '"approved" not in s and "denied" not in s'
+
+    start_warden "d$n-b"
+    ds=$(ds_of "$v") || die "round $n: the Vessel did not start again"
+    nonce=$(hello "$ds") || die "round $n: its agent never said hello again"
+    if [ "$what" = approve ]; then
+        r=$(ctl approve "$v" "$op")
+        check "D$n asked again, the approval is answered" "$r" 'd.get("approved") is True'
+        r=$($HAND sender --socket "$(sender_sock "$ds")" --receipt "page k$n") || die "round $n: the sender failed"
+        check "D$n the sender is offered it exactly once" "$r" \
+            "[(e['op'], e['request']) for e in d['effects']] == [($op, 'GET https://example.org/k$n')]"
+        check "D$n its report is taken" "$r" 'd["outcomes"][0]["refused"] is None'
+        r=$(tell "$ds" "$nonce" "{\"do\":\"result\",\"op\":$op}")
+        check "D$n the agent reads the receipt" "$r" "d['state'] == 'Applied' and d['receipt'] == 'page k$n'"
+        r=$($HAND sender --socket "$(sender_sock "$ds")" --receipt "again") || die "round $n: the sender failed"
+        check "D$n it is not offered a second time" "$r" 'd["effects"] == []'
+    else
+        r=$(ctl deny "$v" "$op" not wanted)
+        check "D$n asked again, the denial is answered" "$r" 'd.get("denied") is True'
+        r=$(tell "$ds" "$nonce" "{\"do\":\"result\",\"op\":$op}")
+        check "D$n the agent reads the reason" "$r" 'd["state"] == "NotApplied" and "denied" in d["reason"]'
+        r=$($HAND sender --socket "$(sender_sock "$ds")" --receipt "never") || die "round $n: the sender failed"
+        check "D$n the sender is offered nothing" "$r" 'd["effects"] == []'
+        r=$(ctl approve "$v" "$op")
+        check "D$n it cannot be approved afterwards" "$r" '"refused" in d'
+    fi
+    l=$(ctl proposals "$v")
+    check "D$n nothing stays held" "$l" 'L[-1]["held"] == 0'
+    tell "$ds" "$nonce" '{"do":"exit","code":0}' >/dev/null
+    warden_ends "D$n the Warden ends by itself, exit 0"
+}
+round 1 effect.approved approve
+round 2 ledger.shipped approve
+round 3 effect.denied deny
 
 echo "results in $OUT"
 if [ "$FAILS" = 0 ]; then
