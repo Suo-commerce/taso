@@ -1503,12 +1503,25 @@ fn holder_synced(
 
 /// The obligation changes an accepted batch makes (§1.5, D34): an intent
 /// with a barrier opens one; a terminal outcome closes it.
+///
+/// A held action (`Proposed`) is closed too: it is nobody's obligation
+/// until something releases it.  A release that comes without its intent
+/// in the same batch is an approval of a held action (D&D C-1 a,
+/// 2026-11-23; the ledger writes every other release together with its
+/// intent): it opens the obligation again, until the sender's answer.
+/// The outcome does not say whether its intent set a barrier, so every
+/// approved action counts until it is answered: at most a sanction or a
+/// purge waits for an answer it need not have waited for, never the
+/// reverse.  Nothing stored changes: the journal keeps each note as it
+/// is.
 fn obligation_changes(
     envelopes: &[Envelope],
     effects: &[Vec<u8>],
 ) -> Result<Vec<(u64, bool)>, CoordError> {
     let mut bytes = effects.iter();
     let mut changes = Vec::new();
+    // The ops whose intent is in this batch.
+    let mut declared = std::collections::BTreeSet::new();
     for e in envelopes {
         if e.stream != Stream::Effect {
             continue;
@@ -1526,7 +1539,18 @@ fn obligation_changes(
             });
         }
         match Payload::decode(b) {
-            Ok(Payload::Intent(i)) if i.barrier.is_some() => changes.push((i.op.get(), true)),
+            Ok(Payload::Intent(i)) => {
+                declared.insert(i.op.get());
+                if i.barrier.is_some() {
+                    changes.push((i.op.get(), true));
+                }
+            }
+            Ok(Payload::Outcome(o))
+                if o.state == OutcomeState::DispatchAuthorized
+                    && !declared.contains(&o.op.get()) =>
+            {
+                changes.push((o.op.get(), true))
+            }
             Ok(Payload::Outcome(o))
                 if matches!(
                     o.state,
@@ -4022,6 +4046,60 @@ mod log_tests {
         );
         coord.append_batch_with(A, &e, &fx).unwrap();
         assert!(coord.obligations(c).unwrap().is_empty());
+    }
+
+    /// D&D C-1 a (2026-11-23): a held action is nobody's obligation; its
+    /// approval (a release without its intent in the batch) is one until
+    /// the sender's answer, with or without a barrier, and across a
+    /// restart; a denial (not applied) of a held action changes nothing.
+    /// Without this an approved action in flight was invisible to the
+    /// rules that refuse a sanction or a purge.
+    #[test]
+    fn an_approved_held_action_is_an_obligation_until_it_is_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.redb");
+        let store = Arc::new(Fake::default());
+        let coord = open(&path, store.clone());
+        let c = chron(1);
+        coord.register(c, A).unwrap();
+        let step = |coord: &Coordinator, recs: Vec<(Stream, Payload)>| {
+            let (e, fx) = next(coord, c, recs);
+            coord.append_batch_with(A, &e, &fx).unwrap();
+            coord.obligations(c).unwrap()
+        };
+        let held = |op, consequence| {
+            vec![
+                (Stream::Effect, intent(op, consequence)),
+                (Stream::Effect, outcome(op, OutcomeState::Proposed)),
+            ]
+        };
+        assert!(step(&coord, held(1, Consequence::Irreversible)).is_empty());
+        assert!(step(&coord, held(2, Consequence::NoExternalMutation)).is_empty());
+        assert!(step(&coord, held(3, Consequence::Irreversible)).is_empty());
+        let one = |op, state| vec![(Stream::Effect, outcome(op, state))];
+        assert_eq!(
+            step(&coord, one(1, OutcomeState::DispatchAuthorized)),
+            vec![1],
+            "approved"
+        );
+        assert_eq!(
+            step(&coord, one(2, OutcomeState::DispatchAuthorized)),
+            vec![1, 2],
+            "approved; no barrier, counted all the same"
+        );
+        assert_eq!(
+            step(&coord, one(3, OutcomeState::ConfirmedNotApplied)),
+            vec![1, 2],
+            "denied"
+        );
+        drop(coord);
+        let coord = open(&path, store);
+        assert_eq!(coord.obligations(c).unwrap(), vec![1, 2]);
+        assert_eq!(
+            step(&coord, one(1, OutcomeState::ConfirmedApplied)),
+            vec![2]
+        );
+        assert!(step(&coord, one(2, OutcomeState::ConfirmedNotApplied)).is_empty());
     }
 
     /// R2a: the quarantine is recorded when the database is made (or first
