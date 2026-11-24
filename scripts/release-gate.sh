@@ -59,6 +59,25 @@ flock -n 9 || { echo "release-gate: another release gate is running" >&2; exit 3
 free_gib() { df --output=avail -B1G /root | tail -1 | tr -d ' '; }
 # Nothing else runs (the lock): what a killed gate left is safe to remove.
 # Not /var/lib/taso*: the node's installed services keep their state there.
+# The heavy gates' own block daemons (blk-crash.sh, blk-bench.sh,
+# blk-fstests.sh; never the node's, which serves /var/lib/taso/blk.log).
+# A gate that is killed leaves its step's daemon running: it keeps its
+# socket, so the next run's step refuses to start, and it keeps its log
+# open, so the log's space stays taken after the log is removed
+# (2026-11-24: 10 GiB, and a full gate one GiB short of starting).
+left='taso-blkd /var/lib/taso-blk/(crash|bench|fst)\.log'
+if pgrep -f "$left" >/dev/null; then
+    echo "release-gate: stopping a block daemon a killed gate left: $(pgrep -af "$left" | tr '\n' ';')"
+    awk '$5 ~ "^/mnt/blk-(crash|bench|fork|base|fst)(/|$)" { print length($5), $5 }' /proc/self/mountinfo \
+        | sort -rn | cut -d' ' -f2- | while read -r m; do
+            fsfreeze -u "$m" 2>/dev/null
+            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+        done
+    pkill -KILL -f "$left"
+    for _ in $(seq 50); do pgrep -f "$left" >/dev/null || break; sleep 0.1; done
+    pgrep -f "$left" >/dev/null && die "a block daemon a killed gate left does not go: $(pgrep -af "$left")"
+    for k in crash bench fst; do rm -f "/run/taso-blk-$k.sock" "/run/taso-blk-$k.sock.lock"; done
+fi
 rm -rf /var/tmp/taso-p2blk.* /var/tmp/taso-p3.* /var/tmp/taso-f6fork.* /var/tmp/taso-review.* \
        /var/tmp/taso-k2e2e.* /var/tmp/e3check.*
 find /root -maxdepth 1 -mtime +"$KEEP_DAYS" \
