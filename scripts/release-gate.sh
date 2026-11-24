@@ -2,11 +2,26 @@
 # release-gate.sh: every gate on one commit, one table (V4b plan §9, the
 # release runner).  A release needs a PASS of `full` on the commit tagged.
 #
-#   scripts/release-gate.sh quick    about 7 minutes (taso-test, 1b7ebe1):
+#   scripts/release-gate.sh quick    about 7 minutes (taso-test, 1b7ebe1;
+#                                    before the three gates below, which
+#                                    add E3's 16 hold rounds):
 #                                    every gate once, the default sizes
 #   scripts/release-gate.sh full     overnight: quick's gates at release
 #                                    sizes, plus xfstests -g quick,
-#                                    blk-bench, and 100 crash rounds
+#                                    blk-bench, 100 crash rounds, and E3's
+#                                    whole subset (434 rounds)
+#
+# Since the maturity review of e4a37b2 (finding 12; G-j (a), G-k (a)):
+#   oracle   scripts/e3-oracle.py selftest: E3's grader grades its own cases
+#   e3       the device-level crash harness (scripts/e3-crash.sh): quick, the
+#            subset's hold rounds (exact crash points); full, the subset
+#   ignored  the root and runc tests no script ran: taso-warden's runtime
+#            and template tests (the isolation under runc, the idmapped
+#            fork, the verifier) and taso-landlock's under runc.  Fails if a
+#            filter matched no test.  Not run by any gate, by their own
+#            notes: the benchmarks (run alone, in release), the tests that
+#            need a kube-apiserver (TASO_KUBE_*) or a bucket (TASO_S3_*),
+#            taso-blk's compaction_timing and its LD_PRELOAD audit test.
 #   scripts/release-gate.sh clean    only the cleaning below (the nightly
 #                                    runs it on nights it skips)
 #
@@ -141,10 +156,26 @@ run unit     "$LIMIT" scripts/gate-unit.sh
 run clippy   "$LIMIT" bash -c 'cargo clippy -q --workspace --all-targets -- -D warnings && echo clean'
 run fmt      5m       bash -c 'cargo fmt --all --check && echo clean'
 run gates    5m       scripts/gate-exit-test.sh
+run oracle   5m       python3 -I scripts/e3-oracle.py selftest
 run smoke    "$LIMIT" scripts/blk-smoke.sh
 run contract "$LIMIT" scripts/blk-contract.sh
 run crash    "$LIMIT" scripts/blk-crash.sh "$CRASH" && drop /var/lib/taso-blk/crash.log*
+if [ "$TIER" = quick ]; then run e3 "$LIMIT" scripts/e3-crash.sh run --subset --only hold
+else                         run e3 "$LIMIT" scripts/e3-crash.sh run --subset; fi
 run blkpool  "$LIMIT" scripts/blk-warden-test.sh
+# The ignored tests blk-warden-test.sh does not run.  A filter that matches
+# no test passes with "0 passed": that is a failure here.
+run ignored  "$LIMIT" bash -c '
+some() {
+    local out rc=0
+    out=$("$@" 2>&1) || rc=$?
+    printf "%s\n" "$out"
+    [ "$rc" = 0 ] || return "$rc"
+    if grep -q "test result: ok. 0 passed" <<<"$out"; then echo "release-gate: no test ran: $*"; return 1; fi
+}
+some cargo test -q -p taso-warden --lib -- --ignored --test-threads=1 runtime:: template:: &&
+some cargo test -q -p taso-landlock --test under_runc -- --ignored --test-threads=1 &&
+echo "ignored: the root and runc tests ran and passed"'
 run genesis  "$LIMIT" scripts/p4-genesis.sh blk
 run births   "$LIMIT" scripts/p4-births.sh blk
 run nominate "$LIMIT" scripts/p4-nominate.sh blk
