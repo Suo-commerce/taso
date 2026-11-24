@@ -30,6 +30,11 @@
 # sync, so the fsync and freeze rows would measure a device that does not
 # keep the contract (spec rev. 38, D&D F (a); blk-crash.sh's K1, 2026-11-06).
 # The pass/kill lines are the ones in the spike plan (section 2).
+#
+# Exit status (maturity review of e4a37b2, finding 12; G-d (a)): 1 if any
+# verdict is KILL, the plan's own line for "not acceptable"; "between" is
+# shown and passes.  The last line says which.  Under --quick a KILL is shown
+# and said, not failed: its counts are too small to judge by.  2 is ABORT.
 
 set -euo pipefail
 
@@ -411,12 +416,15 @@ umount "$MBASE"
 losetup -d "$BASEDEV"; BASEDEV=
 
 # ---- verdicts ----------------------------------------------------------------
-python3 - "$RESULTS" <<'PY' | tee -a "$RESULTS"
+rc=0
+python3 - "$RESULTS" "$QUICK" <<'PY' | tee -a "$RESULTS" || rc=$?
 import json, sys
+kills = []
 lines = open(sys.argv[1]).read().splitlines()
 get = lambda tag: json.loads(next(l for l in lines if l.startswith(tag + " ")).split(" ", 1)[1])
 def verdict(name, value, ok, kill, note=""):
     v = "PASS" if ok else ("KILL" if kill else "between")
+    if v == "KILL": kills.append(name)
     print(f"{name:3} {v:8} {value}{'  (' + note + ')' if note else ''}")
 print("\nverdicts (spike plan section 2):")
 k2 = get("K2"); p95 = float(k2["branch_p95_ms"])
@@ -444,5 +452,13 @@ verdict("K6", f"with ext4 freeze+thaw p95 {p95} ms", p95 < 2, p95 > 114, "the fr
 d = float(k3["drop_total_s"])
 verdict("K7", f"dropped {n} branches in {d} s ({k3['attached']} detached first in {k3['detach_total_s']} s); log {k3['log_bytes_after_drop']} B", d < 5, False,
         "dropping frees map entries; the log shrinks when compacted (compact, --compact-pct)")
+if not kills:
+    print("\nBENCH PASS: no verdict is KILL")
+elif sys.argv[2] == "1":
+    print(f"\nBENCH not judged (--quick): KILL at {', '.join(kills)}, not failed on these counts")
+else:
+    print(f"\nBENCH FAIL: KILL at {', '.join(kills)}")
+    sys.exit(1)
 PY
 say "results kept in $RESULTS"
+exit "$rc"
