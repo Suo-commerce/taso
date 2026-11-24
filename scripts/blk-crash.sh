@@ -143,6 +143,17 @@ wait_exit() {
     return 1
 }
 
+# grade_writer ROUND ALIVE STATUS BEFORE AFTER: the writer's part of a round
+# (header: "The writer is graded too").  ALIVE is 1 if it still ran when the
+# daemon was killed, STATUS its exit status, BEFORE and AFTER the manifest's
+# done lines around the round.  One function, so gate-exit-test.sh can call
+# it without root.
+grade_writer() {
+    [[ $2 -eq 1 ]] || fail "round $1: the writer stopped by itself before the kill (its last words are above)"
+    [[ $3 -eq 0 ]] || fail "round $1: the writer ended with status $3, a fault of its own, not the device's error (its last words are above)"
+    [[ $5 -gt $4 ]] || fail "round $1: the writer made nothing durable before the kill ($5 operations before and after)"
+}
+
 control_devices() { find /dev -maxdepth 1 -name 'ublkc*' 2>/dev/null | wc -l; }
 
 cleanup() {
@@ -319,16 +330,15 @@ for r in $(seq "$ROUNDS"); do
     sleep "$((delay / 1000)).$(printf '%03d' $((delay % 1000)))"
     # The writer runs until the device under it is gone.  One that is gone
     # already stopped by itself, and the kill below cuts nothing in flight.
-    kill -0 "$WRITER_PID" 2>/dev/null || fail "round $r: the writer stopped by itself before the kill (its last words are above)"
+    alive=1; kill -0 "$WRITER_PID" 2>/dev/null || alive=0
     kill -9 "$DAEMON_PID"
     wait "$DAEMON_PID" 2>/dev/null || true
     DAEMON_PID=
     wait_exit "$WRITER_PID" 30 || die "writer still running 30 s after the kill (stuck in I/O?): ps -o stat,wchan -p $WRITER_PID"
     WRITER_PID=
-    [[ $EXIT_RC -eq 0 ]] || fail "round $r: the writer ended with status $EXIT_RC, a fault of its own, not the device's error (its last words are above)"
     unmount
     done_ops=$(grep -c '^D' "$MAN" || true)
-    [[ $done_ops -gt $before ]] || fail "round $r: the writer made nothing durable before the kill ($done_ops operations before and after)"
+    grade_writer "$r" "$alive" "$EXIT_RC" "$before" "$done_ops"
     say "round $r: killed after ${delay} ms; $done_ops operations durable so far; control devices left: $(( $(control_devices) - CTRL_BEFORE ))"
 done
 
