@@ -46,6 +46,22 @@
 #     PASS only if every line holds on every Vessel; a driver or setup
 #     failure is HARNESS, never a pass.  Exit 0 PASS, 1 FAIL, 2 HARNESS.
 #
+# What a round must show before it is graded (maturity review of e4a37b2:
+# a round could pass with nothing acknowledged, and nothing asked whether
+# the machine had lost power; G-g (a), G-h (a)):
+#   the cut   `run` keeps the machine's boot id in $WORK/boot-id, synced with
+#             the config, and writes $WORK/b3-stopped when it ends by itself
+#             (its driver stopped, a signal, a shutdown that reached it).
+#             `verify` is HARNESS, before it starts anything, unless the boot
+#             id has changed and b3-stopped is absent.  This shows the machine
+#             went down under a running round; it cannot tell a power cut
+#             from a reset that killed the script before its marker landed.
+#   the work  a Vessel for which the witness holds no acknowledged Seal is
+#             HARNESS: the cut had nothing of its to lose.
+# A dry round (a kill -9 of the Warden and taso-blkd standing in for the
+# cut, the machine up throughout) is verified with B3_DRY=1: the cut is not
+# checked and the last line says "B3 PASS (dry: no power cut)".
+#
 # Touches, and nothing else: $WORK (/var/lib/taso-blk/b3, resolved) and
 # $WORK-<time> (earlier rounds, kept), $RUN (/run/taso-b3), $MNT
 # (/mnt/taso-b3), the ublk devices of this run's taso-blkd, runc containers
@@ -272,9 +288,16 @@ json.dump({
 }, open(cfg, "w"), indent=1)
 PY
     printf '%s\n' "$COMMIT" >"$WORK/commit"
+    cat /proc/sys/kernel/random/boot_id >"$WORK/boot-id"
     sync
     say "work directory, rootfs and config synced ($WORK)"
-    trap 'stop_stack' EXIT
+    # From here `run` ends only by the machine going down under it.  If it
+    # ends by itself, that is written first and synced: verify refuses the round.
+    run_ended() {
+        { printf '%s\n' "$(date +%Y-%m-%dT%H:%M:%S)" >"$WORK/b3-stopped" && sync "$WORK/b3-stopped" "$WORK"; } 2>/dev/null || true
+        stop_stack
+    }
+    trap 'run_ended' EXIT
     start_stack run
     say "taso-blkd (${BLKD_FLAGS[*]}) and the Warden up; waiting for $P agents"
     python3 -I - "$P" "$WRITES" "$PORT" "$COMMIT" "$ROWS" <<PY
@@ -357,6 +380,19 @@ if [[ -n "$FIRST" ]]; then
         || die "B3_FIRST=$FIRST holds no blkd-verify.err and warden-verify.err"
     say "taso-blkd's recovery and the Warden's settle lines from the first rebirth: $FIRST"
 fi
+# The cut, before anything is started on the log (see the header).
+DRY=${B3_DRY:-0}; [[ "$DRY" == 0 || "$DRY" == 1 ]] || die "B3_DRY=$DRY: 0 or 1"
+harness() { printf 'HARNESS: %s\n' "$*"; echo "== B3 HARNESS: the round was not graded and nothing was started"; exit 2; }
+if [[ "$DRY" == 1 ]]; then
+    say "dry round (B3_DRY=1): whether the machine went down is not checked, and the result says dry"
+else
+    [[ -s "$WORK/boot-id" ]] || harness "run kept no boot id in $WORK/boot-id (a round run by an older script): the cut cannot be shown"
+    [[ "$(cat "$WORK/boot-id")" != "$(cat /proc/sys/kernel/random/boot_id)" ]] \
+        || harness "the machine has not been down since run (the same boot id): nothing was cut.  A dry round is verified with B3_DRY=1"
+    [[ ! -e "$WORK/b3-stopped" ]] \
+        || harness "run ended by itself at $(cat "$WORK/b3-stopped") before the machine went down: a power cut never lets it.  A dry round is verified with B3_DRY=1"
+    say "the cut: the machine has booted again since run, and run did not end by itself"
+fi
 OUT=$WORK/verify-$(date +%Y%m%d-%H%M%S); mkdir -p "$OUT"
 say "B3 verify at $COMMIT, witness file $ACKED, results in $OUT"
 cp "$ACKED" "$OUT/acked.json"
@@ -365,10 +401,10 @@ trap 'stop_stack' EXIT
 start_stack verify
 say "taso-blkd and the Warden started on the cut log; waiting for $P agents"
 rc=0
-python3 -I - "$P" "$ROWS" "$OUT" "$WORK" "$FIRST" <<PY || rc=$?
+python3 -I - "$P" "$ROWS" "$OUT" "$WORK" "$FIRST" "$DRY" <<PY || rc=$?
 $DRIVER
 import shutil
-p, rows, outdir, work, first = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+p, rows, outdir, work, first, dry = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6] == "1"
 w = json.load(open(outdir + "/acked.json"))
 if not w.get("hello"):
     print("HARNESS: the witness file has no hello: it never heard the host"); sys.exit(2)
@@ -428,6 +464,16 @@ for i in range(p):
         verdict = max(verdict, 1)
         lines.append(f"FAIL    v{i}: did not come back: its agent never started in 300 s")
         lines += [f"        1: the Warden said: {l}" for l in said[-4:]] or ["        1: the Warden said nothing about it"]
+        continue
+    if a_s == 0:
+        # The work: a Vessel with no Seal acknowledged to the witness had
+        # nothing of its own for the cut to lose; every line below would hold
+        # on zeros.  Not graded and not driven.
+        verdict = max(verdict, 2)
+        lines.append(f"HARNESS v{i}: the witness holds no acknowledged Seal for it (requested {q_s}, writes in {len(wr)} turn(s)): the cut proved nothing for it")
+        lines += ["        note: driver errors before the cut: " + str(x["errors"][:2])] if x["errors"] else []
+        try: Agent(found[i]).step("exit", 30)
+        except RuntimeError: pass
         continue
     a = Agent(found[i])
     R = a.ready.get("resumed_after") or 0
@@ -494,7 +540,7 @@ for i in range(p):
         lines.append("PASS    " + head)
     lines += ["        note: " + n for n in notes]
 total = {0: "PASS", 1: "FAIL", 2: "HARNESS"}[verdict]
-lines.append(f"== B3 {total}: {p} Vessels; the witness held {sum(v['seal_acked'] for v in w['vessels'].values())} acknowledged Seals, {w['lines']} lines")
+lines.append(f"== B3 {total}{' (dry: no power cut)' if dry else ''}: {p} Vessels; the witness held {sum(v['seal_acked'] for v in w['vessels'].values())} acknowledged Seals, {w['lines']} lines")
 open(outdir + "/result.txt", "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
 sys.exit(verdict)
