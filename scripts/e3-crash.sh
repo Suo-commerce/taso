@@ -10,6 +10,13 @@
 #
 # From the repository root, as root, on a host E3-1's `check` passes on.
 #
+# Exit status of `run` and `round` (the last line printed says which and why):
+#   0  at least one round was graded and none failed
+#   1  a FAIL; or a HARNESS line (the harness did not finish a round: never
+#      a pass); or no round graded at all (no PASS and no FAIL: nothing was
+#      proven).  MISSED and REFUSED rounds are counted and shown, not failed.
+#   2  ABORT: the script itself could not go on
+#
 # One round (protocol 1-6 of the one-pager):
 #  1 a fresh dm-flakey device (scripts/e3-device.sh) over a file under
 #    $WORK, ext4 on it, mounted at $WORK/d: the block log, the coordinator,
@@ -1322,12 +1329,33 @@ run_one() { # run_one N "SEQ" POINT MODE
     fi
     true
 }
+# grade RESULTS: the counts of the run's lines, then the verdict; its status is
+# the script's.  A run that printed FAIL and exited 0 could stop no release
+# (maturity review of e4a37b2, finding 12).
+grade() {
+    python3 -I - "$1" <<'GRADE'
+import collections, re, sys
+lines = [l for l in open(sys.argv[1]) if l[:1].isupper()]
+c = collections.Counter(l.split()[0] for l in lines)
+secs = [int(m.group(1)) for l in lines if (m := re.search(r"\((\d+)s\)\s*$", l))]
+print("== " + (", ".join(f"{k} {v}" for k, v in sorted(c.items())) or "no rounds") + (f"; {sum(secs) / len(secs):.0f} s per round" if secs else ""))
+if c["FAIL"] or c["HARNESS"]:
+    print(f"== E3 FAIL: {c['FAIL']} FAIL, {c['HARNESS']} HARNESS")
+    sys.exit(1)
+if not c["PASS"]:
+    print("== E3 FAIL: no round was graded (no PASS and no FAIL): nothing was proven")
+    sys.exit(1)
+print(f"== E3 PASS: {c['PASS']} graded, none failed")
+GRADE
+}
 case "${1:-}" in
     round)
         [[ $# == 4 ]] || die "round \"SEQ\" POINT MODE"
         say "one round, taso-blkd durable at $DURABLE_AT; results in $OUT"
         mkdir -p "$OUT"; echo "== taso-blkd durable at $DURABLE_AT" >>"$OUT/results.txt"
-        run_one 1 "$2" "$3" "$4" ;;
+        run_one 1 "$2" "$3" "$4"
+        rc=0; grade "$OUT/results.txt" || rc=$?
+        exit "$rc" ;;
     run)
         shift; sub=""; limit=0; only=""
         while (($#)); do case "$1" in --subset) sub=--subset ;; --only) only=$2; shift ;; --limit) limit=$2; shift ;; *) die "run [--subset] [--only KIND] [--limit N]" ;; esac; shift; done
@@ -1361,13 +1389,8 @@ case "${1:-}" in
             n=$((n + 1)); ((limit > 0 && n > limit)) && break
             printf '%4d/%d  ' "$n" "$total"; run_one "$n" "$s" "$p" "$m"
         done < <(pick)
-        python3 -I - "$OUT/results.txt" <<'PY'
-import collections, re, sys
-lines = [l for l in open(sys.argv[1]) if l[:1].isupper()]
-c = collections.Counter(l.split()[0] for l in lines)
-secs = [int(m.group(1)) for l in lines if (m := re.search(r"\((\d+)s\)\s*$", l))]
-print("== " + ", ".join(f"{k} {v}" for k, v in sorted(c.items())) + (f"; {sum(secs) / len(secs):.0f} s per round" if secs else ""))
-PY
+        rc=0; grade "$OUT/results.txt" || rc=$?
+        exit "$rc"
         ;;
     *) sed -n '2,8p' "$0"; exit 64 ;;
 esac
