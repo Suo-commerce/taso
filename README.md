@@ -1,8 +1,122 @@
 # Taso
 
-A storage substrate for agents: every Vessel's work is a hash-chained
-Chronicle, and a Vessel's sealed state can become the next Template.
-The specifications the code cites are in [`docs/spec`](docs/spec/README.md).
+**Checkpoints and branches for the storage AI agents work on.**
+
+Most databases remember what happened. Taso remembers what could have
+happened, and lets you choose afterwards.
+
+## What it does
+
+An agent works on files and databases, and it makes mistakes. Taso gives
+each agent its own workspace on an ordinary Linux filesystem and keeps a
+complete, tamper-evident history of everything written to it. The agent
+needs no changes: its files and its SQLite database work as they do on
+any disk.
+
+On top of that history you get four things:
+
+- **Checkpoints.** Taso takes a checkpoint of the workspace at the end of
+  every agent turn. After a crash, the workspace comes back exactly as it
+  was at its last checkpoint, never half-written.
+- **Branches.** Start a copy of a workspace from a checkpoint and let
+  another agent (or a sub-agent) try something there. Nothing is copied
+  up front, so a branch starts in an instant, however much data the
+  workspace holds.
+- **Merge by choice.** A branch changes nothing in its parent until
+  someone outside the agent decides to merge it. A branch nobody merges
+  simply goes away, with no trace in the parent.
+- **Restore anywhere.** Every checkpoint is shipped to object storage (a
+  local directory or an S3-compatible bucket). If a machine is lost,
+  another machine rebuilds the workspace from the bucket, and the old
+  machine is refused if it ever comes back.
+
+Taso also keeps an **outbox** for anything the agent wants to do outside
+its workspace: send an e-mail, call an API, push to a repository. The
+agent declares the action, Taso records it and answers *released* or
+*held*, and a separate sender of yours carries it out and reports the
+result. Taso itself never sends anything. This is what lets a branch be
+thrown away safely: its outside actions were waiting in the outbox, not
+already done.
+
+## Why you would use it
+
+- You run agents and want to **undo** what one did, back to a known good
+  point, without restoring a whole server.
+- You want to run **many attempts in parallel** on the same starting
+  data and keep only the one that worked.
+- You want a **record you can trust** of what an agent wrote and what it
+  asked to do in the outside world, with the reason for every decision
+  rebuilt from the records (`taso-ctl explain`).
+- You keep agent state in **object storage** and want it to survive the
+  loss of a machine without duplicated or lost outside actions.
+
+## What it is not
+
+- **Not a replacement for your database.** Taso sits between the agent
+  and its storage. Your SQLite file or your documents live inside the
+  workspace as before.
+- **Not a sandbox.** Taso runs each agent in a container, but its promise
+  is about storage, not about containing a hostile agent.
+- **Not a policy engine.** Taso records and holds; it does not decide.
+  What to merge and which outside actions to allow is decided by you, or
+  by a program of yours that Taso asks.
+
+## How it works, in one paragraph
+
+Each workspace is a virtual disk with ext4 on it. Every block the agent
+writes becomes a record in an append-only log, and each record carries
+the hash of the one before it, so history cannot be changed without
+breaking the chain. A checkpoint is a position in that log. A branch is
+a new log that points at its parent's checkpoint. Restoring is replaying
+the log from the bucket. One service per machine (`taso-blkd`) serves the
+disks; a second (`taso-wardend`) starts the agents, takes the
+checkpoints and ships them.
+
+## The words used in this repository
+
+The rest of this README, the code and the specs use Taso's own names.
+
+| Taso's name | What it is |
+|---|---|
+| Vessel | One agent's workspace: its disk and the container the agent runs in |
+| Seal | A checkpoint of a Vessel |
+| Chronicle | A Vessel's append-only, hash-chained log |
+| Fork | A branch started from a Seal |
+| Promotion | Merging a fork's files and outbox into its parent |
+| Template | A reviewed checkpoint that new Vessels can start from |
+| Effect | An action outside the workspace, declared to the outbox |
+| Warden | The service that runs Vessels on a machine (`taso-wardend`) |
+| Coordinator | The service that decides which Warden owns a Vessel |
+| Rebirth | Rebuilding a Vessel on another machine from the bucket |
+
+## Status
+
+Taso is **pre-release**: version 0.1 is being prepared and stored formats
+may still change before it. It runs on Linux 6.0 or later with the
+`ublk_drv` module, without SELinux (Ubuntu and Debian, for example), on
+one machine or in containers with Docker Compose. Kubernetes support is
+in progress.
+
+## Where to go next
+
+- **Try it:** [Install on one machine](#install-on-one-machine) or
+  [Run in containers](#run-in-containers). The demo takes under a minute.
+- **Connect your own sender:** [`docs/relay.md`](docs/relay.md), the
+  contract between Taso's outbox and whoever carries its actions out.
+- **Read the design:** [`docs/spec`](docs/spec/README.md).
+
+| In this repository | |
+|---|---|
+| `crates/taso-core` | The record types and rules, with no I/O |
+| `crates/taso-blk` | The block log and `taso-blkd` |
+| `crates/taso-warden` | The Warden, the coordinator and `taso-ctl` |
+| `crates/taso-field` | The protocol between an agent and the Warden |
+| `crates/taso-landlock` | The file-access limits put on an agent |
+| `crates/taso-sim` | The demo agent |
+| `deploy/` | Dockerfile, Compose file, Kubernetes resource definition |
+| `scripts/`, `bench/` | Test gates, crash tests and benchmarks |
+
+Licensed under [Apache-2.0](LICENSE).
 
 ## Install on one machine
 
