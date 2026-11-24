@@ -32,6 +32,11 @@
 # plus the raw samples beside it.  Nothing is compared or judged here: the
 # storage rule (§3) is applied to the tables by hand, in the plan.
 #
+# Exit status: the numbers are not judged, the run is.  1 (last line BENCH
+# FAIL, saying which) if a Warden run exited non-zero, if fewer Vessels ended
+# ok than RUNS x (P + FORKS), or if the kernel reported a stalled task during
+# a run (its row is discarded); else 0 and BENCH PASS.  2 is ABORT.
+#
 # Storage: a fresh taso-blkd on its own log under $DIR (which A1 puts on the
 # measured drive through /var/lib/taso-blk), mounts under /mnt/p5-bench,
 # stopped after.  The Warden leaves each Vessel mounted under $MNT at exit,
@@ -301,6 +306,7 @@ PY
         umount "$at"; [[ "$whose" == theirs ]] || blk detach "$branch" >/dev/null
     done
     rmdir "$at"
+    echo "$rc" >"$OUT/warden-$r.rc"
     local ok; ok=$(grep -cE "$VESSEL_OK" "$OUT/warden-$r.out" || true)
     echo "warden run $r: exit $rc, $ok of $P Vessels ok, $(awk '{printf "user %.2fs sys %.2fs rss %d KiB", $1, $2, $3}' "$OUT/warden-$r.time")"
     # The host's disk can stall for minutes (taso-test, 2026-11-03: journald
@@ -486,3 +492,23 @@ for name in sorted(spans):
     v = spans[name]; print(f"| {name} | {len(v)} | {q(v, .5):.1f} | {q(v, .95):.1f} | {q(v, 1):.1f} |")
 PY
 echo "results in $OUT"
+
+# ---- the verdict ---------------------------------------------------------------
+# A table from a run that failed is no result, and the script used to end 0
+# over it (maturity review of e4a37b2, finding 12; G-e (a)).  Not in table.md.
+why=""
+for r in $(seq 1 "$RUNS"); do
+    rc=$(cat "$OUT/warden-$r.rc" 2>/dev/null || echo "none recorded")
+    [[ "$rc" == 0 ]] || why="$why run $r: the Warden's exit status was $rc;"
+    n=$(cat "$OUT/warden-$r.stalls" 2>/dev/null || echo 0)
+    [[ "${n:-0}" == 0 ]] || why="$why run $r: the kernel reported $n task(s) blocked for over 120 s, its row is discarded;"
+done
+ok=$(cat "$OUT"/warden-*.out 2>/dev/null | grep -cE "$VESSEL_OK" || true)
+want=$((RUNS * (P + FORKS)))
+[[ "$ok" == "$want" ]] || why="$why $ok of $want Vessels ok;"
+if [[ -z "$why" ]]; then
+    echo "BENCH PASS: $RUNS run(s), $ok of $want Vessels ok, no stall"
+else
+    echo "BENCH FAIL:${why%;}"
+    exit 1
+fi
