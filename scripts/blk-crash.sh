@@ -31,6 +31,13 @@
 # or its new state, nothing else.  Replace and create go through a
 # temporary name and rename, so neither can be torn.
 #
+# The writer is graded too, each round (maturity review of e4a37b2, finding
+# 12; G-c (a)): a kill that had nothing in flight and nothing durable behind
+# it proves nothing, and it used to count toward PASS.  A round is a FAIL if
+# the writer had stopped by itself before the kill, if it ended by a fault of
+# its own (any status but 0: it exits 0 when the device's error stops it), or
+# if it made no operation durable in that round.
+#
 # What a kill -9 does not test: log writes the daemon issued but had not
 # yet synced survive here in the page cache; a power cut would lose them.
 # The store's unit tests cover that (the log cut at every byte).
@@ -126,10 +133,11 @@ unmount() {
     umount "$MNT" 2>/dev/null || umount -l "$MNT"
 }
 
-# Wait up to $2 s for pid $1 to exit.
+# Wait up to $2 s for pid $1 to exit; its exit status is left in EXIT_RC.
+EXIT_RC=0
 wait_exit() {
     for _ in $(seq $(($2 * 10))); do
-        kill -0 "$1" 2>/dev/null || { wait "$1" 2>/dev/null || true; return 0; }
+        kill -0 "$1" 2>/dev/null || { EXIT_RC=0; wait "$1" 2>/dev/null || EXIT_RC=$?; return 0; }
         sleep 0.1
     done
     return 1
@@ -304,17 +312,23 @@ for r in $(seq "$ROUNDS"); do
     if [[ $r -gt 1 ]]; then
         recover_and_check "$r"
     fi
+    before=$(grep -c '^D' "$MAN" || true)
     python3 "$HELPER" write "$MNT" "$MAN" "$r" &
     WRITER_PID=$!
     delay=$((RANDOM % 7000 + 1000))
     sleep "$((delay / 1000)).$(printf '%03d' $((delay % 1000)))"
+    # The writer runs until the device under it is gone.  One that is gone
+    # already stopped by itself, and the kill below cuts nothing in flight.
+    kill -0 "$WRITER_PID" 2>/dev/null || fail "round $r: the writer stopped by itself before the kill (its last words are above)"
     kill -9 "$DAEMON_PID"
     wait "$DAEMON_PID" 2>/dev/null || true
     DAEMON_PID=
     wait_exit "$WRITER_PID" 30 || die "writer still running 30 s after the kill (stuck in I/O?): ps -o stat,wchan -p $WRITER_PID"
     WRITER_PID=
+    [[ $EXIT_RC -eq 0 ]] || fail "round $r: the writer ended with status $EXIT_RC, a fault of its own, not the device's error (its last words are above)"
     unmount
     done_ops=$(grep -c '^D' "$MAN" || true)
+    [[ $done_ops -gt $before ]] || fail "round $r: the writer made nothing durable before the kill ($done_ops operations before and after)"
     say "round $r: killed after ${delay} ms; $done_ops operations durable so far; control devices left: $(( $(control_devices) - CTRL_BEFORE ))"
 done
 
