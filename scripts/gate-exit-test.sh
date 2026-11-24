@@ -15,6 +15,17 @@
 # 6. soak.sh runs its cleanup when it is sent TERM (systemctl stop), and
 #    stops at its free-space floor; release-gate.sh clean names the large
 #    files the gates leave in /var/lib/taso-blk.
+# 7. e3-crash.sh's grade exits 1 on a FAIL, on a HARNESS line and on a run
+#    with no graded round; 0 when a round passed and none failed.
+# 8. blk-crash.sh's grade of a round's writer fails one that stopped by
+#    itself, one that ended by its own fault and one that made nothing durable.
+# 9. blk-bench.sh's verdicts exit 1 on a KILL, 0 on "between", and 0 on a
+#    KILL under --quick.
+# 10. bench/p5/bench.sh's verdict exits 1 on a failed Warden run, on a Vessel
+#    that did not end ok and on a stall.
+# 11. bench/p5/b3-power.sh's verify refuses (2) a round whose machine did not
+#    go down under a running `run`, and goes on for a cut or a dry round.
+# (7-11: maturity review of e4a37b2, finding 12.)
 set -uo pipefail
 cd "$(dirname "$0")/.."
 T=$(mktemp -d /tmp/gate-exit-test.XXXXXX); trap 'rm -rf "$T"' EXIT
@@ -113,5 +124,77 @@ for f in crash.log bench.log bench-base.img fst.log; do
     grep -q "/var/lib/taso-blk/$f" scripts/release-gate.sh && r=0 || r=1
     check "release-gate clean: removes /var/lib/taso-blk/$f" 0 "$r"
 done
+
+# 7. e3-crash.sh's grade(), its Python cut out of the script, over results files
+awk '/<<.GRADE.$/ {on=1; next} on && /^GRADE$/ {exit} on' scripts/e3-crash.sh > "$T/grade.py"
+[ -s "$T/grade.py" ] || { echo "FAIL  e3-crash: its grade was not found"; bad=$((bad + 1)); }
+e3() { printf '== taso-blkd durable at fua\n%b' "$1" > "$T/e3.txt"; python3 -I "$T/grade.py" "$T/e3.txt" >/dev/null 2>&1; echo $?; }
+check "e3: a PASS and a MISSED exit 0" 0 "$(e3 'PASS    [write seal] boundary:2 drop  (4s)\nMISSED  [write seal] timing:2+0 drop  (3s)\n')"
+check "e3: a FAIL line exits 1" 1 "$(e3 'PASS    a  (4s)\nFAIL    b  (4s)\n        1: an acknowledged Seal is lost\n')"
+check "e3: a HARNESS line exits 1" 1 "$(e3 'PASS    a  (4s)\nHARNESS b: no result  (2s)\n')"
+check "e3: no graded round exits 1" 1 "$(e3 'MISSED  a  (3s)\nREFUSED b  (3s)\n')"
+check "e3: no round at all exits 1" 1 "$(e3 "")"
+
+# 8. blk-crash.sh's grade_writer (and its fail), cut out: the exit is the FAILs
+sed -n '/^fail() /p; /^grade_writer() {$/,/^}$/p' scripts/blk-crash.sh > "$T/writer.fn"
+grep -q '^grade_writer() {' "$T/writer.fn" && grep -q '^fail() ' "$T/writer.fn" ||
+    { echo "FAIL  blk-crash: its grade_writer or its fail was not found"; bad=$((bad + 1)); }
+writer() { # writer ALIVE STATUS BEFORE AFTER
+    bash -c 'set -euo pipefail; FAILS=0
+. "$0"
+grade_writer 1 "$@"; exit "$FAILS"' "$T/writer.fn" "$@" >/dev/null 2>&1; echo $?
+}
+check "blk-crash: a writer cut at work passes" 0 "$(writer 1 0 5 9)"
+check "blk-crash: a writer that stopped by itself fails" 1 "$(writer 0 0 5 9)"
+check "blk-crash: a writer that ended by its own fault fails" 1 "$(writer 1 1 5 9)"
+check "blk-crash: a writer that made nothing durable fails" 1 "$(writer 1 0 5 5)"
+
+# 9. blk-bench.sh's verdicts, the Python cut out, over made-up result lines
+awk 'index($0, "python3 - \"$RESULTS\" \"$QUICK\" <<") == 1 {on=1; next} on && /^PY$/ {exit} on' scripts/blk-bench.sh > "$T/verdict.py"
+[ -s "$T/verdict.py" ] || { echo "FAIL  blk-bench: its verdicts were not found"; bad=$((bad + 1)); }
+bench() { # bench FORK_P95_MS FREEZE_P95_MS QUICK
+    cat > "$T/bench.txt" <<EOF
+K2 {"branch_p95_ms": "$1", "attach_p95_ms": "4", "detach_p95_ms": "15"}
+K3K7 {"branches": 1000, "asked": 1000, "branch_total_s": "0.1", "before": {"rss_kib": 1000, "threads": 4}, "after_branches": {"rss_kib": 1300, "threads": 4}, "after_attach": {"rss_kib": 18000, "threads": 304}, "attached": 100, "asked_attached": 100, "mem_drop_attach_mib": 77, "stopped_early_low_memory": false, "drop_total_s": "0.1", "detach_total_s": "1.4", "log_bytes_after_drop": 5}
+K4 big/small: 1.17; fork/baseline: 1.25
+K5 randwrite (base/blk 1.12)
+K5 seqwrite (base/blk 1.08)
+K6 {"seal_only_p95_ms": "1.0", "total_p95_ms": "$2"}
+EOF
+    python3 "$T/verdict.py" "$T/bench.txt" "$3" >/dev/null 2>&1; echo $?
+}
+check "blk-bench: every verdict PASS exits 0" 0 "$(bench 0.5 1.5 0)"
+check "blk-bench: a between exits 0" 0 "$(bench 0.5 7.8 0)"
+check "blk-bench: a KILL exits 1" 1 "$(bench 60 7.8 0)"
+check "blk-bench: a KILL under --quick exits 0" 0 "$(bench 60 7.8 1)"
+
+# 10. bench/p5/bench.sh's verdict, cut out, over the files a run leaves
+sed -n '/^why=""$/,$p' bench/p5/bench.sh > "$T/p5verdict"
+grep -q 'BENCH FAIL' "$T/p5verdict" || { echo "FAIL  bench.sh: its verdict was not found"; bad=$((bad + 1)); }
+p5b() { # p5b WARDEN_STATUS STALLS VESSELS_OK (of 2)
+    rm -rf "$T/p5"; mkdir "$T/p5"; echo "$1" > "$T/p5/warden-1.rc"; echo "$2" > "$T/p5/warden-1.stalls"; : > "$T/p5/warden-1.out"
+    for _ in $(seq "$3"); do echo 'p5-bench-v0: 3 Seals, 0 publish failures, 2 segments pruned, 0 prune failures, agent ok' >> "$T/p5/warden-1.out"; done
+    OUT="$T/p5" RUNS=1 P=2 FORKS=0 VESSEL_OK=' 0 publish failures, [0-9]+ segments pruned, 0 prune failures, agent ok$' \
+        bash -c 'set -euo pipefail; . "$0"' "$T/p5verdict" >/dev/null 2>&1; echo $?
+}
+check "bench.sh: a good run exits 0" 0 "$(p5b 0 0 2)"
+check "bench.sh: a Warden run that failed exits 1" 1 "$(p5b 1 0 2)"
+check "bench.sh: a Vessel that did not end ok exits 1" 1 "$(p5b 0 0 1)"
+check "bench.sh: a stall exits 1" 1 "$(p5b 0 3 2)"
+
+# 11. b3-power.sh verify's check of the cut, cut out, over a work directory
+sed -n '/^DRY=\${B3_DRY:-0}/,/^fi$/p' bench/p5/b3-power.sh > "$T/cut.lines"
+grep -q 'boot-id' "$T/cut.lines" || { echo "FAIL  b3-power: its check of the cut was not found"; bad=$((bad + 1)); }
+b3() { # b3 BOOT(same|other|none) STOPPED(0|1) DRY(0|1) -> 0 when verify would go on to grade
+    rm -rf "$T/b3"; mkdir "$T/b3"
+    case "$1" in same) cat /proc/sys/kernel/random/boot_id > "$T/b3/boot-id" ;; other) echo another-boot > "$T/b3/boot-id" ;; esac
+    [ "$2" = 0 ] || date > "$T/b3/b3-stopped"
+    WORK="$T/b3" B3_DRY="$3" bash -c 'set -Eeuo pipefail; die() { exit 2; }; say() { :; }; . "$0"' "$T/cut.lines" >/dev/null 2>&1; echo $?
+}
+check "b3: a machine that went down under a running round is graded" 0 "$(b3 other 0 0)"
+check "b3: the same boot id is refused" 2 "$(b3 same 0 0)"
+check "b3: a run that ended by itself is refused" 2 "$(b3 other 1 0)"
+check "b3: a round with no boot id kept is refused" 2 "$(b3 none 0 0)"
+check "b3: a dry round is graded" 0 "$(b3 same 1 1)"
 
 [ "$bad" = 0 ] && echo "gate-exit-test: PASS" || { echo "gate-exit-test: $bad FAILED"; exit 1; }
