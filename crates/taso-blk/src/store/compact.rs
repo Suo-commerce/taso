@@ -8,7 +8,7 @@
 //! one's place.
 //!
 //! ```text
-//!   new log:  "TASOBLK3" | Data* | Base+ | Flush | (old log's later records, re-chained)
+//!   new log:  header (flag: compacted) | Data* | Base+ | Flush | (old log's later records, re-chained)
 //!             Data  = live blocks, packed, no map effect
 //!             Base  = pieces of: lsn | map | tags and names (checkpoint encoding),
 //!                     every log location pointing into the Data records
@@ -54,8 +54,8 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ckpt_path, encode_record, mode_of_log, read_record, remove_if_there, sync_dir,
-    write_checkpoint, FlushPoint, Meta, ReadAt, Stats, Store, StoreError, COMPACT_MAGIC, HASH,
-    HEADER_LEN, K_BASE, K_DATA, K_FLUSH, MAX_BODY, REC_HEAD,
+    write_checkpoint, FlushPoint, LogId, Meta, ReadAt, Stats, Store, StoreError, HASH, HEADER_LEN,
+    K_BASE, K_DATA, K_FLUSH, MAX_BODY, REC_HEAD,
 };
 use crate::map::{Map, BLOCK};
 
@@ -103,6 +103,8 @@ pub struct OldLog(#[allow(dead_code)] Vec<File>);
 pub struct Compaction {
     log: PathBuf,
     temp: PathBuf,
+    /// The log's identity, for the new log's checkpoint.
+    id: LogId,
     /// The old log, read only.
     old: File,
     new: File,
@@ -166,11 +168,12 @@ impl Store {
             .mode(mode)
             .open(&temp)?;
         new.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        let mut header = [0u8; HEADER_LEN as usize];
-        header[..8].copy_from_slice(COMPACT_MAGIC);
+        // The same log, rewritten: its identity and flush key carry over.
+        let header = self.header.compacted().encode();
         new.write_all_at(&header, 0)?;
         Ok(Compaction {
             log: self.path.clone(),
+            id: self.header.id,
             temp,
             old: self.file.try_clone()?,
             new,
@@ -338,7 +341,7 @@ impl Compaction {
             self.map.take().expect("copy put it back"),
             self.meta.take().expect("copy put it back"),
         );
-        write_checkpoint(&self.temp, &base_at, 0, &map, &meta)?;
+        write_checkpoint(&self.temp, &self.id, &base_at, 0, &map, &meta)?;
         drop((map, meta));
 
         // Open the new log as the next start would, and check it agrees.
