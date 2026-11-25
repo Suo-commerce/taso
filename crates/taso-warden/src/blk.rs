@@ -4093,6 +4093,9 @@ mod tests {
         seals: Vec<Position>,
         len_after: Vec<u64>,
         shipped_at_8: Position,
+        /// The action held in turn 10, if the Vessel holds its effects
+        /// ([`TenTurns::holding`]).
+        held: Option<taso_core::record::OpId>,
     }
 
     impl TenTurns {
@@ -4120,6 +4123,17 @@ mod tests {
         }
 
         fn new() -> Self {
+            Self::with(false)
+        }
+
+        /// The same ten turns of a Vessel that holds its effects (as a
+        /// fork does): in turn 10 its agent declares one action, which is
+        /// held, and Seal 10 covers it.
+        fn holding() -> Self {
+            Self::with(true)
+        }
+
+        fn with(hold_in_turn_10: bool) -> Self {
             let tmp = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(tmp.path().join("store")).unwrap();
             let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
@@ -4136,6 +4150,7 @@ mod tests {
                     lsn: Lsn::new(0),
                     hash: h(0),
                 },
+                held: None,
             };
             let a = t.node(pool);
             let (mut v, _) = a.ensure(Namespace::from_bytes([3; 16]), b"user").unwrap();
@@ -4145,6 +4160,44 @@ mod tests {
             for turn in 0..=10u64 {
                 let s = if turn == 0 {
                     v.seal_birth().unwrap().seal
+                } else if turn == 10 && hold_in_turn_10 {
+                    write0(&a.pool, v.dataset(), turn as u8);
+                    let publisher = crate::pack::PackPublisher::new(
+                        t.packs(&a),
+                        t.coord.clone(),
+                        WardenId::new(1),
+                    );
+                    let (mut fx, _) = crate::effects::Effects::open(
+                        crate::effects::Mode::Hold,
+                        Box::new(publisher),
+                        &mut v,
+                    )
+                    .unwrap();
+                    let asked = fx
+                        .ask(
+                            &mut v,
+                            &crate::ledger::Declared {
+                                provider: "mail".into(),
+                                request: b"send the report of turn 10".to_vec(),
+                                footprint: Vec::new(),
+                                dispatch: taso_core::record::Dispatch::Immediate,
+                                retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
+                                    key: b"turn-10".to_vec(),
+                                },
+                                consequence: taso_core::record::Consequence::Irreversible,
+                                authority: b"user".to_vec(),
+                            },
+                        )
+                        .unwrap();
+                    let crate::effects::Asked::Held { op } = asked else {
+                        panic!("a holding Vessel holds: {asked:?}");
+                    };
+                    t.held = Some(op);
+                    // Seal 10 covers the held action (its ledger position).
+                    let covered = crate::effects::ledger_pos(&v).unwrap();
+                    v.seal(StreamCut::EMPTY, Verdict::Clean, covered, TurnId::new(turn))
+                        .unwrap()
+                        .seal
                 } else {
                     write0(&a.pool, v.dataset(), turn as u8);
                     seal(&mut v, turn)
@@ -4377,5 +4430,61 @@ mod tests {
             .to_string();
         assert!(e.contains("no Seal layer"), "{e}");
         assert_eq!(t.coord.shipped(t.id).unwrap(), t.shipped_at_8);
+    }
+
+    /// Case A for a Vessel that holds its effects: an action its agent
+    /// declared in turn 10, which Seal 10 covers.  The layers of Seals 9
+    /// and 10 are lost, so the files of turn 10 are gone; the action is
+    /// not.
+    #[test]
+    fn today_a_held_action_of_a_turn_whose_files_were_lost_stays_held_and_can_be_released() {
+        let t = TenTurns::holding();
+        let op = t.held.unwrap();
+        let (node, mut v, _, settled) = t.restart_with_block_log_cut_after(8);
+        assert_eq!(settled.rolled_back_to, Some(t.seals[8]));
+        assert_eq!(block0(&node.pool, &t.dataset), 8, "the files of turn 8");
+
+        // The ledger at this start withdraws the held actions of a turn
+        // that did not end: those past the log's last Seal.  That is Seal
+        // 10, whose record is here, so the action of turn 10 is not one.
+        let publisher =
+            crate::pack::PackPublisher::new(t.packs(&node), t.coord.clone(), WardenId::new(1));
+        let (mut fx, reconciled) =
+            crate::effects::Effects::open(crate::effects::Mode::Hold, Box::new(publisher), &mut v)
+                .unwrap();
+        assert_eq!(reconciled.withdrawn, vec![]);
+        // A reviewer who lists the Vessel's held actions is shown it, as
+        // one a Seal covers (so one that may be approved).
+        let (held, _) = v.held_proposals().unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(held[0].intent.op == op && held[0].sealed);
+
+        // The next turn's Seal (with the ledger position a session gives
+        // it) ships as a step from Seal 8.
+        write0(&node.pool, v.dataset(), 11);
+        let covered = crate::effects::ledger_pos(&v).unwrap();
+        let s11 = v
+            .seal(StreamCut::EMPTY, Verdict::Clean, covered, TurnId::new(11))
+            .unwrap()
+            .seal;
+        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
+        v.publish_seal(&t.packs(&node), &snap, None).unwrap();
+
+        // The reviewer approves it: it is released, and a sender is shown
+        // it to act on.  Its turn's files are on no node and in no pack.
+        let approved = fx.approve(&mut v, op);
+        assert!(
+            matches!(approved, Ok(crate::effects::Decided::Now)),
+            "{approved:?}"
+        );
+        let listed = fx.released(&v).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].intent.op, op);
+        assert_eq!(listed[0].intent.request, b"send the report of turn 10");
+        assert_eq!(
+            block0(&node.pool, &t.dataset),
+            11,
+            "turn 8's files and turn 11's"
+        );
     }
 }
