@@ -75,7 +75,17 @@ pub struct Reconciled {
     pub open: Vec<OpId>,
     /// Held proposals of a turn that did not end, withdrawn now.
     pub withdrawn: Vec<OpId>,
+    /// Obligations the coordinator counted and this log does not hold,
+    /// closed now ([`LOST_IN_GAP`], D100).
+    pub lost: Vec<OpId>,
 }
+
+/// The evidence of an obligation closed because its records are gone
+/// (P4 spec §1.5, D100): the coordinator accepted the op's records, and
+/// the log lost them before they were shipped (its holder lost, D97; its
+/// Vessel rebuilt, D99).  Nobody acted on such an op: a sender is shown
+/// an action only once its records are shipped.
+pub const LOST_IN_GAP: &str = "lost: its records were lost before they were shipped";
 
 /// The evidence of a withdrawal: a held proposal past the last Seal at a
 /// start, closed `ConfirmedNotApplied` (it was never released, so never
@@ -267,6 +277,12 @@ impl Ledger {
     /// [`Ledger::mark_unknown`]).  A barrier intent not settled becomes
     /// an open obligation.  `publisher` ships the ledger before every send,
     /// here and later.
+    ///
+    /// Before that, every time: the coordinator is asked which
+    /// obligations it counts for the Chronicle, and each one this log
+    /// does not hold is closed `ConfirmedNotApplied` with the evidence
+    /// [`LOST_IN_GAP`] (D100).  If the coordinator cannot be asked, the
+    /// ledger does not open.
     pub fn open<L, F>(
         publisher: Box<dyn Publish>,
         vessel: &mut Vessel<L>,
@@ -654,6 +670,7 @@ impl Ledger {
             .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
         self.next_op = self.next_op.max(summary.next_op);
         let mut report = Reconciled {
+            lost: Self::close_lost_in_gap(vessel, &summary)?,
             withdrawn: self.withdraw_lost_turn(vessel, &frames, &summary)?,
             ..Reconciled::default()
         };
@@ -706,6 +723,54 @@ impl Ledger {
 }
 
 impl Ledger {
+    /// Close the obligations the coordinator counts and this log does not
+    /// hold (P4 spec §1.5, D100).
+    ///
+    /// The coordinator opens an obligation when it accepts an op's
+    /// records, and a gap can take those records from the log afterwards:
+    /// then no outcome would ever close it, and the Chronicle could never
+    /// be sanctioned or purged.  The log holds an op exactly when its
+    /// intent is in it, and intents are numbered in order with nothing
+    /// skipped, so the ops it does not hold are the ones at or past the
+    /// next op id.  Each gets `ConfirmedNotApplied`, all in one write; the
+    /// coordinator closes an obligation on a terminal outcome whether or
+    /// not it is given the intent.  The next op id does not move: the next
+    /// action takes the number of the first lost one, which nobody was
+    /// ever shown.
+    ///
+    /// An op the coordinator counts and the log does hold is left to the
+    /// pass that follows.
+    fn close_lost_in_gap<L: Layers>(
+        vessel: &mut Vessel<L>,
+        summary: &crate::summary::Summary,
+    ) -> Result<Vec<OpId>, VesselError> {
+        let lost: Vec<OpId> = vessel
+            .chronicle()
+            .counted_obligations()
+            .map_err(VesselError::Coord)?
+            .into_iter()
+            .filter(|op| *op >= summary.next_op)
+            .map(OpId::new)
+            .collect();
+        if !lost.is_empty() {
+            vessel.append_batch(
+                lost.iter()
+                    .map(|op| {
+                        (
+                            Stream::Effect,
+                            outcome(
+                                *op,
+                                OutcomeState::ConfirmedNotApplied,
+                                Some(LOST_IN_GAP.as_bytes().to_vec()),
+                            ),
+                        )
+                    })
+                    .collect(),
+            )?;
+        }
+        Ok(lost)
+    }
+
     /// Withdraw the held proposals of a turn that did not end.
     ///
     /// The ledger is opened at a start, when the Vessel's files are back
@@ -799,7 +864,10 @@ fn outcome(op: OpId, state: OutcomeState, evidence: Option<Vec<u8>>) -> Payload 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::CoordError;
     use crate::vessel::tests::{env, ns, Env, FakeLayers};
+    use taso_core::envelope::{ChronicleHead, Envelope};
+    use taso_core::model::{Ownership, WardenId};
 
     /// A publisher that fails every time.
     struct NeverPublish;
@@ -818,6 +886,104 @@ mod tests {
 
     fn vessel(e: &Env) -> Vessel<FakeLayers> {
         e.host.ensure(ns(1), b"u").unwrap().0
+    }
+
+    /// The coordinator, deaf to the question of what is still owed when
+    /// told to be.
+    struct Deaf {
+        inner: crate::coordinator::Coordinator,
+        deaf: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::coordinator::Coord for Deaf {
+        fn register(&self, c: ChronicleId, h: WardenId) -> Result<ChronicleHead, CoordError> {
+            self.inner.register(c, h)
+        }
+        fn append(&self, w: WardenId, e: &Envelope) -> Result<ChronicleHead, CoordError> {
+            self.inner.append(w, e)
+        }
+        fn append_batch_with(
+            &self,
+            w: WardenId,
+            es: &[Envelope],
+            fx: &[Vec<u8>],
+        ) -> Result<ChronicleHead, CoordError> {
+            self.inner.append_batch_with(w, es, fx)
+        }
+        fn transfer_if(
+            &self,
+            c: ChronicleId,
+            h: WardenId,
+            e: (WardenId, Epoch),
+        ) -> Result<Epoch, CoordError> {
+            self.inner.transfer_if(c, h, e)
+        }
+        fn transfer(&self, c: ChronicleId, h: WardenId) -> Result<Epoch, CoordError> {
+            self.inner.transfer(c, h)
+        }
+        fn ownership(&self, c: ChronicleId) -> Result<Ownership, CoordError> {
+            self.inner.ownership(c)
+        }
+        fn head(&self, c: ChronicleId) -> Result<ChronicleHead, CoordError> {
+            self.inner.head(c)
+        }
+        fn advance_shipped(
+            &self,
+            w: WardenId,
+            c: ChronicleId,
+            e: Epoch,
+            to: Position,
+        ) -> Result<Position, CoordError> {
+            self.inner.advance_shipped(w, c, e, to)
+        }
+        fn shipped(&self, c: ChronicleId) -> Result<Position, CoordError> {
+            self.inner.shipped(c)
+        }
+        fn obligations(&self, c: ChronicleId) -> Result<Vec<u64>, CoordError> {
+            if self.deaf.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(CoordError::Unavailable(std::io::Error::other("down")));
+            }
+            self.inner.obligations(c)
+        }
+    }
+
+    /// D100: the ledger asks the coordinator what it counts at every
+    /// opening.  If the coordinator cannot be asked, the ledger does not
+    /// open and nothing is written: the Warden never lets a Vessel act on
+    /// a guess about what is still owed.  Once it answers, the ledger
+    /// opens as before.
+    #[test]
+    fn the_ledger_does_not_open_if_the_coordinator_cannot_be_asked() {
+        use std::sync::atomic::Ordering;
+        let mut e = env();
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = std::sync::Arc::new(Deaf {
+            inner: crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap(),
+            deaf: false.into(),
+        });
+        e.host.coord = coord.clone();
+        let mut v = vessel(&e);
+        let (mut ledger, _) = open(&mut v);
+        ledger
+            .release(&mut v, &declared("a", Consequence::Irreversible))
+            .unwrap();
+        let tail = v.tail();
+
+        coord.deaf.store(true, Ordering::SeqCst);
+        let Err(err) = Ledger::open(Box::new(AlwaysPublish), &mut v, cannot_settle) else {
+            panic!("opened without the coordinator's answer");
+        };
+        assert!(
+            matches!(err, VesselError::Coord(CoordError::Unavailable(_))),
+            "{err}"
+        );
+        assert_eq!(v.tail(), tail, "nothing written");
+
+        coord.deaf.store(false, Ordering::SeqCst);
+        let (ledger, r) = open(&mut v);
+        assert_eq!(r.open, vec![OpId::new(1)]);
+        assert!(r.lost.is_empty(), "the log holds it: not lost");
+        assert!(!ledger.authorized());
     }
 
     fn declared(request: &str, consequence: Consequence) -> Declared {
