@@ -78,7 +78,21 @@ pub struct Reconciled {
     /// Obligations the coordinator counted and this log does not hold,
     /// closed now ([`LOST_IN_GAP`], D100).
     pub lost: Vec<OpId>,
+    /// Open obligations of this log that the coordinator had stopped
+    /// counting, declared to it again now ([`COUNTED_AGAIN`]).
+    pub counted_again: Vec<OpId>,
 }
+
+/// The evidence of a release written again at an opening.  The log holds
+/// a released action with no answer, and the coordinator does not count
+/// it: the coordinator accepted the action's answer, and the log lost
+/// that answer before it was shipped (D97, D99).  The log no longer says
+/// what happened, so the action is an open obligation here, and the
+/// coordinator must count it too or it would allow a verdict or a purge
+/// of the Vessel meanwhile.  The coordinator counts an action again on a
+/// release that comes without its intent (P4 spec §1.5).
+pub const COUNTED_AGAIN: &str =
+    "counted again: its answer was lost before it was shipped; what happened is not known here";
 
 /// The evidence of an obligation closed because its records are gone
 /// (P4 spec §1.5, D100): the coordinator accepted the op's records, and
@@ -281,8 +295,10 @@ impl Ledger {
     /// Before that, every time: the coordinator is asked which
     /// obligations it counts for the Chronicle, and each one this log
     /// does not hold is closed `ConfirmedNotApplied` with the evidence
-    /// [`LOST_IN_GAP`] (D100).  If the coordinator cannot be asked, the
-    /// ledger does not open.
+    /// [`LOST_IN_GAP`] (D100).  The other way round, an open obligation
+    /// of this log that the coordinator does not count is declared to it
+    /// again ([`COUNTED_AGAIN`]).  If the coordinator cannot be asked,
+    /// the ledger does not open.
     pub fn open<L, F>(
         publisher: Box<dyn Publish>,
         vessel: &mut Vessel<L>,
@@ -669,8 +685,14 @@ impl Ledger {
         let summary = crate::summary::Summary::of(&frames)
             .map_err(|(lsn, error)| VesselError::Decode { lsn, error })?;
         self.next_op = self.next_op.max(summary.next_op);
+        let counted: BTreeSet<u64> = vessel
+            .chronicle()
+            .counted_obligations()
+            .map_err(VesselError::Coord)?
+            .into_iter()
+            .collect();
         let mut report = Reconciled {
-            lost: Self::close_lost_in_gap(vessel, &summary)?,
+            lost: Self::close_lost_in_gap(vessel, &summary, &counted)?,
             withdrawn: self.withdraw_lost_turn(vessel, &frames, &summary)?,
             ..Reconciled::default()
         };
@@ -709,7 +731,36 @@ impl Ledger {
                     )?;
                     true
                 }
-                _ => settle(self, vessel, &i, state)?,
+                _ => {
+                    // A released action with no answer here, with an
+                    // external effect, that the coordinator does not
+                    // count: its answer was lost in a gap.  The release
+                    // is written again, which the coordinator counts,
+                    // and `OutcomeUnknown` with it in the same write, so
+                    // that no reader ever finds the action as released
+                    // and never acted on.
+                    let state = if i.barrier.is_some() && !counted.contains(&op.get()) {
+                        vessel.append_batch(vec![
+                            (
+                                Stream::Effect,
+                                outcome(
+                                    op,
+                                    OutcomeState::DispatchAuthorized,
+                                    Some(COUNTED_AGAIN.as_bytes().to_vec()),
+                                ),
+                            ),
+                            (
+                                Stream::Effect,
+                                outcome(op, OutcomeState::OutcomeUnknown, None),
+                            ),
+                        ])?;
+                        report.counted_again.push(op);
+                        Some(OutcomeState::OutcomeUnknown)
+                    } else {
+                        state
+                    };
+                    settle(self, vessel, &i, state)?
+                }
             };
             if settled {
                 report.settled.push(op);
@@ -743,14 +794,12 @@ impl Ledger {
     fn close_lost_in_gap<L: Layers>(
         vessel: &mut Vessel<L>,
         summary: &crate::summary::Summary,
+        counted: &BTreeSet<u64>,
     ) -> Result<Vec<OpId>, VesselError> {
-        let lost: Vec<OpId> = vessel
-            .chronicle()
-            .counted_obligations()
-            .map_err(VesselError::Coord)?
-            .into_iter()
-            .filter(|op| *op >= summary.next_op)
-            .map(OpId::new)
+        let lost: Vec<OpId> = counted
+            .iter()
+            .filter(|op| **op >= summary.next_op)
+            .map(|op| OpId::new(*op))
             .collect();
         if !lost.is_empty() {
             vessel.append_batch(
@@ -1143,6 +1192,17 @@ mod tests {
         // An unknown answer without a barrier opens no obligation.
         l.record(&mut v, a.op, a.barrier, &Answer::Unknown).unwrap();
         assert!(l.authorized());
+        // Nor at the next opening: the coordinator does not count it, and
+        // it is not declared to it (that is for an action with an
+        // external effect whose answer a gap took, [`COUNTED_AGAIN`]).
+        // Nobody could close it there: a resolution is refused for an
+        // action that is not open.
+        let tail = v.tail();
+        let (l, r) = open(&mut v);
+        assert_eq!(r, Reconciled::default());
+        assert!(l.authorized());
+        assert_eq!(v.tail(), tail, "nothing written");
+        assert!(v.chronicle().counted_obligations().unwrap().is_empty());
     }
 
     #[test]
