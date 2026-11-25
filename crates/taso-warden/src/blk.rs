@@ -4487,4 +4487,123 @@ mod tests {
             "turn 8's files and turn 11's"
         );
     }
+
+    /// A Candidate of `id` nominated at `seal`, as far as an attempt's
+    /// first record needs one (the record is refused before anyone checks
+    /// the Candidate itself).
+    fn a_candidate(
+        id: taso_core::envelope::ChronicleId,
+        seal: Position,
+    ) -> taso_core::contract::Candidate {
+        use taso_core::contract::{
+            candidate_id, facts_hash, Candidate, ClassCounts, Facts, NominatedBy, SealRef,
+            VerifierRequirement, TRANSFORM_VERSION,
+        };
+        let requirement = VerifierRequirement {
+            template: taso_core::envelope::ChronicleId::from_bytes([0x5A; 16]),
+            vconf_key: h(0x5B),
+            version: 1,
+        };
+        let exclude = std::collections::BTreeSet::new();
+        let facts = Facts {
+            input: ClassCounts::default(),
+            excluded: ClassCounts::default(),
+            open_obligations: 0,
+            effects_adopted: 0,
+            ledger_lsn: Lsn::new(0),
+            requirement,
+        };
+        Candidate {
+            candidate_id: candidate_id(
+                id,
+                seal.hash,
+                &exclude,
+                h(0x5C),
+                TRANSFORM_VERSION,
+                &requirement,
+            ),
+            chronicle: id,
+            seal: SealRef {
+                lsn: seal.lsn,
+                hash: seal.hash,
+            },
+            exclude,
+            transform_version: TRANSFORM_VERSION,
+            classmap_key: h(0x5C),
+            input_manifest_key: h(0x5D),
+            output_manifest_key: h(0x5D),
+            artifact_key: h(0x5E),
+            requirement,
+            facts_hash: facts_hash(&facts),
+            facts,
+            nominated_by: NominatedBy::Agent,
+            nominated_at: seal.lsn,
+        }
+    }
+
+    /// Case A again: what a start does before its agent runs.  Closing a
+    /// verification attempt that was open (and starting one) writes a
+    /// record and ships the log up to it, and the log cannot ship past
+    /// Seal 10, which has no layer to publish.  In a run, a failure to
+    /// close an open attempt ends the start (`daemon.rs`, `run_once`), so
+    /// such a Vessel never reaches the turn whose Seal would ship.
+    #[test]
+    fn today_no_attempt_record_can_be_written_while_the_last_seal_has_no_layer() {
+        use crate::attempt::{AttemptError, Attempts};
+        use crate::pack::PackError;
+        use crate::submit::SubmitError;
+        use taso_core::contract::{attempt_id, ContractRecord, VerificationStarted};
+        use taso_core::coordlog::Submitted;
+
+        let t = TenTurns::new();
+        let (node, mut v, _, _) = t.restart_with_block_log_cut_after(8);
+        // The same bucket, as the Warden holds it (shared).
+        let store: crate::ship::SharedStore =
+            Arc::new(crate::ship::LocalStore::new(t.tmp.path().join("store")));
+        let packs = crate::pack::Packs::new(store, node.pool.sender(), "vessels", t.id).unwrap();
+        let at = Attempts {
+            coord: t.coord.clone(),
+            warden: WardenId::new(1),
+            failpoint: crate::attempt::no_failpoints(),
+        };
+        let cand = a_candidate(t.id, t.seals[8]);
+
+        // The attempt's first record: appended, and refused when the log
+        // is shipped up to it.
+        let e = at.start(&mut v, &packs, &cand).unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                AttemptError::Submit(SubmitError::Pack(PackError::SealNotShipped { seal }))
+                    if *seal == t.seals[10].lsn
+            ),
+            "{e:?}"
+        );
+        assert_eq!(t.coord.shipped(t.id).unwrap(), t.shipped_at_8);
+
+        // Only a later Seal's publish lets the log ship again: a record
+        // written after Seal 11 is shipped.
+        write0(&node.pool, v.dataset(), 11);
+        let s11 = seal(&mut v, 11);
+        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
+        v.publish_seal(&packs, &snap, None).unwrap();
+        let started_at = v.tail().lsn;
+        let rec = ContractRecord::VerificationStarted(VerificationStarted {
+            candidate_id: cand.candidate_id,
+            attempt_id: attempt_id(cand.candidate_id, started_at),
+            artifact_key: cand.artifact_key,
+            requirement: cand.requirement,
+            started_at,
+        });
+        v.append_contract(rec.clone()).unwrap();
+        crate::submit::put(
+            &*t.coord,
+            WardenId::new(1),
+            v.chronicle(),
+            &packs,
+            &Submitted::Contract(rec),
+        )
+        .unwrap();
+        assert_eq!(t.coord.shipped(t.id).unwrap().lsn, v.tail().lsn);
+    }
 }
