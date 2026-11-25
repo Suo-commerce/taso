@@ -356,6 +356,7 @@ impl Compaction {
         let (mut fresh, rec) = Store::open(&self.temp)?;
         let agrees = rec.checkpoint == Some(base_at.lsn)
             && rec.cut == 0
+            && rec.set_aside.is_none()
             && fresh.lsn == store.lsn
             && fresh.tail == self.tail
             && fresh.map.layers() == store.map.layers()

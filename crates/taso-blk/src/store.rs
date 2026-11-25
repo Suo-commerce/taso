@@ -79,9 +79,7 @@
 //! that a Flush can be told from bytes that only look like one without the
 //! chain: a Vessel's agent chooses the bytes of its blocks, which lie in
 //! this file, and must not be able to place a Flush's image in it.  A
-//! Flush whose body does not check out fails the replay.  (What the open
-//! does with the durable ends: design note
-//! `claude/Taso_design_blocklog_format_2026-11-25.md`, 3.3.)
+//! Flush whose body does not check out fails the replay.
 //!
 //! A record that verifies and has a kind this version does not know was
 //! written by a newer one: the open is refused
@@ -89,12 +87,35 @@
 //! the end of the log, and everything after the previous Flush was cut:
 //! maturity review of e4a37b2, finding 2.)
 //!
-//! Known limit (spike): a bad record is treated as the end of the log,
-//! as PostgreSQL's and SQLite's write-ahead logs do.  A torn tail after a
-//! crash looks like that; so would media corruption in the middle of the
-//! log, which would cut durable groups.  [`Recovered::cut`] reports what
-//! was dropped.  Protection against media corruption comes later from a
-//! second copy (shipped packs), not from this file.
+//! # A torn tail and damage are told apart
+//!
+//! The replay stops at the first record that does not verify, at offset
+//! X.  Two things leave such a record: a crash while the tail was being
+//! written (the kernel may have written later pages and not earlier ones,
+//! so well-formed bytes after X prove nothing), and bytes that were on the
+//! medium and have changed since.  [`Store::open`] reads the rest of the
+//! file for Flush records whose own offset and keyed check hold, and takes
+//! the largest durable end D they name.
+//!
+//! - **No such Flush, or D <= X: a torn tail.**  The file is cut back to
+//!   the last verified Flush, as it always was ([`Recovered::cut`]).
+//! - **D > X: damage.**  When that later Flush was appended, an
+//!   `fdatasync` covering X had returned.  Nothing is dropped: everything
+//!   from the last verified Flush to the end of the file is copied to
+//!   `<log>.damaged-<offset>`, that file and its directory are synced, and
+//!   only then is the log cut there ([`Recovered::set_aside`]).  The
+//!   records after X cannot be replayed (their chain starts from a record
+//!   that is gone), and replaying them without it would give a state that
+//!   never was.  If the copy cannot be made the open is refused
+//!   ([`StoreError::SetAside`]) and the log is left whole.
+//!
+//! (It used to be one case, a cut: one flipped bit early in the log made
+//! the next start drop every later group of every Vessel on the node and
+//! serve normally.  Maturity review of e4a37b2, finding 1.)  The second
+//! copy of what is set aside is the shipped packs, not this file.
+//!
+//! Not covered: the replay starts at the checkpoint, so damage in a
+//! record before it is met only when its block is read.
 //!
 //! # Tags, origins and names (for the Warden's `Pool` and `Layers`)
 //!
@@ -279,6 +300,17 @@ pub enum StoreError {
         /// The header's flags.
         flags: u32,
     },
+    /// The log is damaged (see [`Recovered::set_aside`]) and the damaged
+    /// part could not be copied aside, for want of room or otherwise.
+    /// The log was left whole: the only copy is never dropped.
+    SetAside {
+        /// Bytes the copy needs.
+        need: u64,
+        /// Where the copy was to go.
+        path: PathBuf,
+        /// Why it failed.
+        error: io::Error,
+    },
     /// A record that verifies but whose kind this version does not know:
     /// a newer version wrote it.  Nothing was cut.
     UnknownKind {
@@ -349,6 +381,11 @@ impl std::fmt::Display for StoreError {
                 f,
                 "the log is in format version {version} (flags {flags:#x}); this version reads {FORMAT_VERSION}: a newer taso-blk wrote it; nothing was changed"
             ),
+            Self::SetAside { need, path, error } => write!(
+                f,
+                "the log is damaged and its damaged part ({need} bytes) could not be set aside at {}: {error}; the log was left whole (free {need} bytes there and start again)",
+                path.display()
+            ),
             Self::UnknownKind { kind, at } => write!(
                 f,
                 "the record at byte {at} verifies but is of kind {kind}, which this version does not know: a newer taso-blk wrote it; nothing was cut"
@@ -415,6 +452,26 @@ pub struct Recovered {
     pub tightened: Option<u32>,
     /// The log's identity, from its header.
     pub id: LogId,
+    /// Damage: a part of the log that had been durable no longer
+    /// verified, and was set aside whole instead of cut
+    /// ([module docs](self)).  `cut` is 0 then.
+    pub set_aside: Option<SetAside>,
+}
+
+/// A damaged part of the log, kept as a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetAside {
+    /// Where the record that did not verify starts.
+    pub at: u64,
+    /// The durable end a later Flush record names: `at` lies below it.
+    pub durable: u64,
+    /// Where the part set aside begins: the end of the last verified
+    /// Flush, and the log's length now.
+    pub from: u64,
+    /// Its length: everything from there to the old end of the file.
+    pub bytes: u64,
+    /// The file it was copied to.
+    pub path: PathBuf,
 }
 
 /// The header's fields ([module docs](self)).
@@ -731,10 +788,37 @@ impl Store {
                 pending.push(Pending::of(kind, &body, data_at, lsn));
             }
         }
-        let cut = len - end;
+        // The replay stopped at `pos`.  If bytes lie there that are no
+        // record, a later Flush may say they had been durable: damage, set
+        // aside whole; else a torn tail, cut (module docs).
+        let mut cut = len - end;
+        let mut set_aside = None;
+        if pos < len {
+            if let Some(durable) =
+                later_durable_end(&file, &flush_mac, pos, len)?.filter(|d| *d > pos)
+            {
+                let refused = |to: &Path, error| StoreError::SetAside {
+                    need: cut,
+                    path: to.to_path_buf(),
+                    error,
+                };
+                let to = aside_path(path, &file, end, cut).map_err(|e| refused(path, e))?;
+                copy_aside(&file, end, cut, &to).map_err(|e| refused(&to, e))?;
+                set_aside = Some(SetAside {
+                    at: pos,
+                    durable,
+                    from: end,
+                    bytes: cut,
+                    path: to,
+                });
+            }
+        }
         if cut > 0 {
             file.set_len(end)?;
             file.sync_all()?;
+        }
+        if set_aside.is_some() {
+            cut = 0;
         }
         let stats = Stats {
             log_bytes: end,
@@ -768,6 +852,7 @@ impl Store {
                 checkpoint: from,
                 tightened,
                 id: fields.id,
+                set_aside,
             },
         ))
     }
@@ -1800,6 +1885,128 @@ fn no_others(f: &File) -> io::Result<Option<u32>> {
     }
     f.set_permissions(std::fs::Permissions::from_mode(mode & !0o007))?;
     Ok(Some(mode))
+}
+
+/// The largest durable end named by a Flush record in `from..len` of
+/// `file`: a record's head for a Flush at an offset its body names as its
+/// own, with the keyed check.  Found without the chain, which is broken
+/// at `from`.  `None` if there is none.
+fn later_durable_end(
+    file: &File,
+    flush_mac: &[u8; 32],
+    from: u64,
+    len: u64,
+) -> io::Result<Option<u64>> {
+    // A Flush record's head: magic, body length, kind.
+    let mut head = [0u8; REC_HEAD as usize];
+    head[..4].copy_from_slice(&REC_MAGIC.to_le_bytes());
+    head[4..8].copy_from_slice(&(FLUSH_BODY as u32).to_le_bytes());
+    head[8] = K_FLUSH;
+    const CHUNK: usize = 1 << 20;
+    // A head and body that straddle two chunks: the next chunk starts
+    // this many bytes back.
+    let need = REC_HEAD as usize + FLUSH_BODY;
+    let mut buf = vec![0u8; CHUNK + need];
+    let (mut at, mut best) = (from, None::<u64>);
+    while at < len {
+        let n = ((len - at) as usize).min(buf.len());
+        file.read_exact_at(&mut buf[..n], at)?;
+        let mut i = 0;
+        while i + need <= n {
+            match buf[i..n - FLUSH_BODY].iter().position(|b| *b == head[0]) {
+                None => break,
+                Some(k) => i += k,
+            }
+            if i + need > n {
+                break;
+            }
+            if buf[i..i + REC_HEAD as usize] == head {
+                let body = &buf[i + REC_HEAD as usize..i + need];
+                if let Some(d) = flush_claim(flush_mac, body, at + i as u64) {
+                    best = Some(best.map_or(d, |b| b.max(d)));
+                }
+            }
+            i += 1;
+        }
+        if n < buf.len() {
+            break;
+        }
+        at += CHUNK as u64;
+    }
+    Ok(best)
+}
+
+/// Where the part of the log at `path` that begins at `from` (`bytes`
+/// long) is set aside: `<log>.damaged-<from>`.  If a file of that name is
+/// there and is this very part (a start that died after the copy, before
+/// cutting the log), that name again; if it is anything else (an earlier
+/// damage that began at the same offset), the next free name with `.1`,
+/// `.2`, ... after it: a part once set aside is never written over.
+fn aside_path(path: &Path, file: &File, from: u64, bytes: u64) -> io::Result<PathBuf> {
+    for n in 0u32.. {
+        let mut p = path.as_os_str().to_owned();
+        p.push(format!(".damaged-{from}"));
+        if n > 0 {
+            p.push(format!(".{n}"));
+        }
+        let p = PathBuf::from(p);
+        match File::open(&p) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(p),
+            // A name that cannot even be looked up is no place for it.
+            Err(e) => return Err(e),
+            Ok(there) if same_bytes(&there, file, from, bytes)? => return Ok(p),
+            // Something else of that name: not ours to write over.
+            Ok(_) => {}
+        }
+    }
+    unreachable!("a free name is found before u32 runs out")
+}
+
+/// Whether `there` is exactly the `bytes` of `file` from `from`.
+fn same_bytes(there: &File, file: &File, from: u64, bytes: u64) -> io::Result<bool> {
+    if !there.metadata()?.is_file() || there.metadata()?.len() != bytes {
+        return Ok(false);
+    }
+    let (mut a, mut b) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    let mut done = 0u64;
+    while done < bytes {
+        let n = ((bytes - done) as usize).min(a.len());
+        there.read_exact_at(&mut a[..n], done)?;
+        file.read_exact_at(&mut b[..n], from + done)?;
+        if a[..n] != b[..n] {
+            return Ok(false);
+        }
+        done += n as u64;
+    }
+    Ok(true)
+}
+
+/// Copy `bytes` of `file` from `from` to a new private file at `to`, and
+/// make the copy and its name durable ([`aside_path`] chose a name that is
+/// free or already holds these bytes).  On an error the partial copy is
+/// removed.
+fn copy_aside(file: &File, from: u64, bytes: u64, to: &Path) -> io::Result<()> {
+    let run = || -> io::Result<()> {
+        let out = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(PRIVATE)
+            .open(to)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut done = 0u64;
+        while done < bytes {
+            let n = ((bytes - done) as usize).min(buf.len());
+            file.read_exact_at(&mut buf[..n], from + done)?;
+            out.write_all_at(&buf[..n], done)?;
+            done += n as u64;
+        }
+        out.sync_all()?;
+        sync_dir(to)
+    };
+    run().inspect_err(|_| {
+        let _ = std::fs::remove_file(to);
+    })
 }
 
 fn ckpt_path(path: &Path) -> PathBuf {
@@ -3644,6 +3851,221 @@ mod tests {
         std::fs::remove_file(ckpt_path(&path)).unwrap();
         let (_, rec) = Store::open(&path).unwrap();
         assert_eq!((rec.checkpoint, rec.cut), (None, 0));
+    }
+
+    /// A log of four groups on one branch, each synced by `flush`, and
+    /// the end offset of each (the root Seal's group first).
+    fn four_synced_groups(path: &Path) -> (LayerId, Vec<u64>) {
+        let mut s = Store::create(path).unwrap();
+        let root = s.root_seal().unwrap();
+        let mut ends = vec![s.stats().log_bytes];
+        let b = s.fork(root).unwrap();
+        for i in 0..4u8 {
+            s.write(b, i as u64, &blocks(i + 1, 1), false).unwrap();
+            s.flush().unwrap();
+            ends.push(s.stats().log_bytes);
+        }
+        (b, ends)
+    }
+
+    fn flip(path: &Path, at: u64) {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact_at(&mut b, at).unwrap();
+        f.write_all_at(&[b[0] ^ 0x40], at).unwrap();
+    }
+
+    #[test]
+    fn damage_below_a_later_flushs_durable_end_is_set_aside_not_cut() {
+        // Maturity review of e4a37b2, finding 1: one flipped bit early in
+        // the log made the next open cut every later group and serve.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (b, ends) = four_synced_groups(&path);
+        let whole_log = std::fs::read(&path).unwrap();
+        // A bit in the second written group's block: the groups after it
+        // were synced, and their Flush records say so.
+        let at = ends[1] + REC_HEAD + 100;
+        flip(&path, at);
+        let damaged = std::fs::read(&path).unwrap();
+        let (s, rec) = Store::open(&path).unwrap();
+        let aside = rec.set_aside.clone().expect("damage, not a torn tail");
+        assert_eq!(rec.cut, 0, "nothing was cut as a tail");
+        assert_eq!(
+            (aside.at, aside.from, aside.bytes),
+            (ends[1], ends[1], ends[4] - ends[1]),
+            "from the last verified Flush to the old end"
+        );
+        assert!(aside.durable > aside.at, "a later Flush named it durable");
+        assert_eq!(
+            aside.path,
+            dir.path().join(format!("log.damaged-{}", ends[1]))
+        );
+        // Every byte the log lost is in the file, as it was found.
+        assert_eq!(
+            std::fs::read(&aside.path).unwrap(),
+            damaged[ends[1] as usize..]
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), whole_log[..ends[1] as usize]);
+        assert_eq!(
+            std::fs::metadata(&aside.path).unwrap().permissions().mode() & 0o7777,
+            PRIVATE
+        );
+        // What is served is the state at the last verified Flush.
+        let mut buf = vec![0u8; B];
+        s.read(b, 0, &mut buf).unwrap();
+        assert_eq!(buf, blocks(1, 1));
+        s.read(b, 1, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![0u8; B],
+            "the damaged group and those after it are not served"
+        );
+        drop(s);
+        // The next open is clean, and leaves the file alone.
+        let (_, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, rec.set_aside), (0, None));
+        assert_eq!(
+            std::fs::read(&aside.path).unwrap(),
+            damaged[ends[1] as usize..]
+        );
+    }
+
+    #[test]
+    fn a_torn_tail_with_well_formed_groups_after_it_is_still_cut() {
+        // Groups ended and never synced: a crash may leave a later one
+        // whole and an earlier one torn.  No Flush names them durable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        s.flush().unwrap();
+        let synced = s.stats().log_bytes;
+        let mut ends = Vec::new();
+        for i in 1..4u8 {
+            s.write(b, i as u64, &blocks(i + 1, 1), false).unwrap();
+            s.flush_pending().unwrap();
+            ends.push(s.stats().log_bytes);
+        }
+        drop(s);
+        let len = std::fs::metadata(&path).unwrap().len();
+        flip(&path, ends[0] + REC_HEAD + 100); // in the second of the three
+        let (_, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.set_aside, None, "no later Flush names it durable");
+        assert_eq!(rec.cut, len - ends[0]);
+        assert!(ends[0] > synced);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), ends[0]);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "the log and its lock"
+        );
+    }
+
+    #[test]
+    fn an_agents_image_of_a_flush_record_does_not_make_a_torn_tail_damage() {
+        // A Vessel's agent chooses its blocks' bytes.  Its best forgery: a
+        // Flush record's image for the very offset it lands at, naming
+        // everything durable, under a key it has to guess.  The control:
+        // the same image under the log's own key is believed, so it is the
+        // key, and nothing else about the image, that refuses the forgery.
+        let dir = tempfile::tempdir().unwrap();
+        let run = |name: &str, own_key: bool| {
+            let path = dir.path().join(name);
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            let b = s.fork(root).unwrap();
+            s.write(b, 0, &blocks(1, 1), false).unwrap();
+            s.flush().unwrap();
+            let first = s.stats().log_bytes;
+            s.write(b, 1, &blocks(2, 1), false).unwrap();
+            s.flush_pending().unwrap();
+            let torn_at = s.stats().log_bytes - FLUSH_LEN - 50;
+            s.write(b, 2, &blocks(0, 1), false).unwrap();
+            let data_at = match s.map().unwrap().read(b, 2).unwrap() {
+                Some(Loc::Log(off)) => off,
+                other => panic!("{other:?}"),
+            };
+            // The image, written where the block's data lies.
+            let key = if own_key { s.flush_mac } else { [0u8; 32] };
+            let mut img = Vec::new();
+            img.extend_from_slice(&REC_MAGIC.to_le_bytes());
+            img.extend_from_slice(&(FLUSH_BODY as u32).to_le_bytes());
+            img.push(K_FLUSH);
+            img.extend_from_slice(&flush_body(&key, data_at, u64::MAX));
+            s.file.write_all_at(&img, data_at).unwrap();
+            drop(s);
+            let len = std::fs::metadata(&path).unwrap().len();
+            flip(&path, torn_at);
+            let (_, rec) = Store::open(&path).unwrap();
+            (rec, len - first)
+        };
+        let (rec, tail) = run("forged", false);
+        assert_eq!((rec.set_aside, rec.cut), (None, tail), "a torn tail, cut");
+        let (rec, tail) = run("control", true);
+        let aside = rec
+            .set_aside
+            .expect("under the log's key the image is a Flush");
+        assert_eq!((aside.durable, aside.bytes, rec.cut), (u64::MAX, tail, 0));
+    }
+
+    #[test]
+    fn damage_that_cannot_be_set_aside_refuses_the_open_and_leaves_the_log_whole() {
+        // No file can be made beside this log for its damaged part: with
+        // ".damaged-" and a five-digit offset the name is one byte longer
+        // than a name may be, while every other name the store makes
+        // beside the log still fits.  (Root is refused that too, and the
+        // gates run as root.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l".repeat(242));
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        let mut ends = Vec::new();
+        for i in 0..6u8 {
+            s.write(b, i as u64, &blocks(i + 1, 1), false).unwrap();
+            s.flush().unwrap();
+            ends.push(s.stats().log_bytes);
+        }
+        drop(s);
+        assert!(ends[3] >= 10_000, "a five-digit offset: {}", ends[3]);
+        flip(&path, ends[3] + REC_HEAD + 100);
+        let damaged = std::fs::read(&path).unwrap();
+        match Store::open(&path).map(|(_, r)| r) {
+            Err(StoreError::SetAside { need, .. }) => assert_eq!(need, ends[5] - ends[3]),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            damaged,
+            "the only copy is not dropped"
+        );
+        // And again: refused the same way, not cut on a second try.
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::SetAside { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), damaged);
+    }
+
+    #[test]
+    fn a_part_set_aside_earlier_is_never_written_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let (_, ends) = four_synced_groups(&path);
+        flip(&path, ends[1] + REC_HEAD + 100);
+        let name = |n: &str| dir.path().join(format!("log.damaged-{}{n}", ends[1]));
+        // An earlier damage that began at the same offset left its part.
+        std::fs::write(name(""), b"an earlier part").unwrap();
+        let (_, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.set_aside.unwrap().path, name(".1"));
+        assert_eq!(std::fs::read(name("")).unwrap(), b"an earlier part");
     }
 
     #[test]
