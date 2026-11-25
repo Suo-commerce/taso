@@ -802,6 +802,7 @@ const QUARANTINE_KEY: &str = "deleted_quarantine";
 /// records the journal holds changed shape); 3 since generation 3 (2026-11,
 /// before v0.1: a Seal record carries the adopted count, and the log's
 /// rules changed).  An older database is refused, not converted.
+// The refusal message in `check_generation` names this number.
 pub const GENERATION: u32 = 3;
 
 /// Whether a table exists and holds a row.
@@ -829,7 +830,7 @@ fn check_generation(db: &Database) -> Result<(), CoordError> {
                 Some(g) if g.value() == GENERATION => return Ok(()),
                 Some(_) => {
                     return refused(
-                        "this database is of another generation than this coordinator's (2): \
+                        "this database is of another generation than this coordinator's (3): \
                          refused, not converted",
                     )
                 }
@@ -4201,6 +4202,12 @@ mod log_tests {
         .err()
         .expect("refused");
         assert!(e.to_string().contains("another generation"), "{e}");
+        // The message names this coordinator's generation, whatever it is.
+        assert!(
+            e.to_string()
+                .contains(&format!("this coordinator's ({GENERATION})")),
+            "{e}"
+        );
     }
 
     /// A store whose pack listing can fail (and whose reads can be slow).
