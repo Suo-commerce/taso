@@ -101,6 +101,67 @@ pub enum LayerKind {
     Seal,
 }
 
+/// What the daemon's start found in its log (`recovered`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogStart {
+    /// The log's identity: 32 hex digits.  Made with the log and kept by a
+    /// compaction; another value is another log.
+    pub id: String,
+    /// Bytes cut from the log's end as a torn tail (0: none).
+    pub cut: u64,
+    /// Damage: a part of the log that had been durable and no longer
+    /// verified, set aside whole.  The Seals whose layers lay in it are
+    /// gone from the node's block log.
+    pub set_aside: Option<LogAside>,
+}
+
+/// A damaged part of the log, kept as a file beside it and not served.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogAside {
+    /// Its length.
+    pub bytes: u64,
+    /// Where the record that no longer verified starts.
+    pub at: u64,
+    /// Where the part began: the log's length after.
+    pub from: u64,
+    /// The durable end a later Flush record named.
+    pub durable: u64,
+    /// The file's name, as the daemon answered it (`%XX` for any byte but
+    /// letters, digits, `.`, `_` and `-`).
+    pub file: String,
+}
+
+impl LogStart {
+    /// From the answer's words.  Unknown keys are let through (a newer
+    /// daemon may say more); a missing or malformed one is `None`.
+    fn parse(answer: &str) -> Option<Self> {
+        let kv: BTreeMap<&str, &str> = answer
+            .split_whitespace()
+            .map(|w| w.split_once('='))
+            .collect::<Option<_>>()?;
+        let n = |k: &str| kv.get(k)?.parse::<u64>().ok();
+        let id = kv.get("id")?.to_string();
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let set_aside = match n("aside")? {
+            0 => None,
+            bytes => Some(LogAside {
+                bytes,
+                at: n("aside_at")?,
+                from: n("aside_from")?,
+                durable: n("aside_durable")?,
+                file: kv.get("aside_file")?.to_string(),
+            }),
+        };
+        Some(Self {
+            id,
+            cut: n("cut")?,
+            set_aside,
+        })
+    }
+}
+
 /// One connection to `taso-blkd`.
 pub struct Client {
     reader: BufReader<UnixStream>,
@@ -357,6 +418,13 @@ impl Client {
                     .ok_or_else(|| ClientError::Protocol(format!("stats answered {a:?}")))
             })
             .collect()
+    }
+
+    /// What the daemon's start found in its log.
+    pub fn recovered(&mut self) -> Result<LogStart> {
+        let a = self.call(&["recovered"])?;
+        LogStart::parse(&a)
+            .ok_or_else(|| ClientError::Protocol(format!("recovered answered {a:?}")))
     }
 
     /// Stop every device, flush, and end the daemon.

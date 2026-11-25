@@ -531,3 +531,85 @@ fn a_stop_signal_quits_as_quit_does() {
         assert!(second.contains("from the checkpoint at record"), "{second}");
     }
 }
+
+/// Flip one bit of the file at `at`.
+fn flip(path: &Path, at: u64) {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    let mut b = [0u8; 1];
+    f.read_exact_at(&mut b, at).unwrap();
+    f.write_all_at(&[b[0] ^ 0x40], at).unwrap();
+}
+
+#[test]
+fn the_daemon_answers_what_its_start_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, sock) = (dir.path().join("log"), dir.path().join("sock"));
+    let ckpt = dir.path().join("log.ckpt");
+
+    // A new log: an identity, nothing cut, nothing set aside.
+    let d = Daemon::start(&log, &sock);
+    let mut c = Client::connect(&sock).unwrap();
+    let first = c.recovered().unwrap();
+    assert_eq!((first.cut, &first.set_aside), (0, &None));
+    assert_eq!(first.id.len(), 32);
+
+    // Four Seals of one branch, each in a group made durable, and where
+    // each group ends.
+    let root = c.root().unwrap();
+    let a = c.branch(root, Some("a")).unwrap();
+    let mut ends = Vec::new();
+    for i in 0..4u8 {
+        c.seal(a, &[i; 32]).unwrap();
+        c.flush().unwrap();
+        ends.push(std::fs::metadata(&log).unwrap().len());
+    }
+    c.quit().unwrap();
+    assert!(d.wait());
+    // (Without the checkpoint a start replays the whole log.)
+    std::fs::remove_file(&ckpt).ok();
+
+    // A clean restart: the same log, by its identity.
+    let d = Daemon::start(&log, &sock);
+    let mut c = Client::connect(&sock).unwrap();
+    assert_eq!(
+        c.recovered().unwrap(),
+        first,
+        "the same identity, nothing cut or set aside"
+    );
+    assert_eq!(c.seals(a).unwrap().len(), 4);
+    c.quit().unwrap();
+    assert!(d.wait());
+    std::fs::remove_file(&ckpt).ok();
+
+    // One bit of the third Seal's record changes on the medium.
+    flip(&log, ends[1] + 20);
+    let len = std::fs::metadata(&log).unwrap().len();
+    let d = Daemon::start(&log, &sock);
+    let mut c = Client::connect(&sock).unwrap();
+    let found = c.recovered().unwrap();
+    let aside = found.set_aside.clone().expect("damage, set aside");
+    assert_eq!((found.id.as_str(), found.cut), (first.id.as_str(), 0));
+    assert_eq!(
+        (aside.at, aside.from, aside.bytes),
+        (ends[1], ends[1], len - ends[1])
+    );
+    assert!(aside.durable > aside.at);
+    assert_eq!(aside.file, format!("log.damaged-{}", ends[1]));
+    assert_eq!(
+        std::fs::metadata(dir.path().join(&aside.file))
+            .unwrap()
+            .len(),
+        aside.bytes
+    );
+    // What is served is the state at the last verified Flush: two Seals.
+    assert_eq!(c.seals(a).unwrap().len(), 2);
+    // And it is this start's answer, asked again.
+    assert_eq!(c.recovered().unwrap(), found);
+    c.quit().unwrap();
+    assert!(d.wait());
+}

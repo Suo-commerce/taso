@@ -36,6 +36,7 @@
 //! | `drop <layer>`   | detach if needed, drop the branch or Seal        | `ok`                 |
 //! | `flush`          | end a group                                      | `ok <lsn>`           |
 //! | `stats`          | counters, for measurements                       | `ok key=value ...`   |
+//! | `recovered`      | what this start found in the log (below)         | `ok key=value ...`   |
 //! | `quit`           | stop every device, flush, then exit              | `ok`                 |
 //!
 //! SIGTERM and SIGINT do what `quit` does (C3-h: `docker stop`, a
@@ -178,7 +179,7 @@ use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use taso_blk::map::{Kind, LayerId, BLOCK};
-use taso_blk::store::{Compacted, Store, StoreError, Syncer};
+use taso_blk::store::{Compacted, Recovered, Store, StoreError, Syncer};
 
 /// The ublk target name of this daemon's devices; it is how a later
 /// daemon recognises leftovers as its own.
@@ -639,6 +640,8 @@ struct Daemon {
     geometry: Geometry,
     /// A compaction is running.
     compacting: AtomicBool,
+    /// What this start found in the log (`recovered`).
+    recovered: Recovered,
 }
 
 fn main() {
@@ -711,7 +714,7 @@ fn main() {
         log!("taso-blkd: cannot protect itself from the out-of-memory killer: {e}");
     }
 
-    let store = if log.exists() {
+    let (store, recovered) = if log.exists() {
         match Store::open(&log) {
             Ok((s, rec)) => {
                 if let Some(was) = rec.tightened {
@@ -721,8 +724,9 @@ fn main() {
                     );
                 }
                 log!(
-                    "taso-blkd: recovered {}: {} records, {} groups, {} bytes cut ({})",
+                    "taso-blkd: recovered {} (id {}): {} records, {} groups, {} bytes cut ({})",
                     log.display(),
+                    hex(&rec.id),
                     rec.records,
                     rec.groups,
                     rec.cut,
@@ -731,13 +735,30 @@ fn main() {
                         None => "full replay".to_string(),
                     }
                 );
-                s
+                if let Some(a) = &rec.set_aside {
+                    log!(
+                        "taso-blkd: DAMAGE in {}: the record at byte {} no longer verifies, and a later Flush record says the log was durable to byte {}. {} bytes from byte {} were set aside in {} and are not served. Seals in that part are gone from this node.",
+                        log.display(),
+                        a.at,
+                        a.durable,
+                        a.bytes,
+                        a.from,
+                        a.path.display()
+                    );
+                }
+                (s, rec)
             }
             Err(e) => fail(&format!("cannot open {}: {e}", log.display())),
         }
     } else {
-        Store::create(&log)
-            .unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", log.display())))
+        let s = Store::create(&log)
+            .unwrap_or_else(|e| fail(&format!("cannot create {}: {e}", log.display())));
+        log!("taso-blkd: created {} (id {})", log.display(), hex(&s.id()));
+        let rec = Recovered {
+            id: s.id(),
+            ..Recovered::default()
+        };
+        (s, rec)
     };
 
     let (removed, failed) = reap_dead_devices();
@@ -776,6 +797,7 @@ fn main() {
         settle_wait: SETTLE_WAIT,
         geometry: g,
         compacting: AtomicBool::new(false),
+        recovered,
     });
     if g.checkpoint_every > 0 || g.compact_pct > 0 {
         let d = daemon.clone();
@@ -1065,6 +1087,53 @@ fn file_arg(w: Option<&&str>) -> Result<PathBuf, String> {
         return Err(format!("{} is not an absolute path", p.display()));
     }
     Ok(p)
+}
+
+/// The answer to `recovered`: what this start found in the log, for the
+/// Warden to ask (design note Taso_design_blocklog_format_2026-11-25, 3.4).
+///
+/// ```text
+///   id=<32 hex>   the log's identity, from its header
+///   cut=<bytes>   a torn tail, cut at this start (0: none)
+///   aside=<bytes> damage, set aside whole at this start (0: none); then also
+///     aside_at=<offset>       where the record that no longer verified starts
+///     aside_from=<offset>     where the part set aside began: the log's length after
+///     aside_durable=<offset>  the durable end a later Flush record named
+///     aside_file=<name>       the file beside the log that holds the part
+/// ```
+///
+/// The Seals whose layers lay in a part set aside are gone from this
+/// node's block log; the part itself is kept and is not served.
+fn recovered_answer(rec: &Recovered) -> String {
+    let mut a = format!("id={} cut={}", hex(&rec.id), rec.cut);
+    match &rec.set_aside {
+        None => a.push_str(" aside=0"),
+        Some(s) => {
+            let name = s.path.file_name().unwrap_or_default().as_encoded_bytes();
+            a.push_str(&format!(
+                " aside={} aside_at={} aside_from={} aside_durable={} aside_file={}",
+                s.bytes,
+                s.at,
+                s.from,
+                s.durable,
+                one_word(name)
+            ));
+        }
+    }
+    a
+}
+
+/// `name` as one word of an answer line: every byte but letters, digits
+/// and `.`, `_`, `-` as `%XX` (an answer's words are split at spaces).
+fn one_word(name: &[u8]) -> String {
+    name.iter()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                (*b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Lowercase hex of `b`.
@@ -1541,6 +1610,9 @@ impl Daemon {
                 Ok(lsn.to_string())
             }
             "stats" => Ok(self.stats()),
+            // This start's facts: no lock, and answered on a poisoned
+            // store too (as `stats` is).
+            "recovered" => Ok(recovered_answer(&self.recovered)),
             "quit" => match self.shutdown() {
                 Quit::Done(r) => r,
                 Quit::Refused(e) => Err(e),
@@ -2558,6 +2630,7 @@ mod detach_test {
                 compact_min: 1 << 30,
             },
             compacting: AtomicBool::new(false),
+            recovered: Recovered::default(),
         };
         (dir, d, branch, stop)
     }
