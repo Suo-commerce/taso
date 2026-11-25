@@ -228,7 +228,47 @@ impl S3Store {
             .run(req)
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionAborted, format!("{what}: {e}")))
     }
+
+    /// [`S3Store::send`] for a request that may be sent again: one whose
+    /// effect is the same however often the store carries it out (a GET, a
+    /// HEAD, a DELETE, a PUT of the same bytes under the same key or part
+    /// number).  A system call interrupted by a signal is not a broken
+    /// connection (a stopped and continued process gets `EINTR` from a
+    /// socket call with a timeout even under `SA_RESTART`; see
+    /// `taso_core::frame::read_frame`): the request `make` builds is sent
+    /// again, on a new connection, up to [`INTERRUPTED_TRIES`] times.  It
+    /// is built again each time, so its date is the try's own.
+    fn send_again<B: ureq::AsSendBody + Copy>(
+        &self,
+        what: &str,
+        make: impl Fn() -> http::request::Builder,
+        body: B,
+    ) -> io::Result<http::Response<ureq::Body>> {
+        let mut interrupted = 0;
+        loop {
+            let req = make()
+                .body(body)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{what}: {e}")))?;
+            match self.agent.run(req) {
+                Err(ureq::Error::Io(e))
+                    if e.kind() == io::ErrorKind::Interrupted
+                        && interrupted < INTERRUPTED_TRIES =>
+                {
+                    interrupted += 1;
+                }
+                other => {
+                    return other.map_err(|e| {
+                        io::Error::new(io::ErrorKind::ConnectionAborted, format!("{what}: {e}"))
+                    })
+                }
+            }
+        }
+    }
 }
+
+/// How often a request interrupted by a signal is sent again before the
+/// interruption is reported as its failure.
+const INTERRUPTED_TRIES: u32 = 8;
 
 /// The HTTP client for S3 and the Kubernetes API: every request times out
 /// after `timeout`; with `ca`, TLS trusts exactly the certificates in that
@@ -298,8 +338,8 @@ impl S3Store {
             return Ok(());
         }
         let path = format!("/{}", self.config.bucket);
-        let req = self.request("HEAD", &path, &[], EMPTY_SHA256, &[]);
-        let resp = self.send(what, req, ())?;
+        let req = || self.request("HEAD", &path, &[], EMPTY_SHA256, &[]);
+        let resp = self.send_again(what, req, ())?;
         if resp.status() == http::StatusCode::NOT_FOUND {
             return Err(no_bucket(what, &self.config.bucket));
         }
@@ -353,8 +393,8 @@ impl S3Store {
             }
             let path = format!("/{}", self.config.bucket);
             let what = format!("list {prefix}");
-            let req = self.request("GET", &path, &query, EMPTY_SHA256, &[]);
-            let body = success(&what, self.send(&what, req, ())?)?
+            let req = || self.request("GET", &path, &query, EMPTY_SHA256, &[]);
+            let body = success(&what, self.send_again(&what, req, ())?)?
                 .body_mut()
                 .read_to_string()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{what}: {e}")))?;
@@ -404,8 +444,8 @@ impl S3Store {
         let hash = hex(&digest);
         let extra = [("x-amz-checksum-sha256", base64(&digest))];
         let what = format!("put {key}");
-        let req = self.request("PUT", &self.path(key), &[], &hash, &extra);
-        success(&what, self.send(&what, req, body)?)?;
+        let req = || self.request("PUT", &self.path(key), &[], &hash, &extra);
+        success(&what, self.send_again(&what, req, body)?)?;
         Ok(body.len() as u64)
     }
 
@@ -414,6 +454,8 @@ impl S3Store {
     fn put_parts(&self, key: &str, first: Vec<u8>, data: &mut dyn Read) -> io::Result<u64> {
         let what = format!("put {key}");
         let path = self.path(key);
+        // Sent once (also when interrupted): a second start would open a
+        // second upload and leave the first one open.
         let req = self.request("POST", &path, &[("uploads", "")], EMPTY_SHA256, &[]);
         let start = format!("{what}: start a multipart upload");
         let body = success(&start, self.send(&start, req, ())?)?
@@ -430,8 +472,8 @@ impl S3Store {
         if sent.is_err() {
             // Best effort: an upload left open keeps its parts (and their
             // space) until the bucket's own lifecycle rule, if any, ends it.
-            let req = self.request("DELETE", &path, &[("uploadId", &id)], EMPTY_SHA256, &[]);
-            match self.send(&what, req, ()) {
+            let req = || self.request("DELETE", &path, &[("uploadId", &id)], EMPTY_SHA256, &[]);
+            match self.send_again(&what, req, ()) {
                 Ok(r) if r.status().is_success() => {}
                 Ok(r) => eprintln!(
                     "taso: {what}: could not abort the multipart upload {id}: HTTP {}",
@@ -465,14 +507,16 @@ impl S3Store {
             let part = format!("{what}: part {n}");
             let num = n.to_string();
             let hash = hex(&Sha256::digest(&buf));
-            let req = self.request(
-                "PUT",
-                path,
-                &[("partNumber", &num), ("uploadId", id)],
-                &hash,
-                &[],
-            );
-            let resp = success(&part, self.send(&part, req, &buf[..])?)?;
+            let req = || {
+                self.request(
+                    "PUT",
+                    path,
+                    &[("partNumber", &num), ("uploadId", id)],
+                    &hash,
+                    &[],
+                )
+            };
+            let resp = success(&part, self.send_again(&part, req, &buf[..])?)?;
             let etag = resp
                 .headers()
                 .get("etag")
@@ -500,6 +544,8 @@ impl S3Store {
         xml.push_str("</CompleteMultipartUpload>");
         let done = format!("{what}: complete the multipart upload");
         let hash = hex(&Sha256::digest(xml.as_bytes()));
+        // Sent once: a completion that was carried out answers a second
+        // one with "no such upload".
         let req = self.request("POST", path, &[("uploadId", id)], &hash, &[]);
         let body = success(&done, self.send(&done, req, xml.as_bytes())?)?
             .body_mut()
@@ -537,8 +583,8 @@ impl ObjectStore for S3Store {
             return Err(bad_key(key));
         }
         let what = format!("get {key}");
-        let req = self.request("GET", &self.path(key), &[], EMPTY_SHA256, &[]);
-        let mut resp = self.send(&what, req, ())?;
+        let req = || self.request("GET", &self.path(key), &[], EMPTY_SHA256, &[]);
+        let mut resp = self.send_again(&what, req, ())?;
         if resp.status() == http::StatusCode::NOT_FOUND {
             let body = resp.body_mut().read_to_string().unwrap_or_default();
             if between(&body, "<Code>", "</Code>") == Some("NoSuchBucket") {
@@ -555,8 +601,8 @@ impl ObjectStore for S3Store {
             return Err(bad_key(key));
         }
         let what = format!("head {key}");
-        let req = self.request("HEAD", &self.path(key), &[], EMPTY_SHA256, &[]);
-        let resp = self.send(&what, req, ())?;
+        let req = || self.request("HEAD", &self.path(key), &[], EMPTY_SHA256, &[]);
+        let resp = self.send_again(&what, req, ())?;
         if resp.status() == http::StatusCode::NOT_FOUND {
             // A HEAD's answer has no body to say whose 404 it is: the
             // bucket is asked for once, and from then on a 404 is the key's.
@@ -609,6 +655,8 @@ impl ObjectStore for S3Store {
             return Ok(false);
         }
         let what = format!("delete {key}");
+        // Sent once: a delete that was carried out answers a second one
+        // 404, which would read as "it was not there".
         let req = self.request("DELETE", &self.path(key), &[], EMPTY_SHA256, &[]);
         let resp = self.send(&what, req, ())?;
         if resp.status() == http::StatusCode::NOT_FOUND {
