@@ -5435,4 +5435,107 @@ mod tests {
         ledger.deny(&mut w, op, "not this one").unwrap();
         assert!(t.coord.obligations(t.id).unwrap().is_empty());
     }
+
+    /// An answer lost in a gap (D&D R4-c2 a, 2026-11-26).  An action is
+    /// released and shipped, so a sender may act on it.  Its answer
+    /// "applied" is recorded: the coordinator accepts it and stops
+    /// counting the action.  The Warden dies before it ships the answer,
+    /// and another node takes the Vessel over.  That log holds the
+    /// release and no answer, so nobody there knows what happened: the
+    /// action is an open obligation of the ledger, and effect authority
+    /// is withheld.  Before this fix the coordinator went on counting
+    /// nothing, so it would have allowed a verdict or a purge of the
+    /// Vessel.  Now the Warden declares the action to it again when the
+    /// ledger opens, and it is counted until someone answers it.
+    #[test]
+    fn an_answer_lost_in_a_gap_is_counted_again_when_the_ledger_opens() {
+        use taso_core::record::OutcomeState as S;
+        let t = TenTurns::new();
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, _) = node.open(t.id).unwrap();
+        crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+        let snap = node
+            .pool
+            .snapshot(v.dataset(), t.seals[10].lsn)
+            .unwrap()
+            .unwrap();
+        v.publish_seal(&t.packs(&node), &snap, None).unwrap();
+        let (mut ledger, _) = ledger_of(&t, &node, &mut v);
+        let a = ledger.release(&mut v, &a_mail()).unwrap();
+        ledger.ship_before_send(&mut v, &a).unwrap().unwrap();
+        ledger
+            .record(
+                &mut v,
+                a.op,
+                a.barrier,
+                &crate::ledger::Answer::Applied {
+                    receipt: b"r".to_vec(),
+                },
+            )
+            .unwrap();
+        assert!(t.coord.obligations(t.id).unwrap().is_empty(), "answered");
+        drop(v);
+
+        let b = Host {
+            coord: t.coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: t.tmp.path().join("node-2"),
+            warden: WardenId::new(2),
+        };
+        let (mut w, reborn) = b.rebirth(t.id, &t.packs(&b)).unwrap();
+        assert!(reborn.gap.is_some(), "the answer is in the gap");
+        let (ledger, reconciled) = ledger_of(&t, &b, &mut w);
+        assert_eq!(
+            reconciled,
+            crate::ledger::Reconciled {
+                open: vec![a.op],
+                counted_again: vec![a.op],
+                ..Default::default()
+            }
+        );
+        assert!(!ledger.authorized());
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![a.op.get()]);
+        let said = outcomes_of(&w, a.op);
+        assert_eq!(
+            said.iter().map(|o| o.state).collect::<Vec<_>>(),
+            vec![
+                S::DispatchAuthorized,
+                S::DispatchAuthorized,
+                S::OutcomeUnknown
+            ],
+            "the release again, and unknown after it"
+        );
+        assert_eq!(
+            said[1].evidence.as_deref(),
+            Some(crate::ledger::COUNTED_AGAIN.as_bytes())
+        );
+
+        // The next opening finds it open and counted: nothing is written.
+        let tail = w.tail();
+        let (mut ledger, reconciled) = ledger_of(&t, &b, &mut w);
+        assert_eq!(
+            reconciled,
+            crate::ledger::Reconciled {
+                open: vec![a.op],
+                ..Default::default()
+            }
+        );
+        assert_eq!(w.tail(), tail, "nothing written");
+
+        // An operator says what happened: closed at both.
+        ledger
+            .resolve(
+                &mut w,
+                a.op,
+                crate::ledger::Resolution::Applied,
+                taso_core::record::Authority {
+                    actor: "operator".into(),
+                    reason: "the provider shows it sent".into(),
+                },
+            )
+            .unwrap();
+        assert!(ledger.authorized());
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
+    }
 }
