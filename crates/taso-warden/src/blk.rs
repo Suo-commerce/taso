@@ -4036,4 +4036,294 @@ mod tests {
             (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash))
         );
     }
+
+    // ── A node's block log loses Seal layers ────────────────────────
+    //
+    // Two tests that change nothing in the product: they run today's code
+    // on what a node's block log holds after it was cut back at a group's
+    // end (taso-blkd's start after a record no longer verifies: maturity
+    // review of e4a37b2, finding 1), and say what the Warden then does.
+    // The Vessel's own log in the state directory is whole in both.
+
+    use crate::coordinator::Coord as _;
+
+    /// The block log's length with everything so far made durable.
+    fn log_len(p: &TestPool) -> u64 {
+        let mut d = p.blkd.lock().unwrap();
+        d.store.flush().unwrap();
+        d.store.stats().log_bytes
+    }
+
+    /// The node's block log loses everything past `len` (a group's end),
+    /// and taso-blkd starts again on what is left: no device, no mount.
+    fn lose_block_log_after(p: &TestPool, len: u64) {
+        let mut d = p.blkd.lock().unwrap();
+        let path = d._dir.path().join("log");
+        // The store holds its log's lock: let it go before the file is cut.
+        let spare = tempfile::tempdir().unwrap();
+        let other = Store::create(&spare.path().join("log")).unwrap();
+        drop(std::mem::replace(&mut d.store, other));
+        let _ = std::fs::remove_file(d._dir.path().join("log.ckpt"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+        let (store, rec) = Store::open(&path).unwrap();
+        assert_eq!(
+            rec.cut, 0,
+            "cut at a group's end: the open finds a whole log"
+        );
+        d.store = store;
+        d.devs.clear();
+        p.mounts.table.borrow_mut().clear();
+    }
+
+    /// A Vessel of ten turns on one node: Seals 1 to 8 published to the
+    /// bucket, 9 and 10 taken and not published.  Block 0 holds the turn's
+    /// number.  Returns the node, the Vessel's id, its Seals by turn (0:
+    /// the birth Seal) and the block log's length after each publish.
+    struct TenTurns {
+        tmp: tempfile::TempDir,
+        coord: Arc<Coordinator>,
+        pool: TestPool,
+        id: taso_core::envelope::ChronicleId,
+        dataset: Dataset,
+        seals: Vec<Position>,
+        len_after: Vec<u64>,
+        shipped_at_8: Position,
+    }
+
+    impl TenTurns {
+        fn node(&self, pool: TestPool) -> Host<TestPool> {
+            Host {
+                coord: self.coord.clone(),
+                pool,
+                root: ds("tank/vessels"),
+                state_dir: self.tmp.path().join("node-1"),
+                warden: WardenId::new(1),
+            }
+        }
+
+        fn packs(
+            &self,
+            h: &Host<TestPool>,
+        ) -> crate::pack::Packs<crate::ship::LocalStore, BlkSend<StoreBlkd>> {
+            crate::pack::Packs::new(
+                crate::ship::LocalStore::new(self.tmp.path().join("store")),
+                h.pool.sender(),
+                "vessels",
+                self.id,
+            )
+            .unwrap()
+        }
+
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("store")).unwrap();
+            let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
+            let pool = pool();
+            let mut t = Self {
+                tmp,
+                coord,
+                pool: Clone::clone(&pool),
+                id: taso_core::envelope::ChronicleId::from_bytes([0; 16]),
+                dataset: ds("tank/none"),
+                seals: Vec::new(),
+                len_after: Vec::new(),
+                shipped_at_8: Position {
+                    lsn: Lsn::new(0),
+                    hash: h(0),
+                },
+            };
+            let a = t.node(pool);
+            let (mut v, _) = a.ensure(Namespace::from_bytes([3; 16]), b"user").unwrap();
+            t.id = v.id();
+            t.dataset = v.dataset().clone();
+            let packs = t.packs(&a);
+            for turn in 0..=10u64 {
+                let s = if turn == 0 {
+                    v.seal_birth().unwrap().seal
+                } else {
+                    write0(&a.pool, v.dataset(), turn as u8);
+                    seal(&mut v, turn)
+                };
+                t.seals.push(s);
+                if turn <= 8 {
+                    let snap = a.pool.snapshot(v.dataset(), s.lsn).unwrap().unwrap();
+                    v.publish_seal(&packs, &snap, None).unwrap();
+                }
+                t.len_after.push(log_len(&a.pool));
+            }
+            t.shipped_at_8 = t.coord.shipped(t.id).unwrap();
+            assert!(t.shipped_at_8.lsn >= t.seals[8].lsn && t.shipped_at_8.lsn < t.seals[9].lsn);
+            t
+        }
+
+        /// The Warden starts again on the node whose block log now ends
+        /// after turn `kept`'s publish: opens the Vessel and puts its
+        /// state at a Seal, as a run does before its agent starts.
+        fn restart_with_block_log_cut_after(
+            &self,
+            kept: usize,
+        ) -> (
+            Host<TestPool>,
+            Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+            crate::chronicle::Recovery,
+            crate::daemon::Settled,
+        ) {
+            lose_block_log_after(&self.pool, self.len_after[kept]);
+            let node = self.node(after_a_crash(&self.pool));
+            let (mut v, recovery) = node.open(self.id).unwrap();
+            let settled = crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+            (node, v, recovery, settled)
+        }
+    }
+
+    /// Case A: the layers lost are of Seals that were never shipped (9 and
+    /// 10); the newest shipped Seal's layer (8) is still on the node.
+    #[test]
+    fn today_a_node_that_lost_only_unshipped_seal_layers_goes_on_from_the_newest_it_has() {
+        let t = TenTurns::new();
+        let (node, mut v, recovery, settled) = t.restart_with_block_log_cut_after(8);
+        let s = &t.seals;
+
+        // The open: Seals 9 and 10 are in the log and have no layer here.
+        assert_eq!(recovery.missing_layers, vec![s[9], s[10]]);
+        assert_eq!(
+            v.last_seal(),
+            Some(s[10]),
+            "the last Seal is still the log's"
+        );
+        assert!(matches!(
+            crate::daemon::verdict_after_open(&recovery),
+            Verdict::Unverified(why) if why.contains("2 Seals without their layer")
+        ));
+        // The state: reset to Seal 8, older than the last Seal.
+        assert_eq!(settled.rolled_back_to, Some(s[8]));
+        assert!(settled.behind());
+        assert_eq!(block0(&node.pool, &t.dataset), 8, "the files of turn 8");
+        // The agent is told the last sealed turn of the log: 10.
+        let told = crate::field::Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .last_sealed_turn();
+        assert_eq!(told, Some(10), "files of turn 8, told turn 10");
+
+        // The last Seal cannot be published: it has no layer to send.
+        assert!(node
+            .pool
+            .snapshot(v.dataset(), s[10].lsn)
+            .unwrap()
+            .is_none());
+        assert_eq!(t.coord.shipped(t.id).unwrap(), t.shipped_at_8);
+
+        // The next turn's Seal ships, as a step from Seal 8 (the last one
+        // shipped, whose layer is here), and the anchor moves past 9 and 10.
+        let packs = t.packs(&node);
+        write0(&node.pool, v.dataset(), 11);
+        let s11 = seal(&mut v, 11);
+        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
+        v.publish_seal(&packs, &snap, None).unwrap();
+        assert!(t.coord.shipped(t.id).unwrap().lsn >= s11.lsn);
+
+        // At its next start this node is told nothing is missing: a Seal
+        // with no layer that is older than one with a layer, and at or
+        // below the shipped anchor, is taken for a Seal folded away after
+        // its section was shipped (S-c), which 9 and 10 never were.  The
+        // first Seal after that start would be Clean.
+        drop(v);
+        let (v, recovery) = t.node(after_a_crash(&t.pool)).open(t.id).unwrap();
+        assert_eq!(recovery.missing_layers, vec![]);
+        assert_eq!(crate::daemon::verdict_after_open(&recovery), Verdict::Clean);
+
+        // What the bucket holds, read by another node's rebirth: the files
+        // of Seals 0 to 8 and 11; Seals 9 and 10 have none anywhere.
+        let b = Host {
+            coord: t.coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: t.tmp.path().join("node-2"),
+            warden: WardenId::new(2),
+        };
+        drop(v);
+        let (w, reborn) = b.rebirth(t.id, &t.packs(&b)).unwrap();
+        let mut want: Vec<Lsn> = s[..=8].iter().map(|p| p.lsn).collect();
+        want.push(s11.lsn);
+        assert_eq!(
+            reborn.received, want,
+            "no section for 9 or 10 in the bucket"
+        );
+        assert_eq!(block0(&b.pool, w.dataset()), 11);
+        // And that node is told nothing is missing either.
+        assert_eq!(reborn.missing_layers, vec![]);
+        assert_eq!(
+            crate::daemon::verdict_after_rebirth(&reborn),
+            Verdict::Clean
+        );
+    }
+
+    /// Case B: the layers lost include Seals that were shipped (7 and 8,
+    /// with the unshipped 9 and 10); the newest layer on the node is 6.
+    #[test]
+    fn today_a_node_that_lost_a_shipped_seal_layer_can_never_ship_again() {
+        let t = TenTurns::new();
+        let (node, mut v, recovery, settled) = t.restart_with_block_log_cut_after(6);
+        let s = &t.seals;
+
+        assert_eq!(recovery.missing_layers, vec![s[7], s[8], s[9], s[10]]);
+        assert_eq!(settled.rolled_back_to, Some(s[6]));
+        assert_eq!(block0(&node.pool, &t.dataset), 6, "the files of turn 6");
+        let told = crate::field::Session::new(&mut v, Verdict::Clean)
+            .unwrap()
+            .last_sealed_turn();
+        assert_eq!(told, Some(10), "files of turn 6, told turn 10");
+
+        // Every later Seal must ship as a step from Seal 8, the last one
+        // shipped; its layer is not on the node, so the send fails.
+        let packs = t.packs(&node);
+        let mut errors = Vec::new();
+        for turn in 11..=12u64 {
+            write0(&node.pool, v.dataset(), turn as u8);
+            let sn = seal(&mut v, turn);
+            let snap = node.pool.snapshot(v.dataset(), sn.lsn).unwrap().unwrap();
+            let e = v.publish_seal(&packs, &snap, None).unwrap_err().to_string();
+            assert!(
+                e.contains("no Seal layer") && e.ends_with(&format!("{:020}", s[8].lsn.get())),
+                "turn {turn}: the send from Seal 8's layer: {e}"
+            );
+            errors.push(e);
+            // The log alone cannot ship past the unshipped Seals either
+            // (F4), which is what an effect's release waits for.
+            let tail = v.tail();
+            assert!(matches!(
+                packs.ship_log(&v.chronicle().segments(), tail),
+                Err(crate::pack::PackError::SealNotShipped { .. })
+            ));
+            assert_eq!(
+                t.coord.shipped(t.id).unwrap(),
+                t.shipped_at_8,
+                "the shipped anchor has not moved"
+            );
+        }
+
+        // A restart of the Warden changes nothing: the same refusal.
+        drop(v);
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, recovery) = node.open(t.id).unwrap();
+        // (7 and 8 are no longer called missing: with the newer local
+        // layers of 11 and 12 above them they count as in the bucket only,
+        // which they are.  9 and 10 are past the shipped anchor.)
+        assert_eq!(recovery.missing_layers, vec![s[9], s[10]]);
+        crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+        write0(&node.pool, v.dataset(), 13);
+        let s13 = seal(&mut v, 13);
+        let snap = node.pool.snapshot(v.dataset(), s13.lsn).unwrap().unwrap();
+        let e = v
+            .publish_seal(&t.packs(&node), &snap, None)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no Seal layer"), "{e}");
+        assert_eq!(t.coord.shipped(t.id).unwrap(), t.shipped_at_8);
+    }
 }
