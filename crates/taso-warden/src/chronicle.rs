@@ -1147,6 +1147,15 @@ impl<L: Layers> Chronicle<L> {
         self.epoch
     }
 
+    /// The effect obligations the coordinator counts as open for this
+    /// Chronicle, ascending by op id (P4 spec §1.5).  The coordinator
+    /// derives them from the effect records it accepted and knows nothing
+    /// of gaps, so the answer may name an op this log no longer holds
+    /// (D100); the ledger asks at every open.
+    pub fn counted_obligations(&self) -> Result<Vec<u64>, CoordError> {
+        self.coord.obligations(self.id)
+    }
+
     /// The local tail (equal to the anchored head while live).
     pub fn tail(&self) -> Position {
         self.segment.tail()
