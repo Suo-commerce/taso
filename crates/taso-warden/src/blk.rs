@@ -4606,4 +4606,92 @@ mod tests {
         .unwrap();
         assert_eq!(t.coord.shipped(t.id).unwrap().lsn, v.tail().lsn);
     }
+
+    /// What a gap leaves at the coordinator, today, on any takeover.  The
+    /// Warden records an action's release (the coordinator accepts it and
+    /// counts it as an open obligation) and dies before it ships the log.
+    /// Another node takes the Vessel over: the release is past the shipped
+    /// anchor, so it is lost in the gap, and the reborn Vessel's log does
+    /// not know the action.  The coordinator still counts it.
+    #[test]
+    fn today_an_obligation_lost_in_a_gap_stays_open_at_the_coordinator() {
+        let t = TenTurns::new();
+        // Seals 9 and 10 shipped too: the log is shipped to its tail.
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, _) = node.open(t.id).unwrap();
+        crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+        let packs = t.packs(&node);
+        let snap = node
+            .pool
+            .snapshot(v.dataset(), t.seals[10].lsn)
+            .unwrap()
+            .unwrap();
+        v.publish_seal(&packs, &snap, None).unwrap();
+        let shipped = t.coord.shipped(t.id).unwrap();
+        assert_eq!(shipped.lsn, v.tail().lsn);
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
+
+        // The release is recorded and accepted; the Warden dies before the
+        // ship that would let a sender see it.
+        let (mut ledger, _) = crate::ledger::Ledger::open(
+            Box::new(crate::pack::PackPublisher::new(
+                t.packs(&node),
+                t.coord.clone(),
+                WardenId::new(1),
+            )),
+            &mut v,
+            |l, v, i, s| l.mark_unknown(v, i.op, s),
+        )
+        .unwrap();
+        let released = ledger
+            .release(
+                &mut v,
+                &crate::ledger::Declared {
+                    provider: "mail".into(),
+                    request: b"send".to_vec(),
+                    footprint: Vec::new(),
+                    dispatch: taso_core::record::Dispatch::Immediate,
+                    retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
+                        key: b"k".to_vec(),
+                    },
+                    consequence: taso_core::record::Consequence::Irreversible,
+                    authority: b"user".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            t.coord.obligations(t.id).unwrap(),
+            vec![released.op.get()],
+            "the coordinator counts the release"
+        );
+        assert_eq!(t.coord.shipped(t.id).unwrap(), shipped, "nothing shipped");
+        drop(v);
+
+        // Another node takes the Vessel over, from the bucket.
+        let b = Host {
+            coord: t.coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: t.tmp.path().join("node-2"),
+            warden: WardenId::new(2),
+        };
+        let (mut w, reborn) = b.rebirth(t.id, &t.packs(&b)).unwrap();
+        assert!(reborn.gap.is_some(), "the release is in the gap");
+        // Its ledger knows no such action: nothing to settle, nothing open.
+        let (ledger, reconciled) = crate::ledger::Ledger::open(
+            Box::new(crate::pack::PackPublisher::new(
+                t.packs(&b),
+                t.coord.clone(),
+                WardenId::new(2),
+            )),
+            &mut w,
+            |l, v, i, s| l.mark_unknown(v, i.op, s),
+        )
+        .unwrap();
+        assert_eq!(reconciled, crate::ledger::Reconciled::default());
+        assert!(ledger.authorized());
+        // The coordinator still counts it: a verdict on this Vessel is
+        // refused for an open obligation that no log holds.
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![released.op.get()]);
+    }
 }
