@@ -11,6 +11,22 @@
 //!                         ^ group end, fdatasync   ^ group end   ^ not durable
 //! ```
 //!
+//! # The header (64 bytes)
+//!
+//! ```text
+//!   magic "TASOBLK4" | version u32 | flags u32 | log id [16] | flush key [16] | checksum [16]
+//!   checksum = BLAKE3(the 48 bytes before it), its first 16 bytes
+//! ```
+//!
+//! The **log id** is random, made when the log is created, and kept by a
+//! compaction: it says which log this is.  The chain below is seeded from
+//! the whole header, so a record copied from another log does not verify.
+//! The **flush key** is random too (its use: the design note
+//! `claude/Taso_design_blocklog_format_2026-11-25.md`, 3.2).  Flag bit 0:
+//! the log was written by a compaction.  [`Store::open`] refuses a header
+//! whose checksum fails, a version above its own, a flag it does not know,
+//! and the formats before this one (`TASOBLK1` to `3`: no migration).
+//!
 //! # Durability, as a disk promises it
 //!
 //! - [`Store::flush`] appends a `Flush` record and calls `fdatasync` once:
@@ -45,6 +61,12 @@
 //! a fresh [`Map`] (same calls, same ids).  It stops at the first record
 //! that is short, has a bad magic or a wrong hash, and cuts the file back
 //! to the end of the **last Flush** it verified: what was durable.
+//!
+//! A record that verifies and has a kind this version does not know was
+//! written by a newer one: the open is refused
+//! ([`StoreError::UnknownKind`]) and nothing is cut.  (It used to read as
+//! the end of the log, and everything after the previous Flush was cut:
+//! maturity review of e4a37b2, finding 2.)
 //!
 //! Known limit (spike): a bad record is treated as the end of the log,
 //! as PostgreSQL's and SQLite's write-ahead logs do.  A torn tail after a
@@ -103,8 +125,8 @@
 //! [`Store::compaction`] writes a new log holding only the live blocks
 //! and the state that points at them (a **base**), followed by whatever
 //! the old log received meanwhile, and swaps it in; layer ids, names,
-//! tags and sequence numbers carry over.  A compacted log starts
-//! `TASOBLK3` and may hold two more record kinds, both only in its first
+//! tags, sequence numbers and the log id carry over.  A compacted log has
+//! flag bit 0 set and may hold two more record kinds, both only in its first
 //! group: `Data` (live blocks, no map effect) and `Base` (pieces of the
 //! state, in checkpoint encoding).  See the `compact` module.
 //!
@@ -128,19 +150,24 @@ use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
 mod compact;
 pub use compact::{Compacted, Compaction, OldLog};
 
-const FILE_MAGIC: &[u8; 8] = b"TASOBLK2";
-/// A log written by a compaction: it may begin with a base
-/// ([`K_DATA`] and [`K_BASE`] records).  Otherwise the same records.  A
-/// separate magic, so a version that does not know base records refuses
-/// the log instead of taking its first record for a torn end.
-const COMPACT_MAGIC: &[u8; 8] = b"TASOBLK3";
-/// The spike's format (no tags, origins or names).
-const OLD_MAGIC: &[u8; 8] = b"TASOBLK1";
+const FILE_MAGIC: &[u8; 8] = b"TASOBLK4";
+/// The formats before the header had a version, an identity or a
+/// checksum: the spike's (1), and the plain (2) and compacted (3) logs up
+/// to main e4a37b2.  Refused by name; there is no migration.
+const OLD_MAGICS: [&[u8; 8]; 3] = [b"TASOBLK1", b"TASOBLK2", b"TASOBLK3"];
+/// The number of this format, in the header.  A log with a larger one was
+/// written by a newer version and is refused.
+pub const FORMAT_VERSION: u32 = 4;
+/// Header flag: the log was written by a compaction, so it may begin with
+/// a base ([`K_DATA`] and [`K_BASE`] records).  Otherwise the same records.
+const FLAG_COMPACTED: u32 = 1;
+/// A log's identity: random, made with the log, kept by a compaction.
+pub type LogId = [u8; 16];
 /// Largest Seal tag, in bytes.
 pub const MAX_TAG: usize = 64;
 /// Largest branch name, in bytes.
 pub const MAX_NAME: usize = 255;
-const HEADER_LEN: u64 = 16;
+const HEADER_LEN: u64 = 64;
 const REC_MAGIC: u32 = 0x5442_4c4b; // "TBLK"
 /// magic + len + kind
 const REC_HEAD: u64 = 4 + 4 + 1;
@@ -172,7 +199,9 @@ const K_UNSEAL: u8 = 13;
 const K_FOLD: u8 = 14;
 const K_LAST: u8 = K_FOLD;
 
-const CKPT_MAGIC: &[u8; 8] = b"TASOCKP1";
+/// `TASOCKP2`: the log's id follows the magic (a `TASOCKP1` checkpoint is
+/// not read: a full replay).
+const CKPT_MAGIC: &[u8; 8] = b"TASOCKP2";
 
 /// Export streams: magic, run kinds, and the longest data run (4 MiB).
 const STREAM_MAGIC: &[u8; 8] = b"TASOBLKX";
@@ -190,9 +219,29 @@ pub enum StoreError {
     Map(MapError),
     /// The file is not a block log (bad header).
     NotALog,
-    /// A log in the spike's format (`TASOBLK1`), which this version does
-    /// not read.
+    /// A log in a format before this one (`TASOBLK1`, `2` or `3`), which
+    /// this version does not read or migrate.
     OldFormat,
+    /// The header's checksum fails: the header is damaged, and with it
+    /// the log's identity and the chain's seed.  Nothing was changed.
+    DamagedHeader,
+    /// The header names a format version above [`FORMAT_VERSION`], or a
+    /// flag this version does not know: a newer version wrote the log.
+    /// Nothing was changed.
+    NewerFormat {
+        /// The header's version.
+        version: u32,
+        /// The header's flags.
+        flags: u32,
+    },
+    /// A record that verifies but whose kind this version does not know:
+    /// a newer version wrote it.  Nothing was cut.
+    UnknownKind {
+        /// The record's kind.
+        kind: u8,
+        /// Where the record starts in the file.
+        at: u64,
+    },
     /// A verified record does not replay: the log contradicts itself.
     Replay {
         /// The record's sequence number.
@@ -245,7 +294,19 @@ impl std::fmt::Display for StoreError {
             Self::NotALog => write!(f, "not a taso-blk log"),
             Self::OldFormat => write!(
                 f,
-                "a taso-blk log in the spike's format (TASOBLK1); this version reads TASOBLK2"
+                "a taso-blk log in an older format (TASOBLK1, 2 or 3); this version reads TASOBLK4 and migrates nothing"
+            ),
+            Self::DamagedHeader => write!(
+                f,
+                "the log's header fails its checksum: the header is damaged; nothing was changed"
+            ),
+            Self::NewerFormat { version, flags } => write!(
+                f,
+                "the log is in format version {version} (flags {flags:#x}); this version reads {FORMAT_VERSION}: a newer taso-blk wrote it; nothing was changed"
+            ),
+            Self::UnknownKind { kind, at } => write!(
+                f,
+                "the record at byte {at} verifies but is of kind {kind}, which this version does not know: a newer taso-blk wrote it; nothing was cut"
             ),
             Self::BadTag(n) => write!(f, "a tag of {n} bytes; at most {MAX_TAG}"),
             Self::BadName(n) => write!(
@@ -307,6 +368,76 @@ pub struct Recovered {
     /// the store made its files private (audit 2026-11-16, S1).  The
     /// caller says so in its own log.
     pub tightened: Option<u32>,
+    /// The log's identity, from its header.
+    pub id: LogId,
+}
+
+/// The header's fields ([module docs](self)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Header {
+    flags: u32,
+    id: LogId,
+    flush_key: [u8; 16],
+}
+
+impl Header {
+    /// A new log's header: a fresh identity and flush key from the
+    /// kernel's random source.
+    fn fresh() -> io::Result<Self> {
+        let mut r = [0u8; 32];
+        File::open("/dev/urandom")?.read_exact(&mut r)?;
+        Ok(Self {
+            flags: 0,
+            id: r[..16].try_into().expect("16 bytes"),
+            flush_key: r[16..].try_into().expect("16 bytes"),
+        })
+    }
+
+    /// This log's header as a compaction writes it: the same identity and
+    /// key, the compacted flag set.
+    fn compacted(self) -> Self {
+        Self {
+            flags: self.flags | FLAG_COMPACTED,
+            ..self
+        }
+    }
+
+    fn is_compacted(&self) -> bool {
+        self.flags & FLAG_COMPACTED != 0
+    }
+
+    fn encode(&self) -> [u8; HEADER_LEN as usize] {
+        let mut b = [0u8; HEADER_LEN as usize];
+        b[..8].copy_from_slice(FILE_MAGIC);
+        b[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        b[12..16].copy_from_slice(&self.flags.to_le_bytes());
+        b[16..32].copy_from_slice(&self.id);
+        b[32..48].copy_from_slice(&self.flush_key);
+        let sum = blake3::hash(&b[..48]);
+        b[48..].copy_from_slice(&sum.as_bytes()[..16]);
+        b
+    }
+
+    /// The checksum before anything it covers is believed; then the
+    /// version and the flags.
+    fn decode(b: &[u8; HEADER_LEN as usize]) -> Result<Self, StoreError> {
+        if &b[..8] != FILE_MAGIC {
+            return Err(StoreError::NotALog);
+        }
+        if blake3::hash(&b[..48]).as_bytes()[..16] != b[48..] {
+            return Err(StoreError::DamagedHeader);
+        }
+        let version = u32::from_le_bytes(b[8..12].try_into().expect("4 bytes"));
+        let flags = u32::from_le_bytes(b[12..16].try_into().expect("4 bytes"));
+        if version != FORMAT_VERSION || flags & !FLAG_COMPACTED != 0 {
+            return Err(StoreError::NewerFormat { version, flags });
+        }
+        Ok(Self {
+            flags,
+            id: b[16..32].try_into().expect("16 bytes"),
+            flush_key: b[32..48].try_into().expect("16 bytes"),
+        })
+    }
 }
 
 /// Counters for measurements.
@@ -356,6 +487,8 @@ pub struct Store {
     /// the log after it.
     shared: Arc<LogFile>,
     path: PathBuf,
+    /// The log's header: its identity, its flush key, its flags.
+    header: Header,
     map: Map,
     meta: Meta,
     /// End of the last record: where the next one goes.
@@ -397,8 +530,8 @@ impl Store {
         ] {
             remove_if_there(&stale)?;
         }
-        let mut header = [0u8; HEADER_LEN as usize];
-        header[..8].copy_from_slice(FILE_MAGIC);
+        let fields = Header::fresh()?;
+        let header = fields.encode();
         file.write_all_at(&header, 0)?;
         file.sync_all()?;
         sync_dir(path)?;
@@ -407,6 +540,7 @@ impl Store {
             shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
             file,
             path: path.to_path_buf(),
+            header: fields,
             map: Map::new(),
             meta: Meta::default(),
             tail: HEADER_LEN,
@@ -434,18 +568,23 @@ impl Store {
         let lock = lock_log(path)?;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let len = file.metadata()?.len();
-        if len < HEADER_LEN {
+        // The magic first: an older format's header is shorter than ours,
+        // and is refused by name whatever its length.
+        let mut magic = [0u8; 8];
+        if len < 8 {
+            return Err(StoreError::NotALog);
+        }
+        file.read_exact_at(&mut magic, 0)?;
+        if OLD_MAGICS.contains(&&magic) {
+            return Err(StoreError::OldFormat);
+        }
+        if &magic != FILE_MAGIC || len < HEADER_LEN {
             return Err(StoreError::NotALog);
         }
         let mut header = [0u8; HEADER_LEN as usize];
         file.read_exact_at(&mut header, 0)?;
-        if &header[..8] == OLD_MAGIC {
-            return Err(StoreError::OldFormat);
-        }
-        let compacted = &header[..8] == COMPACT_MAGIC;
-        if &header[..8] != FILE_MAGIC && !compacted {
-            return Err(StoreError::NotALog);
-        }
+        let fields = Header::decode(&header)?;
+        let compacted = fields.is_compacted();
         // A log made before the store made its files private: others'
         // access goes, the owner's and the group's stay (an operator's
         // group setting is theirs).  Its checkpoint goes with it.
@@ -464,7 +603,7 @@ impl Store {
         }
 
         // Start from a checkpoint if one checks out, else from the header.
-        let ck = load_checkpoint(path, &file, len);
+        let ck = load_checkpoint(path, &file, len, &fields.id);
         let from = ck.as_ref().map(|c| c.lsn);
         let (mut map, mut meta, start, start_lsn, start_prev, mut garbage) = match ck {
             Some(c) => (c.map, c.meta, c.end, c.lsn, c.prev, c.garbage),
@@ -486,6 +625,11 @@ impl Store {
         // joined base pieces.  Only in the first group of the file.
         let mut base = Base::default();
         while let Some((kind, body, hash)) = read_record(&mut r, &prev)? {
+            if !(K_WRITE..=K_LAST).contains(&kind) {
+                // It verifies, so it is a record, and one a newer version
+                // wrote.  Before anything is cut: the file is as it was.
+                return Err(StoreError::UnknownKind { kind, at: pos });
+            }
             lsn += 1;
             let data_at = pos + REC_HEAD;
             pos += REC_HEAD + body.len() as u64 + HASH as u64;
@@ -544,6 +688,7 @@ impl Store {
             shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
             file,
             path: path.to_path_buf(),
+            header: fields,
             map,
             meta,
             tail: end,
@@ -562,8 +707,15 @@ impl Store {
                 cut,
                 checkpoint: from,
                 tightened,
+                id: fields.id,
             },
         ))
+    }
+
+    /// The log's identity: random, made with the log, kept by a
+    /// compaction.  Not poisoned by a failed append: it is the header's.
+    pub fn id(&self) -> LogId {
+        self.header.id
     }
 
     /// The map (read-only): layers, kinds, deltas.  Refused once the
@@ -951,6 +1103,7 @@ impl Store {
         };
         write_checkpoint(
             &self.path,
+            &self.header.id,
             &at,
             self.stats.garbage_bytes,
             &self.map,
@@ -1238,7 +1391,10 @@ fn chain(prev: &[u8; HASH], kind: u8, body: &[u8]) -> [u8; HASH] {
 type Record = (u8, Vec<u8>, [u8; HASH]);
 
 /// Read and verify the next record.  `None` at a clean end or at anything
-/// that is not a whole, verified record (torn, bad magic, bad hash).
+/// that is not a whole, verified record (torn, bad magic, bad hash).  The
+/// kind is whatever the record says: a record that verifies with a kind
+/// the caller does not know is a record, not an end, and is the caller's
+/// to refuse.
 fn read_record(r: &mut impl Read, prev: &[u8; HASH]) -> io::Result<Option<Record>> {
     let mut head = [0u8; REC_HEAD as usize];
     if !read_full(r, &mut head)? {
@@ -1247,7 +1403,7 @@ fn read_record(r: &mut impl Read, prev: &[u8; HASH]) -> io::Result<Option<Record
     let magic = u32::from_le_bytes(head[0..4].try_into().unwrap());
     let len = u32::from_le_bytes(head[4..8].try_into().unwrap());
     let kind = head[8];
-    if magic != REC_MAGIC || len > MAX_BODY || !(K_WRITE..=K_LAST).contains(&kind) {
+    if magic != REC_MAGIC || len > MAX_BODY {
         return Ok(None);
     }
     let mut body = vec![0u8; len as usize];
@@ -1609,6 +1765,7 @@ struct FlushPoint {
 /// atomically (a temporary file, synced, then renamed).
 fn write_checkpoint(
     log: &Path,
+    id: &LogId,
     at: &FlushPoint,
     garbage: u64,
     map: &Map,
@@ -1616,6 +1773,7 @@ fn write_checkpoint(
 ) -> io::Result<()> {
     let mut b = Vec::with_capacity(1 << 16);
     b.extend_from_slice(CKPT_MAGIC);
+    b.extend_from_slice(id);
     for v in [at.end, at.lsn, garbage] {
         b.extend_from_slice(&v.to_le_bytes());
     }
@@ -1713,15 +1871,21 @@ struct Checkpoint {
 }
 
 /// The checkpoint of the log at `path`, if there is one and it checks
-/// out: its own hash, and the Flush record at its end offset on disk with
-/// the chain hash it names.  Any doubt: `None` (a full replay).
-fn load_checkpoint(path: &Path, file: &File, len: u64) -> Option<Checkpoint> {
+/// out: its own hash, the log's id, and the Flush record at its end offset
+/// on disk with the chain hash it names.  Any doubt: `None` (a full
+/// replay).  A checkpoint of another log is not this log's: its id says so
+/// before its offsets are looked at.
+fn load_checkpoint(path: &Path, file: &File, len: u64, id: &LogId) -> Option<Checkpoint> {
     let b = std::fs::read(ckpt_path(path)).ok()?;
     let (body, sum) = b.split_at(b.len().checked_sub(HASH)?);
     if blake3::hash(body).as_bytes() != sum || !body.starts_with(CKPT_MAGIC) {
         return None;
     }
     let mut r = &body[CKPT_MAGIC.len()..];
+    if r.get(..id.len())? != id {
+        return None;
+    }
+    r = &r[id.len()..];
     let mut u = || -> Option<u64> {
         let v = u64::from_le_bytes(r.get(..8)?.try_into().ok()?);
         r = &r[8..];
@@ -3113,14 +3277,154 @@ mod tests {
         );
     }
 
+    /// A log of two groups on one branch; returns the branch.
+    fn two_groups(path: &Path) -> LayerId {
+        let mut s = Store::create(path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        s.flush().unwrap();
+        s.write(b, 1, &blocks(2, 1), false).unwrap();
+        s.flush().unwrap();
+        b
+    }
+
+    #[test]
+    fn a_record_of_an_unknown_kind_refuses_the_open_and_cuts_nothing() {
+        // Maturity review of e4a37b2, finding 2: a kind a newer version
+        // wrote read as the end of the log, and every later group was cut.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let at;
+        {
+            let mut s = Store::create(&path).unwrap();
+            let root = s.root_seal().unwrap();
+            let b = s.fork(root).unwrap();
+            s.write(b, 0, &blocks(1, 1), false).unwrap();
+            s.flush().unwrap();
+            at = s.stats().log_bytes;
+            s.append(K_LAST + 1, b"from a newer version").unwrap();
+            s.write(b, 1, &blocks(2, 1), false).unwrap();
+            s.flush().unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        match Store::open(&path) {
+            Err(StoreError::UnknownKind { kind, at: found }) => {
+                assert_eq!((kind, found), (K_LAST + 1, at));
+            }
+            other => panic!("opened or refused otherwise: {:?}", other.map(|(_, r)| r)),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was cut");
+    }
+
+    #[test]
+    fn a_header_that_does_not_check_out_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        two_groups(&path);
+        let good = std::fs::read(&path).unwrap();
+        let try_with = |header: &[u8]| {
+            let mut b = good.clone();
+            b[..header.len()].copy_from_slice(header);
+            std::fs::write(&path, &b).unwrap();
+            let r = Store::open(&path).map(|(_, r)| r);
+            assert_eq!(std::fs::read(&path).unwrap(), b, "refused, not changed");
+            r
+        };
+        // One bit of the identity flipped: the checksum catches it.
+        let mut h = good[..HEADER_LEN as usize].to_vec();
+        h[20] ^= 1;
+        assert!(matches!(try_with(&h), Err(StoreError::DamagedHeader)));
+        // A newer version's log, and one with a flag this version does not
+        // know: both with a good checksum.
+        let resum = |h: &mut Vec<u8>| {
+            let sum = blake3::hash(&h[..48]);
+            h[48..64].copy_from_slice(&sum.as_bytes()[..16]);
+        };
+        let mut h = good[..HEADER_LEN as usize].to_vec();
+        h[8..12].copy_from_slice(&(FORMAT_VERSION + 1).to_le_bytes());
+        resum(&mut h);
+        assert!(matches!(
+            try_with(&h),
+            Err(StoreError::NewerFormat { version, flags: 0 }) if version == FORMAT_VERSION + 1
+        ));
+        let mut h = good[..HEADER_LEN as usize].to_vec();
+        h[12..16].copy_from_slice(&2u32.to_le_bytes());
+        resum(&mut h);
+        assert!(matches!(
+            try_with(&h),
+            Err(StoreError::NewerFormat { flags: 2, .. })
+        ));
+        // The magic alone, cut short of a header.
+        std::fs::write(&path, &good[..40]).unwrap();
+        assert!(matches!(Store::open(&path), Err(StoreError::NotALog)));
+        // And the log as it was opens.
+        std::fs::write(&path, &good).unwrap();
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.groups, rec.cut), (3, 0)); // the root Seal's group and the two written
+        assert_eq!(rec.id, s.id());
+    }
+
+    #[test]
+    fn a_log_has_its_own_identity_and_its_records_verify_in_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        two_groups(&a);
+        two_groups(&b);
+        let (ida, idb) = (Store::open(&a).unwrap().1.id, Store::open(&b).unwrap().1.id);
+        assert_ne!(ida, idb, "two logs, two identities");
+        assert_eq!(Store::open(&a).unwrap().1.id, ida, "kept across opens");
+        // The same operations made the same records but for the chain,
+        // which starts from each log's header: a's records under b's
+        // header are no records of b's.
+        let (bytes_a, bytes_b) = (std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        assert_eq!(bytes_a.len(), bytes_b.len());
+        let mut mixed = bytes_b[..HEADER_LEN as usize].to_vec();
+        mixed.extend_from_slice(&bytes_a[HEADER_LEN as usize..]);
+        std::fs::write(&b, &mixed).unwrap();
+        let (_, rec) = Store::open(&b).unwrap();
+        assert_eq!((rec.id, rec.records, rec.groups), (idb, 0, 0));
+        assert_eq!(rec.cut, bytes_a.len() as u64 - HEADER_LEN);
+    }
+
+    #[test]
+    fn a_checkpoint_of_another_log_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for p in [&a, &b] {
+            two_groups(p);
+            let (mut s, _) = Store::open(p).unwrap();
+            s.checkpoint().unwrap();
+        }
+        assert!(
+            Store::open(&b).unwrap().1.checkpoint.is_some(),
+            "its own is used"
+        );
+        std::fs::copy(ckpt_path(&a), ckpt_path(&b)).unwrap();
+        let (s, rec) = Store::open(&b).unwrap();
+        assert_eq!(rec.checkpoint, None, "a full replay");
+        assert_eq!(s.map().unwrap().log_locs().len(), 2);
+    }
+
     #[test]
     fn a_log_in_the_spike_format_is_refused_by_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old");
-        let mut header = [0u8; HEADER_LEN as usize];
-        header[..8].copy_from_slice(OLD_MAGIC);
-        std::fs::write(&path, header).unwrap();
-        assert!(matches!(Store::open(&path), Err(StoreError::OldFormat)));
+        // Each older format, with the 16-byte header those had.
+        for old in OLD_MAGICS {
+            let mut header = [0u8; 16];
+            header[..8].copy_from_slice(old);
+            std::fs::write(&path, header).unwrap();
+            assert!(
+                matches!(Store::open(&path), Err(StoreError::OldFormat)),
+                "{old:?}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                header,
+                "refused, not changed"
+            );
+        }
     }
 
     #[test]
@@ -3312,7 +3616,8 @@ mod tests {
                     assert_eq!(rec.checkpoint, None);
                 } else if let Some(c) = &ckpt {
                     // A cut that keeps the checkpoint's Flush must start from it.
-                    let end = u64::from_le_bytes(c[8..16].try_into().unwrap());
+                    // (After the checkpoint's magic and the log's id.)
+                    let end = u64::from_le_bytes(c[24..32].try_into().unwrap());
                     assert_eq!(
                         rec.checkpoint.is_some(),
                         len >= end,
@@ -3565,7 +3870,11 @@ mod tests {
         assert!(done.after < before.log_bytes / 4, "{done:?}");
         // Live: a has 3 (0..3) + 7; b has 6; the Seals 1 and 3 blocks.
         assert_eq!(done.live, s.map().unwrap().log_locs().len() as u64 * BLOCK);
-        assert_eq!(std::fs::read(&path).unwrap()[..8], *COMPACT_MAGIC);
+        let header: [u8; HEADER_LEN as usize] = std::fs::read(&path).unwrap()
+            [..HEADER_LEN as usize]
+            .try_into()
+            .unwrap();
+        assert!(Header::decode(&header).unwrap().is_compacted());
         assert!(!compact::temp_path(&path).exists());
 
         // It goes on as a store, and opens as one: from its checkpoint,
@@ -3643,7 +3952,11 @@ mod tests {
         s.write(layers[1], 2, &blocks(50, 1), false).unwrap();
         s.flush().unwrap();
         let want = whole(&s, &layers);
-        assert_eq!(std::fs::read(&path).unwrap()[..8], *FILE_MAGIC);
+        let header: [u8; HEADER_LEN as usize] = std::fs::read(&path).unwrap()
+            [..HEADER_LEN as usize]
+            .try_into()
+            .unwrap();
+        assert!(!Header::decode(&header).unwrap().is_compacted());
         drop(s);
 
         // A crash during a compaction leaves its file beside the log.

@@ -256,7 +256,13 @@ fn the_daemon_compacts_by_itself_and_keeps_what_is_live() {
         }
     }
     assert!(compacted, "no automatic compaction within 15 s");
-    assert_eq!(&std::fs::read(&log).unwrap()[..8], b"TASOBLK3");
+    // The header's flags (bytes 12..16): bit 0, written by a compaction.
+    let header = std::fs::read(&log).unwrap();
+    assert_eq!(&header[..8], b"TASOBLK4");
+    assert_eq!(
+        u32::from_le_bytes(header[12..16].try_into().unwrap()) & 1,
+        1
+    );
     let out = dir.path().join("out.blks");
     c.export(sealed, None, &out).unwrap();
     assert_eq!(
