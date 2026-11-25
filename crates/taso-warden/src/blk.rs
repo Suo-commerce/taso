@@ -4181,6 +4181,47 @@ mod tests {
         }
     }
 
+    /// An agent's session on `v` declares one effect, with the real
+    /// publisher (the log shipped, then the anchor advanced, before
+    /// anything is released).  `Ok(())` if it was released, else why not.
+    fn declare_an_effect(
+        t: &TenTurns,
+        node: &Host<TestPool>,
+        v: &mut Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+        call: u64,
+    ) -> Result<(), String> {
+        use taso_field::protocol::{EffectResult, Reply, Request, VERSION};
+        let publisher =
+            crate::pack::PackPublisher::new(t.packs(node), t.coord.clone(), WardenId::new(1));
+        let (mut fx, _) =
+            crate::effects::Effects::open(crate::effects::Mode::Dispatch, Box::new(publisher), v)
+                .unwrap();
+        let mut s = crate::field::Session::new(v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(Request::Hello { version: VERSION });
+        let request = format!("send {call}").into_bytes();
+        match s.handle(Request::Effect {
+            call,
+            provider: "mail".into(),
+            request: request.clone(),
+            footprint: Vec::new(),
+            retry: taso_core::record::RetryPolicy::ProviderDeduplicated { key: request },
+            consequence: taso_core::record::Consequence::Irreversible,
+            authority: b"user".to_vec(),
+        }) {
+            Reply::Effect {
+                result: EffectResult::Released { .. },
+                ..
+            } => Ok(()),
+            Reply::Effect {
+                result: EffectResult::Refused { reason },
+                ..
+            } => Err(reason),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
     /// Case A: the layers lost are of Seals that were never shipped (9 and
     /// 10); the newest shipped Seal's layer (8) is still on the node.
     #[test]
@@ -4218,6 +4259,11 @@ mod tests {
             .is_none());
         assert_eq!(t.coord.shipped(t.id).unwrap(), t.shipped_at_8);
 
+        // An effect the agent declares in the turn after the restart is
+        // refused: the log cannot ship past Seals 9 and 10.
+        let refused = declare_an_effect(&t, &node, &mut v, 1).unwrap_err();
+        assert!(refused.contains("not shipped"), "{refused}");
+
         // The next turn's Seal ships, as a step from Seal 8 (the last one
         // shipped, whose layer is here), and the anchor moves past 9 and 10.
         let packs = t.packs(&node);
@@ -4226,6 +4272,8 @@ mod tests {
         let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
         v.publish_seal(&packs, &snap, None).unwrap();
         assert!(t.coord.shipped(t.id).unwrap().lsn >= s11.lsn);
+        // And from then on an effect is released again.
+        declare_an_effect(&t, &node, &mut v, 2).unwrap();
 
         // At its next start this node is told nothing is missing: a Seal
         // with no layer that is older than one with a layer, and at or
@@ -4306,6 +4354,10 @@ mod tests {
                 "the shipped anchor has not moved"
             );
         }
+
+        // So every effect the agent declares is refused, turn after turn.
+        let refused = declare_an_effect(&t, &node, &mut v, 1).unwrap_err();
+        assert!(refused.contains("not shipped"), "{refused}");
 
         // A restart of the Warden changes nothing: the same refusal.
         drop(v);
