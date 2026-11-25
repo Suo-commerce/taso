@@ -471,9 +471,24 @@ impl<P: Pool> Host<P> {
                 .map_err(VesselError::Pool)?
                 .is_some()
         {
-            self.pool
-                .back_to(&dataset, &ends)
-                .map_err(VesselError::Pool)?;
+            if let Err(e) = self.pool.back_to(&dataset, &ends) {
+                // Refused (a fork or a Seal view in use on a layer that
+                // would go, a dataset that cannot be unmounted): the
+                // Vessel keeps the state directory it had, so a refused
+                // rebuild has changed nothing (D99).  After a failure
+                // part-way the next look finds it behind again, and the
+                // next call finishes the step.
+                if let Some(aside) = kept {
+                    std::fs::rename(&aside, &dir).map_err(|r| {
+                        VesselError::LocalState(format!(
+                            "{e}; and putting {} back as {}: {r}",
+                            aside.display(),
+                            dir.display()
+                        ))
+                    })?;
+                }
+                return Err(VesselError::Pool(e));
+            }
         }
         // The sections at or below the newest section end on the node
         // are not received: that layer holds them (an interrupted
