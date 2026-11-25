@@ -1510,6 +1510,10 @@ fn holder_synced(
 /// in the same batch is an approval of a held action (D&D C-1 a,
 /// 2026-11-23; the ledger writes every other release together with its
 /// intent): it opens the obligation again, until the sender's answer.
+/// The ledger also writes such a release at an opening, for a released
+/// action whose answer a gap took (`ledger::COUNTED_AGAIN`, D&D R4-c2 a,
+/// 2026-11-26): this log had closed it on that answer, and it is open
+/// again until someone says what happened.
 /// The outcome does not say whether its intent set a barrier, so every
 /// approved action counts until it is answered: at most a sanction or a
 /// purge waits for an answer it need not have waited for, never the
