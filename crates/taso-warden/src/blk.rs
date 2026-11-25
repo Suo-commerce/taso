@@ -4234,4 +4234,995 @@ mod tests {
             (Some((w.dataset().clone(), s1.lsn)), Some(s1.hash))
         );
     }
+
+    // ── A node's block log loses Seal layers ────────────────────────
+    //
+    // What the Warden does on a node whose block log was cut back at a
+    // group's end (taso-blkd's start after a record no longer verifies:
+    // maturity review of e4a37b2, finding 1).  The Vessel's own log in
+    // the state directory is whole.  The Warden finds the Vessel behind
+    // its log and rebuilds it here from the bucket (P4 spec rev. 38, D99:
+    // `Host::behind`, `Host::rebuild_here`).  The tests named `today_`
+    // still say what the openers do before they use that step.
+
+    use crate::coordinator::Coord as _;
+
+    /// The block log's length with everything so far made durable.
+    fn log_len(p: &TestPool) -> u64 {
+        let mut d = p.blkd.lock().unwrap();
+        d.store.flush().unwrap();
+        d.store.stats().log_bytes
+    }
+
+    /// The node's block log loses everything past `len` (a group's end),
+    /// and taso-blkd starts again on what is left: no device, no mount.
+    fn lose_block_log_after(p: &TestPool, len: u64) {
+        let mut d = p.blkd.lock().unwrap();
+        let path = d._dir.path().join("log");
+        // The store holds its log's lock: let it go before the file is cut.
+        let spare = tempfile::tempdir().unwrap();
+        let other = Store::create(&spare.path().join("log")).unwrap();
+        drop(std::mem::replace(&mut d.store, other));
+        let _ = std::fs::remove_file(d._dir.path().join("log.ckpt"));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+        let (store, rec) = Store::open(&path).unwrap();
+        assert_eq!(
+            rec.cut, 0,
+            "cut at a group's end: the open finds a whole log"
+        );
+        d.store = store;
+        d.devs.clear();
+        p.mounts.table.borrow_mut().clear();
+    }
+
+    /// A Vessel of ten turns on one node: Seals 1 to 8 published to the
+    /// bucket, 9 and 10 taken and not published.  Block 0 holds the turn's
+    /// number.  Returns the node, the Vessel's id, its Seals by turn (0:
+    /// the birth Seal) and the block log's length after each publish.
+    struct TenTurns {
+        tmp: tempfile::TempDir,
+        coord: Arc<Coordinator>,
+        pool: TestPool,
+        id: taso_core::envelope::ChronicleId,
+        dataset: Dataset,
+        seals: Vec<Position>,
+        len_after: Vec<u64>,
+        /// The block log's length when the dataset was made and no Seal
+        /// taken yet.
+        len_born: u64,
+        shipped_at_8: Position,
+        /// The action held in turn 10, if the Vessel holds its effects
+        /// ([`TenTurns::holding`]).
+        held: Option<taso_core::record::OpId>,
+    }
+
+    impl TenTurns {
+        fn node(&self, pool: TestPool) -> Host<TestPool> {
+            Host {
+                coord: self.coord.clone(),
+                pool,
+                root: ds("tank/vessels"),
+                state_dir: self.tmp.path().join("node-1"),
+                warden: WardenId::new(1),
+            }
+        }
+
+        fn packs(
+            &self,
+            h: &Host<TestPool>,
+        ) -> crate::pack::Packs<crate::ship::LocalStore, BlkSend<StoreBlkd>> {
+            crate::pack::Packs::new(
+                crate::ship::LocalStore::new(self.tmp.path().join("store")),
+                h.pool.sender(),
+                "vessels",
+                self.id,
+            )
+            .unwrap()
+        }
+
+        fn new() -> Self {
+            Self::with(false)
+        }
+
+        /// The same ten turns of a Vessel that holds its effects (as a
+        /// fork does): in turn 10 its agent declares one action, which is
+        /// held, and Seal 10 covers it.
+        fn holding() -> Self {
+            Self::with(true)
+        }
+
+        fn with(hold_in_turn_10: bool) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("store")).unwrap();
+            let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
+            let pool = pool();
+            let mut t = Self {
+                tmp,
+                coord,
+                pool: Clone::clone(&pool),
+                id: taso_core::envelope::ChronicleId::from_bytes([0; 16]),
+                dataset: ds("tank/none"),
+                seals: Vec::new(),
+                len_after: Vec::new(),
+                len_born: 0,
+                shipped_at_8: Position {
+                    lsn: Lsn::new(0),
+                    hash: h(0),
+                },
+                held: None,
+            };
+            let a = t.node(pool);
+            let (mut v, _) = a.ensure(Namespace::from_bytes([3; 16]), b"user").unwrap();
+            t.id = v.id();
+            t.dataset = v.dataset().clone();
+            t.len_born = log_len(&a.pool);
+            let packs = t.packs(&a);
+            for turn in 0..=10u64 {
+                let s = if turn == 0 {
+                    v.seal_birth().unwrap().seal
+                } else if turn == 10 && hold_in_turn_10 {
+                    write0(&a.pool, v.dataset(), turn as u8);
+                    let publisher = crate::pack::PackPublisher::new(
+                        t.packs(&a),
+                        t.coord.clone(),
+                        WardenId::new(1),
+                    );
+                    let (mut fx, _) = crate::effects::Effects::open(
+                        crate::effects::Mode::Hold,
+                        Box::new(publisher),
+                        &mut v,
+                    )
+                    .unwrap();
+                    let asked = fx
+                        .ask(
+                            &mut v,
+                            &crate::ledger::Declared {
+                                provider: "mail".into(),
+                                request: b"send the report of turn 10".to_vec(),
+                                footprint: Vec::new(),
+                                dispatch: taso_core::record::Dispatch::Immediate,
+                                retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
+                                    key: b"turn-10".to_vec(),
+                                },
+                                consequence: taso_core::record::Consequence::Irreversible,
+                                authority: b"user".to_vec(),
+                            },
+                        )
+                        .unwrap();
+                    let crate::effects::Asked::Held { op } = asked else {
+                        panic!("a holding Vessel holds: {asked:?}");
+                    };
+                    t.held = Some(op);
+                    // Seal 10 covers the held action (its ledger position).
+                    let covered = crate::effects::ledger_pos(&v).unwrap();
+                    v.seal(StreamCut::EMPTY, Verdict::Clean, covered, TurnId::new(turn))
+                        .unwrap()
+                        .seal
+                } else {
+                    write0(&a.pool, v.dataset(), turn as u8);
+                    seal(&mut v, turn)
+                };
+                t.seals.push(s);
+                if turn <= 8 {
+                    let snap = a.pool.snapshot(v.dataset(), s.lsn).unwrap().unwrap();
+                    v.publish_seal(&packs, &snap, None).unwrap();
+                }
+                t.len_after.push(log_len(&a.pool));
+            }
+            t.shipped_at_8 = t.coord.shipped(t.id).unwrap();
+            assert!(t.shipped_at_8.lsn >= t.seals[8].lsn && t.shipped_at_8.lsn < t.seals[9].lsn);
+            t
+        }
+
+        /// The node as the Warden finds it at its next start, its block
+        /// log now ending at `len` (a group's end).  Nothing is opened.
+        fn node_with_block_log_cut_at(&self, len: u64) -> Host<TestPool> {
+            lose_block_log_after(&self.pool, len);
+            self.node(after_a_crash(&self.pool))
+        }
+
+        /// The Seals of turns `turns`, as [`Host::behind`] lists them.
+        fn seals_of(&self, turns: std::ops::RangeInclusive<usize>) -> Vec<Position> {
+            self.seals[turns].to_vec()
+        }
+
+        /// What is in the state directory's parent beside the Vessel's
+        /// own directory: the directories a rebuild kept.
+        fn kept_aside(&self, node: &Host<TestPool>) -> Vec<std::path::PathBuf> {
+            let own = node.dir_for(self.id);
+            let mut out: Vec<_> = std::fs::read_dir(&node.state_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| *p != own)
+                .collect();
+            out.sort();
+            out
+        }
+
+        /// The Warden starts again on the node whose block log now ends
+        /// after turn `kept`'s publish: opens the Vessel and puts its
+        /// state at a Seal, as a run does before its agent starts.
+        fn restart_with_block_log_cut_after(
+            &self,
+            kept: usize,
+        ) -> (
+            Host<TestPool>,
+            Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+            crate::chronicle::Recovery,
+            crate::daemon::Settled,
+        ) {
+            lose_block_log_after(&self.pool, self.len_after[kept]);
+            let node = self.node(after_a_crash(&self.pool));
+            let (mut v, recovery) = node.open(self.id).unwrap();
+            let settled = crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+            (node, v, recovery, settled)
+        }
+    }
+
+    /// An agent's session on `v` declares one effect, with the real
+    /// publisher (the log shipped, then the anchor advanced, before
+    /// anything is released).  `Ok(())` if it was released, else why not.
+    fn declare_an_effect(
+        t: &TenTurns,
+        node: &Host<TestPool>,
+        v: &mut Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+        call: u64,
+    ) -> Result<(), String> {
+        use taso_field::protocol::{EffectResult, Reply, Request, VERSION};
+        let publisher =
+            crate::pack::PackPublisher::new(t.packs(node), t.coord.clone(), WardenId::new(1));
+        let (mut fx, _) =
+            crate::effects::Effects::open(crate::effects::Mode::Dispatch, Box::new(publisher), v)
+                .unwrap();
+        let mut s = crate::field::Session::new(v, Verdict::Clean)
+            .unwrap()
+            .with_effects(&mut fx);
+        s.handle(Request::Hello { version: VERSION });
+        let request = format!("send {call}").into_bytes();
+        match s.handle(Request::Effect {
+            call,
+            provider: "mail".into(),
+            request: request.clone(),
+            footprint: Vec::new(),
+            retry: taso_core::record::RetryPolicy::ProviderDeduplicated { key: request },
+            consequence: taso_core::record::Consequence::Irreversible,
+            authority: b"user".to_vec(),
+        }) {
+            Reply::Effect {
+                result: EffectResult::Released { .. },
+                ..
+            } => Ok(()),
+            Reply::Effect {
+                result: EffectResult::Refused { reason },
+                ..
+            } => Err(reason),
+            other => Err(format!("{other:?}")),
+        }
+    }
+
+    /// What a run does with a rebuilt Vessel before its agent starts, and
+    /// what the agent is then told and finds: the last sealed turn and
+    /// block 0 (the turn's number).
+    fn told_and_files(
+        node: &Host<TestPool>,
+        t: &TenTurns,
+        v: &mut Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+    ) -> (Option<u64>, u8) {
+        let settled = crate::daemon::settle_at(v, crate::vessel::BIRTH_TURN).unwrap();
+        assert!(!settled.behind(), "the files are the last Seal's");
+        let told = crate::field::Session::new(v, Verdict::Clean)
+            .unwrap()
+            .last_sealed_turn();
+        (told, block0(&node.pool, &t.dataset))
+    }
+
+    /// No layer was received by a rebirth.
+    const NO_LAYER: &dyn Fn(
+        taso_core::envelope::ChronicleId,
+        HashVal,
+    ) -> Result<(), crate::vessel::VesselError> = &|_, _| Ok(());
+
+    /// Case A: the layers lost are of Seals that were never shipped (9 and
+    /// 10); the newest shipped Seal's layer (8) is still on the node.  The
+    /// Warden rebuilds the Vessel at Seal 8 with nothing to receive, and
+    /// the Vessel works again at once.
+    #[test]
+    fn a_node_that_lost_only_unshipped_seal_layers_is_rebuilt_at_the_newest_shipped_seal() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[8]);
+        let s = &t.seals;
+
+        // The look: Seals 9 and 10 are in the log and have no layer.
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert_eq!(
+            behind,
+            crate::rebirth::Behind {
+                no_dataset: false,
+                without_layer: t.seals_of(9..=10),
+            }
+        );
+        assert_eq!(behind.to_string().matches("lsn").count(), 1, "{behind}");
+
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.behind, behind);
+        assert_eq!(
+            r.stood_on,
+            Some(s[8]),
+            "the dataset stood on Seal 8: nothing was received"
+        );
+        assert_eq!(r.reborn.dataset_at, Some(s[8]));
+        assert_eq!(r.reborn.anchor, t.shipped_at_8);
+        let (kept, head) = r.reborn.gap.expect("a gap");
+        assert_eq!(kept, t.shipped_at_8, "kept up to the shipped anchor");
+        assert!(head.lsn >= s[10].lsn, "the lost records keep their place");
+        assert_eq!(r.reborn.missing_layers, vec![]);
+        // The last Seal is the bucket's, and so is what the agent is told
+        // and what its files are.
+        assert_eq!(v.last_seal(), Some(s[8]));
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+
+        // Nothing was deleted: the state directory the Vessel had is
+        // beside the new one, with Seal 10's record in it.
+        assert_eq!(t.kept_aside(&node), vec![r.kept.clone()]);
+        let old = crate::chronicle::read_log(&r.kept).unwrap();
+        assert!(old.iter().any(|f| f.envelope.lsn == s[10].lsn));
+        let new = crate::chronicle::read_log(&node.dir_for(t.id)).unwrap();
+        assert!(!new.iter().any(|f| f.envelope.lsn == s[10].lsn));
+
+        // An effect is released in the very next turn (before the rebuild
+        // it was refused until a later Seal shipped), and the next Seal
+        // ships as a step from Seal 8.
+        declare_an_effect(&t, &node, &mut v, 1).unwrap();
+        let packs = t.packs(&node);
+        write0(&node.pool, v.dataset(), 11);
+        let s11 = seal(&mut v, 11);
+        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
+        v.publish_seal(&packs, &snap, None).unwrap();
+        assert!(t.coord.shipped(t.id).unwrap().lsn >= s11.lsn);
+
+        // At its next start the Vessel is not behind, and nothing is
+        // missing.
+        drop(v);
+        let node = t.node(after_a_crash(&t.pool));
+        assert_eq!(node.behind(t.id).unwrap(), None);
+        let (_, recovery) = node.open(t.id).unwrap();
+        assert_eq!(recovery.missing_layers, vec![]);
+    }
+
+    /// Case B: the layers lost include Seals that were shipped (7 and 8,
+    /// with the unshipped 9 and 10); the newest layer on the node is 6.
+    /// The Warden receives the sections of Seals 7 and 8 onto it.  Before
+    /// the rebuild this Vessel could never ship again.
+    #[test]
+    fn a_node_that_lost_a_shipped_seal_layer_receives_the_sections_after_the_newest_it_has() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[6]);
+        let s = &t.seals;
+
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert_eq!(behind.without_layer, t.seals_of(7..=10));
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.stood_on, Some(s[6]), "sections 7 and 8 were received");
+        assert_eq!(r.reborn.dataset_at, Some(s[8]));
+        assert_eq!(r.reborn.missing_layers, vec![]);
+        assert_eq!(v.last_seal(), Some(s[8]));
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+        for seal in &s[7..=8] {
+            assert!(
+                node.pool.snapshot(v.dataset(), seal.lsn).unwrap().is_some(),
+                "the layer of the Seal at lsn {} is on the node again",
+                seal.lsn.get()
+            );
+        }
+
+        // It ships again: an effect, and the next two Seals.
+        declare_an_effect(&t, &node, &mut v, 1).unwrap();
+        let packs = t.packs(&node);
+        for turn in 11..=12u64 {
+            write0(&node.pool, v.dataset(), turn as u8);
+            let sn = seal(&mut v, turn);
+            let snap = node.pool.snapshot(v.dataset(), sn.lsn).unwrap().unwrap();
+            v.publish_seal(&packs, &snap, None).unwrap();
+            assert!(t.coord.shipped(t.id).unwrap().lsn >= sn.lsn);
+        }
+    }
+
+    /// Case B found one start later, as a node that ran before the
+    /// rebuild existed: Seals 11 and 12 were taken since and have layers,
+    /// so the last Seal has its layer; but the Seal the last shipped
+    /// section ends at (8) has none.  The third sign finds it.
+    #[test]
+    fn a_vessel_whose_last_shipped_seal_has_no_layer_is_behind_though_its_last_seal_has_one() {
+        let t = TenTurns::new();
+        let (node, mut v, _, _) = t.restart_with_block_log_cut_after(6);
+        let s = &t.seals;
+        write0(&node.pool, v.dataset(), 11);
+        let s11 = seal(&mut v, 11);
+        drop(v);
+        let node = t.node(after_a_crash(&t.pool));
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert_eq!(behind.without_layer, vec![s[8]]);
+
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.stood_on, Some(s[6]));
+        assert_eq!(v.last_seal(), Some(s[8]), "Seal 11 was never shipped");
+        assert!(node.pool.snapshot(v.dataset(), s11.lsn).unwrap().is_none());
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+    }
+
+    /// Case C: the dataset is not on the block log at all.  Every section
+    /// is received.
+    #[test]
+    fn a_vessel_whose_dataset_is_gone_is_rebuilt_from_every_section() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[8]);
+        let guid = node.pool.guid(&t.dataset).unwrap().unwrap();
+        assert!(node.pool.destroy(&t.dataset, guid).unwrap());
+        let s = &t.seals;
+
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert!(behind.no_dataset);
+        assert_eq!(behind.without_layer, t.seals_of(0..=10));
+        assert!(
+            behind.to_string().contains("not on the block log"),
+            "{behind}"
+        );
+
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.stood_on, None, "every section was received");
+        let want: Vec<Lsn> = s[..=8].iter().map(|p| p.lsn).collect();
+        assert_eq!(r.reborn.received, want);
+        assert_eq!(v.last_seal(), Some(s[8]));
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+    }
+
+    /// Every Seal layer is lost and the dataset is still there, with no
+    /// layer a section ends at: it is put back on what it was born on,
+    /// and the first section, a full one, is received onto it.
+    #[test]
+    fn a_dataset_that_lost_every_seal_layer_receives_every_section_onto_what_it_was_born_on() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_born);
+        let s = &t.seals;
+        assert!(node.pool.info(&t.dataset).unwrap().is_some());
+
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert!(!behind.no_dataset);
+        assert_eq!(behind.without_layer, t.seals_of(0..=10));
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.stood_on, None);
+        assert_eq!(v.last_seal(), Some(s[8]));
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+    }
+
+    /// V-b (a): a Seal that was never shipped is lost with the rest, even
+    /// when its own layer survived (9 is there, 10 is not).
+    #[test]
+    fn an_unshipped_seal_whose_layer_survived_is_lost_with_the_rest() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[9]);
+        let s = &t.seals;
+        assert!(node.pool.snapshot(&t.dataset, s[9].lsn).unwrap().is_some());
+
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert_eq!(behind.without_layer, vec![s[10]]);
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.stood_on, Some(s[8]));
+        assert_eq!(v.last_seal(), Some(s[8]));
+        assert!(
+            node.pool.snapshot(&t.dataset, s[9].lsn).unwrap().is_none(),
+            "the layer of Seal 9 was taken away"
+        );
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+    }
+
+    /// After a bucket outage a node holds layers of Seals that are in the
+    /// shipped log and have no section of their own (9 and 10: the
+    /// section of 11 covers them).  Such a layer below the one the
+    /// dataset is put back at stays, and a rebirth accepts it (before
+    /// rev. 38 it refused any layer no section ends at).
+    #[test]
+    fn a_layer_the_next_section_covers_is_no_obstacle_to_a_rebuild() {
+        let t = TenTurns::new();
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, _) = node.open(t.id).unwrap();
+        crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+        let packs = t.packs(&node);
+        let mut later = Vec::new();
+        let mut len_after_11 = 0;
+        for turn in 11..=12u64 {
+            write0(&node.pool, v.dataset(), turn as u8);
+            let sn = seal(&mut v, turn);
+            let snap = node.pool.snapshot(v.dataset(), sn.lsn).unwrap().unwrap();
+            v.publish_seal(&packs, &snap, None).unwrap();
+            later.push(sn);
+            if turn == 11 {
+                len_after_11 = log_len(&node.pool);
+            }
+        }
+        drop(v);
+        // The layer of Seal 12 is lost; 9, 10 and 11 are here.
+        let node = t.node_with_block_log_cut_at(len_after_11);
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert_eq!(behind.without_layer, vec![later[1]]);
+
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.stood_on, Some(later[0]), "onto Seal 11's layer");
+        assert_eq!(v.last_seal(), Some(later[1]));
+        assert!(
+            node.pool
+                .snapshot(&t.dataset, t.seals[9].lsn)
+                .unwrap()
+                .is_some(),
+            "the layer of Seal 9 stays"
+        );
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(12), 12));
+    }
+
+    /// R2-a (a): a rebuild cut short after it renamed the state directory
+    /// is finished by the next start, which finds a Vessel it holds with
+    /// no state directory and runs a rebirth.
+    #[test]
+    fn a_rebuild_cut_short_after_the_rename_is_finished_by_the_next_starts_rebirth() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[6]);
+        let s = &t.seals;
+        // As the rebuild leaves it when the Warden dies right after the
+        // rename: the layers of Seals 0 to 6, and no state directory.
+        let dir = node.dir_for(t.id);
+        std::fs::rename(&dir, dir.with_extension("superseded-1")).unwrap();
+
+        assert_eq!(node.behind(t.id).unwrap(), None, "no log here to look at");
+        let (mut v, reborn) = node.rebirth(t.id, &t.packs(&node)).unwrap();
+        assert_eq!(reborn.dataset_at, Some(s[8]));
+        assert_eq!(reborn.missing_layers, vec![]);
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+    }
+
+    /// The same when the Warden died with layers still to take away: a
+    /// rebirth of a Vessel this Warden holds takes them away itself.
+    #[test]
+    fn a_rebirth_of_a_vessel_this_warden_holds_takes_away_the_layers_never_shipped() {
+        let t = TenTurns::new();
+        // Nothing lost; only the state directory is gone (kept aside).
+        let node = t.node(after_a_crash(&t.pool));
+        let dir = node.dir_for(t.id);
+        std::fs::rename(&dir, dir.with_extension("superseded-1")).unwrap();
+        let s = &t.seals;
+
+        let (mut v, reborn) = node.rebirth(t.id, &t.packs(&node)).unwrap();
+        assert_eq!(reborn.dataset_at, Some(s[8]));
+        for seal in &s[9..=10] {
+            assert!(node.pool.snapshot(&t.dataset, seal.lsn).unwrap().is_none());
+        }
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+    }
+
+    /// A Vessel that is not behind is not rebuilt: a healthy one keeps its
+    /// unshipped Seals, and its state directory stays where it is.
+    #[test]
+    fn a_vessel_that_is_not_behind_is_not_rebuilt() {
+        let t = TenTurns::new();
+        let node = t.node(after_a_crash(&t.pool));
+        let s = &t.seals;
+        assert_eq!(node.behind(t.id).unwrap(), None);
+        let e = node
+            .rebuild_here(t.id, &t.packs(&node), NO_LAYER)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("is not behind"), "{e}");
+        assert_eq!(t.kept_aside(&node), Vec::<std::path::PathBuf>::new());
+        let (v, recovery) = node.open(t.id).unwrap();
+        assert_eq!(v.last_seal(), Some(s[10]));
+        assert_eq!(recovery.missing_layers, vec![]);
+    }
+
+    /// Old Seal layers folded away after their sections were shipped are
+    /// no sign of being behind (S-c).
+    #[test]
+    fn folded_seal_layers_are_not_behind() {
+        let t = TenTurns::new();
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, _) = node.open(t.id).unwrap();
+        assert!(v.fold_old_seals(2, 100).unwrap() > 0);
+        drop(v);
+        let node = t.node(after_a_crash(&t.pool));
+        assert!(node
+            .pool
+            .snapshot(&t.dataset, t.seals[1].lsn)
+            .unwrap()
+            .is_none());
+        assert_eq!(node.behind(t.id).unwrap(), None);
+    }
+
+    /// Old layers were folded away, and then the newest Seal's layer is
+    /// lost: the sections of the folded Seals are not received again (a
+    /// rebirth used to try, and failed); the dataset stays on Seal 8.
+    #[test]
+    fn a_rebuild_does_not_receive_the_sections_of_seals_folded_away() {
+        let t = TenTurns::new();
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, _) = node.open(t.id).unwrap();
+        assert!(v.fold_old_seals(2, 100).unwrap() > 0);
+        let folded = log_len(&node.pool);
+        crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+        write0(&node.pool, v.dataset(), 11);
+        let s11 = seal(&mut v, 11);
+        drop(v);
+        let node = t.node_with_block_log_cut_at(folded);
+        let s = &t.seals;
+        assert!(node.pool.snapshot(&t.dataset, s[1].lsn).unwrap().is_none());
+        let behind = node.behind(t.id).unwrap().expect("behind");
+        assert_eq!(behind.without_layer, vec![s11]);
+
+        let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.stood_on, Some(s[8]));
+        assert_eq!(v.last_seal(), Some(s[8]));
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
+    }
+
+    /// Refused, changing nothing: the bucket cannot be read.
+    #[test]
+    fn a_rebuild_whose_bucket_cannot_be_read_changes_nothing() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[6]);
+        let store = t.tmp.path().join("store");
+        std::fs::rename(&store, t.tmp.path().join("store.away")).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        let before = node.pool.layers(&t.dataset).list().unwrap();
+        assert!(node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).is_err());
+        assert!(node.dir_for(t.id).exists(), "the state directory stays");
+        assert_eq!(t.kept_aside(&node), Vec::<std::path::PathBuf>::new());
+        assert_eq!(node.pool.layers(&t.dataset).list().unwrap(), before);
+        assert!(node.behind(t.id).unwrap().is_some(), "still behind");
+    }
+
+    /// Refused, changing nothing: a Seal view in use stands on a layer
+    /// that would go (Seal 9's, never shipped).  The state directory the
+    /// rebuild had renamed is put back.
+    #[test]
+    fn a_rebuild_refused_for_a_seal_view_in_use_changes_nothing() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[9]);
+        let s = &t.seals;
+        let view = node.pool.seal_view(&t.dataset, s[9].lsn).unwrap();
+
+        let before = node.pool.layers(&t.dataset).list().unwrap();
+        let e = node
+            .rebuild_here(t.id, &t.packs(&node), NO_LAYER)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("not taking that layer away"), "{e}");
+        assert!(node.dir_for(t.id).exists(), "the state directory is back");
+        assert_eq!(t.kept_aside(&node), Vec::<std::path::PathBuf>::new());
+        assert_eq!(node.pool.layers(&t.dataset).list().unwrap(), before);
+
+        // With the view released the same call rebuilds it.
+        drop(view);
+        let (v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!((r.stood_on, v.last_seal()), (Some(s[8]), Some(s[8])));
+    }
+
+    /// Refused, changing nothing: nothing of the Vessel was ever shipped.
+    #[test]
+    fn a_vessel_with_nothing_shipped_is_not_rebuilt() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("store")).unwrap();
+        let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
+        let p = pool();
+        let host = |pool: TestPool| Host {
+            coord: coord.clone(),
+            pool,
+            root: ds("tank/vessels"),
+            state_dir: tmp.path().join("node-1"),
+            warden: WardenId::new(1),
+        };
+        let a = host(Clone::clone(&p));
+        let (mut v, _) = a.ensure(Namespace::from_bytes([3; 16]), b"user").unwrap();
+        let id = v.id();
+        let born = log_len(&a.pool);
+        v.seal_birth().unwrap();
+        write0(&a.pool, v.dataset(), 1);
+        seal(&mut v, 1);
+        drop(v);
+        lose_block_log_after(&p, born);
+        let node = host(after_a_crash(&p));
+        assert!(node.behind(id).unwrap().is_some());
+        let packs = crate::pack::Packs::new(
+            crate::ship::LocalStore::new(tmp.path().join("store")),
+            node.pool.sender(),
+            "vessels",
+            id,
+        )
+        .unwrap();
+        assert!(matches!(
+            node.rebuild_here(id, &packs, NO_LAYER),
+            Err(crate::vessel::VesselError::NothingShipped(_))
+        ));
+        assert!(node.dir_for(id).exists());
+    }
+
+    /// A Vessel with no log on this node is not behind: it is a
+    /// rebirth's to start.
+    #[test]
+    fn a_vessel_without_a_log_here_is_not_behind() {
+        let t = TenTurns::new();
+        let node = Host {
+            state_dir: t.tmp.path().join("node-2"),
+            warden: WardenId::new(2),
+            ..t.node(after_a_crash(&t.pool))
+        };
+        assert_eq!(node.behind(t.id).unwrap(), None);
+    }
+
+    /// Case A for a Vessel that holds its effects: an action its agent
+    /// declared in turn 10, which Seal 10 covers.  The layers of Seals 9
+    /// and 10 are lost, so the files of turn 10 are gone; the action is
+    /// not.
+    #[test]
+    fn today_a_held_action_of_a_turn_whose_files_were_lost_stays_held_and_can_be_released() {
+        let t = TenTurns::holding();
+        let op = t.held.unwrap();
+        let (node, mut v, _, settled) = t.restart_with_block_log_cut_after(8);
+        assert_eq!(settled.rolled_back_to, Some(t.seals[8]));
+        assert_eq!(block0(&node.pool, &t.dataset), 8, "the files of turn 8");
+
+        // The ledger at this start withdraws the held actions of a turn
+        // that did not end: those past the log's last Seal.  That is Seal
+        // 10, whose record is here, so the action of turn 10 is not one.
+        let publisher =
+            crate::pack::PackPublisher::new(t.packs(&node), t.coord.clone(), WardenId::new(1));
+        let (mut fx, reconciled) =
+            crate::effects::Effects::open(crate::effects::Mode::Hold, Box::new(publisher), &mut v)
+                .unwrap();
+        assert_eq!(reconciled.withdrawn, vec![]);
+        // A reviewer who lists the Vessel's held actions is shown it, as
+        // one a Seal covers (so one that may be approved).
+        let (held, _) = v.held_proposals().unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(held[0].intent.op == op && held[0].sealed);
+
+        // The next turn's Seal (with the ledger position a session gives
+        // it) ships as a step from Seal 8.
+        write0(&node.pool, v.dataset(), 11);
+        let covered = crate::effects::ledger_pos(&v).unwrap();
+        let s11 = v
+            .seal(StreamCut::EMPTY, Verdict::Clean, covered, TurnId::new(11))
+            .unwrap()
+            .seal;
+        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
+        v.publish_seal(&t.packs(&node), &snap, None).unwrap();
+
+        // The reviewer approves it: it is released, and a sender is shown
+        // it to act on.  Its turn's files are on no node and in no pack.
+        let approved = fx.approve(&mut v, op);
+        assert!(
+            matches!(approved, Ok(crate::effects::Decided::Now)),
+            "{approved:?}"
+        );
+        let listed = fx.released(&v).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].intent.op, op);
+        assert_eq!(listed[0].intent.request, b"send the report of turn 10");
+        assert_eq!(
+            block0(&node.pool, &t.dataset),
+            11,
+            "turn 8's files and turn 11's"
+        );
+    }
+
+    /// A Candidate of `id` nominated at `seal`, as far as an attempt's
+    /// first record needs one (the record is refused before anyone checks
+    /// the Candidate itself).
+    fn a_candidate(
+        id: taso_core::envelope::ChronicleId,
+        seal: Position,
+    ) -> taso_core::contract::Candidate {
+        use taso_core::contract::{
+            candidate_id, facts_hash, Candidate, ClassCounts, Facts, NominatedBy, SealRef,
+            VerifierRequirement, TRANSFORM_VERSION,
+        };
+        let requirement = VerifierRequirement {
+            template: taso_core::envelope::ChronicleId::from_bytes([0x5A; 16]),
+            vconf_key: h(0x5B),
+            version: 1,
+        };
+        let exclude = std::collections::BTreeSet::new();
+        let facts = Facts {
+            input: ClassCounts::default(),
+            excluded: ClassCounts::default(),
+            open_obligations: 0,
+            effects_adopted: 0,
+            ledger_lsn: Lsn::new(0),
+            requirement,
+        };
+        Candidate {
+            candidate_id: candidate_id(
+                id,
+                seal.hash,
+                &exclude,
+                h(0x5C),
+                TRANSFORM_VERSION,
+                &requirement,
+            ),
+            chronicle: id,
+            seal: SealRef {
+                lsn: seal.lsn,
+                hash: seal.hash,
+            },
+            exclude,
+            transform_version: TRANSFORM_VERSION,
+            classmap_key: h(0x5C),
+            input_manifest_key: h(0x5D),
+            output_manifest_key: h(0x5D),
+            artifact_key: h(0x5E),
+            requirement,
+            facts_hash: facts_hash(&facts),
+            facts,
+            nominated_by: NominatedBy::Agent,
+            nominated_at: seal.lsn,
+        }
+    }
+
+    /// Case A again: what a start does before its agent runs.  Closing a
+    /// verification attempt that was open (and starting one) writes a
+    /// record and ships the log up to it, and the log cannot ship past
+    /// Seal 10, which has no layer to publish.  In a run, a failure to
+    /// close an open attempt ends the start (`daemon.rs`, `run_once`), so
+    /// such a Vessel never reaches the turn whose Seal would ship.
+    #[test]
+    fn today_no_attempt_record_can_be_written_while_the_last_seal_has_no_layer() {
+        use crate::attempt::{AttemptError, Attempts};
+        use crate::pack::PackError;
+        use crate::submit::SubmitError;
+        use taso_core::contract::{attempt_id, ContractRecord, VerificationStarted};
+        use taso_core::coordlog::Submitted;
+
+        let t = TenTurns::new();
+        let (node, mut v, _, _) = t.restart_with_block_log_cut_after(8);
+        // The same bucket, as the Warden holds it (shared).
+        let store: crate::ship::SharedStore =
+            Arc::new(crate::ship::LocalStore::new(t.tmp.path().join("store")));
+        let packs = crate::pack::Packs::new(store, node.pool.sender(), "vessels", t.id).unwrap();
+        let at = Attempts {
+            coord: t.coord.clone(),
+            warden: WardenId::new(1),
+            failpoint: crate::attempt::no_failpoints(),
+        };
+        let cand = a_candidate(t.id, t.seals[8]);
+
+        // The attempt's first record: appended, and refused when the log
+        // is shipped up to it.
+        let e = at.start(&mut v, &packs, &cand).unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                AttemptError::Submit(SubmitError::Pack(PackError::SealNotShipped { seal }))
+                    if *seal == t.seals[10].lsn
+            ),
+            "{e:?}"
+        );
+        assert_eq!(t.coord.shipped(t.id).unwrap(), t.shipped_at_8);
+
+        // Only a later Seal's publish lets the log ship again: a record
+        // written after Seal 11 is shipped.
+        write0(&node.pool, v.dataset(), 11);
+        let s11 = seal(&mut v, 11);
+        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
+        v.publish_seal(&packs, &snap, None).unwrap();
+        let started_at = v.tail().lsn;
+        let rec = ContractRecord::VerificationStarted(VerificationStarted {
+            candidate_id: cand.candidate_id,
+            attempt_id: attempt_id(cand.candidate_id, started_at),
+            artifact_key: cand.artifact_key,
+            requirement: cand.requirement,
+            started_at,
+        });
+        v.append_contract(rec.clone()).unwrap();
+        crate::submit::put(
+            &*t.coord,
+            WardenId::new(1),
+            v.chronicle(),
+            &packs,
+            &Submitted::Contract(rec),
+        )
+        .unwrap();
+        assert_eq!(t.coord.shipped(t.id).unwrap().lsn, v.tail().lsn);
+    }
+
+    /// What a gap leaves at the coordinator, today, on any takeover.  The
+    /// Warden records an action's release (the coordinator accepts it and
+    /// counts it as an open obligation) and dies before it ships the log.
+    /// Another node takes the Vessel over: the release is past the shipped
+    /// anchor, so it is lost in the gap, and the reborn Vessel's log does
+    /// not know the action.  The coordinator still counts it.
+    #[test]
+    fn today_an_obligation_lost_in_a_gap_stays_open_at_the_coordinator() {
+        let t = TenTurns::new();
+        // Seals 9 and 10 shipped too: the log is shipped to its tail.
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, _) = node.open(t.id).unwrap();
+        crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+        let packs = t.packs(&node);
+        let snap = node
+            .pool
+            .snapshot(v.dataset(), t.seals[10].lsn)
+            .unwrap()
+            .unwrap();
+        v.publish_seal(&packs, &snap, None).unwrap();
+        let shipped = t.coord.shipped(t.id).unwrap();
+        assert_eq!(shipped.lsn, v.tail().lsn);
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
+
+        // The release is recorded and accepted; the Warden dies before the
+        // ship that would let a sender see it.
+        let (mut ledger, _) = crate::ledger::Ledger::open(
+            Box::new(crate::pack::PackPublisher::new(
+                t.packs(&node),
+                t.coord.clone(),
+                WardenId::new(1),
+            )),
+            &mut v,
+            |l, v, i, s| l.mark_unknown(v, i.op, s),
+        )
+        .unwrap();
+        let released = ledger
+            .release(
+                &mut v,
+                &crate::ledger::Declared {
+                    provider: "mail".into(),
+                    request: b"send".to_vec(),
+                    footprint: Vec::new(),
+                    dispatch: taso_core::record::Dispatch::Immediate,
+                    retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
+                        key: b"k".to_vec(),
+                    },
+                    consequence: taso_core::record::Consequence::Irreversible,
+                    authority: b"user".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            t.coord.obligations(t.id).unwrap(),
+            vec![released.op.get()],
+            "the coordinator counts the release"
+        );
+        assert_eq!(t.coord.shipped(t.id).unwrap(), shipped, "nothing shipped");
+        drop(v);
+
+        // Another node takes the Vessel over, from the bucket.
+        let b = Host {
+            coord: t.coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: t.tmp.path().join("node-2"),
+            warden: WardenId::new(2),
+        };
+        let (mut w, reborn) = b.rebirth(t.id, &t.packs(&b)).unwrap();
+        assert!(reborn.gap.is_some(), "the release is in the gap");
+        // Its ledger knows no such action: nothing to settle, nothing open.
+        let (ledger, reconciled) = crate::ledger::Ledger::open(
+            Box::new(crate::pack::PackPublisher::new(
+                t.packs(&b),
+                t.coord.clone(),
+                WardenId::new(2),
+            )),
+            &mut w,
+            |l, v, i, s| l.mark_unknown(v, i.op, s),
+        )
+        .unwrap();
+        assert_eq!(reconciled, crate::ledger::Reconciled::default());
+        assert!(ledger.authorized());
+        // The coordinator still counts it: a verdict on this Vessel is
+        // refused for an open obligation that no log holds.
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![released.op.get()]);
+    }
 }
