@@ -5138,15 +5138,16 @@ mod tests {
         assert_eq!(t.coord.shipped(t.id).unwrap().lsn, v.tail().lsn);
     }
 
-    /// What a gap leaves at the coordinator, today, on any takeover.  The
-    /// Warden records an action's release (the coordinator accepts it and
-    /// counts it as an open obligation) and dies before it ships the log.
-    /// Another node takes the Vessel over: the release is past the shipped
-    /// anchor, so it is lost in the gap, and the reborn Vessel's log does
-    /// not know the action.  The coordinator still counts it.
-    #[test]
-    fn today_an_obligation_lost_in_a_gap_stays_open_at_the_coordinator() {
-        let t = TenTurns::new();
+    /// A release the coordinator accepted and the Warden never shipped:
+    /// the Vessel of [`TenTurns`], shipped to its tail, then one action
+    /// released.  Returns the Vessel, the ledger and the action's op id.
+    fn released_and_not_shipped(
+        t: &TenTurns,
+    ) -> (
+        Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+        crate::ledger::Ledger,
+        taso_core::record::OpId,
+    ) {
         // Seals 9 and 10 shipped too: the log is shipped to its tail.
         let node = t.node(after_a_crash(&t.pool));
         let (mut v, _) = node.open(t.id).unwrap();
@@ -5162,40 +5163,85 @@ mod tests {
         assert_eq!(shipped.lsn, v.tail().lsn);
         assert!(t.coord.obligations(t.id).unwrap().is_empty());
 
-        // The release is recorded and accepted; the Warden dies before the
-        // ship that would let a sender see it.
-        let (mut ledger, _) = crate::ledger::Ledger::open(
-            Box::new(crate::pack::PackPublisher::new(
-                t.packs(&node),
-                t.coord.clone(),
-                WardenId::new(1),
-            )),
-            &mut v,
-            |l, v, i, s| l.mark_unknown(v, i.op, s),
-        )
-        .unwrap();
-        let released = ledger
-            .release(
-                &mut v,
-                &crate::ledger::Declared {
-                    provider: "mail".into(),
-                    request: b"send".to_vec(),
-                    footprint: Vec::new(),
-                    dispatch: taso_core::record::Dispatch::Immediate,
-                    retry: taso_core::record::RetryPolicy::ProviderDeduplicated {
-                        key: b"k".to_vec(),
-                    },
-                    consequence: taso_core::record::Consequence::Irreversible,
-                    authority: b"user".to_vec(),
-                },
-            )
-            .unwrap();
+        // The release is recorded and accepted; nothing ships it, so no
+        // sender is shown it.
+        let (mut ledger, r) = ledger_of(t, &node, &mut v);
+        assert_eq!(r, crate::ledger::Reconciled::default());
+        let released = ledger.release(&mut v, &a_mail()).unwrap();
         assert_eq!(
             t.coord.obligations(t.id).unwrap(),
             vec![released.op.get()],
             "the coordinator counts the release"
         );
         assert_eq!(t.coord.shipped(t.id).unwrap(), shipped, "nothing shipped");
+        (v, ledger, released.op)
+    }
+
+    fn a_mail() -> crate::ledger::Declared {
+        crate::ledger::Declared {
+            provider: "mail".into(),
+            request: b"send".to_vec(),
+            footprint: Vec::new(),
+            dispatch: taso_core::record::Dispatch::Immediate,
+            retry: taso_core::record::RetryPolicy::ProviderDeduplicated { key: b"k".to_vec() },
+            consequence: taso_core::record::Consequence::Irreversible,
+            authority: b"user".to_vec(),
+        }
+    }
+
+    /// Open the ledger of `v` as the Warden's start does.
+    fn ledger_of(
+        t: &TenTurns,
+        host: &Host<TestPool>,
+        v: &mut Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+    ) -> (crate::ledger::Ledger, crate::ledger::Reconciled) {
+        crate::ledger::Ledger::open(
+            Box::new(crate::pack::PackPublisher::new(
+                t.packs(host),
+                t.coord.clone(),
+                host.warden,
+            )),
+            v,
+            |l, v, i, s| l.mark_unknown(v, i.op, s),
+        )
+        .unwrap()
+    }
+
+    /// The outcomes the log of `v` holds for `op`, oldest first.
+    fn outcomes_of(
+        v: &Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
+        op: taso_core::record::OpId,
+    ) -> Vec<taso_core::record::OutcomeRecord> {
+        v.chronicle()
+            .frames()
+            .unwrap()
+            .iter()
+            .filter(|f| f.envelope.stream == taso_core::envelope::Stream::Effect)
+            .filter_map(
+                |f| match taso_core::record::Payload::decode(&f.payload).unwrap() {
+                    taso_core::record::Payload::Outcome(o) if o.op == op => Some(o),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// D100.  The Warden records an action's release (the coordinator
+    /// accepts it and counts an open obligation) and dies before it ships
+    /// the log.  Another node takes the Vessel over: the release is past
+    /// the shipped anchor, so the gap takes it, and the reborn Vessel's log
+    /// does not know the action.  When that Warden opens the ledger it
+    /// asks the coordinator, finds the obligation its log does not hold,
+    /// and closes it as not applied.  Before this the obligation stayed
+    /// open for ever and no verdict or purge of the Vessel was possible.
+    ///
+    /// The lost action's number is then taken by the next action, which
+    /// is an obligation of its own until it is answered; and a later
+    /// opening closes nothing.
+    #[test]
+    fn an_obligation_lost_in_a_gap_is_closed_when_the_ledger_opens() {
+        let t = TenTurns::new();
+        let (v, _, lost) = released_and_not_shipped(&t);
         drop(v);
 
         // Another node takes the Vessel over, from the bucket.
@@ -5208,21 +5254,132 @@ mod tests {
         };
         let (mut w, reborn) = b.rebirth(t.id, &t.packs(&b)).unwrap();
         assert!(reborn.gap.is_some(), "the release is in the gap");
-        // Its ledger knows no such action: nothing to settle, nothing open.
-        let (ledger, reconciled) = crate::ledger::Ledger::open(
-            Box::new(crate::pack::PackPublisher::new(
-                t.packs(&b),
-                t.coord.clone(),
-                WardenId::new(2),
-            )),
-            &mut w,
-            |l, v, i, s| l.mark_unknown(v, i.op, s),
-        )
-        .unwrap();
+        assert!(
+            outcomes_of(&w, lost).is_empty(),
+            "its log knows no such action"
+        );
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![lost.get()]);
+
+        let (mut ledger, reconciled) = ledger_of(&t, &b, &mut w);
+        assert_eq!(
+            reconciled,
+            crate::ledger::Reconciled {
+                lost: vec![lost],
+                ..Default::default()
+            }
+        );
+        assert!(t.coord.obligations(t.id).unwrap().is_empty(), "closed");
+        assert!(ledger.authorized());
+        let said = outcomes_of(&w, lost);
+        assert_eq!(said.len(), 1);
+        assert_eq!(
+            said[0].state,
+            taso_core::record::OutcomeState::ConfirmedNotApplied
+        );
+        assert_eq!(
+            said[0].evidence.as_deref(),
+            Some(crate::ledger::LOST_IN_GAP.as_bytes())
+        );
+
+        // The next action takes the lost one's number: nobody was ever
+        // shown that number.  It is an obligation like any other.
+        assert_eq!(ledger.next_op(), lost);
+        let again = ledger.release(&mut w, &a_mail()).unwrap();
+        assert_eq!(again.op, lost);
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![lost.get()]);
+
+        // An opening with that action in the log: it is the log's own, so
+        // it is not closed as lost; it stays open, as any released action
+        // without an answer does.
+        let tail = w.tail();
+        let (mut ledger, reconciled) = ledger_of(&t, &b, &mut w);
+        assert_eq!(
+            reconciled,
+            crate::ledger::Reconciled {
+                open: vec![lost],
+                ..Default::default()
+            }
+        );
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![lost.get()]);
+        assert_eq!(
+            outcomes_of(&w, lost).last().unwrap().state,
+            taso_core::record::OutcomeState::OutcomeUnknown
+        );
+        assert_eq!(
+            w.tail().lsn.get(),
+            tail.lsn.get() + 1,
+            "only that one record"
+        );
+
+        // Answered: closed at both, and the next opening writes nothing.
+        ledger
+            .record(
+                &mut w,
+                lost,
+                again.barrier,
+                &crate::ledger::Answer::Applied {
+                    receipt: b"r".to_vec(),
+                },
+            )
+            .unwrap();
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
+        let tail = w.tail();
+        let (mut ledger, reconciled) = ledger_of(&t, &b, &mut w);
         assert_eq!(reconciled, crate::ledger::Reconciled::default());
         assert!(ledger.authorized());
-        // The coordinator still counts it: a verdict on this Vessel is
-        // refused for an open obligation that no log holds.
-        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![released.op.get()]);
+        assert_eq!(w.tail(), tail, "nothing written");
+
+        // A second gap, with an action in the log before the lost one:
+        // the log is shipped with the first action and its answer, a
+        // second action is released and not shipped, and a third Warden
+        // takes the Vessel over.  The first action is the log's; only the
+        // second is closed as lost.
+        ledger.ship_before_send(&mut w, &again).unwrap().unwrap();
+        let second = ledger.release(&mut w, &a_mail()).unwrap().op;
+        assert_eq!(second.get(), lost.get() + 1);
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![second.get()]);
+        drop(w);
+        let c = Host {
+            coord: t.coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: t.tmp.path().join("node-3"),
+            warden: WardenId::new(3),
+        };
+        let (mut x, reborn) = c.rebirth(t.id, &t.packs(&c)).unwrap();
+        assert!(reborn.gap.is_some());
+        let (ledger, reconciled) = ledger_of(&t, &c, &mut x);
+        assert_eq!(
+            reconciled,
+            crate::ledger::Reconciled {
+                lost: vec![second],
+                ..Default::default()
+            }
+        );
+        assert_eq!(ledger.next_op(), second);
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
+        assert_eq!(
+            outcomes_of(&x, lost).last().unwrap().state,
+            taso_core::record::OutcomeState::ConfirmedApplied,
+            "the first action is as it was"
+        );
+    }
+
+    /// D100 on the same node (D99): the Vessel is behind its log, it is
+    /// rebuilt here from the bucket, and the release the rebuild took is
+    /// closed the same way when the ledger opens.
+    #[test]
+    fn an_obligation_lost_in_a_rebuild_here_is_closed_when_the_ledger_opens() {
+        let t = TenTurns::new();
+        let (v, _, lost) = released_and_not_shipped(&t);
+        drop(v);
+        let node = t.node_with_block_log_cut_at(t.len_born);
+        let (mut w, rebuilt) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert!(rebuilt.reborn.gap.is_some());
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![lost.get()]);
+        let (ledger, reconciled) = ledger_of(&t, &node, &mut w);
+        assert_eq!(reconciled.lost, vec![lost]);
+        assert!(ledger.authorized());
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
     }
 }
