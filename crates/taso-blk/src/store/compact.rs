@@ -53,7 +53,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
-    ckpt_path, encode_record, mode_of_log, read_record, remove_if_there, sync_dir,
+    ckpt_path, encode_record, flush_body, mode_of_log, read_record, remove_if_there, sync_dir,
     write_checkpoint, FlushPoint, LogId, Meta, ReadAt, Stats, Store, StoreError, HASH, HEADER_LEN,
     K_BASE, K_DATA, K_FLUSH, MAX_BODY, REC_HEAD,
 };
@@ -105,6 +105,8 @@ pub struct Compaction {
     temp: PathBuf,
     /// The log's identity, for the new log's checkpoint.
     id: LogId,
+    /// The key of the Flush records' check (the header's, derived).
+    flush_mac: [u8; 32],
     /// The old log, read only.
     old: File,
     new: File,
@@ -174,6 +176,7 @@ impl Store {
         Ok(Compaction {
             log: self.path.clone(),
             id: self.header.id,
+            flush_mac: self.flush_mac,
             temp,
             old: self.file.try_clone()?,
             new,
@@ -254,7 +257,7 @@ impl Compaction {
             self.put(K_BASE, piece)?;
         }
         let before = self.prev;
-        self.put(K_FLUSH, &[])?;
+        self.put_flush()?;
         self.write_buf()?;
         self.new.sync_data()?;
         self.base_at = Some(FlushPoint {
@@ -308,6 +311,11 @@ impl Compaction {
             }
             copied += batch.len() as u64;
             for (kind, body) in batch {
+                if kind == K_FLUSH {
+                    // Its body names offsets of the old log.
+                    self.put_flush()?;
+                    continue;
+                }
                 self.put(kind, &body)?;
             }
         }
@@ -385,6 +393,9 @@ impl Compaction {
         // the shared handle points at the new file (the store is flushed,
         // nothing is waiting on the old one).
         store.shared.set(for_syncer);
+        // And what the next Flush record says is durable is the new log,
+        // whole: it was synced above, and nothing was appended since.
+        store.shared.restart(fresh.tail);
         fresh.shared = std::sync::Arc::clone(&store.shared);
         fresh.stats = Stats {
             syncs: store.stats.syncs,
@@ -441,6 +452,14 @@ impl Compaction {
             self.write_buf()?;
         }
         Ok(())
+    }
+
+    /// A Flush record at its place in the new log.  It claims nothing
+    /// durable (0): the old log's offsets mean nothing here, and the new
+    /// log is synced whole before it takes the old one's place.
+    fn put_flush(&mut self) -> io::Result<()> {
+        let at = self.tail + self.buf.len() as u64;
+        self.put(K_FLUSH, &flush_body(&self.flush_mac, at, 0))
     }
 
     fn write_buf(&mut self) -> io::Result<()> {

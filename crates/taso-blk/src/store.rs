@@ -21,8 +21,8 @@
 //! The **log id** is random, made when the log is created, and kept by a
 //! compaction: it says which log this is.  The chain below is seeded from
 //! the whole header, so a record copied from another log does not verify.
-//! The **flush key** is random too (its use: the design note
-//! `claude/Taso_design_blocklog_format_2026-11-25.md`, 3.2).  Flag bit 0:
+//! The **flush key** is random too, for the Flush record's check (below).
+//! Flag bit 0:
 //! the log was written by a compaction.  [`Store::open`] refuses a header
 //! whose checksum fails, a version above its own, a flag it does not know,
 //! and the formats before this one (`TASOBLK1` to `3`: no migration).
@@ -61,6 +61,27 @@
 //! a fresh [`Map`] (same calls, same ids).  It stops at the first record
 //! that is short, has a bad magic or a wrong hash, and cuts the file back
 //! to the end of the **last Flush** it verified: what was durable.
+//!
+//! # The Flush record says what was durable
+//!
+//! ```text
+//!   body (40 bytes): durable end u64 | own offset u64 | check [24]
+//!   check = BLAKE3 keyed from the header's flush key, over the 16 bytes before it
+//! ```
+//!
+//! **Durable end** is the end offset of the newest Flush whose
+//! `fdatasync` had returned when this Flush was appended: what the store
+//! knew to be on the medium.  Never this Flush's own group, whose sync has
+//! not run yet; 0 until the first sync after an open, and in every Flush a
+//! compaction writes (it claims nothing; claiming less is always safe).
+//! The [`Syncer`] and [`Store::flush`] publish the value after each sync.
+//! **Own offset** is where the record starts, and the check is keyed, so
+//! that a Flush can be told from bytes that only look like one without the
+//! chain: a Vessel's agent chooses the bytes of its blocks, which lie in
+//! this file, and must not be able to place a Flush's image in it.  A
+//! Flush whose body does not check out fails the replay.  (What the open
+//! does with the durable ends: design note
+//! `claude/Taso_design_blocklog_format_2026-11-25.md`, 3.3.)
 //!
 //! A record that verifies and has a kind this version does not know was
 //! written by a newer one: the open is refused
@@ -168,6 +189,30 @@ pub const MAX_TAG: usize = 64;
 /// Largest branch name, in bytes.
 pub const MAX_NAME: usize = 255;
 const HEADER_LEN: u64 = 64;
+/// A Flush record's body ([module docs](self)).
+const FLUSH_BODY: usize = 40;
+/// A whole Flush record.
+const FLUSH_LEN: u64 = REC_HEAD + FLUSH_BODY as u64 + HASH as u64;
+
+/// The body of a Flush record at offset `at` of a log whose flush key
+/// (derived, [`Header::flush_mac`]) is `key`, saying that the log was
+/// durable up to `durable`.
+fn flush_body(key: &[u8; 32], at: u64, durable: u64) -> [u8; FLUSH_BODY] {
+    let mut b = [0u8; FLUSH_BODY];
+    b[..8].copy_from_slice(&durable.to_le_bytes());
+    b[8..16].copy_from_slice(&at.to_le_bytes());
+    let check = blake3::keyed_hash(key, &b[..16]);
+    b[16..].copy_from_slice(&check.as_bytes()[..FLUSH_BODY - 16]);
+    b
+}
+
+/// The durable end a Flush record's `body` names, if it is the body of a
+/// Flush at offset `at` of the log with this key: its length, its own
+/// offset and its check.
+fn flush_claim(key: &[u8; 32], body: &[u8], at: u64) -> Option<u64> {
+    let durable = u64::from_le_bytes(body.get(..8)?.try_into().ok()?);
+    (body == flush_body(key, at, durable)).then_some(durable)
+}
 const REC_MAGIC: u32 = 0x5442_4c4b; // "TBLK"
 /// magic + len + kind
 const REC_HEAD: u64 = 4 + 4 + 1;
@@ -402,6 +447,12 @@ impl Header {
         }
     }
 
+    /// The key of the Flush records' check, derived from the header's
+    /// flush key.
+    fn flush_mac(&self) -> [u8; 32] {
+        blake3::derive_key("taso-blk 2026-11-25 flush record check", &self.flush_key)
+    }
+
     fn is_compacted(&self) -> bool {
         self.flags & FLAG_COMPACTED != 0
     }
@@ -489,6 +540,8 @@ pub struct Store {
     path: PathBuf,
     /// The log's header: its identity, its flush key, its flags.
     header: Header,
+    /// [`Header::flush_mac`], derived once.
+    flush_mac: [u8; 32],
     map: Map,
     meta: Meta,
     /// End of the last record: where the next one goes.
@@ -537,10 +590,11 @@ impl Store {
         sync_dir(path)?;
         Ok(Self {
             lock,
-            shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
+            shared: Arc::new(LogFile::new(file.try_clone()?)),
             file,
             path: path.to_path_buf(),
             header: fields,
+            flush_mac: fields.flush_mac(),
             map: Map::new(),
             meta: Meta::default(),
             tail: HEADER_LEN,
@@ -603,7 +657,8 @@ impl Store {
         }
 
         // Start from a checkpoint if one checks out, else from the header.
-        let ck = load_checkpoint(path, &file, len, &fields.id);
+        let flush_mac = fields.flush_mac();
+        let ck = load_checkpoint(path, &file, len, &fields.id, &flush_mac);
         let from = ck.as_ref().map(|c| c.lsn);
         let (mut map, mut meta, start, start_lsn, start_prev, mut garbage) = match ck {
             Some(c) => (c.map, c.meta, c.end, c.lsn, c.prev, c.garbage),
@@ -631,6 +686,7 @@ impl Store {
                 return Err(StoreError::UnknownKind { kind, at: pos });
             }
             lsn += 1;
+            let rec_at = pos;
             let data_at = pos + REC_HEAD;
             pos += REC_HEAD + body.len() as u64 + HASH as u64;
             prev = hash;
@@ -645,10 +701,13 @@ impl Store {
                 base.add(kind, &body, data_at)
                     .map_err(|reason| StoreError::ReplayMeta { lsn, reason })?;
             } else if kind == K_FLUSH {
-                if !body.is_empty() {
-                    return Err(StoreError::Replay {
+                // The chain verified it, so the store wrote it: a body
+                // that does not check out is the writer's fault, not a
+                // torn end.
+                if flush_claim(&flush_mac, &body, rec_at).is_none() {
+                    return Err(StoreError::ReplayMeta {
                         lsn,
-                        error: MapError::Overflow,
+                        reason: "a Flush record whose body does not check out",
                     });
                 }
                 if !base.is_empty() {
@@ -685,10 +744,11 @@ impl Store {
         };
         let store = Self {
             lock,
-            shared: Arc::new(LogFile(RwLock::new(file.try_clone()?))),
+            shared: Arc::new(LogFile::new(file.try_clone()?)),
             file,
             path: path.to_path_buf(),
             header: fields,
+            flush_mac,
             map,
             meta,
             tail: end,
@@ -867,6 +927,7 @@ impl Store {
         self.stats.syncs += 1;
         self.stats.sync_us += us;
         self.stats.sync_max_us = self.stats.sync_max_us.max(us);
+        self.shared.synced(lsn);
         Ok(lsn)
     }
 
@@ -875,7 +936,10 @@ impl Store {
     /// the store's lock.  Nothing is durable until that returns.
     pub fn flush_pending(&mut self) -> Result<u64, StoreError> {
         self.check()?;
-        self.append(K_FLUSH, &[])?;
+        // What was durable before this Flush: never its own group.
+        let body = flush_body(&self.flush_mac, self.tail, self.shared.durable_end());
+        self.append(K_FLUSH, &body)?;
+        self.shared.ended(self.lsn, self.tail);
         // This Flush closes a group over every branch touched since the
         // last one: the first group each of them is in.
         for b in self.touched.drain() {
@@ -1875,7 +1939,13 @@ struct Checkpoint {
 /// on disk with the chain hash it names.  Any doubt: `None` (a full
 /// replay).  A checkpoint of another log is not this log's: its id says so
 /// before its offsets are looked at.
-fn load_checkpoint(path: &Path, file: &File, len: u64, id: &LogId) -> Option<Checkpoint> {
+fn load_checkpoint(
+    path: &Path,
+    file: &File,
+    len: u64,
+    id: &LogId,
+    flush_mac: &[u8; 32],
+) -> Option<Checkpoint> {
     let b = std::fs::read(ckpt_path(path)).ok()?;
     let (body, sum) = b.split_at(b.len().checked_sub(HASH)?);
     if blake3::hash(body).as_bytes() != sum || !body.starts_with(CKPT_MAGIC) {
@@ -1897,16 +1967,19 @@ fn load_checkpoint(path: &Path, file: &File, len: u64, id: &LogId) -> Option<Che
     r = &r[2 * HASH..];
     // The Flush record that ends at `end`: exactly where the checkpoint
     // says, with the chain hash it names.
-    let flush_len = REC_HEAD + HASH as u64;
-    if end > len || end < HEADER_LEN + flush_len || chain(&before, K_FLUSH, &[]) != prev {
+    let flush_len = FLUSH_LEN;
+    if end > len || end < HEADER_LEN + flush_len {
         return None;
     }
     let mut rec = vec![0u8; flush_len as usize];
     file.read_exact_at(&mut rec, end - flush_len).ok()?;
+    let body = &rec[REC_HEAD as usize..REC_HEAD as usize + FLUSH_BODY];
     let ok = u32::from_le_bytes(rec[0..4].try_into().unwrap()) == REC_MAGIC
-        && u32::from_le_bytes(rec[4..8].try_into().unwrap()) == 0
+        && u32::from_le_bytes(rec[4..8].try_into().unwrap()) == FLUSH_BODY as u32
         && rec[8] == K_FLUSH
-        && rec[REC_HEAD as usize..] == prev;
+        && flush_claim(flush_mac, body, end - flush_len).is_some()
+        && chain(&before, K_FLUSH, body) == prev
+        && rec[REC_HEAD as usize + FLUSH_BODY..] == prev;
     if !ok {
         return None;
     }
@@ -2089,15 +2162,75 @@ struct SyncState {
 
 /// The log's file as the [`Syncer`] sees it: swapped by a compaction's
 /// switch (the store is held then, and flushed).
-pub struct LogFile(RwLock<File>);
+pub struct LogFile {
+    file: RwLock<File>,
+    durable: std::sync::Mutex<DurableEnd>,
+}
+
+/// What a Flush record says of the log ([module docs](self)): how far it
+/// is known durable, and the Flush records whose sync has not returned.
+#[derive(Default)]
+struct DurableEnd {
+    /// The end offset of the newest Flush a returned `fdatasync` covered.
+    /// 0 after an open: this store has synced nothing yet.
+    end: u64,
+    /// The Flush records appended since: (sequence number, end offset),
+    /// oldest first.
+    waiting: std::collections::VecDeque<(u64, u64)>,
+}
 
 impl LogFile {
+    fn new(file: File) -> Self {
+        Self {
+            file: RwLock::new(file),
+            durable: std::sync::Mutex::default(),
+        }
+    }
+
     fn get(&self) -> std::sync::RwLockReadGuard<'_, File> {
-        self.0.read().unwrap_or_else(PoisonError::into_inner)
+        self.file.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn set(&self, file: File) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = file;
+        *self.file.write().unwrap_or_else(PoisonError::into_inner) = file;
+    }
+
+    fn durable_end(&self) -> u64 {
+        self.durable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .end
+    }
+
+    /// A Flush record with sequence number `lsn` was appended and ends at
+    /// `end`.  (Under the store's lock: in order.)
+    fn ended(&self, lsn: u64, end: u64) {
+        self.durable
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiting
+            .push_back((lsn, end));
+    }
+
+    /// An `fdatasync` that began after everything up to `upto` was
+    /// appended has returned.
+    fn synced(&self, upto: u64) {
+        let mut d = self.durable.lock().unwrap_or_else(PoisonError::into_inner);
+        while let Some(&(lsn, end)) = d.waiting.front() {
+            if lsn > upto {
+                break;
+            }
+            d.end = d.end.max(end);
+            d.waiting.pop_front();
+        }
+    }
+
+    /// A compaction's switch: the file is another, synced whole, `end`
+    /// bytes long.  The old file's offsets mean nothing in it.
+    fn restart(&self, end: u64) {
+        let mut d = self.durable.lock().unwrap_or_else(PoisonError::into_inner);
+        d.end = end;
+        d.waiting.clear();
     }
 }
 
@@ -2132,6 +2265,9 @@ impl Syncer {
             match r {
                 Ok(()) => {
                     st.durable = st.durable.max(upto);
+                    // For the next Flush record to say: the end of the
+                    // newest Flush this sync covered.
+                    self.file.synced(upto);
                     st.syncs += 1;
                     st.sync_us += us;
                     st.sync_max_us = st.sync_max_us.max(us);
@@ -2646,7 +2782,7 @@ mod tests {
         let mut s = Store::create(&path).unwrap();
         s.root_seal().unwrap();
         s.append(K_FORK, &99u64.to_le_bytes()).unwrap();
-        s.append(K_FLUSH, &[]).unwrap();
+        s.flush_pending().unwrap();
         drop(s);
         assert!(matches!(
             Store::open(&path),
@@ -3406,6 +3542,110 @@ mod tests {
         assert_eq!(s.map().unwrap().log_locs().len(), 2);
     }
 
+    /// The durable end named by the Flush record that ends at `end`.
+    fn claim_at(s: &Store, end: u64) -> u64 {
+        let at = end - FLUSH_LEN;
+        let mut rec = vec![0u8; FLUSH_LEN as usize];
+        s.file.read_exact_at(&mut rec, at).unwrap();
+        assert_eq!(rec[8], K_FLUSH, "a Flush record ends at {end}");
+        let body = &rec[REC_HEAD as usize..REC_HEAD as usize + FLUSH_BODY];
+        flush_claim(&s.flush_mac, body, at).expect("its body checks out")
+    }
+
+    #[test]
+    fn a_flush_record_names_what_was_durable_before_it_never_its_own_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        // A new log has synced nothing: its first Flush claims nothing.
+        let root = s.root_seal().unwrap();
+        let e0 = s.stats().log_bytes;
+        assert_eq!(claim_at(&s, e0), 0);
+        // `flush` synced that group, so the next Flush names its end.
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        s.flush().unwrap();
+        let e1 = s.stats().log_bytes;
+        assert_eq!(claim_at(&s, e1), e0);
+        // Two groups ended and not synced: neither is named, by either.
+        let syncer = s.syncer().unwrap();
+        s.write(b, 1, &blocks(2, 1), false).unwrap();
+        let l2 = s.flush_pending().unwrap();
+        let e2 = s.stats().log_bytes;
+        s.write(b, 2, &blocks(3, 1), false).unwrap();
+        let l3 = s.flush_pending().unwrap();
+        let e3 = s.stats().log_bytes;
+        assert_eq!((claim_at(&s, e2), claim_at(&s, e3)), (e1, e1));
+        // The Syncer's sync for the first of them returns: the next Flush
+        // names that one's end, not the second's.
+        assert!(syncer.durable(l2).unwrap());
+        s.write(b, 3, &blocks(4, 1), false).unwrap();
+        let l4 = s.flush_pending().unwrap();
+        let e4 = s.stats().log_bytes;
+        assert_eq!(claim_at(&s, e4), e2);
+        // A sync for the newest covers the one between as well.
+        assert!(l3 < l4);
+        syncer.durable(l4).unwrap();
+        s.flush_pending().unwrap();
+        assert_eq!(claim_at(&s, s.stats().log_bytes), e4);
+        // Opened again, the store has synced nothing itself: 0 again.
+        drop(s);
+        let (mut s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.cut, 0);
+        s.flush_pending().unwrap();
+        assert_eq!(claim_at(&s, s.stats().log_bytes), 0);
+    }
+
+    #[test]
+    fn a_flush_record_whose_body_does_not_check_out_fails_the_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        // Its own offset wrong, another log's key, and the empty body of
+        // the formats before this one.
+        for case in 0..3 {
+            let path = dir.path().join(format!("log{case}"));
+            let mut s = Store::create(&path).unwrap();
+            s.root_seal().unwrap();
+            let at = s.stats().log_bytes;
+            let body = match case {
+                0 => flush_body(&s.flush_mac, at + 1, 0).to_vec(),
+                1 => flush_body(&[7; 32], at, 0).to_vec(),
+                _ => Vec::new(),
+            };
+            s.append(K_FLUSH, &body).unwrap();
+            drop(s);
+            assert!(
+                matches!(
+                    Store::open(&path),
+                    Err(StoreError::ReplayMeta {
+                        reason: "a Flush record whose body does not check out",
+                        ..
+                    })
+                ),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_compaction_gives_every_flush_its_place_in_the_new_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let b = two_groups(&path);
+        let (mut s, _) = Store::open(&path).unwrap();
+        compact(&mut s);
+        // What the next Flush says is durable is the new log, whole.
+        let whole_log = s.stats().log_bytes;
+        s.write(b, 2, &blocks(3, 1), false).unwrap();
+        s.flush_pending().unwrap();
+        assert_eq!(claim_at(&s, s.stats().log_bytes), whole_log);
+        drop(s);
+        // Without its checkpoint the new log is replayed from its header,
+        // which checks every Flush's body at its offset.
+        std::fs::remove_file(ckpt_path(&path)).unwrap();
+        let (_, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.checkpoint, rec.cut), (None, 0));
+    }
+
     #[test]
     fn a_log_in_the_spike_format_is_refused_by_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -3438,7 +3678,7 @@ mod tests {
         let mut body = b.get().to_le_bytes().to_vec();
         body.extend_from_slice(b"x"); // a second branch with the same name
         s.append(K_NAME, &body).unwrap();
-        s.append(K_FLUSH, &[]).unwrap();
+        s.flush_pending().unwrap();
         drop(s);
         assert!(matches!(
             Store::open(&path),
@@ -3861,7 +4101,7 @@ mod tests {
         );
         assert_eq!(
             done.before,
-            before.log_bytes + 2 * (REC_HEAD + HASH as u64),
+            before.log_bytes + 2 * FLUSH_LEN,
             "the old log and the two flushes of the compaction"
         );
         assert_eq!(done.after, s.stats().log_bytes);
