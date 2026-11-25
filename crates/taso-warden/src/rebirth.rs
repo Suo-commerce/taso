@@ -45,16 +45,40 @@
 //! dataset or state directory that is *not* this chain's rebirth in
 //! progress is refused, never overwritten.
 //!
-//! Normative references: v1.0 §1 (P2); v0.4 §8.2–8.5.
+//! # On the same node (P4 spec rev. 38, D99)
+//!
+//! A Vessel whose files on this node are behind its log is rebuilt here
+//! the same way.  [`Host::behind`] looks, and changes nothing: the
+//! dataset is not on the block log, or the last Seal record of the local
+//! log has no layer, or the Seal the last shipped `fs` section ends at
+//! has none.  [`Host::rebuild_here`] then verifies as above, takes a new
+//! epoch, renames the state directory to a name beside it (kept until an
+//! operator removes it), puts the dataset back at the newest Seal layer
+//! it has that a section in the store ends at ([`Pool::back_to`]),
+//! receives the sections after that layer, restores the log and opens
+//! after the gap.  What is lost is what a takeover loses: everything
+//! after the shipped anchor.
+//!
+//! A rebirth of a Vessel this Warden already holds puts the dataset back
+//! the same way when it is on the node, so a rebuild cut short after the
+//! rename is finished by the next start (R2-a (a)).  A takeover from
+//! another Warden still refuses local state that is not this chain's.
+//!
+//! Normative references: v1.0 §1 (P2); v0.4 §8.2–8.5; P4 spec rev. 38
+//! §0.3, §0.4 (D99).
 
+use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
-use taso_core::envelope::{ChronicleId, Epoch, HashVal, Lsn};
+use taso_core::contract::{ContractRecord, LogicalKey};
+use taso_core::coordlog::Submitted;
+use taso_core::envelope::{ChronicleId, Epoch, HashVal, Lsn, Stream};
 use taso_core::record::{LineageRecord, Origin, ParentSeal, Payload};
 
-use crate::chronicle::{restore_log, Chronicle, ChronicleError, Claim, Layers};
+use crate::chronicle::{read_log, restore_log, Chronicle, ChronicleError, Claim, Layers};
 use crate::pack::{Chain, FsBase, Packs};
-use crate::segment::Position;
+use crate::segment::{Frame, Position};
 use crate::ship::{ObjectStore, Sender};
 use crate::storage::CloneBase;
 use crate::vessel::{Host, Pool, Vessel, VesselError};
@@ -102,7 +126,220 @@ impl fmt::Display for Reborn {
     }
 }
 
+/// What the Warden saw of a Vessel whose files on this node are behind
+/// its log (P4 spec rev. 38, D99): [`Host::behind`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Behind {
+    /// The Vessel's dataset is not on the block log.
+    pub no_dataset: bool,
+    /// The Seals of the local log that have no layer and that no newer
+    /// layer stands for, oldest first: those newer than the newest Seal
+    /// with a layer (every one, without a dataset), and the Seal the last
+    /// shipped `fs` section ends at.  A Seal older than one with a layer
+    /// was folded away after its section was shipped, and is not here.
+    pub without_layer: Vec<Position>,
+}
+
+impl fmt::Display for Behind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.no_dataset {
+            write!(f, "its dataset is not on the block log")?;
+        } else {
+            write!(f, "no layer for")?;
+        }
+        if !self.without_layer.is_empty() {
+            if self.no_dataset {
+                write!(f, "; no layer for")?;
+            }
+            let lsns: Vec<String> = self
+                .without_layer
+                .iter()
+                .map(|p| p.lsn.get().to_string())
+                .collect();
+            write!(
+                f,
+                " the Seal{} at lsn {}",
+                if lsns.len() == 1 { "" } else { "s" },
+                lsns.join(", ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// What [`Host::rebuild_here`] found and did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rebuilt {
+    /// What was behind.
+    pub behind: Behind,
+    /// The rebirth: the epoch, the anchor, the Gap, the sections.
+    pub reborn: Reborn,
+    /// The Seal layer the dataset was put back at, onto which the
+    /// sections after it were received; `None` if it had none a section
+    /// ends at, or was not on the node (every section was received).
+    pub stood_on: Option<Position>,
+    /// Where the state directory the Vessel had is kept.  The Warden
+    /// never deletes it.
+    pub kept: PathBuf,
+}
+
+/// What the dataset step of a rebirth did beside receiving.
+struct Placed {
+    stood_on: Option<Position>,
+    kept: Option<PathBuf>,
+}
+
+/// The position of `f` if it is a Seal record.
+fn seal_at(f: &Frame) -> Option<Position> {
+    (f.envelope.stream == Stream::Ctl
+        && matches!(Payload::decode(&f.payload), Ok(Payload::Seal(_))))
+    .then_some(Position {
+        lsn: f.envelope.lsn,
+        hash: f.envelope.hash,
+    })
+}
+
 impl<P: Pool> Host<P> {
+    /// Whether the Vessel `id`'s files on this node are behind its log
+    /// (D99), from what the Warden sees for itself: the local log, read
+    /// without claiming it, and the dataset's Seal layers.  Changes
+    /// nothing.  `None`: not behind, as far as this look can tell; also
+    /// for a Vessel with no log on this node (a rebirth's to start), one
+    /// whose birth is not finished, and one whose purge is committed (its
+    /// dataset is taken away on purpose, and its log stays).
+    pub fn behind(&self, id: ChronicleId) -> Result<Option<Behind>, VesselError> {
+        let dir = self.dir_for(id);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let frames = read_log(&dir)?;
+        // The Seals the log knows, oldest first, and the Seal the newest
+        // FsShipped record names.  A Checkpoint stands for the records
+        // before it, which may be pruned ([`Packs`]' `named_upto`).
+        let mut seals: Vec<Position> = Vec::new();
+        let mut end: Option<Position> = None;
+        for f in &frames {
+            if f.envelope.stream != Stream::Ctl {
+                continue;
+            }
+            match Payload::decode(&f.payload) {
+                Ok(Payload::Seal(_)) => seals.push(Position {
+                    lsn: f.envelope.lsn,
+                    hash: f.envelope.hash,
+                }),
+                Ok(Payload::FsShipped(r)) => {
+                    end = Some(Position {
+                        lsn: r.seal,
+                        hash: r.seal_hash,
+                    })
+                }
+                Ok(Payload::Checkpoint(c)) => {
+                    if let (true, Some(s)) = (seals.is_empty(), c.seal) {
+                        seals.push(Position {
+                            lsn: s.lsn,
+                            hash: s.hash,
+                        });
+                    }
+                    if let (None, Some(r)) = (end, c.fs_shipped) {
+                        end = Some(Position {
+                            lsn: r.seal,
+                            hash: r.seal_hash,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if frames.is_empty() || seals.is_empty() {
+            // No log yet, or no Seal taken: nothing to be behind of (an
+            // unfinished birth is the open's to finish or refuse).
+            return Ok(None);
+        }
+        let dataset = self.dataset_for(id);
+        let no_dataset = self
+            .pool
+            .info(&dataset)
+            .map_err(VesselError::Pool)?
+            .is_none();
+        let here = self.seals_here(&dataset)?;
+        let has = |p: &Position| here.contains(&(p.lsn, p.hash));
+        let newest = seals.iter().rev().find(|p| has(p)).map(|p| p.lsn);
+        let mut without: Vec<Position> = seals
+            .iter()
+            .filter(|p| !has(p) && newest.is_none_or(|n| p.lsn > n))
+            .copied()
+            .collect();
+        if let Some(e) = end {
+            if !has(&e) && !without.contains(&e) {
+                without.push(e);
+                without.sort_by_key(|p| p.lsn);
+            }
+        }
+        if !no_dataset && without.is_empty() {
+            return Ok(None);
+        }
+        // A purged Vessel's dataset is gone on purpose (§6.7, D81).
+        let purge = taso_core::contract::logical_id(&LogicalKey::Purge(id));
+        if let Some((_, Submitted::Contract(ContractRecord::PurgeCommitted(_)))) = self
+            .coord
+            .query_logical(purge)
+            .map_err(VesselError::Coord)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(Behind {
+            no_dataset,
+            without_layer: without,
+        }))
+    }
+
+    /// Rebuild the Vessel `id`, which this Warden holds and whose files
+    /// here are behind its log ([`Host::behind`]), on this node from what
+    /// `packs` holds up to the shipped anchor, as another node would on a
+    /// takeover (D99; the module docs).  `layer` as in
+    /// [`Host::rebirth_with`].
+    ///
+    /// Refused, changing nothing: a Vessel that is not behind; one with
+    /// nothing shipped; a store that cannot be read or does not verify; a
+    /// layer at a shipped Seal's position that is bound to another
+    /// record; a fork or a Seal view in use on a layer that would go; a
+    /// dataset that cannot be unmounted.  Refused after the rebuild if a
+    /// Seal of the restored log still has no layer (C-a: one way to
+    /// recover, and no second try).
+    pub fn rebuild_here<S: ObjectStore, X: Sender>(
+        &self,
+        id: ChronicleId,
+        packs: &Packs<S, X>,
+        layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
+    ) -> Result<(Vessel<P::Layers>, Rebuilt), VesselError> {
+        let Some(behind) = self.behind(id)? else {
+            return Err(VesselError::LocalState(format!(
+                "{} is not behind its log on this node; not rebuilt",
+                self.dataset_for(id)
+            )));
+        };
+        let (vessel, reborn, placed) = self.rebirth_inner(id, packs, Claim::Mine, layer, true)?;
+        if let Some(still) = reborn.missing_layers.first() {
+            return Err(VesselError::LocalState(format!(
+                "{} is still behind after its rebuild: the Seal at lsn {} has no layer",
+                self.dataset_for(id),
+                still.lsn.get()
+            )));
+        }
+        let kept = placed.kept.ok_or_else(|| {
+            VesselError::LocalState("a rebuild found no state directory to keep".into())
+        })?;
+        Ok((
+            vessel,
+            Rebuilt {
+                behind,
+                reborn,
+                stood_on: placed.stood_on,
+                kept,
+            },
+        ))
+    }
+
     /// Continue the Vessel `id` on this node from what `packs` holds up to
     /// the coordinator's shipped anchor (see the module docs), taking it
     /// over from whoever holds it as read now.  A caller that decided from
@@ -151,12 +388,37 @@ impl<P: Pool> Host<P> {
         claim: Claim,
         layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
     ) -> Result<(Vessel<P::Layers>, Reborn), VesselError> {
+        self.rebirth_inner(id, packs, claim, layer, false)
+            .map(|(v, r, _)| (v, r))
+    }
+
+    /// [`Host::rebirth_with`]; with `rebuild`, the state directory the
+    /// Vessel has is first kept aside ([`Host::rebuild_here`]).
+    fn rebirth_inner<S: ObjectStore, X: Sender>(
+        &self,
+        id: ChronicleId,
+        packs: &Packs<S, X>,
+        claim: Claim,
+        layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
+        rebuild: bool,
+    ) -> Result<(Vessel<P::Layers>, Reborn, Placed), VesselError> {
+        // This Warden already holds the Vessel: its own dataset, if it is
+        // on the node, is put back before anything is received (R2-a (a)).
+        let mine = claim == Claim::Mine;
         // 1. Verify before fencing (fencing review F5): what was shipped
         //    and anchored, the chain, the lineage, this node's state and
         //    the parents it needs.  A rebirth that cannot succeed then
         //    fences nobody and the Vessel keeps running where it is.
         let dataset = self.dataset_for(id);
-        let (anchor, chain, lineage) = self.verify(id, packs, &dataset, layer)?;
+        let dir = self.dir_for(id);
+        let aside = dir.with_extension(format!("superseded-{}", std::process::id()));
+        if rebuild && aside.exists() {
+            return Err(VesselError::LocalState(format!(
+                "{} is in the way of keeping the state directory aside",
+                aside.display()
+            )));
+        }
+        let (anchor, chain, lineage) = self.verify(id, packs, &dataset, layer, mine)?;
 
         // 2. Fence, on the claim: from here on the anchor cannot move
         //    under us, and a stale decision changes nothing.
@@ -174,17 +436,58 @@ impl<P: Pool> Host<P> {
         let (anchor, chain, lineage) = if anchored_now == anchor {
             (anchor, chain, lineage)
         } else {
-            self.verify(id, packs, &dataset, layer)?
+            self.verify(id, packs, &dataset, layer, mine)?
         };
 
-        // 4. The dataset.
+        // 4. A rebuild keeps the state directory the Vessel had, beside
+        //    it (D99: nothing is deleted).  From here a stop is finished
+        //    by the next start's rebirth: no state directory, a Vessel
+        //    this Warden holds.
+        let mut kept = None;
+        if rebuild && dir.exists() {
+            std::fs::rename(&dir, &aside).map_err(|e| {
+                VesselError::LocalState(format!(
+                    "keeping {} aside as {}: {e}",
+                    dir.display(),
+                    aside.display()
+                ))
+            })?;
+            kept = Some(aside);
+        }
+
+        // 5. The dataset.  This Warden's own, if it is here, is first put
+        //    back at the newest Seal layer it has that a section ends at:
+        //    out of use, every newer layer taken away, what was written
+        //    after it discarded.
+        let ends: Vec<(Lsn, HashVal)> = chain
+            .seals
+            .iter()
+            .map(|s| (s.fs.to.lsn, s.fs.to.hash))
+            .collect();
+        if mine
+            && self
+                .pool
+                .info(&dataset)
+                .map_err(VesselError::Pool)?
+                .is_some()
+        {
+            self.pool
+                .back_to(&dataset, &ends)
+                .map_err(VesselError::Pool)?;
+        }
+        // The sections at or below the newest section end on the node
+        // are not received: that layer holds them (an interrupted
+        // rebirth received them, or the layers below it were folded
+        // away after their sections were shipped).
         let here = self.seals_here(&dataset)?;
+        let stands = ends.iter().rposition(|e| here.contains(e));
+        let stood_on = stands.map(|i| chain.seals[i].fs.to);
         let mut received = Vec::new();
-        for s in &chain.seals {
+        for (i, s) in chain.seals.iter().enumerate() {
             let to = (s.fs.to.lsn, s.fs.to.hash);
             received.push(to.0);
-            if here.contains(&to) {
-                continue; // received by an interrupted rebirth
+            if stands.is_some_and(|at| i <= at) {
+                continue;
             }
             let mut stream = packs
                 .open_fs(s)
@@ -225,14 +528,13 @@ impl<P: Pool> Host<P> {
             self.as_born(&lineage, &dataset)?;
         }
 
-        // 5. The log, unless an interrupted rebirth already restored it
+        // 6. The log, unless an interrupted rebirth already restored it
         //    (the open below checks that it ends at the anchor).
-        let dir = self.dir_for(id);
         if !dir.exists() {
             restore_log(&dir, id, &chain.frames).map_err(VesselError::Chronicle)?;
         }
 
-        // 6. Open: a new epoch, the Gap, every check of an ordinary open.
+        // 7. Open: a new epoch, the Gap, every check of an ordinary open.
         let (vessel, recovery) = self.open_after_gap(id).map_err(|e| match e {
             VesselError::Chronicle(ChronicleError::SegmentsDisagree { at, why }) => VesselError::LocalState(format!(
                 "the state directory {} does not end at the shipped anchor (lsn {}; at lsn {}: {why})",
@@ -250,20 +552,28 @@ impl<P: Pool> Host<P> {
             dataset_at: chain.seals.last().map(|s| s.fs.to),
             missing_layers: recovery.missing_layers,
         };
-        Ok((vessel, reborn))
+        Ok((vessel, reborn, Placed { stood_on, kept }))
     }
 
     /// Everything a rebirth reads and checks before it changes anything:
     /// the shipped anchor (something must be shipped), the chain up to it
-    /// (verified pack by pack), its Lineage record, that this node holds
-    /// no Seal of the dataset the chain does not name, and that every
-    /// parent a received clone or a void-less birth needs is here.
+    /// (verified pack by pack), its Lineage record, this node's Seal
+    /// layers of the dataset, and that every parent a received clone or
+    /// a void-less birth needs is here.
+    ///
+    /// A Seal layer on this node must be the layer of a Seal record in
+    /// the shipped log, at its lsn with its hash (rev. 38: a section need
+    /// not end at it; after a store outage the next section covers it).
+    /// One past the shipped anchor is in the way of a takeover; of a
+    /// Vessel this Warden holds (`mine`) it is a Seal that was never
+    /// shipped, which the dataset step takes away ([`Pool::back_to`]).
     fn verify<S: ObjectStore, X: Sender>(
         &self,
         id: ChronicleId,
         packs: &Packs<S, X>,
         dataset: &crate::storage::Dataset,
         layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
+        mine: bool,
     ) -> Result<(Position, Chain, LineageRecord), VesselError> {
         let anchor = self.coord.shipped(id).map_err(VesselError::Coord)?;
         if anchor.lsn == Lsn::new(0) {
@@ -279,16 +589,31 @@ impl<P: Pool> Host<P> {
             }
         };
         let here = self.seals_here(dataset)?;
-        let named: Vec<(Lsn, taso_core::envelope::HashVal)> = chain
-            .seals
-            .iter()
-            .map(|s| (s.fs.to.lsn, s.fs.to.hash))
-            .collect();
-        if let Some(stray) = here.iter().find(|s| !named.contains(s)) {
-            return Err(VesselError::LocalState(format!(
-                "{dataset} has Seal {} that the shipped chain does not name",
-                stray.0.get()
-            )));
+        if !here.is_empty() {
+            let shipped: HashMap<Lsn, HashVal> = chain
+                .frames
+                .iter()
+                .filter_map(seal_at)
+                .map(|p| (p.lsn, p.hash))
+                .collect();
+            for (lsn, hash) in &here {
+                match shipped.get(lsn) {
+                    Some(h) if h == hash => {}
+                    Some(_) => {
+                        return Err(VesselError::LocalState(format!(
+                            "{dataset} has a layer at Seal {} that is bound to another record",
+                            lsn.get()
+                        )))
+                    }
+                    None if mine && *lsn > anchor.lsn => {}
+                    None => {
+                        return Err(VesselError::LocalState(format!(
+                            "{dataset} has Seal {} that the shipped log does not hold",
+                            lsn.get()
+                        )))
+                    }
+                }
+            }
         }
         // A Template-born Vessel: its layer first, received and checked
         // here (§5.6), whatever else it needs.
