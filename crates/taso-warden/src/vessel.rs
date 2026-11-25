@@ -2415,6 +2415,26 @@ pub(crate) mod tests {
         fn seal_view(&self, _: &Dataset, _: Lsn) -> Result<SealView, LayerError> {
             Err("the fake pool holds no files".into())
         }
+        /// As the block log does it, on the fake's snapshots: the newest
+        /// one that is one of `ends` stays, the newer ones go.
+        fn back_to(
+            &self,
+            dataset: &Dataset,
+            ends: &[(Lsn, HashVal)],
+        ) -> Result<Option<(Lsn, HashVal)>, LayerError> {
+            let mut all = self.0.borrow_mut();
+            let d = all
+                .get_mut(dataset.as_str())
+                .ok_or_else(|| format!("no dataset {dataset}"))?;
+            let stays = d
+                .snaps
+                .iter()
+                .rev()
+                .find(|(l, h)| ends.contains(&(**l, **h)))
+                .map(|(l, h)| (*l, *h));
+            d.snaps.retain(|l, _| stays.is_some_and(|(s, _)| *l <= s));
+            Ok(stays)
+        }
         fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
             Ok(self
                 .0
