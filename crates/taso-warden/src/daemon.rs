@@ -154,7 +154,7 @@ use crate::effects::{Effects, Mode};
 use crate::field::{serve_vessel, AfterSeal, Branches, FieldSocket, ServeEvent, Session};
 use crate::pack::{PackPublisher, Packs};
 use crate::quiesce::Watch;
-use crate::rebirth::Reborn;
+use crate::rebirth::{Reborn, Rebuilt};
 use crate::runtime::{
     work_dir_range, write_bundle, Runc, RuncCli, RuncRunner, Swept, VesselSpec, ID_RANGE,
 };
@@ -4366,7 +4366,7 @@ impl Node {
                 }
                 Err(None) => continue,
             };
-            let (mut vessel, _) = match self.host().open(id) {
+            let mut vessel = match self.open_held(id, &log) {
                 Ok(v) => v,
                 Err(e) => {
                     log(format!("purge: opening it: {e}"));
@@ -4517,7 +4517,7 @@ impl Node {
             Err(Some(_)) => return None, // running: its session runs it
             Err(None) => return Some(now + QUEUE_BUSY), // the decider or a start has it
         };
-        let (mut vessel, _) = match self.host().open(id) {
+        let mut vessel = match self.open_held(id, &log) {
             Ok(v) => v,
             Err(e) => {
                 log(format!("verifier: opening it: {e}"));
@@ -4704,12 +4704,12 @@ impl Node {
         if let Err(why) = self.mine_here(id) {
             return Err((why, job));
         }
-        let (mut vessel, _) = match self.host().open(id) {
-            Ok(v) => v,
-            Err(e) => return Err((format!("opening Vessel {}: {e}", id_hex(id)), job)),
-        };
         let label = id_hex(id);
         let log = |m: String| eprintln!("taso-wardend[{}] {label}: {m}", self.config.warden.get());
+        let mut vessel = match self.open_held(id, &log) {
+            Ok(v) => v,
+            Err(e) => return Err((format!("opening Vessel {label}: {e}"), job)),
+        };
         log("opened here for the decider (D74)".into());
         if let Err(e) = self.settle_attempts_with(&mut vessel, &log) {
             return Err((format!("Vessel {label}: {e}"), job));
@@ -4915,6 +4915,105 @@ impl Node {
         );
     }
 
+    /// The layer of Template `t` on this node, received here first if it
+    /// is not (§5.6), for a Template-born Vessel that is reborn or rebuilt
+    /// over it: it must be the layer `key` its Lineage names.
+    fn template_layer(
+        &self,
+        t: ChronicleId,
+        key: taso_core::envelope::HashVal,
+        log: &dyn Fn(String),
+    ) -> Result<(), VesselError> {
+        let layers = self.layers.as_ref().ok_or_else(|| {
+            VesselError::LocalState(
+                "a Template-born Vessel is reborn over its layer: runtime.template_slot is not set"
+                    .into(),
+            )
+        })?;
+        let l = layers.ensure(t).map_err(|e| {
+            VesselError::LocalState(format!("the layer of Template {}: {e}", id_hex(t)))
+        })?;
+        for n in &l.notes {
+            log(n.to_string());
+        }
+        if l.layer_key != key {
+            return Err(VesselError::LocalState(format!(
+                "its Lineage names layer {key} of Template {}, but the layer settled for it is {}: a Vessel is not reborn over another layer",
+                id_hex(t),
+                l.layer_key
+            )));
+        }
+        Ok(())
+    }
+
+    /// The Warden looks at the Vessel `id`, which it holds and whose state
+    /// directory is on this node, before it opens it (P4 spec rev. 38,
+    /// D99).  If the Vessel's files here are behind its log, the Warden
+    /// says so in its own log, rebuilds the Vessel on this node from the
+    /// store as on a takeover, and says what it did: `Some`, the Vessel
+    /// open.  `None`: not behind, nothing changed, the caller opens it.
+    /// `Err`: behind and not rebuilt (the store unreachable, nothing
+    /// shipped, a layer in use); the Vessel is not opened.
+    fn rebuild_if_behind(
+        &self,
+        id: ChronicleId,
+        log: &dyn Fn(String),
+    ) -> Result<Option<(Vessel<BlkLayers>, Rebuilt)>, DaemonError> {
+        let host = self.host();
+        let Some(behind) = host.behind(id).map_err(DaemonError::Vessel)? else {
+            return Ok(None);
+        };
+        log(format!(
+            "BEHIND ITS LOG on this node: {behind}. Rebuilding it here from the store; what was not shipped is lost, as on a takeover (D99)"
+        ));
+        let packs = self.packs(id)?;
+        let layer =
+            |t: ChronicleId, key: taso_core::envelope::HashVal| self.template_layer(t, key, log);
+        let (vessel, rebuilt) = host
+            .rebuild_here(id, &packs, &layer)
+            .map_err(|e| match e {
+                // Forks are node-bound (2026-10-23, option c).
+                VesselError::ParentMissing(p) => DaemonError::Refused(format!(
+                    "behind its log and not rebuilt: a fork is rebuilt only where its parent's Seal is, and the Seal at lsn {} of its parent {} is not on this node; the parent is rebuilt first",
+                    p.seal.get(),
+                    id_hex(p.chronicle)
+                )),
+                e => DaemonError::Refused(format!("behind its log and not rebuilt: {e}")),
+            })?;
+        log(format!(
+            "rebuilt here: {}; {}; the state directory it had is kept at {} (the Warden never deletes it)",
+            rebuilt.reborn,
+            match rebuilt.stood_on {
+                Some(at) => format!(
+                    "its dataset was put back at the Seal at lsn {} and the sections after it were received",
+                    at.lsn.get()
+                ),
+                None => "every section was received".to_string(),
+            },
+            rebuilt.kept.display()
+        ));
+        Ok(Some((vessel, rebuilt)))
+    }
+
+    /// Open the Vessel `id`, which this Warden holds and whose state
+    /// directory is on this node, for the Warden's own work on it (the
+    /// decider's open, a waiting verifier, the purge at the TTL): rebuilt
+    /// first if it is behind its log ([`Node::rebuild_if_behind`]; V-c:
+    /// every opener, through one step), else opened as it is.
+    fn open_held(
+        &self,
+        id: ChronicleId,
+        log: &dyn Fn(String),
+    ) -> Result<Vessel<BlkLayers>, DaemonError> {
+        if let Some((vessel, _)) = self.rebuild_if_behind(id, log)? {
+            return Ok(vessel);
+        }
+        self.host()
+            .open(id)
+            .map(|(v, _)| v)
+            .map_err(DaemonError::Vessel)
+    }
+
     /// Find, open or rebirth the Vessel (step 1).
     fn start(&self, vc: &VesselConf) -> Result<(Vessel<BlkLayers>, Start, Verdict), DaemonError> {
         let host = self.host();
@@ -4945,6 +5044,11 @@ impl Node {
         };
         let local = host.dir_for(id).exists();
         let start = decide(known, local, self.config.warden, vc.takeover);
+        let mut rebuilt = if start == Start::Open && claim == Claim::Mine {
+            self.rebuild_if_behind(id, &|m| self.log(vc, m))?
+        } else {
+            None
+        };
         let (vessel, verdict) = match &start {
             Start::Refuse(why) => return Err(DaemonError::Refused(why.clone())),
             Start::Birth if vc.fork.is_some() => {
@@ -4973,6 +5077,13 @@ impl Node {
             Start::Birth if vc.template.is_some() => {
                 let t = vc.template.as_ref().expect("matched");
                 (self.template_birth(vc, t)?, Verdict::Clean)
+            }
+            // A Vessel this Warden holds, with its state here: rebuilt
+            // first if its files are behind its log (D99).  A takeover
+            // onto old local state is not rebuilt (R3-a (a)).
+            Start::Open if rebuilt.is_some() => {
+                let (v, r) = rebuilt.take().expect("matched");
+                (v, verdict_after_rebirth(&r.reborn))
             }
             Start::Birth | Start::Open => {
                 let (v, how) = host.ensure_as(vc.namespace, vc.subject.as_bytes(), claim)?;
@@ -5004,25 +5115,7 @@ impl Node {
                 // A Template-born Vessel: its layer received here first
                 // (§5.6), the one settled for the Template.
                 let layer = |t: ChronicleId, key: taso_core::envelope::HashVal| {
-                    let layers = self.layers.as_ref().ok_or_else(|| {
-                        VesselError::LocalState(
-                            "a Template-born Vessel is reborn over its layer: runtime.template_slot is not set".into(),
-                        )
-                    })?;
-                    let l = layers.ensure(t).map_err(|e| {
-                        VesselError::LocalState(format!("the layer of Template {}: {e}", id_hex(t)))
-                    })?;
-                    for n in &l.notes {
-                        self.log(vc, n);
-                    }
-                    if l.layer_key != key {
-                        return Err(VesselError::LocalState(format!(
-                            "its Lineage names layer {key} of Template {}, but the layer settled for it is {}: a Vessel is not reborn over another layer",
-                            id_hex(t),
-                            l.layer_key
-                        )));
-                    }
-                    Ok(())
+                    self.template_layer(t, key, &|m| self.log(vc, m))
                 };
                 let (v, reborn) = host
                     .rebirth_with(id, &self.packs(id)?, claim, &layer)
