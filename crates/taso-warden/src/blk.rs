@@ -5382,4 +5382,57 @@ mod tests {
         assert!(ledger.authorized());
         assert!(t.coord.obligations(t.id).unwrap().is_empty());
     }
+
+    /// An approval lost in a gap (D&D R4-d a, 2026-11-26).  A reviewer
+    /// approves a held action: the coordinator accepts the release and
+    /// counts the action as an obligation.  The Warden dies before it
+    /// ships the release, and another node takes the Vessel over.  The
+    /// log then holds the action as held, as before the approval; no
+    /// sender was shown it.  The coordinator still counts it, and the
+    /// opening of the ledger does not close it (the log holds the action,
+    /// so it is not lost): a verdict or a purge waits until a reviewer
+    /// decides the action again.  Here it is denied, which closes it.
+    #[test]
+    fn an_approval_lost_in_a_gap_leaves_the_action_held_and_counted_until_decided_again() {
+        let t = TenTurns::holding();
+        let op = t.held.unwrap();
+        let node = t.node(after_a_crash(&t.pool));
+        let (mut v, _) = node.open(t.id).unwrap();
+        crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
+        let snap = node
+            .pool
+            .snapshot(v.dataset(), t.seals[10].lsn)
+            .unwrap()
+            .unwrap();
+        v.publish_seal(&t.packs(&node), &snap, None).unwrap();
+        assert_eq!(t.coord.shipped(t.id).unwrap().lsn, v.tail().lsn);
+        let (mut ledger, _) = ledger_of(&t, &node, &mut v);
+        assert!(t.coord.obligations(t.id).unwrap().is_empty(), "held only");
+        ledger.approve(&mut v, op).unwrap();
+        assert_eq!(t.coord.obligations(t.id).unwrap(), vec![op.get()]);
+        drop(v);
+
+        let b = Host {
+            coord: t.coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: t.tmp.path().join("node-2"),
+            warden: WardenId::new(2),
+        };
+        let (mut w, reborn) = b.rebirth(t.id, &t.packs(&b)).unwrap();
+        assert!(reborn.gap.is_some(), "the approval is in the gap");
+        let (mut ledger, reconciled) = ledger_of(&t, &b, &mut w);
+        assert_eq!(reconciled, crate::ledger::Reconciled::default());
+        let (held, _) = w.held_proposals().unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(held[0].intent.op == op && held[0].sealed, "held again");
+        assert_eq!(
+            t.coord.obligations(t.id).unwrap(),
+            vec![op.get()],
+            "counted until it is decided again"
+        );
+
+        ledger.deny(&mut w, op, "not this one").unwrap();
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
+    }
 }
