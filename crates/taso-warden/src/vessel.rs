@@ -147,6 +147,30 @@ pub trait Pool {
     /// a throwaway branch of the Seal mounted read-only, gone when the
     /// view is dropped.
     fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError>;
+    /// Before a Vessel is rebuilt on this node (design
+    /// `Taso_design_layers_lost`): put `dataset` back at the newest Seal
+    /// layer it has that is one of `ends`, the Seals the bucket's file
+    /// sections end at, and out of use.  The dataset is unmounted and its
+    /// device detached; every Seal layer newer than that one is taken
+    /// away; what was written after it is discarded.  Returns the layer
+    /// the dataset now stands on, or `None` if it has none of `ends` (it
+    /// then stands on what it was born on).  The next section can be
+    /// received onto it ([`Pool::receive`]).
+    ///
+    /// Refused, changing nothing, if a fork or a Seal view in use stands
+    /// on a layer that would go, if the layer at one of `ends` is bound
+    /// to another record, or if the dataset cannot be unmounted.  Calling
+    /// it again finishes a call that was cut short.
+    ///
+    /// Only the block log does this; any other storage refuses.
+    fn back_to(
+        &self,
+        dataset: &Dataset,
+        ends: &[(Lsn, HashVal)],
+    ) -> Result<Option<(Lsn, HashVal)>, LayerError> {
+        let _ = ends;
+        Err(format!("this storage cannot put {dataset} back at a Seal layer in place").into())
+    }
     /// An identity of `dataset` that a later dataset of the same name does
     /// not share (the block log: its branch's id).  `None`
     /// if there is no such dataset.

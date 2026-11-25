@@ -1094,6 +1094,74 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         ))
     }
 
+    /// The branch's own Seals are read from the top down, as it stands on
+    /// them.  The first one that is one of `ends` stays; those above it
+    /// are taken from under the branch one by one (unseal), so a call cut
+    /// short at any step leaves a dataset the next call finishes.  What
+    /// is left is what a receive expects: no device, nothing of its own,
+    /// standing on the layer answered (or on what it was born on).
+    fn back_to(
+        &self,
+        dataset: &Dataset,
+        ends: &[(Lsn, HashVal)],
+    ) -> Result<Option<(Lsn, HashVal)>, LayerError> {
+        // The views before the connection, as `seal_view` takes them.
+        let views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        let mut d = conn(&self.maker, &self.blkd);
+        let b = d
+            .find(dataset.as_str())?
+            .ok_or_else(|| format!("no dataset {dataset}"))?;
+        let tags: BTreeMap<LayerId, Vec<u8>> = d.seals(b)?.into_iter().collect();
+        let mut go = Vec::new();
+        let mut stays = None;
+        let mut cur = d.info(b)?.parent;
+        while let Some(l) = cur {
+            let i = d.info(l)?;
+            if i.origin != Some(b) {
+                break; // what it was born on: not its own
+            }
+            let bound = tags.get(&l).and_then(|t| untag(t));
+            if let Some((lsn, hash)) = bound {
+                match ends.iter().find(|(e, _)| *e == lsn) {
+                    Some((_, h)) if *h == hash => {
+                        stays = Some((lsn, hash));
+                        break;
+                    }
+                    Some(_) => {
+                        return Err(format!(
+                            "Seal layer {} is bound to another record",
+                            dataset.seal_snapshot(lsn)
+                        )
+                        .into())
+                    }
+                    None => {}
+                }
+            }
+            go.push(l);
+            cur = i.parent;
+        }
+        // Refuse before touching anything if another branch stands on a
+        // layer that would go.
+        self.nothing_stands_on(
+            &mut *d,
+            &views,
+            dataset,
+            b,
+            &go,
+            "not taking that layer away",
+        )?;
+        take_off(&mut *d, &*self.mounts, b, &self.mountpoint(dataset))?;
+        for l in go {
+            if d.info(b)?.parent != Some(l) {
+                return Err(format!("{dataset}: branch {b} does not stand on its Seal {l}").into());
+            }
+            d.unseal(b)?;
+        }
+        d.reset(b)?;
+        d.flush()?;
+        Ok(stays)
+    }
+
     fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
         let mut d = conn(&self.maker, &self.blkd);
         Ok(d.find(dataset.as_str())?.map(|b| b.get()))
@@ -1139,45 +1207,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         // open Seal view) stands on one of its layers.
         let mut mine: Vec<LayerId> = own.clone();
         mine.extend(root);
-        //
-        // Another branch can go while this looks (another attempt's
-        // /candidate, a Seal view released: taso-test fd7199d, p4-verify
-        // case 11, "no layer L155"): a layer that is gone stands on
-        // nothing, so a failed look is an error only while its name still
-        // names that branch.
-        for (name, x) in d.names()? {
-            if x == b {
-                continue;
-            }
-            // A view of this dataset whose process is gone, which no
-            // process counts any more: it kept the dataset from being
-            // destroyed for good (audit 2026-11-09, a Seal view left by a
-            // killed Warden).  A view a running process holds refuses
-            // below.
-            if self.left_over(dataset, &name) && !views.contains_key(&name) {
-                take_down(
-                    &mut *d,
-                    &*self.mounts,
-                    x,
-                    &self.mount_root.join(".views").join(&name),
-                )?;
-                continue;
-            }
-            let mut cur = Some(x);
-            while let Some(l) = cur {
-                if l != x && mine.contains(&l) {
-                    return Err(format!(
-                        "{name} stands on {dataset}'s layer {l}; not destroying it"
-                    )
-                    .into());
-                }
-                cur = match d.info(l) {
-                    Ok(i) => i.parent,
-                    Err(_) if d.find(&name)? != Some(x) => None, // gone meanwhile
-                    Err(e) => return Err(e),
-                };
-            }
-        }
+        self.nothing_stands_on(&mut *d, &views, dataset, b, &mine, "not destroying it")?;
         // The branch keeps its name until its Seals are gone: each is
         // taken from under it (unseal), newest first, so a destroy cut
         // short at any step is found again by name and finished by the
@@ -1592,6 +1622,58 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             "gview" => format!("{}.gview-{}-{}", dataset.as_str(), self.pid, lsn.get()),
             kind => format!("{}.{kind}-{}", dataset.as_str(), lsn.get()),
         }
+    }
+
+    /// Refuse (the refusal ends with `so`) if another branch, a clone or a
+    /// Seal view in use, stands on one of `layers`, which are layers of
+    /// `dataset`'s branch `b`.  `views` is this process's views, locked
+    /// by the caller before its connection, as `seal_view` takes them.
+    ///
+    /// A view of this dataset whose process is gone, which no process
+    /// counts any more, is taken down instead: it kept the dataset from
+    /// being destroyed for good (audit 2026-11-09, a Seal view left by a
+    /// killed Warden).
+    ///
+    /// Another branch can go while this looks (another attempt's
+    /// /candidate, a Seal view released: taso-test fd7199d, p4-verify
+    /// case 11, "no layer L155"): a layer that is gone stands on nothing,
+    /// so a failed look is an error only while its name still names that
+    /// branch.
+    fn nothing_stands_on(
+        &self,
+        d: &mut D,
+        views: &BTreeMap<String, (usize, LayerId)>,
+        dataset: &Dataset,
+        b: LayerId,
+        layers: &[LayerId],
+        so: &str,
+    ) -> Result<(), LayerError> {
+        for (name, x) in d.names()? {
+            if x == b {
+                continue;
+            }
+            if self.left_over(dataset, &name) && !views.contains_key(&name) {
+                take_down(
+                    d,
+                    &*self.mounts,
+                    x,
+                    &self.mount_root.join(".views").join(&name),
+                )?;
+                continue;
+            }
+            let mut cur = Some(x);
+            while let Some(l) = cur {
+                if l != x && layers.contains(&l) {
+                    return Err(format!("{name} stands on {dataset}'s layer {l}; {so}").into());
+                }
+                cur = match d.info(l) {
+                    Ok(i) => i.parent,
+                    Err(_) if d.find(&name)? != Some(x) => None, // gone meanwhile
+                    Err(e) => return Err(e),
+                };
+            }
+        }
+        Ok(())
     }
 
     /// Whether `name` is a view of `dataset` that no running process
@@ -3768,6 +3850,122 @@ mod tests {
         let mut d = p.blkd.lock().unwrap();
         let b = d.store.find(a.as_str()).unwrap().unwrap();
         d.store.write(b, 0, &[v; 4096], false).unwrap();
+    }
+
+    /// Ten Seal layers on a new dataset (layer `n` holds `n` in block 0,
+    /// bound to `h(n)`), then the writes of a turn that did not end (99).
+    fn ten_layers(p: &TestPool, a: &Dataset) {
+        p.create(a).unwrap();
+        let mut l = p.layers(a);
+        for n in 1..=10u8 {
+            write0(p, a, n);
+            l.snapshot(Lsn::new(n.into()), h(n)).unwrap().run().unwrap();
+        }
+        write0(p, a, 99);
+    }
+
+    fn ends(upto: u8) -> Vec<(Lsn, HashVal)> {
+        (1..=upto).map(|n| (Lsn::new(n.into()), h(n))).collect()
+    }
+
+    /// Whether the dataset's branch has a device.
+    fn attached(p: &TestPool, a: &Dataset) -> bool {
+        let mut d = p.blkd.lock().unwrap();
+        let b = d.find(a.as_str()).unwrap().unwrap();
+        d.info(b).unwrap().dev.is_some()
+    }
+
+    #[test]
+    fn back_to_leaves_the_newest_section_end_and_a_dataset_ready_to_receive() {
+        use std::io::Read as _;
+        let p = pool();
+        let a = ds("tank/v-a");
+        ten_layers(&p, &a);
+        // The section from Seal 8 to Seal 9, made while layer 9 is there.
+        let mut section = Vec::new();
+        crate::ship::Sender::send(
+            &p.sender(),
+            &a,
+            Some(&a.seal_snapshot(Lsn::new(8))),
+            Lsn::new(9),
+        )
+        .unwrap()
+        .read_to_end(&mut section)
+        .unwrap();
+        assert!(attached(&p, &a));
+
+        // The bucket's sections end at Seals 1 to 8.
+        let stays = p.back_to(&a, &ends(8)).unwrap();
+        assert_eq!(stays, Some((Lsn::new(8), h(8))));
+        assert_eq!(
+            p.layers(&a).list().unwrap(),
+            ends(8),
+            "layers 9 and 10 are gone"
+        );
+        assert_eq!(block0(&p, &a), 8, "the files of Seal 8");
+        assert!(!attached(&p, &a), "out of use");
+        // Again: nothing more to do, the same answer.
+        assert_eq!(p.back_to(&a, &ends(8)).unwrap(), stays);
+
+        // The next section is received onto it.
+        p.receive(
+            &a,
+            Some((Lsn::new(8), h(8))),
+            (Lsn::new(9), h(9)),
+            &mut &section[..],
+        )
+        .unwrap();
+        assert_eq!(p.layers(&a).list().unwrap(), ends(9));
+        assert_eq!(block0(&p, &a), 9);
+    }
+
+    #[test]
+    fn back_to_keeps_a_layer_below_the_one_it_stops_at_and_takes_all_if_none_is_an_end() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        ten_layers(&p, &a);
+        // Sections end at Seals 1 to 6 and at 8: Seal 7 has none of its
+        // own (the section of 8 covers it).  Its layer is below 8: it stays.
+        let mut some = ends(6);
+        some.push((Lsn::new(8), h(8)));
+        assert_eq!(p.back_to(&a, &some).unwrap(), Some((Lsn::new(8), h(8))));
+        assert_eq!(p.layers(&a).list().unwrap(), ends(8));
+
+        // No section ends at a layer it has: every layer goes, and the
+        // dataset stands on what it was born on.
+        assert_eq!(p.back_to(&a, &[(Lsn::new(11), h(11))]).unwrap(), None);
+        assert_eq!(p.layers(&a).list().unwrap(), vec![]);
+        assert!(!attached(&p, &a));
+    }
+
+    #[test]
+    fn back_to_refuses_and_changes_nothing() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        ten_layers(&p, &a);
+        let untouched = |p: &TestPool| {
+            assert_eq!(p.layers(&a).list().unwrap(), ends(10));
+            assert_eq!(block0(p, &a), 99, "the turn's writes are still there");
+            assert!(attached(p, &a));
+        };
+
+        // The layer at an end's lsn is bound to another record: this is
+        // not the dataset those sections belong to.
+        let mut other = ends(7);
+        other.push((Lsn::new(8), h(80)));
+        let e = p.back_to(&a, &other).unwrap_err().to_string();
+        assert!(e.contains("bound to another record"), "{e}");
+        untouched(&p);
+
+        // A fork stands on layer 9, which would go.
+        let child = ds("tank/v-b");
+        Pool::clone(&p, &a, Lsn::new(9), h(9), &child).unwrap();
+        let e = p.back_to(&a, &ends(8)).unwrap_err().to_string();
+        assert!(e.contains("tank/v-b stands on tank/v-a's layer"), "{e}");
+        untouched(&p);
+        // Layer 9 itself may stay: then nothing the fork stands on goes.
+        assert_eq!(p.back_to(&a, &ends(9)).unwrap(), Some((Lsn::new(9), h(9))));
+        assert_eq!(p.layers(&a).list().unwrap(), ends(9));
     }
 
     #[test]
