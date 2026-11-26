@@ -983,6 +983,9 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut t, _) = a.ensure(ns(1), b"template").unwrap();
         let ts = turn(&mut t, 1);
+        // A fork starts only from a shipped Seal (D101).
+        t.publish_seal(&n.packs(t.id()), &snap(&t, ts), None)
+            .unwrap();
         let mut c = a.fork(&t, ts, b"child").unwrap();
         let cs = turn(&mut c, 2);
         c.publish_seal(&n.packs(c.id()), &snap(&c, cs), Some(&snap(&t, ts)))
@@ -1187,6 +1190,9 @@ mod tests {
         let (a, b) = (n.host(1), n.host(2));
         let (mut t, _) = a.ensure(ns(1), b"template").unwrap();
         let ts = turn(&mut t, 1);
+        // A fork starts only from a shipped Seal (D101).
+        t.publish_seal(&n.packs(t.id()), &snap(&t, ts), None)
+            .unwrap();
         let mut c = a.fork(&t, ts, b"child").unwrap();
         c.append(Stream::Fs, raw(2)).unwrap();
         flush(&n, &c, 1);
