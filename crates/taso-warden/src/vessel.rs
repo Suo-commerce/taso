@@ -950,6 +950,14 @@ impl<P: Pool> Host<P> {
         subject: &[u8],
     ) -> Result<Vessel<P::Layers>, VesselError> {
         let id = vessel_id(namespace, subject);
+        // Only from a shipped Seal (P4 spec D101, C-b (a)): every fork,
+        // whoever asks for it.  A child of a Seal only this node holds
+        // could be reborn nowhere once the node is lost, and a rebuild of
+        // the parent here (D99) takes such a Seal's layer away.
+        let shipped = self.coord.shipped(parent).map_err(VesselError::Coord)?;
+        if shipped.lsn < seal.lsn {
+            return Err(VesselError::SealNotShipped { seal, shipped });
+        }
         // R-a (a): a Seal whose layer was folded away is refused by name,
         // before anything is made (a half-made fork stands on its Seal, so
         // that Seal is never folded under a retry).
@@ -2528,6 +2536,25 @@ pub(crate) mod tests {
         pub(crate) host: Host<FakePool>,
     }
 
+    /// Say to the coordinator that everything `id` has is shipped, as a
+    /// publish does: a fork starts only from a shipped Seal (D101), and
+    /// these tests fork without a store.
+    pub(crate) fn ship_all<P: Pool>(host: &Host<P>, id: ChronicleId) {
+        let epoch = host.coord.ownership(id).unwrap().epoch;
+        let head = host.coord.head(id).unwrap();
+        host.coord
+            .advance_shipped(
+                host.warden,
+                id,
+                epoch,
+                Position {
+                    lsn: head.lsn,
+                    hash: head.hash,
+                },
+            )
+            .unwrap();
+    }
+
     pub(crate) fn env() -> Env {
         let tmp = tempfile::tempdir().unwrap();
         let coord = Arc::new(Coordinator::open(tmp.path().join("coord.redb")).unwrap());
@@ -2634,6 +2661,7 @@ pub(crate) mod tests {
             (s3, &b"c3"[..], 3),
             (birth, &b"c0"[..], 0),
         ] {
+            ship_all(&e.host, p.id());
             let mut c = e.host.fork(&p, at, subject).unwrap();
             let t = e.host.birth_turn(&c).unwrap();
             assert_eq!(t.get(), want, "fork from the Seal at lsn {}", at.lsn.get());
@@ -2651,6 +2679,7 @@ pub(crate) mod tests {
         let (mut p, _) = e.host.ensure(ns(1), b"parent").unwrap();
         p.append(Stream::Fs, raw(1)).unwrap();
         let s = seal_at_turn(&mut p, 4);
+        ship_all(&e.host, p.id());
         let c = e.host.fork(&p, s, b"child").unwrap();
         let pid = p.id();
         drop(p);
@@ -2674,6 +2703,7 @@ pub(crate) mod tests {
         let (mut parent, _) = e.host.ensure(ns(1), b"parent").unwrap();
         parent.append(Stream::Fs, raw(1)).unwrap();
         let s = seal(&mut parent);
+        ship_all(&e.host, parent.id());
         let mut child = e.host.fork(&parent, s, b"child").unwrap();
         let b = child.seal_birth().unwrap().seal;
         assert_eq!(b.lsn, Lsn::new(2));
@@ -2756,6 +2786,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(v.fold_old_seals(1, 10).unwrap(), 2);
         assert!(v.chronicle().in_bucket_only(s1.lsn));
+        ship_all(&e.host, v.id());
         match e.host.fork(&v, s1, b"child") {
             Err(VesselError::SealFolded { seal, oldest }) => {
                 assert_eq!((seal, oldest), (s1, Some(s3.lsn)));
@@ -2921,6 +2952,7 @@ pub(crate) mod tests {
     ) -> (ChronicleId, Position) {
         use crate::ledger::{AlwaysPublish, Declared, Ledger};
         use taso_core::record::{Consequence, Dispatch, RetryPolicy};
+        ship_all(&e.host, pid);
         let mut c = e.host.fork_from_log(pid, SealAt::Last, subject).unwrap();
         c.seal_birth().unwrap();
         let (mut l, _) = Ledger::open(Box::new(AlwaysPublish), &mut c, |_, _, i, _| {
@@ -3070,6 +3102,75 @@ pub(crate) mod tests {
     /// A fork asked for over the Field starts only from a shipped Seal:
     /// accepted is not enough, "last" means the newest shipped one only if
     /// it is shipped, and the answer names the Seal and the anchor.
+    /// D101 (C-b (a)): every fork starts only from a shipped Seal,
+    /// whoever asks for it and by whichever way: with the parent open
+    /// ([`Host::fork`]) or from its log ([`Host::fork_from_log`], the way
+    /// of a fork listed in the config and of one an agent asks for).  A
+    /// child of a Seal only this node holds could be reborn nowhere once
+    /// the node is lost, and a rebuild of the parent here (D99) takes
+    /// such a Seal's layer away.  A refused fork has made nothing.
+    #[test]
+    fn every_fork_starts_only_from_a_shipped_seal() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s1 = seal(&mut p);
+        let pid = p.id();
+        let child = vessel_id(ns(1), b"child");
+        let nothing_made = || {
+            assert!(e
+                .host
+                .pool
+                .info(&e.host.dataset_for(child))
+                .unwrap()
+                .is_none());
+            assert!(!e.host.dir_for(child).exists());
+            assert!(matches!(
+                e.host.coord.ownership(child),
+                Err(CoordError::UnknownChronicle(_))
+            ));
+        };
+        // Accepted, with its layer here, and not shipped: refused.
+        let not_shipped = |r: Result<Vessel<FakeLayers>, VesselError>| {
+            assert!(
+                matches!(
+                    r,
+                    Err(VesselError::SealNotShipped { seal, shipped })
+                        if seal == s1 && shipped.lsn < s1.lsn
+                ),
+                "not refused as unshipped"
+            );
+        };
+        not_shipped(e.host.fork(&p, s1, b"child"));
+        nothing_made();
+        not_shipped(e.host.fork_from_log(pid, SealAt::Last, b"child"));
+        nothing_made();
+        not_shipped(e.host.fork_from_log(pid, SealAt::At(s1.lsn), b"child"));
+        nothing_made();
+
+        // Shipped: forked.  A newer Seal that is not shipped is refused
+        // while the shipped one stays forkable.
+        e.host
+            .coord
+            .advance_shipped(e.host.warden, pid, p.chronicle().epoch(), s1)
+            .unwrap();
+        p.append(Stream::Fs, raw(2)).unwrap();
+        let s2 = seal(&mut p);
+        assert!(matches!(
+            e.host.fork_from_log(pid, SealAt::Last, b"child"),
+            Err(VesselError::SealNotShipped { seal, .. }) if seal == s2
+        ));
+        nothing_made();
+        let c = e
+            .host
+            .fork_from_log(pid, SealAt::At(s1.lsn), b"child")
+            .unwrap();
+        assert_eq!(c.lineage().origin.parent().unwrap().seal, s1.lsn);
+        drop(c);
+        let c2 = e.host.fork(&p, s1, b"child-2").unwrap();
+        assert_eq!(c2.lineage().origin.parent().unwrap().seal, s1.lsn);
+    }
+
     #[test]
     fn a_seal_is_forkable_over_the_field_only_once_shipped() {
         let e = env();
@@ -3720,6 +3821,7 @@ pub(crate) mod tests {
                 .unwrap();
             let (mut v, r) = p.host.open(id).unwrap();
             assert_eq!(r.missing_layers, vec![s1]);
+            ship_all(&p.host, v.id());
             assert!(
                 matches!(p.host.fork(&v, s1, b"child"), Err(VesselError::LayerMissing(s)) if s == s1)
             );
@@ -3760,6 +3862,7 @@ pub(crate) mod tests {
             let child_id = vessel_id(ns(1), b"user-2");
             let p = penv(child_id);
             let (parent, ps) = sealed(&p);
+            ship_all(&p.host, parent.id());
             let mut child = p.host.fork(&parent, ps, b"user-2").unwrap();
             child.append(Stream::Fs, raw(3)).unwrap();
             let cs = seal(&mut child);
@@ -3805,6 +3908,7 @@ pub(crate) mod tests {
         let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
         p.append(Stream::Fs, raw(1)).unwrap();
         let s = seal(&mut p);
+        ship_all(&e.host, p.id());
         let child = e.host.fork(&p, s, b"child").unwrap();
         let (pid, cid) = (p.id(), child.id());
         drop(child);
@@ -3836,6 +3940,7 @@ pub(crate) mod tests {
             (SealAt::Last, s2, &b"last"[..]),
             (SealAt::At(s1.lsn), s1, &b"first"[..]),
         ] {
+            ship_all(&e.host, pid);
             let c = e.host.fork_from_log(pid, at, subject).unwrap();
             let Origin::Fork { parent } = c.lineage().origin else {
                 panic!("not a fork")
@@ -3878,6 +3983,7 @@ pub(crate) mod tests {
         p.append(Stream::Fs, raw(2)).unwrap();
         let s2 = seal(&mut p);
         assert_ne!(s1, s2);
+        ship_all(&e.host, pid);
         // "last" finishes the fork from the Seal it started from.
         let c = e.host.fork_from_log(pid, SealAt::Last, b"child").unwrap();
         let ps = c.lineage().origin.parent().copied().unwrap();
@@ -3916,6 +4022,7 @@ pub(crate) mod tests {
         // The parent moves on.
         p.append(Stream::Fs, raw(2)).unwrap();
         let s2 = seal(&mut p);
+        ship_all(&e.host, pid);
         let c = e
             .host
             .fork_from_log(pid, SealAt::At(s2.lsn), b"base.fork-3");
@@ -3932,6 +4039,7 @@ pub(crate) mod tests {
         // Its Lineage is accepted now: not a leftover, never replaced.
         p.append(Stream::Fs, raw(3)).unwrap();
         let s3 = seal(&mut p);
+        ship_all(&e.host, pid);
         assert!(matches!(
             e.host
                 .fork_from_log(pid, SealAt::At(s3.lsn), b"base.fork-3"),
@@ -4011,6 +4119,7 @@ pub(crate) mod tests {
         let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
         p.append(Stream::Fs, raw(1)).unwrap();
         let s = seal(&mut p);
+        ship_all(&e.host, p.id());
         let child = e.host.fork(&p, s, b"child").unwrap();
         let Origin::Fork { parent } = child.lineage().origin else {
             panic!("not a fork")
@@ -4039,6 +4148,7 @@ pub(crate) mod tests {
         let e = env();
         let (mut p, _) = e.host.ensure(ns(1), b"base").unwrap();
         let s = seal(&mut p);
+        ship_all(&e.host, p.id());
         let child = e.host.fork(&p, s, b"child").unwrap();
         let (id, ds) = (child.id(), child.dataset().clone());
         drop(child);
@@ -4311,6 +4421,7 @@ pub(crate) mod tests {
             open_obligations(&v.frames().unwrap()).unwrap(),
             vec![OpId::new(7)]
         );
+        ship_all(&e.host, v.id());
         e.host.fork(&v, last, b"child").unwrap();
         assert!(
             matches!(e.host.fork(&v, old, b"child2"), Err(VesselError::SealNotLocal(p)) if p == old)
