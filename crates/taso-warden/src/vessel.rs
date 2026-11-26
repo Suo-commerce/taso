@@ -273,6 +273,15 @@ pub enum VesselError {
     SealNotLocal(Position),
     /// The Seal is accepted but its layer is not on this node.
     LayerMissing(Position),
+    /// A takeover onto this node's old state of the Vessel, and that
+    /// state is behind its log (D99).  Refused before anything is
+    /// claimed: the Vessel's holder keeps it (D&D R6-a (a)).
+    TakeoverOntoBehind {
+        /// The old state directory on this node.
+        dir: PathBuf,
+        /// What is behind.
+        behind: crate::rebirth::Behind,
+    },
     /// A fork asked from a Seal whose layer this node folded into a newer
     /// one once shipped (S-c, R-a (a), decided 2026-11-14): a fork starts
     /// from the newest Seal, so ask again.  `oldest`: the oldest Seal
@@ -402,6 +411,14 @@ impl fmt::Display for VesselError {
             Self::NotASeal(p) => write!(f, "lsn {} is not an accepted Seal", p.lsn.get()),
             Self::SealNotLocal(p) => write!(f, "the Seal at lsn {} was pruned from the local log", p.lsn.get()),
             Self::LayerMissing(p) => write!(f, "the layer of Seal {} is not on this node", p.lsn.get()),
+            Self::TakeoverOntoBehind { dir, behind } => write!(
+                f,
+                "not taking the Vessel over onto this node's old state of it, which is behind its log \
+                 ({behind}); nothing was claimed and its holder keeps it.  To take it over here, move {} \
+                 aside first: the start then rebuilds the Vessel from the store, which checks this node's \
+                 Seal layers against the shipped log before it changes anything",
+                dir.display()
+            ),
             Self::SealFolded { seal, oldest } => write!(
                 f,
                 "Seal {} is in the bucket only: this node folded its layer into a newer Seal; a fork starts from the newest Seal, ask again{}",
@@ -958,15 +975,21 @@ impl<P: Pool> Host<P> {
         if shipped.lsn < seal.lsn {
             return Err(VesselError::SealNotShipped { seal, shipped });
         }
-        // R-a (a): a Seal whose layer was folded away is refused by name,
-        // before anything is made (a half-made fork stands on its Seal, so
-        // that Seal is never folded under a retry).
+        // A Seal whose layer is not here is refused by name, before
+        // anything is made (a half-made fork stands on its Seal, so that
+        // Seal is never folded under a retry).  Folded away (R-a (a)): a
+        // newer Seal's layer is here, and this one's content is in it and
+        // in the bucket.  Otherwise it is lost: no layer at or above it
+        // is on this node, which is then behind its log (D99).
         let present = self
             .pool
             .layers(parent_dataset)
             .list()
             .map_err(VesselError::Pool)?;
         if !present.contains(&(seal.lsn, seal.hash)) {
+            if present.last().is_none_or(|(l, _)| *l < seal.lsn) {
+                return Err(VesselError::LayerMissing(seal));
+            }
             return Err(VesselError::SealFolded {
                 seal,
                 oldest: present.first().map(|(l, _)| *l),
@@ -1402,6 +1425,19 @@ impl<P: Pool> Host<P> {
     ) -> Result<(Vessel<P::Layers>, Recovery), VesselError> {
         let dataset = self.dataset_for(id);
         let dir = self.dir_for(id);
+        // A takeover onto old local state that is behind its log is
+        // refused here, before the open claims the Vessel: the open
+        // would fence its holder first, and the state could then not be
+        // put at its last Seal (C-a), so the Vessel would run on neither
+        // node (the maturity review's finding 5, for this case).  Looked
+        // at without claiming anything.  A Vessel this Warden holds is
+        // rebuilt by the Warden's start instead (D99); a rebirth's open
+        // (`after_gap`) has just restored the log from the store.
+        if !after_gap && matches!(claim, Claim::TakeOver { .. }) {
+            if let Some(behind) = self.behind(id)? {
+                return Err(VesselError::TakeoverOntoBehind { dir, behind });
+            }
+        }
         let layers = self.pool.layers(&dataset);
         let (chronicle, recovery) = if after_gap {
             Chronicle::open_after_gap_as(&dir, self.coord.clone(), id, self.warden, layers, claim)?
@@ -1797,9 +1833,11 @@ impl<L: Layers> Vessel<L> {
             .seal(StreamCut::EMPTY, Verdict::Clean, Lsn::new(0), turn)?)
     }
 
-    /// Roll the state back to the newest Seal whose layer is here
+    /// Roll the state back to the last Seal
     /// ([`Chronicle::rollback_to_last_seal`]): what was written after it is
-    /// discarded.  Returns that Seal, or `None` if there is none.  The
+    /// discarded.  Returns that Seal, or `None` if none was taken yet.
+    /// Refused, touching nothing, if the last Seal has no layer here: the
+    /// Vessel is behind its log and is rebuilt, not reset (D99, C-a).  The
     /// caller must make sure nothing is writing (no agent running).
     pub fn rollback(&mut self) -> Result<Option<Position>, VesselError> {
         self.writable()?;
@@ -4064,6 +4102,39 @@ pub(crate) mod tests {
                 .fork_from_log(pid, SealAt::At(s3.lsn), b"base.fork-4"),
             Err(VesselError::DatasetConflict(_))
         ));
+    }
+
+    /// A fork from a Seal whose layer is not on the node says which of
+    /// the two it is.  Folded: a newer Seal's layer is here.  Lost: none
+    /// at or above it is (the wrong reason, "folded", was given for both
+    /// before file 6).
+    #[test]
+    fn a_fork_from_a_seal_without_its_layer_says_lost_or_folded() {
+        let e = env();
+        let (mut p, _) = e.host.ensure(ns(1), b"prime").unwrap();
+        let s1 = seal(&mut p);
+        p.append(Stream::Fs, raw(1)).unwrap();
+        let s2 = seal(&mut p);
+        let pid = p.id();
+        ship_all(&e.host, pid);
+        let ds = e.host.dataset_for(pid);
+        drop(p);
+        // Seal 1's layer gone, Seal 2's here: folded.
+        e.host.pool.layers(&ds).destroy(s1.lsn).unwrap();
+        assert!(matches!(
+            e.host.fork_from_log(pid, SealAt::At(s1.lsn), b"c"),
+            Err(VesselError::SealFolded { seal, .. }) if seal == s1
+        ));
+        // Seal 2's layer gone too: lost.
+        e.host.pool.layers(&ds).destroy(s2.lsn).unwrap();
+        for at in [s1, s2] {
+            let r = e.host.fork_from_log(pid, SealAt::At(at.lsn), b"c");
+            assert!(
+                matches!(&r, Err(VesselError::LayerMissing(seal)) if *seal == at),
+                "{:?}",
+                r.err().map(|e| e.to_string())
+            );
+        }
     }
 
     #[test]
