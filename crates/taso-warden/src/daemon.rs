@@ -4863,7 +4863,8 @@ impl Node {
     }
 
     /// Whether a run of the Vessel `key` got past its start in this
-    /// Warden's life ([`crate::supervisor::RunVessel::started`]).
+    /// Warden's life ([`crate::supervisor::RunVessel::started`]): its
+    /// dataset is settled and the publish of its last Seal was tried.
     pub fn has_started(&self, key: &[u8; 16]) -> bool {
         self.started
             .lock()
@@ -5308,11 +5309,6 @@ impl Node {
             Some(_) => BIRTH_TURN,
         };
         let settled = settle_at(&mut vessel, birth_turn)?;
-        // Its dataset is settled here: a fork of it may start (C6).
-        self.started
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(*id.as_bytes());
         self.reopen_waiting_forks(vc);
         if let Some(b) = settled.birth {
             self.log(
@@ -5399,6 +5395,17 @@ impl Node {
                 }
             }
         }
+        // Its dataset is settled here and its last Seal has been
+        // published, or the publish has failed and said so: a fork of it
+        // may start (C6).  After the publish, not before it (D101, C-b
+        // (a)): a fork starts only from a shipped Seal, so one let go
+        // before the publish would find the newest Seal unshipped and be
+        // refused.  If the publish failed, the fork is refused by name
+        // until the Seal is shipped.
+        self.started
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(*id.as_bytes());
         // Old Seal layers this node no longer needs, a bounded number per
         // start (S-c, R-d (a)): an upgraded node's backlog goes over a few
         // starts.  A failure is logged and the run goes on.
@@ -8421,6 +8428,7 @@ mod tests {
         let e = vessel_env();
         let (mut p, _) = e.host.ensure(ns(1), b"parent").unwrap();
         let s = p.seal_birth().unwrap().seal;
+        crate::vessel::tests::ship_all(&e.host, p.id());
         let c = e.host.fork(&p, s, b"child").unwrap();
         let (pid, cid) = (p.id(), c.id());
         drop(c);
