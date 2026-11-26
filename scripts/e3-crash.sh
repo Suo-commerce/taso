@@ -578,7 +578,7 @@ if child:
     err = open(os.path.join(r, "warden-2.err"), errors="replace").read()
     out = open(os.path.join(r, "warden-2.out"), errors="replace").read() if os.path.exists(os.path.join(r, "warden-2.out")) else ""
     said = next((l[len(child) + 2:] for l in out.splitlines() if l.startswith(child + ": ")), None)
-    ch = dict(json.loads(childj), ran=bool(re.search(rf" {re.escape(child)}: (Opened\(|reborn at epoch)", err)), refused=said)
+    ch = dict(json.loads(childj), ran=bool(re.search(rf" {re.escape(child)}: (Opened\(|reborn at epoch|rebuilt here: )", err)), refused=said)
 a["takeover"] = {
     "owner": json.loads(owner), "shipped_lsn": int(shipped), "child": ch,
     "thaw": {"acks": int(acks), "replies": open(os.path.join(r, "thaw.txt")).read().splitlines(), "fenced": fenced or None},
@@ -1189,8 +1189,9 @@ PY
     # refusal, a failed open).  Without this a Vessel never reborn was graded
     # on taso-blkd's layers alone (F2, 2026-10-28).
     local opened=false not_run=""
-    # A Vessel rebuilt from the store says "reborn at epoch" instead (E3-4: B and C).
-    grep -qE " $subject: (Opened\(|reborn at epoch)" "$R/warden-$gt.err" 2>/dev/null && opened=true
+    # A Vessel rebuilt from the store says "reborn at epoch" instead (E3-4: B and C),
+    # and one rebuilt on its own node "rebuilt here: reborn at epoch" (D99).
+    grep -qE " $subject: (Opened\(|reborn at epoch|rebuilt here: )" "$R/warden-$gt.err" 2>/dev/null && opened=true
     [[ "$opened" == true ]] || not_run=$(grep -m1 "^$subject: " "$R/warden-$gt.out" 2>/dev/null | cut -c$((${#subject} + 3))- || true)
     # The log taso-blkd reopened (compact.written: it must be the one from before the held compaction).
     local ino_after=""; [[ -n "$7" ]] && ino_after=$(stat -c %i "$D/blk.log" 2>/dev/null || true)
