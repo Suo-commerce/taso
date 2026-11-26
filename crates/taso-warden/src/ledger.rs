@@ -1543,6 +1543,7 @@ mod tests {
         let e = env();
         let mut p = vessel(&e);
         seal_turn(&mut p, 1);
+        crate::vessel::tests::ship_all(&e.host, p.id());
         // The child: two proposals, sealed.
         let mut c = e.host.fork_from_log(p.id(), SealAt::Last, b"c").unwrap();
         c.seal_birth().unwrap();
