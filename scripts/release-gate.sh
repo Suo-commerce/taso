@@ -22,6 +22,11 @@
 #            notes: the benchmarks (run alone, in release), the tests that
 #            need a kube-apiserver (TASO_KUBE_*) or a bucket (TASO_S3_*),
 #            taso-blk's compaction_timing and its LD_PRELOAD audit test.
+# Since the hardening before v0.1 (2026-11-26):
+#   rebuild  scripts/rebuild-here.sh: on a real block device, the Warden's
+#            start finds a Vessel whose files on the node are behind its
+#            log and rebuilds it there from the store (P4 spec D99).  Its
+#            own taso-blkd, coordinator and store, under /var/tmp.
 #   scripts/release-gate.sh clean    only the cleaning below (the nightly
 #                                    runs it on nights it skips)
 #
@@ -44,7 +49,9 @@
 # Disk (taso-test 2026-11-07: a quick run filled the 40 GB disk and p3 hit
 # ENOSPC in round 14).  Under the lock, before anything else: the work
 # directories that gates leave when killed (/var/tmp/taso-p2blk.*,
-# taso-p3.*, taso-f6fork.*, taso-k2e2e.*, e3check.*) are removed, and gate
+# taso-p3.*, taso-f6fork.*, taso-k2e2e.*, e3check.*, and taso-rebuild.*
+# after its own block daemon is stopped and its mounts are gone) are
+# removed, and gate
 # results under /root older than $KEEP_DAYS days.  Then the run refuses to
 # start with less than $MIN_FREE_QUICK (quick) or $MIN_FREE_FULL (full)
 # GiB free (full: xfstests checks its own 20; the first full run used 4
@@ -93,10 +100,27 @@ if pgrep -f "$left" >/dev/null; then
     pgrep -f "$left" >/dev/null && die "a block daemon a killed gate left does not go: $(pgrep -af "$left")"
     for k in crash bench fst; do rm -f "/run/taso-blk-$k.sock" "/run/taso-blk-$k.sock.lock"; done
 fi
+# rebuild-here.sh keeps everything under its work directory: its own block
+# daemon (its log is there), its coordinator, its mounts.  Killed, it
+# leaves them; the directory is removed only once nothing is mounted in it.
+rleft='/var/tmp/taso-rebuild\.'
+if pgrep -f "$rleft" >/dev/null || grep -q " /var/tmp/taso-rebuild\." /proc/self/mountinfo; then
+    echo "release-gate: stopping what a killed rebuild gate left: $(pgrep -af "$rleft" | tr '\n' ';')"
+    awk '$5 ~ "^/var/tmp/taso-rebuild\\." { print length($5), $5 }' /proc/self/mountinfo \
+        | sort -rn | cut -d' ' -f2- | while read -r m; do
+            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+        done
+    pkill -KILL -f "$rleft"
+    for _ in $(seq 50); do pgrep -f "$rleft" >/dev/null || break; sleep 0.1; done
+    pgrep -f "$rleft" >/dev/null && die "what a killed rebuild gate left does not go: $(pgrep -af "$rleft")"
+    grep -q " /var/tmp/taso-rebuild\." /proc/self/mountinfo && die "a killed rebuild gate left a mount that does not go: $(grep " /var/tmp/taso-rebuild\." /proc/self/mountinfo | cut -d' ' -f5 | tr '\n' ';')"
+fi
+rm -rf /var/tmp/taso-rebuild.*
 rm -rf /var/tmp/taso-p2blk.* /var/tmp/taso-p3.* /var/tmp/taso-f6fork.* /var/tmp/taso-review.* \
        /var/tmp/taso-k2e2e.* /var/tmp/e3check.*
 find /root -maxdepth 1 -mtime +"$KEEP_DAYS" \
-     \( -name 'taso-gate-*' -o -name 'taso-f6-fork-*' -o -name 'release-*-quick-*' -o -name 'release-*-full-*' \) \
+     \( -name 'taso-gate-*' -o -name 'taso-f6-fork-*' -o -name 'release-*-quick-*' -o -name 'release-*-full-*' \
+        -o -name 'taso-rebuild-here-*' \) \
      -exec rm -rf {} +
 # The full gates' large logs and images (2026-11-10: 14 GB left): each
 # gate makes its own again at its start.
@@ -202,6 +226,7 @@ run verify   "$LIMIT" scripts/p4-verify.sh blk
 run decide   "$LIMIT" scripts/p4-decide.sh blk
 run sanction "$LIMIT" scripts/p4-sanction.sh blk
 run purge    "$LIMIT" scripts/p4-purge.sh blk
+run rebuild  "$LIMIT" scripts/rebuild-here.sh
 run f6fork   "$LIMIT" scripts/f6-fork-blk.sh
 run p3       "$LIMIT" env N="$P3N" scripts/p3-no-trace.sh
 run review   "$LIMIT" scripts/p3-review.sh
