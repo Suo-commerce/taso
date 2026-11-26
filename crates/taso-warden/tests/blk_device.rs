@@ -72,6 +72,17 @@ impl Drop for Unmount {
     }
 }
 
+/// Say to the coordinator that everything `v` has is shipped, as a
+/// publish does: a fork starts only from a shipped Seal (D101), and these
+/// tests fork without a store.
+fn shipped<P: Pool>(host: &Host<P>, v: &taso_warden::vessel::Vessel<P::Layers>) {
+    let epoch = host.coord.ownership(v.id()).unwrap().epoch;
+    let tail = v.tail();
+    host.coord
+        .advance_shipped(host.warden, v.id(), epoch, tail)
+        .unwrap();
+}
+
 fn seal<L: Layers>(
     v: &mut taso_warden::vessel::Vessel<L>,
     turn: u64,
@@ -148,6 +159,7 @@ fn vessels_on_real_devices() {
     );
 
     // A fork of s1 sees exactly the sealed state.
+    shipped(&host, &v);
     let child = host.fork(&v, s1, b"child-1").unwrap();
     let ci = host.pool.info(child.dataset()).unwrap().unwrap();
     assert_eq!(
@@ -254,6 +266,7 @@ fn succession_on_real_devices() {
     std::fs::write(mountpoint(v.dataset()).join("notes.txt"), b"mine").unwrap();
     let s = seal(&mut v, 1);
 
+    shipped(&host, &v);
     let child = host.fork(&v, s, b"user-1-fork").unwrap();
     assert_eq!(
         std::fs::read(mountpoint(child.dataset()).join("notes.txt")).unwrap(),
