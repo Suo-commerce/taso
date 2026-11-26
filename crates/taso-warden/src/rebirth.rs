@@ -181,12 +181,19 @@ pub struct Rebuilt {
     /// Where the state directory the Vessel had is kept.  The Warden
     /// never deletes it.
     pub kept: PathBuf,
+    /// The blocks of the Vessel's filesystem that putting the dataset
+    /// back discarded: the Seal layers taken away and what the agent
+    /// wrote after its last Seal (D93 (i)); `None` if the dataset was not
+    /// on the node, so nothing of it was there to discard.
+    pub discarded_blocks: Option<u64>,
 }
 
 /// What the dataset step of a rebirth did beside receiving.
 struct Placed {
     stood_on: Option<Position>,
     kept: Option<PathBuf>,
+    /// What [`Pool::back_to`] discarded, if it ran.
+    discarded_blocks: Option<u64>,
 }
 
 /// The position of `f` if it is a Seal record.
@@ -345,6 +352,7 @@ impl<P: Pool> Host<P> {
                 reborn,
                 stood_on: placed.stood_on,
                 kept,
+                discarded_blocks: placed.discarded_blocks,
             },
         ))
     }
@@ -473,6 +481,7 @@ impl<P: Pool> Host<P> {
             .iter()
             .map(|s| (s.fs.to.lsn, s.fs.to.hash))
             .collect();
+        let mut discarded_blocks = None;
         if mine
             && self
                 .pool
@@ -480,24 +489,27 @@ impl<P: Pool> Host<P> {
                 .map_err(VesselError::Pool)?
                 .is_some()
         {
-            if let Err(e) = self.pool.back_to(&dataset, &ends) {
-                // Refused (a fork or a Seal view in use on a layer that
-                // would go, a dataset that cannot be unmounted): the
-                // Vessel keeps the state directory it had, so a refused
-                // rebuild has changed nothing (D99).  After a failure
-                // part-way the next look finds it behind again, and the
-                // next call finishes the step.
-                if let Some(aside) = kept {
-                    std::fs::rename(&aside, &dir).map_err(|r| {
-                        VesselError::LocalState(format!(
-                            "{e}; and putting {} back as {}: {r}",
-                            aside.display(),
-                            dir.display()
-                        ))
-                    })?;
+            discarded_blocks = match self.pool.back_to(&dataset, &ends) {
+                Ok((_, n)) => Some(n),
+                Err(e) => {
+                    // Refused (a fork or a Seal view in use on a layer that
+                    // would go, a dataset that cannot be unmounted): the
+                    // Vessel keeps the state directory it had, so a refused
+                    // rebuild has changed nothing (D99).  After a failure
+                    // part-way the next look finds it behind again, and the
+                    // next call finishes the step.
+                    if let Some(aside) = kept {
+                        std::fs::rename(&aside, &dir).map_err(|r| {
+                            VesselError::LocalState(format!(
+                                "{e}; and putting {} back as {}: {r}",
+                                aside.display(),
+                                dir.display()
+                            ))
+                        })?;
+                    }
+                    return Err(VesselError::Pool(e));
                 }
-                return Err(VesselError::Pool(e));
-            }
+            };
         }
         // The sections at or below the newest section end on the node
         // are not received: that layer holds them (an interrupted
@@ -576,7 +588,15 @@ impl<P: Pool> Host<P> {
             dataset_at: chain.seals.last().map(|s| s.fs.to),
             missing_layers: recovery.missing_layers,
         };
-        Ok((vessel, reborn, Placed { stood_on, kept }))
+        Ok((
+            vessel,
+            reborn,
+            Placed {
+                stood_on,
+                kept,
+                discarded_blocks,
+            },
+        ))
     }
 
     /// Everything a rebirth reads and checks before it changes anything:
