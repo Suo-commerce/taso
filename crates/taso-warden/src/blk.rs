@@ -4581,6 +4581,11 @@ mod tests {
         assert_eq!(behind.to_string().matches("lsn").count(), 1, "{behind}");
 
         let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(
+            r.discarded_blocks,
+            Some(0),
+            "the node had lost those layers already: nothing left to discard"
+        );
         assert_eq!(r.behind, behind);
         assert_eq!(
             r.stood_on,
@@ -4706,6 +4711,7 @@ mod tests {
         );
 
         let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(r.discarded_blocks, None, "no dataset: nothing to discard");
         assert_eq!(r.stood_on, None, "every section was received");
         let want: Vec<Lsn> = s[..=8].iter().map(|p| p.lsn).collect();
         assert_eq!(r.reborn.received, want);
@@ -4744,6 +4750,11 @@ mod tests {
         let behind = node.behind(t.id).unwrap().expect("behind");
         assert_eq!(behind.without_layer, vec![s[10]]);
         let (mut v, r) = node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).unwrap();
+        assert_eq!(
+            r.discarded_blocks,
+            Some(1),
+            "the one block of Seal 9's layer, said as discarded (D93)"
+        );
         assert_eq!(r.stood_on, Some(s[8]));
         assert_eq!(v.last_seal(), Some(s[8]));
         assert!(
