@@ -1213,6 +1213,7 @@ mod tests {
 
     /// A fork of `parent`'s last Seal, with `n` held proposals, sealed.
     fn child(e: &Env, parent: &Vessel<FakeLayers>, subject: &[u8], n: u64) -> ChronicleId {
+        crate::vessel::tests::ship_all(&e.host, parent.id());
         let mut c = e
             .host
             .fork_from_log(parent.id(), SealAt::Last, subject)
@@ -2092,6 +2093,7 @@ mod tests {
         .unwrap();
         // A child holding two proposals of 1 MiB.
         let kid = {
+            crate::vessel::tests::ship_all(&e.host, p.id());
             let mut c = e.host.fork_from_log(p.id(), SealAt::Last, b"c1").unwrap();
             c.seal_birth().unwrap();
             let (mut fx, _) = Effects::open(Mode::Hold, Box::new(AlwaysPublish), &mut c).unwrap();
