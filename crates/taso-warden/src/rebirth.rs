@@ -202,8 +202,8 @@ fn seal_at(f: &Frame) -> Option<Position> {
 impl<P: Pool> Host<P> {
     /// Whether the Vessel `id`'s files on this node are behind its log
     /// (D99), from what the Warden sees for itself: the local log, read
-    /// without claiming it, and the dataset's Seal layers.  Changes
-    /// nothing.  `None`: not behind, as far as this look can tell; also
+    /// without claiming it and only up to the head the coordinator has
+    /// accepted, and the dataset's Seal layers.  Changes nothing.  `None`: not behind, as far as this look can tell; also
     /// for a Vessel with no log on this node (a rebirth's to start), one
     /// whose birth is not finished, and one whose purge is committed (its
     /// dataset is taken away on purpose, and its log stays).
@@ -212,7 +212,16 @@ impl<P: Pool> Host<P> {
         if !dir.exists() {
             return Ok(None);
         }
-        let frames = read_log(&dir)?;
+        let mut frames = read_log(&dir)?;
+        // Only what the coordinator accepted counts.  A crash inside a
+        // Seal can leave its frame in the local log, never accepted and
+        // with no layer (the frame and the layer are made side by side,
+        // before the commit); the open cuts such a frame (D96).  Read as
+        // a Seal it would be a false sign: the Vessel would be rebuilt
+        // from the store and lose what it had not shipped (E3 on
+        // taso-test, 2026-11-26, [write seal] hold:seal.framed).
+        let head = self.coord.head(id).map_err(VesselError::Coord)?;
+        frames.retain(|f| f.envelope.lsn <= head.lsn);
         // The Seals the log knows, oldest first, and the Seal the newest
         // FsShipped record names.  A Checkpoint stands for the records
         // before it, which may be pruned ([`Packs`]' `named_upto`).
