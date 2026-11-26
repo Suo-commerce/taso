@@ -4480,22 +4480,24 @@ mod tests {
         }
 
         /// The Warden starts again on the node whose block log now ends
-        /// after turn `kept`'s publish: opens the Vessel and puts its
-        /// state at a Seal, as a run does before its agent starts.
+        /// after turn `kept`'s publish, as a run does before its agent
+        /// starts: the Vessel is behind its log, so it is rebuilt here
+        /// from the bucket (D99), and its state is put at its last Seal.
         fn restart_with_block_log_cut_after(
             &self,
             kept: usize,
         ) -> (
             Host<TestPool>,
             Vessel<BlkLayers<StoreBlkd, FakeMounts>>,
-            crate::chronicle::Recovery,
+            crate::rebirth::Rebuilt,
             crate::daemon::Settled,
         ) {
-            lose_block_log_after(&self.pool, self.len_after[kept]);
-            let node = self.node(after_a_crash(&self.pool));
-            let (mut v, recovery) = node.open(self.id).unwrap();
+            let node = self.node_with_block_log_cut_at(self.len_after[kept]);
+            let (mut v, rebuilt) = node
+                .rebuild_here(self.id, &self.packs(&node), NO_LAYER)
+                .unwrap();
             let settled = crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap();
-            (node, v, recovery, settled)
+            (node, v, rebuilt, settled)
         }
     }
 
@@ -4679,8 +4681,16 @@ mod tests {
     #[test]
     fn a_vessel_whose_last_shipped_seal_has_no_layer_is_behind_though_its_last_seal_has_one() {
         let t = TenTurns::new();
-        let (node, mut v, _, _) = t.restart_with_block_log_cut_after(6);
+        // That older Warden's start: an open, and the state reset to the
+        // newest layer left (Seal 6); then one more turn.  The reset is
+        // done here by hand: today's start refuses it (C-a).
+        let node = t.node_with_block_log_cut_at(t.len_after[6]);
         let s = &t.seals;
+        let (mut v, _) = node.open(t.id).unwrap();
+        node.pool
+            .layers(v.dataset())
+            .rollback(s[6].lsn, s[6].hash)
+            .unwrap();
         write0(&node.pool, v.dataset(), 11);
         let s11 = seal(&mut v, 11);
         drop(v);
@@ -5009,60 +5019,68 @@ mod tests {
         assert_eq!(node.behind(t.id).unwrap(), None);
     }
 
+    /// C-a (a): one way to recover.  A start that meets a Vessel whose
+    /// last Seal has no layer does not reset its files to an older Seal
+    /// (the agent would be told turn 10 over the files of turn 8): the
+    /// step that puts the state at a Seal refuses, and nothing is reset.
+    /// The Warden's start rebuilds such a Vessel first (D99), so this is
+    /// reached only if that was passed by.
+    #[test]
+    fn a_vessel_behind_its_log_is_never_reset_to_an_older_seal() {
+        let t = TenTurns::new();
+        let node = t.node_with_block_log_cut_at(t.len_after[8]);
+        let (mut v, recovery) = node.open(t.id).unwrap();
+        assert_eq!(recovery.missing_layers, vec![t.seals[9], t.seals[10]]);
+        let before = block0(&node.pool, &t.dataset);
+        let e = crate::daemon::settle_at(&mut v, crate::vessel::BIRTH_TURN).unwrap_err();
+        assert!(
+            matches!(
+                &e,
+                crate::vessel::VesselError::Chronicle(crate::chronicle::ChronicleError::BehindItsLog {
+                    last,
+                    newest_layer,
+                }) if *last == t.seals[10] && *newest_layer == Some(t.seals[8].lsn)
+            ),
+            "{e}"
+        );
+        assert_eq!(block0(&node.pool, &t.dataset), before, "nothing reset");
+        assert_eq!(v.last_seal(), Some(t.seals[10]), "the log is untouched");
+    }
+
     /// Case A for a Vessel that holds its effects: an action its agent
     /// declared in turn 10, which Seal 10 covers.  The layers of Seals 9
-    /// and 10 are lost, so the files of turn 10 are gone; the action is
-    /// not.
+    /// and 10 are lost.  The Vessel is rebuilt at Seal 8, the newest one
+    /// shipped, and the action goes with its turn: its records were past
+    /// the shipped anchor.  No reviewer is shown it and no sender can be
+    /// given it; the agent does turn 10 again and declares it again.
+    /// (Before the rebuild the action stayed held over the files of turn
+    /// 8, and could be approved and sent though its turn's files were on
+    /// no node and in no pack.)
     #[test]
-    fn today_a_held_action_of_a_turn_whose_files_were_lost_stays_held_and_can_be_released() {
+    fn a_held_action_of_a_turn_whose_files_were_lost_goes_with_its_turn() {
         let t = TenTurns::holding();
         let op = t.held.unwrap();
-        let (node, mut v, _, settled) = t.restart_with_block_log_cut_after(8);
+        let (node, mut v, rebuilt, settled) = t.restart_with_block_log_cut_after(8);
+        assert!(rebuilt.reborn.gap.is_some());
         assert_eq!(settled.rolled_back_to, Some(t.seals[8]));
-        assert_eq!(block0(&node.pool, &t.dataset), 8, "the files of turn 8");
+        assert!(!settled.behind());
+        assert_eq!(told_and_files(&node, &t, &mut v), (Some(8), 8));
 
-        // The ledger at this start withdraws the held actions of a turn
-        // that did not end: those past the log's last Seal.  That is Seal
-        // 10, whose record is here, so the action of turn 10 is not one.
         let publisher =
             crate::pack::PackPublisher::new(t.packs(&node), t.coord.clone(), WardenId::new(1));
         let (mut fx, reconciled) =
             crate::effects::Effects::open(crate::effects::Mode::Hold, Box::new(publisher), &mut v)
                 .unwrap();
-        assert_eq!(reconciled.withdrawn, vec![]);
-        // A reviewer who lists the Vessel's held actions is shown it, as
-        // one a Seal covers (so one that may be approved).
+        assert_eq!(reconciled, crate::ledger::Reconciled::default());
         let (held, _) = v.held_proposals().unwrap();
-        assert_eq!(held.len(), 1);
-        assert!(held[0].intent.op == op && held[0].sealed);
-
-        // The next turn's Seal (with the ledger position a session gives
-        // it) ships as a step from Seal 8.
-        write0(&node.pool, v.dataset(), 11);
-        let covered = crate::effects::ledger_pos(&v).unwrap();
-        let s11 = v
-            .seal(StreamCut::EMPTY, Verdict::Clean, covered, TurnId::new(11))
-            .unwrap()
-            .seal;
-        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
-        v.publish_seal(&t.packs(&node), &snap, None).unwrap();
-
-        // The reviewer approves it: it is released, and a sender is shown
-        // it to act on.  Its turn's files are on no node and in no pack.
-        let approved = fx.approve(&mut v, op);
+        assert!(held.is_empty(), "no held action: it went with turn 10");
         assert!(
-            matches!(approved, Ok(crate::effects::Decided::Now)),
-            "{approved:?}"
+            outcomes_of(&v, op).is_empty(),
+            "the log knows no such action"
         );
-        let listed = fx.released(&v).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].intent.op, op);
-        assert_eq!(listed[0].intent.request, b"send the report of turn 10");
-        assert_eq!(
-            block0(&node.pool, &t.dataset),
-            11,
-            "turn 8's files and turn 11's"
-        );
+        assert!(fx.released(&v).unwrap().is_empty());
+        assert!(fx.approve(&mut v, op).is_err(), "nothing to approve");
+        assert!(t.coord.obligations(t.id).unwrap().is_empty());
     }
 
     /// A Candidate of `id` nominated at `seal`, as far as an attempt's
@@ -5118,19 +5136,15 @@ mod tests {
         }
     }
 
-    /// Case A again: what a start does before its agent runs.  Closing a
-    /// verification attempt that was open (and starting one) writes a
-    /// record and ships the log up to it, and the log cannot ship past
-    /// Seal 10, which has no layer to publish.  In a run, a failure to
-    /// close an open attempt ends the start (`daemon.rs`, `run_once`), so
-    /// such a Vessel never reaches the turn whose Seal would ship.
+    /// Case A again: what a start does before its agent runs.  Starting
+    /// (or closing) a verification attempt writes a record and ships the
+    /// log up to it.  After the rebuild the log ships: its last Seal is
+    /// Seal 8, which is shipped.  (Before the rebuild the log could not
+    /// ship past Seal 10, which had no layer to publish, so the start
+    /// ended there, on every start.)
     #[test]
-    fn today_no_attempt_record_can_be_written_while_the_last_seal_has_no_layer() {
-        use crate::attempt::{AttemptError, Attempts};
-        use crate::pack::PackError;
-        use crate::submit::SubmitError;
-        use taso_core::contract::{attempt_id, ContractRecord, VerificationStarted};
-        use taso_core::coordlog::Submitted;
+    fn after_a_rebuild_the_log_ships_up_to_an_attempts_record() {
+        use crate::attempt::Attempts;
 
         let t = TenTurns::new();
         let (node, mut v, _, _) = t.restart_with_block_log_cut_after(8);
@@ -5144,44 +5158,23 @@ mod tests {
             failpoint: crate::attempt::no_failpoints(),
         };
         let cand = a_candidate(t.id, t.seals[8]);
-
-        // The attempt's first record: appended, and refused when the log
-        // is shipped up to it.
+        // The record is appended and the log is shipped up to it.  The
+        // coordinator then refuses this made-up Candidate (it has no such
+        // artifact), which is its word on the Candidate, not on the log.
         let e = at.start(&mut v, &packs, &cand).unwrap_err();
         assert!(
             matches!(
                 &e,
-                AttemptError::Submit(SubmitError::Pack(PackError::SealNotShipped { seal }))
-                    if *seal == t.seals[10].lsn
+                crate::attempt::AttemptError::Submit(crate::submit::SubmitError::NotAccepted(_))
             ),
             "{e:?}"
         );
-        assert_eq!(t.coord.shipped(t.id).unwrap(), t.shipped_at_8);
-
-        // Only a later Seal's publish lets the log ship again: a record
-        // written after Seal 11 is shipped.
-        write0(&node.pool, v.dataset(), 11);
-        let s11 = seal(&mut v, 11);
-        let snap = node.pool.snapshot(v.dataset(), s11.lsn).unwrap().unwrap();
-        v.publish_seal(&packs, &snap, None).unwrap();
-        let started_at = v.tail().lsn;
-        let rec = ContractRecord::VerificationStarted(VerificationStarted {
-            candidate_id: cand.candidate_id,
-            attempt_id: attempt_id(cand.candidate_id, started_at),
-            artifact_key: cand.artifact_key,
-            requirement: cand.requirement,
-            started_at,
-        });
-        v.append_contract(rec.clone()).unwrap();
-        crate::submit::put(
-            &*t.coord,
-            WardenId::new(1),
-            v.chronicle(),
-            &packs,
-            &Submitted::Contract(rec),
-        )
-        .unwrap();
-        assert_eq!(t.coord.shipped(t.id).unwrap().lsn, v.tail().lsn);
+        assert!(t.shipped_at_8.lsn < v.tail().lsn);
+        assert_eq!(
+            t.coord.shipped(t.id).unwrap().lsn,
+            v.tail().lsn,
+            "the log is shipped up to the attempt's record"
+        );
     }
 
     /// A release the coordinator accepted and the Warden never shipped:
@@ -5655,6 +5648,66 @@ mod tests {
         let (v, r) = node.open(t.id).unwrap();
         assert_eq!(r.segment.unaccepted_frames, 1);
         assert_eq!(v.tail(), tail);
+        assert_eq!(v.last_seal(), Some(t.seals[10]));
+    }
+
+    /// D&D R6-a (a).  Another Warden takes the Vessel over onto this
+    /// node's old state of it, and that state is behind its log.  The
+    /// takeover is refused before anything is claimed: the Vessel's
+    /// holder is not fenced and keeps its epoch.  (Claimed first, the
+    /// holder would be fenced and the new Warden could then not put the
+    /// state at its last Seal: the Vessel would run on neither.)
+    #[test]
+    fn a_takeover_onto_old_state_that_is_behind_is_refused_before_it_claims_anything() {
+        let t = TenTurns::new();
+        let held = t.coord.ownership(t.id).unwrap();
+        assert_eq!(held.holder, WardenId::new(1));
+        let claim = crate::chronicle::Claim::TakeOver {
+            from: held.holder,
+            epoch: held.epoch,
+        };
+        let taker = Host {
+            warden: WardenId::new(2),
+            ..t.node_with_block_log_cut_at(t.len_after[8])
+        };
+        let e = taker.open_as(t.id, claim).err().expect("refused");
+        assert!(
+            matches!(
+                &e,
+                crate::vessel::VesselError::TakeoverOntoBehind { behind, .. }
+                    if behind.without_layer == vec![t.seals[9], t.seals[10]]
+            ),
+            "{e}"
+        );
+        assert!(e.to_string().contains("nothing was claimed"), "{e}");
+        let now = t.coord.ownership(t.id).unwrap();
+        assert_eq!(
+            (now.holder, now.epoch),
+            (held.holder, held.epoch),
+            "its holder keeps it, at its epoch"
+        );
+    }
+
+    /// The other side of it: onto a state that is not behind, the
+    /// takeover is not held up.
+    #[test]
+    fn a_takeover_onto_old_state_that_is_not_behind_goes_through() {
+        let t = TenTurns::new();
+        let held = t.coord.ownership(t.id).unwrap();
+        let taker = Host {
+            warden: WardenId::new(2),
+            ..t.node(after_a_crash(&t.pool))
+        };
+        let (v, _) = taker
+            .open_as(
+                t.id,
+                crate::chronicle::Claim::TakeOver {
+                    from: held.holder,
+                    epoch: held.epoch,
+                },
+            )
+            .unwrap();
+        assert_eq!(t.coord.ownership(t.id).unwrap().holder, WardenId::new(2));
         assert_eq!(v.last_seal(), Some(t.seals[10]));
     }
 }
