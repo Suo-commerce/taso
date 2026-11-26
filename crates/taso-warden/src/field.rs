@@ -1570,6 +1570,7 @@ mod tests {
             )
             .unwrap()
             .seal;
+        crate::vessel::tests::ship_all(&e.host, p.id());
         let mut c = e.host.fork(&p, s, b"child").unwrap();
         let t = e.host.birth_turn(&c).unwrap();
         c.seal_birth_at(t).unwrap();
@@ -2466,6 +2467,7 @@ mod tests {
                 return Err("no fork slot left".into());
             }
             let name = format!("c{}", self.children.len() + 1);
+            crate::vessel::tests::ship_all(self.host, vessel.id());
             let c = self
                 .host
                 .fork_from_log(vessel.id(), at, name.as_bytes())
