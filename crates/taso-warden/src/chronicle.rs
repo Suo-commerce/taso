@@ -59,10 +59,16 @@
 //! previous holder closed may still hold a copy of its file (see
 //! `lock_dir`).
 //!
-//! Known gap: an accepted Seal whose snapshot is missing is not detected
-//! yet.  That needs the record kind, i.e. the payload decoder; with
-//! snapshot-first it can only happen if someone destroys a snapshot by
-//! hand.
+//! An accepted Seal whose layer is missing is detected at open
+//! ([`Recovery::missing_layers`]).  If it is the last Seal, the Vessel's
+//! files are behind its log: nothing here resets them to an older layer.
+//! The Warden rebuilds such a Vessel from the store before it opens it
+//! (P4 spec D99, `rebirth.rs`), and [`Chronicle::rollback_to_last_seal`]
+//! refuses ([`ChronicleError::BehindItsLog`]) if one is reached all the
+//! same.  A Seal's layer and its frame are made side by side, before the
+//! record is accepted; a crash between them leaves a frame without a
+//! layer or a layer without a frame, and open cuts the one and destroys
+//! the other (D96).
 //!
 //! Normative references: v0.4 §2.1, §5.2, §8.2–8.7; v1.0 §1 (P1), §3.
 
@@ -365,6 +371,14 @@ pub enum ChronicleError {
     },
     /// [`restore_log`] found the directory already there.
     StateExists(PathBuf),
+    /// The last Seal has no layer on this node: the Vessel's files are
+    /// behind its log (P4 spec D99).  Nothing was touched.
+    BehindItsLog {
+        /// The last Seal in the log.
+        last: Position,
+        /// The newest Seal layer on the node, if any.
+        newest_layer: Option<Lsn>,
+    },
     /// A continuation segment exists but its Gap record was never accepted
     /// (a takeover was interrupted).  [`Chronicle::open_after_gap`]
     /// finishes it; a plain open does not.
@@ -420,6 +434,17 @@ impl fmt::Display for ChronicleError {
                 )
             }
             Self::StateExists(p) => write!(f, "{} already exists", p.display()),
+            Self::BehindItsLog { last, newest_layer } => write!(
+                f,
+                "the Vessel's files on this node are behind its log: the last Seal (lsn {}) has no \
+                 layer here ({}); its state is not reset to an older Seal, the Vessel is rebuilt \
+                 from the store instead (D99)",
+                last.lsn.get(),
+                match newest_layer {
+                    Some(l) => format!("the newest layer is of the Seal at lsn {}", l.get()),
+                    None => "no Seal layer is here".to_string(),
+                }
+            ),
             Self::Decode { lsn, error } => {
                 write!(f, "record at lsn {} does not decode: {error}", lsn.get())
             }
@@ -1229,14 +1254,17 @@ impl<L: Layers> Chronicle<L> {
         Ok(folded)
     }
 
-    /// Roll the state back to the newest Seal whose layer is here,
-    /// discarding everything written after it (a restart resumes from a
-    /// Seal, as a rebirth does).  Returns that Seal, or `None` if no Seal
-    /// has a layer here (nothing is touched).
+    /// Roll the state back to the last Seal, discarding everything
+    /// written after it (a restart resumes from a Seal, as a rebirth
+    /// does).  Returns that Seal, or `None` if no Seal was taken yet
+    /// (nothing is touched).
     ///
-    /// The target is normally the last Seal.  If its layer is missing
-    /// ([`Self::layer_missing`]) it is the newest Seal before it that has
-    /// one; the caller sees which from the returned position.  After open
+    /// The last Seal's layer must be here.  If it is not, the Vessel's
+    /// files are behind its log and this refuses, touching nothing
+    /// ([`ChronicleError::BehindItsLog`]): the state is never reset to an
+    /// older Seal's layer, which would leave the agent told one turn and
+    /// holding another's files.  Such a Vessel is rebuilt from the store
+    /// (D99; D&D C-a (a), 2026-11-25: one way to recover).  After open
     /// every layer left is a Seal's (orphans are destroyed), so a layer
     /// past the last Seal is an inconsistency and refused, as is a fenced
     /// or poisoned Chronicle.  Nothing is appended: the log is not state.
@@ -1246,8 +1274,12 @@ impl<L: Layers> Chronicle<L> {
             return Ok(None);
         };
         let layers = self.layers.list().map_err(ChronicleError::Layer)?;
-        let Some(&(lsn, hash)) = layers.last() else {
-            return Ok(None);
+        let newest = layers.last().copied();
+        let Some((lsn, hash)) = newest.filter(|(l, _)| *l >= last.lsn) else {
+            return Err(ChronicleError::BehindItsLog {
+                last,
+                newest_layer: newest.map(|(l, _)| l),
+            });
         };
         if lsn > last.lsn {
             return Err(ChronicleError::Layer(
@@ -2313,10 +2345,12 @@ mod tests {
         assert!(e.layers.rolled_back.borrow().is_empty());
     }
 
-    /// The last Seal's layer is gone: roll back to the newest Seal that
-    /// still has one, and say which.
+    /// The last Seal's layer is gone: the Vessel's files are behind its
+    /// log.  The state is not reset to the Seal before it (C-a (a): one
+    /// way to recover, the rebuild from the store); the rollback refuses
+    /// and touches nothing.
     #[test]
-    fn rollback_with_the_last_layer_missing_goes_to_the_one_before() {
+    fn rollback_with_the_last_layer_missing_refuses_and_resets_nothing() {
         let e = env();
         let mut c = e.create();
         let s1 = seal(&mut c, 1).unwrap().seal;
@@ -2325,22 +2359,57 @@ mod tests {
         e.layers.clone().destroy(s2.lsn).unwrap();
         let (mut c, _) = e.open(A);
         assert!(c.layer_missing(s2.lsn));
-        assert_eq!(c.rollback_to_last_seal().unwrap(), Some(s1));
-        assert_eq!(*e.layers.rolled_back.borrow(), vec![s1.lsn]);
+        let err = c.rollback_to_last_seal().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ChronicleError::BehindItsLog { last, newest_layer }
+                    if last == s2 && newest_layer == Some(s1.lsn)
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("behind its log"), "{err}");
+        assert!(e.layers.rolled_back.borrow().is_empty(), "nothing reset");
+        assert_eq!(c.last_seal(), Some(s2), "the log is untouched");
     }
 
-    /// No layer at all although Seals exist (every one lost): nothing to
-    /// roll back to.
+    /// No layer at all although Seals exist (every one lost): behind its
+    /// log too, refused the same way.
     #[test]
-    fn rollback_with_every_layer_missing_does_nothing() {
+    fn rollback_with_every_layer_missing_refuses() {
         let e = env();
         let mut c = e.create();
         let s1 = seal(&mut c, 1).unwrap().seal;
         drop(c);
         e.layers.clone().destroy(s1.lsn).unwrap();
         let (mut c, _) = e.open(A);
-        assert_eq!(c.rollback_to_last_seal().unwrap(), None);
+        let err = c.rollback_to_last_seal().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ChronicleError::BehindItsLog { last, newest_layer: None } if last == s1
+            ),
+            "{err}"
+        );
         assert!(e.layers.rolled_back.borrow().is_empty());
+    }
+
+    /// A Seal in the middle without its layer, the last Seal's layer
+    /// here (D&D R6-b (a)): the Vessel is not behind.  Its files are at
+    /// its last Seal, and the rollback goes there as always.
+    #[test]
+    fn rollback_with_a_middle_layer_missing_goes_to_the_last_seal() {
+        let e = env();
+        let mut c = e.create();
+        seal(&mut c, 1).unwrap();
+        let s2 = seal(&mut c, 2).unwrap().seal;
+        let s3 = seal(&mut c, 3).unwrap().seal;
+        drop(c);
+        e.layers.clone().destroy(s2.lsn).unwrap();
+        let (mut c, r) = e.open(A);
+        assert_eq!(r.missing_layers, vec![s2], "never shipped, and gone");
+        assert_eq!(c.rollback_to_last_seal().unwrap(), Some(s3));
+        assert_eq!(*e.layers.rolled_back.borrow(), vec![s3.lsn]);
     }
 
     /// A layer past the last Seal, or one bound to another record, is
