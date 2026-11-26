@@ -5538,4 +5538,77 @@ mod tests {
         assert!(ledger.authorized());
         assert!(t.coord.obligations(t.id).unwrap().is_empty());
     }
+
+    /// A crash inside a Seal (E3 on taso-test, 2026-11-26, `[write seal]
+    /// hold:seal.framed`).  The Seal's frame is in the local log, the
+    /// coordinator never accepted it, and its layer was never made.  That
+    /// is no sign of being behind: the open cuts the frame, and the
+    /// Vessel goes on from its last Seal with everything it had.  Read as
+    /// a Seal without a layer, the frame had the Vessel rebuilt from the
+    /// store, which took away what it had not shipped.
+    #[test]
+    fn a_seal_frame_the_coordinator_never_accepted_is_no_sign_of_being_behind() {
+        use taso_core::canon::Canonical;
+        use taso_core::envelope::Stream;
+        use taso_core::record::{
+            LayerRef, Payload, Record, SealRecord, StreamCut, TurnId, Verdict,
+        };
+        let t = TenTurns::new();
+        let node = t.node(after_a_crash(&t.pool));
+        let (v, _) = node.open(t.id).unwrap();
+        let (tail, epoch) = (v.tail(), v.chronicle().epoch());
+        let seg_path = v.chronicle().segment().path().to_path_buf();
+        drop(v);
+        assert!(node.behind(t.id).unwrap().is_none());
+
+        // What a Seal leaves when the Warden dies after its frame is
+        // synced and before its layer is made or its record accepted.
+        let rec = Record::new(
+            t.id,
+            taso_core::envelope::BranchId::TRUNK,
+            epoch,
+            Stream::Ctl,
+            tail.lsn.next(),
+            tail.hash,
+            Payload::Seal(SealRecord {
+                parent: Some(t.seals[10].hash),
+                cut: StreamCut {
+                    fs: Lsn::new(0),
+                    db: Lsn::new(0),
+                    transcript: Lsn::new(0),
+                },
+                layer: LayerRef::new(tail.lsn.next().get()),
+                verdict: Verdict::Clean,
+                ledger_pos: Lsn::new(0),
+                turn: TurnId::new(11),
+                adopted: 0,
+            }),
+        );
+        let (mut seg, _) =
+            crate::segment::Segment::open(&seg_path, t.coord.head(t.id).unwrap()).unwrap();
+        seg.append(&rec.envelope, &rec.payload.canon_bytes())
+            .unwrap();
+        drop(seg);
+        assert_eq!(
+            crate::chronicle::read_log(&node.dir_for(t.id))
+                .unwrap()
+                .last()
+                .unwrap()
+                .envelope
+                .lsn,
+            tail.lsn.next(),
+            "the frame is in the local log"
+        );
+
+        assert!(
+            node.behind(t.id).unwrap().is_none(),
+            "an unaccepted frame is not a Seal"
+        );
+        assert!(node.rebuild_here(t.id, &t.packs(&node), NO_LAYER).is_err());
+        // The open cuts it and stands where it stood.
+        let (v, r) = node.open(t.id).unwrap();
+        assert_eq!(r.segment.unaccepted_frames, 1);
+        assert_eq!(v.tail(), tail);
+        assert_eq!(v.last_seal(), Some(t.seals[10]));
+    }
 }
