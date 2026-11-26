@@ -1889,9 +1889,14 @@ pub fn verdict_after_open(r: &Recovery) -> Verdict {
             resumes.lsn.get()
         ));
     }
+    // Not the last Seal's: a Vessel whose last Seal has no layer is
+    // rebuilt before it is opened (D99), and its settle refuses.  What is
+    // left is a Seal in the middle, taken while the store could not be
+    // reached and gone from this node since (D&D R6-b (a)): the files
+    // are at the last Seal, and only a fork from that Seal is impossible.
     if !r.missing_layers.is_empty() {
         lost.push(format!(
-            "{} Seals without their layer",
+            "{} Seal(s) with no layer on this node, never shipped",
             r.missing_layers.len()
         ));
     }
@@ -3301,8 +3306,14 @@ pub struct Settled {
 }
 
 impl Settled {
-    /// The state is older than the last Seal: its layer was missing, so
-    /// the rollback went to an earlier one (or to none).
+    /// The state is older than the last Seal.
+    ///
+    /// Never true since C-a (a) (2026-11-25; file 6, 2026-11-26): a
+    /// Vessel whose last Seal has no layer is rebuilt from the store
+    /// before it is opened (D99), and the settle refuses to put its state
+    /// at an older Seal.  Kept only because the Kubernetes status carries
+    /// it (`settled.behind`, always false now); it goes with the status
+    /// format when the Kubernetes work is done (D&D R6-c (a)).
     pub fn behind(&self) -> bool {
         self.rolled_back_to != self.last_seal
     }
@@ -5108,6 +5119,20 @@ impl Node {
                 };
                 self.log(vc, format_args!("{how:?}"));
                 if let Ensured::Opened(r) = &how {
+                    if !r.missing_layers.is_empty() {
+                        let at: Vec<String> = r
+                            .missing_layers
+                            .iter()
+                            .map(|p| p.lsn.get().to_string())
+                            .collect();
+                        self.log(
+                            vc,
+                            format_args!(
+                                "Seal(s) at lsn {} have no layer on this node and were never shipped: their files are lost (a fork from one is refused); the state is at the last Seal",
+                                at.join(", ")
+                            ),
+                        );
+                    }
                     if !r.orphan_layers.is_empty() {
                         // As PostgreSQL logs its crash recovery: plainly, once.
                         let at: Vec<String> = r
@@ -5350,16 +5375,10 @@ impl Node {
                 vc,
                 format_args!("state at its last Seal (lsn {}): nothing reset{blocks}", s.lsn.get()),
             ),
-            (None, _) => self.log(vc, "no Seal layer here: state not rolled back"),
-        }
-        if settled.behind() {
-            self.log(
-                vc,
-                format_args!(
-                    "WARNING: the last Seal (lsn {}) has no layer here; the state is older than the turn the agent resumes after",
-                    settled.last_seal.map_or(0, |s| s.lsn.get())
-                ),
-            );
+            // No Seal to put the state at: not reached, a start takes the
+            // birth Seal first, and a Seal without its layer is refused
+            // by the settle above (C-a (a)).
+            (None, _) => {}
         }
         let mut publisher = SealPublisher {
             storage: Clone::clone(&self.storage),
@@ -6116,10 +6135,11 @@ mod tests {
         assert_eq!(v.last_seal(), None);
     }
 
-    /// The last Seal's layer gone: the state goes to the Seal before it,
-    /// and `behind` says so.
+    /// The last Seal's layer gone: the Vessel is behind its log.  The
+    /// state is not put at the Seal before it; the settle refuses (C-a
+    /// (a)), and the Warden's start rebuilds such a Vessel first (D99).
     #[test]
-    fn a_missing_last_layer_settles_behind() {
+    fn a_missing_last_layer_is_not_settled_at_an_older_seal() {
         let e = vessel_env();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
         let b = settle(&mut v).unwrap().birth.unwrap();
@@ -6131,18 +6151,18 @@ mod tests {
             .destroy(s1.lsn)
             .unwrap();
         let (mut v, _) = e.host.ensure(ns(1), b"u").unwrap();
-        let s = settle(&mut v).unwrap();
-        assert_eq!(
-            s,
-            Settled {
-                birth: None,
-                was_at: s.was_at,
-                rolled_back_to: Some(b),
-                discarded_blocks: None,
-                last_seal: Some(s1)
-            }
+        let err = settle(&mut v).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                VesselError::Chronicle(crate::chronicle::ChronicleError::BehindItsLog {
+                    last,
+                    newest_layer,
+                }) if *last == s1 && *newest_layer == Some(b.lsn)
+            ),
+            "{err}"
         );
-        assert!(s.behind());
+        assert_eq!(v.last_seal(), Some(s1));
     }
 
     #[test]
@@ -8622,7 +8642,12 @@ mod tests {
         let Verdict::Unverified(why) = verdict_after_open(&lossy) else {
             panic!()
         };
-        for part in ["2 unaccepted", "7 bytes", "records 4..6", "1 Seals without"] {
+        for part in [
+            "2 unaccepted",
+            "7 bytes",
+            "records 4..6",
+            "1 Seal(s) with no layer on this node, never shipped",
+        ] {
             assert!(why.contains(part), "{why:?} lacks {part:?}");
         }
 
