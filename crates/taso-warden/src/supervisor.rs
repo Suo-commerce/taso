@@ -54,8 +54,9 @@ pub trait RunVessel: Send + Sync + 'static {
     /// run ended on a stop.
     fn outcome(out: &Self::Out) -> (Option<bool>, bool);
     /// Whether a run of `key` has got past its start: its dataset is
-    /// settled here (opened, or reborn), so a fork of it may start
-    /// (parent before child, P3 close-out C6).  By default at once.
+    /// settled here (opened, or reborn) and the publish of its last Seal
+    /// was tried, so a fork of it may start (parent before child, P3
+    /// close-out C6; only from a shipped Seal, D101).  By default at once.
     fn started(&self, _key: &VesselKey) -> bool {
         true
     }
