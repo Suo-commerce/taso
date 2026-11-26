@@ -4981,7 +4981,7 @@ impl Node {
                 e => DaemonError::Refused(format!("behind its log and not rebuilt: {e}")),
             })?;
         log(format!(
-            "rebuilt here: {}; {}; the state directory it had is kept at {} (the Warden never deletes it)",
+            "rebuilt here: {}; {}{}; the state directory it had is kept at {} (the Warden never deletes it)",
             rebuilt.reborn,
             match rebuilt.stood_on {
                 Some(at) => format!(
@@ -4989,6 +4989,13 @@ impl Node {
                     at.lsn.get()
                 ),
                 None => "every section was received".to_string(),
+            },
+            // D93 (i): what the rebuild discarded, in the words of a
+            // reset's line (the agent's writes add no record, so the
+            // block count is their only mention).
+            match rebuilt.discarded_blocks {
+                Some(n) => format!("; {n} block(s) of the Vessel's filesystem discarded"),
+                None => String::new(),
             },
             rebuilt.kept.display()
         ));
@@ -5015,7 +5022,13 @@ impl Node {
     }
 
     /// Find, open or rebirth the Vessel (step 1).
-    fn start(&self, vc: &VesselConf) -> Result<(Vessel<BlkLayers>, Start, Verdict), DaemonError> {
+    ///
+    /// The last value says whether the Vessel was rebuilt here from the
+    /// store on the way (D99): its start kind is still `Open`.
+    fn start(
+        &self,
+        vc: &VesselConf,
+    ) -> Result<(Vessel<BlkLayers>, Start, Verdict, bool), DaemonError> {
         let host = self.host();
         let id = vc.id();
         // A purged Vessel is never started again (§6.5).
@@ -5049,6 +5062,7 @@ impl Node {
         } else {
             None
         };
+        let rebuilt_here = rebuilt.is_some();
         let (vessel, verdict) = match &start {
             Start::Refuse(why) => return Err(DaemonError::Refused(why.clone())),
             Start::Birth if vc.fork.is_some() => {
@@ -5168,9 +5182,9 @@ impl Node {
             self.host()
                 .finish_birth(&mut vessel, &self.packs(id)?, &|p| self.birth_failpoint(p))
                 .map_err(|e| DaemonError::Refused(format!("finishing its Birth: {e}")))?;
-            return Ok((vessel, start, verdict));
+            return Ok((vessel, start, verdict, rebuilt_here));
         }
-        Ok((vessel, start, verdict))
+        Ok((vessel, start, verdict, rebuilt_here))
     }
 
     /// The parent's Seal snapshot, for a forked Vessel with no `fs`
@@ -5286,7 +5300,7 @@ impl Node {
         // The decider waits for this run, and this run for an open of the
         // decider's (D74).
         let _slot = self.hold_for_run(*vc.id().as_bytes());
-        let (mut vessel, start, verdict) = self.start(vc)?;
+        let (mut vessel, start, verdict, rebuilt_here) = self.start(vc)?;
         let id = vc.id();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
         let birth_turn = match vessel.last_seal() {
@@ -5321,6 +5335,12 @@ impl Node {
             None => String::new(),
         };
         match (settled.rolled_back_to, settled.was_at) {
+            // After a rebuild here the "rebuilt here" line has said where
+            // the Vessel stands, what was lost and what was discarded:
+            // the lines below would read as a second, ordinary reset
+            // (D&D R5-b (a)).  Never silent about blocks, though: if this
+            // settle discarded any, it is said as always.
+            _ if rebuilt_here && settled.discarded_blocks.unwrap_or(0) == 0 => {}
             (Some(s), Some(at)) if settled.discarded() > 0 || settled.discarded_blocks.unwrap_or(0) > 0 => self.log(
                 vc,
                 format_args!(
