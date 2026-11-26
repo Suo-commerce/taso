@@ -226,6 +226,10 @@ echo "== run 3: the Warden starts the Vessel on the damaged node; two more turns
 rc=$(warden 3 2)
 check "run 3: the Warden says the Vessel is behind its log" "$(grep -q 'BEHIND ITS LOG on this node' "$OUT/run-3.err"; echo $?)"
 check "run 3: the Warden says it rebuilt the Vessel here" "$(grep -q 'rebuilt here: ' "$OUT/run-3.err"; echo $?)"
+# D93: what the rebuild discarded is named as blocks, in the rebuilt line.
+check "run 3: the rebuilt line names the blocks of the filesystem it discarded" "$(grep 'rebuilt here: ' "$OUT/run-3.err" | grep -qE "[0-9]+ block\(s\) of the Vessel's filesystem discarded"; echo $?)"
+# And no ordinary reset line after it, which would read as a second reset.
+check "run 3: no line about a reset to the last Seal after the rebuild" "$(! grep -qE ': state at lsn [0-9]+ reset to the Seal|: state at its last Seal' "$OUT/run-3.err"; echo $?)"
 check "run 3: the Warden exits 0 (it said $rc)" "$([ "$rc" = 0 ]; echo $?)"
 r=$(resumed); check "run 3: the agent was told turn 6 (it was told $r)" "$([ "$r" = 6 ]; echo $?)"
 dbv=$(python3 scripts/gate-cloud/dbcheck.py "$WORK/mnt/$DS" 8 2 4 2>&1 || true)
