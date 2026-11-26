@@ -154,20 +154,24 @@ pub trait Pool {
     /// device detached; every Seal layer newer than that one is taken
     /// away; what was written after it is discarded.  Returns the layer
     /// the dataset now stands on, or `None` if it has none of `ends` (it
-    /// then stands on what it was born on).  The next section can be
-    /// received onto it ([`Pool::receive`]).
+    /// then stands on what it was born on), and the blocks of the
+    /// dataset's filesystem this call discarded: the layers taken away
+    /// and what was written after the newest (D93 names what a Warden
+    /// discards).  The next section can be received onto it
+    /// ([`Pool::receive`]).
     ///
     /// Refused, changing nothing, if a fork or a Seal view in use stands
     /// on a layer that would go, if the layer at one of `ends` is bound
     /// to another record, or if the dataset cannot be unmounted.  Calling
-    /// it again finishes a call that was cut short.
+    /// it again finishes a call that was cut short; the count is then of
+    /// that call alone.
     ///
     /// Only the block log does this; any other storage refuses.
     fn back_to(
         &self,
         dataset: &Dataset,
         ends: &[(Lsn, HashVal)],
-    ) -> Result<Option<(Lsn, HashVal)>, LayerError> {
+    ) -> Result<(Option<(Lsn, HashVal)>, u64), LayerError> {
         let _ = ends;
         Err(format!("this storage cannot put {dataset} back at a Seal layer in place").into())
     }
@@ -2421,7 +2425,7 @@ pub(crate) mod tests {
             &self,
             dataset: &Dataset,
             ends: &[(Lsn, HashVal)],
-        ) -> Result<Option<(Lsn, HashVal)>, LayerError> {
+        ) -> Result<(Option<(Lsn, HashVal)>, u64), LayerError> {
             let mut all = self.0.borrow_mut();
             let d = all
                 .get_mut(dataset.as_str())
@@ -2433,7 +2437,8 @@ pub(crate) mod tests {
                 .find(|(l, h)| ends.contains(&(**l, **h)))
                 .map(|(l, h)| (*l, *h));
             d.snaps.retain(|l, _| stays.is_some_and(|(s, _)| *l <= s));
-            Ok(stays)
+            // The fake holds no blocks.
+            Ok((stays, 0))
         }
         fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
             Ok(self

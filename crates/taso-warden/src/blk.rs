@@ -1104,7 +1104,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
         &self,
         dataset: &Dataset,
         ends: &[(Lsn, HashVal)],
-    ) -> Result<Option<(Lsn, HashVal)>, LayerError> {
+    ) -> Result<(Option<(Lsn, HashVal)>, u64), LayerError> {
         // The views before the connection, as `seal_view` takes them.
         let views = self.views.lock().unwrap_or_else(|e| e.into_inner());
         let mut d = conn(&self.maker, &self.blkd);
@@ -1151,15 +1151,18 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
             "not taking that layer away",
         )?;
         take_off(&mut *d, &*self.mounts, b, &self.mountpoint(dataset))?;
+        // What goes from the filesystem: each layer taken away, with what
+        // stood on it, and what was written after the layer that stays.
+        let mut discarded = 0u64;
         for l in go {
             if d.info(b)?.parent != Some(l) {
                 return Err(format!("{dataset}: branch {b} does not stand on its Seal {l}").into());
             }
-            d.unseal(b)?;
+            discarded += d.unseal(b)?;
         }
-        d.reset(b)?;
+        discarded += d.reset(b)?;
         d.flush()?;
-        Ok(stays)
+        Ok((stays, discarded))
     }
 
     fn guid(&self, dataset: &Dataset) -> Result<Option<u64>, LayerError> {
@@ -3895,8 +3898,12 @@ mod tests {
         assert!(attached(&p, &a));
 
         // The bucket's sections end at Seals 1 to 8.
-        let stays = p.back_to(&a, &ends(8)).unwrap();
+        let (stays, discarded) = p.back_to(&a, &ends(8)).unwrap();
         assert_eq!(stays, Some((Lsn::new(8), h(8))));
+        assert_eq!(
+            discarded, 3,
+            "one block each: layers 9 and 10 and the write after Seal 10 (D93)"
+        );
         assert_eq!(
             p.layers(&a).list().unwrap(),
             ends(8),
@@ -3905,7 +3912,7 @@ mod tests {
         assert_eq!(block0(&p, &a), 8, "the files of Seal 8");
         assert!(!attached(&p, &a), "out of use");
         // Again: nothing more to do, the same answer.
-        assert_eq!(p.back_to(&a, &ends(8)).unwrap(), stays);
+        assert_eq!(p.back_to(&a, &ends(8)).unwrap(), (stays, 0));
 
         // The next section is received onto it.
         p.receive(
@@ -3928,14 +3935,36 @@ mod tests {
         // own (the section of 8 covers it).  Its layer is below 8: it stays.
         let mut some = ends(6);
         some.push((Lsn::new(8), h(8)));
-        assert_eq!(p.back_to(&a, &some).unwrap(), Some((Lsn::new(8), h(8))));
+        assert_eq!(
+            p.back_to(&a, &some).unwrap(),
+            (Some((Lsn::new(8), h(8))), 3)
+        );
         assert_eq!(p.layers(&a).list().unwrap(), ends(8));
 
         // No section ends at a layer it has: every layer goes, and the
         // dataset stands on what it was born on.
-        assert_eq!(p.back_to(&a, &[(Lsn::new(11), h(11))]).unwrap(), None);
+        assert_eq!(
+            p.back_to(&a, &[(Lsn::new(11), h(11))]).unwrap(),
+            (None, 8),
+            "the eight layers left"
+        );
         assert_eq!(p.layers(&a).list().unwrap(), vec![]);
         assert!(!attached(&p, &a));
+    }
+
+    /// The newest layer is a section's end: no layer goes, and what was
+    /// written after it is discarded and counted.
+    #[test]
+    fn back_to_the_newest_layer_discards_and_counts_what_was_written_after_it() {
+        let p = pool();
+        let a = ds("tank/v-a");
+        ten_layers(&p, &a);
+        assert_eq!(
+            p.back_to(&a, &ends(10)).unwrap(),
+            (Some((Lsn::new(10), h(10))), 1)
+        );
+        assert_eq!(p.layers(&a).list().unwrap(), ends(10));
+        assert_eq!(block0(&p, &a), 10, "the files of Seal 10");
     }
 
     #[test]
@@ -3964,7 +3993,10 @@ mod tests {
         assert!(e.contains("tank/v-b stands on tank/v-a's layer"), "{e}");
         untouched(&p);
         // Layer 9 itself may stay: then nothing the fork stands on goes.
-        assert_eq!(p.back_to(&a, &ends(9)).unwrap(), Some((Lsn::new(9), h(9))));
+        assert_eq!(
+            p.back_to(&a, &ends(9)).unwrap(),
+            (Some((Lsn::new(9), h(9))), 2)
+        );
         assert_eq!(p.layers(&a).list().unwrap(), ends(9));
     }
 
