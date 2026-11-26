@@ -3810,6 +3810,175 @@ pub fn check_state_generation(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// The file in the Warden's `state_dir` that names the block log its
+/// Vessels' datasets are on (P4 spec D102; F-b (a)): the log's id, 32 hex
+/// digits and a newline.
+pub const BLOCK_LOG_ID_FILE: &str = "block-log-id";
+
+/// What [`pair_block_log`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pairing {
+    /// The recorded id.
+    Same,
+    /// No id was recorded: this one is now.  A first start on a node, or
+    /// a state directory from before the id was recorded (W-b (a)).
+    Recorded,
+    /// Another id, and the log holds none of this Warden's Vessels: the
+    /// block log was made anew.  The new id is recorded; every Vessel is
+    /// rebuilt from the store at its start (W-f (a), W-e (a)).
+    Replaced {
+        /// The id recorded before.
+        was: String,
+    },
+}
+
+fn is_log_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Record `id` as the block log of the Warden whose state is in
+/// `state_dir`: written under a temporary name, synced, renamed, and the
+/// directory synced.  The node's operator's re-pair (`taso-ctl block-log
+/// pair`) writes it too.
+pub fn write_block_log_id(state_dir: &Path, id: &str) -> io::Result<()> {
+    use std::io::Write;
+    if !is_log_id(id) {
+        return Err(io::Error::other(format!(
+            "{id:?} is not a block log id (32 hex digits)"
+        )));
+    }
+    let tmp = state_dir.join(format!("{BLOCK_LOG_ID_FILE}.tmp"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(format!("{}\n", id.to_ascii_lowercase()).as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, state_dir.join(BLOCK_LOG_ID_FILE))?;
+    std::fs::File::open(state_dir)?.sync_all()
+}
+
+/// The block log id recorded in `state_dir`, if any.  A file that does
+/// not hold one is refused, not guessed.
+pub fn recorded_block_log_id(state_dir: &Path) -> io::Result<Option<String>> {
+    let path = state_dir.join(BLOCK_LOG_ID_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(t) if is_log_id(t.trim()) => Ok(Some(t.trim().to_ascii_lowercase())),
+        Ok(t) => Err(io::Error::other(format!(
+            "{} holds {:?}, not a block log id",
+            path.display(),
+            t.trim()
+        ))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Check the block log `id` against the one recorded in `state_dir`, and
+/// record it where that is safe (P4 spec D102; W-b (a), W-f (a)).
+/// `mine`: the datasets of this Warden's Vessels that the log holds,
+/// asked only when the ids differ.
+///
+/// Refused, writing nothing, when the ids differ and the log holds a
+/// dataset of one of this Warden's Vessels: it may be another node's log,
+/// or the config may name another block log than before, and the right
+/// one may still hold work that was never shipped.  Only the node's
+/// operator can tell; the refusal says what to check and how to pair the
+/// Warden with this log if it is the right one.
+pub fn pair_block_log(
+    state_dir: &Path,
+    id: &str,
+    mine: impl FnOnce() -> Result<Vec<String>, String>,
+) -> io::Result<Pairing> {
+    let id = id.to_ascii_lowercase();
+    let Some(was) = recorded_block_log_id(state_dir)? else {
+        write_block_log_id(state_dir, &id)?;
+        return Ok(Pairing::Recorded);
+    };
+    if was == id {
+        return Ok(Pairing::Same);
+    }
+    let held = mine().map_err(io::Error::other)?;
+    if held.is_empty() {
+        write_block_log_id(state_dir, &id)?;
+        return Ok(Pairing::Replaced { was });
+    }
+    Err(io::Error::other(format!(
+        "the block log is {id}, and this Warden's state names {was}; the log holds dataset(s) of \
+         its Vessels ({}{}), so it is not a log made anew: it may be another node's, or the config \
+         may name another block log than before.  Nothing was changed.  Check which block log the \
+         config's storage.socket serves.  If this is the right log, pair the Warden with it: \
+         taso-ctl block-log pair --id {id}",
+        held.iter().take(3).cloned().collect::<Vec<_>>().join(", "),
+        if held.len() > 3 {
+            format!(" and {} more", held.len() - 3)
+        } else {
+            String::new()
+        }
+    )))
+}
+
+/// What the Warden says at its start about the block log (P4 spec D102,
+/// D103): whether it is the log its state names ([`pair_block_log`]), and
+/// what `taso-blkd`'s own start cut or set aside.  Returns the lines to
+/// log; an error refuses the Warden's start (W-c (a)).  `has`: whether the
+/// log holds a dataset.
+pub fn block_log_at_start(
+    state_dir: &Path,
+    root: &Dataset,
+    start: &taso_blk::client::LogStart,
+    has: impl Fn(&Dataset) -> Result<bool, String>,
+) -> io::Result<Vec<String>> {
+    let mine = || -> Result<Vec<String>, String> {
+        let rd = std::fs::read_dir(state_dir)
+            .map_err(|e| format!("reading {}: {e}", state_dir.display()))?;
+        let mut out = Vec::new();
+        for e in rd {
+            let name = e.map_err(|e| e.to_string())?.file_name();
+            let Some(hex) = name.to_str().filter(|n| key_of_hex(n).is_some()) else {
+                continue; // not a Vessel's state
+            };
+            let ds =
+                Dataset::new(&format!("{}/v-{hex}", root.as_str())).map_err(|e| e.to_string())?;
+            if has(&ds)? {
+                out.push(ds.to_string());
+            }
+        }
+        out.sort();
+        Ok(out)
+    };
+    let mut lines = Vec::new();
+    match pair_block_log(state_dir, &start.id, mine)? {
+        Pairing::Same => {}
+        Pairing::Recorded => lines.push(format!(
+            "block log {}: recorded as this Warden's (its first start on it)",
+            start.id
+        )),
+        Pairing::Replaced { was } => lines.push(format!(
+            "THE BLOCK LOG WAS REPLACED: it is {}, this Warden's state named {was}, and it holds \
+             none of this Warden's Vessels.  Paired with it.  Each Vessel is rebuilt from the store \
+             at its start; what was not shipped is lost (D99)",
+            start.id
+        )),
+    }
+    if start.cut > 0 {
+        lines.push(format!(
+            "taso-blkd's start cut {} byte(s) from the block log's end: a torn tail, writes after the \
+             last group that was made durable, never promised (D102)",
+            start.cut
+        ));
+    }
+    if let Some(a) = &start.set_aside {
+        lines.push(format!(
+            "DAMAGE IN THE BLOCK LOG: taso-blkd set {} byte(s) aside, from offset {} (the record at \
+             {} no longer verified, below the durable end {} a later group named), into {}.  Seal \
+             layers that lay there are gone from this node: each Vessel they were of is behind its \
+             log and is rebuilt from the store at its start (D103, D99).  The file is kept; the \
+             Warden never deletes it",
+            a.bytes, a.from, a.at, a.durable, a.file
+        ));
+    }
+    Ok(lines)
+}
+
 /// The TTL start kept in file `f`; if none is kept yet, the Warden keeps
 /// `now` there first.  Whoever asks gets what the file holds.
 ///
@@ -3879,6 +4048,21 @@ impl Node {
         // Before anything reads it: state from before the format break is
         // refused, never misread (review G-a).
         check_state_generation(&config.state_dir).map_err(ctx("the state directory"))?;
+        // The block log: this Warden's, and what taso-blkd's start found
+        // (D102, D103).  Another log that holds its Vessels refuses the
+        // Warden's start (W-c (a), W-f (a)).
+        let start = storage
+            .recovered()
+            .map_err(|e| io::Error::other(format!("asking taso-blkd what its start found: {e}")))?;
+        let said = block_log_at_start(&config.state_dir, &config.root, &start, |ds| {
+            Pool::info(&storage, ds)
+                .map(|i| i.is_some())
+                .map_err(|e| e.to_string())
+        })
+        .map_err(ctx("the block log"))?;
+        for line in &said {
+            eprintln!("taso-wardend[{}]: {line}", config.warden.get());
+        }
         // Before the sweep: an agent writing into a file system its killed
         // Warden left frozen (mid-Seal) waits in the kernel and cannot be
         // killed until a thaw (soak, taso-test 2026-11-08).  Thawed, the
@@ -6216,6 +6400,98 @@ mod tests {
             refuse_selinux(&gone).is_err(),
             "no sysfs: cannot tell, refused"
         );
+    }
+
+    /// The block log's identity at the Warden's start (D102; W-b, W-c,
+    /// W-f (a)): recorded at a first start, the same id says nothing, a
+    /// log made anew is paired with and said loudly, and another log that
+    /// holds this Warden's Vessels refuses the start and changes nothing.
+    #[test]
+    fn the_block_log_is_recorded_kept_replaced_or_refused() {
+        use taso_blk::client::LogStart;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let root = Dataset::new("tank/vessels").unwrap();
+        let start = |id: &str| LogStart {
+            id: id.into(),
+            cut: 0,
+            set_aside: None,
+        };
+        let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        let none = |_: &Dataset| Ok(false);
+
+        // First start: recorded, and said.
+        let said = block_log_at_start(state, &root, &start(&a), none).unwrap();
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("recorded as this Warden's"), "{said:?}");
+        assert_eq!(recorded_block_log_id(state).unwrap(), Some(a.clone()));
+        // The same log: nothing to say.
+        assert!(block_log_at_start(state, &root, &start(&a), none)
+            .unwrap()
+            .is_empty());
+
+        // A Vessel of this Warden's, by its state directory.
+        let vessel = "0123456789abcdef0123456789abcdef";
+        std::fs::create_dir(state.join(vessel)).unwrap();
+        let its = format!("tank/vessels/v-{vessel}");
+        let holds_it = |d: &Dataset| Ok(d.as_str() == its);
+
+        // Another log that holds it: refused, nothing written.
+        let e = block_log_at_start(state, &root, &start(&b), holds_it).unwrap_err();
+        let e = e.to_string();
+        assert!(e.contains(&its), "{e}");
+        assert!(
+            e.contains(&format!("taso-ctl block-log pair --id {b}")),
+            "{e}"
+        );
+        assert!(e.contains("Nothing was changed"), "{e}");
+        assert_eq!(recorded_block_log_id(state).unwrap(), Some(a.clone()));
+
+        // A log made anew (none of its Vessels): paired, and said loudly.
+        let said = block_log_at_start(state, &root, &start(&c), none).unwrap();
+        assert!(
+            said[0].starts_with("THE BLOCK LOG WAS REPLACED"),
+            "{said:?}"
+        );
+        assert!(said[0].contains(&a) && said[0].contains(&c), "{said:?}");
+        assert_eq!(recorded_block_log_id(state).unwrap(), Some(c));
+
+        // A file that holds no id is refused, not guessed.
+        std::fs::write(state.join(BLOCK_LOG_ID_FILE), "junk\n").unwrap();
+        assert!(block_log_at_start(state, &root, &start(&a), none).is_err());
+    }
+
+    /// What taso-blkd's start cut or set aside is said in the Warden's
+    /// log (D102, D103).
+    #[test]
+    fn what_the_block_logs_start_found_is_said() {
+        use taso_blk::client::{LogAside, LogStart};
+        let dir = tempfile::tempdir().unwrap();
+        let root = Dataset::new("tank/vessels").unwrap();
+        let id = "d".repeat(32);
+        write_block_log_id(dir.path(), &id).unwrap();
+        let said = block_log_at_start(
+            dir.path(),
+            &root,
+            &LogStart {
+                id: id.clone(),
+                cut: 41,
+                set_aside: Some(LogAside {
+                    bytes: 4096,
+                    at: 8192,
+                    from: 8000,
+                    durable: 20000,
+                    file: "blk.log.damaged-8000".into(),
+                }),
+            },
+            |_| Ok(false),
+        )
+        .unwrap();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("cut 41 byte(s)") && said[0].contains("torn tail"));
+        assert!(said[1].starts_with("DAMAGE IN THE BLOCK LOG"));
+        assert!(said[1].contains("blk.log.damaged-8000") && said[1].contains("4096"));
+        assert!(said[1].contains("rebuilt from the store"));
     }
 
     /// Review G-a: the state directory's generation.  Empty or missing:
