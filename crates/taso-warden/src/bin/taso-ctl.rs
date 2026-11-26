@@ -131,6 +131,7 @@ const USAGE: &str = "usage: taso-ctl init [--data DIR] [--size-gib N] [--rootfs 
        taso-ctl proposals <vessel> [--config PATH]
        taso-ctl approve <vessel> <op> [--config PATH]
        taso-ctl deny <vessel> <op> [reason...] [--config PATH]
+       taso-ctl block-log pair --id <log id> [--config PATH]
        taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>";
 
 const CONFIG: &str = "/etc/taso/warden.json";
@@ -183,6 +184,9 @@ fn main() -> ExitCode {
         Some("proposals") => proposals(&args[1..]),
         Some("approve") => decide(&args[1..], true),
         Some("deny") => decide(&args[1..], false),
+        Some("block-log") if args.get(1).map(String::as_str) == Some("pair") => {
+            block_log_pair(&args[2..])
+        }
         Some(_) if args.len() == 3 && args[1] == "explain" => explain_cmd(&args[0], &args[2]),
         Some(_) => usage("unknown command"),
         None => usage("a command is needed"),
@@ -744,6 +748,92 @@ fn agent_limits(config: &Config) -> String {
     out
 }
 
+// ── block-log pair ────────────────────────────────────────────────────
+
+/// The arguments of `block-log pair`: the id typed, and the config.
+fn pair_args(args: &[String]) -> Result<(String, &str), String> {
+    let (mut id, mut path) = (None, CONFIG);
+    let mut it = args.iter();
+    while let Some(w) = it.next() {
+        match w.as_str() {
+            "--id" => id = Some(it.next().ok_or("--id needs a value")?.to_ascii_lowercase()),
+            "--config" => path = it.next().ok_or("--config needs a value")?,
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    Ok((
+        id.ok_or("--id <log id> is needed: the id the Warden's refusal named")?,
+        path,
+    ))
+}
+
+/// The node's operator pairs the Warden with the block log its config
+/// serves (P4 spec D102; W-d (a), W-f (a)): after the Warden refused a
+/// log with another id that holds its Vessels, and the operator has
+/// checked that this log is the right one.  The id must be typed, and
+/// must be the log's own: a re-pair never happens by reflex or by a
+/// stale id.  Run where the Warden runs, with the Warden stopped (it
+/// does not start on such a log anyway).
+///
+/// After it, each Vessel whose dataset is not on this log is rebuilt from
+/// the store at its start, and what it had not shipped is lost (W-e (a)).
+fn block_log_pair(args: &[String]) -> ExitCode {
+    let (id, path) = match pair_args(args) {
+        Ok(a) => a,
+        Err(e) => return usage(&e),
+    };
+    let config = match read_config(path) {
+        Ok(c) => c,
+        Err(e) => return usage(&format!("{path}: {e}")),
+    };
+    let socket = &config.storage.socket;
+    let live = match taso_blk::client::Client::connect(socket).and_then(|mut c| c.recovered()) {
+        Ok(r) => r.id,
+        Err(e) => {
+            eprintln!(
+                "taso-ctl: the block log at {} does not answer ({e}): nothing changed",
+                socket.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if live != id {
+        eprintln!(
+            "taso-ctl: the block log at {} is {live}, not {id}: nothing changed",
+            socket.display()
+        );
+        return ExitCode::from(1);
+    }
+    let state = &config.state_dir;
+    let was = match taso_warden::daemon::recorded_block_log_id(state) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("taso-ctl: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if was.as_deref() == Some(id.as_str()) {
+        println!("the Warden is already paired with block log {id}: nothing to do");
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "pairing the Warden ({}) with block log {id}{}.  At their next start, Vessels whose datasets \
+         are not on this log are rebuilt from the store; what they had not shipped is lost.",
+        state.display(),
+        was.map_or(String::new(), |w| format!(" (it named {w})"))
+    );
+    match taso_warden::daemon::write_block_log_id(state, &id) {
+        Ok(()) => {
+            println!("paired");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("taso-ctl: writing {}: {e}", state.display());
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn read_config(path: &str) -> Result<Config, String> {
     std::fs::read_to_string(path)
         .map_err(|e| e.to_string())
@@ -1196,6 +1286,21 @@ mod tests {
     /// Audit 2026-11-09, `init` made the block log's socket directory under
     /// `/run`, which a reboot empties, and nothing made it again at boot.
     /// It is kept by a tmpfiles.d entry, for both run directories.
+    /// `block-log pair` needs the id typed (W-d (a)): the id the
+    /// Warden's refusal named, never a bare "yes".
+    #[test]
+    fn block_log_pair_needs_the_id_typed() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(pair_args(&a(&[]))
+            .unwrap_err()
+            .contains("--id <log id> is needed"));
+        assert!(pair_args(&a(&["--yes"])).is_err());
+        let id = "AB".repeat(16);
+        let args = a(&["--id", &id, "--config", "/x.json"]);
+        let (got, path) = pair_args(&args).unwrap();
+        assert_eq!((got.as_str(), path), ("ab".repeat(16).as_str(), "/x.json"));
+    }
+
     #[test]
     fn the_run_directories_are_kept_at_boot() {
         assert_eq!(
