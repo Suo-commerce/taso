@@ -160,6 +160,10 @@ pub trait Blkd {
     fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError>;
     /// Make every change so far durable.
     fn flush(&mut self) -> Result<(), LayerError>;
+    /// What the daemon's start found in its log: the log's identity, the
+    /// bytes it cut as a torn tail, and a damaged part it set aside (P4
+    /// spec D102, D103).  The Warden asks at its own start.
+    fn recovered(&mut self) -> Result<taso_blk::client::LogStart, LayerError>;
 }
 
 /// `taso-blkd` over its socket.  Connects on first use and again after a
@@ -261,6 +265,9 @@ impl Blkd for Daemon {
     }
     fn flush(&mut self) -> Result<(), LayerError> {
         self.call(|c| c.flush()).map(|_| ())
+    }
+    fn recovered(&mut self) -> Result<taso_blk::client::LogStart, LayerError> {
+        self.call(|c| c.recovered())
     }
 }
 
@@ -650,6 +657,11 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
             maker: self.maker.clone(),
             spool: self.spool.clone(),
         }
+    }
+
+    /// What the daemon's start found in its log ([`Blkd::recovered`]).
+    pub fn recovered(&self) -> Result<taso_blk::client::LogStart, LayerError> {
+        conn(&self.maker, &self.blkd).recovered()
     }
 
     /// This call's connection ([`Conn`]).
@@ -2132,6 +2144,10 @@ mod tests {
         /// (the daemon or the connection going away between two
         /// commands); `None`: it succeeds.
         fail_unseal_after: Option<usize>,
+        /// What the daemon's start says it found (cut, set aside).
+        start: Option<taso_blk::client::LogStart>,
+        /// Another id than the store's, as another log would give.
+        id: Option<String>,
     }
 
     impl StoreBlkd {
@@ -2156,6 +2172,8 @@ mod tests {
                 fail_seal: false,
                 ghosts: Vec::new(),
                 fail_unseal_after: None,
+                start: None,
+                id: None,
             }
         }
     }
@@ -2274,6 +2292,20 @@ mod tests {
             self.store.flush()?;
             Ok(())
         }
+        /// The store's own id; what a start found is set by a test
+        /// ([`StoreBlkd::start`]), nothing by default.
+        fn recovered(&mut self) -> Result<taso_blk::client::LogStart, LayerError> {
+            let mut r = self.start.clone().unwrap_or(taso_blk::client::LogStart {
+                id: String::new(),
+                cut: 0,
+                set_aside: None,
+            });
+            r.id = self
+                .id
+                .clone()
+                .unwrap_or_else(|| self.store.id().iter().map(|b| format!("{b:02x}")).collect());
+            Ok(r)
+        }
     }
 
     /// `RefCell`'s `borrow`/`borrow_mut` over an `RwLock`: the fake's
@@ -2378,6 +2410,9 @@ mod tests {
         }
         fn flush(&mut self) -> Result<(), LayerError> {
             self.0.lock().unwrap().flush()
+        }
+        fn recovered(&mut self) -> Result<taso_blk::client::LogStart, LayerError> {
+            self.0.lock().unwrap().recovered()
         }
     }
 
@@ -3998,6 +4033,25 @@ mod tests {
             (Some((Lsn::new(9), h(9))), 2)
         );
         assert_eq!(p.layers(&a).list().unwrap(), ends(9));
+    }
+
+    /// The pool asks taso-blkd what its start found: the log's id, as 32
+    /// hex digits of the store's own id (D102).
+    #[test]
+    fn the_pool_asks_what_the_daemons_start_found() {
+        let p = pool();
+        let r = p.recovered().unwrap();
+        let want: String = p
+            .blkd
+            .lock()
+            .unwrap()
+            .store
+            .id()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(r.id, want);
+        assert_eq!((r.cut, r.set_aside), (0, None));
     }
 
     #[test]
