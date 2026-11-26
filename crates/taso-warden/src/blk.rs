@@ -4105,6 +4105,7 @@ mod tests {
             "a block-log Seal per Seal record"
         );
 
+        crate::vessel::tests::ship_all(&host, v.id());
         let child = host.fork(&v, s1, b"child-1").unwrap();
         let info = host.pool.info(child.dataset()).unwrap().unwrap();
         assert_eq!(
@@ -4147,6 +4148,7 @@ mod tests {
             !layers.fold(s3.lsn).unwrap(),
             "the newest: its branch stands on it"
         );
+        crate::vessel::tests::ship_all(&host, v.id());
         let child = host.fork(&v, s2, b"child-1").unwrap();
         assert!(!layers.fold(s2.lsn).unwrap(), "a fork stands on it");
         assert!(layers.fold(s1.lsn).unwrap());
@@ -4222,6 +4224,7 @@ mod tests {
         )
         .unwrap();
 
+        crate::vessel::tests::ship_all(&a, v.id());
         let mut child = a.fork(&v, s1, b"child").unwrap();
         let pc = packs(&a, child.id());
         let cb = child.seal_birth().unwrap().seal;
