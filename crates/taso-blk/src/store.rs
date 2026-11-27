@@ -609,6 +609,11 @@ pub struct Store {
     prev: [u8; HASH],
     stats: Stats,
     poisoned: bool,
+    /// Tests: a filesystem with room for the log's file up to this many
+    /// bytes; a write that would grow it further fails `StorageFull`, as
+    /// a full ext4 does (maturity review finding 4).
+    #[cfg(test)]
+    room: Option<u64>,
     /// Branches with a record since the last Flush (write, discard, fork,
     /// name, reset, unseal, Seal, drop): their data is in no group yet.
     touched: HashSet<LayerId>,
@@ -662,6 +667,8 @@ impl Store {
                 ..Stats::default()
             },
             poisoned: false,
+            #[cfg(test)]
+            room: None,
             touched: HashSet::new(),
             covered: HashMap::new(),
         })
@@ -840,6 +847,8 @@ impl Store {
             prev: good_prev,
             stats,
             poisoned: false,
+            #[cfg(test)]
+            room: None,
             touched: HashSet::new(),
             covered: HashMap::new(),
         };
@@ -1517,7 +1526,18 @@ impl Store {
         let hash = encode_record(&mut rec, &self.prev, kind, body);
         self.stats.write_hash_us += t.elapsed().as_micros() as u64;
         let t = std::time::Instant::now();
-        if let Err(e) = self.file.write_all_at(&rec, self.tail) {
+        #[cfg(test)]
+        let r = if self
+            .room
+            .is_some_and(|room| self.tail + rec.len() as u64 > room)
+        {
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        } else {
+            self.file.write_all_at(&rec, self.tail)
+        };
+        #[cfg(not(test))]
+        let r = self.file.write_all_at(&rec, self.tail);
+        if let Err(e) = r {
             self.poisoned = true;
             return Err(e.into());
         }
@@ -2617,6 +2637,60 @@ mod tests {
 
     fn chmod(p: &Path, m: u32) {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    /// Maturity review of e4a37b2, finding 4 (F4-a (a)): a write that does
+    /// not fit on the log's filesystem is refused, and refused alone.  The
+    /// map does not move, the store is not poisoned, the writes before it
+    /// read back, a Seal still closes in the room held back for it, and once
+    /// there is room the same write goes through.  The room the store keeps
+    /// ahead of its tail is not a torn tail at the next open.
+    #[test]
+    fn a_write_that_does_not_fit_is_refused_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let a = s.fork(root).unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(0xB0, 1), false).unwrap();
+        s.flush().unwrap();
+        // The filesystem: room for some forty more blocks.
+        s.room = Some(s.tail + 40 * BLOCK);
+        let mut refused_at = None;
+        for lba in 0..200 {
+            match s.write(a, lba, &blocks(lba as u8 + 1, 1), false) {
+                Ok(()) => {}
+                Err(StoreError::Io(e)) if e.kind() == io::ErrorKind::StorageFull => {
+                    refused_at = Some(lba);
+                    break;
+                }
+                Err(e) => panic!("block {lba}: {e}"),
+            }
+        }
+        let at = refused_at.expect("a write was refused before 200 blocks");
+        assert!(at > 0, "the room held some writes");
+        assert!(!s.is_poisoned(), "one refused write poisoned the store");
+        // The refused write changed nothing; the others read back.
+        assert_eq!(
+            read1(&s, a, at),
+            0,
+            "the refused block reads as never written"
+        );
+        assert_eq!(read1(&s, a, at - 1), at as u8);
+        assert_eq!(read1(&s, b, 0), 0xB0, "another branch reads");
+        // A Seal closes in the room held back for it.
+        s.seal(a).unwrap();
+        // Room again: the same write goes through.
+        s.room = None;
+        let a2 = s.fork(root).unwrap();
+        s.write(a2, at, &blocks(0xA2, 1), false).unwrap();
+        s.flush().unwrap();
+        drop(s);
+        // The room kept ahead of the tail is not a torn tail.
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.cut, 0, "the reserve was reported as a torn tail");
+        assert_eq!((read1(&s, a2, at), read1(&s, b, 0)), (0xA2, 0xB0));
     }
 
     /// Maturity review of e4a37b2, finding 3: a checkpoint's sync and a
