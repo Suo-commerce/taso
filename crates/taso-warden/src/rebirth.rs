@@ -189,6 +189,26 @@ pub struct Rebuilt {
 }
 
 /// What the dataset step of a rebirth did beside receiving.
+/// How [`Host::take_over_here`] took a Vessel over onto this node's old
+/// state of it.
+#[derive(Debug)]
+pub enum TakenOver {
+    /// The old state held the coordinator's head: opened as it was.
+    Opened(crate::chronicle::Recovery),
+    /// The old state was of an earlier holding: kept aside, the dataset
+    /// put back, the Vessel reborn from the store.
+    Rebuilt {
+        /// The rebirth.
+        reborn: Reborn,
+        /// The section end the dataset was put back at, if any.
+        stood_on: Option<Position>,
+        /// Where the old state directory was kept.
+        kept: Option<PathBuf>,
+        /// The blocks of the old filesystem put-back discarded.
+        discarded_blocks: Option<u64>,
+    },
+}
+
 struct Placed {
     stood_on: Option<Position>,
     kept: Option<PathBuf>,
@@ -357,6 +377,58 @@ impl<P: Pool> Host<P> {
         ))
     }
 
+    /// Take the Vessel `id` over from another Warden (`claim`, a
+    /// takeover) onto this node's old state of it (D&D 5-a, 5-b (a),
+    /// 2026-11-27).  The old state is opened as it is only when it holds
+    /// the coordinator's head (a frame at its lsn with its hash: what a
+    /// crashed holder on this node leaves) and is not behind its log
+    /// ([`Host::behind`]).  Anything else (a log that ends before the
+    /// head, one that went another way after the takeover that took the
+    /// Vessel from this node, a dataset gone or a Seal without its layer)
+    /// is the state of an earlier holding: it is kept aside, the dataset
+    /// put back at its newest layer a shipped section ends at, and the
+    /// Vessel reborn from the store, all before the holder is fenced.
+    /// Opened that way, a takeover fenced first and then failed, and the
+    /// Vessel ran on neither node (the maturity review's finding 5).
+    pub fn take_over_here<S: ObjectStore, X: Sender>(
+        &self,
+        id: ChronicleId,
+        packs: &Packs<S, X>,
+        claim: Claim,
+        layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
+    ) -> Result<(Vessel<P::Layers>, TakenOver), VesselError> {
+        if claim == Claim::Mine {
+            return Err(VesselError::LocalState(
+                "a takeover names the Warden it takes the Vessel from".into(),
+            ));
+        }
+        if self.holds_head(id)? && self.behind(id)?.is_none() {
+            let (v, r) = self.open_as(id, claim)?;
+            return Ok((v, TakenOver::Opened(r)));
+        }
+        let (vessel, reborn, placed) = self.rebirth_inner(id, packs, claim, layer, true)?;
+        Ok((
+            vessel,
+            TakenOver::Rebuilt {
+                reborn,
+                stood_on: placed.stood_on,
+                kept: placed.kept,
+                discarded_blocks: placed.discarded_blocks,
+            },
+        ))
+    }
+
+    /// Whether this node's log of `id` holds the coordinator's head: a
+    /// frame at its lsn with its hash (read, nothing claimed).
+    fn holds_head(&self, id: ChronicleId) -> Result<bool, VesselError> {
+        let head = self.coord.head(id).map_err(VesselError::Coord)?;
+        let frames = crate::chronicle::read_log(&self.dir_for(id))
+            .map_err(|e| VesselError::LocalState(format!("{}: {e}", self.dir_for(id).display())))?;
+        Ok(frames
+            .iter()
+            .any(|f| f.envelope.lsn == head.lsn && f.envelope.hash == head.hash))
+    }
+
     /// Continue the Vessel `id` on this node from what `packs` holds up to
     /// the coordinator's shipped anchor (see the module docs), taking it
     /// over from whoever holds it as read now.  A caller that decided from
@@ -435,31 +507,14 @@ impl<P: Pool> Host<P> {
                 aside.display()
             )));
         }
-        let (anchor, chain, lineage) = self.verify(id, packs, &dataset, layer, mine)?;
+        let (anchor, chain, lineage) = self.verify(id, packs, &dataset, layer, mine, rebuild)?;
 
-        // 2. Fence, on the claim: from here on the anchor cannot move
-        //    under us, and a stale decision changes nothing.
-        let expected =
-            Chronicle::<P::Layers>::expected(self.coord.as_ref(), id, self.warden, claim)
-                .map_err(VesselError::Coord)?;
-        self.coord
-            .transfer_if(id, self.warden, expected)
-            .map_err(VesselError::Coord)?;
-
-        // 3. The anchor may have moved between the check and the fence
-        //    (the holder shipped more): verify again against what is
-        //    anchored now.  This second check is the one that counts.
-        let anchored_now = self.coord.shipped(id).map_err(VesselError::Coord)?;
-        let (anchor, chain, lineage) = if anchored_now == anchor {
-            (anchor, chain, lineage)
-        } else {
-            self.verify(id, packs, &dataset, layer, mine)?
-        };
-
-        // 4. A rebuild keeps the state directory the Vessel had, beside
-        //    it (D99: nothing is deleted).  From here a stop is finished
-        //    by the next start's rebirth: no state directory, a Vessel
-        //    this Warden holds.
+        // 2. A rebuild keeps the state directory the Vessel had, beside
+        //    it (D99: nothing is deleted).  Before the fence (D&D 5-a): a
+        //    takeover onto this node's old state changes only that stale
+        //    state until the holder is fenced, so a refusal here leaves
+        //    the holder running.  From here a stop is finished by the
+        //    next start's rebirth (no state directory).
         let mut kept = None;
         if rebuild && dir.exists() {
             std::fs::rename(&dir, &aside).map_err(|e| {
@@ -472,17 +527,20 @@ impl<P: Pool> Host<P> {
             kept = Some(aside);
         }
 
-        // 5. The dataset.  This Warden's own, if it is here, is first put
+        // 3. The dataset, before the fence too (D&D 5-a): this Warden's
+        //    own, or the old state of a takeover onto this node, is put
         //    back at the newest Seal layer it has that a section ends at:
         //    out of use, every newer layer taken away, what was written
-        //    after it discarded.
+        //    after it discarded.  Refused (in use, a fork on a layer that
+        //    would go), the state directory is put back and nothing was
+        //    claimed.
         let ends: Vec<(Lsn, HashVal)> = chain
             .seals
             .iter()
             .map(|s| (s.fs.to.lsn, s.fs.to.hash))
             .collect();
         let mut discarded_blocks = None;
-        if mine
+        if (mine || rebuild)
             && self
                 .pool
                 .info(&dataset)
@@ -511,6 +569,35 @@ impl<P: Pool> Host<P> {
                 }
             };
         }
+
+        // 4. Fence, on the claim: from here on the anchor cannot move
+        //    under us, and a stale decision changes nothing.  A fence
+        //    refused after a takeover's steps 2 and 3 leaves this node's
+        //    stale state aside and put back: the next start here reborn.
+        let expected =
+            Chronicle::<P::Layers>::expected(self.coord.as_ref(), id, self.warden, claim)
+                .map_err(VesselError::Coord)?;
+        self.coord
+            .transfer_if(id, self.warden, expected)
+            .map_err(VesselError::Coord)?;
+
+        // 5. The anchor may have moved between the check and the fence
+        //    (the holder shipped more): verify again against what is
+        //    anchored now.  This second check is the one that counts; the
+        //    dataset stands at a section's end, which a longer chain
+        //    still holds.
+        let anchored_now = self.coord.shipped(id).map_err(VesselError::Coord)?;
+        let (anchor, chain, lineage) = if anchored_now == anchor {
+            (anchor, chain, lineage)
+        } else {
+            self.verify(id, packs, &dataset, layer, mine, rebuild)?
+        };
+        let ends: Vec<(Lsn, HashVal)> = chain
+            .seals
+            .iter()
+            .map(|s| (s.fs.to.lsn, s.fs.to.hash))
+            .collect();
+
         // The sections at or below the newest section end on the node
         // are not received: that layer holds them (an interrupted
         // rebirth received them, or the layers below it were folded
@@ -611,6 +698,12 @@ impl<P: Pool> Host<P> {
     /// One past the shipped anchor is in the way of a takeover; of a
     /// Vessel this Warden holds (`mine`) it is a Seal that was never
     /// shipped, which the dataset step takes away ([`Pool::back_to`]).
+    /// With `rebuild` (D99, and a takeover onto this node's old state,
+    /// D&D 5-a), every layer above the newest one that a shipped section
+    /// ends at is taken away by that step, whatever record it was made
+    /// for: the Seals of a history the shipped log no longer holds (this
+    /// node's own, never shipped, before another Warden took the Vessel
+    /// over).  A layer at or below it must still be the shipped log's.
     fn verify<S: ObjectStore, X: Sender>(
         &self,
         id: ChronicleId,
@@ -618,6 +711,7 @@ impl<P: Pool> Host<P> {
         dataset: &crate::storage::Dataset,
         layer: &dyn Fn(ChronicleId, HashVal) -> Result<(), VesselError>,
         mine: bool,
+        rebuild: bool,
     ) -> Result<(Position, Chain, LineageRecord), VesselError> {
         let anchor = self.coord.shipped(id).map_err(VesselError::Coord)?;
         if anchor.lsn == Lsn::new(0) {
@@ -640,7 +734,24 @@ impl<P: Pool> Host<P> {
                 .filter_map(seal_at)
                 .map(|p| (p.lsn, p.hash))
                 .collect();
+            // The layer the dataset step puts the dataset back at.
+            let target = rebuild
+                .then(|| {
+                    here.iter()
+                        .filter(|l| {
+                            chain
+                                .seals
+                                .iter()
+                                .any(|s| (s.fs.to.lsn, s.fs.to.hash) == **l)
+                        })
+                        .map(|(lsn, _)| *lsn)
+                        .max()
+                })
+                .flatten();
             for (lsn, hash) in &here {
+                if rebuild && target.is_none_or(|t| *lsn > t) {
+                    continue; // taken away by the dataset step
+                }
                 match shipped.get(lsn) {
                     Some(h) if h == hash => {}
                     Some(_) => {
