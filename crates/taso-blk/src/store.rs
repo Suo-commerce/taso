@@ -1003,6 +1003,15 @@ impl Store {
     /// Returns the Flush record's sequence number.
     pub fn flush(&mut self) -> Result<u64, StoreError> {
         let lsn = self.flush_pending()?;
+        #[cfg(test)]
+        if self
+            .shared
+            .fail_next_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.poisoned = true;
+            return Err(io::Error::other("test: the sync failed").into());
+        }
         let t = std::time::Instant::now();
         if let Err(e) = self.file.sync_data() {
             self.poisoned = true;
@@ -2372,6 +2381,9 @@ struct SyncState {
 pub struct LogFile {
     file: RwLock<File>,
     durable: std::sync::Mutex<DurableEnd>,
+    /// Tests: the next sync of the store's own (`Store::flush`) fails.
+    #[cfg(test)]
+    fail_next_sync: std::sync::atomic::AtomicBool,
 }
 
 /// What a Flush record says of the log ([module docs](self)): how far it
@@ -2391,6 +2403,8 @@ impl LogFile {
         Self {
             file: RwLock::new(file),
             durable: std::sync::Mutex::default(),
+            #[cfg(test)]
+            fail_next_sync: Default::default(),
         }
     }
 
@@ -2564,6 +2578,36 @@ mod tests {
 
     fn chmod(p: &Path, m: u32) {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    }
+
+    /// Maturity review of e4a37b2, finding 3: a checkpoint's sync and a
+    /// device flush's group commit sync one file description.  When the
+    /// checkpoint's `fdatasync` fails, the kernel reports the error to that
+    /// call only; a sync after it can return ok with the data never written.
+    /// So once the store has seen a failed sync, the Syncer must not answer
+    /// any later sync as durable, and the device flush is refused.
+    #[test]
+    fn a_failed_checkpoint_sync_refuses_the_syncers_next_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = new_store(&dir);
+        let sync = s.syncer().unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        // A device flush ends its group under the lock ...
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        let lsn = s.flush_pending().unwrap();
+        // ... and before it syncs outside the lock, a checkpoint's sync fails.
+        s.shared
+            .fail_next_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(s.checkpoint().is_err(), "the checkpoint's sync failed");
+        assert!(s.is_poisoned());
+        // The device flush's sync now: on a real disk it could return ok,
+        // the error already taken by the checkpoint's call.  Refused.
+        assert!(
+            matches!(sync.durable(lsn), Err(StoreError::Poisoned)),
+            "the Syncer answered a sync after a failed one"
+        );
     }
 
     /// Audit 2026-11-16, S1: a Vessel's bytes sit in the log and its
