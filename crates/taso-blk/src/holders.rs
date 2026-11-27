@@ -27,9 +27,12 @@ pub struct Holder {
     pub comm: String,
     /// Its mount namespace, as `ns/mnt` reads (`mnt:[4026531841]`).
     pub mnt_ns: String,
-    /// How it holds it: "mounted at …" with the mount's propagation, "open",
-    /// "working directory", "root directory", "open file …".
-    pub how: String,
+    /// The mounts in its mount table that hold it: "at …" with the
+    /// mount's propagation.  Every process of a namespace sees the same.
+    pub mounted: Vec<String>,
+    /// How it uses it itself: "open", "working directory", "root
+    /// directory", "open file …".
+    pub uses: Vec<String>,
 }
 
 /// The processes under `proc` whose mount table has a mount on `dir`, or
@@ -37,23 +40,24 @@ pub struct Holder {
 pub fn of_mount(proc: &Path, dir: &Path) -> Vec<Holder> {
     let mut out = Vec::new();
     for (pid, p) in processes(proc) {
-        let mut hows = Vec::new();
+        let mut mounted = Vec::new();
         for m in mounts(&p) {
             if m.point == dir {
-                hows.push(format!("mounted at {} ({})", m.point.display(), m.tags));
+                mounted.push(format!("at {} ({})", m.point.display(), m.tags));
             }
         }
+        let mut uses = Vec::new();
         for (name, what) in [("cwd", "working directory"), ("root", "root directory")] {
             if std::fs::read_link(p.join(name)).is_ok_and(|t| t.starts_with(dir)) {
-                hows.push(what.to_string());
+                uses.push(what.to_string());
             }
         }
         for t in open_files(&p) {
             if t.starts_with(dir) {
-                hows.push(format!("open file {}", t.display()));
+                uses.push(format!("open file {}", t.display()));
             }
         }
-        push(&mut out, pid, &p, hows);
+        push(&mut out, pid, &p, mounted, uses);
     }
     out
 }
@@ -65,64 +69,101 @@ pub fn of_device(proc: &Path, dev: &Path) -> Vec<Holder> {
     let number = std::fs::metadata(dev).ok().map(|m| device_number(m.rdev()));
     let mut out = Vec::new();
     for (pid, p) in processes(proc) {
-        let mut hows = Vec::new();
+        let mut mounted = Vec::new();
         for m in mounts(&p) {
             if Some(m.device.as_str()) == number.as_deref() || m.source == dev {
-                hows.push(format!("mounted at {} ({})", m.point.display(), m.tags));
+                mounted.push(format!("at {} ({})", m.point.display(), m.tags));
             }
         }
+        let mut uses = Vec::new();
         if open_files(&p).iter().any(|t| t == dev) {
-            hows.push("open".to_string());
+            uses.push("open".to_string());
         }
-        push(&mut out, pid, &p, hows);
+        push(&mut out, pid, &p, mounted, uses);
     }
     out
 }
 
-/// One line for an error message: the holders grouped by mount
-/// namespace, the caller's own namespace named as such, at most `most`
-/// processes listed (and how many more).  "nobody found" when the list is
-/// empty: whoever held it let go before it was looked for.
+/// One line for an error message.  First every process that uses it
+/// itself (open, working or root directory under it), all of them; then
+/// each mount namespace whose mount table holds it, once, with the
+/// mount's propagation, how many processes are in it and one of them
+/// (every process of a namespace sees the same mounts: listing them would
+/// hide the few that matter, as the first report on taso-test did).  The
+/// caller's own namespace is named as such; at most `most` lines of each
+/// kind.  "nobody found" when nothing holds it: whoever held it let go
+/// before it was looked for.
 pub fn report(holders: &[Holder], own_ns: Option<&str>, most: usize) -> String {
     if holders.is_empty() {
         return "held by: nobody found (whoever held it had let go when it was looked for)"
             .to_string();
     }
-    let mut namespaces: Vec<&str> = holders.iter().map(|h| h.mnt_ns.as_str()).collect();
+    let users: Vec<String> = holders
+        .iter()
+        .filter(|h| !h.uses.is_empty())
+        .map(|h| {
+            format!(
+                "{} {} in {}: {}",
+                h.pid,
+                h.comm,
+                h.mnt_ns,
+                h.uses.join(", ")
+            )
+        })
+        .collect();
+    let mut namespaces: Vec<&str> = holders
+        .iter()
+        .filter(|h| !h.mounted.is_empty())
+        .map(|h| h.mnt_ns.as_str())
+        .collect();
     namespaces.sort_unstable();
     namespaces.dedup();
-    let mut parts = Vec::new();
-    let mut listed = 0;
-    for ns in &namespaces {
-        let here: Vec<&Holder> = holders.iter().filter(|h| h.mnt_ns == *ns).collect();
-        let mine = if own_ns == Some(*ns) {
-            " (this process's)"
-        } else {
-            ""
-        };
-        let mut who = Vec::new();
-        for h in &here {
-            if listed < most {
-                who.push(format!("{} {}: {}", h.pid, h.comm, h.how));
-                listed += 1;
-            }
+    let mounts: Vec<String> = namespaces
+        .iter()
+        .map(|ns| {
+            let here: Vec<&Holder> = holders
+                .iter()
+                .filter(|h| h.mnt_ns == *ns && !h.mounted.is_empty())
+                .collect();
+            let mine = if own_ns == Some(*ns) {
+                " (this process's)"
+            } else {
+                ""
+            };
+            format!(
+                "{ns}{mine}: mounted {}, {} process(es), e.g. {} {}",
+                here[0].mounted.join(" and "),
+                here.len(),
+                here[0].pid,
+                here[0].comm
+            )
+        })
+        .collect();
+    let capped = |v: &[String]| {
+        let mut s = v.iter().take(most).cloned().collect::<Vec<_>>().join("; ");
+        if v.len() > most {
+            s.push_str(&format!("; and {} more", v.len() - most));
         }
-        if !who.is_empty() {
-            parts.push(format!("{ns}{mine}: {}", who.join(", ")));
-        }
+        s
+    };
+    let mut out = String::from("held by");
+    if users.is_empty() {
+        out.push_str(" no process using it itself");
+    } else {
+        out.push_str(&format!(
+            " {} process(es) using it: {}",
+            users.len(),
+            capped(&users)
+        ));
     }
-    let more = holders.len().saturating_sub(listed);
-    format!(
-        "held by {} process(es) in {} mount namespace(s): {}{}",
-        holders.len(),
-        namespaces.len(),
-        parts.join("; "),
-        if more > 0 {
-            format!("; and {more} more")
-        } else {
-            String::new()
-        }
-    )
+    if !mounts.is_empty() {
+        out.push_str(&format!(
+            "; mounted in {} mount namespace(s): {}",
+            mounts.len(),
+            capped(&mounts)
+        ));
+    }
+    out
 }
 
 /// This process's own mount namespace under `proc`.
@@ -132,8 +173,8 @@ pub fn own_ns(proc: &Path) -> Option<String> {
         .map(|t| t.display().to_string())
 }
 
-fn push(out: &mut Vec<Holder>, pid: u32, p: &Path, hows: Vec<String>) {
-    if hows.is_empty() {
+fn push(out: &mut Vec<Holder>, pid: u32, p: &Path, mounted: Vec<String>, uses: Vec<String>) {
+    if mounted.is_empty() && uses.is_empty() {
         return;
     }
     let comm = std::fs::read_to_string(p.join("comm"))
@@ -146,7 +187,8 @@ fn push(out: &mut Vec<Holder>, pid: u32, p: &Path, hows: Vec<String>) {
         pid,
         comm,
         mnt_ns,
-        how: hows.join(", "),
+        mounted,
+        uses,
     });
 }
 
@@ -283,7 +325,7 @@ mod tests {
         let slave = line(90, "259:7", MNT, "master:12", "/dev/ublkb7");
         process(proc, 1, "systemd", HOST, &shared);
         process(proc, 812, "(udev-worker)", UDEV, &slave);
-        let busy = process(proc, 900, "sh", HOST, "");
+        let busy = process(proc, 900, "sh", HOST, &shared);
         std::fs::remove_file(busy.join("cwd")).unwrap();
         symlink(format!("{MNT}/sub"), busy.join("cwd")).unwrap();
         process(
@@ -296,34 +338,52 @@ mod tests {
         let h = of_mount(proc, Path::new(MNT));
         assert_eq!(
             h.iter()
-                .map(|h| (h.pid, h.how.as_str()))
+                .map(|h| (h.pid, h.mounted.len(), h.uses.clone()))
                 .collect::<Vec<_>>(),
             [
-                (1, format!("mounted at {MNT} (shared:12)").as_str()),
-                (812, format!("mounted at {MNT} (master:12)").as_str()),
-                (900, "working directory"),
+                (1, 1, vec![]),
+                (812, 1, vec![]),
+                (900, 1, vec!["working directory".to_string()]),
             ]
         );
         let r = report(&h, Some(HOST), 10);
-        assert!(
-            r.starts_with("held by 3 process(es) in 2 mount namespace(s): "),
-            "{r}"
+        assert_eq!(
+            r,
+            format!(
+                "held by 1 process(es) using it: 900 sh in {HOST}: working directory; \
+                 mounted in 2 mount namespace(s): \
+                 {HOST} (this process's): mounted at {MNT} (shared:12), 2 process(es), e.g. 1 systemd; \
+                 {UDEV}: mounted at {MNT} (master:12), 1 process(es), e.g. 812 (udev-worker)"
+            )
         );
+        let one = report(&h, Some(HOST), 1);
+        assert!(one.ends_with("e.g. 1 systemd; and 1 more"), "{one}");
+    }
+
+    /// The first report on taso-test (2026-11-27) listed every process of
+    /// the host's namespace, each seeing the host's own mount, and the
+    /// cap ran out before any that mattered.  A user of the mount in
+    /// another namespace comes first, however many processes see it.
+    #[test]
+    fn a_user_is_never_hidden_behind_the_processes_that_only_see_the_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path();
+        let shared = line(40, "259:7", MNT, "shared:12", "/dev/ublkb7");
+        for pid in 1..=400 {
+            process(proc, pid, "kworker", HOST, &shared);
+        }
+        let slave = line(90, "259:7", MNT, "master:12", "/dev/ublkb7");
+        let svc = process(proc, 4000, "chronyd", "mnt:[4026532400]", &slave);
+        symlink(format!("{MNT}/f"), svc.join("fd/7")).unwrap();
+        let r = report(&of_mount(proc, Path::new(MNT)), Some(HOST), 12);
         assert!(
-            r.contains(&format!("{HOST} (this process's): 1 systemd")),
-            "{r}"
-        );
-        assert!(
-            r.contains(&format!(
-                "{UDEV}: 812 (udev-worker): mounted at {MNT} (master:12)"
+            r.starts_with(&format!(
+                "held by 1 process(es) using it: 4000 chronyd in mnt:[4026532400]: open file {MNT}/f; \
+                 mounted in 2 mount namespace(s): "
             )),
             "{r}"
         );
-        let one = report(&h, Some(HOST), 1);
-        assert!(
-            one.contains("1 systemd") && one.ends_with("; and 2 more"),
-            "{one}"
-        );
+        assert!(r.contains("400 process(es), e.g. 1 kworker"), "{r}");
     }
 
     #[test]
@@ -345,12 +405,19 @@ mod tests {
         let h = of_device(proc, dev);
         assert_eq!(
             h.iter()
-                .map(|h| (h.pid, h.how.as_str()))
+                .map(|h| (h.pid, h.mounted.clone(), h.uses.clone()))
                 .collect::<Vec<_>>(),
             [
-                (77, format!("mounted at {MNT} (private)").as_str()),
-                (813, "open"),
+                (77, vec![format!("at {MNT} (private)")], vec![]),
+                (813, vec![], vec!["open".to_string()]),
             ]
+        );
+        assert_eq!(
+            report(&h, Some(HOST), 10),
+            format!(
+                "held by 1 process(es) using it: 813 (udev-worker) in {UDEV}: open; \
+                 mounted in 1 mount namespace(s): mnt:[4026532400]: mounted at {MNT} (private), 1 process(es), e.g. 77 chronyd"
+            )
         );
     }
 
