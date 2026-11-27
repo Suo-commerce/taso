@@ -35,6 +35,10 @@ use crate::map::LayerId;
 /// many devices, or `quit` with many attached, takes seconds.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How often a long command's wait asks whether to go on waiting
+/// ([`Client::export_while`], [`Client::import_while`]).
+pub const WAIT_STEP: Duration = Duration::from_secs(10);
+
 /// Why a client call failed.
 #[derive(Debug)]
 pub enum ClientError {
@@ -166,6 +170,8 @@ impl LogStart {
 pub struct Client {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// How long each command may take ([`Client::set_timeout`]).
+    timeout: Duration,
 }
 
 impl Client {
@@ -175,6 +181,7 @@ impl Client {
         let mut c = Self {
             reader: BufReader::new(s.try_clone()?),
             writer: s,
+            timeout: DEFAULT_TIMEOUT,
         };
         c.set_timeout(DEFAULT_TIMEOUT)?;
         Ok(c)
@@ -184,6 +191,7 @@ impl Client {
     pub fn set_timeout(&mut self, t: Duration) -> Result<()> {
         self.writer.set_read_timeout(Some(t))?;
         self.writer.set_write_timeout(Some(t))?;
+        self.timeout = t;
         Ok(())
     }
 
@@ -272,12 +280,53 @@ impl Client {
             .map_err(|_| ClientError::Protocol(format!("export answered {a:?}")))
     }
 
+    /// [`Client::export`], its answer waited for as long as `going` says:
+    /// asked every `step` ([`WAIT_STEP`]), with no other limit (the
+    /// maturity review's finding 7: a large stream takes longer than any
+    /// one limit).  When `going` says no, the call fails as a timeout and
+    /// the connection is not to be used again.
+    pub fn export_while(
+        &mut self,
+        to: LayerId,
+        from: Option<LayerId>,
+        path: &Path,
+        step: Duration,
+        mut going: impl FnMut() -> bool,
+    ) -> Result<u64> {
+        let (t, f) = (
+            to.to_string(),
+            from.map_or_else(|| "-".to_string(), |f| f.to_string()),
+        );
+        let p = path_arg(path)?;
+        let a = self.call_while(&["export", &t, &f, &p], Some((step, &mut going)))?;
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("export answered {a:?}")))
+    }
+
     /// Apply the stream in the file `path` to a detached `branch` with no
     /// blocks of its own; nothing is kept if the stream is bad.  Returns the
     /// blocks applied.  Durable at the next [`Client::flush`] (or Seal).
     pub fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64> {
         let p = path_arg(path)?;
         let a = self.call(&["import", &branch.to_string(), &p])?;
+        a.parse()
+            .map_err(|_| ClientError::Protocol(format!("import answered {a:?}")))
+    }
+
+    /// [`Client::import`], its answer waited for as long as `going` says
+    /// (as [`Client::export_while`]).
+    pub fn import_while(
+        &mut self,
+        branch: LayerId,
+        path: &Path,
+        step: Duration,
+        mut going: impl FnMut() -> bool,
+    ) -> Result<u64> {
+        let p = path_arg(path)?;
+        let a = self.call_while(
+            &["import", &branch.to_string(), &p],
+            Some((step, &mut going)),
+        )?;
         a.parse()
             .map_err(|_| ClientError::Protocol(format!("import answered {a:?}")))
     }
@@ -434,6 +483,18 @@ impl Client {
 
     /// Send one command; the answer after `ok` (maybe empty).
     fn call(&mut self, words: &[&str]) -> Result<String> {
+        self.call_while(words, None)
+    }
+
+    /// Send `words` and read the answer: within the command's limit, or,
+    /// with `wait`, in steps of its duration for as long as its `going`
+    /// says (an answer that comes in parts between two steps is kept
+    /// whole).
+    fn call_while(
+        &mut self,
+        words: &[&str],
+        wait: Option<(Duration, &mut dyn FnMut() -> bool)>,
+    ) -> Result<String> {
         for w in words {
             if w.is_empty() || w.chars().any(|c| c.is_whitespace() || c.is_control()) {
                 return Err(ClientError::BadArgument(w.to_string()));
@@ -442,13 +503,39 @@ impl Client {
         let mut line = words.join(" ");
         line.push('\n');
         self.writer.write_all(line.as_bytes())?;
-        let mut answer = String::new();
-        if self.reader.read_line(&mut answer)? == 0 {
+        let mut answer = Vec::new();
+        match wait {
+            None => {
+                self.reader.read_until(b'\n', &mut answer)?;
+            }
+            Some((step, going)) => {
+                self.writer.set_read_timeout(Some(step))?;
+                let read = loop {
+                    match self.reader.read_until(b'\n', &mut answer) {
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) && going() => {}
+                        other => break other,
+                    }
+                };
+                self.writer.set_read_timeout(Some(self.timeout))?;
+                read?;
+            }
+        }
+        if answer.is_empty() {
             return Err(ClientError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "taso-blkd closed the connection",
             )));
         }
+        let answer = String::from_utf8(answer).map_err(|_| {
+            ClientError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "taso-blkd answered something that is not UTF-8",
+            ))
+        })?;
         let answer = answer.trim_end_matches('\n');
         if answer == "ok" {
             Ok(String::new())
@@ -536,6 +623,72 @@ mod tests {
             got
         });
         (dir, path, h)
+    }
+
+    /// Finding 7 (D&D 7-e, 2026-11-27): a long command's answer is waited
+    /// for as long as the caller says, past the command's limit, and an
+    /// answer that comes in parts across steps is read whole.  When the
+    /// caller stops waiting, the call fails as a timeout.
+    #[test]
+    fn a_long_answer_is_waited_for_while_the_caller_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let h = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            let mut line = String::new();
+            // The export: answered in two parts, 300 ms apart, after 300 ms.
+            r.read_line(&mut line).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            w.write_all(b"ok 12").unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            w.write_all(b"34\n").unwrap();
+            // The import: answered after the caller has stopped waiting.
+            r.read_line(&mut line).unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            let _ = w.write_all(b"ok 1\n");
+            line
+        });
+        let mut c = Client::connect(&path).unwrap();
+        c.set_timeout(Duration::from_millis(100)).unwrap();
+        let mut asked = 0;
+        let got = c.export_while(
+            LayerId::from_raw(3),
+            None,
+            Path::new("/spool/s"),
+            Duration::from_millis(50),
+            || {
+                asked += 1;
+                true
+            },
+        );
+        assert_eq!(got.unwrap(), 1234, "past the 100 ms limit, read whole");
+        assert!(asked >= 8, "asked every step: {asked}");
+        let t = std::time::Instant::now();
+        let e = c
+            .import_while(
+                LayerId::from_raw(4),
+                Path::new("/spool/s"),
+                Duration::from_millis(50),
+                || t.elapsed() < Duration::from_millis(200),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&e, ClientError::Io(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+            "{e}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            t.elapsed()
+        );
+        drop(c);
+        assert_eq!(
+            h.join().unwrap(),
+            "export L3 - /spool/s\nimport L4 /spool/s\n"
+        );
     }
 
     #[test]
