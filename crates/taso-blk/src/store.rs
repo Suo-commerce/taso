@@ -185,6 +185,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use crate::map::{Kind, LayerId, Loc, Map, MapError, BLOCK};
@@ -214,6 +215,30 @@ const HEADER_LEN: u64 = 64;
 const FLUSH_BODY: usize = 40;
 /// A whole Flush record.
 const FLUSH_LEN: u64 = REC_HEAD + FLUSH_BODY as u64 + HASH as u64;
+
+/// How far past the tail the log's file is kept written with zeros and
+/// synced, ahead of the records that will go there (maturity review of
+/// e4a37b2, finding 4; F4-a (a), F4-c (a), 2026-11-27).  Two things come
+/// of it.  A full disk is met when the reserve is made, not when a record
+/// is appended after the map has moved: a write that does not fit is
+/// refused alone, and the store goes on.  And a group commit's
+/// `fdatasync` then carries data only: appending past the end of the file
+/// makes every sync also journal the file's growth, as allocating with
+/// `fallocate` does for its unwritten extents.  This is PostgreSQL's
+/// `wal_init_zero`, for the reasons and the measurement given in
+/// https://www.postgresql.org/message-id/4xaez4hh3cwkclr77tnkdba6wisueu32vza44iugozai5hklyb@5epf6zpo66aa
+/// (pgsql-hackers, "Re: Purpose of wal_init_zero", 2025-01-15).
+const RESERVE: u64 = if cfg!(test) { 64 << 10 } else { 64 << 20 };
+/// The filler is woken when less than this is ready past the tail.
+const RESERVE_LOW: u64 = RESERVE / 2;
+/// The last part of the reserve, which a write of data may not use: it is
+/// kept for the records that close a group or a turn (Flush, Seal, and
+/// the small records of forks, names and discards), so that a Seal still
+/// closes on a full disk.
+const HELD_BACK: u64 = if cfg!(test) { 4 << 10 } else { 64 << 10 };
+/// The filler writes and syncs this much at a time, so a write that
+/// overtakes it waits for one piece at most.
+const FILL_CHUNK: u64 = if cfg!(test) { 16 << 10 } else { 1 << 20 };
 
 /// The body of a Flush record at offset `at` of a log whose flush key
 /// (derived, [`Header::flush_mac`]) is `key`, saying that the log was
@@ -652,7 +677,7 @@ impl Store {
         sync_dir(path)?;
         Ok(Self {
             lock,
-            shared: Arc::new(LogFile::new(file.try_clone()?)),
+            shared: Arc::new(LogFile::new(file.try_clone()?, HEADER_LEN, HEADER_LEN)),
             file,
             path: path.to_path_buf(),
             header: fields,
@@ -797,12 +822,17 @@ impl Store {
         }
         // The replay stopped at `pos`.  If bytes lie there that are no
         // record, a later Flush may say they had been durable: damage, set
-        // aside whole; else a torn tail, cut (module docs).
-        let mut cut = len - end;
+        // aside whole; else a torn tail, cut (module docs).  Zeros that run
+        // from the last non-zero byte to the end of the file are the
+        // reserve the store keeps ahead of its tail ([`RESERVE`]): not a
+        // torn tail, never counted as cut, and kept.  Bytes that are not
+        // zero, zeros among them, are what they always were.
+        let data_end = nonzero_end(&file, end, len)?;
+        let mut cut = data_end - end;
         let mut set_aside = None;
-        if pos < len {
+        if pos < data_end {
             if let Some(durable) =
-                later_durable_end(&file, &flush_mac, pos, len)?.filter(|d| *d > pos)
+                later_durable_end(&file, &flush_mac, pos, data_end)?.filter(|d| *d > pos)
             {
                 let refused = |to: &Path, error| StoreError::SetAside {
                     need: cut,
@@ -820,10 +850,14 @@ impl Store {
                 });
             }
         }
-        if cut > 0 {
+        // A cut takes the reserve after it too; the filler makes it again.
+        let allocated = if cut > 0 {
             file.set_len(end)?;
             file.sync_all()?;
-        }
+            end
+        } else {
+            len
+        };
         if set_aside.is_some() {
             cut = 0;
         }
@@ -835,7 +869,7 @@ impl Store {
         };
         let store = Self {
             lock,
-            shared: Arc::new(LogFile::new(file.try_clone()?)),
+            shared: Arc::new(LogFile::new(file.try_clone()?, end, allocated)),
             file,
             path: path.to_path_buf(),
             header: fields,
@@ -945,6 +979,9 @@ impl Store {
         if self.map.kind(branch)? != Kind::Branch {
             return Err(MapError::NotABranch(branch).into());
         }
+        // Room for the record before the map moves (finding 4): a write
+        // that does not fit is refused here, and nothing has changed.
+        self.room_for(REC_HEAD + 16 + data.len() as u64 + HASH as u64, false)?;
         // The data starts after the record head and the two fields.
         let data_at = self.tail + REC_HEAD + 16;
         let t = std::time::Instant::now();
@@ -1013,19 +1050,7 @@ impl Store {
     pub fn flush(&mut self) -> Result<u64, StoreError> {
         let lsn = self.flush_pending()?;
         let t = std::time::Instant::now();
-        #[cfg(test)]
-        let r = if self
-            .shared
-            .fail_next_sync
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            Err(io::Error::other("test: the sync failed"))
-        } else {
-            self.file.sync_data()
-        };
-        #[cfg(not(test))]
-        let r = self.file.sync_data();
-        if let Err(e) = r {
+        if let Err(e) = self.shared.sync(&self.file) {
             // The Syncer syncs the same file description: it must not
             // answer a later sync as durable (finding 3).
             self.poisoned = true;
@@ -1499,7 +1524,50 @@ impl Store {
         self.poisoned
     }
 
+    /// The log's reserve filler, for a thread of its own outside the
+    /// store's lock ([`Filler`]).
+    pub fn filler(&self) -> Filler {
+        Filler(Arc::clone(&self.shared))
+    }
+
     // ── internals ───────────────────────────────────────────────────
+
+    /// Make room in the reserve for a record of `len` bytes at the tail:
+    /// with `closing`, the held-back part may be used ([`HELD_BACK`]).
+    /// What the filler has not made ready yet is written here with zeros
+    /// (not synced: the next group commit carries it).  A disk without
+    /// that room answers `StorageFull`, and nothing has changed: no
+    /// record, no map, the store not poisoned.  Any other failure to
+    /// write the zeros sets the log's failure latch (finding 3): the file
+    /// may not be what this store thinks.
+    fn room_for(&mut self, len: u64, closing: bool) -> Result<(), StoreError> {
+        let need = self.tail + len + if closing { 0 } else { HELD_BACK };
+        if need <= self.shared.allocated() {
+            return Ok(());
+        }
+        let _fill = self.shared.fill_lock();
+        let from = self.shared.allocated();
+        if need <= from {
+            return Ok(()); // the filler got there meanwhile
+        }
+        let to = need.next_multiple_of(BLOCK);
+        #[cfg(test)]
+        if self.room.is_some_and(|room| to > room) {
+            return Err(io::Error::from(io::ErrorKind::StorageFull).into());
+        }
+        let zeros = vec![0u8; (to - from) as usize];
+        match self.file.write_all_at(&zeros, from) {
+            Ok(()) => {
+                self.shared.made_ready(to);
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::StorageFull => Err(e.into()),
+            Err(e) => {
+                self.shared.fail();
+                Err(e.into())
+            }
+        }
+    }
 
     fn check(&self) -> Result<(), StoreError> {
         // A sync failed on either path (the store's own or the Syncer's):
@@ -1525,6 +1593,13 @@ impl Store {
         let mut rec = Vec::with_capacity(REC_HEAD as usize + body.len() + HASH);
         let hash = encode_record(&mut rec, &self.prev, kind, body);
         self.stats.write_hash_us += t.elapsed().as_micros() as u64;
+        // Every record may use the held-back room (a write of data asked
+        // for its room, held-back part kept, before its map moved).  The
+        // map has moved already: a failure here poisons, as before.
+        if let Err(e) = self.room_for(rec.len() as u64, true) {
+            self.poisoned = true;
+            return Err(e);
+        }
         let t = std::time::Instant::now();
         #[cfg(test)]
         let r = if self
@@ -1543,6 +1618,7 @@ impl Store {
         }
         self.stats.write_pwrite_us += t.elapsed().as_micros() as u64;
         self.tail += rec.len() as u64;
+        self.shared.appended(self.tail);
         self.lsn += 1;
         self.prev = hash;
         self.stats.log_bytes = self.tail;
@@ -1932,6 +2008,25 @@ fn no_others(f: &File) -> io::Result<Option<u32>> {
 /// `file`: a record's head for a Flush at an offset its body names as its
 /// own, with the keyed check.  Found without the chain, which is broken
 /// at `from`.  `None` if there is none.
+/// The offset just past the last byte in `from..len` of `file` that is
+/// not zero; `from` if they all are.  Read backwards from the end, a
+/// megabyte at a time: the reserve is the zeros this skips.
+fn nonzero_end(file: &File, from: u64, len: u64) -> io::Result<u64> {
+    const CHUNK: u64 = 1 << 20;
+    let mut buf = vec![0u8; CHUNK as usize];
+    let mut hi = len;
+    while hi > from {
+        let lo = hi.saturating_sub(CHUNK).max(from);
+        let b = &mut buf[..(hi - lo) as usize];
+        file.read_exact_at(b, lo)?;
+        if let Some(i) = b.iter().rposition(|x| *x != 0) {
+            return Ok(lo + i as u64 + 1);
+        }
+        hi = lo;
+    }
+    Ok(from)
+}
+
 fn later_durable_end(
     file: &File,
     flush_mac: &[u8; 32],
@@ -2408,6 +2503,70 @@ struct SyncState {
     sync_max_us: u64,
 }
 
+/// The log's reserve filler ([`RESERVE`]): keeps the file written with
+/// zeros and synced ahead of the tail, a piece at a time, outside the
+/// store's lock.  `taso-blkd` runs it on a thread of its own.
+pub struct Filler(Arc<LogFile>);
+
+impl Filler {
+    /// Wait until the reserve has fallen low, or `most` has passed.
+    pub fn wait(&self, most: std::time::Duration) {
+        let lf = &self.0;
+        let w = lf.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut w, _) = lf
+            .wake
+            .wait_timeout_while(w, most, |w| !*w)
+            .unwrap_or_else(PoisonError::into_inner);
+        *w = false;
+    }
+
+    /// Fill the reserve up to [`RESERVE`] past the tail, one piece at a
+    /// time, each written with zeros and synced before it counts.
+    /// Returns the bytes made ready.  Two kinds of failure, kept apart:
+    /// a disk without room answers `StorageFull` and changes nothing (the
+    /// reserve is what it was, the store goes on, and a write that needs
+    /// more is refused alone); any other failure, a failed sync above all,
+    /// sets the log's failure latch (finding 3: the sync shares one file
+    /// description with the records' syncs and may have taken their error).
+    pub fn fill_ahead(&self) -> Result<u64, StoreError> {
+        let lf = &self.0;
+        let mut made = 0;
+        loop {
+            let _fill = lf.fill_lock();
+            if lf.has_failed() {
+                return Err(StoreError::Poisoned);
+            }
+            let from = lf.allocated();
+            let target = lf.tail.load(Ordering::SeqCst) + RESERVE;
+            if from >= target {
+                return Ok(made);
+            }
+            let to = (from + FILL_CHUNK).min(target).next_multiple_of(BLOCK);
+            let f = lf.get();
+            #[cfg(test)]
+            {
+                let room = lf.room.load(Ordering::SeqCst);
+                if room != 0 && to > room {
+                    return Err(io::Error::from(io::ErrorKind::StorageFull).into());
+                }
+            }
+            let zeros = vec![0u8; (to - from) as usize];
+            if let Err(e) = f.write_all_at(&zeros, from) {
+                if e.kind() != io::ErrorKind::StorageFull {
+                    lf.fail();
+                }
+                return Err(e.into());
+            }
+            if let Err(e) = lf.sync(&f) {
+                lf.fail();
+                return Err(e.into());
+            }
+            lf.made_ready(to);
+            made += to - from;
+        }
+    }
+}
+
 /// The log's file as the [`Syncer`] sees it: swapped by a compaction's
 /// switch (the store is held then, and flushed).
 pub struct LogFile {
@@ -2419,9 +2578,24 @@ pub struct LogFile {
     /// review of e4a37b2, finding 3).  Set once, never cleared: the log is
     /// reopened to recover.
     failed: std::sync::atomic::AtomicBool,
-    /// Tests: the next sync of the store's own (`Store::flush`) fails.
+    /// The end of the reserve: everything below it is the file's, written
+    /// (records, or zeros) ([`RESERVE`]).  Moved under `fill`.
+    allocated: AtomicU64,
+    /// The store's tail, for the filler (set as each record is appended).
+    tail: AtomicU64,
+    /// One fill at a time: the filler's piece, a write's own zeros, a
+    /// compaction's switch.
+    fill: std::sync::Mutex<()>,
+    /// The filler is wanted: the reserve fell below [`RESERVE_LOW`].
+    wanted: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+    /// Tests: the next sync through [`LogFile::sync`] fails.
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Tests: a filesystem with room for the file up to this many bytes
+    /// (0: no limit), for the filler's writes.
+    #[cfg(test)]
+    room: AtomicU64,
 }
 
 /// What a Flush record says of the log ([module docs](self)): how far it
@@ -2437,13 +2611,58 @@ struct DurableEnd {
 }
 
 impl LogFile {
-    fn new(file: File) -> Self {
+    /// Over `file`, whose records end at `tail` and which is written up to
+    /// `allocated` (the rest of the reserve, zeros).
+    fn new(file: File, tail: u64, allocated: u64) -> Self {
         Self {
             file: RwLock::new(file),
             durable: std::sync::Mutex::default(),
             failed: std::sync::atomic::AtomicBool::new(false),
+            allocated: AtomicU64::new(allocated.max(tail)),
+            tail: AtomicU64::new(tail),
+            fill: std::sync::Mutex::new(()),
+            wanted: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
             #[cfg(test)]
             fail_next_sync: Default::default(),
+            #[cfg(test)]
+            room: AtomicU64::new(0),
+        }
+    }
+
+    /// `fdatasync` of `f`, a description of this log (the store's own
+    /// sync and the filler's go through here; the Syncer's has its own).
+    fn sync(&self, f: &File) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("test: the sync failed"));
+        }
+        f.sync_data()
+    }
+
+    fn allocated(&self) -> u64 {
+        self.allocated.load(Ordering::SeqCst)
+    }
+
+    fn fill_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.fill.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Everything below `to` is written: the reserve ends there.
+    fn made_ready(&self, to: u64) {
+        self.allocated.fetch_max(to, Ordering::SeqCst);
+    }
+
+    /// A record was appended; the tail is now `tail`.  Wakes the filler
+    /// when the reserve ahead has fallen low.
+    fn appended(&self, tail: u64) {
+        self.tail.store(tail, Ordering::SeqCst);
+        if self.allocated().saturating_sub(tail) < RESERVE_LOW {
+            let mut w = self.wanted.lock().unwrap_or_else(PoisonError::into_inner);
+            if !*w {
+                *w = true;
+                self.wake.notify_all();
+            }
         }
     }
 
@@ -2451,8 +2670,14 @@ impl LogFile {
         self.file.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// A compaction's switch to a new file, `file` (the store is held and
+    /// flushed; [`LogFile::restart`] follows with the new file's end).  No
+    /// fill straddles it, and none runs between the two: the reserve reads
+    /// as full until `restart` says where the new file's ends.
     fn set(&self, file: File) {
+        let _fill = self.fill_lock();
         *self.file.write().unwrap_or_else(PoisonError::into_inner) = file;
+        self.allocated.store(u64::MAX, Ordering::SeqCst);
     }
 
     /// A sync of the log failed (see [`LogFile::failed`]).
@@ -2498,6 +2723,12 @@ impl LogFile {
     /// A compaction's switch: the file is another, synced whole, `end`
     /// bytes long.  The old file's offsets mean nothing in it.
     fn restart(&self, end: u64) {
+        {
+            // The new file has no reserve yet: the filler makes it.
+            let _fill = self.fill_lock();
+            self.allocated.store(end, Ordering::SeqCst);
+            self.tail.store(end, Ordering::SeqCst);
+        }
         let mut d = self.durable.lock().unwrap_or_else(PoisonError::into_inner);
         d.end = end;
         d.waiting.clear();
@@ -2617,6 +2848,15 @@ mod tests {
         vec![byte; n * B]
     }
 
+    /// Where the bytes of a log end that are not the reserve's zeros (the
+    /// rule of [`nonzero_end`]): what an open counts from `from` as cut.
+    fn data_len(bytes: &[u8], from: u64) -> u64 {
+        bytes
+            .iter()
+            .rposition(|b| *b != 0)
+            .map_or(from, |i| (i as u64 + 1).max(from))
+    }
+
     fn read1(s: &Store, layer: LayerId, lba: u64) -> u8 {
         let mut buf = vec![0xEEu8; B];
         s.read(layer, lba, &mut buf).unwrap();
@@ -2691,6 +2931,123 @@ mod tests {
         let (s, rec) = Store::open(&path).unwrap();
         assert_eq!(rec.cut, 0, "the reserve was reported as a torn tail");
         assert_eq!((read1(&s, a2, at), read1(&s, b, 0)), (0xA2, 0xB0));
+    }
+
+    /// Finding 4, the filler (F4-c (a)): it keeps [`RESERVE`] written and
+    /// synced past the tail; writes then need no zeros of their own; an
+    /// open keeps the reserve and counts nothing of it as cut; the zeros
+    /// are no records to a compaction either, and after its switch the
+    /// filler makes the new file's reserve.
+    #[test]
+    fn the_filler_keeps_the_reserve_ahead_and_an_open_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let filler = s.filler();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        assert!(filler.fill_ahead().unwrap() > 0);
+        // Ahead by the reserve, to the next whole block.
+        let ahead = (s.tail + RESERVE).next_multiple_of(BLOCK);
+        assert_eq!(s.shared.allocated(), ahead);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), ahead);
+        assert_eq!(filler.fill_ahead().unwrap(), 0, "full: nothing to do");
+        for lba in 0..4 {
+            s.write(b, lba, &blocks(lba as u8 + 1, 1), false).unwrap();
+        }
+        s.flush().unwrap();
+        assert_eq!(
+            s.shared.allocated(),
+            std::fs::metadata(&path).unwrap().len(),
+            "the writes fitted in the reserve"
+        );
+        let len = std::fs::metadata(&path).unwrap().len();
+        drop(s);
+        let (mut s, rec) = Store::open(&path).unwrap();
+        assert_eq!((rec.cut, rec.set_aside.is_none()), (0, true));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "the reserve is kept"
+        );
+        assert_eq!(s.shared.allocated(), len);
+        assert_eq!(read1(&s, b, 3), 4);
+        // A compaction: the zeros are no records; the new file has no
+        // reserve until the filler makes it.
+        compact(&mut s);
+        assert_eq!(s.shared.allocated(), s.tail);
+        let filler = s.filler();
+        filler.fill_ahead().unwrap();
+        assert_eq!(
+            s.shared.allocated(),
+            (s.tail + RESERVE).next_multiple_of(BLOCK)
+        );
+        assert_eq!((read1(&s, b, 0), read1(&s, b, 3)), (1, 4));
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.cut, 0);
+        assert_eq!(read1(&s, b, 2), 3);
+    }
+
+    /// Finding 4 and finding 3: the filler's two kinds of failure are kept
+    /// apart.  No room on the disk changes nothing: the store goes on.  A
+    /// failed sync sets the log's latch: the store refuses everything.
+    #[test]
+    fn the_fillers_two_kinds_of_failure_are_kept_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = new_store(&dir);
+        let filler = s.filler();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        let before = s.shared.allocated();
+        s.shared
+            .room
+            .store(before + FILL_CHUNK / 2, std::sync::atomic::Ordering::SeqCst);
+        match filler.fill_ahead() {
+            Err(StoreError::Io(e)) if e.kind() == io::ErrorKind::StorageFull => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s.shared.allocated(), before, "nothing counted");
+        assert!(!s.is_poisoned());
+        s.write(b, 0, &blocks(7, 1), false).unwrap();
+        s.flush().unwrap();
+        assert_eq!(read1(&s, b, 0), 7, "the store goes on");
+        // A sync that fails while filling.
+        s.shared.room.store(0, std::sync::atomic::Ordering::SeqCst);
+        s.shared
+            .fail_next_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(filler.fill_ahead().is_err());
+        assert!(matches!(
+            s.write(b, 1, &blocks(8, 1), false),
+            Err(StoreError::Poisoned)
+        ));
+        assert!(matches!(filler.fill_ahead(), Err(StoreError::Poisoned)));
+    }
+
+    /// Finding 4, the open: only zeros that run to the end of the file are
+    /// the reserve.  Bytes that are not zero before them are a torn tail:
+    /// counted as cut, and cut with the reserve after them.
+    #[test]
+    fn a_torn_tail_before_the_reserve_is_cut_and_counted_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log");
+        let mut s = Store::create(&path).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        s.write(b, 0, &blocks(1, 1), false).unwrap();
+        s.flush().unwrap();
+        s.filler().fill_ahead().unwrap();
+        let end = s.tail;
+        // A torn record: twenty bytes that are not zero, then the zeros.
+        s.file.write_all_at(&[0x5Au8; 20], end + 100).unwrap();
+        drop(s);
+        let (s, rec) = Store::open(&path).unwrap();
+        assert_eq!(rec.set_aside, None);
+        assert_eq!(rec.cut, 120, "up to the last byte that is not zero");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), end);
+        assert_eq!(s.shared.allocated(), end, "the reserve went with the cut");
+        assert_eq!(read1(&s, b, 0), 1);
     }
 
     /// Maturity review of e4a37b2, finding 3: a checkpoint's sync and a
@@ -3121,7 +3478,7 @@ mod tests {
                     .unwrap_or_else(|e| panic!("byte {} mask {mask:#x}: {e}", at - mid));
                 assert_eq!(s.stats().log_bytes, mid, "byte {} mask {mask:#x}", at - mid);
                 assert_eq!(read1(&s, b, 0), 1, "byte {} mask {mask:#x}", at - mid);
-                assert_eq!(rec.cut, good.len() as u64 - mid);
+                assert_eq!(rec.cut, data_len(&bytes, mid) - mid);
             }
         }
     }
@@ -3884,7 +4241,7 @@ mod tests {
         std::fs::write(&b, &mixed).unwrap();
         let (_, rec) = Store::open(&b).unwrap();
         assert_eq!((rec.id, rec.records, rec.groups), (idb, 0, 0));
-        assert_eq!(rec.cut, bytes_a.len() as u64 - HEADER_LEN);
+        assert_eq!(rec.cut, data_len(&mixed, HEADER_LEN) - HEADER_LEN);
     }
 
     #[test]
@@ -4065,7 +4422,7 @@ mod tests {
         // Every byte the log lost is in the file, as it was found.
         assert_eq!(
             std::fs::read(&aside.path).unwrap(),
-            damaged[ends[1] as usize..]
+            damaged[ends[1] as usize..data_len(&damaged, ends[1]) as usize]
         );
         assert_eq!(std::fs::read(&path).unwrap(), whole_log[..ends[1] as usize]);
         assert_eq!(
@@ -4088,7 +4445,7 @@ mod tests {
         assert_eq!((rec.cut, rec.set_aside), (0, None));
         assert_eq!(
             std::fs::read(&aside.path).unwrap(),
-            damaged[ends[1] as usize..]
+            damaged[ends[1] as usize..data_len(&damaged, ends[1]) as usize]
         );
     }
 
@@ -4111,8 +4468,8 @@ mod tests {
             ends.push(s.stats().log_bytes);
         }
         drop(s);
-        let len = std::fs::metadata(&path).unwrap().len();
         flip(&path, ends[0] + REC_HEAD + 100); // in the second of the three
+        let len = data_len(&std::fs::read(&path).unwrap(), ends[0]);
         let (_, rec) = Store::open(&path).unwrap();
         assert_eq!(rec.set_aside, None, "no later Flush names it durable");
         assert_eq!(rec.cut, len - ends[0]);
@@ -4158,8 +4515,8 @@ mod tests {
             img.extend_from_slice(&flush_body(&key, data_at, u64::MAX));
             s.file.write_all_at(&img, data_at).unwrap();
             drop(s);
-            let len = std::fs::metadata(&path).unwrap().len();
             flip(&path, torn_at);
+            let len = data_len(&std::fs::read(&path).unwrap(), first);
             let (_, rec) = Store::open(&path).unwrap();
             (rec, len - first)
         };
@@ -4425,7 +4782,10 @@ mod tests {
                     *want_len,
                     "cut at {len}, checkpoint {with_ckpt}"
                 );
-                assert_eq!(rec.cut, len - want_len);
+                assert_eq!(
+                    rec.cut,
+                    data_len(&full[..len as usize], *want_len) - want_len
+                );
                 assert_eq!(
                     &snapshot(&s, layers, 9),
                     want,
@@ -4478,10 +4838,15 @@ mod tests {
         // Every byte from the second-to-last durable point to the end (the
         // last groups and the tail), and every byte around each durable
         // point before that.  A cut elsewhere inside block data is the
-        // same case as its neighbours: an incomplete record.
+        // same case as its neighbours: an incomplete record.  In the
+        // reserve's zeros after the records, every 97th byte and the end:
+        // each is the same case, a whole reserve or a part of one.
         let len = std::fs::metadata(&path).unwrap().len();
+        let data = data_len(&std::fs::read(&path).unwrap(), HEADER_LEN);
         let tail_from = points[points.len() - 2].0;
-        let mut cuts: Vec<u64> = (tail_from..=len).collect();
+        let mut cuts: Vec<u64> = (tail_from..=data).collect();
+        cuts.extend((data..len).step_by(97));
+        cuts.push(len);
         for (at, _) in &points {
             cuts.extend(at.saturating_sub(2).max(HEADER_LEN)..=(at + 2).min(len));
         }
