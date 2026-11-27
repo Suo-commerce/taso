@@ -54,7 +54,12 @@
 //!    birth never finished) is refused, not turned into a birth: the
 //!    operator expected an existing Vessel, and starting an empty one
 //!    there would hide a wrong coordinator or a wrong node (decided
-//!    2026-10-21).  Without the takeover it is born as usual.
+//!    2026-10-21).  Without the takeover it is born as usual.  A takeover
+//!    onto this node's old state of the Vessel opens it as it is only
+//!    when its log holds the coordinator's head and it is not behind;
+//!    else that state is of an earlier holding, kept aside, put back and
+//!    reborn from the store before the holder is fenced (D&D 5-a, 5-b
+//!    (a); [`crate::vessel::Host::take_over_here`]).
 //! 2. **Settle the state** ([`settle`]).  A Vessel with no Seal takes its
 //!    birth Seal (turn 0, [`Vessel::seal_birth`]) before anything else:
 //!    every Vessel has a Seal before its agent first runs.  Then the
@@ -5258,7 +5263,7 @@ impl Node {
         } else {
             None
         };
-        let rebuilt_here = rebuilt.is_some();
+        let mut rebuilt_here = rebuilt.is_some();
         let (vessel, verdict) = match &start {
             Start::Refuse(why) => return Err(DaemonError::Refused(why.clone())),
             Start::Birth if vc.fork.is_some() => {
@@ -5290,10 +5295,68 @@ impl Node {
             }
             // A Vessel this Warden holds, with its state here: rebuilt
             // first if its files are behind its log (D99).  A takeover
-            // onto old local state is not rebuilt (R3-a (a)).
+            // onto old local state is the next arm's (D&D 5-a).
             Start::Open if rebuilt.is_some() => {
                 let (v, r) = rebuilt.take().expect("matched");
                 (v, verdict_after_rebirth(&r.reborn))
+            }
+            // A takeover onto this node's old state of the Vessel (D&D 5-a,
+            // 5-b (a)): opened as it is only if it holds the coordinator's
+            // head and is not behind; else the state of an earlier holding,
+            // kept aside, put back and reborn, all before the holder is
+            // fenced (the maturity review's finding 5).
+            Start::Open if claim != Claim::Mine => {
+                let layer = |t: ChronicleId, key: taso_core::envelope::HashVal| {
+                    self.template_layer(t, key, &|m| self.log(vc, m))
+                };
+                let (v, how) = host
+                    .take_over_here(id, &self.packs(id)?, claim, &layer)
+                    .map_err(|e| match e {
+                        VesselError::ParentMissing(p) => DaemonError::Refused(format!(
+                            "taking it over onto the old state here: a fork is reborn only where its parent's Seal is, and the Seal at lsn {} of its parent {} is not on this node; nothing was claimed",
+                            p.seal.get(),
+                            id_hex(p.chronicle)
+                        )),
+                        e => DaemonError::Refused(format!(
+                            "taking it over onto the old state here: {e}"
+                        )),
+                    })?;
+                match how {
+                    crate::rebirth::TakenOver::Opened(r) => {
+                        self.log(vc, "taken over onto its state on this node, which holds the coordinator's head: opened as it is");
+                        (v, verdict_after_open(&r))
+                    }
+                    crate::rebirth::TakenOver::Rebuilt {
+                        reborn,
+                        stood_on,
+                        kept,
+                        discarded_blocks,
+                    } => {
+                        rebuilt_here = true;
+                        self.log(
+                            vc,
+                            format_args!(
+                                "taken over onto old state of an earlier holding on this node, reborn from the store: {reborn}; {}{}; the state directory it had is kept at {} (the Warden never deletes it)",
+                                match stood_on {
+                                    Some(at) => format!(
+                                        "its dataset was put back at the Seal at lsn {} and the sections after it were received",
+                                        at.lsn.get()
+                                    ),
+                                    None => "every section was received".to_string(),
+                                },
+                                match discarded_blocks {
+                                    Some(n) => format!(
+                                        "; {n} block(s) of the Vessel's filesystem discarded"
+                                    ),
+                                    None => String::new(),
+                                },
+                                kept.as_deref()
+                                    .map_or("(none)".into(), |k| k.display().to_string())
+                            ),
+                        );
+                        (v, verdict_after_rebirth(&reborn))
+                    }
+                }
             }
             Start::Birth | Start::Open => {
                 let (v, how) = host.ensure_as(vc.namespace, vc.subject.as_bytes(), claim)?;
