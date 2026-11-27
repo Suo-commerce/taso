@@ -1003,18 +1003,24 @@ impl Store {
     /// Returns the Flush record's sequence number.
     pub fn flush(&mut self) -> Result<u64, StoreError> {
         let lsn = self.flush_pending()?;
+        let t = std::time::Instant::now();
         #[cfg(test)]
-        if self
+        let r = if self
             .shared
             .fail_next_sync
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
+            Err(io::Error::other("test: the sync failed"))
+        } else {
+            self.file.sync_data()
+        };
+        #[cfg(not(test))]
+        let r = self.file.sync_data();
+        if let Err(e) = r {
+            // The Syncer syncs the same file description: it must not
+            // answer a later sync as durable (finding 3).
             self.poisoned = true;
-            return Err(io::Error::other("test: the sync failed").into());
-        }
-        let t = std::time::Instant::now();
-        if let Err(e) = self.file.sync_data() {
-            self.poisoned = true;
+            self.shared.fail();
             return Err(e.into());
         }
         let us = t.elapsed().as_micros() as u64;
@@ -1474,8 +1480,12 @@ impl Store {
         self.poisoned = true;
     }
 
-    /// Whether an append or a sync has failed: every call fails until the
-    /// log is reopened.
+    /// Whether an append or a sync of the store's own has failed, or the
+    /// store was [`poison`](Self::poison)ed: every call fails until the log
+    /// is reopened.  A failed sync of the [`Syncer`]'s makes every call
+    /// fail too, but is not counted here until the Syncer's caller poisons
+    /// the store, so that caller still learns it is the first to know (and
+    /// names the error: `taso-blkd`'s `durable`).
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -1483,7 +1493,9 @@ impl Store {
     // ── internals ───────────────────────────────────────────────────
 
     fn check(&self) -> Result<(), StoreError> {
-        if self.poisoned {
+        // A sync failed on either path (the store's own or the Syncer's):
+        // the map may be ahead of what is on the medium (finding 3).
+        if self.poisoned || self.shared.has_failed() {
             Err(StoreError::Poisoned)
         } else {
             Ok(())
@@ -2381,6 +2393,12 @@ struct SyncState {
 pub struct LogFile {
     file: RwLock<File>,
     durable: std::sync::Mutex<DurableEnd>,
+    /// A sync of this log failed, the store's or the Syncer's: nothing
+    /// after it is ever durable, since both sync one file description and
+    /// the kernel reports a failed write-back to one call only (maturity
+    /// review of e4a37b2, finding 3).  Set once, never cleared: the log is
+    /// reopened to recover.
+    failed: std::sync::atomic::AtomicBool,
     /// Tests: the next sync of the store's own (`Store::flush`) fails.
     #[cfg(test)]
     fail_next_sync: std::sync::atomic::AtomicBool,
@@ -2403,6 +2421,7 @@ impl LogFile {
         Self {
             file: RwLock::new(file),
             durable: std::sync::Mutex::default(),
+            failed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_sync: Default::default(),
         }
@@ -2414,6 +2433,16 @@ impl LogFile {
 
     fn set(&self, file: File) {
         *self.file.write().unwrap_or_else(PoisonError::into_inner) = file;
+    }
+
+    /// A sync of the log failed (see [`LogFile::failed`]).
+    fn fail(&self) {
+        self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether a sync of the log has failed, on either path.
+    fn has_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn durable_end(&self) -> u64 {
@@ -2465,7 +2494,7 @@ impl Syncer {
         st.requested = st.requested.max(lsn);
         let mut led = false;
         loop {
-            if st.failed {
+            if st.failed || self.file.has_failed() {
                 return Err(StoreError::Poisoned);
             }
             if st.durable >= lsn {
@@ -2483,6 +2512,15 @@ impl Syncer {
             let us = t.elapsed().as_micros() as u64;
             st = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.syncing = false;
+            // The store's own sync failed while this one ran: the
+            // kernel may have reported the error to that call alone, so
+            // this one's ok proves nothing (finding 3).
+            let r = match r {
+                Ok(()) if self.file.has_failed() => {
+                    Err(io::Error::other("a sync of the log failed (the store's)"))
+                }
+                r => r,
+            };
             match r {
                 Ok(()) => {
                     st.durable = st.durable.max(upto);
@@ -2495,6 +2533,7 @@ impl Syncer {
                     led = true;
                 }
                 Err(e) => {
+                    self.file.fail();
                     st.failed = true;
                     st.error = Some(e.to_string());
                     self.done.notify_all();
