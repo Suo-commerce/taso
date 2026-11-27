@@ -5369,6 +5369,94 @@ mod tests {
         eprintln!("{done:?}");
     }
 
+    /// Timing, not a check (the maturity review's finding 7, D&D 7-d,
+    /// 2026-11-27): how fast taso-blkd's `export` and `import` move a
+    /// large stream, to set how the Warden's time limit for the two calls
+    /// grows with the size.  `TASO_IMPORT_MIB` (default 2048) of blocks
+    /// in 1 MiB writes, every block's bytes its own, sealed; exported to a
+    /// file and synced; imported into a fresh branch; sealed.  The export
+    /// and the import are made as taso-blkd makes them (a buffered
+    /// writer, then a sync; a 1 MiB buffered reader), with a reserve
+    /// thread filling ahead.  The log and the stream are in `TMPDIR`: put
+    /// it on the block log's own filesystem.  `cargo test --release -p
+    /// taso-blk --lib import_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn import_timing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let mib: u64 = std::env::var("TASO_IMPORT_MIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
+        let rate = |bytes: u64, t: Duration| (bytes >> 20) as f64 / t.as_secs_f64();
+        let dir = tempfile::tempdir().unwrap();
+        eprintln!("import_timing: {mib} MiB in {}", dir.path().display());
+        let mut s = Store::create(&dir.path().join("log")).unwrap();
+        let ended = Arc::new(AtomicBool::new(false));
+        let reserve = {
+            let (f, ended) = (s.filler(), ended.clone());
+            std::thread::spawn(move || {
+                while !ended.load(Ordering::SeqCst) {
+                    f.fill_ahead().unwrap();
+                    f.wait(Duration::from_millis(100));
+                }
+            })
+        };
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        let mut chunk = vec![0u8; 1 << 20];
+        let per = chunk.len() as u64 / BLOCK;
+        let t = Instant::now();
+        for i in 0..mib {
+            for (j, block) in chunk.chunks_mut(BLOCK as usize).enumerate() {
+                let n = (i * per + j as u64).to_le_bytes();
+                for w in block.chunks_mut(8) {
+                    w.copy_from_slice(&n);
+                }
+            }
+            s.write(b, i * per, &chunk, false).unwrap();
+        }
+        let seal = s.seal(b).unwrap();
+        let wrote = t.elapsed();
+        eprintln!(
+            "write  {mib} MiB, sealed, in {wrote:.2?}: {:.0} MiB/s",
+            rate(mib << 20, wrote)
+        );
+
+        let path = dir.path().join("stream");
+        let t = Instant::now();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut w = io::BufWriter::new(file);
+        let blocks = s.export_plan(seal, None).unwrap().write(&mut w).unwrap();
+        w.into_inner().unwrap().sync_all().unwrap();
+        let exported = t.elapsed();
+        let len = std::fs::metadata(&path).unwrap().len();
+        eprintln!(
+            "export {} MiB stream ({blocks} blocks) in {exported:.2?}: {:.0} MiB/s",
+            len >> 20,
+            rate(len, exported)
+        );
+
+        let b2 = s.fork(root).unwrap();
+        let t = Instant::now();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut r = io::BufReader::with_capacity(1 << 20, file);
+        assert_eq!(s.import(b2, &mut r).unwrap(), blocks);
+        let imported = t.elapsed();
+        eprintln!(
+            "import {} MiB stream in {imported:.2?}: {:.0} MiB/s (the store held throughout)",
+            len >> 20,
+            rate(len, imported)
+        );
+        let t = Instant::now();
+        s.seal(b2).unwrap();
+        let sealed = t.elapsed();
+        eprintln!("seal   after the import in {sealed:.2?}");
+        ended.store(true, Ordering::SeqCst);
+        reserve.join().unwrap();
+    }
+
     #[test]
     fn syncer_group_commit_covers_every_group_with_fewer_syncs() {
         // 32 threads each end a group under the lock and ask the syncer
