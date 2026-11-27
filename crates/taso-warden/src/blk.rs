@@ -311,6 +311,21 @@ fn run(cmd: &mut Command) -> io::Result<()> {
     }
 }
 
+/// A refused unmount of `dir`, naming who holds the mount as `proc` shows
+/// them, read after the refusal: every mount on `dir` in any mount
+/// namespace with its propagation, and every process working in it or
+/// with a file open under it; or "nobody found" when they had let go.
+fn umount_refused(proc: &Path, dir: &Path, e: io::Error) -> io::Error {
+    let held = taso_blk::holders::of_mount(proc, dir);
+    io::Error::new(
+        e.kind(),
+        format!(
+            "{e}; {}",
+            taso_blk::holders::report(&held, taso_blk::holders::own_ns(proc).as_deref(), 12)
+        ),
+    )
+}
+
 /// `FIFREEZE` and `FITHAW` (linux/fs.h: `_IOWR('X', 119, int)` and
 /// `_IOWR('X', 120, int)`): the two calls `fsfreeze -f` and `fsfreeze -u`
 /// make.
@@ -395,7 +410,9 @@ impl Mounts for System {
         ))
     }
     fn umount(&self, dir: &Path) -> io::Result<()> {
-        run(Command::new("umount").arg(dir))
+        // A refusal names who holds the mount, read after it (taso-test,
+        // 2026-11-27: "target is busy" at a Vessel's reset after birth).
+        run(Command::new("umount").arg(dir)).map_err(|e| umount_refused(Path::new("/proc"), dir, e))
     }
     fn freeze(&self, dir: &Path) -> io::Result<()> {
         fs_freeze_call(dir, FIFREEZE)
@@ -2093,6 +2110,25 @@ mod tests {
             .unwrap()
             .1;
         assert!(lib.contains("#![deny(unsafe_code)]"));
+    }
+
+    /// A refused unmount names who holds the mount, or says nobody was
+    /// found (taso-test, 2026-11-27: "target is busy" at a reset after
+    /// birth, with every Vessel mount also in the host services' mount
+    /// namespaces).
+    #[test]
+    fn a_refused_unmount_names_who_holds_the_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = super::umount_refused(
+            Path::new("/proc"),
+            &dir.path().join("not-mounted"),
+            io::Error::other("umount: target is busy"),
+        );
+        let msg = e.to_string();
+        assert!(
+            msg.starts_with("umount: target is busy; held by: nobody found"),
+            "{msg}"
+        );
     }
 
     /// The freeze call refuses what `fsfreeze` would have followed: a
