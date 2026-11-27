@@ -53,8 +53,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use taso_blk::client::{Client, ClientError, Info};
+use taso_blk::client::{Client, ClientError, Info, WAIT_STEP};
 use taso_blk::map::LayerId;
 use taso_core::envelope::{HashVal, Lsn};
 
@@ -166,6 +167,26 @@ pub trait Blkd {
     fn recovered(&mut self) -> Result<taso_blk::client::LogStart, LayerError>;
 }
 
+/// How long an export may go without its stream file growing (the
+/// maturity review's finding 7, D&D 7-e, 2026-11-27): the Warden waits
+/// while taso-blkd writes the stream, however long that takes.
+pub const EXPORT_IDLE: Duration = Duration::from_secs(120);
+
+/// How long an import may take: this, and a second for every
+/// [`IMPORT_PER_SECOND`] bytes of its stream ([`import_limit`]).
+pub const IMPORT_BASE: Duration = Duration::from_secs(120);
+
+/// The rate an import's limit allows for (D&D 7-d): 32 MiB/s, about a
+/// thirteenth of what taso-test measured (432 MiB/s for 2 GiB,
+/// 2026-11-27) and an eighth of its export.
+pub const IMPORT_PER_SECOND: u64 = 32 << 20;
+
+/// How long an import of a `bytes`-long stream may take (D&D 7-d): 184 s
+/// for 2 GiB, 440 s for 10 GiB.
+pub fn import_limit(bytes: u64) -> Duration {
+    IMPORT_BASE + Duration::from_secs(bytes / IMPORT_PER_SECOND)
+}
+
 /// `taso-blkd` over its socket.  Connects on first use and again after a
 /// socket error (an answer may have been lost; the next call starts on a
 /// fresh connection).
@@ -201,6 +222,64 @@ impl Daemon {
             }
         }
     }
+
+    /// [`Blkd::export`], waited for while the stream file at `path` grows:
+    /// given up after `idle` with no growth, asked every `step`.
+    fn export_watching(
+        &mut self,
+        to: LayerId,
+        from: Option<LayerId>,
+        path: &Path,
+        step: Duration,
+        idle: Duration,
+    ) -> Result<u64, LayerError> {
+        let (mut size, mut since) = (0, Instant::now());
+        let growing = || {
+            let now = std::fs::metadata(path).map_or(0, |m| m.len());
+            if now > size {
+                (size, since) = (now, Instant::now());
+            }
+            since.elapsed() < idle
+        };
+        self.call(|c| c.export_while(to, from, path, step, growing))
+            .map_err(|e| match timed_out(&e) {
+                true => format!(
+                    "taso-blkd's export of {to} stopped: its stream {} stayed at {} bytes for {idle:?} (given up; the connection is dropped)",
+                    path.display(),
+                    std::fs::metadata(path).map_or(0, |m| m.len())
+                )
+                .into(),
+                false => e,
+            })
+    }
+
+    /// [`Blkd::import`], waited for at most `limit`, asked every `step`.
+    fn import_within(
+        &mut self,
+        branch: LayerId,
+        path: &Path,
+        step: Duration,
+        limit: Duration,
+    ) -> Result<u64, LayerError> {
+        let t = Instant::now();
+        self.call(|c| c.import_while(branch, path, step, || t.elapsed() < limit))
+            .map_err(|e| match timed_out(&e) {
+                true => format!(
+                    "taso-blkd's import of {} into {branch} gave no answer within {limit:?} (given up; the connection is dropped)",
+                    path.display()
+                )
+                .into(),
+                false => e,
+            })
+    }
+}
+
+/// Whether `e` is the client giving up waiting (a socket timeout).
+fn timed_out(e: &LayerError) -> bool {
+    matches!(
+        e.downcast_ref::<ClientError>(),
+        Some(ClientError::Io(e)) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+    )
 }
 
 impl Blkd for Daemon {
@@ -255,10 +334,13 @@ impl Blkd for Daemon {
         from: Option<LayerId>,
         path: &Path,
     ) -> Result<u64, LayerError> {
-        self.call(|c| c.export(to, from, path))
+        // Finding 7 (D&D 7-e): as long as taso-blkd writes the stream.
+        self.export_watching(to, from, path, WAIT_STEP, EXPORT_IDLE)
     }
     fn import(&mut self, branch: LayerId, path: &Path) -> Result<u64, LayerError> {
-        self.call(|c| c.import(branch, path))
+        // Finding 7 (D&D 7-d): a limit that grows with the stream.
+        let bytes = std::fs::metadata(path)?.len();
+        self.import_within(branch, path, WAIT_STEP, import_limit(bytes))
     }
     fn names(&mut self) -> Result<Vec<(String, LayerId)>, LayerError> {
         self.call(|c| c.names())
@@ -2120,6 +2202,124 @@ impl<D: Blkd, M: Mounts> Layers for BlkLayers<D, M> {
 
 #[cfg(test)]
 mod tests {
+    // ── Long exports and imports (finding 7) ────────────────────────
+
+    /// A stand-in taso-blkd on a socket in `dir`: `root` is answered L3,
+    /// every other line goes to `answer`, which writes what it likes.
+    /// Serves every connection until the test ends.
+    fn stand_in(
+        dir: &std::path::Path,
+        answer: fn(&str, &mut std::os::unix::net::UnixStream),
+    ) -> super::Daemon {
+        use std::io::BufRead;
+        let sock = dir.join("blk.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for s in listener.incoming() {
+                let Ok(s) = s else { return };
+                std::thread::spawn(move || {
+                    let mut w = s.try_clone().unwrap();
+                    for line in std::io::BufReader::new(s).lines() {
+                        let Ok(line) = line else { return };
+                        if line == "root" {
+                            use std::io::Write;
+                            let _ = writeln!(w, "ok L3");
+                            continue;
+                        }
+                        answer(&line, &mut w);
+                    }
+                });
+            }
+        });
+        super::Daemon::new(sock)
+    }
+
+    /// The stream path an `export L3 - PATH` line names.
+    fn stream_of(line: &str) -> std::path::PathBuf {
+        line.rsplit(' ').next().unwrap().into()
+    }
+
+    /// D&D 7-e (2026-11-27): an export is waited for while taso-blkd
+    /// writes its stream, past the time it may go without growth; one
+    /// whose stream stops growing is given up, with a reason that says
+    /// so.
+    #[test]
+    fn an_export_is_waited_for_while_its_stream_grows() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = stand_in(dir.path(), |line, w| {
+            let mut f = std::fs::File::create(stream_of(line)).unwrap();
+            let rounds = if line.ends_with("/s1") { 6 } else { 1 };
+            for _ in 0..rounds {
+                f.write_all(&[7; 10]).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            if rounds == 1 {
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+            let _ = writeln!(w, "ok {rounds}");
+        });
+        let (step, idle) = (Duration::from_millis(20), Duration::from_millis(250));
+        let l3 = super::Blkd::root(&mut d).unwrap();
+        let t = Instant::now();
+        let got = d.export_watching(l3, None, &dir.path().join("s1"), step, idle);
+        assert_eq!(got.unwrap(), 6, "600 ms of growth, past the 250 ms");
+        assert!(t.elapsed() >= Duration::from_millis(600));
+        let t = Instant::now();
+        let e = d
+            .export_watching(l3, None, &dir.path().join("s2"), step, idle)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("taso-blkd's export of L3 stopped: its stream ")
+                && e.contains("stayed at 10 bytes for 250ms"),
+            "{e}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(800),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
+    /// D&D 7-d: an import is waited for within its limit, which grows
+    /// with its stream (184 s for 2 GiB, 440 s for 10 GiB); past it, it is
+    /// given up with a reason that says so.
+    #[test]
+    fn an_import_is_waited_for_within_a_limit_that_grows_with_its_stream() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        assert_eq!(super::import_limit(2 << 30), Duration::from_secs(184));
+        assert_eq!(super::import_limit(10 << 30), Duration::from_secs(440));
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = stand_in(dir.path(), |_, w| {
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = writeln!(w, "ok 9");
+        });
+        let (s, step) = (dir.path().join("s"), Duration::from_millis(20));
+        let l3 = super::Blkd::root(&mut d).unwrap();
+        let got = d.import_within(l3, &s, step, Duration::from_secs(2));
+        assert_eq!(got.unwrap(), 9, "400 ms, within 2 s");
+        let t = Instant::now();
+        let e = d
+            .import_within(l3, &s, step, Duration::from_millis(150))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("taso-blkd's import of ")
+                && e.ends_with(
+                    "into L3 gave no answer within 150ms (given up; the connection is dropped)"
+                ),
+            "{e}"
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(350),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+
     /// The crate denies unsafe code with one named exception
     /// (`fs_freeze_call`).  Any other `allow` of it fails here, so a new one
     /// is a change to this test, made on purpose and seen in review.
