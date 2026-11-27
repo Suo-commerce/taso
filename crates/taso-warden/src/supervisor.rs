@@ -28,6 +28,11 @@
 //!   that run has ended (a new listing, not a restart).
 //! - **A panicking run** is reported and counts as a run whose agent never
 //!   ran (a failure for the restart policy).
+//! - **A fenced run is never started again here** (the maturity review's
+//!   finding 6): another Warden holds the Vessel now, so neither its policy
+//!   nor its listing starts it again.  It stays done while it is listed;
+//!   removed and listed again, it starts afresh (a takeover, if its entry
+//!   says so).
 //!
 //! # Ending
 //!
@@ -53,6 +58,11 @@ pub trait RunVessel: Send + Sync + 'static {
     /// Whether the agent exited ok (`None`: it never ran) and whether the
     /// run ended on a stop.
     fn outcome(out: &Self::Out) -> (Option<bool>, bool);
+    /// Whether the run ended because another Warden holds the Vessel now
+    /// (finding 6).  By default never.
+    fn fenced(_out: &Self::Out) -> bool {
+        false
+    }
     /// Whether a run of `key` has got past its start: its dataset is
     /// settled here (opened, or reborn) and the publish of its last Seal
     /// was tried, so a fork of it may start (parent before child, P3
@@ -74,6 +84,10 @@ impl RunVessel for Node {
             Ok(r) => (r.agent.as_ref().map(|(ok, _)| *ok), r.stopped),
             Err(_) => (None, false),
         }
+    }
+
+    fn fenced(out: &Self::Out) -> bool {
+        matches!(out, Ok(r) if r.fenced)
     }
 
     fn started(&self, key: &VesselKey) -> bool {
@@ -279,21 +293,26 @@ impl<R: RunVessel> Supervisor<R> {
             if now.duration_since(since) >= self.timing.healthy {
                 slot.streak = 0;
             }
-            let (agent_ok, stopped, out) = match handle.join() {
+            let (agent_ok, stopped, fenced, out) = match handle.join() {
                 Ok(out) => {
                     let (ok, stopped) = R::outcome(&out);
-                    (ok, stopped || stop.requested(), Some(out))
+                    (ok, stopped || stop.requested(), R::fenced(&out), Some(out))
                 }
-                Err(_) => (None, stop.requested(), None),
+                Err(_) => (None, stop.requested(), false, None),
             };
-            // A stop on purpose never restarts; otherwise the latest entry's policy decides.
-            let restart = !stopped && slot.vc.restart.again(agent_ok);
+            // A stop on purpose, or a fence, never restarts; otherwise the
+            // latest entry's policy decides.
+            let restart = !stopped && !fenced && slot.vc.restart.again(agent_ok);
             let restart_in = restart.then(|| {
                 slot.streak += 1;
                 self.timing.backoff(slot.streak)
             });
             slot.state = match restart_in {
                 Some(d) => State::Waiting(now + d),
+                // Another Warden holds it now: not started again here while
+                // it is listed (its run stopped its agent through its own
+                // Stop, so it ended "stopped").
+                None if fenced => State::Done,
                 // Stopped because it was removed, but listed again before
                 // the run ended: a new listing, not a restart (no backoff).
                 None if stopped && self.wanted.contains_key(key) => State::Ready,
@@ -448,6 +467,9 @@ mod tests {
         Slow(Option<bool>, u64),
         /// Run until stopped.
         UntilStop,
+        /// Fenced: stop itself, as a run that learns another Warden holds
+        /// its Vessel does.
+        Fenced,
         /// Panic.
         Panic,
     }
@@ -455,6 +477,9 @@ mod tests {
     /// One recorded run: subject, the restart policy it ran with, start,
     /// end, and whether it ended on a stop.
     type RunRecord = (String, Restart, Instant, Instant, bool);
+
+    /// A fake run's outcome: the agent's result, stopped, fenced.
+    type Out = (Option<bool>, bool, bool);
 
     /// A runner that follows a script per subject and records every run.
     #[derive(Default)]
@@ -493,7 +518,7 @@ mod tests {
     }
 
     impl RunVessel for Fake {
-        type Out = (Option<bool>, bool);
+        type Out = Out;
         fn run(&self, vc: &VesselConf, stop: &Stop) -> Self::Out {
             {
                 let mut live = self.live.lock().unwrap();
@@ -530,19 +555,25 @@ mod tests {
                 Act::Exit(ok) => {
                     std::thread::sleep(Duration::from_millis(3));
                     leave(false);
-                    (ok, false)
+                    (ok, false, false)
                 }
                 Act::Slow(ok, ms) => {
                     std::thread::sleep(Duration::from_millis(ms));
                     leave(false);
-                    (ok, false)
+                    (ok, false, false)
                 }
                 Act::UntilStop => {
                     while !stop.requested() {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                     leave(true);
-                    (Some(false), true)
+                    (Some(false), true, false)
+                }
+                Act::Fenced => {
+                    std::thread::sleep(Duration::from_millis(3));
+                    stop.request();
+                    leave(true);
+                    (Some(false), true, true)
                 }
                 Act::Panic => {
                     leave(false);
@@ -551,7 +582,10 @@ mod tests {
             }
         }
         fn outcome(out: &Self::Out) -> (Option<bool>, bool) {
-            *out
+            (out.0, out.1)
+        }
+        fn fenced(out: &Self::Out) -> bool {
+            out.2
         }
         fn started(&self, key: &VesselKey) -> bool {
             self.started.lock().unwrap().contains(key)
@@ -619,7 +653,7 @@ mod tests {
         SourceFailed,
     }
 
-    fn simple(e: Event<(Option<bool>, bool)>) -> E {
+    fn simple(e: Event<Out>) -> E {
         match e {
             Event::Started(v) => E::Started(v.subject),
             Event::Exited {
@@ -876,6 +910,43 @@ mod tests {
         let ev = events.lock().unwrap();
         assert!(ev.contains(&E::Stopping("a".into())));
         assert!(ev.contains(&E::Exited("a".into(), true, false)));
+    }
+
+    /// Finding 6 (D&D 6 (a), 2026-11-27).  A fenced run stopped its agent
+    /// through its own Stop; under `always`, and still listed, it was
+    /// started again at once ("stopped, but listed": a new listing) and
+    /// took the Vessel back from the Warden that holds it now.  It stays
+    /// done while listed; removed and listed again, it starts afresh.
+    #[test]
+    fn a_fenced_vessel_is_not_started_again_while_it_is_listed() {
+        let f = Fake::with(&[("a", &[Act::Fenced])]);
+        let (live, shutdown, events, h) = spawn_live(&f);
+        live.push(Ok(Some(vec![vc("a", 0, Restart::Always)])));
+        wait_for("the fenced run", || f.runs_of("a").len() == 1);
+        std::thread::sleep(Duration::from_millis(60)); // longer than any backoff
+        assert_eq!(
+            f.runs_of("a").len(),
+            1,
+            "a fenced Vessel was started again while still listed"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&E::Exited("a".into(), true, false)),
+            "ended stopped, with no restart"
+        );
+        // Removed, then listed again: a new listing starts it.
+        live.push(Ok(Some(vec![])));
+        wait_for("the removal to be read", || {
+            live.0.lock().unwrap().is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        live.push(Ok(Some(vec![vc("a", 0, Restart::Always)])));
+        wait_for("a new run", || f.live.lock().unwrap().get("a") == Some(&1));
+        shutdown.request();
+        h.join().unwrap();
+        assert_eq!(f.runs_of("a").len(), 2);
     }
 
     // ── removal, overlap, source failure ────────────────────────────
