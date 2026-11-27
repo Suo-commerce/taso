@@ -4500,6 +4500,49 @@ mod tests {
         .seal
     }
 
+    /// Finding 8 (D&D 8 (a), 2026-11-27), on the block log: a Warden
+    /// killed between naming a void birth's branch and making its file
+    /// system left the branch, attached, with no file system.  The next
+    /// birth destroys it (detached, dropped with its root) and makes the
+    /// dataset again, file system and all.
+    #[test]
+    fn a_branch_left_unformatted_by_a_killed_birth_is_made_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = host(tmp.path());
+        let ns = Namespace::from_bytes([1; 16]);
+        let dataset = host.dataset_for(taso_core::record::vessel_id(ns, b"user-1"));
+        // `create` up to its mkfs, then killed.
+        let (left, root) = {
+            let mut d = host.pool.blkd.lock().unwrap();
+            let root = d.root().unwrap();
+            let b = d.branch(root, dataset.as_str()).unwrap();
+            d.flush().unwrap();
+            d.attach(b).unwrap();
+            (b, root)
+        };
+        calls(&host.pool);
+        let (_, how) = host.ensure(ns, b"user-1").unwrap();
+        assert!(matches!(how, crate::vessel::Ensured::Born));
+        let mut d = host.pool.blkd.lock().unwrap();
+        let now = d.find(dataset.as_str()).unwrap().unwrap();
+        assert_ne!(now, left, "another branch");
+        assert!(
+            d.info(left).is_err() && d.info(root).is_err(),
+            "the old branch and its root are gone"
+        );
+        let dev = d.info(now).unwrap().dev.unwrap();
+        drop(d);
+        let mp = host.pool.mountpoint(&dataset);
+        assert_eq!(
+            calls(&host.pool),
+            [
+                format!("mkfs {}", dev.display()),
+                format!("mount {} {}", dev.display(), mp.display())
+            ],
+            "the new branch has its file system"
+        );
+    }
+
     #[test]
     fn vessels_are_born_sealed_forked_and_reopened_on_the_block_log() {
         let tmp = tempfile::tempdir().unwrap();
