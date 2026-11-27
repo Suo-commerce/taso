@@ -97,6 +97,9 @@ pub fn status_of(
             restart_in,
         } => {
             let how = match (&r.agent, stopped) {
+                // Finding 6: the run stopped its own agent, because another
+                // Warden holds the Vessel; nobody asked.
+                _ if r.fenced => "fenced: another Warden holds this Vessel now; not started again here until it is listed again".to_string(),
                 (_, true) => "stopped on request".to_string(),
                 (Some((true, _)), _) => "agent exited ok".to_string(),
                 (Some((false, err)), _) => format!("agent failed: {}", err.trim()),
@@ -114,7 +117,9 @@ pub fn status_of(
                 key(vc),
                 json!({
                     "phase": "Exited",
-                    "holder": holder,
+                    // Fenced: not this Warden's any more, and the new holder
+                    // is not known here (null removes it from the status).
+                    "holder": if r.fenced { Value::Null } else { json!(holder) },
                     "start": start,
                     "settled": {
                         "birthSeal": lsn(r.settled.birth),
@@ -473,6 +478,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(stopped["message"], "stopped on request");
+        // Finding 6: a fenced run stopped its own agent; nobody asked, and
+        // this Warden no longer holds it.
+        let fenced = s(Event::Exited {
+            vc: vc("v1"),
+            out: Ok(Report {
+                fenced: true,
+                ..report(Some((false, "killed")), true)
+            }),
+            stopped: true,
+            restart_in: None,
+        })
+        .unwrap();
+        assert_eq!(
+            fenced["message"],
+            "fenced: another Warden holds this Vessel now; not started again here until it is listed again"
+        );
+        assert_eq!(fenced["holder"], Value::Null);
+        assert_eq!(fenced["phase"], "Exited");
         let never = s(Event::Exited {
             vc: vc("v1"),
             out: Ok(report(None, false)),
