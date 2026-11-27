@@ -30,7 +30,32 @@
 //!   or, with [`S3Config::ca_file`], against that CA alone (a Garage behind
 //!   a proxy with a private CA).
 //! - One attempt per request; the callers decide about retrying (a failed
-//!   publish is retried by the next one).
+//!   publish is retried by the next one).  The one exception is a
+//!   download's later pieces (below).
+//!
+//! # Downloads
+//!
+//! A GET reads an object in pieces of [`PIECE`] (64 MiB), each its own
+//! ranged request (the maturity review's finding 7; D&D 7-a…7-c,
+//! 2026-11-27): one limit on the whole call cut every download that took
+//! longer than 30 s, so a large Vessel could not be reborn from the store.
+//! Each phase of a request has its own limit instead, and a piece's body
+//! must arrive within [`PIECE_BODY`].
+//!
+//! - A piece that fails partway (the connection broken, its body too
+//!   slow, a 5xx) is asked for again from the byte it reached, three more
+//!   times, after 1, 2 and 4 s; each try is logged, and the last failure
+//!   is a `FAILED` line and the read's error.  A first request that gets no
+//!   answer at all is the caller's, as for every request.
+//! - Every later piece is asked for with the first answer's ETag
+//!   (`If-Match`), and its own answer's ETag is compared with it: an object
+//!   changed or deleted while it was read ends the read at once, not
+//!   retried, instead of joining the bytes of two objects.
+//! - An object larger than one piece logs its progress: at the start,
+//!   every 10 s, and at the end.
+//! - A store that ignores `Range` answers the whole object to the first
+//!   request, read as one answer (its body within [`PIECE_BODY`]); an empty
+//!   object (which has no byte 0) is asked for again without a range.
 
 use std::fmt::Write as _;
 use std::io::{self, Read};
@@ -79,18 +104,56 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
+/// How much of an object one GET asks for (finding 7, D&D 7-a,
+/// 2026-11-27): a 10 GiB `fs` section is 160 requests.
+pub const PIECE: u64 = 64 << 20;
+
+/// How long one piece's body may take to arrive (D&D 7-a): 64 MiB in it
+/// is about 0.5 MiB/s at the least.  Also how long one body may take to
+/// send (a part is 16 MiB).
+pub const PIECE_BODY: Duration = Duration::from_secs(120);
+
+/// The waits before a failed piece is asked for again (D&D 7-c): three
+/// more tries after the first.
+const PIECE_WAITS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+/// A download's progress line at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_secs(10);
+
 /// An [`ObjectStore`] in an S3 bucket.
 #[derive(Debug)]
 pub struct S3Store {
+    conn: Conn,
+    /// The bucket answered as there once: a HEAD's 404 is then the key's.
+    bucket_seen: std::sync::atomic::AtomicBool,
+    /// A download's piece ([`PIECE`]; smaller in tests).
+    piece: u64,
+    /// The waits before a piece is asked for again ([`PIECE_WAITS`]).
+    waits: [Duration; 3],
+    /// The limit of each phase of a request but a body's (kept for
+    /// [`S3Store::tuned`]).
+    #[cfg(test)]
+    timeout: Duration,
+}
+
+/// What a request needs: where the store is, how to sign, the client.
+/// A download's reader keeps its own copy, to ask for its later pieces.
+#[derive(Clone, Debug)]
+struct Conn {
     config: S3Config,
     host: String,
     agent: ureq::Agent,
-    /// The bucket answered as there once: a HEAD's 404 is then the key's.
-    bucket_seen: std::sync::atomic::AtomicBool,
 }
 
 impl S3Store {
-    /// A store over `config`.  Requests time out after `timeout`.
+    /// A store over `config`.  Each phase of a request (to connect, to
+    /// send its head, to receive the answer's head) waits at most
+    /// `timeout`; a body is sent, or a piece of one received, within
+    /// [`PIECE_BODY`] (see the module docs).
     pub fn new(config: S3Config, timeout: Duration) -> io::Result<Self> {
         let bad_endpoint = || {
             io::Error::new(
@@ -153,19 +216,66 @@ impl S3Store {
                 format!("invalid bucket name {:?}", config.bucket),
             ));
         }
-        let agent = http_agent(timeout, config.ca_file.as_deref())?;
+        let agent = s3_agent(timeout, PIECE_BODY, config.ca_file.as_deref())?;
         Ok(Self {
-            config,
-            host,
-            agent,
+            conn: Conn {
+                config,
+                host,
+                agent,
+            },
             bucket_seen: Default::default(),
+            piece: PIECE,
+            waits: PIECE_WAITS,
+            #[cfg(test)]
+            timeout,
         })
     }
 
-    fn path(&self, key: &str) -> String {
-        format!("/{}/{}", self.config.bucket, key)
+    /// Small pieces, a short body limit and short waits, for tests.
+    #[cfg(test)]
+    fn tuned(mut self, piece: u64, body: Duration, wait: Duration) -> Self {
+        self.conn.agent =
+            s3_agent(self.timeout, body, self.conn.config.ca_file.as_deref()).unwrap();
+        self.piece = piece;
+        self.waits = [wait; 3];
+        self
     }
 
+    fn path(&self, key: &str) -> String {
+        format!("/{}/{}", self.conn.config.bucket, key)
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        payload_hash: &str,
+        extra: &[(&str, String)],
+    ) -> http::request::Builder {
+        self.conn.request(method, path, query, payload_hash, extra)
+    }
+
+    fn send(
+        &self,
+        what: &str,
+        req: http::request::Builder,
+        body: impl ureq::AsSendBody,
+    ) -> io::Result<http::Response<ureq::Body>> {
+        self.conn.send(what, req, body)
+    }
+
+    fn send_again<B: ureq::AsSendBody + Copy>(
+        &self,
+        what: &str,
+        make: impl Fn() -> http::request::Builder,
+        body: B,
+    ) -> io::Result<http::Response<ureq::Body>> {
+        self.conn.send_again(what, make, body)
+    }
+}
+
+impl Conn {
     /// A signed request for `method` on `path` with `query` (unencoded
     /// pairs) and `payload_hash`, plus extra signed headers.
     fn request(
@@ -270,8 +380,34 @@ impl S3Store {
 /// interruption is reported as its failure.
 const INTERRUPTED_TRIES: u32 = 8;
 
-/// The HTTP client for S3 and the Kubernetes API: every request times out
-/// after `timeout`; with `ca`, TLS trusts exactly the certificates in that
+/// The HTTP client for S3 (finding 7): each phase of a request has its
+/// own limit, and none bounds the whole call (one limit on the whole call
+/// cut every download that took longer).  `timeout` to resolve the name,
+/// to connect (TLS included), to send a request's head and to receive an
+/// answer's head; `body` to send a body or to receive one.  A GET receives
+/// an object a piece at a time ([`PIECE`]), each its own request, so
+/// `body` bounds one piece.  As [`http_agent`] otherwise.
+fn s3_agent(
+    timeout: Duration,
+    body: Duration,
+    ca: Option<&std::path::Path>,
+) -> io::Result<ureq::Agent> {
+    let mut config = ureq::Agent::config_builder()
+        .timeout_resolve(Some(timeout))
+        .timeout_connect(Some(timeout))
+        .timeout_send_request(Some(timeout))
+        .timeout_send_body(Some(body))
+        .timeout_recv_response(Some(timeout))
+        .timeout_recv_body(Some(body))
+        .http_status_as_error(false);
+    if let Some(ca) = ca {
+        config = config.tls_config(tls_trusting(ca)?);
+    }
+    Ok(config.build().into())
+}
+
+/// The HTTP client for the Kubernetes API: every request times out after
+/// `timeout`; with `ca`, TLS trusts exactly the certificates in that
 /// file, else the public roots.  Every status is an answer, not an error
 /// (`http_status_as_error(false)`): an error's body carries the server's
 /// reason, which the callers report.
@@ -337,11 +473,11 @@ impl S3Store {
         if self.bucket_seen.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let path = format!("/{}", self.config.bucket);
+        let path = format!("/{}", self.conn.config.bucket);
         let req = || self.request("HEAD", &path, &[], EMPTY_SHA256, &[]);
         let resp = self.send_again(what, req, ())?;
         if resp.status() == http::StatusCode::NOT_FOUND {
-            return Err(no_bucket(what, &self.config.bucket));
+            return Err(no_bucket(what, &self.conn.config.bucket));
         }
         success(&format!("{what}: head the bucket"), resp)?;
         self.bucket_seen.store(true, Ordering::Relaxed);
@@ -391,7 +527,7 @@ impl S3Store {
             if let Some(t) = &token {
                 query.push(("continuation-token", t.as_str()));
             }
-            let path = format!("/{}", self.config.bucket);
+            let path = format!("/{}", self.conn.config.bucket);
             let what = format!("list {prefix}");
             let req = || self.request("GET", &path, &query, EMPTY_SHA256, &[]);
             let body = success(&what, self.send_again(&what, req, ())?)?
@@ -583,17 +719,56 @@ impl ObjectStore for S3Store {
             return Err(bad_key(key));
         }
         let what = format!("get {key}");
-        let req = || self.request("GET", &self.path(key), &[], EMPTY_SHA256, &[]);
+        let path = self.path(key);
+        // The first piece (finding 7: an object is read in pieces).
+        let range = [("range", format!("bytes=0-{}", self.piece - 1))];
+        let req = || self.request("GET", &path, &[], EMPTY_SHA256, &range);
         let mut resp = self.send_again(&what, req, ())?;
-        if resp.status() == http::StatusCode::NOT_FOUND {
-            let body = resp.body_mut().read_to_string().unwrap_or_default();
-            if between(&body, "<Code>", "</Code>") == Some("NoSuchBucket") {
-                return Err(no_bucket(&what, &self.config.bucket));
+        match resp.status() {
+            http::StatusCode::NOT_FOUND => {
+                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                if between(&body, "<Code>", "</Code>") == Some("NoSuchBucket") {
+                    return Err(no_bucket(&what, &self.conn.config.bucket));
+                }
+                return Ok(None);
             }
-            return Ok(None);
+            // An empty object has no byte 0: asked for again whole (the
+            // refusal read first, so its connection is free again).
+            http::StatusCode::RANGE_NOT_SATISFIABLE => {
+                let _ = resp.body_mut().read_to_string();
+                let req = || self.request("GET", &path, &[], EMPTY_SHA256, &[]);
+                let resp = success(&what, self.send_again(&what, req, ())?)?;
+                return Ok(Some(Box::new(resp.into_body().into_reader())));
+            }
+            http::StatusCode::PARTIAL_CONTENT => {}
+            // A whole object to a ranged request (a store that ignores
+            // Range), or an error.
+            _ => {
+                let resp = success(&what, resp)?;
+                return Ok(Some(Box::new(resp.into_body().into_reader())));
+            }
         }
-        let resp = success(&what, resp)?;
-        Ok(Some(Box::new(resp.into_body().into_reader())))
+        let Some((0, end, total)) = content_range(&resp) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{what}: the store answered bytes 0-{} with Content-Range {:?}",
+                    self.piece - 1,
+                    header(&resp, "content-range")
+                ),
+            ));
+        };
+        let etag = header(&resp, "etag");
+        let first = resp.into_body().into_reader();
+        Ok(Some(Box::new(Pieces::new(
+            self,
+            what,
+            path,
+            etag,
+            total,
+            end + 1,
+            Box::new(first),
+        ))))
     }
 
     fn exists(&self, key: &str) -> io::Result<bool> {
@@ -673,6 +848,290 @@ struct Page {
     /// Each key, with its `LastModified` as given.
     keys: Vec<(String, Option<String>)>,
     next: Option<String>,
+}
+
+/// A header of `resp` as text, if it has it.
+fn header(resp: &http::Response<ureq::Body>, name: &str) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+/// `(first, last, total)` of a 206's `Content-Range: bytes first-last/total`.
+fn content_range(resp: &http::Response<ureq::Body>) -> Option<(u64, u64, u64)> {
+    let v = header(resp, "content-range")?;
+    let (range, total) = v.strip_prefix("bytes ")?.split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+    let (first, last, total) = (first.parse().ok()?, last.parse().ok()?, total.parse().ok()?);
+    (first <= last && last < total).then_some((first, last, total))
+}
+
+/// A size as a person reads it: bytes, MiB, or GiB to a tenth.
+fn size(b: u64) -> String {
+    if b >= 1 << 30 {
+        format!("{:.1} GiB", b as f64 / f64::from(1u32 << 30))
+    } else if b >= 1 << 20 {
+        format!("{} MiB", b >> 20)
+    } else {
+        format!("{b} bytes")
+    }
+}
+
+/// Why a piece's request failed.
+enum Fail {
+    /// Worth asking again (no answer, a broken or slow answer, a 5xx).
+    Again(String),
+    /// Not: the object changed or is gone, or the store refuses.
+    Final(String),
+}
+
+/// An object read in pieces, each its own ranged GET (see the module
+/// docs, "Downloads").  Made by [`S3Store::get`] with the first piece's
+/// answer.
+struct Pieces {
+    conn: Conn,
+    /// `get <key>`, the start of every line and error.
+    what: String,
+    path: String,
+    /// The first answer's ETag: every later piece must be of that object.
+    etag: Option<String>,
+    total: u64,
+    piece: u64,
+    waits: [Duration; 3],
+    /// The bytes handed to the reader so far.
+    pos: u64,
+    /// Where the current answer ends (exclusive).
+    end: u64,
+    /// The current answer's body; `None` between pieces.
+    body: Option<Box<dyn Read + Send>>,
+    /// The current piece's failed tries.
+    failures: u32,
+    /// The read failed for good: its error, again.
+    dead: Option<String>,
+    /// Larger than one piece: progress is logged.
+    loud: bool,
+    started: std::time::Instant,
+    said: std::time::Instant,
+    ended: bool,
+}
+
+impl Pieces {
+    fn new(
+        store: &S3Store,
+        what: String,
+        path: String,
+        etag: Option<String>,
+        total: u64,
+        end: u64,
+        first: Box<dyn Read + Send>,
+    ) -> Self {
+        let now = std::time::Instant::now();
+        let p = Self {
+            conn: store.conn.clone(),
+            what,
+            path,
+            etag,
+            total,
+            piece: store.piece,
+            waits: store.waits,
+            pos: 0,
+            end,
+            body: Some(first),
+            failures: 0,
+            dead: None,
+            loud: total > store.piece,
+            started: now,
+            said: now,
+            ended: false,
+        };
+        if p.loud {
+            p.say(format_args!(
+                "{} in {} pieces",
+                size(total),
+                total.div_ceil(store.piece)
+            ));
+        }
+        p
+    }
+
+    fn say(&self, line: std::fmt::Arguments<'_>) {
+        eprintln!("taso: {}: {line}", self.what);
+    }
+
+    /// The piece the reader is in, from 1.
+    fn number(&self) -> u64 {
+        self.pos / self.piece + 1
+    }
+
+    /// Ask for the rest of the piece the reader is in, from `pos`, as part
+    /// of the first answer's object.
+    fn ask(&self) -> Result<(u64, Box<dyn Read + Send>), Fail> {
+        let end = ((self.pos / self.piece + 1) * self.piece).min(self.total);
+        let mut extra = vec![("range", format!("bytes={}-{}", self.pos, end - 1))];
+        if let Some(e) = &self.etag {
+            extra.push(("if-match", e.clone()));
+        }
+        let req = || {
+            self.conn
+                .request("GET", &self.path, &[], EMPTY_SHA256, &extra)
+        };
+        let mut resp = self
+            .conn
+            .send_again("no answer", req, ())
+            .map_err(|e| Fail::Again(e.to_string()))?;
+        let code = resp.status().as_u16();
+        if code != 206 {
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            let text = between(&body, "<Code>", "</Code>").unwrap_or_default();
+            return Err(match code {
+                412 => Fail::Final(format!(
+                    "the object changed while it was read (it is no longer ETag {})",
+                    self.etag.as_deref().unwrap_or("?")
+                )),
+                404 => Fail::Final("the object was deleted while it was read".into()),
+                200 => Fail::Final(
+                    "the store answered a later piece with the whole object (it ignores Range)"
+                        .into(),
+                ),
+                c if c >= 500 || c == 408 || c == 429 => Fail::Again(format!("HTTP {c} {text}")),
+                c => Fail::Final(format!("HTTP {c} {text}")),
+            });
+        }
+        if let (Some(was), Some(now)) = (&self.etag, header(&resp, "etag")) {
+            if *was != now {
+                return Err(Fail::Final(format!(
+                    "the object changed while it was read (ETag {was} became {now})"
+                )));
+            }
+        }
+        match content_range(&resp) {
+            Some((first, last, total))
+                if first == self.pos && last == end - 1 && total == self.total => {}
+            _ => {
+                return Err(Fail::Final(format!(
+                    "the store answered bytes {}-{} of {} with Content-Range {:?}",
+                    self.pos,
+                    end - 1,
+                    self.total,
+                    header(&resp, "content-range")
+                )))
+            }
+        }
+        Ok((end, Box::new(resp.into_body().into_reader())))
+    }
+
+    /// The reader's error for good: a `FAILED` line, and the same text.
+    fn failed(&mut self, why: &str) -> io::Error {
+        let line = format!(
+            "FAILED at {} of {} ({} %): {why}",
+            size(self.pos),
+            size(self.total),
+            self.pos * 100 / self.total.max(1)
+        );
+        self.say(format_args!("{line}"));
+        let e = format!("{}: {line}", self.what);
+        self.dead = Some(e.clone());
+        io::Error::other(e)
+    }
+
+    /// The current piece failed with `why`: wait and go on from `pos`, or,
+    /// past the last try, fail for good.
+    fn again(&mut self, why: String) -> io::Result<()> {
+        self.body = None;
+        self.failures += 1;
+        let tries = self.waits.len() as u32 + 1;
+        if self.failures >= tries {
+            let n = self.number();
+            return Err(self.failed(&format!("piece {n} failed {tries} times, last: {why}")));
+        }
+        self.say(format_args!(
+            "piece {} failed ({why}): again from {}, try {} of {tries}",
+            self.number(),
+            size(self.pos),
+            self.failures + 1
+        ));
+        std::thread::sleep(self.waits[self.failures as usize - 1]);
+        Ok(())
+    }
+
+    fn progress(&mut self) {
+        if !self.loud || self.said.elapsed() < PROGRESS_EVERY {
+            return;
+        }
+        self.said = std::time::Instant::now();
+        let rate = self.pos as f64 / self.started.elapsed().as_secs_f64();
+        self.say(format_args!(
+            "{} of {} ({} %), {:.0} MiB/s, about {:.0} s left",
+            size(self.pos),
+            size(self.total),
+            self.pos * 100 / self.total,
+            rate / f64::from(1u32 << 20),
+            (self.total - self.pos) as f64 / rate
+        ));
+    }
+}
+
+impl Read for Pieces {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(e) = &self.dead {
+            return Err(io::Error::other(e.clone()));
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.body.is_none() {
+                if self.pos >= self.total {
+                    if self.loud && !self.ended {
+                        self.ended = true;
+                        let secs = self.started.elapsed().as_secs_f64();
+                        self.say(format_args!(
+                            "{} in {secs:.1} s, {:.0} MiB/s",
+                            size(self.total),
+                            self.total as f64 / f64::from(1u32 << 20) / secs
+                        ));
+                    }
+                    return Ok(0);
+                }
+                match self.ask() {
+                    Ok((end, body)) => {
+                        self.end = end;
+                        self.body = Some(body);
+                    }
+                    Err(Fail::Final(why)) => return Err(self.failed(&why)),
+                    Err(Fail::Again(why)) => {
+                        self.again(why)?;
+                        continue;
+                    }
+                }
+            }
+            let want = buf.len().min((self.end - self.pos) as usize);
+            let body = self.body.as_mut().expect("a piece is open");
+            match body.read(&mut buf[..want]) {
+                Ok(0) => {
+                    let why = format!(
+                        "its answer ended at {}, short of {}",
+                        size(self.pos),
+                        size(self.end)
+                    );
+                    self.again(why)?;
+                }
+                Ok(n) => {
+                    self.pos += n as u64;
+                    if self.pos == self.end {
+                        // The piece is whole: the next one has its own tries.
+                        self.body = None;
+                        self.failures = 0;
+                    }
+                    self.progress();
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => self.again(e.to_string())?,
+            }
+        }
+    }
 }
 
 fn between<'a>(s: &'a str, open: &str, close: &str) -> Option<&'a str> {
@@ -1424,6 +1883,201 @@ class H(http.server.BaseHTTPRequestHandler):
             "no server: a transport error"
         );
     }
+    // ── Downloads in pieces (finding 7) ───────────────────────────
+
+    /// A stand-in store for downloads (finding 7, D&D 7-a…7-c): one
+    /// 10,000-byte object under every key, served by range with an ETag,
+    /// each key misbehaving its own way from its second request on (a
+    /// later piece).  `asked/<key>` answers how often `<key>` was asked.
+    fn pieces_server() -> TestServer {
+        TestServer::start(
+            false,
+            r#"
+import time
+N = 10000
+data = bytes((i * 7 + i // 251) % 256 for i in range(N))
+asked = {}
+etags = {}
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def head(self, code, n, headers=()):
+        self.send_response(code)
+        for k, v in headers: self.send_header(k, v)
+        self.send_header("Content-Length", str(n))
+        self.end_headers()
+    def reply(self, code, body, headers=()):
+        self.head(code, len(body), headers); self.wfile.write(body)
+    def do_GET(self):
+        k = self.path.split("/", 2)[2]
+        if k.startswith("asked/"):
+            return self.reply(200, str(asked.get(k[6:], 0)).encode())
+        n = asked[k] = asked.get(k, 0) + 1
+        m = k.rsplit("/", 1)[-1]
+        body = b"" if m == "empty" else data
+        tag = etags.setdefault(k, '"e1"')
+        r = self.headers.get("range")
+        if m == "whole" or r is None:
+            return self.reply(200, body, [("ETag", tag)])
+        a, b = (int(x) for x in r[6:].split("-"))
+        if a >= len(body):
+            return self.reply(416, b"<Error><Code>InvalidRange</Code></Error>")
+        b = min(b, len(body) - 1)
+        if n > 1:
+            if m == "gone": return self.reply(404, b"<Error><Code>NoSuchKey</Code></Error>")
+            if m in ("change", "match"): tag = etags[k] = '"e2"'
+            if m == "match" and self.headers.get("if-match") != tag:
+                return self.reply(412, b"<Error><Code>PreconditionFailed</Code></Error>")
+            if m == "flaky" and n == 2:
+                return self.reply(503, b"<Error><Code>SlowDown</Code></Error>")
+        part = body[a:b + 1]
+        self.head(206, len(part), [("ETag", tag), ("Content-Range", "bytes %d-%d/%d" % (a, b, len(body)))])
+        if m == "drop" and n == 2:
+            self.wfile.write(part[:len(part) // 2]); self.wfile.flush()
+            self.close_connection = True
+            return
+        if m == "stall" and a >= 4096: time.sleep(0.6)
+        if m == "slow":
+            for i in range(0, len(part), 4096):
+                time.sleep(0.3); self.wfile.write(part[i:i + 4096]); self.wfile.flush()
+            return
+        self.wfile.write(part)
+    def log_message(self, *a): pass
+"#,
+        )
+    }
+
+    /// What the stand-in serves under every key.
+    fn pieces_data() -> Vec<u8> {
+        (0..10_000u32)
+            .map(|i| ((i * 7 + i / 251) % 256) as u8)
+            .collect()
+    }
+
+    fn read_whole(store: &S3Store, key: &str) -> io::Result<Vec<u8>> {
+        let mut got = Vec::new();
+        store.get(key)?.expect("there").read_to_end(&mut got)?;
+        Ok(got)
+    }
+
+    fn asked(store: &S3Store, key: &str) -> u32 {
+        let got = read_whole(store, &format!("asked/{key}")).unwrap();
+        String::from_utf8(got).unwrap().parse().unwrap()
+    }
+
+    /// An object over three pieces of 4,096 bytes is read whole, one
+    /// request a piece; a piece whose answer breaks off, or that gets a
+    /// 503, goes on from the byte it reached.  A store that ignores Range,
+    /// and an empty object (no byte 0), still read.
+    #[test]
+    fn an_object_is_read_in_pieces_and_a_broken_piece_goes_on() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = pieces_server();
+        let store =
+            store_at(srv.port).tuned(4096, Duration::from_secs(5), Duration::from_millis(10));
+        let data = pieces_data();
+        assert_eq!(read_whole(&store, "d/ok").unwrap(), data);
+        assert_eq!(asked(&store, "d/ok"), 3, "one request a piece");
+        assert_eq!(read_whole(&store, "d/drop").unwrap(), data);
+        assert_eq!(asked(&store, "d/drop"), 4, "the broken piece asked again");
+        assert_eq!(read_whole(&store, "d/flaky").unwrap(), data);
+        assert_eq!(asked(&store, "d/flaky"), 4, "the 503 asked again");
+        assert_eq!(read_whole(&store, "d/whole").unwrap(), data);
+        assert_eq!(asked(&store, "d/whole"), 1);
+        assert_eq!(read_whole(&store, "d/empty").unwrap(), b"");
+    }
+
+    /// D&D 7-c: a piece that fails every try ends the read with a FAILED
+    /// error that says where and why, after four tries.
+    #[test]
+    fn a_piece_that_keeps_failing_fails_the_read_clearly() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = pieces_server();
+        let store =
+            store_at(srv.port).tuned(4096, Duration::from_millis(200), Duration::from_millis(10));
+        let e = read_whole(&store, "d/stall").unwrap_err().to_string();
+        assert!(
+            e.starts_with("get d/stall: FAILED at 4096 bytes of 10000 bytes (40 %): piece 2 failed 4 times, last: "),
+            "{e}"
+        );
+        assert_eq!(
+            asked(&store, "d/stall"),
+            5,
+            "the first piece, and four tries of the second"
+        );
+    }
+
+    /// D&D 7-b: an object that changes while it is read ends the read at
+    /// once, not retried: answered 412 by a store that honours If-Match,
+    /// or seen by its ETag where the store ignores If-Match.  So does an
+    /// object deleted meanwhile.
+    #[test]
+    fn an_object_changed_or_deleted_while_it_is_read_ends_the_read() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = pieces_server();
+        let store =
+            store_at(srv.port).tuned(4096, Duration::from_secs(5), Duration::from_millis(10));
+        for (key, why) in [
+            (
+                "d/change",
+                r#"the object changed while it was read (ETag "e1" became "e2")"#,
+            ),
+            (
+                "d/match",
+                r#"the object changed while it was read (it is no longer ETag "e1")"#,
+            ),
+            ("d/gone", "the object was deleted while it was read"),
+        ] {
+            let e = read_whole(&store, key).unwrap_err().to_string();
+            assert_eq!(
+                e,
+                format!("get {key}: FAILED at 4096 bytes of 10000 bytes (40 %): {why}")
+            );
+            assert_eq!(asked(&store, key), 2, "{key}: not asked again");
+        }
+    }
+
+    /// The maturity review's finding 7: one limit on the whole call cut a
+    /// download that took longer.  The object arrives at 4 KiB per 300 ms,
+    /// 900 ms in all, with every limit at 500 ms: read whole, a piece of
+    /// 4 KiB at a time, none asked again.
+    #[test]
+    fn a_download_longer_than_any_limit_is_not_cut() {
+        if !have_tools() {
+            eprintln!("skipped: needs openssl and python3");
+            return;
+        }
+        let srv = pieces_server();
+        let store = S3Store::new(
+            S3Config {
+                endpoint: format!("http://127.0.0.1:{}", srv.port),
+                region: "garage".into(),
+                bucket: "tsao".into(),
+                plaintext: true,
+                ..aws_example()
+            },
+            Duration::from_millis(500),
+        )
+        .unwrap()
+        .tuned(4096, Duration::from_millis(500), Duration::from_millis(10));
+        let t = std::time::Instant::now();
+        assert_eq!(read_whole(&store, "d/slow").unwrap(), pieces_data());
+        assert!(
+            t.elapsed() > Duration::from_millis(800),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(asked(&store, "d/slow"), 3, "no piece asked again");
+    }
+
     /// A reader that hands out at most 7,777 bytes a call, as a pipe or
     /// a stream producer may: a part must still be read whole.
     struct Trickle<'a>(&'a [u8]);
@@ -1657,7 +2311,7 @@ class H(http.server.BaseHTTPRequestHandler):
         let wrong = S3Store::new(
             S3Config {
                 secret_key: "wrong".into(),
-                ..store.config.clone()
+                ..store.conn.config.clone()
             },
             Duration::from_secs(10),
         )
