@@ -1244,19 +1244,33 @@ impl<P: Pool> Host<P> {
     }
 
     /// Birth from the void, or finish one (`registered`).
+    ///
+    /// A dataset with no origin, no parent and no Seal was left by an
+    /// interrupted void birth: the Warden names the branch before it makes
+    /// its file system, so one killed in between left a branch that is not
+    /// one, and adopting it as it was made a Vessel that could never be
+    /// mounted (the maturity review's finding 8).  Nothing depends on it:
+    /// no record of its Chronicle was accepted (a Chronicle with one is
+    /// opened, never born), its Lineage is appended only at the end of
+    /// this, and its agent starts only after.  So it is destroyed and made
+    /// again, with a line in the Warden's log, as an interrupted fork's
+    /// clone is ([`Host::replace_leftover`]; D&D 8 (a), 2026-11-27).  A
+    /// dataset with an origin, a parent or a Seal is still a conflict.
     fn birth_void(
         &self,
         id: ChronicleId,
         namespace: Namespace,
         registered: bool,
     ) -> Result<Vessel<P::Layers>, VesselError> {
+        if registered {
+            self.held_here(id)?;
+        }
         let dataset = self.dataset_for(id);
+        let conflict = || VesselError::DatasetConflict(dataset.clone());
         match self.pool.info(&dataset).map_err(pool_err)? {
             None => {
                 self.pool.create(&dataset).map_err(pool_err)?;
             }
-            // Left by an interrupted void birth: no origin, no parent, no
-            // Seals.  Anything else is not ours to adopt.
             Some(info) if info.origin.is_none() && info.parent.is_none() => {
                 if !self
                     .pool
@@ -1265,10 +1279,18 @@ impl<P: Pool> Host<P> {
                     .map_err(pool_err)?
                     .is_empty()
                 {
-                    return Err(VesselError::DatasetConflict(dataset));
+                    return Err(conflict());
                 }
+                if let Some(guid) = self.pool.guid(&dataset).map_err(pool_err)? {
+                    self.pool.destroy(&dataset, guid).map_err(pool_err)?;
+                }
+                eprintln!(
+                    "taso-wardend: {}: destroyed a dataset left by an interrupted void birth (nothing of it was accepted, and it may hold no file system); making it again",
+                    dataset.as_str()
+                );
+                self.pool.create(&dataset).map_err(pool_err)?;
             }
-            Some(_) => return Err(VesselError::DatasetConflict(dataset)),
+            Some(_) => return Err(conflict()),
         }
         let mut chronicle = self.chronicle(id, registered)?;
         let lineage = LineageRecord {
@@ -1287,6 +1309,21 @@ impl<P: Pool> Host<P> {
         })
     }
 
+    /// Refuse a birth whose Chronicle, registered with no record, another
+    /// Warden holds, before its dataset is touched: the Chronicle would
+    /// refuse this Warden anyway, and a dataset left by an interrupted
+    /// birth is not to be made again on every try (D&D 8 (a)).
+    fn held_here(&self, id: ChronicleId) -> Result<(), VesselError> {
+        let holder = self.coord.ownership(id).map_err(VesselError::Coord)?.holder;
+        if holder != self.warden {
+            return Err(VesselError::Coord(CoordError::NotHolder {
+                warden: self.warden,
+                holder,
+            }));
+        }
+        Ok(())
+    }
+
     /// The Chronicle of a Vessel being born from `parent`, a bound Seal
     /// `(dataset, lsn, hash)` (a fork's or successor's parent Seal, or a
     /// Template's layer): make or verify the cloned dataset, then register
@@ -1301,6 +1338,10 @@ impl<P: Pool> Host<P> {
             Some(h) if h.lsn == Lsn::new(0) => true,
             Some(_) => return Err(VesselError::AlreadyExists(id)),
         };
+        if registered {
+            // Before a leftover clone is destroyed ([`Host::replace_leftover`]).
+            self.held_here(id)?;
+        }
         let dataset = self.dataset_for(id);
         if let Some((parent_ds, seal, seal_hash)) = parent {
             match self.pool.info(&dataset).map_err(pool_err)? {
@@ -2877,12 +2918,32 @@ pub(crate) mod tests {
         assert_ne!(a.dataset(), b.dataset());
     }
 
+    /// A mark on a dataset of the fake pool, gone when it is made again.
+    fn mark(e: &Env, ds: &Dataset) {
+        e.host
+            .pool
+            .0
+            .borrow_mut()
+            .get_mut(ds.as_str())
+            .unwrap()
+            .received = vec![b"left".to_vec()];
+    }
+
+    fn marked(e: &Env, ds: &Dataset) -> bool {
+        e.host.pool.0.borrow()[ds.as_str()].received == [b"left".to_vec()]
+    }
+
+    /// Finding 8 (D&D 8 (a), 2026-11-27): the dataset an interrupted void
+    /// birth left (it may hold no file system) is destroyed and made
+    /// again, not adopted as it was.
     #[test]
     fn interrupted_void_birth_is_finished_by_ensure() {
         let e = env();
         let id = vessel_id(ns(1), b"user-1");
+        let ds = e.host.dataset_for(id);
         // Crash after the dataset and the registration, before Lineage.
-        e.host.pool.create(&e.host.dataset_for(id)).unwrap();
+        e.host.pool.create(&ds).unwrap();
+        mark(&e, &ds);
         drop(e.host.chronicle(id, false).unwrap());
         assert!(matches!(
             e.host.open(id),
@@ -2892,6 +2953,63 @@ pub(crate) mod tests {
         let (v, how) = e.host.ensure(ns(1), b"user-1").unwrap();
         assert!(matches!(how, Ensured::BirthFinished));
         assert_eq!(v.lineage().origin, Origin::Void);
+        assert!(!marked(&e, &ds), "the dataset was made again");
+    }
+
+    /// The same, killed before the registration: born, the dataset made
+    /// again.
+    #[test]
+    fn a_dataset_left_before_the_registration_is_made_again() {
+        let e = env();
+        let id = vessel_id(ns(1), b"user-1");
+        let ds = e.host.dataset_for(id);
+        e.host.pool.create(&ds).unwrap();
+        mark(&e, &ds);
+        let (_, how) = e.host.ensure(ns(1), b"user-1").unwrap();
+        assert!(matches!(how, Ensured::Born));
+        assert!(!marked(&e, &ds));
+    }
+
+    /// A void dataset with a Seal is not a birth's leftover: refused, and
+    /// left as it is.
+    #[test]
+    fn a_void_dataset_with_a_seal_is_refused_and_left_alone() {
+        let e = env();
+        let id = vessel_id(ns(1), b"user-1");
+        let ds = e.host.dataset_for(id);
+        e.host.pool.create(&ds).unwrap();
+        mark(&e, &ds);
+        e.host
+            .pool
+            .0
+            .borrow_mut()
+            .get_mut(ds.as_str())
+            .unwrap()
+            .snaps
+            .insert(Lsn::new(3), HashVal::from_bytes([3; 32]));
+        assert!(matches!(
+            e.host.ensure(ns(1), b"user-1"),
+            Err(VesselError::DatasetConflict(_))
+        ));
+        assert!(marked(&e, &ds), "left as it was");
+    }
+
+    /// A Chronicle registered with no record by another Warden: refused
+    /// before the dataset is touched (it would be refused at the
+    /// Chronicle's open anyway).
+    #[test]
+    fn a_birth_another_warden_holds_is_refused_before_its_dataset_is_touched() {
+        let e = env();
+        let id = vessel_id(ns(1), b"user-1");
+        let ds = e.host.dataset_for(id);
+        e.host.pool.create(&ds).unwrap();
+        mark(&e, &ds);
+        e.host.coord.register(id, WardenId::new(2)).unwrap();
+        assert!(matches!(
+            e.host.ensure(ns(1), b"user-1"),
+            Err(VesselError::Coord(CoordError::NotHolder { holder, .. })) if holder == WardenId::new(2)
+        ));
+        assert!(marked(&e, &ds), "left as it was");
     }
 
     #[test]
