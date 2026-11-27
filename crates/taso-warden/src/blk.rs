@@ -315,6 +315,57 @@ fn run(cmd: &mut Command) -> io::Result<()> {
 /// them, read after the refusal: every mount on `dir` in any mount
 /// namespace with its propagation, and every process working in it or
 /// with a file open under it; or "nobody found" when they had let go.
+/// How long an unmount refused as busy is tried again, and how often
+/// (D&D (b), 2026-11-27).  With `/` shared, a Vessel's mount is linked to
+/// copies in other mount namespaces (the host's sandboxed services, every
+/// runc start), and the unmount must take them all or none: one copy
+/// briefly in use refuses it, "target is busy".  On taso-test that was
+/// 1 to 7 resets in a bench of 64 Vessels, gone with the mounts kept out
+/// of the other namespaces; what takes the brief reference was never
+/// seen held (finding of 2026-11-27).  Brief by nature, so tried again;
+/// a hold past the bound is refused, naming its holder.
+const BUSY_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+const BUSY_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// `once` (one unmount of `dir`) tried again every `step` while it is
+/// refused as busy, for at most `bound`; any other failure, or busy past
+/// the bound, refused naming who holds the mount as `proc` shows them
+/// ([`umount_refused`]), with the tries made.
+fn umount_retrying(
+    mut once: impl FnMut() -> io::Result<()>,
+    proc: &Path,
+    dir: &Path,
+    bound: std::time::Duration,
+    step: std::time::Duration,
+) -> io::Result<()> {
+    let start = std::time::Instant::now();
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match once() {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy(&e) && start.elapsed() < bound => std::thread::sleep(step),
+            Err(e) if is_busy(&e) => {
+                let e = io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{e} (still busy after {tries} tries over {:?})",
+                        start.elapsed()
+                    ),
+                );
+                return Err(umount_refused(proc, dir, e));
+            }
+            Err(e) => return Err(umount_refused(proc, dir, e)),
+        }
+    }
+}
+
+/// An unmount refused because the mount is in use: umount(8)'s words for
+/// `EBUSY` (the error reaches here as its message, from [`run`]).
+fn is_busy(e: &io::Error) -> bool {
+    e.to_string().contains("target is busy")
+}
+
 fn umount_refused(proc: &Path, dir: &Path, e: io::Error) -> io::Error {
     let held = taso_blk::holders::of_mount(proc, dir);
     io::Error::new(
@@ -412,7 +463,13 @@ impl Mounts for System {
     fn umount(&self, dir: &Path) -> io::Result<()> {
         // A refusal names who holds the mount, read after it (taso-test,
         // 2026-11-27: "target is busy" at a Vessel's reset after birth).
-        run(Command::new("umount").arg(dir)).map_err(|e| umount_refused(Path::new("/proc"), dir, e))
+        umount_retrying(
+            || run(Command::new("umount").arg(dir)),
+            Path::new("/proc"),
+            dir,
+            BUSY_FOR,
+            BUSY_STEP,
+        )
     }
     fn freeze(&self, dir: &Path) -> io::Result<()> {
         fs_freeze_call(dir, FIFREEZE)
@@ -2116,6 +2173,69 @@ mod tests {
     /// found (taso-test, 2026-11-27: "target is busy" at a reset after
     /// birth, with every Vessel mount also in the host services' mount
     /// namespaces).
+    /// D&D (b), 2026-11-27: an unmount refused as busy is tried again,
+    /// briefly; past the bound it is refused with its tries and holders;
+    /// another failure is not tried again.
+    #[test]
+    fn a_busy_unmount_is_tried_again_for_a_bounded_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mnt = dir.path().join("m");
+        let proc = Path::new("/proc");
+        let step = std::time::Duration::from_millis(1);
+        let busy = || Err(io::Error::other("umount: /m: target is busy."));
+        // Busy three times, then through.
+        let mut n = 0;
+        super::umount_retrying(
+            || {
+                n += 1;
+                if n <= 3 {
+                    busy()
+                } else {
+                    Ok(())
+                }
+            },
+            proc,
+            &mnt,
+            std::time::Duration::from_secs(5),
+            step,
+        )
+        .unwrap();
+        assert_eq!(n, 4);
+        // Busy throughout: refused once the bound has passed, saying so.
+        let mut n = 0;
+        let e = super::umount_retrying(
+            || {
+                n += 1;
+                busy()
+            },
+            proc,
+            &mnt,
+            std::time::Duration::from_millis(30),
+            step,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(n > 3, "tried {n} times");
+        assert!(e.contains(&format!("still busy after {n} tries")), "{e}");
+        assert!(e.contains("held by: nobody found"), "{e}");
+        // Anything else: once, not again.
+        let mut n = 0;
+        let e = super::umount_retrying(
+            || {
+                n += 1;
+                Err(io::Error::other("umount: /m: not mounted."))
+            },
+            proc,
+            &mnt,
+            std::time::Duration::from_secs(5),
+            step,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(n, 1);
+        assert!(e.starts_with("umount: /m: not mounted.; held by"), "{e}");
+    }
+
     #[test]
     fn a_refused_unmount_names_who_holds_the_mount() {
         let dir = tempfile::tempdir().unwrap();
