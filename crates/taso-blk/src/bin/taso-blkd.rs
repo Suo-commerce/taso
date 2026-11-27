@@ -2185,11 +2185,22 @@ fn hold_exclusively_at(path: &str) -> Result<Option<File>, String> {
     {
         Ok(f) => Ok(Some(f)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) if e.raw_os_error() == Some(EBUSY) => Err(format!(
-            "{path} is in use (mounted?): not stopped; unmount it first"
-        )),
+        // Who holds it, read after the refusal (taso-test, 2026-11-27: a
+        // reset after birth refused "in use" with the host's mount gone).
+        Err(e) if e.raw_os_error() == Some(EBUSY) => Err(busy(Path::new("/proc"), path)),
         Err(e) => Err(format!("{path}: {e}")),
     }
+}
+
+/// The refusal of a device `path` in use, naming who holds it as `proc`
+/// shows them, read after the refusal (taso-test, 2026-11-27: a reset
+/// after birth refused "in use" with the host's mount already gone).
+fn busy(proc: &Path, path: &str) -> String {
+    let held = taso_blk::holders::of_device(proc, Path::new(path));
+    format!(
+        "{path} is in use (mounted?): not stopped; unmount it first; {}",
+        taso_blk::holders::report(&held, taso_blk::holders::own_ns(proc).as_deref(), 12)
+    )
 }
 
 /// Whether `/dev/ublkb<dev_id>` is in use, as [`hold_exclusively`] finds it.
@@ -2517,6 +2528,17 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::{Site, SITES};
+
+    /// A refusal "in use" names who holds the device, or says nobody was
+    /// found (the holder had let go when it was looked for).
+    #[test]
+    fn a_device_in_use_names_its_holders() {
+        let msg = super::busy(std::path::Path::new("/proc"), "/dev/ublkb999999");
+        assert!(
+            msg.starts_with("/dev/ublkb999999 is in use (mounted?): not stopped; unmount it first; held by: nobody found"),
+            "{msg}"
+        );
+    }
 
     /// The names line up with the sites (`SITES` is indexed by `Site as usize`).
     #[test]
