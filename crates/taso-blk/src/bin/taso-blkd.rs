@@ -179,7 +179,7 @@ use libublk::ctrl::{UblkCtrl, UblkCtrlBuilder};
 use libublk::io::{BufDescList, UblkDev, UblkIOCtx, UblkQueue};
 use libublk::{sys, BufDesc, UblkError, UblkFlags, UblkIORes};
 use taso_blk::map::{Kind, LayerId, BLOCK};
-use taso_blk::store::{Compacted, Recovered, Store, StoreError, Syncer};
+use taso_blk::store::{Compacted, Filler, Recovered, Store, StoreError, Syncer};
 
 /// The ublk target name of this daemon's devices; it is how a later
 /// daemon recognises leftovers as its own.
@@ -806,6 +806,15 @@ fn main() {
             .spawn(move || upkeep(&d))
             .unwrap_or_else(|e| fail(&format!("cannot start the upkeep thread: {e}")));
     }
+    // The log's reserve, kept ahead of its tail (maturity review finding
+    // 4): its own thread, outside the store's lock.
+    {
+        let filler = lock_store(&daemon.store, Site::Upkeep).filler();
+        std::thread::Builder::new()
+            .name("reserve".into())
+            .spawn(move || reserve(&filler))
+            .unwrap_or_else(|e| fail(&format!("cannot start the reserve thread: {e}")));
+    }
     // A signal that came during the start (the log's replay) waited,
     // blocked: it is taken now, with the daemon serving.
     {
@@ -986,6 +995,84 @@ fn raise_open_files() -> u64 {
 /// Write a checkpoint whenever the log has grown by `--checkpoint-mib`
 /// since the last one, and compact when garbage passes `--compact-pct`.
 /// Runs for the daemon's life.
+/// Keep the log's reserve ahead of its tail (`store.rs`, `RESERVE`):
+/// filled when the store says it ran low, and looked at every second.
+/// A full disk is said once, until there is room again; any other failure
+/// has set the log's failure latch (the store refuses everything) and
+/// ends this thread.
+fn reserve(f: &Filler) {
+    let mut first = true;
+    let mut full = false;
+    loop {
+        match f.fill_ahead() {
+            Ok(n) => {
+                if first && n > 0 {
+                    log!(
+                        "taso-blkd: reserve: {} MiB ready ahead of the log's tail",
+                        n >> 20
+                    );
+                }
+                if full {
+                    log!("taso-blkd: reserve: room again on the log's disk");
+                    full = false;
+                }
+            }
+            Err(e) if no_room(&e) => {
+                if !full {
+                    log!(
+                        "taso-blkd: reserve: the log's disk is full ({e}): a write that does not fit is refused with ENOSPC, the rest go on"
+                    );
+                    full = true;
+                }
+            }
+            Err(e) => {
+                log!("taso-blkd: reserve: {e}: the store refuses everything until it is reopened");
+                return;
+            }
+        }
+        first = false;
+        f.wait(std::time::Duration::from_secs(1));
+    }
+}
+
+/// A store error that is a disk without room (`StorageFull`): the one
+/// request is refused with ENOSPC, nothing else is affected (finding 4).
+fn no_room(e: &StoreError) -> bool {
+    matches!(e, StoreError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull)
+}
+
+/// The branches a write was refused for lack of room, each said once
+/// until a write to it goes through again.
+static FULL: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
+static ANY_FULL: AtomicBool = AtomicBool::new(false);
+
+/// A write to `branch` refused, no room: said once per branch.
+fn refused_full(branch: LayerId, lba: u64, e: &StoreError) -> i32 {
+    let mut full = FULL.lock().unwrap_or_else(PoisonError::into_inner);
+    if full.insert(branch.get()) {
+        log!(
+            "taso-blkd: {branch}: write at block {lba} refused, no room on the log's disk ({e}): ENOSPC to this device until a write goes through"
+        );
+    }
+    ANY_FULL.store(true, Ordering::SeqCst);
+    -libc::ENOSPC
+}
+
+/// A write to `branch` went through: if it was refused for room before,
+/// say that it has room again.
+fn wrote(branch: LayerId) {
+    if !ANY_FULL.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut full = FULL.lock().unwrap_or_else(PoisonError::into_inner);
+    if full.remove(&branch.get()) {
+        log!("taso-blkd: {branch}: writes go through again");
+    }
+    if full.is_empty() {
+        ANY_FULL.store(false, Ordering::SeqCst);
+    }
+}
+
 fn upkeep(d: &Daemon) {
     let g = d.geometry;
     let mut last = lock_store(&d.store, Site::Upkeep).stats().log_bytes;
@@ -2533,11 +2620,20 @@ fn handle(
                 r
             };
             let res = match r {
-                Ok(None) => n as i32,
+                Ok(None) => {
+                    wrote(branch);
+                    n as i32
+                }
                 Ok(Some(lsn)) => match durable(sync, store, lsn) {
-                    Ok(()) => n as i32,
+                    Ok(()) => {
+                        wrote(branch);
+                        n as i32
+                    }
                     Err(e) => io(&e),
                 },
+                // Refused before anything changed (finding 4): this
+                // request alone, and the device is told why.
+                Err(e) if no_room(&e) => refused_full(branch, lba, &e),
                 Err(e) => io(&e),
             };
             note_op(if fua { OP_WFUA } else { OP_WRITE }, started, split, bytes);
@@ -2654,6 +2750,27 @@ mod tests {
             msg.starts_with("/dev/ublkb999999 is in use (mounted?): not stopped; unmount it first; held by: nobody found"),
             "{msg}"
         );
+    }
+
+    /// Finding 4: a disk without room refuses the one write with ENOSPC;
+    /// every other store error stays EIO, and a write that goes through
+    /// clears the branch's refusal.
+    #[test]
+    fn no_room_is_enospc_and_only_no_room() {
+        use super::{no_room, refused_full, wrote, StoreError, FULL};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = taso_blk::store::Store::create(&dir.path().join("log")).unwrap();
+        let root = s.root_seal().unwrap();
+        let b = s.fork(root).unwrap();
+        let full = StoreError::Io(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert!(no_room(&full));
+        assert!(!no_room(&StoreError::Poisoned));
+        assert!(!no_room(&StoreError::Io(std::io::Error::other("EIO"))));
+        assert_eq!(refused_full(b, 3, &full), -libc::ENOSPC);
+        assert_eq!(refused_full(b, 4, &full), -libc::ENOSPC);
+        assert!(FULL.lock().unwrap().contains(&b.get()));
+        wrote(b);
+        assert!(!FULL.lock().unwrap().contains(&b.get()));
     }
 
     /// The names line up with the sites (`SITES` is indexed by `Site as usize`).
