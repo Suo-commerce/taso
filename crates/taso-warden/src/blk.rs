@@ -5898,6 +5898,150 @@ mod tests {
         );
     }
 
+    /// The Vessel's history as finding 5 meets it: node 1 held it to
+    /// Seal 10 and shipped to 8; node 2 took it over from the bucket and
+    /// went on to two Seals of its own, shipped.  Node 1 still has its
+    /// old state.  Answers node 1 (Warden 1 again, as at its next start),
+    /// the takeover it must claim, and node 2's last Seal.
+    fn taken_away_and_gone_on(t: &TenTurns) -> (Host<TestPool>, crate::chronicle::Claim, Position) {
+        let b = Host {
+            coord: t.coord.clone(),
+            pool: pool(),
+            root: ds("tank/vessels"),
+            state_dir: t.tmp.path().join("node-2"),
+            warden: WardenId::new(2),
+        };
+        let (mut w, _) = b.rebirth(t.id, &t.packs(&b)).unwrap();
+        let mut last = None;
+        for turn in 11..=12u64 {
+            write0(&b.pool, w.dataset(), turn as u8);
+            let s = seal(&mut w, turn);
+            let snap = b.pool.snapshot(w.dataset(), s.lsn).unwrap().unwrap();
+            w.publish_seal(&t.packs(&b), &snap, None).unwrap();
+            last = Some(s);
+        }
+        drop(w);
+        let held = t.coord.ownership(t.id).unwrap();
+        assert_eq!(held.holder, WardenId::new(2));
+        let claim = crate::chronicle::Claim::TakeOver {
+            from: held.holder,
+            epoch: held.epoch,
+        };
+        (t.node(after_a_crash(&t.pool)), claim, last.unwrap())
+    }
+
+    /// D&D 5-a (2026-11-27), the maturity review's finding 5.  Taken
+    /// back onto node 1's old state, the Vessel is reborn from the
+    /// bucket: the old state directory kept aside, the dataset put back
+    /// at Seal 8 (the newest layer a shipped section ends at) and node 2's
+    /// Seals received.  Opened as it was, the takeover fenced node 2
+    /// first and then failed: the Vessel ran on neither node.
+    #[test]
+    fn a_takeover_back_onto_the_state_of_an_earlier_holding_is_reborn() {
+        let t = TenTurns::new();
+        let (a, claim, last) = taken_away_and_gone_on(&t);
+        let (v, how) = a
+            .take_over_here(t.id, &t.packs(&a), claim, NO_LAYER)
+            .unwrap();
+        let crate::rebirth::TakenOver::Rebuilt { kept, stood_on, .. } = how else {
+            panic!("rebuilt, not opened: {how:?}");
+        };
+        assert!(
+            kept.as_ref().is_some_and(|k| k.exists()),
+            "kept aside: {kept:?}"
+        );
+        assert_eq!(stood_on.map(|p| p.lsn), Some(t.seals[8].lsn));
+        assert_eq!(v.last_seal(), Some(last), "node 2's last Seal");
+        assert_eq!(block0(&a.pool, &t.dataset), 12, "node 2's files");
+        assert_eq!(t.coord.ownership(t.id).unwrap().holder, WardenId::new(1));
+    }
+
+    /// The same, when the old state cannot be put back (a fork stands on
+    /// a layer of node 1's own Seal 9, which would go): refused before
+    /// the fence.  Node 2 keeps the Vessel at its epoch; node 1's state
+    /// directory is where it was.
+    #[test]
+    fn a_takeover_onto_old_state_that_cannot_be_put_back_claims_nothing() {
+        let t = TenTurns::new();
+        let (a, claim, _) = taken_away_and_gone_on(&t);
+        let held = t.coord.ownership(t.id).unwrap();
+        Pool::clone(
+            &a.pool,
+            &t.dataset,
+            t.seals[9].lsn,
+            t.seals[9].hash,
+            &ds("tank/a-fork"),
+        )
+        .unwrap();
+        let e = a
+            .take_over_here(t.id, &t.packs(&a), claim, NO_LAYER)
+            .err()
+            .expect("refused");
+        assert!(e.to_string().contains("stands on"), "{e}");
+        let now = t.coord.ownership(t.id).unwrap();
+        assert_eq!(
+            (now.holder, now.epoch),
+            (held.holder, held.epoch),
+            "not fenced"
+        );
+        assert!(a.dir_for(t.id).exists(), "the state directory put back");
+    }
+
+    /// D&D 5-b (a): a takeover onto old state that is behind (D107's
+    /// case: Seals 9 and 10 without their layer) is reborn the same way,
+    /// no longer refused.  Seals 9 and 10 were never shipped: lost, as on
+    /// any takeover.
+    #[test]
+    fn a_takeover_onto_old_state_that_is_behind_is_reborn() {
+        let t = TenTurns::new();
+        let held = t.coord.ownership(t.id).unwrap();
+        let claim = crate::chronicle::Claim::TakeOver {
+            from: held.holder,
+            epoch: held.epoch,
+        };
+        let taker = Host {
+            warden: WardenId::new(2),
+            ..t.node_with_block_log_cut_at(t.len_after[8])
+        };
+        let (v, how) = taker
+            .take_over_here(t.id, &t.packs(&taker), claim, NO_LAYER)
+            .unwrap();
+        assert!(
+            matches!(how, crate::rebirth::TakenOver::Rebuilt { .. }),
+            "{how:?}"
+        );
+        assert_eq!(v.last_seal(), Some(t.seals[8]));
+        assert_eq!(t.coord.ownership(t.id).unwrap().holder, WardenId::new(2));
+    }
+
+    /// And onto old state that holds the head and is not behind (a holder
+    /// that crashed on this node): opened as it is, nothing reborn.
+    #[test]
+    fn a_takeover_onto_old_state_that_holds_the_head_is_opened() {
+        let t = TenTurns::new();
+        let held = t.coord.ownership(t.id).unwrap();
+        let taker = Host {
+            warden: WardenId::new(2),
+            ..t.node(after_a_crash(&t.pool))
+        };
+        let (v, how) = taker
+            .take_over_here(
+                t.id,
+                &t.packs(&taker),
+                crate::chronicle::Claim::TakeOver {
+                    from: held.holder,
+                    epoch: held.epoch,
+                },
+                NO_LAYER,
+            )
+            .unwrap();
+        assert!(
+            matches!(how, crate::rebirth::TakenOver::Opened(_)),
+            "{how:?}"
+        );
+        assert_eq!(v.last_seal(), Some(t.seals[10]));
+    }
+
     /// The other side of it: onto a state that is not behind, the
     /// takeover is not held up.
     #[test]
