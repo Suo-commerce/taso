@@ -566,7 +566,9 @@ fn the_daemon_answers_what_its_start_found() {
     for i in 0..4u8 {
         c.seal(a, &[i; 32]).unwrap();
         c.flush().unwrap();
-        ends.push(std::fs::metadata(&log).unwrap().len());
+        // The log's own end, not the file's: the file may run on into
+        // the zeros the store keeps ahead of its tail (finding 4).
+        ends.push(c.stats().unwrap()["log_bytes"].parse::<u64>().unwrap());
     }
     c.quit().unwrap();
     assert!(d.wait());
@@ -588,7 +590,10 @@ fn the_daemon_answers_what_its_start_found() {
 
     // One bit of the third Seal's record changes on the medium.
     flip(&log, ends[1] + 20);
-    let len = std::fs::metadata(&log).unwrap().len();
+    // Where the records end: zeros after them are the reserve, which an
+    // open neither cuts nor sets aside (finding 4).
+    let bytes = std::fs::read(&log).unwrap();
+    let len = bytes.iter().rposition(|b| *b != 0).unwrap() as u64 + 1;
     let d = Daemon::start(&log, &sock);
     let mut c = Client::connect(&sock).unwrap();
     let found = c.recovered().unwrap();
