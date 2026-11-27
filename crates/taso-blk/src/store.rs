@@ -2521,7 +2521,12 @@ impl Filler {
     }
 
     /// Fill the reserve up to [`RESERVE`] past the tail, one piece at a
-    /// time, each written with zeros and synced before it counts.
+    /// time: each piece written with zeros under the fill lock and counted
+    /// ready (the room is taken when the write returns), then synced with
+    /// the lock let go, so a write that overtakes the filler waits for a
+    /// page-cache write at most, never for a sync of the whole log (which
+    /// under a burst of births, 64 filesystems made at once, held every
+    /// device write on the node; bench at P=64 on taso-test, 2026-11-27).
     /// Returns the bytes made ready.  Two kinds of failure, kept apart:
     /// a disk without room answers `StorageFull` and changes nothing (the
     /// reserve is what it was, the store goes on, and a write that needs
@@ -2532,37 +2537,39 @@ impl Filler {
         let lf = &self.0;
         let mut made = 0;
         loop {
-            let _fill = lf.fill_lock();
-            if lf.has_failed() {
-                return Err(StoreError::Poisoned);
-            }
-            let from = lf.allocated();
-            let target = lf.tail.load(Ordering::SeqCst) + RESERVE;
-            if from >= target {
-                return Ok(made);
-            }
-            let to = (from + FILL_CHUNK).min(target).next_multiple_of(BLOCK);
-            let f = lf.get();
-            #[cfg(test)]
             {
-                let room = lf.room.load(Ordering::SeqCst);
-                if room != 0 && to > room {
-                    return Err(io::Error::from(io::ErrorKind::StorageFull).into());
+                let _fill = lf.fill_lock();
+                if lf.has_failed() {
+                    return Err(StoreError::Poisoned);
                 }
-            }
-            let zeros = vec![0u8; (to - from) as usize];
-            if let Err(e) = f.write_all_at(&zeros, from) {
-                if e.kind() != io::ErrorKind::StorageFull {
-                    lf.fail();
+                let from = lf.allocated();
+                let target = lf.tail.load(Ordering::SeqCst) + RESERVE;
+                if from >= target {
+                    return Ok(made);
                 }
-                return Err(e.into());
+                let to = (from + FILL_CHUNK).min(target).next_multiple_of(BLOCK);
+                #[cfg(test)]
+                {
+                    let room = lf.room.load(Ordering::SeqCst);
+                    if room != 0 && to > room {
+                        return Err(io::Error::from(io::ErrorKind::StorageFull).into());
+                    }
+                }
+                let zeros = vec![0u8; (to - from) as usize];
+                if let Err(e) = lf.get().write_all_at(&zeros, from) {
+                    if e.kind() != io::ErrorKind::StorageFull {
+                        lf.fail();
+                    }
+                    return Err(e.into());
+                }
+                lf.made_ready(to);
+                made += to - from;
             }
-            if let Err(e) = lf.sync(&f) {
+            // The fill lock let go: writes take their room meanwhile.
+            if let Err(e) = lf.sync(&lf.get()) {
                 lf.fail();
                 return Err(e.into());
             }
-            lf.made_ready(to);
-            made += to - from;
         }
     }
 }
@@ -2596,7 +2603,14 @@ pub struct LogFile {
     /// (0: no limit), for the filler's writes.
     #[cfg(test)]
     room: AtomicU64,
+    /// Tests: called at each sync through [`LogFile::sync`].
+    #[cfg(test)]
+    on_sync: std::sync::Mutex<Option<SyncHook>>,
 }
+
+/// Tests: what [`LogFile::sync`] calls first.
+#[cfg(test)]
+type SyncHook = Box<dyn Fn(&LogFile) + Send>;
 
 /// What a Flush record says of the log ([module docs](self)): how far it
 /// is known durable, and the Flush records whose sync has not returned.
@@ -2627,6 +2641,8 @@ impl LogFile {
             fail_next_sync: Default::default(),
             #[cfg(test)]
             room: AtomicU64::new(0),
+            #[cfg(test)]
+            on_sync: std::sync::Mutex::new(None),
         }
     }
 
@@ -2634,8 +2650,13 @@ impl LogFile {
     /// sync and the filler's go through here; the Syncer's has its own).
     fn sync(&self, f: &File) -> io::Result<()> {
         #[cfg(test)]
-        if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            return Err(io::Error::other("test: the sync failed"));
+        {
+            if let Some(hook) = self.on_sync.lock().unwrap().as_ref() {
+                hook(self);
+            }
+            if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+                return Err(io::Error::other("test: the sync failed"));
+            }
         }
         f.sync_data()
     }
@@ -3023,6 +3044,36 @@ mod tests {
             Err(StoreError::Poisoned)
         ));
         assert!(matches!(filler.fill_ahead(), Err(StoreError::Poisoned)));
+    }
+
+    /// Finding 4: the filler syncs with its fill lock let go, so a write
+    /// that overtakes it never waits for a sync of the whole log (at P=64
+    /// on taso-test, 2026-11-27, a burst of births queued every device
+    /// write behind the filler's syncs).  At each of the filler's syncs
+    /// the fill lock is free, and what it wrote already counts as ready.
+    #[test]
+    fn the_filler_syncs_with_its_lock_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = new_store(&dir);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        *s.shared.on_sync.lock().unwrap() = Some(Box::new(move |lf: &LogFile| {
+            log.lock()
+                .unwrap()
+                .push((lf.fill.try_lock().is_ok(), lf.allocated()));
+        }));
+        let before = s.shared.allocated();
+        s.filler().fill_ahead().unwrap();
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() > 1, "a sync per piece: {seen:?}");
+        assert!(
+            seen.iter().all(|(free, _)| *free),
+            "the fill lock held at a sync: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, ready)| *ready > before),
+            "each piece counted ready before its sync: {seen:?}"
+        );
     }
 
     /// Finding 4, the open: only zeros that run to the end of the file are
