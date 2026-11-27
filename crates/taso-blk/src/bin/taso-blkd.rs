@@ -2160,7 +2160,8 @@ fn reap_dead_devices() -> (usize, usize) {
 /// use, refused, nothing stopped), and held across the stop, so nothing
 /// can mount it in between.
 fn kill_device(dev_id: i32) -> Result<(), String> {
-    let hold = hold_exclusively(dev_id)?;
+    let path = format!("/dev/ublkb{dev_id}");
+    let hold = hold_exclusively_waiting(|| try_exclusive(&path), &path, FREE_WITHIN, FREE_STEP)?;
     let r = UblkCtrl::new_simple(dev_id)
         .and_then(|c| c.kill_dev())
         .map(|_| ())
@@ -2175,6 +2176,68 @@ fn kill_device(dev_id: i32) -> Result<(), String> {
 /// be mounted through it.
 fn hold_exclusively(dev_id: i32) -> Result<Option<File>, String> {
     hold_exclusively_at(&format!("/dev/ublkb{dev_id}"))
+}
+
+/// How long a device found in use at its stop is waited for, and how
+/// often it is tried again (D&D (b) and mechanism 2, 2026-11-27).  A mount
+/// namespace made while a Vessel is mounted (every runc start) holds a
+/// copy of its filesystem, and with it the device, until the kernel
+/// releases the copy after the namespace drops it: a few milliseconds
+/// (on taso-test a loop device under namespaces made in a loop was held
+/// right after its unmount 409 times in 500, at most 10.4 ms, median
+/// 5.8).  So the stop waits; a hold past the bound is refused, naming
+/// its holder (a namespace that lives on holds it until it ends).
+const FREE_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+const FREE_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// One exclusive open of a device that is not there or in use.
+enum Excl {
+    /// `EBUSY`: mounted, or held by another exclusive opener.
+    Busy,
+    /// Any other failure, said.
+    Failed(String),
+}
+
+/// `path` opened exclusively once: `None` when the node is not there.
+fn try_exclusive(path: &str) -> Result<Option<File>, Excl> {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc_o_excl())
+        .open(path)
+    {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.raw_os_error() == Some(EBUSY) => Err(Excl::Busy),
+        Err(e) => Err(Excl::Failed(format!("{path}: {e}"))),
+    }
+}
+
+/// `once` (an exclusive open of `path`) tried again every `step` while
+/// the device is in use, for at most `bound`; in use past the bound,
+/// refused naming who holds it ([`busy`]) with the tries made.
+fn hold_exclusively_waiting<T>(
+    mut once: impl FnMut() -> Result<Option<T>, Excl>,
+    path: &str,
+    bound: std::time::Duration,
+    step: std::time::Duration,
+) -> Result<Option<T>, String> {
+    let start = std::time::Instant::now();
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match once() {
+            Ok(held) => return Ok(held),
+            Err(Excl::Failed(why)) => return Err(why),
+            Err(Excl::Busy) if start.elapsed() < bound => std::thread::sleep(step),
+            Err(Excl::Busy) => {
+                return Err(format!(
+                    "{} (still in use after {tries} tries over {:?})",
+                    busy(Path::new("/proc"), path),
+                    start.elapsed()
+                ))
+            }
+        }
+    }
 }
 
 fn hold_exclusively_at(path: &str) -> Result<Option<File>, String> {
@@ -2528,6 +2591,59 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::{Site, SITES};
+
+    /// Mechanism 2 (2026-11-27): a device in use at its stop is waited
+    /// for, briefly; past the bound it is refused with its tries and
+    /// holders; another failure is not tried again.
+    #[test]
+    fn a_device_in_use_at_its_stop_is_waited_for_a_bounded_time() {
+        use super::{hold_exclusively_waiting, Excl};
+        use std::time::Duration;
+        let step = Duration::from_millis(1);
+        let dev = "/dev/ublkb999999";
+        let mut n = 0;
+        let held = hold_exclusively_waiting(
+            || {
+                n += 1;
+                if n <= 3 {
+                    Err(Excl::Busy)
+                } else {
+                    Ok(Some(n))
+                }
+            },
+            dev,
+            Duration::from_secs(5),
+            step,
+        );
+        assert_eq!((held, n), (Ok(Some(4)), 4));
+        let mut n = 0;
+        let e = hold_exclusively_waiting::<()>(
+            || {
+                n += 1;
+                Err(Excl::Busy)
+            },
+            dev,
+            Duration::from_millis(30),
+            step,
+        )
+        .unwrap_err();
+        assert!(n > 3, "tried {n} times");
+        assert!(e.starts_with(&format!("{dev} is in use (mounted?)")), "{e}");
+        assert!(e.contains("held by: nobody found"), "{e}");
+        assert!(e.contains(&format!("still in use after {n} tries")), "{e}");
+        let mut n = 0;
+        let e = hold_exclusively_waiting::<()>(
+            || {
+                n += 1;
+                Err(Excl::Failed(format!("{dev}: permission denied")))
+            },
+            dev,
+            Duration::from_secs(5),
+            step,
+        )
+        .unwrap_err();
+        assert_eq!((n, e.as_str()), (1, "/dev/ublkb999999: permission denied"));
+    }
 
     /// A refusal "in use" names who holds the device, or says nobody was
     /// found (the holder had let go when it was looked for).
