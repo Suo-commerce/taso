@@ -8,8 +8,9 @@
 # and published), this script's own taso-blkd on a log under $WORK, its
 # own coordinator, packs to a local directory.
 #
-#   run 1   turns 1 to 3.  The block log's length is noted (after a flush:
-#           a group's end).
+#   run 1   turns 1 to 3.  The block log's end is noted (taso-blkd's
+#           log_bytes after a flush: a group's end, before the zeros it
+#           keeps ahead of its tail).
 #   run 2   turns 4 to 6.  Seals 1 to 6 are shipped.
 #   damage  taso-blkd is stopped and its log cut back to the noted length,
 #           as its start leaves it after a record no longer verifies: the
@@ -198,9 +199,15 @@ names
 check "run 1: the Warden exits 0 (it said $rc)" "$([ "$rc" = 0 ]; echo $?)"
 t=$(shipped_turn); check "run 1: the Seal of turn 3 is shipped (newest shipped turn: $t)" "$([ "$t" = 3 ]; echo $?)"
 blk flush >/dev/null
-LEN_3=$(stat -c %s "$LOG")
+# The log's own end, a group's end after the flush: not the file's length,
+# which runs on into the zeros taso-blkd keeps ahead of its tail (the
+# reserve, maturity review finding 4).  Cut at the file's length, the cut
+# can take only zeros and leave turns 4 to 6 on the node (the release
+# gate's rebuild failed on 1661de2, 7 of 20 checks).
+LEN_3=$(blk stats | tr ' ' '\n' | sed -n 's/^log_bytes=//p')
+[ -n "$LEN_3" ] || { echo "taso-blkd's stats named no log_bytes" >&2; exit 1; }
 L3=$(layers)
-echo "  the block log is $LEN_3 bytes; the dataset has $L3 Seal layers"
+echo "  the block log ends at $LEN_3 bytes; the dataset has $L3 Seal layers"
 
 echo "== run 2: turns 4 to 6"
 rc=$(warden 2 3)
