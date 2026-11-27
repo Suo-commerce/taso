@@ -3288,6 +3288,61 @@ pub struct Report {
     /// The run ended because a stop was requested ([`Stop`]): the agent
     /// was killed, or never started.
     pub stopped: bool,
+    /// Another Warden holds the Vessel now: the agent was stopped and the
+    /// Vessel is not started again here (finding 6).
+    pub fenced: bool,
+}
+
+/// How often a running Vessel's holding is asked of the coordinator (D&D
+/// 6 (d), 2026-11-27: 60 s).  One read, on its own thread: a read
+/// transaction on the coordinator, which waits for no write and joins no
+/// queue (a remote coordinator: one request, on a pooled connection of
+/// its own), so no Seal waits for it.
+pub const OWNERSHIP_EVERY: Duration = Duration::from_secs(60);
+
+/// Whether another Warden holds `id` now, as `coord` answers: the
+/// reason, if the holder is not `me` at `epoch`.  An error answers
+/// nothing: an agent is stopped on an answer naming someone else, never
+/// on a coordinator that cannot be asked.
+pub fn moved_from(
+    coord: &dyn Coord,
+    id: ChronicleId,
+    me: WardenId,
+    epoch: Epoch,
+) -> Option<String> {
+    match coord.ownership(id) {
+        Ok(o) if (o.holder, o.epoch) != (me, epoch) => Some(format!(
+            "Warden {} holds this Vessel now, at epoch {} (this run held it at epoch {})",
+            o.holder.get(),
+            o.epoch.get(),
+            epoch.get()
+        )),
+        _ => None,
+    }
+}
+
+/// Ask [`moved_from`] every `every`, until `ended` (looked at every
+/// second, so the watch ends within a second of the run) or it answers.
+pub fn watch_ownership(
+    coord: &dyn Coord,
+    id: ChronicleId,
+    me: WardenId,
+    epoch: Epoch,
+    every: Duration,
+    ended: &AtomicBool,
+) -> Option<String> {
+    let step = every.min(Duration::from_secs(1));
+    let mut since = std::time::Instant::now();
+    while !ended.load(Ordering::SeqCst) {
+        std::thread::sleep(step);
+        if since.elapsed() >= every {
+            since = std::time::Instant::now();
+            if let Some(why) = moved_from(coord, id, me, epoch) {
+                return Some(why);
+            }
+        }
+    }
+    None
 }
 
 /// What [`settle`] did.
@@ -5575,6 +5630,9 @@ impl Node {
         let _slot = self.hold_for_run(*vc.id().as_bytes());
         let (mut vessel, start, verdict, rebuilt_here) = self.start(vc)?;
         let id = vc.id();
+        // The holding this run is: another one at the coordinator is a
+        // fence (finding 6).
+        let held_at = vessel.chronicle().epoch();
         self.log(vc, format_args!("dataset {}", vessel.dataset()));
         let birth_turn = match vessel.last_seal() {
             None => self.host().birth_turn(&vessel)?,
@@ -6014,6 +6072,7 @@ impl Node {
                 agent: None,
                 settled,
                 stopped: true,
+                fenced: false,
             });
         }
 
@@ -6119,6 +6178,49 @@ impl Node {
         // fixed list from ever ending when no sender came: taso-test
         // 2026-11-23, blkpool and f6fork timed out on 3280f34).
         let last_run = vc.restart == Restart::Never && self.requested.runs_once(id.as_bytes());
+        // Fenced: another Warden holds the Vessel now (the maturity
+        // review's finding 6; D&D 6 (a) + (d), 2026-11-27).  Its agent is
+        // stopped, through this run's own stop, and the run says so: the
+        // supervisor does not start it again here.  Learnt from the first
+        // request refused as fenced, or by the watch below.
+        let fenced: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let holding = {
+            let (coord, exited, stop, fenced) = (
+                self.coord.clone(),
+                exited.clone(),
+                stop.clone(),
+                fenced.clone(),
+            );
+            let (me, said) = (
+                self.config.warden,
+                format!("taso-wardend[{}] {}", self.config.warden.get(), vc.subject),
+            );
+            std::thread::Builder::new()
+                .name("ownership".into())
+                .spawn(move || {
+                    if let Some(why) =
+                        watch_ownership(&*coord, id, me, held_at, OWNERSHIP_EVERY, &exited)
+                    {
+                        eprintln!(
+                            "{said}: fenced: {why}: its agent is stopped, and the Vessel is not started again here"
+                        );
+                        fenced
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert(why);
+                        stop.request();
+                    }
+                })
+        };
+        if let Err(e) = &holding {
+            // Not a reason to refuse the run: a fence is still learnt from
+            // the first request it refuses.
+            self.log(
+                vc,
+                format_args!("no thread to watch who holds it ({e}): a fence is learnt from the first request it refuses"),
+            );
+        }
+        let (run_stop, run_fenced) = (stop.clone(), fenced.clone());
         let (warden_stop, promoted_now) = (stop.clone(), promoted.clone());
         let linger = move || last_run && !warden_stop.requested() && !promoted_now.requested();
         let stop = || exited.load(Ordering::SeqCst);
@@ -6179,12 +6281,19 @@ impl Node {
                             );
                         }
                         // The agent is told in its reply; the operator learns it here.
-                        ServeEvent::Fenced { request, message } => self.log(
-                            vc,
-                            format_args!(
-                                "fenced: {request} refused, another Warden holds this Vessel now: {message}"
-                            ),
-                        ),
+                        ServeEvent::Fenced { request, message } => {
+                            self.log(
+                                vc,
+                                format_args!(
+                                    "fenced: {request} refused, another Warden holds this Vessel now: {message}; its agent is stopped, and the Vessel is not started again here"
+                                ),
+                            );
+                            run_fenced
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get_or_insert_with(|| message.to_string());
+                            run_stop.request();
+                        }
                         ServeEvent::Waiting { unanswered } => self.log(
                             vc,
                             format_args!(
@@ -6261,6 +6370,16 @@ impl Node {
                 ),
             );
         }
+        if let Ok(w) = holding {
+            // It ends within a second of the agent's exit, or once a
+            // call it is in returns (a remote coordinator's: within its
+            // timeout, 30 s by default).
+            let _ = w.join();
+        }
+        let was_fenced = fenced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         let stopped = stopper
             .join()
             .map_err(|_| DaemonError::Io("the stop thread panicked".into()))?;
@@ -6294,6 +6413,7 @@ impl Node {
             agent,
             settled,
             stopped,
+            fenced: was_fenced,
         })
     }
 }
@@ -6301,6 +6421,74 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Who holds a running Vessel (finding 6) ──────────────────────
+
+    /// D&D 6 (d), 2026-11-27.  The watch answers a fence only: another
+    /// Warden holding the Vessel, or a holding newer than the run's own.
+    /// Its own holding, or a coordinator that cannot answer, is nothing:
+    /// an agent is never stopped on an error.
+    #[test]
+    fn the_holding_watch_answers_a_fence_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap();
+        let id = ChronicleId::from_bytes([9; 16]);
+        let (a, b) = (WardenId::new(1), WardenId::new(2));
+        coord.register(id, a).unwrap();
+        let held = coord.ownership(id).unwrap().epoch;
+        assert_eq!(moved_from(&coord, id, a, held), None, "its own holding");
+        assert_eq!(
+            moved_from(&coord, ChronicleId::from_bytes([8; 16]), a, held),
+            None,
+            "an error answers nothing"
+        );
+        let b_at = coord.transfer_if(id, b, (a, held)).unwrap();
+        let why = moved_from(&coord, id, a, held).expect("fenced");
+        assert!(why.starts_with("Warden 2 holds this Vessel now"), "{why}");
+        // Taken back by this Warden in another run: newer than this run's.
+        coord.transfer_if(id, a, (b, b_at)).unwrap();
+        assert!(moved_from(&coord, id, a, held).is_some(), "a newer holding");
+    }
+
+    /// The watch asks every interval, and ends within a second of the
+    /// run (it looks at the run's end every second, not every interval).
+    #[test]
+    fn the_holding_watch_asks_every_interval_and_ends_with_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let coord = crate::coordinator::Coordinator::open(tmp.path().join("c.redb")).unwrap();
+        let id = ChronicleId::from_bytes([9; 16]);
+        let (a, b) = (WardenId::new(1), WardenId::new(2));
+        coord.register(id, a).unwrap();
+        let held = coord.ownership(id).unwrap().epoch;
+        coord.transfer_if(id, b, (a, held)).unwrap();
+        let ended = AtomicBool::new(false);
+        let t = std::time::Instant::now();
+        let got = watch_ownership(&coord, id, a, held, Duration::from_millis(50), &ended);
+        assert!(got.is_some_and(|w| w.starts_with("Warden 2")));
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // Never fenced, the run ends: the watch ends within a second,
+        // whatever its interval.
+        let now = coord.ownership(id).unwrap();
+        let ended = Arc::new(AtomicBool::new(false));
+        let end = {
+            let ended = ended.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                ended.store(true, Ordering::SeqCst);
+            })
+        };
+        let t = std::time::Instant::now();
+        assert_eq!(
+            watch_ownership(&coord, id, now.holder, now.epoch, OWNERSHIP_EVERY, &ended),
+            None
+        );
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            t.elapsed()
+        );
+        end.join().unwrap();
+    }
 
     // ── Settling the state ──────────────────────────────────────────
 

@@ -429,6 +429,7 @@ mod tests {
                 last_seal: Some(pos(5)),
             },
             stopped,
+            fenced: false,
         }
     }
 
