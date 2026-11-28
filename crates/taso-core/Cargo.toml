@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test hooks read from the environment (`hold`, for the crash harness):
+# off in a release build, so a stray variable changes nothing.  The gates
+# that use them build with it on.
+test-hooks = []
+
 [dependencies]
 blake3 = { workspace = true }
 

@@ -12,14 +12,28 @@
 //! A hold pauses; it never fails the operation.  Off, the first call reads
 //! the environment once; every call after is one load and one compare.
 //! Named, each reach of that site also checks for the arm file.
+//!
+//! Only with the `test-hooks` feature (step 8, 8-10 (a), 2026-11-28).
+//! Without it, `hold` does nothing and reads nothing: a release build
+//! never pauses, whatever its environment says.
 
+#[cfg(any(test, feature = "test-hooks"))]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
 use std::sync::OnceLock;
+#[cfg(any(test, feature = "test-hooks"))]
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "test-hooks")]
 static ARMED: OnceLock<Option<(String, PathBuf)>> = OnceLock::new();
 
+/// Without the `test-hooks` feature: nothing.
+#[cfg(not(feature = "test-hooks"))]
+#[inline]
+pub fn hold(_name: &str) {}
+
 /// Pause here if this process's hold is `name`.
+#[cfg(feature = "test-hooks")]
 pub fn hold(name: &str) {
     let armed = ARMED.get_or_init(|| {
         let name = std::env::var("TASO_E3_HOLD")
@@ -36,6 +50,7 @@ pub fn hold(name: &str) {
 }
 
 /// This process holds at `name`, and the harness has armed it.
+#[cfg(any(test, feature = "test-hooks"))]
 fn is_armed(name: &str, want: &str, dir: &Path) -> bool {
     want == name && dir.join(format!("{name}.arm")).exists()
 }
@@ -43,6 +58,7 @@ fn is_armed(name: &str, want: &str, dir: &Path) -> bool {
 /// Write the marker, then wait for the release or the bound.  Best effort:
 /// if the marker cannot be written the process still pauses, and the
 /// harness reports "the hold was never reached".
+#[cfg(any(test, feature = "test-hooks"))]
 fn wait(name: &str, dir: &Path, bound: Duration) {
     let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(
@@ -88,6 +104,22 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
         let pid = std::fs::read_to_string(dir.join("x.held")).unwrap();
         assert_eq!(pid, std::process::id().to_string());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Step 8, 8-10 (a): without the `test-hooks` feature, a hold named
+    /// and armed in the environment does not pause and writes nothing.
+    #[cfg(not(feature = "test-hooks"))]
+    #[test]
+    fn a_release_build_never_holds() {
+        let dir = scratch("off");
+        std::fs::write(dir.join("off.arm"), "").unwrap();
+        std::env::set_var("TASO_E3_HOLD", "off");
+        std::env::set_var("TASO_E3_HOLD_DIR", &dir);
+        let start = Instant::now();
+        hold("off");
+        assert!(start.elapsed() < Duration::from_secs(1), "it paused");
+        assert!(!dir.join("off.held").exists(), "it marked a hold");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
