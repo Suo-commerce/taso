@@ -44,8 +44,8 @@ already done.
 
 ## Why you would use it
 
-- You run agents and want to **undo** what one did, back to a known good
-  point, without restoring a whole server.
+- You run agents and want to **undo** what one did since its last
+  checkpoint, without restoring a whole server.
 - You want to run **many attempts in parallel** on the same starting
   data and keep only the one that worked.
 - You want a **record you can trust** of what an agent wrote and what it
