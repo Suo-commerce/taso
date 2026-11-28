@@ -182,6 +182,22 @@ says "already set up" and changes nothing but the directory modes
 below. It starts no process and installs no service: the two commands
 below are yours, and `systemd` units, if you want them, are yours too.
 
+**Mount the data directory's filesystem with `lazytime`.** `init` does
+not do this for you. Without it, every write `taso-blkd` makes to the
+block log also updates the file's modification time through the
+filesystem's journal. When the disk is slow to finish a journal commit,
+that write waits for it while `taso-blkd` holds the lock all Vessels
+share, and every Vessel on the node waits with it (on a test VM, once,
+for two minutes). With `lazytime` the time stays in memory and is
+written later, and no such write waits on the journal. Add `lazytime`
+to the filesystem's options in `/etc/fstab` and apply it at once with
+`mount -o remount,lazytime <its mount point>`
+(`findmnt -no TARGET,OPTIONS -T /var/lib/taso` shows which one, and
+whether it has it). Every file's modification time on that filesystem
+is then written lazily, so after a crash one may read older than it
+was. Nothing in Taso depends on that, but a filesystem of the data
+directory's own keeps the option from reaching anything else.
+
 **Who can read the data.** Every Vessel's files live in the block log,
 the packs and the Warden's state, whatever their modes inside the Vessel
 say, so these are root's alone. `init` makes `state`, `store` and
@@ -305,6 +321,8 @@ echo 1 > /sys/kernel/rcu_expedited
 To keep them across reboots, do what `taso-ctl init` does on one
 machine: `ublk_drv` in a file in `/etc/modules-load.d/`, and the
 setting in `/etc/tmpfiles.d/` (`w /sys/kernel/rcu_expedited - - - - 1`).
+Mount the filesystem that holds the data volume with `lazytime` too, as
+for one machine above.
 
 **Run the demo:**
 
