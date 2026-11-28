@@ -65,17 +65,17 @@ fn the_client_and_the_daemon_agree() {
     let mut c = Client::connect(&sock).unwrap();
 
     let root = c.root().unwrap();
-    let a = c.branch(root, Some("tank/taso/a")).unwrap();
+    let a = c.branch(root, Some("taso/taso/a")).unwrap();
     let records = c.stats().unwrap()["records"].clone();
     assert!(
-        matches!(c.branch(root, Some("tank/taso/a")), Err(ClientError::Daemon(e)) if e.contains("taken"))
+        matches!(c.branch(root, Some("taso/taso/a")), Err(ClientError::Daemon(e)) if e.contains("taken"))
     );
     assert!(matches!(
         c.branch(root, Some("bad!name")),
         Err(ClientError::Daemon(_))
     ));
     assert!(matches!(
-        c.branch(root, Some("tank taso")),
+        c.branch(root, Some("bad name")),
         Err(ClientError::BadArgument(_))
     ));
     assert_eq!(
@@ -83,7 +83,7 @@ fn the_client_and_the_daemon_agree() {
         records,
         "refused names append nothing"
     );
-    assert_eq!(c.find("tank/taso/a").unwrap(), Some(a));
+    assert_eq!(c.find("taso/taso/a").unwrap(), Some(a));
     assert_eq!(c.find("nope").unwrap(), None);
 
     let tag: Vec<u8> = (0..64).collect();
@@ -107,7 +107,7 @@ fn the_client_and_the_daemon_agree() {
     let i = c.info(a).unwrap();
     assert_eq!(
         (i.kind, i.parent, i.name.as_deref(), i.tag),
-        (LayerKind::Branch, Some(s2), Some("tank/taso/a"), None)
+        (LayerKind::Branch, Some(s2), Some("taso/taso/a"), None)
     );
 
     // Export a Seal, import it into a fresh branch, seal: the same image,
@@ -122,7 +122,7 @@ fn the_client_and_the_daemon_agree() {
         c.export(s2, None, Path::new("relative.blks")),
         Err(ClientError::BadArgument(_))
     ));
-    let copy = c.branch(root, Some("tank/taso/copy")).unwrap();
+    let copy = c.branch(root, Some("taso/taso/copy")).unwrap();
     assert_eq!(c.import(copy, &f1).unwrap(), n);
     let cs = c.seal(copy, b"").unwrap();
     c.export(cs, None, &f2).unwrap();
@@ -134,12 +134,12 @@ fn the_client_and_the_daemon_agree() {
     assert_eq!(
         c.names().unwrap(),
         vec![
-            ("tank/taso/a".to_string(), a),
-            ("tank/taso/copy".to_string(), copy)
+            ("taso/taso/a".to_string(), a),
+            ("taso/taso/copy".to_string(), copy)
         ]
     );
     std::fs::write(dir.path().join("junk.blks"), b"junk").unwrap();
-    let j = c.branch(root, Some("tank/taso/j")).unwrap();
+    let j = c.branch(root, Some("taso/taso/j")).unwrap();
     assert!(
         matches!(c.import(j, &dir.path().join("junk.blks")), Err(ClientError::Daemon(e)) if e.contains("bad import stream"))
     );
@@ -152,14 +152,14 @@ fn the_client_and_the_daemon_agree() {
         "a reset branch keeps its place"
     );
     assert_eq!(c.seals(a).unwrap().len(), 2, "and its Seals");
-    let b = c.branch(s1, Some("tank/taso/b")).unwrap();
+    let b = c.branch(s1, Some("taso/taso/b")).unwrap();
     assert_eq!(
         c.seals(b).unwrap(),
         vec![],
         "a fork has no Seals of its own"
     );
-    c.name(b, Some("tank/taso/b2")).unwrap();
-    assert_eq!(c.find("tank/taso/b").unwrap(), None);
+    c.name(b, Some("taso/taso/b2")).unwrap();
+    assert_eq!(c.find("taso/taso/b").unwrap(), None);
     c.name(b, None).unwrap();
     assert_eq!(c.info(b).unwrap().name, None);
     assert!(
@@ -183,7 +183,7 @@ fn the_client_and_the_daemon_agree() {
         "compacted: no garbage left"
     );
     assert_eq!(
-        c.find("tank/taso/a").unwrap(),
+        c.find("taso/taso/a").unwrap(),
         Some(a),
         "names survive a compaction"
     );
@@ -196,7 +196,7 @@ fn the_client_and_the_daemon_agree() {
 
     let d = Daemon::start(&log, &sock);
     let mut c = Client::connect(&sock).unwrap();
-    assert_eq!(c.find("tank/taso/a").unwrap(), Some(a));
+    assert_eq!(c.find("taso/taso/a").unwrap(), Some(a));
     assert_eq!(c.seals(a).unwrap(), vec![(s1, tag), (s2, vec![])]);
     assert!(
         matches!(c.info(b), Err(ClientError::Daemon(_))),
@@ -235,7 +235,7 @@ fn the_daemon_compacts_by_itself_and_keeps_what_is_live() {
     let blocks = dir.path().join("in.blks");
     std::fs::write(&blocks, stream(0xab, 256)).unwrap();
     // Kept: a Seal of 256 blocks.  Garbage: the same again, reset away.
-    let keep = c.branch(root, Some("tank/keep")).unwrap();
+    let keep = c.branch(root, Some("taso/keep")).unwrap();
     c.import(keep, &blocks).unwrap();
     let sealed = c.seal(keep, b"").unwrap();
     let gone = c.branch(root, None).unwrap();
@@ -270,7 +270,7 @@ fn the_daemon_compacts_by_itself_and_keeps_what_is_live() {
         std::fs::read(&blocks).unwrap(),
         "the Seal's blocks, unchanged"
     );
-    assert_eq!(c.find("tank/keep").unwrap(), Some(keep));
+    assert_eq!(c.find("taso/keep").unwrap(), Some(keep));
     c.quit().unwrap();
     assert!(d.wait());
     // And it starts again on the compacted log.
@@ -307,7 +307,7 @@ fn the_daemon_works_when_its_log_cannot_be_written() {
     );
     let mut c = Client::connect(&sock).unwrap();
     let root = c.root().unwrap();
-    let a = c.branch(root, Some("tank/full")).unwrap();
+    let a = c.branch(root, Some("taso/full")).unwrap();
     std::fs::write(dir.path().join("in.blks"), stream(0x5a, 8)).unwrap();
     c.import(a, &dir.path().join("in.blks")).unwrap();
     c.reset(a).unwrap();
@@ -349,8 +349,8 @@ fn an_attach_holds_up_no_call_about_another_branch() {
     );
     let mut c = Client::connect(&sock).unwrap();
     let root = c.root().unwrap();
-    let a = c.branch(root, Some("tank/held")).unwrap();
-    let b = c.branch(root, Some("tank/other")).unwrap();
+    let a = c.branch(root, Some("taso/held")).unwrap();
+    let b = c.branch(root, Some("taso/other")).unwrap();
     let attaching = {
         let sock = sock.clone();
         thread::spawn(move || Client::connect(&sock).unwrap().attach(a))
@@ -371,7 +371,7 @@ fn an_attach_holds_up_no_call_about_another_branch() {
         move || {
             let mut c = Client::connect(&sock).unwrap();
             let info = c.info(b).unwrap();
-            c.branch(root, Some("tank/third")).unwrap();
+            c.branch(root, Some("taso/third")).unwrap();
             c.reset(b).unwrap();
             info
         }
@@ -425,16 +425,16 @@ fn a_failed_fork_leaves_no_branch_or_name() {
     let mut c = Client::connect(&sock).unwrap();
     let root = c.root().unwrap();
     let before = c.stats().unwrap()["layers"].clone();
-    match c.fork(root, Some("tank/failed")) {
+    match c.fork(root, Some("taso/failed")) {
         Ok((b, _)) => {
             c.detach(b).unwrap();
         }
         Err(e) => {
             assert!(matches!(e, ClientError::Daemon(_)), "{e:?}");
-            assert_eq!(c.find("tank/failed").unwrap(), None, "no name left");
+            assert_eq!(c.find("taso/failed").unwrap(), None, "no name left");
             assert_eq!(c.stats().unwrap()["layers"], before, "no branch left");
             // And the same fork answers the same way again, not "taken".
-            match c.fork(root, Some("tank/failed")) {
+            match c.fork(root, Some("taso/failed")) {
                 Err(ClientError::Daemon(e)) => assert!(!e.contains("taken"), "{e}"),
                 other => panic!("{other:?}"),
             }
@@ -454,7 +454,7 @@ fn quit_reports_a_failed_final_checkpoint() {
     let d = Daemon::start(&log, &sock);
     let mut c = Client::connect(&sock).unwrap();
     let root = c.root().unwrap();
-    c.branch(root, Some("tank/q")).unwrap();
+    c.branch(root, Some("taso/q")).unwrap();
     std::fs::create_dir(dir.path().join("log.ckpt.tmp")).unwrap();
     assert!(
         matches!(c.quit(), Err(ClientError::Daemon(e)) if e.contains("final checkpoint")),
@@ -486,7 +486,7 @@ fn a_stop_signal_quits_as_quit_does() {
         );
         let mut c = Client::connect(&sock).unwrap();
         let root = c.root().unwrap();
-        let a = c.branch(root, Some("tank/signal")).unwrap();
+        let a = c.branch(root, Some("taso/signal")).unwrap();
         drop(c);
 
         let pid = d.0.id().to_string();
@@ -521,7 +521,7 @@ fn a_stop_signal_quits_as_quit_does() {
         );
         let mut c = Client::connect(&sock).unwrap();
         assert_eq!(
-            c.find("tank/signal").unwrap(),
+            c.find("taso/signal").unwrap(),
             Some(a),
             "SIG{sig}: nothing lost"
         );

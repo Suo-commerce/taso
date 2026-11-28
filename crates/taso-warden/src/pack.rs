@@ -2419,7 +2419,7 @@ mod tests {
         }
         fn snap(&self, lsn: u64, guid: u64) -> Snapshot {
             Snapshot {
-                dataset: Dataset::new("tank/v").unwrap(),
+                dataset: Dataset::new("taso/v").unwrap(),
                 seal: Lsn::new(lsn),
                 guid,
                 seal_hash: Some(self.at(lsn).hash),
@@ -2800,7 +2800,7 @@ mod tests {
         log.fill(9, &[6, 9]);
         let h2 = log.publish(&e, 9, 101, None).unwrap();
         assert_eq!(h2.header.fs.unwrap().base, FsBase::Seal(log.at(6)));
-        let s6 = "tank/v@taso-seal-00000000000000000006";
+        let s6 = "taso/v@taso-seal-00000000000000000006";
         assert_eq!(
             *e.send.calls.borrow(),
             vec![(None, Lsn::new(6)), (Some(s6.to_string()), Lsn::new(9))]
@@ -3384,7 +3384,7 @@ mod tests {
             keys.len() + 1,
             "the Seal pack was replaced; only the log pack is new"
         );
-        let s3 = "tank/v@taso-seal-00000000000000000003";
+        let s3 = "taso/v@taso-seal-00000000000000000003";
         assert_eq!(e.read_fs(6).unwrap(), body(Some(s3), Lsn::new(6), 7));
         assert_eq!(e.packs.chain(None).unwrap().seals.len(), 2);
         // A crash after the record, before the log was shipped: nothing to
@@ -3671,7 +3671,7 @@ mod tests {
             old.at(7),
             "the log starts where the store ends, which B knows by hash"
         );
-        let s2 = "tank/v@taso-seal-00000000000000000002".to_string();
+        let s2 = "taso/v@taso-seal-00000000000000000002".to_string();
         assert_eq!(
             e.send.calls.borrow().last().unwrap(),
             &(Some(s2), Lsn::new(10))
@@ -3694,7 +3694,7 @@ mod tests {
         assert_eq!(
             e.read_fs(10).unwrap(),
             body(
-                Some("tank/v@taso-seal-00000000000000000002"),
+                Some("taso/v@taso-seal-00000000000000000002"),
                 Lsn::new(10),
                 0
             )
@@ -4159,7 +4159,7 @@ mod tests {
 
     fn origin_snap(guid: u64) -> Snapshot {
         Snapshot {
-            dataset: Dataset::new("tank/tpl").unwrap(),
+            dataset: Dataset::new("taso/tpl").unwrap(),
             seal: Lsn::new(40),
             guid,
             seal_hash: Some(HashVal::from_bytes([0x40; 32])),
@@ -4190,7 +4190,7 @@ mod tests {
         );
         assert_eq!(
             e.send.calls.borrow()[0].0.as_deref(),
-            Some("tank/tpl@taso-seal-00000000000000000040")
+            Some("taso/tpl@taso-seal-00000000000000000040")
         );
         // Later Seals are incremental from the previous one; no origin then.
         log.fill(6, &[3, 6]);

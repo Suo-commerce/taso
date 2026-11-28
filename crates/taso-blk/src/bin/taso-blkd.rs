@@ -3016,10 +3016,10 @@ mod detach_test {
     fn a_poisoned_store_answers_err_to_find_seals_names_and_info() {
         let (_dir, d, branch, stop) = daemon_with_a_running_branch();
         let l = branch.to_string();
-        d.command(&["name", &l, "tank/a"]).unwrap();
+        d.command(&["name", &l, "taso/a"]).unwrap();
         d.command(&["seal", &l]).unwrap();
         for words in [
-            &["find", "tank/a"][..],
+            &["find", "taso/a"][..],
             &["seals", &l],
             &["names"],
             &["info", &l],
@@ -3029,11 +3029,11 @@ mod detach_test {
         assert!(!d.stats().contains("layers=?"), "{}", d.stats());
         lock_store(&d.store, Site::Poisoned).poison();
         for words in [
-            &["find", "tank/a"][..],
+            &["find", "taso/a"][..],
             &["seals", &l],
             &["names"],
             &["info", &l],
-            &["branch", &l, "tank/b"],
+            &["branch", &l, "taso/b"],
         ] {
             let e = d.command(words).unwrap_err();
             assert!(e.contains("reopen the store"), "{words:?}: {e}");

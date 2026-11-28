@@ -3588,20 +3588,20 @@ mod tests {
             let mut s = Store::create(&path).unwrap();
             root = s.root_seal().unwrap();
             a = s.fork(root).unwrap();
-            s.name(a, "tank/taso/vessel-a").unwrap();
+            s.name(a, "taso/taso/vessel-a").unwrap();
             s.write(a, 0, &blocks(1, 1), false).unwrap();
             s1 = s.seal_tagged(a, b"lsn=7 hash=aa").unwrap();
             s.write(a, 0, &blocks(2, 1), false).unwrap();
             s2 = s.seal_tagged(a, &[0xff; MAX_TAG]).unwrap();
             b = s.fork(s1).unwrap();
-            s.name(b, "tank/taso/vessel-b").unwrap();
+            s.name(b, "taso/taso/vessel-b").unwrap();
             s3 = s.seal(b).unwrap();
             s.flush().unwrap();
         }
         let (s, _) = Store::open(&path).unwrap();
-        assert_eq!(s.find("tank/taso/vessel-a").unwrap(), Some(a));
-        assert_eq!(s.find("tank/taso/vessel-b").unwrap(), Some(b));
-        assert_eq!(s.name_of(a).unwrap(), Some("tank/taso/vessel-a"));
+        assert_eq!(s.find("taso/taso/vessel-a").unwrap(), Some(a));
+        assert_eq!(s.find("taso/taso/vessel-b").unwrap(), Some(b));
+        assert_eq!(s.name_of(a).unwrap(), Some("taso/taso/vessel-a"));
         assert_eq!(s.tag(s1).unwrap(), Some(&b"lsn=7 hash=aa"[..]));
         assert_eq!(s.tag(s2).unwrap(), Some(&[0xff; MAX_TAG][..]));
         assert_eq!(s.tag(s3).unwrap(), Some(&b""[..]));
@@ -3710,7 +3710,7 @@ mod tests {
             let mut s = Store::create(&path).unwrap();
             let root = s.root_seal().unwrap();
             a = s.fork(root).unwrap();
-            s.name(a, "tank/v-a").unwrap();
+            s.name(a, "taso/v-a").unwrap();
             s.write(a, 0, &blocks(1, 2), false).unwrap();
             s1 = s.seal_tagged(a, b"t1").unwrap();
             s.write(a, 0, &blocks(2, 1), false).unwrap();
@@ -3740,7 +3740,7 @@ mod tests {
             "the reset survives a reopen"
         );
         assert_eq!(
-            (s.find("tank/v-a").unwrap(), s.seals_of(a).unwrap()),
+            (s.find("taso/v-a").unwrap(), s.seals_of(a).unwrap()),
             (Some(a), vec![s1])
         );
         assert_eq!(s.map().unwrap().parent(a).unwrap(), Some(s1));
@@ -3755,7 +3755,7 @@ mod tests {
             let mut s = Store::create(&path).unwrap();
             let root = s.root_seal().unwrap();
             a = s.fork(root).unwrap();
-            s.name(a, "tank/v-a").unwrap();
+            s.name(a, "taso/v-a").unwrap();
             s.write(a, 0, &blocks(1, 2), false).unwrap();
             s1 = s.seal_tagged(a, b"t1").unwrap();
             s.write(a, 0, &blocks(2, 1), false).unwrap();
@@ -3791,7 +3791,7 @@ mod tests {
             "the unseal survives a reopen"
         );
         assert_eq!(
-            (s.find("tank/v-a").unwrap(), s.seals_of(a).unwrap()),
+            (s.find("taso/v-a").unwrap(), s.seals_of(a).unwrap()),
             (Some(a), vec![s1])
         );
         assert_eq!(s.map().unwrap().parent(a).unwrap(), Some(s1));
@@ -4056,11 +4056,11 @@ mod tests {
         let mut s = new_store(&dir);
         let root = s.root_seal().unwrap();
         let (x, y) = (s.fork(root).unwrap(), s.fork(root).unwrap());
-        s.name(y, "tank/b").unwrap();
-        s.name(x, "tank/a").unwrap();
+        s.name(y, "taso/b").unwrap();
+        s.name(x, "taso/a").unwrap();
         assert_eq!(
             s.names().unwrap(),
-            vec![("tank/a".to_string(), x), ("tank/b".to_string(), y)]
+            vec![("taso/a".to_string(), x), ("taso/b".to_string(), y)]
         );
     }
 
@@ -4070,13 +4070,13 @@ mod tests {
         let mut s = Store::create(path).unwrap();
         let root = s.root_seal().unwrap();
         let a = s.fork(root).unwrap();
-        s.name(a, "tank/a").unwrap();
+        s.name(a, "taso/a").unwrap();
         s.write(a, 0, &blocks(1, 3), false).unwrap();
         s.discard(a, 1, 1).unwrap();
         let s1 = s.seal_tagged(a, b"one").unwrap();
         s.write(a, 0, &blocks(2, 1), false).unwrap();
         let b = s.fork(s1).unwrap();
-        s.name(b, "tank/b").unwrap();
+        s.name(b, "taso/b").unwrap();
         s.write(b, 5, &blocks(3, 2), false).unwrap();
         let at = s.checkpoint().unwrap();
         s.write(a, 7, &blocks(4, 1), false).unwrap();
@@ -4084,7 +4084,7 @@ mod tests {
         s.reset(b).unwrap();
         s.write(b, 6, &blocks(5, 1), false).unwrap();
         let c = s.fork(s2).unwrap();
-        s.name(c, "tank/c").unwrap();
+        s.name(c, "taso/c").unwrap();
         s.name(b, "").unwrap();
         s.flush().unwrap();
         (s, vec![root, a, s1, b, s2, c], at)
@@ -5151,7 +5151,7 @@ mod tests {
         c.copy().unwrap();
         let seal = s.seal_tagged(a, b"three").unwrap();
         let e = s.fork(seal).unwrap();
-        s.name(e, "tank/e").unwrap();
+        s.name(e, "taso/e").unwrap();
         s.write(e, 3, &blocks(41, 1), false).unwrap();
         s.drop_seal(layers[4]).unwrap_err(); // has children: refused, appends nothing
         assert!(c.catch_up().unwrap() > 0);
@@ -5163,7 +5163,7 @@ mod tests {
         assert!(done.records > 0);
         assert_eq!(whole(&s, &layers), want);
         assert_eq!(s.tag(seal).unwrap(), Some(&b"three"[..]));
-        assert_eq!(s.find("tank/e").unwrap(), Some(e));
+        assert_eq!(s.find("taso/e").unwrap(), Some(e));
         drop(s);
         let (s, _) = Store::open(&path).unwrap();
         assert_eq!(

@@ -934,7 +934,7 @@ mod tests {
             Host {
                 coord: self.coord.clone(),
                 pool: FakePool::default(),
-                root: Dataset::new("tank/vessels").unwrap(),
+                root: Dataset::new("taso/vessels").unwrap(),
                 state_dir: self.tmp.path().join(format!("node-{n}")),
                 warden: WardenId::new(n),
             }

@@ -55,7 +55,7 @@ fn a_pass_decides_each_pending_candidate_and_a_second_sends_the_same() {
         &cfg,
         format!(
             r#"{{"warden": 1, "coordinator": {{"remote": "/nonexistent/coord.sock"}}, "storage": {{"blk": {{"socket": "/nonexistent/blk.sock", "mounts": "/nonexistent/mnt", "spool": "/nonexistent/spool"}}}},
-               "root": "tank/vessel", "state_dir": "/var/lib/taso/state",
+               "root": "taso/vessel", "state_dir": "/var/lib/taso/state",
                "store": "/srv/taso/store", "run_dir": "{}",
                "runtime": {{"rootfs": "/srv/taso/rootfs", "host_uid_base": 200000,
                            "args": ["/usr/bin/agent"], "memory_bytes": 268435456, "pids": 64}},

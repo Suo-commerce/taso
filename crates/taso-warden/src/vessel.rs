@@ -2640,7 +2640,7 @@ pub(crate) mod tests {
         let host = Host {
             coord,
             pool: FakePool::default(),
-            root: Dataset::new("tank/vessels").unwrap(),
+            root: Dataset::new("taso/vessels").unwrap(),
             state_dir: tmp.path().join("state"),
             warden: WardenId::new(1),
         };
@@ -3630,7 +3630,7 @@ pub(crate) mod tests {
             let host = Host {
                 coord: coord.clone(),
                 pool: FakePool::default(),
-                root: Dataset::new("tank/vessels").unwrap(),
+                root: Dataset::new("taso/vessels").unwrap(),
                 state_dir: tmp.path().join("state"),
                 warden: WardenId::new(1),
             };
@@ -3914,7 +3914,7 @@ pub(crate) mod tests {
             let p = penv(vessel_id(ns(1), b"user-1"));
             let (mut v, s1) = sealed(&p);
             let mut other = snap(&v, s1);
-            other.dataset = Dataset::new("tank/vessels/elsewhere").unwrap();
+            other.dataset = Dataset::new("taso/vessels/elsewhere").unwrap();
             assert!(matches!(
                 v.publish_seal(&p.packs, &other, None),
                 Err(VesselError::NotThisSeal(_))

@@ -489,7 +489,7 @@ mod tests {
                 }),
             );
             let snap = Snapshot {
-                dataset: Dataset::new("tank/v").unwrap(),
+                dataset: Dataset::new("taso/v").unwrap(),
                 seal: p.lsn,
                 guid: 7,
                 seal_hash: Some(p.hash),

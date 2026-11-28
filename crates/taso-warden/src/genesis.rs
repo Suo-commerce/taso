@@ -1499,7 +1499,7 @@ pub(crate) mod tests {
                 coord: self.coord.clone(),
                 warden: WardenId::new(n),
                 state_dir: at.join("state"),
-                root: Dataset::new("tank/taso").unwrap(),
+                root: Dataset::new("taso/taso").unwrap(),
                 host_uid_base: BASE,
                 limits: Limits::default(),
                 reserved: Reserved::defaults(),
@@ -1976,7 +1976,7 @@ class = "Scratch"
     fn a_seal_is_read_with_its_top_directorys_slot_base() {
         let c = Cluster::new();
         let g = c.node(1);
-        let v = Dataset::new("tank/taso/v-0123").unwrap();
+        let v = Dataset::new("taso/taso/v-0123").unwrap();
         let base = BASE + 3 * SLOT;
         let root = g.pool.make(&v);
         good_tree(&root, base);
@@ -2027,7 +2027,7 @@ class = "Scratch"
             (3, (BASE + 5, BASE + 5)),
             (4, (BASE - SLOT, BASE - SLOT)),
         ] {
-            let v = Dataset::new(&format!("tank/taso/v-{n}")).unwrap();
+            let v = Dataset::new(&format!("taso/taso/v-{n}")).unwrap();
             let root = g.pool.make(&v);
             good_tree(&root, owner.0);
             std::os::unix::fs::chown(&root, Some(owner.0), Some(owner.1)).unwrap();

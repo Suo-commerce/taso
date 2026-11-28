@@ -15,7 +15,7 @@
 //! use taso_blk::client::Client;
 //! let mut c = Client::connect("/run/taso-blk.sock".as_ref())?;
 //! let root = c.root()?;
-//! let b = c.branch(root, Some("tank/taso/vessel-a"))?;
+//! let b = c.branch(root, Some("taso/vessels/v-vessel-a"))?;
 //! let dev = c.attach(b)?;            // mkfs and mount dev, write, ...
 //! let seal = c.seal(b, b"lsn+hash")?;
 //! assert_eq!(c.seals(b)?, vec![(seal, b"lsn+hash".to_vec())]);
@@ -726,7 +726,7 @@ mod tests {
             "ok L5",
             "ok L5:0700ab L7:",
             "ok kind=seal parent=L0 name=- tag=0700ab origin=L1 dev=-",
-            "ok kind=branch parent=L5 name=tank/a tag=- origin=- dev=/dev/ublkb4",
+            "ok kind=branch parent=L5 name=taso/a tag=- origin=- dev=/dev/ublkb4",
             "ok",
             "ok 42",
             "ok log_bytes=10 layers=3",
@@ -734,7 +734,7 @@ mod tests {
         let mut c = Client::connect(&path).unwrap();
         let l = |n| LayerId::from_raw(n);
         assert_eq!(c.root().unwrap(), l(0));
-        assert_eq!(c.branch(l(0), Some("tank/a")).unwrap(), l(1));
+        assert_eq!(c.branch(l(0), Some("taso/a")).unwrap(), l(1));
         assert_eq!(
             c.fork(l(0), None).unwrap(),
             (l(2), PathBuf::from("/dev/ublkb3"))
@@ -762,7 +762,7 @@ mod tests {
             (i.kind, i.name.as_deref(), i.tag, i.dev),
             (
                 LayerKind::Branch,
-                Some("tank/a"),
+                Some("taso/a"),
                 None,
                 Some("/dev/ublkb4".into())
             )
@@ -778,7 +778,7 @@ mod tests {
             h.join().unwrap(),
             [
                 "root",
-                "branch L0 tank/a",
+                "branch L0 taso/a",
                 "fork L0",
                 "attach L1",
                 "seal L1 0700ab",

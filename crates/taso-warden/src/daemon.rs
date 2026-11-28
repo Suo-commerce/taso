@@ -6751,7 +6751,7 @@ mod tests {
         use taso_blk::client::LogStart;
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path();
-        let root = Dataset::new("tank/vessels").unwrap();
+        let root = Dataset::new("taso/vessels").unwrap();
         let start = |id: &str| LogStart {
             id: id.into(),
             cut: 0,
@@ -6773,7 +6773,7 @@ mod tests {
         // A Vessel of this Warden's, by its state directory.
         let vessel = "0123456789abcdef0123456789abcdef";
         std::fs::create_dir(state.join(vessel)).unwrap();
-        let its = format!("tank/vessels/v-{vessel}");
+        let its = format!("taso/vessels/v-{vessel}");
         let holds_it = |d: &Dataset| Ok(d.as_str() == its);
 
         // Another log that holds it: refused, nothing written.
@@ -6807,7 +6807,7 @@ mod tests {
     fn what_the_block_logs_start_found_is_said() {
         use taso_blk::client::{LogAside, LogStart};
         let dir = tempfile::tempdir().unwrap();
-        let root = Dataset::new("tank/vessels").unwrap();
+        let root = Dataset::new("taso/vessels").unwrap();
         let id = "d".repeat(32);
         write_block_log_id(dir.path(), &id).unwrap();
         let said = block_log_at_start(
@@ -7216,7 +7216,7 @@ mod tests {
     const GOOD: &str = r#"{
         "warden": 1,
         "coordinator": { "local": "/var/lib/taso/coord.redb", "serve": "/run/taso/coord.sock" },
-        "root": "tank/vessel",
+        "root": "taso/vessel",
         "storage": { "blk": { "socket": "/run/taso-blk.sock", "mounts": "/srv/taso", "spool": "/var/lib/taso-blk/spool" } },
         "state_dir": "/var/lib/taso/state",
         "store": "/srv/taso/store",
@@ -7631,7 +7631,7 @@ mod tests {
             (e.host.dataset_for(tb), vec![0, tbase, tbase + 5]),
             (e.host.dataset_for(void), vec![tbase]),
         ]);
-        let root = Dataset::new("tank/vessels").unwrap();
+        let root = Dataset::new("taso/vessels").unwrap();
         let (held, warnings) = held_on(&pool, &root, 200_000, Some(9), &state).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
@@ -8344,7 +8344,7 @@ mod tests {
                 ),
             ),
             ("store number", Box::new(|v| v["store"] = 3.into())),
-            ("bad dataset", Box::new(|v| v["root"] = "tank//v".into())),
+            ("bad dataset", Box::new(|v| v["root"] = "taso//v".into())),
             (
                 "no agent",
                 Box::new(|v| v["runtime"]["args"] = serde_json::json!([])),
@@ -9075,7 +9075,7 @@ mod tests {
             (e.host.dataset_for(pid), vec![0, range1]),
             (e.host.dataset_for(cid), vec![range1, range1 + 1000]),
         ]);
-        let root = Dataset::new("tank/vessels").unwrap();
+        let root = Dataset::new("taso/vessels").unwrap();
         let (held, warnings) = held_on(&pool, &root, 200_000, None, &state).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         let by = |k: ChronicleId| held.iter().find(|h| h.key == *k.as_bytes()).unwrap();

@@ -1011,7 +1011,7 @@ class = \"Scratch\"
         let host = Host {
             coord: coord.clone(),
             pool: FakePool::default(),
-            root: Dataset::new("tank/vessels").unwrap(),
+            root: Dataset::new("taso/vessels").unwrap(),
             state_dir: dir.path().join("state"),
             warden: WardenId::new(1),
         };
@@ -1086,7 +1086,7 @@ class = \"Scratch\"
             coord: w.coord.clone(),
             warden: WardenId::new(100),
             state_dir: w.dir.path().join("gstate"),
-            root: Dataset::new("tank/taso").unwrap(),
+            root: Dataset::new("taso/taso").unwrap(),
             host_uid_base: BASE,
             limits: Limits::default(),
             reserved: Reserved::defaults(),

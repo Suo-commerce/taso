@@ -609,7 +609,7 @@ mod tests {
         let c = parse(&args(&[
             "/etc/taso/warden.json",
             "--from",
-            "tank/taso/v-00ff@12",
+            "taso/taso/v-00ff@12",
             "--classmap",
             "/etc/taso/map.toml",
             "--actor",
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(
             r.source,
             Source::Seal {
-                dataset: Dataset::new("tank/taso/v-00ff").unwrap(),
+                dataset: Dataset::new("taso/taso/v-00ff").unwrap(),
                 lsn: Lsn::new(12)
             }
         );
@@ -750,11 +750,11 @@ mod tests {
             assert!(parse(&args(c)).is_err(), "{c:?}");
         }
         for bad in [
-            "tank/v@",
-            "tank/v@x",
-            "tank/v",
+            "taso/v@",
+            "taso/v@x",
+            "taso/v",
             "relative/dir",
-            "tank/v@0",
+            "taso/v@0",
             "/@1x",
         ] {
             if bad.starts_with('/') {

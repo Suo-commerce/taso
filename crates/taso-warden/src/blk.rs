@@ -2918,7 +2918,7 @@ mod tests {
             "/mnt/taso",
             spool.path(),
         );
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(2), h(2))
@@ -2942,7 +2942,7 @@ mod tests {
     fn a_destroy_cut_short_at_any_step_is_finished_by_a_retry() {
         for cut in 0..3 {
             let p = pool();
-            let a = ds("tank/v-a");
+            let a = ds("taso/v-a");
             p.create(&a).unwrap();
             for n in [2u8, 4, 6] {
                 p.layers(&a)
@@ -2954,7 +2954,7 @@ mod tests {
             let g = p.guid(&a).unwrap().unwrap();
             let chain: Vec<LayerId> = {
                 let mut d = p.blkd.lock().unwrap();
-                let b = d.find("tank/v-a").unwrap().unwrap();
+                let b = d.find("taso/v-a").unwrap().unwrap();
                 let mut v = vec![b];
                 let mut cur = d.info(b).unwrap().parent;
                 while let Some(l) = cur {
@@ -3001,8 +3001,8 @@ mod tests {
             // As text: that is how mountinfo is matched (`Path`'s own
             // comparison would call these equal).
             assert_eq!(
-                mk(root).mountpoint(&ds("tank/v-1")).to_str(),
-                Some("/mnt/taso/x/tank/v-1"),
+                mk(root).mountpoint(&ds("taso/v-1")).to_str(),
+                Some("/mnt/taso/x/taso/v-1"),
                 "{root}"
             );
         }
@@ -3011,15 +3011,15 @@ mod tests {
         let link = spool.path().join("link");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
         let p = mk(link.to_str().unwrap());
-        let want = std::fs::canonicalize(real.path()).unwrap().join("tank/v-1");
-        assert_eq!(p.mountpoint(&ds("tank/v-1")), want);
+        let want = std::fs::canonicalize(real.path()).unwrap().join("taso/v-1");
+        assert_eq!(p.mountpoint(&ds("taso/v-1")), want);
         // And what mountinfo lists for it is found.
         let mi = format!(
             "90 22 259:3 / {} rw,relatime shared:50 - ext4 /dev/ublkb3 rw\n",
             want.display()
         );
         assert_eq!(
-            mount_source(&mi, &p.mountpoint(&ds("tank/v-1"))),
+            mount_source(&mi, &p.mountpoint(&ds("taso/v-1"))),
             Some("/dev/ublkb3".into())
         );
     }
@@ -3069,13 +3069,13 @@ mod tests {
     fn mountinfo_is_read_for_the_exact_mount_point() {
         let mi = "\
 22 1 252:2 / / rw,relatime shared:1 - ext4 /dev/vda2 rw
-90 22 259:3 / /mnt/taso/tank/v-1 rw,relatime shared:50 - ext4 /dev/ublkb3 rw
-91 22 259:4 / /mnt/taso/tank/v-1/sub rw - ext4 /dev/ublkb4 rw
+90 22 259:3 / /mnt/taso/taso/v-1 rw,relatime shared:50 - ext4 /dev/ublkb3 rw
+91 22 259:4 / /mnt/taso/taso/v-1/sub rw - ext4 /dev/ublkb4 rw
 92 22 0:50 / /mnt/with\\040space rw - tmpfs tmp\\040fs rw
-93 90 259:9 / /mnt/taso/tank/v-1 rw - ext4 /dev/ublkb9 rw
+93 90 259:9 / /mnt/taso/taso/v-1 rw - ext4 /dev/ublkb9 rw
 ";
         assert_eq!(
-            mount_source(mi, Path::new("/mnt/taso/tank/v-1")),
+            mount_source(mi, Path::new("/mnt/taso/taso/v-1")),
             Some("/dev/ublkb9".into()),
             "the last mount on top wins"
         );
@@ -3084,7 +3084,7 @@ mod tests {
             Some("tmp fs".into())
         );
         assert_eq!(
-            mount_source(mi, Path::new("/mnt/taso/tank")),
+            mount_source(mi, Path::new("/mnt/taso/taso")),
             None,
             "a directory under / is not a mount point"
         );
@@ -3094,39 +3094,39 @@ mod tests {
     #[test]
     fn create_makes_a_formatted_mounted_void_born_dataset() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         let info = p.create(&a).unwrap();
-        assert_eq!(info.mountpoint, Some(PathBuf::from("/mnt/taso/tank/v-a")));
+        assert_eq!(info.mountpoint, Some(PathBuf::from("/mnt/taso/taso/v-a")));
         assert_eq!((info.origin, info.parent), (None, None));
         let dev = {
             let mut d = p.blkd.lock().unwrap();
-            let b = d.find("tank/v-a").unwrap().unwrap();
+            let b = d.find("taso/v-a").unwrap().unwrap();
             d.info(b).unwrap().dev.unwrap()
         };
         assert_eq!(
             calls(&p),
             [
                 format!("mkfs {}", dev.display()),
-                format!("mount {} /mnt/taso/tank/v-a", dev.display())
+                format!("mount {} /mnt/taso/taso/v-a", dev.display())
             ]
         );
         assert!(p.layers(&a).list().unwrap().is_empty());
         assert!(p.create(&a).is_err(), "a dataset is created once");
-        assert_eq!(p.info(&ds("tank/none")).unwrap(), None);
+        assert_eq!(p.info(&ds("taso/none")).unwrap(), None);
     }
 
     #[test]
     fn a_failed_create_leaves_nothing_to_adopt() {
         let p = pool();
         *p.mounts.fail_mkfs.borrow_mut() = true;
-        assert!(p.create(&ds("tank/v-a")).is_err());
+        assert!(p.create(&ds("taso/v-a")).is_err());
         assert_eq!(
-            p.info(&ds("tank/v-a")).unwrap(),
+            p.info(&ds("taso/v-a")).unwrap(),
             None,
             "no half-made dataset"
         );
         *p.mounts.fail_mkfs.borrow_mut() = false;
-        p.create(&ds("tank/v-a")).unwrap();
+        p.create(&ds("taso/v-a")).unwrap();
     }
 
     /// With a daemon that gives connections of their own, no attach, mkfs,
@@ -3144,7 +3144,7 @@ mod tests {
         );
         let shared = p.blkd.clone();
         *p.mounts.probe.borrow_mut() = Some(Box::new(move || shared.try_lock().is_err()));
-        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        let (a, c) = (ds("taso/v-a"), ds("taso/v-c"));
         p.create(&a).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(2), h(2))
@@ -3158,7 +3158,7 @@ mod tests {
         let made = std::mem::take(&mut *p.mounts.calls.borrow_mut());
         for (want, at) in [
             ("mkfs ", ""),
-            ("mount ", " /mnt/taso/tank/v-c"),
+            ("mount ", " /mnt/taso/taso/v-c"),
             ("mount-ro ", ""),
             ("umount ", ""),
         ] {
@@ -3173,7 +3173,7 @@ mod tests {
     #[test]
     fn snapshots_freeze_only_their_own_mount_and_list_in_order() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         calls(&p);
         let mut l = p.layers(&a);
@@ -3182,10 +3182,10 @@ mod tests {
         assert_eq!(
             calls(&p),
             [
-                "freeze /mnt/taso/tank/v-a",
-                "thaw /mnt/taso/tank/v-a",
-                "freeze /mnt/taso/tank/v-a",
-                "thaw /mnt/taso/tank/v-a"
+                "freeze /mnt/taso/taso/v-a",
+                "thaw /mnt/taso/taso/v-a",
+                "freeze /mnt/taso/taso/v-a",
+                "thaw /mnt/taso/taso/v-a"
             ]
         );
         assert_eq!(
@@ -3199,12 +3199,12 @@ mod tests {
     #[test]
     fn a_mountpoint_mounted_from_elsewhere_is_never_frozen() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         p.mounts
             .table
             .borrow_mut()
-            .insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
+            .insert("/mnt/taso/taso/v-a".into(), "/dev/sda1".into());
         calls(&p);
         assert!(p.layers(&a).snapshot(Lsn::new(2), h(2)).is_err());
         assert!(calls(&p).is_empty(), "no freeze, no seal");
@@ -3214,14 +3214,14 @@ mod tests {
     #[test]
     fn the_thaw_runs_when_the_seal_fails() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         calls(&p);
         p.blkd.lock().unwrap().fail_seal = true;
         assert!(p.layers(&a).snapshot(Lsn::new(2), h(2)).is_err());
         assert_eq!(
             calls(&p),
-            ["freeze /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-a"]
+            ["freeze /mnt/taso/taso/v-a", "thaw /mnt/taso/taso/v-a"]
         );
         assert!(p.mounts.frozen.borrow().is_empty());
     }
@@ -3229,7 +3229,7 @@ mod tests {
     #[test]
     fn a_failed_thaw_is_named_even_when_the_seal_failed_too() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         // Thaw alone fails: the Seal is made and its thaw handed back
         // (bite 2), whose run returns the error, not a false success.
@@ -3246,13 +3246,13 @@ mod tests {
             .to_string();
         assert!(e.contains("seal failed"), "{e}");
         assert!(e.contains("device gone"), "{e}");
-        assert!(e.contains("/mnt/taso/tank/v-a is still frozen"), "{e}");
+        assert!(e.contains("/mnt/taso/taso/v-a is still frozen"), "{e}");
     }
 
     #[test]
     fn an_unmounted_branch_is_sealed_without_a_freeze() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         p.mounts.table.borrow_mut().clear(); // as after a reboot
         calls(&p);
@@ -3268,7 +3268,7 @@ mod tests {
     #[test]
     fn clones_carry_origin_and_parent() {
         let p = pool();
-        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        let (a, c) = (ds("taso/v-a"), ds("taso/v-c"));
         p.create(&a).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(2), h(2))
@@ -3299,7 +3299,7 @@ mod tests {
         assert_eq!(info.origin_seal(), Some((a.clone(), Lsn::new(2))));
         let mounted = calls(&p);
         assert_eq!(mounted.len(), 1, "mounted, not formatted: {mounted:?}");
-        assert!(mounted[0].starts_with("mount ") && mounted[0].ends_with(" /mnt/taso/tank/v-c"));
+        assert!(mounted[0].starts_with("mount ") && mounted[0].ends_with(" /mnt/taso/taso/v-c"));
         assert!(
             p.layers(&c).list().unwrap().is_empty(),
             "a clone has no layers of its own"
@@ -3328,7 +3328,7 @@ mod tests {
     #[test]
     fn destroy_drops_orphans_and_refuses_layers_that_carry_clones() {
         let p = pool();
-        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        let (a, c) = (ds("taso/v-a"), ds("taso/v-c"));
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
         l.snapshot(Lsn::new(2), h(2)).unwrap().run().unwrap();
@@ -3343,7 +3343,7 @@ mod tests {
     fn the_open_takes_an_orphan_from_under_its_branch_and_the_rollback_counts_it() {
         // F1, 2026-10-28: a Seal's layer taken, its record never accepted.
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
         write0(&p, &a, 1);
@@ -3364,7 +3364,7 @@ mod tests {
         );
         assert_eq!(block0(&p, &a), 1, "reads as the Seal at lsn 2");
         let c = calls(&p);
-        assert_eq!(c[0], "umount /mnt/taso/tank/v-a", "{c:?}");
+        assert_eq!(c[0], "umount /mnt/taso/taso/v-a", "{c:?}");
         assert!(c[1].starts_with("mount "), "remounted: {c:?}");
         l.rollback(Lsn::new(2), h(2)).unwrap();
         assert_eq!(
@@ -3381,7 +3381,7 @@ mod tests {
     #[test]
     fn a_seal_view_is_a_read_only_throwaway_branch_gone_when_dropped() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(3), h(3))
@@ -3391,11 +3391,11 @@ mod tests {
         assert!(p.seal_view(&a, Lsn::new(9)).is_err(), "no such Seal");
         calls(&p);
         let view = p.seal_view(&a, Lsn::new(3)).unwrap();
-        assert_eq!(view.path(), Path::new("/mnt/taso/.views/tank/v-a.view-3"));
+        assert_eq!(view.path(), Path::new("/mnt/taso/.views/taso/v-a.view-3"));
         let (vb, dev) = {
             let mut d = p.blkd.lock().unwrap();
             let vb = d
-                .find("tank/v-a.view-3")
+                .find("taso/v-a.view-3")
                 .unwrap()
                 .expect("the view's branch");
             (vb, d.info(vb).unwrap().dev.unwrap())
@@ -3403,7 +3403,7 @@ mod tests {
         assert_eq!(
             calls(&p),
             [format!(
-                "mount-ro {} /mnt/taso/.views/tank/v-a.view-3",
+                "mount-ro {} /mnt/taso/.views/taso/v-a.view-3",
                 dev.display()
             )]
         );
@@ -3414,10 +3414,10 @@ mod tests {
             "the view stands on its Seal"
         );
         drop(view);
-        assert_eq!(calls(&p), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
+        assert_eq!(calls(&p), ["umount /mnt/taso/.views/taso/v-a.view-3"]);
         let mut d = p.blkd.lock().unwrap();
         assert_eq!(
-            d.find("tank/v-a.view-3").unwrap(),
+            d.find("taso/v-a.view-3").unwrap(),
             None,
             "the branch is dropped"
         );
@@ -3441,7 +3441,7 @@ mod tests {
     #[test]
     fn a_view_left_by_a_killed_warden_does_not_block_destroy() {
         let p = pool();
-        let a = ds("tank/a-1");
+        let a = ds("taso/a-1");
         p.create(&a).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(1), h(1))
@@ -3479,7 +3479,7 @@ mod tests {
             .map(|(n, _)| n)
             .collect();
         assert!(
-            names.iter().all(|n| !n.starts_with("tank/a-1")),
+            names.iter().all(|n| !n.starts_with("taso/a-1")),
             "{names:?}"
         );
     }
@@ -3491,7 +3491,7 @@ mod tests {
     #[test]
     fn two_genesis_processes_never_take_down_each_others_views() {
         let warden = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         warden.create(&a).unwrap();
         warden
             .layers(&a)
@@ -3525,17 +3525,17 @@ mod tests {
         let gone: u32 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
             .map_or(4_194_304, |s| s.trim().parse().unwrap())
             + 1;
-        assert!(!second.left_over(&a, "tank/v-a.gview-1-3"));
-        assert!(second.left_over(&a, &format!("tank/v-a.gview-{gone}-3")));
-        assert!(!second.left_over(&a, "tank/v-a.view-3"), "the Warden's");
-        assert!(warden.left_over(&a, "tank/v-a.view-3"));
-        assert!(!warden.left_over(&a, "tank/v-a.viewer-3"));
+        assert!(!second.left_over(&a, "taso/v-a.gview-1-3"));
+        assert!(second.left_over(&a, &format!("taso/v-a.gview-{gone}-3")));
+        assert!(!second.left_over(&a, "taso/v-a.view-3"), "the Warden's");
+        assert!(warden.left_over(&a, "taso/v-a.view-3"));
+        assert!(!warden.left_over(&a, "taso/v-a.viewer-3"));
     }
 
     #[test]
     fn a_view_left_by_a_crash_is_taken_down_first() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(3), h(3))
@@ -3547,7 +3547,7 @@ mod tests {
         calls(&p);
         let view = p.seal_view(&a, Lsn::new(3)).unwrap();
         let c = calls(&p);
-        assert_eq!(c[0], "umount /mnt/taso/.views/tank/v-a.view-3", "{c:?}");
+        assert_eq!(c[0], "umount /mnt/taso/.views/taso/v-a.view-3", "{c:?}");
         assert!(c[1].starts_with("mount-ro "));
         drop(view);
     }
@@ -3560,7 +3560,7 @@ mod tests {
     #[test]
     fn two_users_of_one_seal_share_its_view_and_the_last_takes_it_down() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(3), h(3))
@@ -3584,7 +3584,7 @@ mod tests {
             p.blkd
                 .lock()
                 .unwrap()
-                .find("tank/v-a.view-3")
+                .find("taso/v-a.view-3")
                 .unwrap()
                 .is_some(),
             "its branch stays"
@@ -3592,9 +3592,9 @@ mod tests {
         let third = p.seal_view(&a, Lsn::new(3)).unwrap();
         drop(second);
         drop(third);
-        assert_eq!(calls(&p), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
+        assert_eq!(calls(&p), ["umount /mnt/taso/.views/taso/v-a.view-3"]);
         assert_eq!(
-            p.blkd.lock().unwrap().find("tank/v-a.view-3").unwrap(),
+            p.blkd.lock().unwrap().find("taso/v-a.view-3").unwrap(),
             None,
             "the last user dropped the branch"
         );
@@ -3615,7 +3615,7 @@ mod tests {
     #[test]
     fn a_genesis_and_the_warden_never_take_down_each_others_views() {
         let warden = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         warden.create(&a).unwrap();
         warden
             .layers(&a)
@@ -3640,27 +3640,27 @@ mod tests {
         );
         assert_eq!(c.len(), 1, "one mount: {c:?}");
         assert!(
-            c[0].starts_with("mount-ro ") && c[0].ends_with("/tank/v-a.gview-1-3"),
+            c[0].starts_with("mount-ro ") && c[0].ends_with("/taso/v-a.gview-1-3"),
             "{c:?}"
         );
-        assert_eq!(g.path(), Path::new("/mnt/taso/.views/tank/v-a.gview-1-3"));
+        assert_eq!(g.path(), Path::new("/mnt/taso/.views/taso/v-a.gview-1-3"));
         drop(g);
         assert_eq!(
             calls(&warden),
-            ["umount /mnt/taso/.views/tank/v-a.gview-1-3"]
+            ["umount /mnt/taso/.views/taso/v-a.gview-1-3"]
         );
         assert!(
             warden
                 .blkd
                 .lock()
                 .unwrap()
-                .find("tank/v-a.view-3")
+                .find("taso/v-a.view-3")
                 .unwrap()
                 .is_some(),
             "the Warden's view stands"
         );
         drop(held);
-        assert_eq!(calls(&warden), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
+        assert_eq!(calls(&warden), ["umount /mnt/taso/.views/taso/v-a.view-3"]);
     }
 
     /// The test VM at fd7199d, p4-verify case 11: two attempts' /candidate
@@ -3672,17 +3672,17 @@ mod tests {
     #[test]
     fn destroy_goes_on_when_another_branch_goes_while_it_looks() {
         let p = pool();
-        let (a, b) = (ds("tank/a-1"), ds("tank/a-2"));
+        let (a, b) = (ds("taso/a-1"), ds("taso/a-2"));
         p.create(&a).unwrap();
         p.create(&b).unwrap();
-        let gone = p.blkd.lock().unwrap().find("tank/a-2").unwrap().unwrap();
+        let gone = p.blkd.lock().unwrap().find("taso/a-2").unwrap().unwrap();
         assert!(Pool::destroy(&p, &b, gone.get()).unwrap());
         // The other destroy's listing still has it.
         p.blkd
             .lock()
             .unwrap()
             .ghosts
-            .push(("tank/a-2".into(), gone));
+            .push(("taso/a-2".into(), gone));
         let g = p.guid(&a).unwrap().unwrap();
         assert!(Pool::destroy(&p, &a, g).unwrap(), "a is destroyed");
         assert_eq!(p.guid(&a).unwrap(), None);
@@ -3691,7 +3691,7 @@ mod tests {
     #[test]
     fn destroy_takes_a_dataset_and_its_own_layers_by_guid() {
         let p = pool();
-        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        let (a, c) = (ds("taso/v-a"), ds("taso/v-c"));
         assert_eq!(p.guid(&a).unwrap(), None);
         assert!(!Pool::destroy(&p, &a, 1).unwrap(), "nothing to destroy");
         p.create(&a).unwrap();
@@ -3722,7 +3722,7 @@ mod tests {
         );
         let layers: Vec<LayerId> = {
             let mut d = p.blkd.lock().unwrap();
-            let b = d.find("tank/v-a").unwrap().unwrap();
+            let b = d.find("taso/v-a").unwrap().unwrap();
             let mut v = Vec::new();
             let mut cur = d.info(b).unwrap().parent;
             while let Some(l) = cur {
@@ -3740,7 +3740,7 @@ mod tests {
             }
         }
         assert_eq!(p.info(&a).unwrap(), None);
-        assert!(calls(&p).contains(&"umount /mnt/taso/tank/v-a".to_string()));
+        assert!(calls(&p).contains(&"umount /mnt/taso/taso/v-a".to_string()));
         // Every layer it made is gone: only the store's own state is left.
         let mut d = p.blkd.lock().unwrap();
         assert!(d.names().unwrap().is_empty());
@@ -3759,7 +3759,7 @@ mod tests {
     #[test]
     fn a_start_thaws_what_a_dead_warden_left_frozen() {
         let p = pool();
-        let (a, b, c) = (ds("tank/v-a"), ds("tank/v-b"), ds("tank/v-c"));
+        let (a, b, c) = (ds("taso/v-a"), ds("taso/v-b"), ds("taso/v-c"));
         for d in [&a, &b, &c] {
             p.create(d).unwrap();
         }
@@ -3767,20 +3767,20 @@ mod tests {
         p.mounts.table.borrow_mut().remove(&p.mountpoint(&c));
         calls(&p);
         assert_eq!(
-            p.thaw_left_frozen(&ds("tank")).unwrap(),
+            p.thaw_left_frozen(&ds("taso")).unwrap(),
             vec![p.mountpoint(&a)]
         );
         assert!(p.mounts.frozen.borrow().is_empty(), "thawed");
         assert_eq!(
             calls(&p),
-            ["thaw /mnt/taso/tank/v-a", "thaw /mnt/taso/tank/v-b"],
+            ["thaw /mnt/taso/taso/v-a", "thaw /mnt/taso/taso/v-b"],
             "a thawed; b asked and found not frozen; c not mounted"
         );
         // A thaw that fails otherwise is an error, naming the mount.
         p.mounts.freeze(&p.mountpoint(&b)).unwrap();
         *p.mounts.fail_thaw.borrow_mut() = true;
-        let e = p.thaw_left_frozen(&ds("tank")).unwrap_err().to_string();
-        assert!(e.contains("thawing /mnt/taso/tank/v-"), "{e}");
+        let e = p.thaw_left_frozen(&ds("taso")).unwrap_err().to_string();
+        assert!(e.contains("thawing /mnt/taso/taso/v-"), "{e}");
     }
 
     /// C3-n.  In a container the dead Warden's mounts went with it, but a
@@ -3791,7 +3791,7 @@ mod tests {
     #[test]
     fn a_start_thaws_what_a_dead_wardens_container_left_frozen_and_unmounted() {
         let p = pool();
-        let (a, b) = (ds("tank/v-a"), ds("tank/v-b"));
+        let (a, b) = (ds("taso/v-a"), ds("taso/v-b"));
         for d in [&a, &b] {
             p.create(d).unwrap();
         }
@@ -3804,7 +3804,7 @@ mod tests {
         p.mounts.table.borrow_mut().remove(&p.mountpoint(&b));
         calls(&p);
         assert_eq!(
-            p.thaw_left_frozen(&ds("tank")).unwrap(),
+            p.thaw_left_frozen(&ds("taso")).unwrap(),
             vec![p.mountpoint(&a)]
         );
         assert!(
@@ -3820,9 +3820,9 @@ mod tests {
         assert_eq!(
             calls(&p),
             [
-                format!("mount {} /mnt/taso/tank/v-a", dev_a.display()),
-                "thaw /mnt/taso/tank/v-a".to_string(),
-                "umount /mnt/taso/tank/v-a".to_string(),
+                format!("mount {} /mnt/taso/taso/v-a", dev_a.display()),
+                "thaw /mnt/taso/taso/v-a".to_string(),
+                "umount /mnt/taso/taso/v-a".to_string(),
             ],
             "a released; b left alone"
         );
@@ -3884,7 +3884,7 @@ mod tests {
     #[test]
     fn ensure_mounted_reattaches_after_a_restart() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         p.blkd.lock().unwrap().devs.clear(); // the daemon restarted: devices are lazy
         p.mounts.table.borrow_mut().clear();
@@ -3892,7 +3892,7 @@ mod tests {
         let dev = p.ensure_mounted(&a).unwrap();
         assert_eq!(
             calls(&p),
-            [format!("mount {} /mnt/taso/tank/v-a", dev.display())]
+            [format!("mount {} /mnt/taso/taso/v-a", dev.display())]
         );
         assert_eq!(p.ensure_mounted(&a).unwrap(), dev);
         assert!(calls(&p).is_empty(), "already mounted: nothing to do");
@@ -3903,13 +3903,13 @@ mod tests {
         assert_eq!(guid(Lsn::new(3), h(1)), guid(Lsn::new(3), h(1)));
         assert_ne!(guid(Lsn::new(3), h(1)), guid(Lsn::new(4), h(1)));
         assert_ne!(guid(Lsn::new(3), h(1)), guid(Lsn::new(3), h(2)));
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         assert_eq!(
             parse_seal_name(&a.seal_snapshot(Lsn::new(7))),
             Some((a, Lsn::new(7)))
         );
-        assert_eq!(parse_seal_name("tank/v-a@other-7"), None);
-        assert_eq!(parse_seal_name("tank/v-a"), None);
+        assert_eq!(parse_seal_name("taso/v-a@other-7"), None);
+        assert_eq!(parse_seal_name("taso/v-a"), None);
     }
 
     #[test]
@@ -3921,11 +3921,11 @@ mod tests {
             mounts.path(),
             mounts.path().join("spool"),
         );
-        let (a, c) = (ds("tank/vessels/v-a"), ds("tank/vessels/v-c"));
+        let (a, c) = (ds("taso/vessels/v-a"), ds("taso/vessels/v-c"));
         p.create(&a).unwrap();
         p.create(&c).unwrap();
-        p.create(&ds("tank/other")).unwrap();
-        p.create(&ds("tank/vessels/v-a/deeper")).unwrap();
+        p.create(&ds("taso/other")).unwrap();
+        p.create(&ds("taso/vessels/v-a/deeper")).unwrap();
         p.layers(&a)
             .snapshot(Lsn::new(2), h(2))
             .unwrap()
@@ -3941,9 +3941,9 @@ mod tests {
             )
         );
         assert_eq!(p.snapshot(&a, Lsn::new(3)).unwrap(), None);
-        assert_eq!(p.snapshot(&ds("tank/none"), Lsn::new(2)).unwrap(), None);
+        assert_eq!(p.snapshot(&ds("taso/none"), Lsn::new(2)).unwrap(), None);
         assert_eq!(
-            p.children(&ds("tank/vessels")).unwrap(),
+            p.children(&ds("taso/vessels")).unwrap(),
             [a.clone(), c.clone()],
             "direct children only"
         );
@@ -3974,7 +3974,7 @@ mod tests {
             mounts.path(),
             mounts.path().join("spool"),
         );
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         let mp = p.mountpoint(&a);
         std::fs::create_dir_all(&mp).unwrap();
@@ -4011,7 +4011,7 @@ mod tests {
     #[test]
     fn seals_travel_between_nodes_by_send_and_receive() {
         let (na, nb) = (pool(), pool());
-        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        let (a, c) = (ds("taso/v-a"), ds("taso/v-c"));
         na.create(&a).unwrap();
         write0(&na, &a, 1);
         na.layers(&a)
@@ -4122,7 +4122,7 @@ mod tests {
     #[test]
     fn an_interrupted_receive_is_finished_by_its_retry() {
         let src = pool();
-        let (a, c) = (ds("tank/v-a"), ds("tank/v-c"));
+        let (a, c) = (ds("taso/v-a"), ds("taso/v-c"));
         src.create(&a).unwrap();
         write0(&src, &a, 7);
         src.layers(&a)
@@ -4220,7 +4220,7 @@ mod tests {
     #[test]
     fn a_bad_stream_received_leaves_nothing() {
         let (na, nb) = (pool(), pool());
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         na.create(&a).unwrap();
         write0(&na, &a, 1);
         na.layers(&a)
@@ -4315,7 +4315,7 @@ mod tests {
     fn back_to_leaves_the_newest_section_end_and_a_dataset_ready_to_receive() {
         use std::io::Read as _;
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         ten_layers(&p, &a);
         // The section from Seal 8 to Seal 9, made while layer 9 is there.
         let mut section = Vec::new();
@@ -4362,7 +4362,7 @@ mod tests {
     #[test]
     fn back_to_keeps_a_layer_below_the_one_it_stops_at_and_takes_all_if_none_is_an_end() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         ten_layers(&p, &a);
         // Sections end at Seals 1 to 6 and at 8: Seal 7 has none of its
         // own (the section of 8 covers it).  Its layer is below 8: it stays.
@@ -4390,7 +4390,7 @@ mod tests {
     #[test]
     fn back_to_the_newest_layer_discards_and_counts_what_was_written_after_it() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         ten_layers(&p, &a);
         assert_eq!(
             p.back_to(&a, &ends(10)).unwrap(),
@@ -4403,7 +4403,7 @@ mod tests {
     #[test]
     fn back_to_refuses_and_changes_nothing() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         ten_layers(&p, &a);
         let untouched = |p: &TestPool| {
             assert_eq!(p.layers(&a).list().unwrap(), ends(10));
@@ -4420,10 +4420,10 @@ mod tests {
         untouched(&p);
 
         // A fork stands on layer 9, which would go.
-        let child = ds("tank/v-b");
+        let child = ds("taso/v-b");
         Pool::clone(&p, &a, Lsn::new(9), h(9), &child).unwrap();
         let e = p.back_to(&a, &ends(8)).unwrap_err().to_string();
-        assert!(e.contains("tank/v-b stands on tank/v-a's layer"), "{e}");
+        assert!(e.contains("taso/v-b stands on taso/v-a's layer"), "{e}");
         untouched(&p);
         // Layer 9 itself may stay: then nothing the fork stands on goes.
         assert_eq!(
@@ -4455,7 +4455,7 @@ mod tests {
     #[test]
     fn rollback_discards_what_came_after_the_newest_layer_and_remounts() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
         write0(&p, &a, 1);
@@ -4472,9 +4472,9 @@ mod tests {
         );
         let c = calls(&p);
         assert_eq!(c.len(), 2, "{c:?}");
-        assert_eq!(c[0], "umount /mnt/taso/tank/v-a");
+        assert_eq!(c[0], "umount /mnt/taso/taso/v-a");
         assert!(
-            c[1].starts_with("mount ") && c[1].ends_with(" /mnt/taso/tank/v-a"),
+            c[1].starts_with("mount ") && c[1].ends_with(" /mnt/taso/taso/v-a"),
             "{c:?}"
         );
         assert_eq!(l.list().unwrap(), [(Lsn::new(2), h(2))], "the layer stays");
@@ -4484,7 +4484,7 @@ mod tests {
     #[test]
     fn rollback_refuses_and_changes_nothing() {
         let p = pool();
-        let a = ds("tank/v-a");
+        let a = ds("taso/v-a");
         p.create(&a).unwrap();
         let mut l = p.layers(&a);
         l.snapshot(Lsn::new(2), h(2)).unwrap().run().unwrap();
@@ -4507,7 +4507,7 @@ mod tests {
         p.mounts
             .table
             .borrow_mut()
-            .insert("/mnt/taso/tank/v-a".into(), "/dev/sda1".into());
+            .insert("/mnt/taso/taso/v-a".into(), "/dev/sda1".into());
         assert!(
             l.rollback(Lsn::new(4), h(4)).is_err(),
             "mounted from elsewhere"
@@ -4525,7 +4525,7 @@ mod tests {
         Host {
             coord: Arc::new(Coordinator::open(dir.join("coord.redb")).unwrap()),
             pool: pool(),
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: dir.join("state"),
             warden: WardenId::new(1),
         }
@@ -4676,7 +4676,7 @@ mod tests {
         let node = |n: u64| Host {
             coord: coord.clone(),
             pool: pool(),
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: tmp.path().join(format!("node-{n}")),
             warden: WardenId::new(n),
         };
@@ -4836,7 +4836,7 @@ mod tests {
             Host {
                 coord: self.coord.clone(),
                 pool,
-                root: ds("tank/vessels"),
+                root: ds("taso/vessels"),
                 state_dir: self.tmp.path().join("node-1"),
                 warden: WardenId::new(1),
             }
@@ -4876,7 +4876,7 @@ mod tests {
                 coord,
                 pool: Clone::clone(&pool),
                 id: taso_core::envelope::ChronicleId::from_bytes([0; 16]),
-                dataset: ds("tank/none"),
+                dataset: ds("taso/none"),
                 seals: Vec::new(),
                 len_after: Vec::new(),
                 len_born: 0,
@@ -5472,7 +5472,7 @@ mod tests {
         let host = |pool: TestPool| Host {
             coord: coord.clone(),
             pool,
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: tmp.path().join("node-1"),
             warden: WardenId::new(1),
         };
@@ -5782,7 +5782,7 @@ mod tests {
         let b = Host {
             coord: t.coord.clone(),
             pool: pool(),
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: t.tmp.path().join("node-2"),
             warden: WardenId::new(2),
         };
@@ -5876,7 +5876,7 @@ mod tests {
         let c = Host {
             coord: t.coord.clone(),
             pool: pool(),
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: t.tmp.path().join("node-3"),
             warden: WardenId::new(3),
         };
@@ -5949,7 +5949,7 @@ mod tests {
         let b = Host {
             coord: t.coord.clone(),
             pool: pool(),
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: t.tmp.path().join("node-2"),
             warden: WardenId::new(2),
         };
@@ -6013,7 +6013,7 @@ mod tests {
         let b = Host {
             coord: t.coord.clone(),
             pool: pool(),
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: t.tmp.path().join("node-2"),
             warden: WardenId::new(2),
         };
@@ -6192,7 +6192,7 @@ mod tests {
         let b = Host {
             coord: t.coord.clone(),
             pool: pool(),
-            root: ds("tank/vessels"),
+            root: ds("taso/vessels"),
             state_dir: t.tmp.path().join("node-2"),
             warden: WardenId::new(2),
         };
@@ -6255,7 +6255,7 @@ mod tests {
             &t.dataset,
             t.seals[9].lsn,
             t.seals[9].hash,
-            &ds("tank/a-fork"),
+            &ds("taso/a-fork"),
         )
         .unwrap();
         let e = a

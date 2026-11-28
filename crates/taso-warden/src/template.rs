@@ -1406,7 +1406,7 @@ mod tests {
                 coord: coord.clone(),
                 warden: WardenId::new(100),
                 state_dir: n0.join("state"),
-                root: Dataset::new("tank/taso").unwrap(),
+                root: Dataset::new("taso/taso").unwrap(),
                 host_uid_base: BASE,
                 limits: Limits::default(),
                 reserved: Reserved::defaults(),
@@ -1449,7 +1449,7 @@ mod tests {
                 coord: self.coord.clone(),
                 warden: WardenId::new(n),
                 state_dir: at.join("state"),
-                root: Dataset::new("tank/taso").unwrap(),
+                root: Dataset::new("taso/taso").unwrap(),
                 template_base: TBASE,
                 limits: Limits::default(),
                 reserved: Reserved::defaults(),
@@ -2220,7 +2220,7 @@ mod tests {
                 coord: self.coord.clone(),
                 warden: WardenId::new(100),
                 state_dir: n0.join("state"),
-                root: Dataset::new("tank/taso").unwrap(),
+                root: Dataset::new("taso/taso").unwrap(),
                 host_uid_base: BASE,
                 limits: Limits::default(),
                 reserved: Reserved::defaults(),
@@ -2306,7 +2306,7 @@ mod tests {
         let host = Host {
             coord: c.coord.clone(),
             pool: crate::vessel::tests::FakePool::default(),
-            root: Dataset::new("tank/vessels").unwrap(),
+            root: Dataset::new("taso/vessels").unwrap(),
             state_dir: c.dir.path().join(format!("vstate-{}", hex(subject))),
             warden: WardenId::new(1),
         };
@@ -2416,7 +2416,7 @@ mod tests {
         let host = Host {
             coord: c.coord.clone(),
             pool: crate::vessel::tests::FakePool::default(),
-            root: Dataset::new("tank/vessels").unwrap(),
+            root: Dataset::new("taso/vessels").unwrap(),
             state_dir: c.dir.path().join(format!("vstate-{}", hex(subject))),
             warden: WardenId::new(1),
         };
@@ -2823,7 +2823,7 @@ mod tests {
         let host = Host {
             coord: c.coord.clone(),
             pool: crate::vessel::tests::FakePool::default(),
-            root: Dataset::new("tank/vessels").unwrap(),
+            root: Dataset::new("taso/vessels").unwrap(),
             state_dir: c.dir.path().join("vstate-nobody"),
             warden: WardenId::new(1),
         };
