@@ -22,7 +22,7 @@
 //! corrupt row) arrives as [`CoordError::Unavailable`] carrying the
 //! server's message.  Refusals arrive as themselves, field for field.
 //!
-//! # Wire format (v1)
+//! # Wire format (version 5, `WIRE_VERSION`)
 //!
 //! One frame per request and one per reply, framed as the Field protocol
 //! (u32 big-endian length, 16 MiB cap).  All integers big-endian.  The
@@ -31,7 +31,7 @@
 //! the other.
 //!
 //! ```text
-//! request  version 3 (1) · op (1) · fields
+//! request  version 5 (1) · op (1) · fields
 //!   1 register   chronicle (16) · holder (8)
 //!   2 append     warden (8) · envelope (137, as in a segment frame)
 //!   3 (transfer: not served, below)
@@ -702,8 +702,8 @@ impl Request {
         let mut i = In { b: body };
         if i.u8()? != WIRE_VERSION {
             return Err(Malformed(
-                "another protocol version: this coordinator speaks version 3 \
-                 (since the Chronicle view says `sanctioned`; 2 and 1 are older)",
+                "another protocol version: this coordinator speaks version 5 \
+                 (generation 3; versions 1 to 4 are older)",
             ));
         }
         let op = i.u8()?;
@@ -2643,7 +2643,10 @@ mod tests {
         let reply = read_frame(&mut s).unwrap().unwrap();
         assert_eq!(reply[0], ST_BAD);
         let text = String::from_utf8_lossy(&reply[1..]);
-        assert!(text.contains("speaks version 3"), "{text}");
+        assert!(
+            text.contains(&format!("speaks version {WIRE_VERSION} ")),
+            "the refusal names the version spoken: {text}"
+        );
         assert_eq!(read_frame(&mut s).unwrap(), None, "closed");
         let after = c.ownership(chron(1)).unwrap();
         assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
