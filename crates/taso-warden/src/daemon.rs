@@ -105,11 +105,14 @@
 //!
 //! # Stopping
 //!
-//! There is no shutdown protocol.  The Warden is built to be killed: every
-//! step is durable before it is answered, and recovery finishes or drops
-//! what was in flight.  SIGTERM and SIGKILL are both a crash.  (The agent's
-//! container outlives a killed daemon until the next start sweeps it; it
-//! can no longer record anything or reach the network.)
+//! The Warden is built to be killed: every step is durable before it is
+//! answered, and recovery finishes or drops what was in flight.  SIGKILL
+//! is a crash.  SIGTERM or SIGINT asks `taso-wardend` for a stop: every
+//! agent is stopped (its container killed), every run waited for, and the
+//! daemon exits; a second signal is a crash (see `taso-wardend`).  That is
+//! no safer than a crash, but it leaves no agent behind.  (After a crash
+//! the agent's container outlives the daemon until the next start sweeps
+//! it; it can no longer record anything or reach the network.)
 //!
 //! One Vessel can be stopped on its own ([`Stop`], [`Node::run_vessel_until`]):
 //! its container is killed, which is a crash of that agent only; the next
