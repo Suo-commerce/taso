@@ -546,11 +546,7 @@ pub fn verifier_config(spec: &VerifierSpec) -> Result<Value, SpecError> {
 /// Write a verifier's bundle: `config.json` in `bundle`.
 pub fn write_verifier_bundle(bundle: &Path, spec: &VerifierSpec) -> Result<PathBuf, BundleError> {
     let config = verifier_config(spec).map_err(BundleError::Spec)?;
-    std::fs::create_dir_all(bundle).map_err(BundleError::Io)?;
-    let path = bundle.join("config.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&config).expect("JSON"))
-        .map_err(BundleError::Io)?;
-    Ok(path)
+    write_private(bundle, &serde_json::to_vec_pretty(&config).expect("JSON"))
 }
 
 /// Directories every Vessel image must contain.  Nothing is mounted on
@@ -721,10 +717,34 @@ fn own_lost_found(work: &Path, range: u32) -> io::Result<()> {
 /// Write `config.json` for `spec` into `bundle` (created if missing).
 pub fn write_bundle(bundle: &Path, spec: &VesselSpec) -> Result<PathBuf, BundleError> {
     let config = oci_config(spec).map_err(BundleError::Spec)?;
-    std::fs::create_dir_all(bundle).map_err(BundleError::Io)?;
-    let path = bundle.join("config.json");
     let text = serde_json::to_vec_pretty(&config).expect("a JSON value serializes");
-    std::fs::write(&path, text).map_err(BundleError::Io)?;
+    write_private(bundle, &text)
+}
+
+/// `config.json` in `bundle`, readable by its owner only (0600), in a
+/// directory made 0700 if this makes it.  It carries the Vessel's or the
+/// verifier's environment, credentials included; under the default umask
+/// it was readable by every user of the host (the maturity review,
+/// `runtime.rs:722-728`).  A file there already is made 0600 too.
+fn write_private(bundle: &Path, text: &[u8]) -> Result<PathBuf, BundleError> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(bundle)
+        .map_err(BundleError::Io)?;
+    let path = bundle.join("config.json");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(BundleError::Io)?;
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(BundleError::Io)?;
+    f.write_all(text).map_err(BundleError::Io)?;
     Ok(path)
 }
 
@@ -1525,6 +1545,27 @@ mod tests {
         let path = write_bundle(&dir.path().join("b"), &spec()).unwrap();
         let back: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(back, oci_config(&spec()).unwrap());
+    }
+
+    /// The maturity review (`runtime.rs:722-728`): `config.json` carries
+    /// the environment and was written under the default umask.  It is
+    /// 0600, its new directory 0700, and a file there already is made
+    /// 0600 too.  Rewritten whole.
+    #[test]
+    fn a_bundle_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("a/b");
+        let path = write_bundle(&bundle, &spec()).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&bundle), 0o700);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&path, vec![b' '; 1 << 16]).unwrap();
+        let path = write_bundle(&bundle, &spec()).unwrap();
+        assert_eq!(mode(&path), 0o600, "made 0600 again");
+        let back: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(back, oci_config(&spec()).unwrap(), "rewritten whole");
     }
 
     // ── runc driver ─────────────────────────────────────────────────
