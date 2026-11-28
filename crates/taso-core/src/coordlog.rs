@@ -855,7 +855,7 @@ impl CoordLog {
             let e = &self.log[pos as usize - 1];
             if e.digest == *digest.as_bytes() {
                 if let Some(ch) = self.chrons.get_mut(chronicle.as_bytes()) {
-                    if ch.pending.as_ref().is_some_and(|p| p.submission == s) {
+                    if ch.epoch == epoch && ch.pending.as_ref().is_some_and(|p| p.submission == s) {
                         ch.pending = None;
                     }
                 }
@@ -869,12 +869,16 @@ impl CoordLog {
         if let Some((f, _)) = self.refused_subs.get(&(*chronicle.as_bytes(), s)) {
             return Answer::FinalRefused(f.clone());
         }
-        // 2. Epoch.
+        // 2. Epoch.  Under an epoch that is not the Chronicle's nothing
+        // changes, as for a cancel (Y5): the pending submission of that id
+        // was cleared here, so the holder's own accept of it was refused
+        // `NotAnnounced` (maturity review of e4a37b2, `coordlog.rs:853-878`).
+        // A stale-epoch refusal is never kept: the check gives it again.
         let Some(ch) = self.chrons.get(chronicle.as_bytes()) else {
-            return self.finalize(chronicle, s, Final::StaleEpoch, now);
+            return Answer::FinalRefused(Final::StaleEpoch);
         };
         if ch.epoch != epoch {
-            return self.finalize(chronicle, s, Final::StaleEpoch, now);
+            return Answer::FinalRefused(Final::StaleEpoch);
         }
         // 3. Pending guard.
         match &ch.pending {
@@ -3632,6 +3636,50 @@ mod tests {
             w.log.cancel(f.v, e, s2, w.now),
             Answer::FinalRefused(Final::Cancelled)
         );
+    }
+
+    /// The maturity review (`coordlog.rs:853-878`): an accept under an
+    /// epoch that is not the Chronicle's cleared the pending submission of
+    /// that id, and the holder's own accept of it was refused
+    /// `NotAnnounced`.  It changes nothing now, as a cancel does (Y5).
+    #[test]
+    fn an_accept_under_a_stale_epoch_changes_nothing() {
+        let store = Store::default();
+        let mut log = CoordLog::new(cfg());
+        let mut w = W {
+            log: &mut log,
+            store: &store,
+            now: 100,
+        };
+        let f = vessel(&mut w);
+        let e = w.epoch(f.v);
+        let stale = Epoch::new(e.get() + 7);
+        let r = Submitted::Contract(ContractRecord::Candidate(Box::new(f.k.clone())));
+        let s = sub(&r, e, 1);
+        w.log
+            .announce(f.v, e, s, r.logical_id(), r.digest(), w.now)
+            .unwrap();
+        w.store.ship(f.v, "p1", &r);
+        let head = w.head(f.v);
+        assert_eq!(
+            w.log
+                .accept(f.v, stale, s, head, "p1", r.clone(), w.store, w.now),
+            Answer::FinalRefused(Final::StaleEpoch)
+        );
+        assert_eq!(
+            w.log.query_submission(f.v, s),
+            SubmissionStatus::AbsentAtRead,
+            "still pending, not final"
+        );
+        let a = w
+            .log
+            .accept(f.v, e, s, head, "p1", r.clone(), w.store, w.now);
+        assert!(matches!(a, Answer::Accepted { .. }), "{a:?}");
+        // Final now: any epoch's accept repeats the answer.
+        assert!(matches!(
+            w.log.accept(f.v, stale, s, head, "p1", r, w.store, w.now),
+            Answer::AlreadyAccepted { .. }
+        ));
     }
 
     /// Finding 3.2: `accept_reads` makes the reads `accept` makes, in
