@@ -3,11 +3,11 @@
 # (design claude/Taso_design_b3_2026-10-31.md rev. 1; plan rev. 18 §3 B3;
 # claim C2; spec D92, D93).
 #
-#   sudo bench/p5/b3-power.sh run [PORT]              taso-p5: the Warden and 8 Vessels at work, a witness port open
+#   sudo bench/p5/b3-power.sh run [PORT]              the bare-metal node: the Warden and 8 Vessels at work, a witness port open
 #        bench/p5/b3-power.sh listener HOST[:PORT]    the laptop: the witness (ends after 10 s of silence)
-#   sudo bench/p5/b3-power.sh verify ACKED            taso-p5 after the cut: the rebirth, graded against the witness
+#   sudo bench/p5/b3-power.sh verify ACKED            the bare-metal node after the cut: the rebirth, graded against the witness
 #
-# From the repository root, as root, on A1's host (taso-p5), apt timers
+# From the repository root, as root, on A1's host (the bare-metal node), apt timers
 # stopped.  One round:
 #   1 `run`: builds; a fresh work directory on the measured drive ($WORK,
 #     the previous one kept beside it as $WORK-<time>); the rootfs and the
@@ -156,7 +156,7 @@ ROOTFS=$WORK/rootfs
 CFG=$WORK/w.json
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo '?')
 # B3_COMPACT_PCT: rounds 1-3 (30) never compacted: the Warden keeps every
-# Seal, so garbage stayed at 3.4 % of the log (taso-p5, 2026-10-31).
+# Seal, so garbage stayed at 3.4 % of the log (the bare-metal node, 2026-10-31).
 COMPACT_PCT=${B3_COMPACT_PCT:-30}
 [[ "$COMPACT_PCT" =~ ^[0-9]+$ ]] && (( COMPACT_PCT <= 99 )) || die "B3_COMPACT_PCT=$COMPACT_PCT: 0 to 99"
 DURABLE_AT=${B3_DURABLE_AT:-fua}
@@ -199,7 +199,7 @@ stop_stack() { # the Warden, its containers, the mounts, taso-blkd; guarded
 # (host_uid_base + uid_slot x 65536; slot i+1 is Vessel i), and talks to
 # each through its --step channel (E3-3a): an op file written as the
 # namespace's root (nsenter -U: root's own create fails EOVERFLOW in the
-# agent's tmpfs, taso-test 2026-10-27), a reply file read and removed.
+# agent's tmpfs, the test VM 2026-10-27), a reply file read and removed.
 DRIVER=$(cat <<'PY'
 import json, os, re, socket, sqlite3, subprocess, sys, threading, time
 UID_BASE, RANGE, STEP = 200000, 65536, "/tmp/b3"
@@ -482,7 +482,7 @@ for i in range(p):
     if R > q_s: fails.append(f"2: a Seal never asked (resumed after turn {R}, the last requested was turn {q_s})")
     # 3: the rows, through the agent's own mount
     # Read from a copy (E3's way: cp state.db*): opened in place through
-    # /proc/<pid>/root, SQLite refused (taso-p5, 2026-10-31: "unable to
+    # /proc/<pid>/root, SQLite refused (the bare-metal node, 2026-10-31: "unable to
     # open database file" on all eight).  The agent is idle between ops,
     # so the database and its WAL are copied whole; the -shm is rebuilt.
     # The copy is opened read-only: closing the last read-write connection

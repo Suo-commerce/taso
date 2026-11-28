@@ -3913,7 +3913,7 @@ mod tests {
         assert_eq!(v.tail().lsn, tail);
     }
 
-    /// Soak, taso-test 2026-11-09: a sanctioned Candidate stayed counted
+    /// Soak, the test VM 2026-11-09: a sanctioned Candidate stayed counted
     /// open, so after `max_open_candidates_per_vessel` sanctions a Vessel
     /// could never nominate again.  With a limit of one: while its
     /// sanction is committing, a second nomination is answered Retry; once

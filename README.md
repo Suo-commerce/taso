@@ -120,6 +120,12 @@ in progress.
 | `deploy/` | Dockerfile, Compose file, Kubernetes resource definition |
 | `scripts/`, `bench/` | Test gates, crash tests and benchmarks |
 
+Comments that cite a measurement name one of two machines: **the test
+VM**, a cloud VM (UpCloud, Helsinki) that runs the release gate and the
+nightly, and **the bare-metal node**, a Scaleway Elastic Metal
+EM-B420E with two Samsung PM981 NVMe drives, used for the power-loss
+test and the benchmarks that need local NVMe.
+
 Licensed under [Apache-2.0](LICENSE).
 
 ## Install on one machine

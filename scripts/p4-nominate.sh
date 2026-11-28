@@ -262,7 +262,7 @@ EOF
 genesis() {
     local rc=0
     "$BIN/taso-genesis" "$W/genesis1.json" --from "$2" --best-effort --classmap "$W/map.toml" \
-        --actor p4n --reason "file 6d on taso-test" >"$W/out/$1.json" 2>"$W/out/$1.err" || rc=$?
+        --actor p4n --reason "file 6d on the test VM" >"$W/out/$1.json" 2>"$W/out/$1.err" || rc=$?
     [[ $rc == 0 ]] || return 1
     python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v["template_id"] if v.get("outcome")=="ready" else "")' "$W/out/$1.json"
 }

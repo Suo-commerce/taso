@@ -14,7 +14,7 @@ needed: the block log is a file on the root disk.
 
 | Name | Zone | Role |
 |---|---|---|
-| taso-test (keep) | FI-HEL2 | the hub: `taso-coordd` (`coord` role) and the gate driver; also a one-machine node (S2.1) |
+| the test VM (keep) | FI-HEL2 | the hub: `taso-coordd` (`coord` role) and the gate driver; also a one-machine node (S2.1) |
 | taso-a, taso-b (create, delete after) | FI-HEL1 | nodes: `taso-blkd`, `taso-wardend` started by the gate, runc (`vessel-blk` role) |
 
 The driver and the coordinator must outlive the node that is killed, so
@@ -121,7 +121,7 @@ p95.
 
 | Stage | Layout | Result |
 |---|---|---|
-| S2.1 | one machine (taso-test) | 20/20, p95 0.29 s (packs local) |
+| S2.1 | one machine (the test VM) | 20/20, p95 0.29 s (packs local) |
 | S2.2 | two servers, packs in Paris | 20/20, p95 6.60 s |
 | S2.3 | node A's power cut, 5 times | 5/5, p95 5.89 s |
 | S2.4 | A's log after each cut | 0 bytes cut in 9 boots |

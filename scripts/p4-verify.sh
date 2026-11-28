@@ -256,7 +256,7 @@ EOF
 genesis() {
     local rc=0
     "$BIN/taso-genesis" "$W/genesis1.json" --from "$2" --best-effort --classmap "$W/map.toml" \
-        --actor p4v --reason "file 7d on taso-test" >"$W/out/$1.json" 2>"$W/out/$1.err" || rc=$?
+        --actor p4v --reason "file 7d on the test VM" >"$W/out/$1.json" 2>"$W/out/$1.err" || rc=$?
     [[ $rc == 0 ]] || return 1
     python3 -c 'import json,sys; v=json.load(open(sys.argv[1])); print(v["template_id"] if v.get("outcome")=="ready" else "")' "$W/out/$1.json"
 }
@@ -423,7 +423,7 @@ expect "finished Exit { code: 7 }" is "$(finished 3-f f)" "Exit { code: 7 }"
 
 say "4. /candidate is read-only (predict: writing fails, 'Exit { code: 0 }')"
 # The write is in a subshell: a failed redirection of a special builtin
-# (':') exits a POSIX shell, which first runs on taso-test showed (Exit 2).
+# (':') exits a POSIX shell, which first runs on the test VM showed (Exit 2).
 attempted 4-w w 3 'if (echo x > /candidate/x) 2>/dev/null; then exit 9; fi; exit 0'
 expect "finished Exit { code: 0 }" is "$(finished 4-w w)" "Exit { code: 0 }"
 

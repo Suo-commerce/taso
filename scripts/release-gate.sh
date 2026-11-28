@@ -2,7 +2,7 @@
 # release-gate.sh: every gate on one commit, one table (V4b plan §9, the
 # release runner).  A release needs a PASS of `full` on the commit tagged.
 #
-#   scripts/release-gate.sh quick    about 7 minutes (taso-test, 1b7ebe1;
+#   scripts/release-gate.sh quick    about 7 minutes (the test VM, 1b7ebe1;
 #                                    before the three gates below, which
 #                                    add E3's 16 hold rounds):
 #                                    every gate once, the default sizes
@@ -30,7 +30,7 @@
 #   scripts/release-gate.sh clean    only the cleaning below (the nightly
 #                                    runs it on nights it skips)
 #
-# As root on taso-test, from the repository root, on a clean tree.  The
+# As root on the test VM, from the repository root, on a clean tree.  The
 # commit is the one checked out; the runner refuses a dirty tree, and
 # refuses the result if HEAD moved while it ran.
 #
@@ -46,7 +46,7 @@
 #
 # One run at a time per node: a second one exits 3 (the lock).
 #
-# Disk (taso-test 2026-11-07: a quick run filled the 40 GB disk and p3 hit
+# Disk (the test VM 2026-11-07: a quick run filled the 40 GB disk and p3 hit
 # ENOSPC in round 14).  Under the lock, before anything else: the work
 # directories that gates leave when killed (/var/tmp/taso-p2blk.*,
 # taso-p3.*, taso-f6fork.*, taso-k2e2e.*, e3check.*, and taso-rebuild.*
@@ -171,7 +171,7 @@ drop() { rm -f "$@"; }
 echo "== release gate ($TIER) on $COMMIT, output in $OUT"
 # taso-blkd is built on its own, as every script and the README build it:
 # built together with taso-warden, cargo unifies two dependency features
-# (rustix default, serde alloc) into a different binary (taso-test
+# (rustix default, serde alloc) into a different binary (the test VM
 # 0e7a58e: gate-p2-blk found the installed daemon "not this build").
 run build 60m bash -c 'cargo build --release -q --workspace --bins && cargo build --release -q -p taso-blk --bin taso-blkd'
 run install 5m bash -c '

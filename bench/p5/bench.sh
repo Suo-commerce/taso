@@ -19,7 +19,7 @@
 #   commit       taso-sim's SQLite commit latency inside the Vessel: the
 #                agent's write as SQLite acknowledges it.  With WAL and
 #                synchronous=normal (the default) a commit does not fsync,
-#                so this is a page-cache write (66 us on taso-test), not a
+#                so this is a page-cache write (66 us on the test VM), not a
 #                durable acknowledgement; the Seal is
 #   turn pause   the agent's TurnEnd round trip: the time the agent waits
 #                for the Warden to seal — the durable acknowledgement as
@@ -70,7 +70,7 @@
 # Compare: K4 (taso-blkd alone, 2026-10-18), 2.5 ms p50 at 1 GiB.
 # MEM_MIB (default 256) is each agent's memory limit: at 256 a 1 GiB
 # file got the agent OOM-killed by its memory cgroup while writing it
-# (taso-p5, 2026-10-31: its dirty pages, not its own memory); BIG_MIB=1024
+# (the bare-metal node, 2026-10-31: its dirty pages, not its own memory); BIG_MIB=1024
 # runs with MEM_MIB=2048.
 #
 # NOISY=1 (needs P >= 2; B1's "Seal p50/p95 at 8 and 64 Vessels with one
@@ -107,7 +107,7 @@ NOISY_TXNS=${NOISY_TXNS:-64}; NOISY_ROWS=${NOISY_ROWS:-256}; NOISY_ROW_BYTES=${N
 [[ "$FORKS" == 0 || "$P" == 1 ]] || { echo "FORKS needs P=1 (one parent, N children)" >&2; exit 64; }
 [[ "$NOISY" == 0 || "$P" -ge 2 ]] || { echo "NOISY needs P >= 2 (one neighbour, P-1 others)" >&2; exit 64; }
 # The real path: runc refuses a rootfs reached through a symlink, and A1
-# makes /var/lib/taso-blk one (taso-p5, 2026-10-26: "invalid rootfs").
+# makes /var/lib/taso-blk one (the bare-metal node, 2026-10-26: "invalid rootfs").
 DIR=$(readlink -f /var/lib/taso-blk)/p5-bench
 BLK_SOCK=/run/taso-p5-bench-blk.sock
 MNT=/mnt/p5-bench
@@ -309,7 +309,7 @@ PY
     echo "$rc" >"$OUT/warden-$r.rc"
     local ok; ok=$(grep -cE "$VESSEL_OK" "$OUT/warden-$r.out" || true)
     echo "warden run $r: exit $rc, $ok of $P Vessels ok, $(awk '{printf "user %.2fs sys %.2fs rss %d KiB", $1, $2, $3}' "$OUT/warden-$r.time")"
-    # The host's disk can stall for minutes (taso-test, 2026-11-03: journald
+    # The host's disk can stall for minutes (the test VM, 2026-11-03: journald
     # blocked in writeback, every Seal past the client's timeout, 14 Vessels
     # left frozen): a row measured across a stall is no row.  The kernel
     # names a stalled task after 120 s; any such line during the run
@@ -434,7 +434,7 @@ for k in ("flush", "write", "wfua", "read", "discard"):
 # its requests one at a time, so this wait is in series on the Seal --
 # against the lock's holds, by site, per Seal.  A wait much larger
 # than the holds is a queue: the lock is busy with others' holds, or
-# its holder was preempted (taso-test, P=64, 2026-11-03: ~2 ms waited
+# its holder was preempted (the test VM, P=64, 2026-11-03: ~2 ms waited
 # per request for 10-80 us held).
 waited = sum(v[4] for v in tot.values())
 held = {}

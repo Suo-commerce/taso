@@ -287,7 +287,7 @@ fn the_daemon_compacts_by_itself_and_keeps_what_is_live() {
 }
 
 /// The daemon's log on a full disk: every write to it fails.  Logging must
-/// never take the daemon down (on taso-test, 2026-10-18, a failed log write
+/// never take the daemon down (on the test VM, 2026-10-18, a failed log write
 /// panicked a device thread holding the store, and the daemon could not
 /// quit).  /dev/full fails every write with ENOSPC.
 #[test]
@@ -324,7 +324,7 @@ fn the_daemon_works_when_its_log_cannot_be_written() {
 /// daemon is held inside an attach (after its table entry is made, where
 /// the device would start), and a second client's `info` of another layer,
 /// a `branch` and a `reset` of another branch answer while it is held
-/// (the fork probe, taso-test, 2026-10-29: a fork's `info` waited behind
+/// (the fork probe, the test VM, 2026-10-29: a fork's `info` waited behind
 /// every attach in progress).  A call about the held branch itself waits
 /// for it: its `reset` is refused only once the attach has ended, as
 /// attached or not.  Without root and ublk the attach then fails; either

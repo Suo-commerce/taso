@@ -59,7 +59,7 @@ sectors_of() { cat "$(state_dir "$1")/sectors"; }
 dev_of()     { echo "/dev/mapper/$1"; }
 # The flakey table: "0 SECTORS flakey DEV 0 UP DOWN NFEATURES [FEATURE]".
 # The features apply only during the DOWN seconds of the up/down cycle
-# (dm-flakey.rst; taso-test 2026-10-27: with "1 0" drop_writes never
+# (dm-flakey.rst; the test VM 2026-10-27: with "1 0" drop_writes never
 # applied, and self-check 1 said so).  So up is "1 0" (always up) and drop
 # and error are "0 1" (always down): the harness decides when the device
 # fails by swapping tables, never a timer.
@@ -92,7 +92,7 @@ mode_of() { dmsetup table "$1" | awk '{ print ($8 == 0) ? "up" : $9 }' | sed 's/
 # goes through that device's own page cache, which dm's bios bypass: udev's
 # blkid probe at attach time leaves the first pages cached as zeros, and
 # every later buffered read (dumpe2fs, sha256sum, dd) returns them — a
-# filesystem's blocks with no superblock (taso-test, 2026-10-28, found by
+# filesystem's blocks with no superblock (the test VM, 2026-10-28, found by
 # dumpe2fs on the dm device and on the loop right after mkfs).
 read_backing() { # read_backing NAME OUT  (OUT: a file, or - for stdout)
     local src; src=$(loop_of "$1"); [[ -n "$src" ]] || src=$(backing_of "$1")

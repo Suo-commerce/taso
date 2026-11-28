@@ -28,7 +28,7 @@
 #
 # (b2) logfile: what the block log pays to make an append durable - the
 #     flush that blk-trace-freeze.sh (2026-10-26) showed at 13.4 ms for
-#     4 MiB on taso-p5, on an NVMe that writes over 1 GB/s.  MIB (default
+#     4 MiB on the bare-metal node, on an NVMe that writes over 1 GB/s.  MIB (default
 #     4) appended and fdatasync'd, 20 times each, four ways, on the
 #     block-log partition (/var/lib/taso, ext4 ordered with a journal):
 #       as-is         a growing file, buffered writes (the store today)

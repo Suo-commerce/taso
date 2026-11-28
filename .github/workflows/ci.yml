@@ -2,7 +2,7 @@
 #
 # Levels 1-3 of the plan: the model proptests, the conformance suite and
 # the unit and component tests, plus lints and the supply chain.  Tests
-# that need root, ZFS, ublk or runc are #[ignore] and run on taso-test
+# that need root, ZFS, ublk or runc are #[ignore] and run on the test VM
 # (levels 4-5); nothing here touches a server.
 #
 # Every check here was run locally on gate/ci before this file was written

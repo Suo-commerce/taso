@@ -594,7 +594,7 @@ pub struct Stats {
     /// The longest of them (µs).
     pub sync_max_us: u64,
     /// Where a write's time under the lock goes, summed over every write
-    /// (µs), for the probe of the serial append (taso-p5, 2026-10-26:
+    /// (µs), for the probe of the serial append (the bare-metal node, 2026-10-26:
     /// 0.8 ms per 512 KiB under the lock, four threads changing nothing).
     /// The map's inserts, one per block.
     pub write_map_us: u64,
@@ -1257,7 +1257,7 @@ impl Store {
     /// branch held of its own — what the reset discards from the
     /// filesystem, which the Warden names (spec rev. 33, D93 class (i):
     /// an agent's write adds no Chronicle record, so only this count says
-    /// it was lost; E3 [seal write], taso-test 2026-10-28).
+    /// it was lost; E3 [seal write], the test VM 2026-10-28).
     pub fn reset(&mut self, branch: LayerId) -> Result<u64, StoreError> {
         self.check()?;
         let freed = self.map.reset(branch)?;
@@ -1336,7 +1336,7 @@ impl Store {
     /// descriptor is closed; a Seal dropped meanwhile frees nothing in
     /// the file.  What the plan reads is what the store held at planning.
     /// Measured before: `export` held the store 1.2 ms a Seal at P=64 on
-    /// taso-test, 30 ms at the longest, the largest holder of the lock
+    /// the test VM, 30 ms at the longest, the largest holder of the lock
     /// (`claude/Taso_design_freeze_trace_2026-11-03.md`, row 3).
     pub fn export_plan(
         &self,
@@ -2474,7 +2474,7 @@ impl Read for ReadAt<'_> {
 /// syncs for everyone who has asked so far; the others wait for it, and
 /// whoever it did not cover leads the next.  Holding the mutex through
 /// the sync serialised every Vessel's Seal and every device flush behind
-/// one disk operation at a time (taso-p5, P=64, 2026-10-26: `seal.log`
+/// one disk operation at a time (the bare-metal node, P=64, 2026-10-26: `seal.log`
 /// 690 ms p50 for a 1 ms fsync).
 pub struct Syncer {
     file: Arc<LogFile>,
@@ -2526,7 +2526,7 @@ impl Filler {
     /// the lock let go, so a write that overtakes the filler waits for a
     /// page-cache write at most, never for a sync of the whole log (which
     /// under a burst of births, 64 filesystems made at once, held every
-    /// device write on the node; bench at P=64 on taso-test, 2026-11-27).
+    /// device write on the node; bench at P=64 on the test VM, 2026-11-27).
     /// Returns the bytes made ready.  Two kinds of failure, kept apart:
     /// a disk without room answers `StorageFull` and changes nothing (the
     /// reserve is what it was, the store goes on, and a write that needs
@@ -3048,7 +3048,7 @@ mod tests {
 
     /// Finding 4: the filler syncs with its fill lock let go, so a write
     /// that overtakes it never waits for a sync of the whole log (at P=64
-    /// on taso-test, 2026-11-27, a burst of births queued every device
+    /// on the test VM, 2026-11-27, a burst of births queued every device
     /// write behind the filler's syncs).  At each of the filler's syncs
     /// the fill lock is free, and what it wrote already counts as ready.
     #[test]
@@ -5463,7 +5463,7 @@ mod tests {
         // for it outside: every ask is answered durable, with at least one
         // sync and never more syncs than asks.  How many asks one sync
         // covers depends on how long a sync takes: where it costs nothing
-        // (taso-test's temp directory, 2026-10-29) the asks seldom overlap
+        // (the test VM's temp directory, 2026-10-29) the asks seldom overlap
         // one and each may run its own; the old bound (fewer than asks)
         // failed there 1 run in 3.  Grouping is measured by the bench's
         // Seals, not here (decided 2026-10-29: (a)).

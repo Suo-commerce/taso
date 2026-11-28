@@ -228,7 +228,7 @@ for n in a b; do
 done
 # The installed daemons (node A; node B too with two machines) must answer
 # and must be this build: a socket file can outlive its daemon, and an old
-# installed binary would gate old code (2026-11-07, both seen on taso-test).
+# installed binary would gate old code (2026-11-07, both seen on the test VM).
 installed=a; [ "$ONE_MACHINE" = 0 ] && installed="a b"
 for n in $installed; do
     blk "$n" names >/dev/null 2>&1 \

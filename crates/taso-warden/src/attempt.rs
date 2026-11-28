@@ -639,7 +639,7 @@ impl<P: Pool, X: Sender> AttemptRun<'_, P, X> {
             // the next start's sweep would) and no result is given.  No
             // terminal: a `runc run` that inherits one is stopped by job
             // control when it touches it, and its wait never returns
-            // (taso-test, 2026-10-25).  The container is killed, then
+            // (the test VM, 2026-10-25).  The container is killed, then
             // `runc run` itself, so the wait returns even when the kill
             // found no container yet.
             let mut c = cmd;

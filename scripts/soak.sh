@@ -41,7 +41,7 @@
 #     fewer than 6 samples of the Warden cannot say, and fails);
 #   - taso-blkd's memory and threads did not grow, by the same rule (a
 #     device that never stopped held a thread per call, 482 by morning:
-#     taso-test 2026-11-12);
+#     the test VM 2026-11-12);
 #   - no device taso-blkd deleted is still kept by the kernel (stats
 #     zombies=0);
 #   - the deepest chain of layers did not grow, by the same rule: old Seal
@@ -50,7 +50,7 @@
 #     12 GB in 8 h).  The live size is sampled for a person to read, not
 #     judged: each sanction's Template layer stays by design;
 #   - free space never fell below FLOOR_GIB: the soak stops there and
-#     fails, rather than run on with a full disk (taso-test 2026-11-09: a
+#     fails, rather than run on with a full disk (the test VM 2026-11-09: a
 #     24 h run filled it in 2 h and sat stalled for 19 h);
 #   - work was done: Seals (the Seal frames in those Chronicles), attempts
 #     and sanctions each more than zero;
@@ -66,7 +66,7 @@
 # the same disk and keeps every Seal, about 170 KB each, with about 6.5 KB
 # each in the coordinator: at 8000 ms, 8 Vessels make about 0.85 Seals a
 # second, about 13 GB a day; at 2000 ms they made 2.3 a second and the
-# bucket and the block log filled 22 GB in 8 h, taso-test 2026-11-13).
+# bucket and the block log filled 22 GB in 8 h, the test VM 2026-11-13).
 #
 # Stopped early (a TERM), bash runs the EXIT trap: it cleans up first, as
 # at its end.  Under systemd, run it with KillMode=mixed, so the TERM
@@ -135,7 +135,7 @@ sys.exit(0 if line.startswith("ok") else 1)
 PY
 }
 # Not `ls | wc -l`: with no device, ls fails, and under pipefail and -e
-# that ended the script with no word (taso-test, 2026-11-08, twice).
+# that ended the script with no word (the test VM, 2026-11-08, twice).
 ublk_devices() {
     local n=0 d
     for d in /dev/ublkb*; do [[ -e "$d" ]] && n=$((n + 1)); done
@@ -459,7 +459,7 @@ done
 expect "taso-blkd's memory did not grow" is "$(growth 4)" ok
 # A device that never stopped held one taso-blkd thread for every call
 # about its branch, 482 by morning, and every Warden start hung (soak,
-# taso-test 2026-11-12): its threads grow, by the same rule.
+# the test VM 2026-11-12): its threads grow, by the same rule.
 expect "taso-blkd's threads did not grow" is "$(growth 8)" ok
 # A device deleted without waiting that the kernel never freed (blkd-del
 # d): a leak to see, never a hang.
@@ -511,7 +511,7 @@ expect "Seals" atleast "$SEALS" 1
 say "taso-blkd quits clean and leaves no device (predict: after the Vessels' file systems are unmounted, quit answers ok within 60 s and the daemon exits 0)"
 # The Warden leaves its Vessels mounted when it stops (a crash leaves
 # them too); a device under a mounted file system cannot be stopped, so
-# they are unmounted first, as an operator would (taso-test 2026-11-08:
+# they are unmounted first, as an operator would (the test VM 2026-11-08:
 # quit with them mounted did not answer in 120 s).
 while read -r m; do
     [[ -n "$m" ]] || continue
@@ -537,7 +537,7 @@ tail -n 3 "$W/soak.tsv" | column -t
 echo
 if [[ $FAIL -eq 0 ]]; then
     # A pass keeps its logs and samples, not its block log and store (5.7
-    # GB after 5 h on taso-test 2026-11-09: the night's xfstests then found
+    # GB after 5 h on the test VM 2026-11-09: the night's xfstests then found
     # 18 GiB free, wanting 20).
     rm -rf "$W/blk.log" "$W/store" "$W/spool"
     echo "SOAK PASS: $SECS s, $VESSELS Vessels, $KILLS kills, $ATTEMPTS attempts, $SANCTIONS sanctions, $SEALS Seals; $PASS checks"

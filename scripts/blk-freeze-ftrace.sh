@@ -8,7 +8,7 @@
 #
 #   sudo scripts/blk-freeze-ftrace.sh [DIRTY_KIB] [RCU_EXPEDITED]   (default 4096, as the host has it)
 #
-# Run 1 (taso-p5, 2026-10-26): before sync_filesystem starts, the freeze
+# Run 1 (the bare-metal node, 2026-10-26): before sync_filesystem starts, the freeze
 # takes the superblock's three write barriers (percpu_down_write ->
 # rcu_sync_enter -> synchronize_rcu), each a full RCU grace period of
 # 9-10 ms on this 24-thread host: ~30 ms of a freeze with no I/O in

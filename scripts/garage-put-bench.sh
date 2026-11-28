@@ -21,7 +21,7 @@
 # connection open, so this is slightly pessimistic.  Garage's data lives on
 # the server's root disk (network block storage here), not local NVMe.
 #
-# Usage (as root on taso-test):
+# Usage (as root on the test VM):
 #   scripts/garage-put-bench.sh run      # install if needed, measure, stop
 #   scripts/garage-put-bench.sh clean    # stop and remove everything
 #

@@ -1022,7 +1022,7 @@ impl<L: Layers> Chronicle<L> {
         );
         let hash = rec.envelope.hash;
         // The record's frame is written and synced into the segment beside
-        // the layer, not after it (P5, the next lever after s-g: on taso-p5
+        // the layer, not after it (P5, the next lever after s-g: on the bare-metal node
         // the segment's fsync was 8 ms of a 35 ms Seal at P=64).  What
         // accepts the Seal is the CAS below, which still waits for both; a
         // crash before it leaves a frame on disk the coordinator never

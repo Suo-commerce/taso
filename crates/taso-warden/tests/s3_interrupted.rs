@@ -1,6 +1,6 @@
 //! A request to the store that a signal interrupts is sent again.
 //!
-//! taso-test, 2026-11-25: one part's upload failed with "Interrupted
+//! The test VM, 2026-11-25: one part's upload failed with "Interrupted
 //! system call" in the Warden's unit tests, and the whole put with it.
 //! A signal that interrupts a socket call is not a broken connection: a
 //! stopped and continued process gets `EINTR` from a socket call with a

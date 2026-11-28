@@ -109,7 +109,7 @@ fn parse_seal_name(name: &str) -> Option<(Dataset, Lsn)> {
 pub trait Blkd {
     /// A connection of its own to the same block log, for a Vessel's Seals:
     /// the pool's shared connection serialised every Vessel's commands
-    /// through one socket and one serving thread (taso-p5, P=64,
+    /// through one socket and one serving thread (the bare-metal node, P=64,
     /// 2026-10-26: 250 ms of queue per Seal after group commit).  `None`
     /// (the default, for in-process fakes): the shared connection is used.
     fn own_connection(&self) -> Option<Self>
@@ -177,7 +177,7 @@ pub const EXPORT_IDLE: Duration = Duration::from_secs(120);
 pub const IMPORT_BASE: Duration = Duration::from_secs(120);
 
 /// The rate an import's limit allows for (D&D 7-d): 32 MiB/s, about a
-/// thirteenth of what taso-test measured (432 MiB/s for 2 GiB,
+/// thirteenth of what the test VM measured (432 MiB/s for 2 GiB,
 /// 2026-11-27) and an eighth of its export.
 pub const IMPORT_PER_SECOND: u64 = 32 << 20;
 
@@ -401,7 +401,7 @@ fn run(cmd: &mut Command) -> io::Result<()> {
 /// (D&D (b), 2026-11-27).  With `/` shared, a Vessel's mount is linked to
 /// copies in other mount namespaces (the host's sandboxed services, every
 /// runc start), and the unmount must take them all or none: one copy
-/// briefly in use refuses it, "target is busy".  On taso-test that was
+/// briefly in use refuses it, "target is busy".  On the test VM that was
 /// 1 to 7 resets in a bench of 64 Vessels, gone with the mounts kept out
 /// of the other namespaces; what takes the brief reference was never
 /// seen held (finding of 2026-11-27).  Brief by nature, so tried again;
@@ -467,7 +467,7 @@ const FITHAW: u32 = 0xC004_5878;
 
 /// Freeze (`FIFREEZE`) or thaw (`FITHAW`) the filesystem mounted at `dir`
 /// by the kernel call itself.  The Warden used to start `fsfreeze` for each:
-/// on taso-test at 64 concurrent Seals a freeze took 21 ms p50 that way and
+/// on the test VM at 64 concurrent Seals a freeze took 21 ms p50 that way and
 /// 3.9 ms as the call, a thaw 9.3 and 3.3 (scripts/p5-fsfreeze-probe.sh,
 /// 2026-11-02); starting a program alone cost 11 ms there.  No `PATH`
 /// lookup either: a program found by name ran as root on every Seal.
@@ -526,7 +526,7 @@ impl Mounts for System {
         // was: the Warden resets the branch to the last Seal, whose image
         // was taken frozen with every write complete, so ext4's journal
         // would replay nothing - and it cost ten barriers per Seal (an
-        // ordered freeze: 12 log syncs; without the journal: 2; taso-p5,
+        // ordered freeze: 12 log syncs; without the journal: 2; the bare-metal node,
         // scripts/blk-freeze-probe.sh, 2026-10-26).
         run(Command::new("mkfs.ext4")
             .args(["-q", "-F", "-O", "^has_journal", "-E", "nodiscard"])
@@ -557,7 +557,7 @@ impl Mounts for System {
         ))
     }
     fn umount(&self, dir: &Path) -> io::Result<()> {
-        // A refusal names who holds the mount, read after it (taso-test,
+        // A refusal names who holds the mount, read after it (the test VM,
         // 2026-11-27: "target is busy" at a Vessel's reset after birth).
         umount_retrying(
             || run(Command::new("umount").arg(dir)),
@@ -629,7 +629,7 @@ fn mount_source(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
 /// One call's connection to `taso-blkd`.  A fresh one of its own when the
 /// daemon gives one ([`Blkd::own_connection`]): no other Vessel's call
 /// waits on it, nor it on theirs, and nothing is held across an attach, a
-/// mount or an export (the fork probe, taso-test, 2026-10-29: forks waited
+/// mount or an export (the fork probe, the test VM, 2026-10-29: forks waited
 /// up to 180 ms on the shared connection while children attached and
 /// mounted under it).  Else, for the in-process fakes, the shared one,
 /// held for the call.
@@ -922,7 +922,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// Seal's freeze leaves the file system frozen, and the Vessel's agent
     /// then waits in the kernel, unkillable, at its next write: the next
     /// start's sweep could not remove its container, and the Warden refused
-    /// to start for good (soak, taso-test 2026-11-08: two agents in state D
+    /// to start for good (soak, the test VM 2026-11-08: two agents in state D
     /// in `ext4_page_mkwrite`).  Only a mount exactly at a dataset's mount
     /// point, from one of the block log's devices, is thawed (never what
     /// holds a plain directory: the freeze's rule); one not frozen answers
@@ -932,7 +932,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// namespace, but a file system it left frozen does not: the kernel
     /// keeps it, frozen, mounted nowhere, and it holds the branch's device
     /// (C3-n: C3-d's step 4 and 5, a device busy until taso-blkd died; the
-    /// same on a loop device with no Taso, taso-test 2026-11-17).  So a
+    /// same on a loop device with no Taso, the test VM 2026-11-17).  So a
     /// dataset not mounted here whose branch has a device in use is mounted
     /// at its mount point (the kernel gives back that same file system),
     /// thawed, and unmounted again; a device in use but not frozen is
@@ -954,7 +954,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
                 Ok(()) => thawed.push(dir),
                 // Not frozen: EINVAL, seen by its kind (the real call wraps
                 // the error with its mount point and so loses the raw
-                // number: taso-test 1ef7531, every start refused).
+                // number: the test VM at 1ef7531, every start refused).
                 Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
                 Err(e) => return Err(format!("thawing {}: {e}", dir.display()).into()),
             }
@@ -1234,7 +1234,7 @@ impl<D: Blkd + 'static, M: Mounts + 'static> Pool for BlkPool<D, M> {
     /// to drop it takes it down.  Before, the second user took the first's
     /// view for a crash's and unmounted it under a running verifier (two
     /// attempts on one verifier Template: SIGBUS, exit 135, recorded as a
-    /// result about the files; taso-test, p4-verify.sh case 11,
+    /// result about the files; the test VM, p4-verify.sh case 11,
     /// 2026-11-06).  The views lock is held while a view is made or taken
     /// down, so a user never finds one half made or half gone; a name
     /// found in the block log but not in this process's count is a
@@ -1824,7 +1824,7 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// killed Warden).
     ///
     /// Another branch can go while this looks (another attempt's
-    /// /candidate, a Seal view released: taso-test fd7199d, p4-verify
+    /// /candidate, a Seal view released: the test VM at fd7199d, p4-verify
     /// case 11, "no layer L155"): a layer that is gone stands on nothing,
     /// so a failed look is an error only while its name still names that
     /// branch.
@@ -2396,7 +2396,7 @@ mod tests {
     }
 
     /// A refused unmount names who holds the mount, or says nobody was
-    /// found (taso-test, 2026-11-27: "target is busy" at a reset after
+    /// found (the test VM, 2026-11-27: "target is busy" at a reset after
     /// birth, with every Vessel mount also in the host services' mount
     /// namespaces).
     /// D&D (b), 2026-11-27: an unmount refused as busy is tried again,
@@ -3132,7 +3132,7 @@ mod tests {
     /// With a daemon that gives connections of their own, no attach, mkfs,
     /// mount or unmount runs while the shared connection is held: another
     /// Vessel's call (a fork's info, an open's list) never waits on a
-    /// child's attach and mount (the fork probe, taso-test, 2026-10-29).
+    /// child's attach and mount (the fork probe, the test VM, 2026-10-29).
     #[test]
     fn nothing_holds_the_shared_connection_across_a_mount() {
         let spool = tempfile::tempdir().unwrap().keep();
@@ -3663,7 +3663,7 @@ mod tests {
         assert_eq!(calls(&warden), ["umount /mnt/taso/.views/tank/v-a.view-3"]);
     }
 
-    /// taso-test fd7199d, p4-verify case 11: two attempts' /candidate
+    /// The test VM at fd7199d, p4-verify case 11: two attempts' /candidate
     /// datasets were destroyed at once; one destroy listed the names, the
     /// other's branch went, and the first failed on it ("no layer L155"),
     /// leaving its dataset for the next start.  A branch that goes while
@@ -3750,7 +3750,7 @@ mod tests {
         assert_ne!(p.guid(&a).unwrap(), Some(g));
     }
 
-    /// Soak, taso-test 2026-11-08: a Warden killed mid-Seal left two
+    /// Soak, the test VM 2026-11-08: a Warden killed mid-Seal left two
     /// Vessels frozen; their agents waited in the kernel, unkillable, and
     /// every later start refused (its sweep could not remove them).  The
     /// start now thaws, first: the frozen one is thawed and named; one
@@ -3831,7 +3831,7 @@ mod tests {
     /// The kernel's side, through the real [`System`] (as root, on a loop
     /// device with the Vessels' ext4): a thaw of a file system not frozen
     /// is an error of kind `InvalidInput`, which `thaw_left_frozen` takes
-    /// as "not frozen"; frozen, the thaw goes through.  taso-test 1ef7531:
+    /// as "not frozen"; frozen, the thaw goes through.  The test VM at 1ef7531:
     /// the fake said EINVAL by number, the real call by kind only, and
     /// every start refused.  Skipped without root, losetup or mkfs.ext4.
     #[test]
@@ -6073,7 +6073,7 @@ mod tests {
         assert!(t.coord.obligations(t.id).unwrap().is_empty());
     }
 
-    /// A crash inside a Seal (E3 on taso-test, 2026-11-26, `[write seal]
+    /// A crash inside a Seal (E3 on the test VM, 2026-11-26, `[write seal]
     /// hold:seal.framed`).  The Seal's frame is in the local log, the
     /// coordinator never accepted it, and its layer was never made.  That
     /// is no sign of being behind: the open cuts the frame, and the

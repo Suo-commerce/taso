@@ -9,11 +9,11 @@
 #   tmux new -s p5
 #   scripts/p5-node.sh setup ... 2>&1 | tee /root/p5-setup.log
 # An ssh session that drops takes a plain run with it (SIGHUP; apt died
-# mid-unpack on taso-p5, 2026-10-26); under tmux the run goes on and
+# mid-unpack on the bare-metal node, 2026-10-26); under tmux the run goes on and
 # `tmux attach -t p5` or the log shows where it is.
 #
 # check reads the host and prints the report; it changes nothing and works
-# on any machine (taso-test included).  setup refuses the host unless it is
+# on any machine (the test VM included).  setup refuses the host unless it is
 # Ubuntu 26.04, the disk is a whole NVMe drive with no partitions, no
 # filesystem signature and no mount, and the commit exists; then
 # it does, in this order, each step skipped when already done:
@@ -27,7 +27,7 @@
 #   3 coreutils    GNU coreutils in place of uutils (Ubuntu 25.10 and later
 #                  ship uutils; xfstests and our scripts assume GNU: 271 quick
 #                  tests failed on an option before testing anything,
-#                  taso-test 2026-10-18).  Same swap as blk-fstests.sh setup:
+#                  the test VM 2026-10-18).  Same swap as blk-fstests.sh setup:
 #                  the compilers marked manually installed, coreutils-from-gnu
 #                  in, coreutils-from-uutils and the build-essential bundle
 #                  out, a pin so upgrades keep it; refused if apt would
@@ -44,7 +44,7 @@
 #                  taso-blkd's writes into its reserve need no journal
 #                  handle; under relatime one waited for a slow journal
 #                  commit while it held the store's lock, and every Vessel
-#                  on the node waited with it (taso-test 2026-11-27: one
+#                  on the node waited with it (the test VM 2026-11-27: one
 #                  write 123.6 s; jbd2-probe 2026-11-28: under relatime
 #                  writes waited the disk's full delay, under lazytime none)
 #                  Until V4b (2026-11-06) the drive was split in two halves,
@@ -57,14 +57,14 @@
 #                  bind mount of /var/lib/taso/taso-blk (kept at boot in
 #                  /etc/fstab), so the blk-*.sh scripts land there too.  Not
 #                  a symlink: runc refuses a rootfs reached through one
-#                  ("invalid rootfs", taso-p5 2026-10-26); a symlink left by
+#                  ("invalid rootfs", the bare-metal node 2026-10-26); a symlink left by
 #                  an earlier setup is replaced.
 #   6b RCU         /sys/kernel/rcu_expedited=1, now and at boot
 #                  (/etc/tmpfiles.d/taso-rcu.conf; it is a sysfs attribute,
 #                  not a sysctl): a filesystem freeze
 #                  takes the superblock's three write barriers, each a
 #                  full RCU grace period of ~10 ms on a 24-thread host
-#                  (scripts/blk-freeze-ftrace.sh, taso-p5 2026-10-26);
+#                  (scripts/blk-freeze-ftrace.sh, the bare-metal node 2026-10-26);
 #                  expedited, they are under a millisecond.  P=64 Seal
 #                  p50 120 -> 80 ms, freeze 70 -> 32, CPU per turn the
 #                  same.  The cost: an expedited grace period sends an IPI
@@ -405,7 +405,7 @@ report() {
     else
         bad "$DATA is not a mount point (the block log would be on the root disk)"
     fi
-    # Whatever holds the block log (on taso-test, the root filesystem):
+    # Whatever holds the block log (on the test VM, the root filesystem):
     # lazytime, or a slow journal commit holds taso-blkd's store lock (step 6).
     blk_opts=$(findmnt -no OPTIONS -T /var/lib/taso-blk 2>/dev/null || true)
     if [[ ",$blk_opts," == *,lazytime,* ]]; then

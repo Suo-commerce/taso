@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # blk-freeze-probe.sh: what an ext4 freeze costs on a block-log branch, and
-# why (P5 B1: seal.freeze measured 37 ms p50 at P=1 on taso-test,
+# why (P5 B1: seal.freeze measured 37 ms p50 at P=1 on the test VM,
 # 2026-10-26, while seal.log and seal.thaw were 1-2 ms).
 #
 #   sudo scripts/blk-freeze-probe.sh        (from the repository root)
 #
-# Run 1 (2026-10-26, taso-test): an idle freeze costs ~2 ms on a branch,
+# Run 1 (2026-10-26, the test VM): an idle freeze costs ~2 ms on a branch,
 # lazy init on or off, and ~1.5 ms on loop; a freeze after one 1 MiB file
 # costs 15-32 ms on a branch and 9-20 ms on loop.  The cost is the dirty
 # data written back through the device at the freeze, not the freeze.
-# Run 2 (taso-test): the requests the kernel sends are merged (13-25 per
+# Run 2 (the test VM): the requests the kernel sends are merged (13-25 per
 # freeze, up to 167 KiB each) and the branch moves them as fast as loop.
 # Run 4 (lever 3): the block log's own per-operation times (taso-blkd
 # stats op_*: count:total_us:store_us:bytes) around each freeze - how long
@@ -32,7 +32,7 @@
 #       the data's) or one
 #   R3  no journal: 1 flush per freeze whatever the dirty size, and the
 #       freeze after 4 MiB at the write-back's cost alone
-#   R4  on taso-p5 (1 ms flush) a dirty freeze costs barriers x ~1 ms plus
+#   R4  on the bare-metal node (1 ms flush) a dirty freeze costs barriers x ~1 ms plus
 #       the bytes at ~1 GB/s: 4 MiB under 10 ms when alone
 #
 # Touches, and nothing else:

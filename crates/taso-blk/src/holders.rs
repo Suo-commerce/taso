@@ -2,7 +2,7 @@
 //! refused as busy: for the refusal to name them (spec rev. 33, D93: a
 //! failure is reported in a form the next layer can act on).
 //!
-//! Found on taso-test (2026-11-27, bench at 64 Vessels): a Vessel's reset
+//! Found on the test VM (2026-11-27, bench at 64 Vessels): a Vessel's reset
 //! after its birth was refused, "target is busy" from `umount` or "in use"
 //! from `taso-blkd`'s stop, a few times in a run.  Every Vessel mount is
 //! also present in the mount namespaces of the host's sandboxed services
@@ -89,7 +89,7 @@ pub fn of_device(proc: &Path, dev: &Path) -> Vec<Holder> {
 /// each mount namespace whose mount table holds it, once, with the
 /// mount's propagation, how many processes are in it and one of them
 /// (every process of a namespace sees the same mounts: listing them would
-/// hide the few that matter, as the first report on taso-test did).  The
+/// hide the few that matter, as the first report on the test VM did).  The
 /// caller's own namespace is named as such; at most `most` lines of each
 /// kind.  "nobody found" when nothing holds it: whoever held it let go
 /// before it was looked for.
@@ -360,7 +360,7 @@ mod tests {
         assert!(one.ends_with("e.g. 1 systemd; and 1 more"), "{one}");
     }
 
-    /// The first report on taso-test (2026-11-27) listed every process of
+    /// The first report on the test VM (2026-11-27) listed every process of
     /// the host's namespace, each seeing the host's own mount, and the
     /// cap ran out before any that mattered.  A user of the mount in
     /// another namespace comes first, however many processes see it.

@@ -230,7 +230,7 @@ expect() { # expect WHAT TEST...: PASS if the test command succeeds
 is() { [[ "$1" == "$2" ]]; }
 has() { grep -q -- "$2" "$W/out/$1.err"; }
 
-GENRUN=(--classmap "$W/map.toml" --actor p4g --reason "file 4c on taso-test")
+GENRUN=(--classmap "$W/map.toml" --actor p4g --reason "file 4c on the test VM")
 
 # The genesis id of a run that printed nothing: its log directory's name.
 gid_of_node() {

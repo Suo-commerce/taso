@@ -136,12 +136,12 @@
 //! - Non-rotational, which it is (no seek cost).  ext4 allocates
 //!   differently on non-rotational devices; one effect: xfstests
 //!   generic/347 fails on any non-rotational device, ours and loop alike
-//!   (taso-test, 2026-10-19), and passes on both when marked rotational.
+//!   (the test VM, 2026-10-19), and passes on both when marked rotational.
 //! - Discard and write-zeroes both become [`Store::discard`] (reads zeros),
 //!   up to 1 GiB per request.  Mount ext4 with `-o discard`: without it
 //!   ext4 never says which blocks it freed, so every block it ever wrote
 //!   stays live for the store, compaction cannot drop it, and Seals and
-//!   exports carry it (measured on taso-test 2026-10-18: live grew to
+//!   exports carry it (measured on the test VM 2026-10-18: live grew to
 //!   4.8 GB under fsx on a 64 MiB file).
 //! - **User copy** (`UBLK_F_USER_COPY`): request data moves with `pread` /
 //!   `pwrite` on the device's character file into the daemon's own buffer.
@@ -187,7 +187,7 @@ const TARGET: &str = "taso-blk";
 
 /// Write a line to stderr, the daemon's log.  Never panics: if the log
 /// cannot be written (a full disk), the line is lost and the daemon goes on.
-/// `eprintln!` panics on a failed write; on taso-test (2026-10-18) that
+/// `eprintln!` panics on a failed write; on the test VM (2026-10-18) that
 /// panicked a device thread while it held the store, poisoned the lock, and
 /// left a daemon that could not quit.
 macro_rules! log {
@@ -199,7 +199,7 @@ macro_rules! log {
 
 /// Every write to stdout and stderr succeeds, whoever makes it (review fix
 /// H-a).  [`log!`] never panics, but a library's `eprintln!` does on a
-/// failed write: libublk prints with it (66 places), and on taso-test
+/// failed write: libublk prints with it (66 places), and on the test VM
 /// (2026-11-06) its "device reload json failed", for a leftover device
 /// at the start's reap, panicked the daemon before its socket opened when
 /// stderr could not be written (`client_daemon.rs`, /dev/full).  So the
@@ -317,7 +317,7 @@ mod streams {
 
 /// Where the store's lock is taken, for `stats lock=`: every hold is
 /// timed by its site (P5 bite 5's probe, 2026-11-04).  At P=64 on
-/// taso-test a device request waited ~2 ms for a lock the requests
+/// the test VM a device request waited ~2 ms for a lock the requests
 /// themselves held 10-80 µs, 23 % of the time, with ten threads queued:
 /// a queue that deep needs the lock busy most of the time, so the other
 /// holders -- the Warden's commands, the upkeep, the checkpoints -- are
@@ -498,7 +498,7 @@ struct Device {
 
 /// A branch's entry in the device table.  `Starting` while its device
 /// starts (several ms of the kernel's work, ~8 under a storm of forks on
-/// taso-test, 2026-10-29): the table is not held across that, so a call
+/// the test VM, 2026-10-29): the table is not held across that, so a call
 /// about another branch (an `info`, another `attach`) never waits on it;
 /// a call that needs this branch's own entry settled waits for it
 /// ([`Daemon::settled`]).  `Stopping` while `detach` kills its device
@@ -516,7 +516,7 @@ enum Slot {
 /// takes in `handle` altogether, how much of that inside the store's
 /// lock, and how much waiting for it.  Named by lever 3 of P5
 /// (2026-10-26): 1 MiB of write-back through a branch took 37 ms with two
-/// syncs on taso-p5, and nothing in the store accounts for it.  A FUA
+/// syncs on the bare-metal node, and nothing in the store accounts for it.  A FUA
 /// write is counted apart (`op_wfua`): its group ends and syncs at once,
 /// one of a Seal's fresh syncs (the superblock, at the freeze and at the
 /// thaw; bite 5).
@@ -545,7 +545,7 @@ const OP_WFUA: usize = 4;
 /// `TASO_BLKD_OPLOG=path`: one line per device request, `op bytes start_ns
 /// end_ns copy_ns wait_ns store_ns` on CLOCK_MONOTONIC (blktrace's clock),
 /// for the probe of where a request's time goes (blk-trace-freeze.sh).
-/// Run 3 on taso-p5 (2026-10-26) put the whole write phase of a freeze in
+/// Run 3 on the bare-metal node (2026-10-26) put the whole write phase of a freeze in
 /// our handler, 0.92 ms per 512 KiB served one after another, and four
 /// threads changed nothing; the three parts name which half it is: the
 /// copy between the kernel and our buffer (`copy`, outside the lock), the
@@ -665,7 +665,7 @@ fn main() {
         depth: 32,
         queues: 1,
         threads: 1,
-        // 512 KiB: the geometry of common disks; on taso-test it measured
+        // 512 KiB: the geometry of common disks; on the test VM it measured
         // the same as 128 KiB (blk-bench, 2026-10-19, within run noise).
         io_bytes: 512 << 10,
         checkpoint_every: 256 << 20,
@@ -1288,7 +1288,7 @@ fn serve(d: &Daemon, conn: UnixStream) -> Option<i32> {
                 // with its error: the answer carries it up to the Warden,
                 // but a report that only shows the later refusals ("an
                 // earlier append failed") names nothing (spec rev. 34, D93
-                // class (i); E3's error-mode rounds, taso-test 2026-10-28).
+                // class (i); E3's error-mode rounds, the test VM 2026-10-28).
                 if !poisoned_before && lock_store(&d.store, Site::Poisoned).is_poisoned() {
                     log!("taso-blkd: the store is poisoned: {} failed: {e}", words[0]);
                 }
@@ -1623,7 +1623,7 @@ impl Daemon {
                 // The store is held for the plan only (the checks, the
                 // block list); the blocks are read and the pack written
                 // without it (P5 bite 5: the export held the lock 1.2 ms
-                // a Seal at P=64, the largest holder, taso-test 2026-11-04).
+                // a Seal at P=64, the largest holder, the test VM 2026-11-04).
                 let plan = lock_store(&self.store, Site::Export)
                     .export_plan(to, from)
                     .map_err(store_err);
@@ -1959,7 +1959,7 @@ impl Daemon {
     /// `Stopping`; refused if it is still one of them after
     /// [`Daemon::settle_wait`].  A start or a stop takes milliseconds; one
     /// that never ends held every later call about its branch, each in a
-    /// thread of its own, for good (soak, taso-test 2026-11-12: 482 of
+    /// thread of its own, for good (soak, the test VM 2026-11-12: 482 of
     /// them, and every Warden start hung).  Refused, the caller hears why
     /// and the thread ends; the other branches are served meanwhile.
     fn settled(&self, branch: LayerId) -> Result<MutexGuard<'_, HashMap<LayerId, Slot>>, String> {
@@ -2049,7 +2049,7 @@ impl Daemon {
     /// failed final flush or checkpoint is never an "ok".  Refused, with
     /// nothing stopped and the daemon serving on, while a device is in use
     /// (mounted): its stop would wait for the unmount for good (soak,
-    /// taso-test 2026-11-08).
+    /// the test VM 2026-11-08).
     fn shutdown(&self) -> Quit {
         self.shutdown_with(in_use, kill_device)
     }
@@ -2242,7 +2242,7 @@ fn reap_dead_devices() -> (usize, usize) {
 ///
 /// A file system mounted on the device holds it exclusively, and the
 /// device's thread then waits in the kernel's delete for the last opener
-/// for good: `quit` and `detach` never answered (soak, taso-test
+/// for good: `quit` and `detach` never answered (soak, the test VM
 /// 2026-11-08).  So the device is opened exclusively first (`EBUSY`: in
 /// use, refused, nothing stopped), and held across the stop, so nothing
 /// can mount it in between.
@@ -2270,7 +2270,7 @@ fn hold_exclusively(dev_id: i32) -> Result<Option<File>, String> {
 /// namespace made while a Vessel is mounted (every runc start) holds a
 /// copy of its filesystem, and with it the device, until the kernel
 /// releases the copy after the namespace drops it: a few milliseconds
-/// (on taso-test a loop device under namespaces made in a loop was held
+/// (on the test VM a loop device under namespaces made in a loop was held
 /// right after its unmount 409 times in 500, at most 10.4 ms, median
 /// 5.8).  So the stop waits; a hold past the bound is refused, naming
 /// its holder (a namespace that lives on holds it until it ends).
@@ -2335,7 +2335,7 @@ fn hold_exclusively_at(path: &str) -> Result<Option<File>, String> {
     {
         Ok(f) => Ok(Some(f)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        // Who holds it, read after the refusal (taso-test, 2026-11-27: a
+        // Who holds it, read after the refusal (the test VM, 2026-11-27: a
         // reset after birth refused "in use" with the host's mount gone).
         Err(e) if e.raw_os_error() == Some(EBUSY) => Err(busy(Path::new("/proc"), path)),
         Err(e) => Err(format!("{path}: {e}")),
@@ -2343,7 +2343,7 @@ fn hold_exclusively_at(path: &str) -> Result<Option<File>, String> {
 }
 
 /// The refusal of a device `path` in use, naming who holds it as `proc`
-/// shows them, read after the refusal (taso-test, 2026-11-27: a reset
+/// shows them, read after the refusal (the test VM, 2026-11-27: a reset
 /// after birth refused "in use" with the host's mount already gone).
 fn busy(proc: &Path, path: &str) -> String {
     let held = taso_blk::holders::of_device(proc, Path::new(path));
@@ -2472,7 +2472,7 @@ impl Ending for UblkCtrl {
 /// a descriptor, not a mapping, nothing mounted in its namespace) kept
 /// it waiting for good: the device's thread never ended, `detach` never
 /// returned, its branch stayed `Stopping`, and every later call that
-/// settled the branch waited behind it, 482 of them (soak, taso-test
+/// settled the branch waited behind it, 482 of them (soak, the test VM
 /// 2026-11-12, ublk_ctrl_del_dev).  The kernel frees the device when the
 /// last reference goes; a start's reap removes one left behind.  If even
 /// this delete fails, the control is disowned, so its drop does not try
@@ -2916,7 +2916,7 @@ mod detach_test {
         assert!(lock(&d.devices).get(&branch).is_none(), "gone once killed");
     }
 
-    /// Soak, taso-test 2026-11-08: `quit` with a Vessel still mounted on
+    /// Soak, the test VM 2026-11-08: `quit` with a Vessel still mounted on
     /// a device never answered (the device's delete waits for the last
     /// opener).  A device in use refuses the quit: nothing is stopped, the
     /// devices stay tracked and the daemon serves on; unmounted, the quit
@@ -3132,7 +3132,7 @@ mod detach_test {
         assert_eq!(zombies(&deleted, |_| false), 0);
     }
 
-    /// Soak, taso-test 2026-11-12: a branch left `Stopping` for good held
+    /// Soak, the test VM 2026-11-12: a branch left `Stopping` for good held
     /// every later call about it, each in its own thread, until 482 of
     /// them waited and every Warden start hung.  Such a call is refused
     /// once the wait is over, naming why; nothing waits for good.
@@ -3219,7 +3219,7 @@ mod detach_test {
         }
     }
 
-    /// Soak, taso-test 2026-11-12: a device's thread ended in the
+    /// Soak, the test VM 2026-11-12: a device's thread ended in the
     /// waiting delete, which never returned, and the daemon stopped
     /// answering.  Ending a device returns, whatever the kernel waits
     /// for; a failed delete disowns, so the drop does not wait instead.

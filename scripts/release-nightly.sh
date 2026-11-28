@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # release-nightly.sh: release-gate.sh full on origin/main, every night, on
-# taso-test (D&D nightly-a, 2026-11-07).  No GitHub Actions: GitHub only
+# the test VM (D&D nightly-a, 2026-11-07).  No GitHub Actions: GitHub only
 # serves the fetch.
 #
 #   scripts/release-nightly.sh install   once, as root, from a clone: puts

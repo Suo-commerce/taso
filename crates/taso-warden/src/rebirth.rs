@@ -246,7 +246,7 @@ impl<P: Pool> Host<P> {
         // before the commit); the open cuts such a frame (D96).  Read as
         // a Seal it would be a false sign: the Vessel would be rebuilt
         // from the store and lose what it had not shipped (E3 on
-        // taso-test, 2026-11-26, [write seal] hold:seal.framed).
+        // the test VM, 2026-11-26, [write seal] hold:seal.framed).
         let head = self.coord.head(id).map_err(VesselError::Coord)?;
         frames.retain(|f| f.envelope.lsn <= head.lsn);
         // The Seals the log knows, oldest first, and the Seal the newest

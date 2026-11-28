@@ -91,7 +91,7 @@
 
 set -Eeuo pipefail
 # An unguarded failure says where it was; set -e alone ends the script silently
-# (taso-test, 2026-10-27: three rounds stopped at a bad `tr`, with nothing printed).
+# (the test VM, 2026-10-27: three rounds stopped at a bad `tr`, with nothing printed).
 trap 'printf "ABORT: line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
 
 WORK=${E3_WORK:-/var/lib/taso-e3}
@@ -104,7 +104,7 @@ ROWS=${E3_ROWS:-8}
 # The timing step S: the sweep's delays are 0, S, 2S, 3S, a quarter of a lone
 # Seal each.  The burst's own step B: its delays 0, B/2, B, 2B, 3B and its
 # stagger (E3-c2: the second Vessel's Seal after the first's) B/2 -- two
-# Seals together finish well inside one alone (taso-test 2026-11-03: 37 ms
+# Seals together finish well inside one alone (the test VM 2026-11-03: 37 ms
 # alone, both inside 18 together; they share the group's syncs), so the
 # burst is measured as a burst (t-f).  Each set by hand (E3_STEP_MS,
 # E3_BURST_STEP_MS), else measured by `run` (measure_step), else 10 and 5
@@ -280,7 +280,7 @@ send() { # send PID OP: the op file, whole; no wait
     # that namespace, and a new file there must have an owner the namespace
     # can name.  Host uid 0 is not one (the container maps 0..65535 to the
     # Vessel's range), so root's create fails EOVERFLOW ("Value too large")
-    # while root's reads and unlinks work (taso-test, 2026-10-27; the
+    # while root's reads and unlinks work (the test VM, 2026-10-27; the
     # kernel's rule, reproduced by hand).  nsenter -U as the namespace's
     # root creates it as the agent itself would.
     local n=${NEXT[$1]} dir=/proc/$1/root/tmp/e3
@@ -293,7 +293,7 @@ reply() { # reply PID SECONDS [POLL] -> REPLY, the reply to the last op sent; fa
         # Taken: read, then removed (the agent waits for its last reply to go, E3-3a).
         if [[ -f "$f" ]]; then NEXT[$p]=$((n + 1)); REPLY=$(cat "$f"); rm -f "$f"; return 0; fi
         # Alive by /proc, not by kill -0: a signal to an agent in its own user
-        # namespace may be refused while it lives (taso-test, 2026-10-27:
+        # namespace may be refused while it lives (the test VM, 2026-10-27:
         # every first reply was given up on at 0 s).
         [[ -d /proc/$p ]] || { WHY="the agent (pid $p) is gone"; return 1; }
         sleep "$poll"
@@ -373,7 +373,7 @@ if takeover:
 if child:   # after its parent: parent before child (P3 C6)
     # The node takes the existing child over and forks nothing new, so the parent's
     # entry reserves no fork slot (a slot both reserved and a Vessel's is refused at
-    # start: "fork slot 2 is also <child>'s", taso-test 2026-10-29).
+    # start: "fork slot 2 is also <child>'s", the test VM 2026-10-29).
     cfg["vessels"][0].pop("forks", None)
     cfg["vessels"].append({"namespace": "e3" * 16, "subject": child["subject"], "uid_slot": 2,
                            "fork": {"parent": subject, "seal": child["seal"]}, "takeover": child["takeover"]})
@@ -382,7 +382,7 @@ PY
 }
 start_stack() { # start_stack TAG [VAR=VALUE ...]: taso-blkd and the Warden on $D, with the env given; logs $R/*-TAG.err
     # A killed taso-blkd leaves its socket file; the Warden must wait for the
-    # new one to *answer*, not for the file (taso-test 2026-10-28: six rounds
+    # new one to *answer*, not for the file (the test VM 2026-10-28: six rounds
     # lost that race, "taso-blkd socket: Connection refused").
     rm -f "$SOCK"
     env "${@:2}" "$BIN/taso-blkd" "$D/blk.log" "$SOCK" --durable-at "$DURABLE_AT" 2>>"$R/blkd-$1.err" & BLKD_PID=$!
@@ -774,7 +774,7 @@ tk_drain() { # tk_drain TAG SOCKET WARDEN_PID: every agent of that Warden told `
         if wait_agent 1; then
             a=$AGENT
             # The agent may come up before its Warden names the dataset: read the names again
-            # now, or the agent matches neither (taso-test 2026-10-30: b's resume never taken).
+            # now, or the agent matches neither (the test VM 2026-10-30: b's resume never taken).
             for v in 0 1; do
                 [[ -n "${TD_DS[v]}" ]] || TD_DS[v]=$(grep -m1 -o "\] ${bsubj[v]}: dataset .*" "$R/warden-$1.err" 2>/dev/null | sed 's/.*: dataset //' || true)
             done
@@ -1037,7 +1037,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
                 oracle acknowledged "$O" promote child="$child"
                 if ! wait_agent 120; then
                     # The Warden's own word on the parent is a result, not a harness fault
-                    # (taso-test 2026-10-28: after adopting a fresh fork's files it refused to run the parent).
+                    # (the test VM 2026-10-28: after adopting a fresh fork's files it refused to run the parent).
                     local said; said=$(grep -m1 "^$subject: .*refusing" "$R/warden-1.out" 2>/dev/null || true)
                     if [[ -n "$said" ]]; then echo "FAIL    $tag"; echo "        4: after the promotion the Warden refused to run the parent: ${said#*: }"
                     else echo "HARNESS $tag: the parent did not start again after its promotion"; fi
@@ -1076,7 +1076,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
                 # rightly come after the error.  Not counted as an ack after it:
                 # kept as an acknowledged Seal, which the oracle then requires
                 # in the image, whole (line 1) -- found by the first run,
-                # taso-test 2026-11-02, round 424.
+                # the test VM 2026-11-02, round 424.
                 seal) if [[ -n "$(jget "$REPLY" sealed)" ]]; then
                           if [[ "$hname" == seal.thawing ]]; then held_ack=$(jget "$REPLY" sealed); else acks_err=$((acks_err + 1)); fi
                       fi ;;
@@ -1109,7 +1109,7 @@ round() { # round "SEQ" POINT MODE -> the oracle's line on stdout; the round's f
     # 5. the rebirth, on a copy at the same path
     # No $(...) around a step that sets LOOP2: a subshell would keep it from
     # teardown, which then never detaches the loop, and the unlinked 2 GiB
-    # copy stays held until reboot (taso-test 2026-10-28: 391 of them, the
+    # copy stays held until reboot (the test VM 2026-10-28: 391 of them, the
     # disk full by round 380).  The errors go to a file instead.
     if ! { cp --sparse=always "$R/image.raw" "$WORK/rebirth.img" && LOOP2=$(losetup -f --show "$WORK/rebirth.img") && mount "$LOOP2" "$D"; } 2>"$R/rebirth.err"; then
         echo "HARNESS $tag: the rebirth copy could not be mounted: $(tr '\n' ' ' <"$R/rebirth.err") (df: $(df -h --output=avail "$WORK" | tail -1 | tr -d ' ') free on $WORK)"; return
@@ -1223,7 +1223,7 @@ PY
 # that D is the Seal as a round sees it.  Five passes, the median T, the
 # step T/4 in whole ms, never under 2 (t-a).  Nothing polls beside a Seal:
 # the first measurement timed twelve Seals with a 1 ms poll loop and read
-# 27-35 ms where the rounds then found their replies by 14 (taso-test,
+# 27-35 ms where the rounds then found their replies by 14 (the test VM,
 # 2026-11-03, MISSED 92 of 220).  The delay's floor, what `nap 0` takes,
 # is measured beside it: before (t-d) every delay went through a python
 # start-up first.

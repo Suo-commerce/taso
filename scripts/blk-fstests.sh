@@ -71,7 +71,7 @@
 #
 # xfstests is written against GNU coreutils; with uutils (Ubuntu 26.04's
 # default) 271 of the quick tests failed on an unsupported option before
-# testing anything (taso-test, 2026-10-18).  run refuses without GNU
+# testing anything (the test VM, 2026-10-18).  run refuses without GNU
 # coreutils; setup installs them.
 #
 # FST_IO_KIB=N runs the daemon with --io-kib N (largest request; it sets

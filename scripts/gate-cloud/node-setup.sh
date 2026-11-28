@@ -97,7 +97,7 @@ apt_get() { apt_wait; apt-get -o DPkg::Lock::Timeout=600 "$@"; }
 
 # build-essential only when there is no C toolchain: on Ubuntu 26.04 it
 # depends on coreutils-from-uutils, which a machine moved to GNU coreutils
-# (taso-test, 2026-10-18) cannot install, and a machine that has built the
+# (the test VM, 2026-10-18) cannot install, and a machine that has built the
 # repo already has the toolchain.
 toolchain() { if command -v gcc >/dev/null && command -v make >/dev/null; then echo; else echo build-essential; fi; }
 
@@ -212,7 +212,7 @@ if [ "$ROLE" = coord ]; then
     # Its own, because systemd re-owns a unit's runtime directory to the
     # unit's user and group, recursively, when the unit starts; a
     # directory shared with root:root units (taso-blkd, the forward) lost
-    # the socket's group that way (taso-test, 2026-10-20).  The socket
+    # the socket's group that way (the test VM, 2026-10-20).  The socket
     # itself is 0660 by taso-coordd.
     unit taso-coordd "/usr/local/bin/taso-coordd /var/lib/taso/coord.redb /run/taso-coord/coord.sock ${peer_flags[*]} --socket-group $GID" \
         "" "RuntimeDirectory=

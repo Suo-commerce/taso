@@ -15,7 +15,7 @@
 # journal.  Under fua (taso-blkd's default since 2026-11-06, right for the
 # Warden's journal-less ext4 only) a journal's commit block is a FUA write
 # answered before any sync, so an fsync can return for a transaction the
-# next crash cuts: taso-test 2026-11-06, f7_513 lost, 4153 bytes cut (one
+# next crash cuts: the test VM 2026-11-06, f7_513 lost, 4153 bytes cut (one
 # block and its record) -- the mode's documented limit, not a store fault.
 #
 # Touches, and nothing else:

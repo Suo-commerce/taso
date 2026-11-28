@@ -238,7 +238,7 @@ def check(r, a):
     # 1b (D92, D93 (i)): acknowledged writes after the last retained Seal are discarded by the reset, and named
     # — as blocks of the Vessel's filesystem.  The Chronicle count in the reset line does not name them: a
     # SQLite write adds no Chronicle record, and the Warden appends housekeeping after a Seal anyway
-    # (taso-test 2026-10-28, [seal write]: "lsn 6 reset to the Seal at lsn 5: 1 record(s)" with the write unnamed).
+    # (the test VM 2026-10-28, [seal write]: "lsn 6 reset to the Seal at lsn 5: 1 record(s)" with the write unnamed).
     m_blocks = re.search(r"(\d+) block\(s\) of the Vessel's filesystem discarded", report)
     # Not after a takeover: the old node's unsealed writes were never shipped and died with it (class (iii), D97).
     if unsealed and not tk and not (m_blocks and int(m_blocks.group(1)) > 0):

@@ -103,7 +103,7 @@ TRACE_PID=$!
 sleep 0.5
 # MARK: CLOCK_MONOTONIC (the op log's clock) just before the freeze, so the
 # split below takes only the freeze's own ops, not mkfs's and the mount's
-# (run 2 on taso-p5, 2026-10-26, matched the op log from its start).
+# (run 2 on the bare-metal node, 2026-10-26, matched the op log from its start).
 MARK=$(python3 -c 'import time; print(time.monotonic_ns())')
 t0=$(date +%s.%N); fsfreeze -f "$MNT"; t1=$(date +%s.%N)
 sleep 0.2
@@ -111,7 +111,7 @@ kill -INT "$TRACE_PID"; wait "$TRACE_PID" 2>/dev/null || true; TRACE_PID=
 fsfreeze -u "$MNT"
 echo "block log ops (count:total_us:store_us:bytes): $(blk stats | tr ' ' '\n' | grep '^op_' | tr '\n' ' ')"
 # %5T.%9t is seconds since the trace's start.  blkparse has no absolute
-# form (run 2 on taso-p5, 2026-10-26: -t left the times relative, 38
+# form (run 2 on the bare-metal node, 2026-10-26: -t left the times relative, 38
 # minutes from the op log's CLOCK_MONOTONIC), so the split below aligns
 # the two clocks itself.  The file is written before anything reads it
 # (run 1 read it first and found no file).

@@ -1024,7 +1024,7 @@ pub enum ServeEvent<'a> {
     /// A request was refused because this Warden no longer holds the
     /// Vessel: another Warden took it over and the coordinator fenced this
     /// one's epoch.  The agent is told in the reply; the operator learns it
-    /// from the Warden's own log (E3-4, taso-test 2026-10-29: a fenced
+    /// from the Warden's own log (E3-4, the test VM 2026-10-29: a fenced
     /// Warden told its agent and logged nothing).
     Fenced {
         /// The request refused.
@@ -3253,7 +3253,7 @@ mod tests {
         assert_eq!(fx.unanswered(), 1);
     }
 
-    /// E3-4 (taso-test 2026-10-29): a Warden whose Vessel another Warden
+    /// E3-4 (the test VM 2026-10-29): a Warden whose Vessel another Warden
     /// took over refuses the agent's request `Fenced`, and `serve_vessel`
     /// reports it as a `Fenced` event, so the Warden's own log says so too.
     #[test]

@@ -10,7 +10,7 @@
 #   cannot enter cgroupv2 "/sys/fs/cgroup/taso-…" with domain controllers
 #   -- it is in an invalid state
 #
-# (D2, measured on taso-test 2026-10-17: /proc/self/cgroup "0::/",
+# (D2, measured on the test VM 2026-10-17: /proc/self/cgroup "0::/",
 # cgroup.procs 2 entries, cgroup.subtree_control empty.)  The fix, as
 # Docker-in-Docker does it: move this container's own processes into a
 # child cgroup ("init"), then enable the controllers for the children.

@@ -12,7 +12,7 @@
 #   /etc/modules-load.d/taso-ublk.conf (loads ublk_drv at boot), and loads it now
 # check touches nothing.
 #
-# The repository is not cloned here: clone it the way you do on taso-test.
+# The repository is not cloned here: clone it the way you do on the test VM.
 
 set -euo pipefail
 

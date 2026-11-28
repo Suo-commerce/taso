@@ -615,7 +615,7 @@ pub fn prepare_work_dir(work: &Path, host_uid_base: u32) -> io::Result<()> {
 ///   promotion brings back nothing of another range.  Before D95 such a
 ///   fork became its own, and promoting it left the parent's filesystem in
 ///   the child's range, which the parent then refused to run (E3's first
-///   finding, taso-test 2026-10-28, `[write fork promote]`);
+///   finding, the test VM 2026-10-28, `[write fork promote]`);
 /// - owned by exactly `host_uid_base`: returns `host_uid_base`, unchanged;
 /// - owned by exactly the `inherited` range: returns it, and **nothing on
 ///   disk is changed** (not the owner, not the mode): the work mount is

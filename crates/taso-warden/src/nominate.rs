@@ -693,7 +693,7 @@ impl Nominator {
     /// and not closed.  Closed (§3.5): by `Never`, `Cancel` or
     /// `Supersede`, and sanctioned once the commit's `TemplateReady` is
     /// accepted (a commit before that is "committing", still counted).
-    /// Soak, taso-test 2026-11-09: a sanctioned Candidate was counted open
+    /// Soak, the test VM 2026-11-09: a sanctioned Candidate was counted open
     /// for good, so after four sanctions a Vessel's every nomination was
     /// answered Retry for the rest of its life (12 000 times in 5 hours).
     fn open_candidates(&self, chronicle: ChronicleId) -> Result<usize, NominateError> {

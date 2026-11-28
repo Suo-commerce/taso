@@ -4143,7 +4143,7 @@ impl Node {
         }
         // Before the sweep: an agent writing into a file system its killed
         // Warden left frozen (mid-Seal) waits in the kernel and cannot be
-        // killed until a thaw (soak, taso-test 2026-11-08).  Thawed, the
+        // killed until a thaw (soak, the test VM 2026-11-08).  Thawed, the
         // sweep kills it; the reopen rolls the Vessel back to its last
         // Seal, so nothing it wrote after the freeze stays.
         let thawed = storage
@@ -5689,7 +5689,7 @@ impl Node {
         // many records stay in the log without being in the filesystem, and
         // how many blocks of the filesystem went — the agent's own writes
         // after the Seal add no record, so the block count is their only
-        // mention (E3 [seal write], taso-test 2026-10-28).
+        // mention (E3 [seal write], the test VM 2026-10-28).
         let blocks = match settled.discarded_blocks {
             Some(n) => format!("; {n} block(s) of the Vessel's filesystem discarded"),
             None => String::new(),
@@ -6209,7 +6209,7 @@ impl Node {
         // promotion), nor when this Warden is stopping.  A Vessel the
         // source lists does not wait: it is started again with the Warden
         // and serves its sender then (waiting here kept a Warden with a
-        // fixed list from ever ending when no sender came: taso-test
+        // fixed list from ever ending when no sender came: the test VM
         // 2026-11-23, blkpool and f6fork timed out on 3280f34).
         let last_run = vc.restart == Restart::Never && self.requested.runs_once(id.as_bytes());
         // Fenced: another Warden holds the Vessel now (the maturity
@@ -7013,7 +7013,7 @@ mod tests {
 
     #[test]
     fn this_host_passes_the_selinux_check() {
-        // The tests run on a supported host (taso-test, CI); if this
+        // The tests run on a supported host (the test VM, CI); if this
         // fails, every Node::new test fails for the same reason.
         refuse_selinux(Path::new("/sys")).unwrap();
     }
@@ -7043,7 +7043,7 @@ mod tests {
 
     /// A run directory released while another thread spawns processes may
     /// still be held for a moment by a child between fork and exec;
-    /// claiming it again must not be refused for that (found on taso-test
+    /// claiming it again must not be refused for that (found on the test VM
     /// 2026-10-23: the node tests run in parallel, spawning processes,
     /// and a second Node of one test was refused its own run directory).
     #[test]
@@ -7649,7 +7649,7 @@ mod tests {
         assert_eq!(tbh.slots, [9].into());
     }
 
-    /// P4 file 5h (found on taso-test): a birth stopped after its clone
+    /// P4 file 5h (found on the test VM): a birth stopped after its clone
     /// leaves a dataset of the Template range and no Lineage yet.  Its
     /// files count for no slot, as a Template-born Vessel's, because the
     /// dataset is a clone of a layer under the root; a dataset with no
