@@ -9,6 +9,7 @@
 //! taso-ctl proposals <vessel> [--config PATH]
 //! taso-ctl approve <vessel> <op> [--config PATH]
 //! taso-ctl deny <vessel> <op> [reason…] [--config PATH]
+//! taso-ctl resolve <vessel> <op> applied|not-applied|unknown <reason…> [--config PATH]
 //! taso-ctl block-log pair --id <log id> [--config PATH]
 //! taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>
 //! ```
@@ -102,6 +103,20 @@
 //! unresolved, not shipped), or `{…, "error": "<why>"}` when it could not
 //! answer now: the same command may be run again.
 //!
+//! # `resolve`
+//!
+//! An operator's answer for one open effect of a running Vessel (review
+//! fix R (a)): an action released to its sender whose outcome is not
+//! final, such as one the sender reported `unknown`.  `applied`: it
+//! happened; `not-applied`: it did not; `unknown`: nobody can tell, and
+//! it is closed anyway, never sent or asked about again (P4 spec D34).
+//! The reason (the words after the answer, at most 1 KiB) is required.
+//! The Warden records the answer as the action's outcome, with the
+//! caller's uid as its actor, which closes the obligation and gives the
+//! Vessel back its effect authority.  One JSON line:
+//! `{"vessel", "op", "resolved": "<answer>", "before"}`, or `refused` or
+//! `error` as for `deny`.
+//!
 //! # `block-log pair`
 //!
 //! The node's operator pairs the Warden with the block log its config
@@ -115,11 +130,11 @@
 //! # Exit status
 //!
 //! 0 done (`explain`: every check held; `status`: the block log answers;
-//! `proposals`: the Warden answered; `approve`, `deny`: taken, now or
+//! `proposals`: the Warden answered; `approve`, `deny`, `resolve`: taken, now or
 //! before; `block-log pair`: paired, now or before);
 //! 1 it could not be done (`explain`: no such id, the coordinator or the
 //! store unreachable; `status`: the block log does not answer; `init`,
-//! `demo`: a write failed; `proposals`, `approve`, `deny`: the Warden
+//! `demo`: a write failed; `proposals`, `approve`, `deny`, `resolve`: the Warden
 //! does not answer, cannot answer for that Vessel, or refused: its line
 //! says which and why; `block-log pair`: the block log does not answer,
 //! has another id, or the pairing could not be written); 2 a bad command line or configuration (`demo`:
@@ -143,6 +158,7 @@ const USAGE: &str = "usage: taso-ctl init [--data DIR] [--size-gib N] [--rootfs 
        taso-ctl proposals <vessel> [--config PATH]
        taso-ctl approve <vessel> <op> [--config PATH]
        taso-ctl deny <vessel> <op> [reason...] [--config PATH]
+       taso-ctl resolve <vessel> <op> applied|not-applied|unknown <reason...> [--config PATH]
        taso-ctl block-log pair --id <log id> [--config PATH]
        taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>";
 
@@ -196,6 +212,7 @@ fn main() -> ExitCode {
         Some("proposals") => proposals(&args[1..]),
         Some("approve") => decide(&args[1..], true),
         Some("deny") => decide(&args[1..], false),
+        Some("resolve") => resolve(&args[1..]),
         Some("block-log") if args.get(1).map(String::as_str) == Some("pair") => {
             block_log_pair(&args[2..])
         }
@@ -1063,19 +1080,20 @@ fn proposals(args: &[String]) -> ExitCode {
     }
 }
 
-/// What `approve` and `deny` print for the Warden's answer, and whether
-/// the decision is taken.
+/// What `approve`, `deny` and `resolve` print for the Warden's answer,
+/// and whether the decision is taken: `taken` is the key and value a
+/// taken decision prints (`"approved": true`, `"resolved": "applied"`).
 fn decision_json(
     vessel: &taso_core::envelope::ChronicleId,
     op: u64,
-    approval: bool,
+    taken: (&str, serde_json::Value),
     answer: &Result<taso_warden::decidesrv::Ruled, String>,
 ) -> (serde_json::Value, bool) {
     use taso_warden::decidesrv::Ruled;
     let mut j = json!({"vessel": hex(vessel.as_bytes()), "op": op});
     let taken = match answer {
         Ok(Ruled::Done { before }) => {
-            j[if approval { "approved" } else { "denied" }] = json!(true);
+            j[taken.0] = taken.1;
             j["before"] = json!(before);
             true
         }
@@ -1114,7 +1132,86 @@ fn decide(args: &[String], approval: bool) -> ExitCode {
     let answer = DeciderClient::connect(socket)
         .map_err(|e| format!("the Warden's decider socket {}: {e}", socket.display()))
         .and_then(|mut c| c.decide(vessel, op, &ruling));
-    let (line, taken) = decision_json(&vessel, op, approval, &answer);
+    let key = if approval { "approved" } else { "denied" };
+    let (line, taken) = decision_json(&vessel, op, (key, json!(true)), &answer);
+    println!("{line}");
+    if taken {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// The words `resolve` takes for each answer.
+const RESOLUTIONS: [(&str, taso_core::decider::Resolution); 3] = [
+    ("applied", taso_core::decider::Resolution::Applied),
+    ("not-applied", taso_core::decider::Resolution::NotApplied),
+    ("unknown", taso_core::decider::Resolution::AcceptedUnknown),
+];
+
+/// `<vessel> <op> applied|not-applied|unknown <reason…> [--config PATH]`:
+/// the Vessel's argument, the op, the answer (and its word), the reason
+/// (required) and the config's path.
+#[allow(clippy::type_complexity)]
+fn resolve_args(
+    args: &[String],
+) -> Result<
+    (
+        &str,
+        u64,
+        (&'static str, taso_core::decider::Resolution),
+        String,
+        &str,
+    ),
+    String,
+> {
+    let (rest, path) = config_arg(args)?;
+    let [vessel, op, answer, reason @ ..] = rest.as_slice() else {
+        return Err(
+            "a Vessel, an op, an answer (applied, not-applied or unknown) and a reason are needed"
+                .into(),
+        );
+    };
+    let op = op
+        .parse::<u64>()
+        .map_err(|_| format!("{op:?} is not an op (a number)"))?;
+    let answer = RESOLUTIONS
+        .into_iter()
+        .find(|(w, _)| w == answer)
+        .ok_or_else(|| format!("{answer:?} is not an answer: applied, not-applied or unknown"))?;
+    let reason = reason.join(" ");
+    if reason.trim().is_empty() {
+        return Err("a resolution needs a reason: the words after the answer".into());
+    }
+    if reason.len() > taso_core::decider::MAX_DENY_REASON {
+        return Err(format!(
+            "a reason of {} bytes is over {}",
+            reason.len(),
+            taso_core::decider::MAX_DENY_REASON
+        ));
+    }
+    Ok((vessel, op, answer, reason, path))
+}
+
+fn resolve(args: &[String]) -> ExitCode {
+    use taso_warden::decidesrv::{DeciderClient, Ruling};
+    let (arg, op, (word, resolution), reason, path) = match resolve_args(args) {
+        Ok(a) => a,
+        Err(e) => return usage(&e),
+    };
+    let config = match read_config(path) {
+        Ok(c) => c,
+        Err(e) => return usage(&format!("{path}: {e}")),
+    };
+    let vessel = match vessel_of(&config, arg) {
+        Ok(v) => v,
+        Err(e) => return usage(&e),
+    };
+    let socket = &config.decider.socket;
+    let answer = DeciderClient::connect(socket)
+        .map_err(|e| format!("the Warden's decider socket {}: {e}", socket.display()))
+        .and_then(|mut c| c.decide(vessel, op, &Ruling::Resolve(resolution, reason)));
+    let (line, taken) = decision_json(&vessel, op, ("resolved", json!(word)), &answer);
     println!("{line}");
     if taken {
         ExitCode::SUCCESS
@@ -1481,18 +1578,81 @@ mod tests {
             assert!(decide_args(&bad, approval).is_err(), "{bad:?}");
         }
         let v = taso_core::envelope::ChronicleId::from_bytes([5; 16]);
-        let (j, taken) = decision_json(&v, 7, true, &Ok(Ruled::Done { before: false }));
+        let yes = || ("approved", json!(true));
+        let (j, taken) = decision_json(&v, 7, yes(), &Ok(Ruled::Done { before: false }));
         assert!(taken);
         assert_eq!(j["approved"], true);
         assert_eq!(j["before"], false);
         assert_eq!(j["op"], 7);
         assert_eq!(j["vessel"], "05".repeat(16));
-        let (j, taken) = decision_json(&v, 7, false, &Ok(Ruled::Done { before: true }));
+        let (j, taken) = decision_json(
+            &v,
+            7,
+            ("denied", json!(true)),
+            &Ok(Ruled::Done { before: true }),
+        );
         assert!(taken && j["denied"] == true && j["before"] == true && j["approved"].is_null());
-        let (j, taken) = decision_json(&v, 7, true, &Ok(Ruled::Refused("not sealed".into())));
+        let (j, taken) = decision_json(&v, 7, yes(), &Ok(Ruled::Refused("not sealed".into())));
         assert!(!taken && j["refused"] == "not sealed" && j["error"].is_null());
-        let (j, taken) = decision_json(&v, 7, true, &Err("ask again".into()));
+        let (j, taken) = decision_json(&v, 7, yes(), &Err("ask again".into()));
         assert!(!taken && j["error"] == "ask again" && j["refused"].is_null());
+    }
+
+    /// R (a): resolve's command line (the answer is one of three words,
+    /// the reason is required and is the words after it, `--config`
+    /// anywhere) and the line printed when it is taken.
+    #[test]
+    fn a_resolution_is_parsed_and_printed() {
+        use taso_core::decider::Resolution;
+        use taso_warden::decidesrv::Ruled;
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_args(&s(&["demo", "3", "not-applied", "never", "left"])),
+            Ok((
+                "demo",
+                3,
+                ("not-applied", Resolution::NotApplied),
+                "never left".into(),
+                CONFIG
+            ))
+        );
+        assert_eq!(
+            resolve_args(&s(&["demo", "3", "applied", "seen", "--config", "/c"])),
+            Ok((
+                "demo",
+                3,
+                ("applied", Resolution::Applied),
+                "seen".into(),
+                "/c"
+            ))
+        );
+        assert_eq!(
+            resolve_args(&s(&[
+                "--config", "/c", "demo", "3", "unknown", "no", "trace"
+            ]))
+            .map(|a| a.2),
+            Ok(("unknown", Resolution::AcceptedUnknown))
+        );
+        for bad in [
+            s(&["demo", "3"]),
+            s(&["demo", "3", "applied"]),
+            s(&["demo", "3", "applied", " "]),
+            s(&["demo", "three", "applied", "why"]),
+            s(&["demo", "3", "accepted", "why"]),
+            s(&["demo", "3", "applied", &"x".repeat(1025)]),
+            s(&["demo", "3", "applied", "why", "--config"]),
+        ] {
+            assert!(resolve_args(&bad).is_err(), "{bad:?}");
+        }
+        let v = taso_core::envelope::ChronicleId::from_bytes([5; 16]);
+        let (j, taken) = decision_json(
+            &v,
+            3,
+            ("resolved", json!("unknown")),
+            &Ok(Ruled::Done { before: false }),
+        );
+        assert!(taken && j["resolved"] == "unknown" && j["before"] == false);
+        assert!(j["approved"].is_null() && j["denied"].is_null());
     }
 
     /// 4a: a held action is printed with its exact request bytes, and as
