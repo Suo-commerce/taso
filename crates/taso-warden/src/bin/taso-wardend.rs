@@ -26,7 +26,9 @@
 //! of [`taso_warden::daemon::BIRTH_FAILPOINTS`] (P4 spec §10.2, file 5;
 //! tests on a node): the Vessel's start is refused with
 //! `stopped at failpoint <name>` and a run without it finishes the birth.
-//! Any other name refuses to start.
+//! Any other name refuses to start.  Read only in a build with the
+//! `test-hooks` feature ([`taso_warden::hooks`]); a release build ignores
+//! it and says so.
 //!
 //! # Purge at TTL
 //!
@@ -198,7 +200,7 @@ fn main() -> ExitCode {
         config.warden.get(),
         config.storage.socket.display()
     );
-    let failpoint = std::env::var("TASO_FAILPOINT").ok();
+    let failpoint = taso_warden::hooks::env("TASO_FAILPOINT");
     let node = match Node::new(config, coord, storage)
         .map_err(|e| e.to_string())
         .and_then(|n| n.with_failpoint(failpoint.as_deref()))
