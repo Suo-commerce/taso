@@ -150,6 +150,14 @@ pub fn status_of(
             key(vc),
             json!({ "phase": "Failed", "message": message(&format!("the run panicked{}", again(restart_in))) }),
         ),
+        Event::NotStarted {
+            vc,
+            error,
+            restart_in,
+        } => (
+            key(vc),
+            json!({ "phase": "Failed", "message": message(&format!("the run could not start: the system refused a thread ({error}); tried again in {restart_in:?}")) }),
+        ),
         Event::Refused(r) if r.kept_previous => (
             r.key,
             json!({ "message": message(&format!("entry refused, running its last good one: {}", r.reason)) }),

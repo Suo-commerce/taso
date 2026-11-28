@@ -469,6 +469,7 @@ fn supervisor_stops_relists_and_restarts_on_a_real_node() {
                         });
                     }
                     Event::Panicked { .. } => panic!("a run panicked"),
+                    Event::NotStarted { error, .. } => panic!("a run could not start: {error}"),
                     Event::Refused(r) => panic!("refused: {r:?}"),
                     Event::SourceFailed(e) => panic!("{e}"),
                     Event::Stopping(_) => {}

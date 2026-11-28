@@ -118,6 +118,17 @@ pub enum Event<O> {
         /// When it runs again, if its policy says so.
         restart_in: Option<Duration>,
     },
+    /// A run could not start: the OS refused it a thread (the pid or
+    /// thread limit).  Nothing ran; it is tried again after the backoff,
+    /// whatever its policy (the maturity review's finding 10).
+    NotStarted {
+        /// The entry it was to run with.
+        vc: VesselConf,
+        /// What the OS answered.
+        error: String,
+        /// When it is tried again.
+        restart_in: Duration,
+    },
     /// A stop was requested (removed from the source, or shutdown).
     Stopping(VesselConf),
     /// The guard refused an entry.
@@ -186,11 +197,24 @@ enum State<O> {
     Done,
 }
 
+/// How a run's thread is started ([`spawn_thread`]; a refusal in tests).
+type Spawn<O> = fn(Box<dyn FnOnce() -> O + Send>) -> std::io::Result<JoinHandle<O>>;
+
+/// A run's thread, or the OS's refusal (finding 10).
+fn spawn_thread<O: Send + 'static>(
+    run: Box<dyn FnOnce() -> O + Send>,
+) -> std::io::Result<JoinHandle<O>> {
+    std::thread::Builder::new()
+        .name("vessel run".into())
+        .spawn(run)
+}
+
 /// Keeps what runs equal to what the source says (see the module docs).
 pub struct Supervisor<R: RunVessel> {
     runner: Arc<R>,
     guard: Guard,
     timing: Timing,
+    spawn: Spawn<R::Out>,
     vessels: BTreeMap<VesselKey, Slot<R::Out>>,
     /// The keys the source wants now (after the guard).
     wanted: BTreeMap<VesselKey, VesselConf>,
@@ -205,6 +229,7 @@ impl<R: RunVessel> Supervisor<R> {
             runner,
             guard,
             timing,
+            spawn: spawn_thread::<R::Out>,
             vessels: BTreeMap::new(),
             wanted: BTreeMap::new(),
             answered: false,
@@ -393,9 +418,27 @@ impl<R: RunVessel> Supervisor<R> {
                 }
             }
             let (runner, stop, run_vc) = (self.runner.clone(), Stop::new(), slot.vc.clone());
-            let handle = {
+            let spawned = {
                 let (stop, run_vc) = (stop.clone(), run_vc.clone());
-                std::thread::spawn(move || runner.run(&run_vc, &stop))
+                (self.spawn)(Box::new(move || runner.run(&run_vc, &stop)))
+            };
+            // Not `std::thread::spawn`: it panics when the OS refuses a
+            // thread, and the supervisor unwound with agents live
+            // (finding 10).  A refused thread is a start that failed:
+            // nothing ran, and it is tried again after the backoff.
+            let handle = match spawned {
+                Ok(h) => h,
+                Err(e) => {
+                    slot.streak += 1;
+                    let wait = self.timing.backoff(slot.streak);
+                    slot.state = State::Waiting(now + wait);
+                    on_event(Event::NotStarted {
+                        vc: run_vc,
+                        error: e.to_string(),
+                        restart_in: wait,
+                    });
+                    continue;
+                }
             };
             on_event(Event::Started(run_vc.clone()));
             slot.state = State::Running {
@@ -648,6 +691,7 @@ mod tests {
         Started(String),
         Exited(String, bool, bool),
         Panicked(String, bool),
+        NotStarted(String),
         Stopping(String),
         Refused(String),
         SourceFailed,
@@ -663,6 +707,7 @@ mod tests {
                 ..
             } => E::Exited(vc.subject, stopped, restart_in.is_some()),
             Event::Panicked { vc, restart_in } => E::Panicked(vc.subject, restart_in.is_some()),
+            Event::NotStarted { vc, .. } => E::NotStarted(vc.subject),
             Event::Stopping(v) => E::Stopping(v.subject),
             Event::Refused(r) => E::Refused(r.subject),
             Event::SourceFailed(_) => E::SourceFailed,
@@ -699,6 +744,43 @@ mod tests {
     }
 
     // ── finite source: today's taso-wardend ─────────────────────────
+
+    /// The OS refuses the first run's thread, then gives the next.
+    fn refused_once<O: Send + 'static>(
+        run: Box<dyn FnOnce() -> O + Send>,
+    ) -> std::io::Result<JoinHandle<O>> {
+        static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !REFUSED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::from_raw_os_error(11)); // EAGAIN
+        }
+        spawn_thread(run)
+    }
+
+    /// Finding 10 (2026-11-28): `std::thread::spawn` panicked when the OS
+    /// refused a thread, and the supervisor unwound with agents live.  A
+    /// refused thread is a start that failed: reported, tried again after
+    /// the backoff even under `never` (nothing ran), and the loop goes on.
+    #[test]
+    fn a_refused_thread_is_a_start_tried_again_not_a_panic() {
+        let f = Fake::with(&[("a", &[Act::Exit(Some(true))])]);
+        let mut src = Scripted {
+            steps: [Ok(Some(vec![vc("a", 0, Restart::Never)]))].into(),
+            finite: true,
+        };
+        let mut sup = supervisor(&f);
+        sup.spawn = refused_once::<Out>;
+        let mut ev = Vec::new();
+        sup.run(&mut src, &Stop::new(), |e| ev.push(simple(e)));
+        assert_eq!(
+            ev,
+            [
+                E::NotStarted("a".into()),
+                E::Started("a".into()),
+                E::Exited("a".into(), false, false)
+            ]
+        );
+        assert_eq!(f.runs_of("a").len(), 1, "ran once, after the refusal");
+    }
 
     #[test]
     fn a_finite_source_runs_each_vessel_once_and_returns() {

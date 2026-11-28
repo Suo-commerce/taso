@@ -449,6 +449,17 @@ fn report(
             );
             last.insert(vc.subject.clone(), false);
         }
+        Event::NotStarted {
+            vc,
+            error,
+            restart_in,
+        } => {
+            eprintln!(
+                "taso-wardend[{w}] {}: could not start: the system refused a thread ({error}); trying again in {restart_in:?}",
+                vc.subject
+            );
+            last.insert(vc.subject.clone(), false);
+        }
         Event::Refused(r) => {
             println!("{}: refused: {}", r.subject, r.reason);
             last.entry(r.subject.clone()).or_insert(false);
