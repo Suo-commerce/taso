@@ -308,9 +308,7 @@ impl LocalStore {
                 match FileType::from_raw_mode(st.st_mode as _) {
                     FileType::Directory => todo.push(child),
                     FileType::RegularFile => {
-                        let t = std::time::UNIX_EPOCH
-                            + std::time::Duration::new(st.st_mtime as u64, st.st_mtime_nsec as u32);
-                        keys.push((child, t));
+                        keys.push((child, file_time(st.st_mtime, st.st_mtime_nsec as i64)));
                     }
                     _ => return Err(Self::not_an_object(&child)),
                 }
@@ -319,6 +317,24 @@ impl LocalStore {
         keys.sort();
         Ok(keys)
     }
+}
+
+/// The time `sec` seconds and `nsec` nanoseconds after the epoch (before
+/// it, for negative `sec`), as the kernel gives a file's mtime.  One the
+/// clock cannot hold is the epoch.  A file written before 1970 (a clock
+/// set wrong, an archive's dates) made the walk panic: the seconds were
+/// cast to unsigned and added to the epoch (the maturity review,
+/// `ship.rs:311-312`).
+fn file_time(sec: i64, nsec: i64) -> std::time::SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
+    let whole = if sec >= 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(sec.unsigned_abs()))
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(sec.unsigned_abs()))
+    };
+    whole
+        .and_then(|t| t.checked_add(Duration::from_nanos(nsec.clamp(0, 999_999_999) as u64)))
+        .unwrap_or(UNIX_EPOCH)
 }
 
 /// Whether `name` is a put's temp file (`.tmp-<pid>-<n>`) whose process
@@ -501,6 +517,24 @@ mod tests {
 
     /// Review fix 2a: the local store lists every object with when it was
     /// last written; a put again makes it new.
+    /// The maturity review (`ship.rs:311`): an object whose mtime is
+    /// before 1970 made the listing panic.  It is listed, with its time.
+    #[test]
+    fn an_object_written_before_1970_is_listed_with_its_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put("p/old", &mut &b"x"[..]).unwrap();
+        use std::time::{Duration, UNIX_EPOCH};
+        let old = UNIX_EPOCH - Duration::new(315_619_200, 500_000_000); // 1960
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join("p/old"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(store.list_times("p").unwrap(), [("p/old".to_string(), old)]);
+    }
+
     #[test]
     fn list_times_gives_each_object_its_last_write() {
         let dir = tempfile::tempdir().unwrap();
