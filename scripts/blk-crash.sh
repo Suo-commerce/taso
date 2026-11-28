@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# blk-crash.sh: K1 of the block log spike, correctness under crash.
+# blk-crash.sh: K1, the block log's correctness under crash.
 #
 # Each round: start taso-blkd on the same log, attach the branch, mount
 # (ext4 replays its journal), unmount, fsck must be clean, mount again and

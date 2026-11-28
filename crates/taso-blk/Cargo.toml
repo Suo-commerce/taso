@@ -1,6 +1,6 @@
 [package]
 name = "taso-blk"
-description = "Taso block log spike: a userspace block device whose fork is a parent pointer (Phase 4 slice, plan 2026-10-18)."
+description = "Taso block log: a userspace block device over one append-only log, whose Seal is a frozen layer and whose fork is a parent pointer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

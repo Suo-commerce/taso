@@ -1,4 +1,4 @@
-//! `taso-blkd`: the block log spike's daemon (spike file 3).
+//! `taso-blkd`: the block log's daemon.
 //!
 //! Serves branches of one [`Store`] as Linux block devices over ublk, so
 //! ext4 can sit on top.  One device per attached branch; one log for all.

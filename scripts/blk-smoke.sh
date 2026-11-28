@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# blk-smoke.sh: end-to-end smoke test of taso-blkd (block log spike).
+# blk-smoke.sh: end-to-end smoke test of taso-blkd, the block log.
 #
 # Proves the I/O path through real ublk devices: ext4 on a branch, a Seal
 # taken under fsfreeze, a fork of that Seal seeing the sealed bytes while

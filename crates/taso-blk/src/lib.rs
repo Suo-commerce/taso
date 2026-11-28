@@ -1,8 +1,9 @@
-//! Taso block log spike (plan `Taso_plan_blocklog_spike_2026-10-18`).
+//! The Taso block log: the storage of every Vessel on a node.
 //!
-//! A thin slice of Phase 4 on local storage: a block device whose writes
-//! go to a log, whose Seal is a frozen layer at a flush point, and whose
-//! fork is a parent pointer.  ext4 sits on top and never knows.
+//! A block device whose writes go to one append-only log, whose Seal is a
+//! frozen layer at a flush point, and whose fork is a parent pointer.
+//! ext4 sits on top and never knows.  The Warden is its only user
+//! (`taso-warden`'s `blk` module).
 //!
 //! - [`map`]: which log location holds each block of each branch and Seal.
 //! - [`store`]: the append-only log holding the blocks and the map, group
@@ -11,9 +12,6 @@
 //! - [`client`]: a client for the daemon's control socket, for the Warden.
 //! - [`holders`]: who holds a mount or a block device, for a refusal that
 //!   says so.
-//!
-//! Not wired into the Warden.  Judged against the spike's pass and kill
-//! criteria; deleted if a kill criterion is hit.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# blk-bench.sh: K2-K7 of the block log spike, measured against ext4 on a
+# blk-bench.sh: K2-K7 of the block log, measured against ext4 on a
 # loop device on the same disk.
 #
 #   sudo scripts/blk-bench.sh [--quick] [path/to/taso-blkd]   (default target/release/taso-blkd)
@@ -29,7 +29,8 @@
 # Warden's journal-less ext4 only) a journal's commit is answered before any
 # sync, so the fsync and freeze rows would measure a device that does not
 # keep the contract (spec rev. 38, D&D F (a); blk-crash.sh's K1, 2026-11-06).
-# The pass/kill lines are the ones in the spike plan (section 2).
+# The pass/kill lines are the ones the block log was first judged by
+# (its plan of 2026-10-18, section 2).
 #
 # Exit status (maturity review of e4a37b2, finding 12; G-d (a)): 1 if any
 # verdict is KILL, the plan's own line for "not acceptable"; "between" is
@@ -426,7 +427,7 @@ def verdict(name, value, ok, kill, note=""):
     v = "PASS" if ok else ("KILL" if kill else "between")
     if v == "KILL": kills.append(name)
     print(f"{name:3} {v:8} {value}{'  (' + note + ')' if note else ''}")
-print("\nverdicts (spike plan section 2):")
+print("\nverdicts (the block log plan of 2026-10-18, section 2):")
 k2 = get("K2"); p95 = float(k2["branch_p95_ms"])
 verdict("K2", f"fork (branch in the map) p95 {p95} ms", p95 < 5, p95 > 50,
         f"a device when mounting: attach p95 {k2['attach_p95_ms']} ms, detach p95 {k2['detach_p95_ms']} ms")

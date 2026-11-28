@@ -195,8 +195,8 @@ pub use compact::{Compacted, Compaction, OldLog};
 
 const FILE_MAGIC: &[u8; 8] = b"TASOBLK4";
 /// The formats before the header had a version, an identity or a
-/// checksum: the spike's (1), and the plain (2) and compacted (3) logs up
-/// to main e4a37b2.  Refused by name; there is no migration.
+/// checksum: the first prototype's (1), and the plain (2) and compacted
+/// (3) logs up to main e4a37b2.  Refused by name; there is no migration.
 const OLD_MAGICS: [&[u8; 8]; 3] = [b"TASOBLK1", b"TASOBLK2", b"TASOBLK3"];
 /// The number of this format, in the header.  A log with a larger one was
 /// written by a newer version and is refused.
