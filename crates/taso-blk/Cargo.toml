@@ -11,6 +11,9 @@ default = ["daemon"]
 # Warden's Pool and Layers use the store types and the client), so they do
 # not build libublk and its bindgen/clang build dependency.
 daemon = ["dep:libublk", "dep:libc"]
+# The crash harness's holds (taso_core::hold): off in a release build;
+# E3 builds taso-blkd with it on.
+test-hooks = ["taso-core/test-hooks"]
 
 [[bin]]
 name = "taso-blkd"
