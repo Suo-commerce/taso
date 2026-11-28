@@ -283,6 +283,13 @@ Each Vessel's entry says which:
 A held action that nobody decides stays held and fills the Vessel's
 outbox (8 MiB), so decide each one.
 
+An action your sender reported `unknown` (it cannot tell whether the
+action happened) stays open and withholds the Vessel's later actions
+until the sender answers it or you do, while the Vessel runs:
+`taso-ctl resolve <vessel> <op> applied|not-applied|unknown reason…`.
+`unknown` closes it without saying whether it happened; it is never sent
+again ([docs/relay.md](docs/relay.md)).
+
 **Read before running an agent:**
 
 - Taso records; it does not police. Its guarantee holds only when every
