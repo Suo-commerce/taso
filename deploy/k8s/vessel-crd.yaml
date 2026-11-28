@@ -1,9 +1,10 @@
 # The Vessel custom resource (plan: claude/Taso_plan_k8s_docker_2026-10-17.md, K1).
 #
 # Kubernetes stores the intent; the Warden owns the agent.  A Vessel names
-# what to run and on which node; the taso-wardend DaemonSet pod on that node
-# watches Vessels with `spec.node` = its node, starts and stops the agent
-# itself (under runc/runsc, inside its own pod), and reports `status`.
+# what to run and on which node; the taso-wardend pod on that node lists the
+# Vessels with `spec.node` = its node every 2 s (a full list, not a watch),
+# starts and stops the agent itself (under runc, inside its own pod), and
+# reports `status`.
 # There is no pod per agent and no volume: Vessel data is reachable only
 # through the Warden (v1.0 §7, negative space).
 #
@@ -16,16 +17,20 @@
 #
 # Moving a Vessel (rebirth on another node) is an operator action: set
 # spec.node to the new node and spec.takeover to the holder and epoch being
-# replaced, as status.holder and status.epoch show them.  The takeover is
+# replaced.  status.holder shows the holder, but status.epoch is not written
+# yet: set spec.node first, and the new node's Warden refuses the start with
+# a status.message that names the holder and the epoch to copy into
+# spec.takeover.  The takeover is
 # one-shot by construction: it names the epoch it replaces, so once the
 # epoch has moved it refuses itself (fencing review F1/F2: the Warden checks
 # it with a conditional transfer).  A standing "takeover: true" does not
 # exist on purpose.
 #
-# Not yet carried by the daemon (K2 adds them): per-Vessel rootfs, args, env
-# and limits (the daemon config has them per node today), and the watch
-# itself.  Names of fields follow Kubernetes conventions (camelCase); the
-# daemon's JSON config uses snake_case for the same values.
+# The Warden reads every spec field below.  Not written yet: status.epoch,
+# status.lastSeal and status.shippedAnchor (the Turn column stays empty).
+# Only this CRD ships: no DaemonSet, RBAC or coordinator manifests yet.
+# Names of fields follow Kubernetes conventions (camelCase); the daemon's
+# JSON config uses snake_case for the same values.
 #
 # Group: taso.suocommerce.com (a domain the project owns).
 apiVersion: apiextensions.k8s.io/v1
@@ -185,7 +190,10 @@ spec:
                     One-shot takeover: fence the named holder at the named
                     epoch and take the Vessel over on spec.node.  Refused if
                     the holder or epoch has changed since (a stale takeover
-                    refuses itself).  Copy both from status.
+                    refuses itself).  Copy both from status: the holder
+                    from status.holder, the epoch from the status.message
+                    of the refused start on the new node (status.epoch is
+                    not written yet).
                   required: [holder, epoch]
                   properties:
                     holder:
@@ -196,7 +204,7 @@ spec:
                     epoch:
                       type: integer
                       format: int64
-                      description: Its epoch (status.epoch).
+                      description: Its epoch, as the refused start's status.message names it.
                       minimum: 1
                 rootfs:
                   type: object
@@ -269,7 +277,7 @@ spec:
                 epoch:
                   type: integer
                   format: int64
-                  description: The holder's epoch at the coordinator.
+                  description: The holder's epoch at the coordinator (not written yet).
                 start:
                   type: string
                   description: How the last start went (Birth, Open, Rebirth).
