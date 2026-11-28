@@ -53,12 +53,14 @@
 # Rows added for P3 file 11, predictions written before the first run
 # (2026-10-22):
 #   R9 field-fork  phase 4: the parent's log says it forked
-#                  "parent-fork-3" (uid slot 3) at its last Seal on its
-#                  agent's request; the agent got that child, then "no fork
-#                  slot left"; the child ran in slot 3 over the lineage's
-#                  files (idmapped), continued the parent's turns, its
-#                  effect held (none released), its own 2 asks refused
-#                  ("may not fork"); the Warden exits 0
+#                  "parent-fork-3" (uid slot 3 and its host uids) at its
+#                  last Seal on its agent's request; the agent got that
+#                  child, then "no fork slot left"; the child ran in slot 3
+#                  over the lineage's files (idmapped), continued the
+#                  parent's turns, its effect held (none released), its own
+#                  2 asks refused ("may not fork"); its end is logged with
+#                  its slot and host uids (F-a, 2026-11-28); the Warden
+#                  exits 0
 #   R10 promote    phase 5: the promotion adopts exactly the child's 1
 #                  proposal and ends the run; the Warden starts the parent
 #                  again and first adopts the child's files as its adoption
@@ -99,6 +101,8 @@ OUT=${OUT:-/root/taso-f6-fork-$(date +%Y%m%d-%H%M%S)}
 RUN=$(date +%Y%m%d%H%M%S)-$$
 BLK_SOCK=/run/taso/blk.sock
 BASE=200000
+# A slot as the Warden's log names it (F-a): its host uid range.
+slot_text() { echo "uid slot $1, host uids $((BASE + $1 * 65536))-$((BASE + $1 * 65536 + 65535))"; }
 RANGE=65536
 A=$((BASE + 1 * RANGE))   # slot 1: the parent, and the lineage's disk range
 B=$((BASE + 2 * RANGE))   # slot 2: the child
@@ -430,7 +434,8 @@ print("PASS (child at Seal lsn %d, held 1, quota and child refusals)" % lsn if n
 PY
 )
 if [ "$rc4" != 0 ]; then r9="FAIL (exit $rc4; ${r9})"
-elif ! grep -q "parent: forked \"parent-fork-3\" (uid slot 3) at Seal lsn $P4_LSN on its agent's request" "$OUT/phase4.err"; then r9="FAIL (no fork logged at lsn $P4_LSN; ${r9})"
+elif ! grep -q "parent: forked \"parent-fork-3\" ($(slot_text 3)) at Seal lsn $P4_LSN on its agent's request" "$OUT/phase4.err"; then r9="FAIL (no fork logged at lsn $P4_LSN; ${r9})"
+elif ! grep -q "parent-fork-3: fork \"parent-fork-3\" ($(slot_text 3)) ended: .*; the slot stays taken" "$OUT/phase4.err"; then r9="FAIL (the fork's end not logged with its slot; ${r9})"
 elif ! grep -q "parent-fork-3: its files are its lineage's range ($A): /work is idmapped" "$OUT/phase4.err"; then r9="FAIL (the child was not run idmapped; ${r9})"
 fi
 row R9 "$r9"
@@ -481,7 +486,7 @@ else:
 PY
 )
 if [ "$rc6$rc7$rc8" != 000 ]; then r11="FAIL (exits $rc6 $rc7 $rc8; ${r11})"
-elif ! grep -q "parent: forked \"parent-fork-4\" (uid slot 4)" "$OUT/phase6.err"; then r11="FAIL (no fork-4 in phase 6; ${r11})"
+elif ! grep -q "parent: forked \"parent-fork-4\" ($(slot_text 4))" "$OUT/phase6.err"; then r11="FAIL (no fork-4 in phase 6; ${r11})"
 elif ! grep -q "parent: promotion of \"parent-fork-4\" refused: cannot promote: this vessel sealed again" "$OUT/phase8.err"; then r11="FAIL (no refusal logged; ${r11})"
 fi
 row R11 "$r11"
