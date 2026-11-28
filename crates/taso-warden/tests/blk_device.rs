@@ -141,11 +141,13 @@ fn vessels_on_real_devices() {
         .mountpoint
         .unwrap();
     assert!(mp.starts_with(&mounts));
-    assert!(
-        mount_options(&mp).split(',').any(|o| o == "discard"),
-        "mounted -o discard: {}",
-        mount_options(&mp)
-    );
+    for want in ["discard", "nosuid", "nodev"] {
+        assert!(
+            mount_options(&mp).split(',').any(|o| o == want),
+            "mounted -o {want}: {}",
+            mount_options(&mp)
+        );
+    }
     let birth = v.seal_birth().unwrap().seal;
 
     // A file, then a Seal (ext4 frozen for it), then a change after it.
@@ -481,11 +483,13 @@ fn seal_views_and_destroy_on_real_devices() {
 
     let view = pool.seal_view(&ds, Lsn::new(3)).unwrap();
     assert_eq!(std::fs::read(view.path().join("a")).unwrap(), b"sealed");
-    assert!(
-        mount_options(view.path()).split(',').any(|o| o == "ro"),
-        "mounted read-only: {}",
-        mount_options(view.path())
-    );
+    for want in ["ro", "nosuid", "nodev"] {
+        assert!(
+            mount_options(view.path()).split(',').any(|o| o == want),
+            "mounted -o {want}: {}",
+            mount_options(view.path())
+        );
+    }
     assert!(std::fs::write(view.path().join("b"), b"x").is_err());
     let g = pool.guid(&ds).unwrap().unwrap();
     assert!(
