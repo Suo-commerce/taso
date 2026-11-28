@@ -182,7 +182,7 @@ pub fn run_capped(
     // EOF once the child and everything it started have closed theirs.
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let reading = std::thread::spawn(move || -> io::Result<(Vec<u8>, bool)> {
+    let read = move || -> io::Result<(Vec<u8>, bool)> {
         let mut out = Vec::new();
         let mut r = reader;
         let mut buf = [0u8; 8192];
@@ -200,7 +200,25 @@ pub fn run_capped(
             }
         }
         Ok((out, over))
-    });
+    };
+    // Not `std::thread::spawn`, which panics when the OS refuses a thread
+    // (the maturity review's finding 10, checked around): the child is
+    // stopped and reaped before the error, so no verifier runs on with
+    // no one reading it.
+    let reading = match spawn_reader(read) {
+        Ok(h) => h,
+        Err(e) => {
+            loop {
+                kill(pid);
+                if !matches!(child.try_wait(), Ok(None)) {
+                    break;
+                }
+                std::thread::sleep(KILL_AGAIN);
+            }
+            cmd_stdio_guard(cmd);
+            return Err(e);
+        }
+    };
     let start = Instant::now();
     let mut ended = None;
     // When the kill was last asked for.
@@ -247,6 +265,26 @@ pub fn run_capped(
     Ok((ended, out))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the OS refuses [`run_capped`]'s reader thread.
+    static REFUSE_READER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`run_capped`]'s output reader on a thread of its own, or the OS's
+/// refusal.
+fn spawn_reader<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> io::Result<std::thread::JoinHandle<T>> {
+    #[cfg(test)]
+    if REFUSE_READER.with(|r| r.get()) {
+        return Err(io::Error::from_raw_os_error(11)); // EAGAIN
+    }
+    std::thread::Builder::new()
+        .name("verifier output".into())
+        .spawn(read)
+}
+
 /// Drop the `Command`'s own handles to the pipe (it keeps the `Stdio`s it
 /// was given until it is dropped or reconfigured).
 fn cmd_stdio_guard(cmd: &mut Command) -> &mut Command {
@@ -281,6 +319,40 @@ mod tests {
             .arg("-KILL")
             .arg(pid.to_string())
             .status();
+    }
+
+    /// Finding 10, checked around: the OS refuses the output reader's
+    /// thread.  An error, not a panic, and the verifier is stopped and
+    /// reaped first, not left running unread.
+    #[test]
+    fn a_refused_reader_thread_stops_the_verifier_and_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        REFUSE_READER.with(|r| r.set(true));
+        let t = Instant::now();
+        let got = run_capped(
+            &mut sh(&format!("echo $$ > {}; exec sleep 30", pidfile.display())),
+            Duration::from_secs(60),
+            64,
+            &kill,
+        );
+        REFUSE_READER.with(|r| r.set(false));
+        assert_eq!(got.unwrap_err().raw_os_error(), Some(11));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // The verifier: gone, not running on unread.  One killed before
+        // its shell wrote its pid leaves no file; one never killed writes
+        // it within the wait, and runs on.
+        std::thread::sleep(Duration::from_millis(500));
+        if let Some(pid) = std::fs::read_to_string(&pidfile)
+            .ok()
+            .filter(|p| p.ends_with('\n'))
+        {
+            let pid = pid.trim();
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "the verifier {pid} is still running"
+            );
+        }
     }
 
     #[test]
