@@ -9,9 +9,11 @@ happened, and lets you choose afterwards.
 
 An agent works on files and databases, and it makes mistakes. Taso gives
 each agent its own workspace on an ordinary Linux filesystem and keeps a
-complete, tamper-evident history of everything written to it. The agent
-needs no changes: its files and its SQLite database work as they do on
-any disk.
+complete, tamper-evident history of everything written to it. The
+agent's files and its SQLite database work as they do on any disk. The
+one change an agent needs is a single message on its Taso socket at the
+end of each turn, which takes the checkpoint; the same socket is where
+it asks for branches and outside actions, if it wants them.
 
 On top of that history you get four things:
 
