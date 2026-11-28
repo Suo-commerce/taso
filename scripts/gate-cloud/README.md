@@ -93,8 +93,8 @@ On the **hub**, the driver's key and the S3 settings:
 
 On the **hub**, from `/root/taso` on the branch under test:
 ```
-TASO_BLK_S3_ENDPOINT=https://s3.fr-par.scw.cloud TASO_BLK_S3_REGION=fr-par \
-TASO_BLK_S3_BUCKET=taso-packs-suo TASO_BLK_S3_ACCESS_KEY_ID=$(cat /root/s3-key-id) \
+TASO_BLK_S3_ENDPOINT=https://<your S3 endpoint> TASO_BLK_S3_REGION=<its region> \
+TASO_BLK_S3_BUCKET=<your bucket> TASO_BLK_S3_ACCESS_KEY_ID=$(cat /root/s3-key-id) \
 A_HOST=root@<taso-a utility ip> B_HOST=root@<taso-b utility ip> \
 scripts/gate-p2-blk.sh
 ```
