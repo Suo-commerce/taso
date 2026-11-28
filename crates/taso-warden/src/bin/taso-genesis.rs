@@ -44,7 +44,9 @@
 //! eight `genesis.*` names of §10.2.  `TASO_LOSE_REPLY=<record>` lets the
 //! coordinator accept that record (`GenesisStarted`, `GenesisRefused`,
 //! `TemplateReady` or `GenesisCleanedUp`) and exits with status 9 before
-//! the reply is used: the accept happened, nobody heard of it.
+//! the reply is used: the accept happened, nobody heard of it.  Both are
+//! read only in a build with the `test-hooks` feature
+//! ([`taso_warden::hooks`]); a release build ignores them and says so.
 //!
 //! Normative reference: `Taso_spec_p4_contracts` rev. 14, BLAKE3
 //! `0d964e34a75a6c46cd3fcac21c752f863b1a6b431f325e1600e6a00cf1d30ba5`.
@@ -106,27 +108,27 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let failpoint = match std::env::var("TASO_FAILPOINT") {
-        Ok(p) if !FAILPOINTS.contains(&p.as_str()) => {
+    let failpoint = match taso_warden::hooks::env("TASO_FAILPOINT") {
+        Some(p) if !FAILPOINTS.contains(&p.as_str()) => {
             eprintln!(
                 "taso-genesis: TASO_FAILPOINT={p:?} is not one of {}",
                 FAILPOINTS.join(", ")
             );
             return ExitCode::from(2);
         }
-        Ok(p) => Some(p),
-        Err(_) => None,
+        Some(p) => Some(p),
+        None => None,
     };
-    let lose_reply = match std::env::var("TASO_LOSE_REPLY") {
-        Ok(r) if !RECORDS.contains(&r.as_str()) => {
+    let lose_reply = match taso_warden::hooks::env("TASO_LOSE_REPLY") {
+        Some(r) if !RECORDS.contains(&r.as_str()) => {
             eprintln!(
                 "taso-genesis: TASO_LOSE_REPLY={r:?} is not one of {}",
                 RECORDS.join(", ")
             );
             return ExitCode::from(2);
         }
-        Ok(r) => Some(r),
-        Err(_) => None,
+        Some(r) => Some(r),
+        None => None,
     };
     let config = match std::fs::read_to_string(&cmd.config)
         .map_err(|e| e.to_string())
