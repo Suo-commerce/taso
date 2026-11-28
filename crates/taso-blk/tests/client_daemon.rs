@@ -328,8 +328,13 @@ fn the_daemon_works_when_its_log_cannot_be_written() {
 /// every attach in progress).  A call about the held branch itself waits
 /// for it: its `reset` is refused only once the attach has ended, as
 /// attached or not.  Without root and ublk the attach then fails; either
-/// way the table settles.
+/// way the table settles.  The hold is a test hook: only with the
+/// `test-hooks` feature (`scripts/gate-unit.sh` runs it so).
 #[test]
+#[cfg_attr(
+    not(feature = "test-hooks"),
+    ignore = "the attach's hold needs the test-hooks feature"
+)]
 fn an_attach_holds_up_no_call_about_another_branch() {
     let dir = tempfile::tempdir().unwrap();
     let (log, sock, holds) = (
