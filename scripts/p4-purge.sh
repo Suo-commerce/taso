@@ -130,7 +130,9 @@ mkdir -p "$MNT"
 [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 
 say "building"
-cargo build -q --release -p taso-warden -p taso-sim -p taso-landlock --bins
+# This gate uses test hooks (TASO_FAILPOINT, TASO_LOSE_REPLY or TASO_E3_HOLD), read only
+# in a build with the test-hooks feature (step 8, 8-10 (a)).
+cargo build -q --release -p taso-warden -p taso-sim -p taso-landlock --bins --features taso-warden/test-hooks
 cargo build -q --release -p taso-blk
 BIN=$PWD/target/release
 for b in taso-wardend taso-genesis taso-coordd taso-logcheck taso-sim taso-landlock taso-decide taso-policy taso-ctl; do

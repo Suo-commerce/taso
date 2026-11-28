@@ -99,7 +99,9 @@ mkdir -p "$MNT"
 [[ -z "$(mounts_under)" ]] || die "something is already mounted under $MNT"
 
 say "building"
-cargo build -q --release -p taso-warden --bin taso-genesis --bin taso-coordd --bin taso-logcheck
+# This gate uses test hooks (TASO_FAILPOINT, TASO_LOSE_REPLY or TASO_E3_HOLD), read only
+# in a build with the test-hooks feature (step 8, 8-10 (a)).
+cargo build -q --release -p taso-warden --bin taso-genesis --bin taso-coordd --bin taso-logcheck --features taso-warden/test-hooks
 cargo build -q --release -p taso-blk
 
 rm -rf "$W"
