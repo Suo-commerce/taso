@@ -9,6 +9,7 @@
 //! taso-ctl proposals <vessel> [--config PATH]
 //! taso-ctl approve <vessel> <op> [--config PATH]
 //! taso-ctl deny <vessel> <op> [reason…] [--config PATH]
+//! taso-ctl block-log pair --id <log id> [--config PATH]
 //! taso-ctl <warden-config> explain <vessel or template id (32 hex) | candidate id (64 hex)>
 //! ```
 //!
@@ -101,16 +102,27 @@
 //! unresolved, not shipped), or `{…, "error": "<why>"}` when it could not
 //! answer now: the same command may be run again.
 //!
+//! # `block-log pair`
+//!
+//! The node's operator pairs the Warden with the block log its config
+//! serves (P4 spec D102; W-d, W-f), after the Warden refused to start on
+//! a log of another id that holds its Vessels.  The id must be typed, the
+//! one the Warden's refusal named, and must be the log's own.  Run with
+//! the Warden stopped.  At their next start, Vessels whose datasets are
+//! not on this log are rebuilt from the store; what they had not shipped
+//! is lost (W-e).
+//!
 //! # Exit status
 //!
 //! 0 done (`explain`: every check held; `status`: the block log answers;
 //! `proposals`: the Warden answered; `approve`, `deny`: taken, now or
-//! before);
+//! before; `block-log pair`: paired, now or before);
 //! 1 it could not be done (`explain`: no such id, the coordinator or the
 //! store unreachable; `status`: the block log does not answer; `init`,
 //! `demo`: a write failed; `proposals`, `approve`, `deny`: the Warden
 //! does not answer, cannot answer for that Vessel, or refused: its line
-//! says which and why); 2 a bad command line or configuration (`demo`:
+//! says which and why; `block-log pair`: the block log does not answer,
+//! has another id, or the pairing could not be written); 2 a bad command line or configuration (`demo`:
 //! no config, or no rootfs in it); 3 `init`
 //! refused the host; 4 `explain`ed, a check failed (something changed
 //! after it was accepted).
