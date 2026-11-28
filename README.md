@@ -22,9 +22,11 @@ On top of that history you get four things:
   another agent (or a sub-agent) try something there. Nothing is copied
   up front, so a branch starts in an instant, however much data the
   workspace holds.
-- **Merge by choice.** A branch changes nothing in its parent until
-  someone outside the agent decides to merge it. A branch nobody merges
-  simply goes away, with no trace in the parent.
+- **Merge by choice.** A branch changes nothing in its parent until it
+  is merged: by the parent agent's own request, or by you. A branch
+  nobody merges simply goes away, with no trace in the parent. A merged
+  branch's outside actions arrive in the parent still held, so with
+  `"effects": "hold"` nothing it asked for goes out until you approve it.
 - **Restore anywhere.** Every checkpoint is shipped to object storage (a
   local directory or an S3-compatible bucket). If a machine is lost,
   another machine rebuilds the workspace from the bucket, and the old
