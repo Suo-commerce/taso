@@ -506,6 +506,17 @@ fn fs_freeze_call(dir: &Path, request: u32) -> io::Result<()> {
     }
 }
 
+/// A Vessel's file system as the host mounts it (see `discard` in
+/// [`System::mount`]).  `nosuid,nodev` (the maturity review,
+/// `blk.rs:369-383`): its files are the agent's, or a genesis restore's
+/// written as host uid 0, and a setuid file or a device node in it was
+/// one on the host, through this mount, for anyone who could reach it
+/// (the container's own bind of it was already `nosuid,nodev`).
+pub const HOST_MOUNT_RW: &str = "discard,nosuid,nodev";
+
+/// A Seal's view as the host mounts it: read-only, `nosuid,nodev` too.
+pub const HOST_MOUNT_RO: &str = "ro,nosuid,nodev";
+
 impl Mounts for System {
     fn mkfs(&self, dev: &Path) -> io::Result<()> {
         // nodiscard: a fresh branch reads zeros already; discarding the
@@ -528,13 +539,16 @@ impl Mounts for System {
         // ext4 ever wrote stays live, so compaction cannot drop it and
         // Seals and shipped packs carry it.
         run(Command::new("mount")
-            .args(["-o", "discard"])
+            .args(["-o", HOST_MOUNT_RW])
             .arg(dev)
             .arg(dir))
     }
     fn mount_ro(&self, dev: &Path, dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        run(Command::new("mount").args(["-o", "ro"]).arg(dev).arg(dir))
+        run(Command::new("mount")
+            .args(["-o", HOST_MOUNT_RO])
+            .arg(dev)
+            .arg(dir))
     }
     fn source(&self, dir: &Path) -> io::Result<Option<PathBuf>> {
         Ok(mount_source(
