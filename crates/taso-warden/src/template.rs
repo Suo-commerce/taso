@@ -623,13 +623,22 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
     ) -> Result<u64, TemplateError> {
         let marker = self.marker(key);
         if self.pool.info(ds).map_err(TemplateError::Pool)?.is_some() {
-            // Bound to this key already?  `receive` of a Seal that is
-            // there binds and returns without reading.
-            match self
-                .pool
-                .receive(ds, None, (LAYER_LSN, key), &mut io::empty())
-            {
-                Ok(g) => {
+            // What the dataset holds decides, never a failure to ask
+            // (the maturity review, `template.rs:625-657`; D&D T (a),
+            // 2026-11-28): any error of a probe was read as "bound to
+            // another layer", and a correct layer was destroyed.  Only a
+            // layer at lsn 1 bound to another record, or no layer at lsn 1
+            // (a receive cut short), is destroyed; a failure to ask is
+            // returned, and the dataset kept for the next call.
+            let held = self.pool.layers(ds).list().map_err(TemplateError::Pool)?;
+            match held.iter().find(|(lsn, _)| *lsn == LAYER_LSN) {
+                // Bound to this key: `receive` of a Seal that is there
+                // binds and returns without reading.
+                Some((_, h)) if *h == key => {
+                    let g = self
+                        .pool
+                        .receive(ds, None, (LAYER_LSN, key), &mut io::empty())
+                        .map_err(TemplateError::Pool)?;
                     if want.is_some_and(|w| w != g) {
                         return Err(TemplateError::Mismatch(format!(
                             "{ds} is bound to the accepted layer with guid {g}, not {}; left for an operator",
@@ -644,14 +653,19 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
                     self.mark(&marker, g)?;
                     return Ok(g);
                 }
-                Err(_) => {
+                found => {
                     let g = self.pool.guid(ds).map_err(TemplateError::Pool)?;
                     if let Some(g) = g {
                         self.pool.destroy(ds, g).map_err(TemplateError::Pool)?;
-                        notes.push(format!(
-                            "destroyed {ds} (guid {g}): bound to another layer than {}",
-                            hex(key.as_bytes())
-                        ));
+                        notes.push(match found {
+                            Some(_) => format!(
+                                "destroyed {ds} (guid {g}): bound to another layer than {}",
+                                hex(key.as_bytes())
+                            ),
+                            None => format!(
+                                "destroyed {ds} (guid {g}): it holds no layer at lsn 1 (a receive cut short)"
+                            ),
+                        });
                     }
                 }
             }
@@ -701,7 +715,8 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
     }
 
     /// The received layer's top directory is the Template range's and its
-    /// tree walks to the output manifest; else it is destroyed.
+    /// tree walks to the output manifest; if either is not so, it is
+    /// destroyed.  Any other failure is returned and the layer kept.
     fn check_or_destroy(&self, ds: &Dataset, def: &Definition) -> Result<(), TemplateError> {
         let checked = (|| -> Result<(), TemplateError> {
             use std::os::unix::fs::MetadataExt;
@@ -725,6 +740,13 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
             };
             let walked = classify::walk(view.path(), &def.map, owner, &self.limits, &self.reserved)
                 .map_err(TemplateError::Walk)?;
+            // A walk cut short by this node's limits (its deadline, a
+            // slow disk) says nothing of the layer.
+            if let Some(why) = walked.incomplete {
+                return Err(TemplateError::Walk(io::Error::other(format!(
+                    "the walk of {ds} stopped at this node's limit ({why:?}); the layer is kept and checked again"
+                ))));
+            }
             if !same_entries(&walked, &def.manifest) {
                 return Err(TemplateError::Mismatch(format!(
                     "{ds} does not walk to the Template's output manifest"
@@ -732,7 +754,12 @@ impl<P: Pool, X: Sender> TemplateLayers<P, X> {
             }
             Ok(())
         })();
-        if checked.is_err() {
+        // Only a definite answer destroys the layer: its walk finished and
+        // differs, or its owner is wrong (D&D T (a)).  A view that does not
+        // mount, a read that fails or a walk cut short leaves it, unmarked,
+        // to be checked again by the next call: such a failure destroyed a
+        // correct layer, received it again, and could go round for ever.
+        if matches!(checked, Err(TemplateError::Mismatch(_))) {
             self.destroy(ds)?;
         }
         checked
@@ -1572,6 +1599,78 @@ mod tests {
         assert!(matches!(n2.ensure(c.t0), Err(TemplateError::Mismatch(_))));
         assert!(n2.pool.info(&l.dataset).unwrap().is_none(), "destroyed");
         let l = n2.ensure(c.t0).unwrap();
+        present(&c, &n2, &l);
+    }
+
+    /// D&D T (a), 2026-11-28 (the maturity review, `template.rs:705-739`):
+    /// a check that could not finish (here the walk past this node's
+    /// deadline) destroyed a correct layer, which was received again, and
+    /// so on.  It is kept, unmarked, and checked again by the next call.
+    #[test]
+    fn a_check_that_cannot_finish_keeps_the_layer() {
+        let c = Cluster::new();
+        c.node(1).ensure(c.t0).unwrap();
+        let mut n2 = c.node(2);
+        n2.failpoint = fail_at("layer.after_receive");
+        assert!(matches!(n2.ensure(c.t0), Err(TemplateError::Failpoint(_))));
+        n2.failpoint = no_failpoints();
+        let ds = n2.layer_dataset(c.t0).unwrap();
+        let g = n2.pool.guid(&ds).unwrap().unwrap();
+        n2.limits.max_walk = std::time::Duration::ZERO;
+        let e = n2.ensure(c.t0).unwrap_err();
+        assert!(matches!(&e, TemplateError::Walk(_)), "{e}");
+        assert_eq!(n2.pool.guid(&ds).unwrap(), Some(g), "kept, the same layer");
+        n2.limits = Limits::default();
+        let l = n2.ensure(c.t0).unwrap();
+        assert_eq!(
+            n2.pool.guid(&l.dataset).unwrap(),
+            Some(g),
+            "checked, not received again"
+        );
+        present(&c, &n2, &l);
+    }
+
+    /// D&D T (a) (the maturity review, `template.rs:625-657`): any error
+    /// of the "is it bound?" probe was read as "bound to another layer",
+    /// and the layer destroyed.  Here its layers cannot be listed (a stray
+    /// entry): an error, the layer kept, and the next call finds it bound.
+    #[test]
+    fn a_probe_that_fails_keeps_the_layer() {
+        let c = Cluster::new();
+        c.node(1).ensure(c.t0).unwrap();
+        let n2 = c.node(2);
+        let l = n2.ensure(c.t0).unwrap();
+        let g = n2.pool.guid(&l.dataset).unwrap();
+        std::fs::remove_file(n2.marker(l.layer_key)).unwrap();
+        let stray = n2.pool.snaps(&l.dataset).join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        let e = n2.ensure(c.t0).unwrap_err();
+        assert!(matches!(&e, TemplateError::Pool(_)), "{e}");
+        assert_eq!(n2.pool.guid(&l.dataset).unwrap(), g, "kept");
+        std::fs::remove_dir(&stray).unwrap();
+        let l2 = n2.ensure(c.t0).unwrap();
+        assert_eq!(n2.pool.guid(&l2.dataset).unwrap(), g, "the same layer");
+        present(&c, &n2, &l2);
+    }
+
+    /// D&D T (a): what the dataset holds decides.  One left with no layer
+    /// at lsn 1 (a receive cut short) is destroyed and received again, as
+    /// before.
+    #[test]
+    fn a_dataset_with_no_layer_is_destroyed_and_received_again() {
+        let c = Cluster::new();
+        c.node(1).ensure(c.t0).unwrap();
+        let n2 = c.node(2);
+        let ds = n2.layer_dataset(c.t0).unwrap();
+        n2.pool.create(&ds).unwrap();
+        let l = n2.ensure(c.t0).unwrap();
+        assert!(
+            l.notes
+                .iter()
+                .any(|n| n.contains("holds no layer at lsn 1")),
+            "{:?}",
+            l.notes
+        );
         present(&c, &n2, &l);
     }
 
