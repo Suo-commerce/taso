@@ -38,8 +38,15 @@
 #   5 ublk_drv     loaded now and at boot (/etc/modules-load.d/taso-ublk.conf)
 #   6 the disk     GPT with one partition, the whole named NVMe:
 #                    taso-blk  -> ext4, mounted at /var/lib/taso by label
-#                                 (noatime; the block log, the packs, the
-#                                 benchmark scratch, TMPDIR)
+#                                 (noatime,lazytime; the block log, the
+#                                 packs, the benchmark scratch, TMPDIR)
+#                  lazytime: a write's modification time stays in memory, so
+#                  taso-blkd's writes into its reserve need no journal
+#                  handle; under relatime one waited for a slow journal
+#                  commit while it held the store's lock, and every Vessel
+#                  on the node waited with it (taso-test 2026-11-27: one
+#                  write 123.6 s; jbd2-probe 2026-11-28: under relatime
+#                  writes waited the disk's full delay, under lazytime none)
 #                  Until V4b (2026-11-06) the drive was split in two halves,
 #                  taso-zfs (a ZFS pool) and taso-blk, so the §3 comparison
 #                  was of the storage, not of two drives; with ZFS removed
@@ -267,8 +274,11 @@ EOF
         mkfs.ext4 -q -L taso-blk -E lazy_itable_init=0,lazy_journal_init=0 "$BLK_PART"
     fi
     mkdir -p "$DATA"
-    grep -q "^LABEL=taso-blk[[:space:]]" /etc/fstab || echo "LABEL=taso-blk $DATA ext4 defaults,noatime 0 2" >>/etc/fstab
+    grep -q "^LABEL=taso-blk[[:space:]]" /etc/fstab || echo "LABEL=taso-blk $DATA ext4 defaults,noatime,lazytime 0 2" >>/etc/fstab
+    # An earlier setup's line, without lazytime: given it (see step 6).
+    sed -i '/^LABEL=taso-blk[[:space:]]/{/lazytime/!s/noatime/noatime,lazytime/}' /etc/fstab
     mountpoint -q "$DATA" || { systemctl daemon-reload 2>/dev/null || true; mount "$DATA"; }
+    findmnt -no OPTIONS "$DATA" | grep -qw lazytime || mount -o remount,lazytime "$DATA"
     [[ "$(findmnt -no SOURCE "$DATA")" == "$(readlink -f "$BLK_PART")" ]] || die "$DATA is mounted from $(findmnt -no SOURCE "$DATA"), not $BLK_PART"
     mkdir -p "$DATA/tmp" "$DATA/taso-blk"; chmod 1777 "$DATA/tmp"
     # /var/lib/taso-blk: a bind mount of $DATA/taso-blk, never a symlink (runc
@@ -394,6 +404,14 @@ report() {
         pass "$DATA on $(findmnt -no SOURCE,FSTYPE,OPTIONS "$DATA"), $(df -h --output=avail "$DATA" | tail -1 | tr -d ' ') free"
     else
         bad "$DATA is not a mount point (the block log would be on the root disk)"
+    fi
+    # Whatever holds the block log (on taso-test, the root filesystem):
+    # lazytime, or a slow journal commit holds taso-blkd's store lock (step 6).
+    blk_opts=$(findmnt -no OPTIONS -T /var/lib/taso-blk 2>/dev/null || true)
+    if [[ ",$blk_opts," == *,lazytime,* ]]; then
+        pass "the block log's filesystem is mounted lazytime"
+    else
+        bad "the block log's filesystem is not mounted lazytime ($blk_opts): a write can wait for a slow journal commit while it holds taso-blkd's store lock, and every Vessel waits with it; mount -o remount,lazytime $(findmnt -no TARGET -T /var/lib/taso-blk 2>/dev/null), and add lazytime to its line in /etc/fstab"
     fi
     if [[ -L /var/lib/taso-blk ]]; then
         bad "/var/lib/taso-blk is a symlink (runc refuses a rootfs through one); setup replaces it with a bind mount"
