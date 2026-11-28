@@ -4865,14 +4865,26 @@ impl Node {
                         })
                         .map_err(|e| format!("Vessel {}: its ledger: {e}", id_hex(id)))
                         .and_then(|(mut fx, _)| done(fx.deny(vessel, OpId::new(op), why))),
+                    (Ruling::Resolve(resolution, why), Some(fx)) => {
+                        resolve_open(fx, vessel, op, *resolution, why, peer)
+                    }
+                    // Review fix R (a): on a running Vessel, whose
+                    // session holds what its sender was handed.
+                    (Ruling::Resolve(..), None) => Ok(Ruled::Refused(format!(
+                        "Vessel {} is not running on this node: an open effect is resolved while the Vessel runs",
+                        id_hex(id)
+                    ))),
                 };
                 eprintln!(
-                    "taso-wardend[{}] {}: {} of held op {op} from uid {} pid {}: {}",
+                    "taso-wardend[{}] {}: {} from uid {} pid {}: {}",
                     self.config.warden.get(),
                     id_hex(id),
                     match &ruling {
-                        Ruling::Approve => "approval".to_string(),
-                        Ruling::Deny(why) => format!("denial ({why:?})"),
+                        Ruling::Approve => format!("approval of held op {op}"),
+                        Ruling::Deny(why) => format!("denial ({why:?}) of held op {op}"),
+                        Ruling::Resolve(resolution, why) => {
+                            format!("resolution {resolution:?} ({why:?}) of open effect op {op}")
+                        }
                     },
                     peer.uid,
                     peer.pid,
@@ -6415,6 +6427,40 @@ impl Node {
             stopped,
             fenced: was_fenced,
         })
+    }
+}
+
+/// Review fix R (a): the operator's answer for the open effect `op` of
+/// a running Vessel, recorded with the peer's uid as its actor (the
+/// decider socket is the authentication).
+fn resolve_open<L: crate::chronicle::Layers>(
+    fx: &mut Effects,
+    vessel: &mut Vessel<L>,
+    op: u64,
+    resolution: crate::effects::Resolution,
+    why: &str,
+    peer: Peer,
+) -> Result<crate::decidesrv::Ruled, String> {
+    use crate::decidesrv::Ruled;
+    use crate::effects::{Decided, ResolveError};
+    let id = vessel.id();
+    let authority = taso_core::record::Authority {
+        actor: format!("uid {}", peer.uid),
+        reason: why.to_string(),
+    };
+    match fx.resolve(vessel, taso_core::record::OpId::new(op), resolution, authority) {
+        Ok(d) => Ok(Ruled::Done {
+            before: d == Decided::Before,
+        }),
+        // It could not be recorded: not an answer about the effect.
+        Err(ResolveError::Vessel(e)) => Err(format!("Vessel {}: {e}", id_hex(id))),
+        Err(ResolveError::EmptyAuthority) => {
+            Ok(Ruled::Refused("a resolution needs a reason".into()))
+        }
+        Err(ResolveError::NotOpen(_)) => Ok(Ruled::Refused(format!(
+            "op {op} is not an open effect of Vessel {}: only an effect released to its sender whose outcome is not final can be resolved (or the same answer with another reason was given before)",
+            id_hex(id)
+        ))),
     }
 }
 
@@ -9879,6 +9925,85 @@ mod tests {
         assert!(
             one.kills.load(Ordering::SeqCst) >= 3,
             "kills refused before the container exists are sent again"
+        );
+    }
+
+    /// Review fix R (a): an operator's answer for an open effect is
+    /// recorded with the peer's uid as its actor and gives the Vessel back
+    /// its effect authority; asked again it is answered "before"; an op
+    /// that is not open, or no reason, is refused with why.
+    #[test]
+    fn an_open_effect_is_resolved_with_the_peers_uid_as_its_actor() {
+        use crate::decidesrv::Ruled;
+        use crate::effects::{Mode, Resolution};
+        use crate::ledger::{Answer, Declared};
+        use taso_core::canon::Canonical;
+        use taso_core::record::{Consequence, Dispatch, OpId, OutcomeState, RetryPolicy};
+        let e = vessel_env();
+        let mut v = e.host.ensure(ns(1), b"u").unwrap().0;
+        let (mut fx, _) = Effects::open(
+            Mode::Dispatch,
+            Box::new(crate::effects::AlwaysPublish),
+            &mut v,
+        )
+        .unwrap();
+        let pay = Declared {
+            provider: "pay".into(),
+            request: b"pay 1".to_vec(),
+            footprint: Vec::new(),
+            dispatch: Dispatch::Immediate,
+            retry: RetryPolicy::ProviderDeduplicated { key: b"k".to_vec() },
+            consequence: Consequence::Irreversible,
+            authority: Vec::new(),
+        };
+        fx.ask(&mut v, &pay).unwrap();
+        fx.report(&mut v, OpId::new(1), &Answer::Unknown).unwrap();
+        assert!(!fx.authorized());
+        let peer = Peer { uid: 1000, pid: 7 };
+        let why = "the provider's console shows it was never sent";
+        let r = resolve_open(&mut fx, &mut v, 1, Resolution::NotApplied, why, peer);
+        assert_eq!(r, Ok(Ruled::Done { before: false }));
+        assert!(fx.authorized(), "effect authority is back");
+        let last = v
+            .chronicle()
+            .frames()
+            .unwrap()
+            .iter()
+            .rev()
+            .filter(|f| f.envelope.stream == Stream::Effect)
+            .find_map(|f| match Payload::decode(&f.payload).unwrap() {
+                Payload::Outcome(o) => Some(o),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(last.state, OutcomeState::ConfirmedNotApplied);
+        let want = taso_core::record::Authority {
+            actor: "uid 1000".into(),
+            reason: why.into(),
+        };
+        assert_eq!(last.evidence, Some(want.canon_bytes()));
+        assert_eq!(
+            resolve_open(&mut fx, &mut v, 1, Resolution::NotApplied, why, peer),
+            Ok(Ruled::Done { before: true })
+        );
+        let Ok(Ruled::Refused(no)) =
+            resolve_open(&mut fx, &mut v, 2, Resolution::Applied, why, peer)
+        else {
+            panic!("op 2 is not open")
+        };
+        assert!(no.contains("op 2 is not an open effect"), "{no}");
+        fx.ask(
+            &mut v,
+            &Declared {
+                request: b"pay 2".to_vec(),
+                ..pay
+            },
+        )
+        .unwrap();
+        fx.report(&mut v, OpId::new(2), &Answer::Unknown).unwrap();
+        assert_eq!(
+            resolve_open(&mut fx, &mut v, 2, Resolution::Applied, " ", peer),
+            Ok(Ruled::Refused("a resolution needs a reason".into()))
         );
     }
 }
