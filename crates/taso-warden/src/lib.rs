@@ -30,6 +30,7 @@ pub mod explain;
 pub mod field;
 pub mod finish;
 pub mod genesis;
+pub mod hooks;
 pub mod kube;
 pub mod ledger;
 pub mod navigate;

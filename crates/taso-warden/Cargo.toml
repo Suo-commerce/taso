@@ -5,6 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test hooks read from the environment (src/hooks.rs): failpoints, a lost
+# reply, the crash harness's holds.  Off in a release build; the gates that
+# use them build with it on.
+test-hooks = ["taso-core/test-hooks"]
+
 [dependencies]
 taso-core = { path = "../taso-core" }
 taso-field = { path = "../taso-field" }
