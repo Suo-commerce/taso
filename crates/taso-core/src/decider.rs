@@ -15,6 +15,9 @@
 //! | `Approve { vessel, op }` | 4 | `Approved { op, before }` | 5 |
 //! | `Deny { vessel, op, reason }` | 5 | `Denied { op, before }` | 6 |
 //! | | | `Refused { op, why }` | 7 |
+//! | `Resolve { vessel, op, resolution, reason }` | 6 | `Resolved { op, before }` | 8 |
+//!
+//! A [`Resolution`]: `Applied` 0, `NotApplied` 1, `AcceptedUnknown` 2.
 //!
 //! Answers (D77, D86): `Committed { template_id }` 0, `Held` 1,
 //! `ClosedNever` 2, `Refused { rule }` 3, `Retry { reason }` 4.  A Retry's
@@ -48,6 +51,15 @@
 //! until the state it names changes.  `Error` is not an answer about the
 //! action: the request was malformed, or the Warden could not reach the
 //! Vessel now ("ask again").
+//!
+//! `Resolve` (version 4) is an operator's answer for one open effect of
+//! a running Vessel: one released to its sender whose outcome is not
+//! final (`OutcomeUnknown`, say).  The Warden records it as the effect's
+//! outcome with the authority `{ actor: "uid <the peer's uid>", reason }`
+//! (`reason` non-empty, at most [`MAX_DENY_REASON`] bytes), which closes
+//! the obligation and gives the Vessel back its effect authority.  Asked
+//! again with the same answer and reason, it answers `Resolved` with
+//! `before` set and writes nothing.
 
 use crate::canon::{Canon, Canonical};
 use crate::contract::{
@@ -55,14 +67,15 @@ use crate::contract::{
 };
 use crate::decode::{DecodeError, Reader};
 use crate::envelope::{ChronicleId, HashVal, Lsn};
-use crate::record::IntentRecord;
+use crate::record::{IntentRecord, OutcomeState};
 
 /// The protocol version.  2: `Pending` in pages (review fix N3b-a).  3:
-/// `Proposals`.  A peer speaking another version is refused at `Hello`.
-pub const VERSION: u32 = 3;
+/// `Proposals`.  4: `Resolve`.  A peer speaking another version is
+/// refused at `Hello`.
+pub const VERSION: u32 = 4;
 
-/// The most bytes of a `Deny`'s reason: it is recorded with the action
-/// and read by the agent.
+/// The most bytes of a `Deny`'s or a `Resolve`'s reason: it is recorded
+/// with the action and read by the agent.
 pub const MAX_DENY_REASON: usize = 1024;
 
 /// The most items in one `Pending` page.
@@ -187,6 +200,37 @@ pub enum VerdictAnswer {
     Retry(RetryReason),
 }
 
+/// An operator's answer for an open effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// It happened: `ConfirmedApplied`.
+    Applied,
+    /// It did not happen: `ConfirmedNotApplied`.
+    NotApplied,
+    /// Nobody knows, and the operator closes it anyway:
+    /// `AcceptedUnknown` (P4 spec D34).  Never re-issued or probed.
+    AcceptedUnknown,
+}
+
+impl Resolution {
+    /// The outcome state it records.
+    pub fn state(self) -> OutcomeState {
+        match self {
+            Self::Applied => OutcomeState::ConfirmedApplied,
+            Self::NotApplied => OutcomeState::ConfirmedNotApplied,
+            Self::AcceptedUnknown => OutcomeState::AcceptedUnknown,
+        }
+    }
+
+    fn tag(self) -> u8 {
+        match self {
+            Self::Applied => 0,
+            Self::NotApplied => 1,
+            Self::AcceptedUnknown => 2,
+        }
+    }
+}
+
 /// A request to the decider socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -228,6 +272,17 @@ pub enum Request {
         /// The proposal's op.
         op: u64,
         /// Why, for the agent and the history ([`MAX_DENY_REASON`]).
+        reason: String,
+    },
+    /// An operator's answer for one open effect of a running Vessel.
+    Resolve {
+        /// The Vessel's Chronicle id.
+        vessel: ChronicleId,
+        /// The effect's op.
+        op: u64,
+        /// What became of it.
+        resolution: Resolution,
+        /// Why, for the history ([`MAX_DENY_REASON`]); not empty.
         reason: String,
     },
 }
@@ -288,6 +343,14 @@ pub enum Reply {
         op: u64,
         /// Why, for a person.
         why: String,
+    },
+    /// The effect's outcome is recorded as the operator answered.
+    Resolved {
+        /// Its op.
+        op: u64,
+        /// The same answer was recorded before this request: nothing was
+        /// written.
+        before: bool,
     },
 }
 
@@ -418,6 +481,16 @@ impl Request {
                 vessel.canon(&mut c);
                 c.u64(*op).str(reason);
             }
+            Self::Resolve {
+                vessel,
+                op,
+                resolution,
+                reason,
+            } => {
+                c.tag(6);
+                vessel.canon(&mut c);
+                c.u64(*op).tag(resolution.tag()).str(reason);
+            }
         }
         c.into_bytes()
     }
@@ -444,6 +517,17 @@ impl Request {
             (_, 5) => Self::Deny {
                 vessel: r.chronicle()?,
                 op: r.u64()?,
+                reason: r.string()?,
+            },
+            (_, 6) => Self::Resolve {
+                vessel: r.chronicle()?,
+                op: r.u64()?,
+                resolution: match r.tag()? {
+                    (_, 0) => Resolution::Applied,
+                    (_, 1) => Resolution::NotApplied,
+                    (_, 2) => Resolution::AcceptedUnknown,
+                    (at, t) => return Reader::bad(at, "resolution", t),
+                },
                 reason: r.string()?,
             },
             (at, t) => return Reader::bad(at, "decider request", t),
@@ -489,6 +573,9 @@ impl Reply {
             }
             Self::Refused { op, why } => {
                 c.tag(7).u64(*op).str(why);
+            }
+            Self::Resolved { op, before } => {
+                c.tag(8).u64(*op).bool(*before);
             }
         }
         c.into_bytes()
@@ -536,6 +623,10 @@ impl Reply {
             (_, 7) => Self::Refused {
                 op: r.u64()?,
                 why: r.string()?,
+            },
+            (_, 8) => Self::Resolved {
+                op: r.u64()?,
+                before: r.bool()?,
             },
             (at, t) => return Reader::bad(at, "decider reply", t),
         };
@@ -631,7 +722,7 @@ mod tests {
             }
         }
         assert!(matches!(
-            Request::decode(&[6]),
+            Request::decode(&[7]),
             Err(DecodeError::BadTag { .. })
         ));
         for p in every_reply() {
@@ -643,7 +734,7 @@ mod tests {
             assert!(Reply::decode(&b[..b.len() - 1]).is_err());
         }
         assert!(matches!(
-            Reply::decode(&[8]),
+            Reply::decode(&[9]),
             Err(DecodeError::BadTag { .. })
         ));
         assert!(Reply::decode(&[2, 5]).is_err(), "no answer tag 5 (D86)");
@@ -856,8 +947,60 @@ mod tests {
             assert!(Reply::decode(&t).is_err());
             assert!(Reply::decode(&b[..b.len() - 1]).is_err());
         }
-        assert!(Request::decode(&[6]).is_err(), "no request 6");
-        assert!(Reply::decode(&[8]).is_err(), "no reply 8");
+        assert!(Request::decode(&[7]).is_err(), "no request 7");
+        assert!(Reply::decode(&[9]).is_err(), "no reply 9");
+    }
+
+    /// Version 4: Resolve, each answer, and Resolved round-trip under
+    /// their own tags; an answer tag past 2 is refused.
+    #[test]
+    fn a_resolution_round_trips_and_decoding_is_strict() {
+        let vessel = ChronicleId::from_bytes([5; 16]);
+        for (resolution, t) in [
+            (Resolution::Applied, 0),
+            (Resolution::NotApplied, 1),
+            (Resolution::AcceptedUnknown, 2),
+        ] {
+            let q = Request::Resolve {
+                vessel,
+                op: 9,
+                resolution,
+                reason: "the provider's console shows it sent".into(),
+            };
+            let b = q.encode();
+            assert_eq!(b[0], 6);
+            assert_eq!(b[1 + 16 + 8], t, "the answer's tag after vessel and op");
+            assert_eq!(Request::decode(&b).unwrap(), q);
+            let mut x = b.clone();
+            x.push(0);
+            assert!(Request::decode(&x).is_err());
+            assert!(Request::decode(&b[..b.len() - 1]).is_err());
+            let mut bad = b.clone();
+            bad[1 + 16 + 8] = 3;
+            assert!(matches!(
+                Request::decode(&bad),
+                Err(DecodeError::BadTag { .. })
+            ));
+        }
+        assert_eq!(Resolution::Applied.state(), OutcomeState::ConfirmedApplied);
+        assert_eq!(
+            Resolution::NotApplied.state(),
+            OutcomeState::ConfirmedNotApplied
+        );
+        assert_eq!(
+            Resolution::AcceptedUnknown.state(),
+            OutcomeState::AcceptedUnknown
+        );
+        for before in [false, true] {
+            let p = Reply::Resolved { op: 9, before };
+            let b = p.encode();
+            assert_eq!(b[0], 8);
+            assert_eq!(Reply::decode(&b).unwrap(), p);
+            let mut x = b.clone();
+            x.push(0);
+            assert!(Reply::decode(&x).is_err());
+            assert!(Reply::decode(&b[..b.len() - 1]).is_err());
+        }
     }
 
     /// 4a: 150 proposals, given in any order, are each seen once, in op
