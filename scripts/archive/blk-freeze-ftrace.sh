@@ -6,7 +6,7 @@
 # call under the freeze with its duration; the lines over 1 ms are the
 # answer.
 #
-#   sudo scripts/blk-freeze-ftrace.sh [DIRTY_KIB] [RCU_EXPEDITED]   (default 4096, as the host has it)
+#   sudo scripts/archive/blk-freeze-ftrace.sh [DIRTY_KIB] [RCU_EXPEDITED]   (default 4096, as the host has it)
 #
 # Run 1 (the bare-metal node, 2026-10-26): before sync_filesystem starts, the freeze
 # takes the superblock's three write barriers (percpu_down_write ->

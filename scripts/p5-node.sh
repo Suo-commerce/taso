@@ -23,7 +23,7 @@
 #   2 packages     apt: git, the C toolchain, pkg-config, libclang-dev
 #                  (libublk's bindings), python3, jq, curl, chrony, runc,
 #                  e2fsprogs, util-linux, fio, nvme-cli,
-#                  blktrace (the kernel's request trace, blk-trace-freeze.sh)
+#                  blktrace (the kernel's request trace, scripts/archive/blk-trace-freeze.sh)
 #   3 coreutils    GNU coreutils in place of uutils (Ubuntu 25.10 and later
 #                  ship uutils; xfstests and our scripts assume GNU: 271 quick
 #                  tests failed on an option before testing anything,
@@ -64,7 +64,7 @@
 #                  not a sysctl): a filesystem freeze
 #                  takes the superblock's three write barriers, each a
 #                  full RCU grace period of ~10 ms on a 24-thread host
-#                  (scripts/blk-freeze-ftrace.sh, the bare-metal node 2026-10-26);
+#                  (scripts/archive/blk-freeze-ftrace.sh, the bare-metal node 2026-10-26);
 #                  expedited, they are under a millisecond.  P=64 Seal
 #                  p50 120 -> 80 ms, freeze 70 -> 32, CPU per turn the
 #                  same.  The cost: an expedited grace period sends an IPI

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The tests of the fixes for the audit of 2026-11-09, one by one, by name.
 #
-#   scripts/audit-fix-tests.sh [DIR]
+#   scripts/archive/audit-fix-tests.sh [DIR]
 #
 # Each test is run alone and its output kept in DIR (default: a new
 # directory under /tmp).  One line per test: "ok" or "FAIL", then its
@@ -10,7 +10,7 @@
 # The whole suite is the release gate's `unit` step; this is for looking
 # at each fix by itself.  No root, no devices.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 OUT=${1:-$(mktemp -d /tmp/audit-fix-tests.XXXXXX)}
 mkdir -p "$OUT"
 bad=0 n=0

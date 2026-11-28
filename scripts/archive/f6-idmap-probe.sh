@@ -20,7 +20,7 @@
 #       mapping: EOVERFLOW or EACCES), so a child cannot act as its parent
 #   P6  runc on this host is >= 1.2 (idmapped mounts in the OCI config)
 #
-#   scripts/f6-idmap-probe.sh            (as root, from anywhere)
+#   scripts/archive/f6-idmap-probe.sh            (as root, from anywhere)
 #
 # Touches, and nothing else:
 #   /var/lib/taso-f6/probe.img           (sparse 256 MiB, removed at the end)

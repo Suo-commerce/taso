@@ -527,7 +527,7 @@ impl Mounts for System {
         // was taken frozen with every write complete, so ext4's journal
         // would replay nothing - and it cost ten barriers per Seal (an
         // ordered freeze: 12 log syncs; without the journal: 2; the bare-metal node,
-        // scripts/blk-freeze-probe.sh, 2026-10-26).
+        // scripts/archive/blk-freeze-probe.sh, 2026-10-26).
         run(Command::new("mkfs.ext4")
             .args(["-q", "-F", "-O", "^has_journal", "-E", "nodiscard"])
             .arg(dev))

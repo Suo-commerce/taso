@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     /// Slot 1 (the parent, owner of the files on disk) and slot 2 (the
-    /// child) over the deploy base 200000, as in `f6-idmap-probe.sh`.
+    /// child) over the deploy base 200000, as in `scripts/archive/f6-idmap-probe.sh`.
     const SLOT_A: u32 = 200_000 + ID_RANGE;
     const SLOT_B: u32 = 200_000 + 2 * ID_RANGE;
 

@@ -2,8 +2,8 @@
 # scaleway-node.sh: prepare a fresh Ubuntu 24.04 server (a Scaleway Instance
 # or Elastic Metal) to build and test Taso's block log.
 #
-#   sudo scripts/scaleway-node.sh check     read-only: kernel, ublk, tools, disk
-#   sudo scripts/scaleway-node.sh setup     install what is missing, then check
+#   sudo scripts/archive/scaleway-node.sh check     read-only: kernel, ublk, tools, disk
+#   sudo scripts/archive/scaleway-node.sh setup     install what is missing, then check
 #
 # setup touches, and nothing else:
 #   apt packages: build-essential pkg-config clang libclang-dev git fio

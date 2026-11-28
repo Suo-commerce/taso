@@ -473,7 +473,8 @@ struct Geometry {
     depth: u16,
     /// Hardware queues per device, each served by its own thread: with
     /// one, requests the kernel has in flight together (13 at a freeze,
-    /// blk-trace-freeze.sh 2026-10-26) are served one after another.
+    /// scripts/archive/blk-trace-freeze.sh, 2026-10-26) are served one
+    /// after another.
     queues: u16,
     /// Serving threads per queue (the driver's `UBLK_F_PER_IO_DAEMON`,
     /// Linux 6.16+): the queue's tags are split among them, so requests
@@ -544,7 +545,8 @@ const OP_DISCARD: usize = 3;
 const OP_WFUA: usize = 4;
 /// `TASO_BLKD_OPLOG=path`: one line per device request, `op bytes start_ns
 /// end_ns copy_ns wait_ns store_ns` on CLOCK_MONOTONIC (blktrace's clock),
-/// for the probe of where a request's time goes (blk-trace-freeze.sh).
+/// for the probe of where a request's time goes
+/// (scripts/archive/blk-trace-freeze.sh).
 /// Run 3 on the bare-metal node (2026-10-26) put the whole write phase of a freeze in
 /// our handler, 0.92 ms per 512 KiB served one after another, and four
 /// threads changed nothing; the three parts name which half it is: the

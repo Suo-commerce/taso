@@ -3,13 +3,13 @@
 # measured under (the P5 plan §2 A2): what the stack says about flushes,
 # what a flush costs, and what the provider's "stop" actually cuts.
 #
-#   sudo scripts/p5-facts.sh report                 (a) what the stack reports
-#   sudo scripts/p5-facts.sh flush                  (b) the cost of a flush
-#   sudo scripts/p5-facts.sh logfile [MIB]          (b2) the block log's own append+fdatasync
-#   sudo scripts/p5-facts.sh appends [KIB] [REC]    (b3) do O_DIRECT appends to one file overlap?
-#   sudo scripts/p5-facts.sh writer [PORT]          (c) on the host, before the cut
-#        scripts/p5-facts.sh listener HOST[:PORT]   (c) on the laptop, the witness
-#   sudo scripts/p5-facts.sh verify ACKED           (c) on the host, after boot
+#   sudo scripts/archive/p5-facts.sh report                 (a) what the stack reports
+#   sudo scripts/archive/p5-facts.sh flush                  (b) the cost of a flush
+#   sudo scripts/archive/p5-facts.sh logfile [MIB]          (b2) the block log's own append+fdatasync
+#   sudo scripts/archive/p5-facts.sh appends [KIB] [REC]    (b3) do O_DIRECT appends to one file overlap?
+#   sudo scripts/archive/p5-facts.sh writer [PORT]          (c) on the host, before the cut
+#        scripts/archive/p5-facts.sh listener HOST[:PORT]   (c) on the laptop, the witness
+#   sudo scripts/archive/p5-facts.sh verify ACKED           (c) on the host, after boot
 #
 # (a) report: for every disk, the kernel's queue flags (write_cache, fua),
 #     the NVMe controller's write-cache feature as the drive reports it
@@ -306,7 +306,7 @@ port, ext4 = int(sys.argv[1]), sys.argv[2]
 streams = [("ext4-fdatasync", ext4, 0, True), ("ext4-odsync", ext4, os.O_DSYNC, False), ("ext4-nosync", ext4, 0, False)]
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("0.0.0.0", port)); srv.listen(1)
-print("writer: listening on %d; start the listener on the laptop: scripts/p5-facts.sh listener <this host>:%d" % (port, port), flush=True)
+print("writer: listening on %d; start the listener on the laptop: scripts/archive/p5-facts.sh listener <this host>:%d" % (port, port), flush=True)
 conn, peer = srv.accept()
 conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 print("writer: listener connected from %s:%d; streams: %s" % (peer[0], peer[1], ", ".join(s[0] for s in streams)), flush=True)

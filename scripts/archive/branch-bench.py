@@ -28,11 +28,11 @@ implementation built on them.
 Usage (as root; ROOT must be an empty or missing directory on the
 filesystem under test, e.g. an XFS mount with reflink=1, Btrfs or ext4):
 
-    scripts/branch-bench.py ROOT [--branches 1000] [--files 2000]
+    scripts/archive/branch-bench.py ROOT [--branches 1000] [--files 2000]
         [--size 65536] [--big 1024] [--json OUT]
 
 Examples:
-    scripts/branch-bench.py /mnt/xfs/branch-bench --big 0    # no big file
+    scripts/archive/branch-bench.py /mnt/xfs/branch-bench --big 0    # no big file
 
 Everything it creates is under ROOT and is removed at the end, also on
 error or Ctrl-C (mounts are unmounted first).  It never touches anything

@@ -5,7 +5,7 @@
 # busy of a 44 ms freeze after 4 MiB dirty, no journal) is set against
 # what the kernel sends and when.
 #
-#   sudo scripts/blk-trace-freeze.sh [DIRTY_KIB] [QUEUES] [THREADS]   (default 4096, 1, 1)
+#   sudo scripts/archive/blk-trace-freeze.sh [DIRTY_KIB] [QUEUES] [THREADS]   (default 4096, 1, 1)
 #
 # THREADS: taso-blkd --threads N, serving threads per queue.  Run 2 showed
 # four queues change nothing (one submitting CPU, one hardware queue, one

@@ -3,7 +3,7 @@
 # why (P5 B1: seal.freeze measured 37 ms p50 at P=1 on the test VM,
 # 2026-10-26, while seal.log and seal.thaw were 1-2 ms).
 #
-#   sudo scripts/blk-freeze-probe.sh        (from the repository root)
+#   sudo scripts/archive/blk-freeze-probe.sh        (from the repository root)
 #
 # Run 1 (2026-10-26, the test VM): an idle freeze costs ~2 ms on a branch,
 # lazy init on or off, and ~1.5 ms on loop; a freeze after one 1 MiB file

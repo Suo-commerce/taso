@@ -13,7 +13,7 @@
 # mount).  Prediction: if the counts differ, the difference is what tips
 # generic/347 over on our device.
 #
-#   scripts/blk-thin-probe.sh                 (from the repository root, as root)
+#   scripts/archive/blk-thin-probe.sh                 (from the repository root, as root)
 #
 # Touches, and nothing else:
 #   /var/lib/taso-blk/probe.log, probe.err, probe.log.ckpt (removed at start)

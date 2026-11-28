@@ -22,8 +22,8 @@
 # the server's root disk (network block storage here), not local NVMe.
 #
 # Usage (as root on the test VM):
-#   scripts/garage-put-bench.sh run      # install if needed, measure, stop
-#   scripts/garage-put-bench.sh clean    # stop and remove everything
+#   scripts/archive/garage-put-bench.sh run      # install if needed, measure, stop
+#   scripts/archive/garage-put-bench.sh clean    # stop and remove everything
 #
 # Environment:
 #   GARAGE_VERSION  release to download (default v2.1.0)
