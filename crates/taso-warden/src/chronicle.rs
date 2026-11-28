@@ -139,13 +139,14 @@ fn segment_name(base: Lsn) -> String {
 /// E3's `seal.framed` is this process's hold and the harness has armed it
 /// (`taso_core::hold`'s rule: `TASO_E3_HOLD=seal.framed` and
 /// `<TASO_E3_HOLD_DIR>/seal.framed.arm`).  The environment is read once; off,
-/// every Seal after the first pays one load and one compare.
+/// every Seal after the first pays one load and one compare.  Only with
+/// the `test-hooks` feature ([`crate::hooks`]): without it, never armed.
 fn framed_hold_armed() -> bool {
     static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let name = std::env::var("TASO_E3_HOLD").ok()?;
+        let name = crate::hooks::env("TASO_E3_HOLD")?;
         (name == "seal.framed").then(|| {
-            std::env::var_os("TASO_E3_HOLD_DIR")
+            crate::hooks::env_os("TASO_E3_HOLD_DIR")
                 .map_or_else(|| PathBuf::from("/run/taso-e3"), PathBuf::from)
         })
     })
