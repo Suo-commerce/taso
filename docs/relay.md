@@ -90,8 +90,14 @@ For every effect it acts on, the sender reports one of:
   `OutcomeUnknown` — the effect is still open until the sender or an
   operator resolves it.  An operator may resolve it as applied, as not
   applied, or as `AcceptedUnknown` (nobody knows; closed with an actor
-  and a reason, P4 spec D34).  Once resolved, the effect is no longer
-  listed to the sender, and a later report for it is refused.
+  and a reason, P4 spec D34), while its Vessel runs:
+  `taso-ctl resolve <vessel> <op> applied|not-applied|unknown reason…`,
+  or `Resolve { vessel, op, resolution, reason }` on the decider socket
+  (below).  The op is the one the sender reported `Unknown` for.  The
+  reason is required, and the actor recorded is the caller's uid.  Once
+  resolved, the effect is no longer listed to the sender, a later
+  report for it is refused, and the Vessel has its effect authority
+  back.
 
 The sender reports through `Request::Outcome { op, result }`.
 A report for an unknown `op` is refused and nothing is recorded.
