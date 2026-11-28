@@ -735,18 +735,37 @@ impl Effects {
 
     /// Operator resolution of an open effect: record what really happened.
     /// Refused without an actor and a reason, or for an effect that is not
-    /// open.
+    /// open.  The same resolution asked again (same answer, same
+    /// authority) of an effect it closed is [`Decided::Before`] and
+    /// writes nothing, so a lost answer is answered by asking again.
     pub fn resolve<L: Layers>(
         &mut self,
         vessel: &mut Vessel<L>,
         op: OpId,
         resolution: Resolution,
         authority: Authority,
-    ) -> Result<(), ResolveError> {
-        self.ledger.resolve(vessel, op, resolution, authority)?;
-        self.released.remove(&op);
-        self.unlisted.remove(&op);
-        Ok(())
+    ) -> Result<Decided, ResolveError> {
+        let bytes = taso_core::canon::Canonical::canon_bytes(&authority);
+        match self.ledger.resolve(vessel, op, resolution, authority) {
+            Err(ResolveError::NotOpen(_)) => {
+                let last = self
+                    .outcomes(vessel, op)
+                    .map_err(ResolveError::Vessel)?
+                    .and_then(|o| o.last().cloned());
+                match last {
+                    Some(o) if o.state == resolution.state() && o.evidence == Some(bytes) => {
+                        Ok(Decided::Before)
+                    }
+                    _ => Err(ResolveError::NotOpen(op)),
+                }
+            }
+            Err(e) => Err(e),
+            Ok(()) => {
+                self.released.remove(&op);
+                self.unlisted.remove(&op);
+                Ok(Decided::Now)
+            }
+        }
     }
 
     /// Promote a fork: record the Promotion ([`Vessel::promote`]), ship
@@ -1098,10 +1117,55 @@ mod tests {
         fx.ask(&mut v, &pay("pay 3")).unwrap();
         fx.report(&mut v, OpId::new(2), &Answer::Unknown).unwrap();
         assert!(!fx.authorized());
-        fx.resolve(&mut v, OpId::new(2), Resolution::Applied, auth())
-            .unwrap();
+        assert_eq!(
+            fx.resolve(&mut v, OpId::new(2), Resolution::Applied, auth())
+                .unwrap(),
+            Decided::Now
+        );
         assert!(fx.authorized());
         assert!(fx.released(&v).unwrap().is_empty());
+    }
+
+    /// R (a): an operator's resolution asked again, with the same answer
+    /// and authority, is answered "before" and writes nothing; another
+    /// answer or another reason for the closed effect is refused.
+    #[test]
+    fn a_resolution_asked_again_is_answered_before_and_writes_nothing() {
+        let e = env();
+        let mut v = vessel(&e);
+        let (mut fx, _) = open_dispatch(&mut v);
+        fx.ask(&mut v, &pay("pay 1")).unwrap();
+        fx.report(&mut v, OpId::new(1), &Answer::Unknown).unwrap();
+        let op = OpId::new(1);
+        assert_eq!(
+            fx.resolve(&mut v, op, Resolution::NotApplied, auth())
+                .unwrap(),
+            Decided::Now
+        );
+        let written = states(&v);
+        assert_eq!(
+            fx.resolve(&mut v, op, Resolution::NotApplied, auth())
+                .unwrap(),
+            Decided::Before
+        );
+        assert_eq!(states(&v), written, "nothing written");
+        assert!(matches!(
+            fx.resolve(&mut v, op, Resolution::Applied, auth()),
+            Err(ResolveError::NotOpen(_))
+        ));
+        let other = Authority {
+            reason: "another reason".into(),
+            ..auth()
+        };
+        assert!(matches!(
+            fx.resolve(&mut v, op, Resolution::NotApplied, other),
+            Err(ResolveError::NotOpen(_))
+        ));
+        assert!(matches!(
+            fx.resolve(&mut v, OpId::new(9), Resolution::NotApplied, auth()),
+            Err(ResolveError::NotOpen(_))
+        ));
+        assert_eq!(states(&v), written);
     }
 
     #[test]
