@@ -356,8 +356,8 @@ impl<'v, L: Layers> Session<'v, L> {
 
     /// A Seal whose publish failed before this session started (the
     /// Warden's start, or an adoption): counted as a failed publish and
-    /// retried before the next effect, as a turn's Seal is (round 2,
-    /// R2-05, Kimi).  A later Seal's publish covers it.
+    /// retried before the next effect, as a turn's Seal is (review fix,
+    /// 2026-11-07).  A later Seal's publish covers it.
     pub fn with_unpublished(mut self, seal: Position, error: String) -> Self {
         self.after_seal_failures += 1;
         self.last_after_seal_error = Some(error);
@@ -1034,7 +1034,7 @@ pub enum ServeEvent<'a> {
     },
     /// A connection was refused: its socket already had
     /// [`MAX_CONNECTIONS_PER_SOCKET`] open, or no thread could be started
-    /// for it (review fix M2, Kimi's M2).  Reported at the 1st, 2nd, 4th,
+    /// for it (review fix, 2026-11-07).  Reported at the 1st, 2nd, 4th,
     /// 8th … refusal of a serve, so a flood does not flood the log.
     Refused {
         /// The socket it came to.
@@ -1054,7 +1054,7 @@ pub enum ServeEvent<'a> {
 }
 
 /// The most connections one of a Vessel's sockets holds at once (review
-/// fix M2, Kimi's M2).  Each costs the Warden a thread outside the
+/// fix, 2026-11-07).  Each costs the Warden a thread outside the
 /// agent's own limits, so an agent opening connections without end would
 /// exhaust the Warden's threads and memory (and a failed thread start
 /// panicked the serve).  The protocol needs one agent connection and the
@@ -1993,7 +1993,7 @@ mod tests {
         );
     }
 
-    /// Round 2, R2-05 (Kimi): a Seal whose publish failed before the
+    /// Review fix, 2026-11-07: a Seal whose publish failed before the
     /// session (the Warden's start: the birth Seal, the last Seal, an
     /// adoption Seal) is retried before the first effect and counted, as a
     /// turn's.  Without it the effect was refused for good although the
@@ -3315,7 +3315,7 @@ mod tests {
         assert!(fenced[0].starts_with("TurnEnd: "), "{fenced:?}");
     }
 
-    /// Review fix M2 (Kimi's M2): an agent opening connections without end
+    /// Review fix, 2026-11-07: an agent opening connections without end
     /// gets at most MAX_CONNECTIONS_PER_SOCKET; the next is closed at once
     /// and reported, and the Warden's threads stay bounded.
     fn used(b: &Budget) -> usize {

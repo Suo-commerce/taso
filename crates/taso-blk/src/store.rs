@@ -1032,8 +1032,8 @@ impl Store {
         }
         // The range checked before any block, as `write` does: unchecked,
         // `lba + i` panicked in a debug build and, optimized, wrapped to
-        // LBA 0 and returned another block's data (review fix H1, Kimi's
-        // H1, reproduced in both profiles).
+        // LBA 0 and returned another block's data (review fix,
+        // 2026-11-07, reproduced in both profiles).
         lba.checked_add(buf.len() as u64 / BLOCK)
             .ok_or(MapError::Overflow)?;
         for (i, chunk) in buf.chunks_mut(BLOCK as usize).enumerate() {
@@ -2341,7 +2341,7 @@ fn load_checkpoint(
 /// 1 to [`MAX_NAME`] bytes of `A-Z a-z 0-9 _ . : / -`: what dataset names
 /// use, and safe in the daemon's line protocol.
 fn valid_name(name: &str) -> bool {
-    // Round 3, R3-04 (Kimi): "-" alone is the control protocol's "none"
+    // Review fix, 2026-11-07: "-" alone is the control protocol's "none"
     // (info's fields, export's base), so it is no name.
     name != "-"
         && (1..=MAX_NAME).contains(&name.len())
@@ -3303,7 +3303,7 @@ mod tests {
         assert_eq!(s2.seals_of(b).unwrap(), vec![seal]);
     }
 
-    /// Review fix H1 (Kimi's H1): a read whose range passes the last LBA
+    /// Review fix, 2026-11-07: a read whose range passes the last LBA
     /// is refused before any block; it used to wrap (optimized: the second
     /// block returned LBA 0's data; debug: a panic).
     #[test]

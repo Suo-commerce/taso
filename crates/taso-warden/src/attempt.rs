@@ -382,7 +382,7 @@ impl Attempts {
 /// prefix to pruning (after every Seal, two closed segments kept), and a
 /// Candidate, an open attempt or a committed sanction read from it went
 /// undiscovered once its record was pruned, while the coordinator still
-/// held it (Kimi K3.1 Pro's audit, round 2).
+/// held it (a review of 2026-11-07).
 pub fn open_work(
     coord: &dyn Coord,
     chronicle: taso_core::envelope::ChronicleId,

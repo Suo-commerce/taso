@@ -709,7 +709,7 @@ pub(crate) fn check_frame(
             got: env.chronicle,
         });
     }
-    // Round 2, R2-01 (Kimi): nothing follows u64::MAX; a frame read from
+    // Review fix, 2026-11-07: nothing follows u64::MAX; a frame read from
     // a file after it is refused, never chained to a wrapped 0.
     let Some(expected) = tail.lsn.checked_next() else {
         return Err(SegmentError::Exhausted { lsn: env.lsn });
@@ -1031,7 +1031,7 @@ mod tests {
 
     // ── local chain refusals ────────────────────────────────────────
 
-    /// Round 2, R2-01 (Kimi): a segment whose base is the last LSN takes
+    /// Review fix, 2026-11-07: a segment whose base is the last LSN takes
     /// no record: a frame that would wrap to 0 is refused (it panicked in
     /// a debug build and chained in a release one), and the tail stays.
     #[test]

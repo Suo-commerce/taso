@@ -684,7 +684,7 @@ mod tests {
         }
     }
 
-    /// Round 3, R3-01 (Kimi; D&D a): a listed object is deleted by one call
+    /// Review fix, 2026-11-07: a listed object is deleted by one call
     /// (its kind's), and a reclaimer whose claim another Warden resolves
     /// while its call is in flight makes no further call: the claim is
     /// checked before each.  So a stale delete is at most one call, within

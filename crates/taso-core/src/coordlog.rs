@@ -3412,7 +3412,7 @@ mod tests {
         );
     }
 
-    /// Round 2, R2-07 (Kimi): an accepted purge's inventory and local
+    /// Review fix, 2026-11-07: an accepted purge's inventory and local
     /// state are held from its `PurgeCommitted` for the log's life (D&D
     /// R2-07 a): a retry and the local deletion read them, and they are
     /// the purge's own record.  A reclaim of either is refused as held.

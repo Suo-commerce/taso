@@ -852,7 +852,7 @@ mod tests {
         }
     }
 
-    /// Review fix H4 (Kimi's H4): an inventory body without end is read to
+    /// Review fix, 2026-11-07: an inventory body without end is read to
     /// its limit and one byte, then refused as a store-integrity fault
     /// (`Unreadable`, never an absence); it used to be read to the end of
     /// the machine's memory.

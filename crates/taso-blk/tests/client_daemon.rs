@@ -413,7 +413,7 @@ fn an_attach_holds_up_no_call_about_another_branch() {
     assert!(d.wait(), "quit exits cleanly");
 }
 
-/// Round 2, R2-03 (Kimi): `fork` is one command, all or none.  A device
+/// Review fix, 2026-11-07: `fork` is one command, all or none.  A device
 /// that does not start (here: no ublk, or not root) leaves no branch and
 /// no name behind, so the same fork can be asked again.  Where the device
 /// does start (root and ublk), there is nothing to test: it is detached.
@@ -444,7 +444,7 @@ fn a_failed_fork_leaves_no_branch_or_name() {
     assert!(d.wait());
 }
 
-/// Round 2, R2-04 (Kimi): `quit` answers only after the final checkpoint,
+/// Review fix, 2026-11-07: `quit` answers only after the final checkpoint,
 /// and a failed one is an error and a non-zero exit, never "ok" and 0.
 /// The checkpoint's temporary is made a directory, so writing it fails.
 #[test]

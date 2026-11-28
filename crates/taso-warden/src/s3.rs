@@ -84,7 +84,7 @@ pub struct S3Config {
     /// instead of the public web roots.
     pub ca_file: Option<std::path::PathBuf>,
     /// The operator's yes to an `http://` endpoint: data and signed
-    /// requests cross the network unencrypted (review fix M4, Kimi's M4).
+    /// requests cross the network unencrypted (review fix, 2026-11-07).
     /// Without it `http://` is refused; with `https://` it is a
     /// contradiction and refused too.
     pub plaintext: bool,

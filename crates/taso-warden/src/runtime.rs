@@ -57,7 +57,7 @@ use std::process::{Command, Stdio};
 use serde_json::{json, Value};
 
 /// The out-of-memory score every agent and verifier runs with: the
-/// kernel's neutral 0, written out (review fix M3, Kimi's M3).  Taso's own
+/// kernel's neutral 0, written out (review fix, 2026-11-07).  Taso's own
 /// daemons mark themselves -1000 ([`protect_from_oom`]); a container's
 /// process would inherit that from the Warden, and an agent the kernel
 /// can never kill for memory would starve the node instead.  With 0, a
@@ -66,7 +66,7 @@ use serde_json::{json, Value};
 pub const AGENT_OOM_SCORE_ADJ: i32 = 0;
 
 /// Mark this process the last the kernel's out-of-memory killer may pick
-/// (`oom_score_adj` -1000; review fix M3, Kimi's M3).  Vessels run
+/// (`oom_score_adj` -1000; review fix, 2026-11-07).  Vessels run
 /// without memory limits unless the operator sets them (D&D M3-a,
 /// decided 2026-11-07); a runaway agent must then die before the services
 /// every Vessel on the node depends on.  Needs root (CAP_SYS_RESOURCE);

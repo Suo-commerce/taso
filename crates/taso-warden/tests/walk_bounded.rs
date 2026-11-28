@@ -1,4 +1,4 @@
-//! Round 2, R2-02 (Kimi; D&D R2-02 a): the walk never holds more of a
+//! Review fix, 2026-11-07: the walk never holds more of a
 //! directory's names than it can still list.  The agent owns the tree, so
 //! a directory of many names must not cost the Warden memory beyond the
 //! walk's own limits.  Its own binary: the counting allocator is global.

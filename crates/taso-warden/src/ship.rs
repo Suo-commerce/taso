@@ -181,7 +181,7 @@ impl LocalStore {
 
     /// The root, opened.  The root itself is the operator's path and may
     /// be a symlink; everything under it is resolved beneath it and never
-    /// through a symlink (round 2, R2-08, Kimi; D&D a).
+    /// through a symlink (review fix, 2026-11-07).
     fn root(&self) -> io::Result<OwnedFd> {
         let fd = openat2(
             CWD,
@@ -806,7 +806,7 @@ mod tests {
         );
     }
 
-    /// Round 2, R2-08 (Kimi; D&D a): nothing under the store's root is
+    /// Review fix, 2026-11-07: nothing under the store's root is
     /// reached through a symlink.  A directory symlink to the outside: put
     /// is refused and writes nothing outside; get, exists, delete and the
     /// listing are errors, never "absent", and touch nothing outside.  A

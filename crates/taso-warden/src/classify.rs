@@ -593,7 +593,7 @@ impl Manifest {
             if entries.last().is_some_and(|l| l.path >= e.path) {
                 return Err(bad("entries not strictly ascending"));
             }
-            // Round 3, R3-03 (Kimi): a walk never lists a slot outside the
+            // Review fix, 2026-11-07: a walk never lists a slot outside the
             // slot width (it is unsupported, OwnerOutOfRange), so a manifest
             // that does is not one: refused here, before any consumer adds
             // it to a base.
@@ -831,7 +831,7 @@ pub fn walk(
 }
 
 /// A directory read with a bound: its `keep` smallest names, in order,
-/// and how many it holds.  Round 2, R2-02 (Kimi; D&D a): the agent owns
+/// and how many it holds.  Review fix, 2026-11-07: the agent owns
 /// the directory, so the Warden never holds more names than the walk can
 /// still list; the deadline is checked while reading too (`None`: it
 /// passed, the walk stops).
@@ -1981,7 +1981,7 @@ class = "Hook"
         assert!(!m.complete() || Manifest::decode(&m.bytes()).is_ok());
     }
 
-    /// Round 3, R3-03 (Kimi): a manifest naming an owner slot past the
+    /// Review fix, 2026-11-07: a manifest naming an owner slot past the
     /// slot width is refused at decode; a walk never lists one.
     #[test]
     fn a_manifest_with_an_owner_slot_out_of_range_is_refused() {

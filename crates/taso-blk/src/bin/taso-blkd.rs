@@ -502,7 +502,7 @@ struct Device {
 /// about another branch (an `info`, another `attach`) never waits on it;
 /// a call that needs this branch's own entry settled waits for it
 /// ([`Daemon::settled`]).  `Stopping` while `detach` kills its device
-/// (review fix H3, Kimi's H3): the entry stays in the table until the
+/// (review fix, 2026-11-07): the entry stays in the table until the
 /// kill is known to have worked, so a failed kill leaves the device
 /// `Running` and tracked, and no `attach` can start a second device for
 /// the branch meanwhile.
@@ -707,7 +707,7 @@ fn main() {
 
     // From here on libraries may print (libublk); no write may panic.
     streams::guard();
-    // Last for the out-of-memory killer (review fix M3, Kimi's M3): every
+    // Last for the out-of-memory killer (review fix, 2026-11-07): every
     // Vessel's disk is served from here, and agents run without memory
     // limits unless the operator sets them.
     if let Err(e) = std::fs::write("/proc/self/oom_score_adj", "-1000") {
@@ -1509,7 +1509,7 @@ impl Daemon {
                 let branch = self.branch(seal, words.get(2).copied())?;
                 match self.attach(branch) {
                     Ok(dev) => Ok(format!("{branch} {dev}")),
-                    // Round 2, R2-03 (Kimi): one command, so all or none:
+                    // Review fix, 2026-11-07: one command, so all or none:
                     // the branch its caller never learns of is dropped
                     // (and its name with it), or the answer says it stays.
                     Err(e) => match self.unfork(branch) {
@@ -1838,7 +1838,7 @@ impl Daemon {
     /// Drop a layer: a branch's device is detached first (`kill` stops it;
     /// a test's can fail), then the branch is dropped while the device
     /// table is held, as `reset` does, so no attach starts in between and
-    /// no branch is dropped under a device (review fix H2, Kimi's H2: the
+    /// no branch is dropped under a device (review fix, 2026-11-07: the
     /// detach's error was ignored and the table not held, so an attach
     /// that had checked the branch could start a device for it after the
     /// drop, and a failed kill left a device on a dropped branch).
@@ -2846,7 +2846,7 @@ mod accept_test {
     }
 }
 
-/// Review fix H3 (Kimi's H3): a failed kill leaves the device tracked.
+/// Review fix, 2026-11-07: a failed kill leaves the device tracked.
 #[cfg(test)]
 mod detach_test {
     use super::*;
@@ -3051,7 +3051,7 @@ mod detach_test {
         d.store.lock().unwrap().map().unwrap().kind(l).is_ok()
     }
 
-    /// Review fix H2 (Kimi's H2): a drop whose detach fails leaves the
+    /// Review fix, 2026-11-07: a drop whose detach fails leaves the
     /// branch, and its device tracked; it used to ignore the error and
     /// drop the branch under the live device.
     #[test]

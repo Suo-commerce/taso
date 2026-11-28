@@ -306,7 +306,7 @@ pub fn restore(
             return Err(ArtifactError::TargetNotEmpty(shown(n)));
         }
     }
-    // Round 3, R3-03 (Kimi): the slot is bounded by the manifest's decode;
+    // Review fix, 2026-11-07: the slot is bounded by the manifest's decode;
     // the sum is still checked, so no base can wrap an owner (to root).
     for e in &manifest.entries {
         if owner.uid_base.checked_add(e.uid_slot).is_none()

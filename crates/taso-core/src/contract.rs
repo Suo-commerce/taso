@@ -111,7 +111,7 @@ pub enum ObjectKind {
 }
 
 /// The most bytes an object of `kind` may have (spec rev. 38 §11.1;
-/// review fix H4, Kimi's H4), or `None` for the kinds read as streams
+/// review fix, 2026-11-07), or `None` for the kinds read as streams
 /// (packs, artifacts, layers, tombstones).  Checked where an object is made and
 /// on every whole read from the store, so no node can make an object
 /// that no node can read back.

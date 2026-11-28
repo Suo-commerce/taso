@@ -423,8 +423,8 @@ fn init(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     // The host: the module now and at boot; expedited RCU now and at boot.
-    // One at a time, the first failure stopping the rest (review fix M5,
-    // Kimi's M5: all four used to run before any result was looked at).
+    // One at a time, the first failure stopping the rest (review fix,
+    // 2026-11-07: all four used to run before any result was looked at).
     let mut steps: Vec<Step> = vec![
         (
             "ublk_drv kept at boot",
@@ -1501,7 +1501,7 @@ mod tests {
         );
     }
 
-    /// Review fix M5 (Kimi's M5): the first failing step stops the rest,
+    /// Review fix, 2026-11-07: the first failing step stops the rest,
     /// and the error names what was already done.
     #[test]
     fn a_failing_step_stops_the_rest_and_names_what_was_done() {

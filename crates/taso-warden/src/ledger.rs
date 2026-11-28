@@ -621,7 +621,7 @@ impl Ledger {
     /// recorded: an append that fails consumes nothing (audit 2026-11-09,
     /// op id consumed by a failed append: it was advanced here, before
     /// the append).
-    /// Round 3, R3-02 (Kimi): `u64::MAX` is never an op id but the mark
+    /// Review fix, 2026-11-07: `u64::MAX` is never an op id but the mark
     /// that every id is used; nothing is reused or wraps.
     fn assign<L: Layers>(
         &self,
@@ -1080,7 +1080,7 @@ mod tests {
         }
     }
 
-    /// Round 3, R3-02 (Kimi): once the last id is used, every further
+    /// Review fix, 2026-11-07: once the last id is used, every further
     /// effect is refused: no id is reused, none wraps to 0, nothing is
     /// written.  An adoption that would pass the last id is refused whole.
     #[test]
