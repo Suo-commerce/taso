@@ -17,16 +17,18 @@
 //! # Seal
 //!
 //! Build the Seal record (stream `Ctl`, as in the model) — its hash is
-//! known before it is appended → snapshot the layer as
-//! `@taso-seal-<lsn>` bound to that hash → append and CAS the record.  If
-//! the append fails, the snapshot is destroyed.
+//! known before anything is written → side by side, write and sync its
+//! frame into the segment and make the layer (`@taso-seal-<lsn>`, bound
+//! to that hash) → CAS the record, once both are done.  If either fails,
+//! the frame is cut and the layer destroyed.
 //!
-//! **A snapshot is a Seal only once its record is accepted.**  The other
-//! order (record, then snapshot) would let a crash leave an accepted Seal
-//! naming a layer that never existed, and a later snapshot would freeze
-//! the wrong state.  Snapshot-first leaves at worst an orphan snapshot,
-//! which recovery recognises exactly: its lsn is past the head, or the
-//! accepted record at its lsn has another hash.
+//! **A layer is a Seal only once its record is accepted.**  Accepting the
+//! record before the layer exists would let a crash leave an accepted
+//! Seal naming a layer that never existed, and a later layer would freeze
+//! the wrong state.  Made side by side and accepted after both, a crash
+//! leaves at worst a frame the coordinator never accepted, which reopen
+//! cuts, and an orphan layer, which recovery recognises exactly: its lsn
+//! is past the head, or the accepted record at its lsn has another hash.
 //!
 //! The Seal's `layer` is its own lsn, because that is what names the
 //! layer.  The store's own id for it cannot go into the record: the
