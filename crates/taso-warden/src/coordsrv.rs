@@ -34,7 +34,7 @@
 //! request  version 3 (1) · op (1) · fields
 //!   1 register   chronicle (16) · holder (8)
 //!   2 append     warden (8) · envelope (137, as in a segment frame)
-//!   3 transfer   chronicle (16) · new_holder (8)
+//!   3 (transfer: not served, below)
 //!   4 ownership  chronicle (16)
 //!   5 head       chronicle (16)
 //!   6 advance_shipped  warden (8) · chronicle (16) · epoch (8) · position (40)
@@ -101,6 +101,13 @@
 //! epoch (8) for kinds 0 and 3) with P4's effect bytes (spec D33): an
 //! append batch with `Effect` records carries their payload bytes, and
 //! one without any is still sent as operation 8.
+//!
+//! Operation 3, the unconditional transfer, is not served (the maturity
+//! review's finding 9; D&D 9 (a), 2026-11-28): it moved a Vessel without
+//! naming what its caller read, and no production code sent it.  A move
+//! on the wire is `transfer_if`, which names the holder and epoch it
+//! read; [`RemoteCoord`]'s `transfer` reads the ownership and sends that.
+//! A request of operation 3 is malformed, and its message says so.
 //!
 //! A malformed request gets status 3 and the server closes the connection,
 //! since it can no longer trust the framing.  The version byte lets a
@@ -180,6 +187,7 @@ const WIRE_VERSION: u8 = 5;
 
 const OP_REGISTER: u8 = 1;
 const OP_APPEND: u8 = 2;
+/// Not served (D&D 9 (a)); the number is not used again.
 const OP_TRANSFER: u8 = 3;
 const OP_OWNERSHIP: u8 = 4;
 const OP_HEAD: u8 = 5;
@@ -285,10 +293,6 @@ enum Request {
         envelopes: Vec<Envelope>,
         /// The `Effect` records' bytes (P4 spec D33); empty: operation 8.
         effects: Vec<Vec<u8>>,
-    },
-    Transfer {
-        chronicle: ChronicleId,
-        new_holder: WardenId,
     },
     TransferIf {
         chronicle: ChronicleId,
@@ -574,13 +578,6 @@ impl Request {
                 }
                 &mut o
             }
-            Self::Transfer {
-                chronicle,
-                new_holder,
-            } => o
-                .u8(OP_TRANSFER)
-                .bytes(chronicle.as_bytes())
-                .u64(new_holder.get()),
             Self::TransferIf {
                 chronicle,
                 new_holder,
@@ -743,10 +740,11 @@ impl Request {
                     effects,
                 }
             }
-            OP_TRANSFER => Self::Transfer {
-                chronicle: i.chronicle()?,
-                new_holder: i.warden()?,
-            },
+            OP_TRANSFER => {
+                return Err(Malformed(
+                    "transfer (operation 3) is not served: a move names the holder and epoch it read (transfer_if, operation 9)",
+                ))
+            }
             OP_TRANSFER_IF => Self::TransferIf {
                 chronicle: i.chronicle()?,
                 new_holder: i.warden()?,
@@ -846,9 +844,7 @@ impl Request {
         match self {
             Self::Register { holder, .. } => Some(*holder),
             Self::Append { warden, .. } | Self::AppendBatch { warden, .. } => Some(*warden),
-            Self::Transfer { new_holder, .. } | Self::TransferIf { new_holder, .. } => {
-                Some(*new_holder)
-            }
+            Self::TransferIf { new_holder, .. } => Some(*new_holder),
             Self::AdvanceShipped { warden, .. } => Some(*warden),
             Self::ClaimChronicle { holder, .. } | Self::TakeoverTarget { holder, .. } => {
                 Some(*holder)
@@ -879,9 +875,7 @@ impl Request {
             | Self::Append { .. }
             | Self::AppendBatch { .. }
             | Self::Head { .. } => OkKind::Head,
-            Self::Transfer { .. } | Self::TransferIf { .. } | Self::ClaimChronicle { .. } => {
-                OkKind::Epoch
-            }
+            Self::TransferIf { .. } | Self::ClaimChronicle { .. } => OkKind::Epoch,
             Self::Ownership { .. } => OkKind::Ownership,
             Self::AdvanceShipped { .. } | Self::Shipped { .. } => OkKind::Position,
             Self::TakeoverTarget { .. }
@@ -1117,10 +1111,6 @@ fn handle(coord: &dyn Coord, req: Request) -> Reply {
         } => coord
             .append_batch_with(warden, &envelopes, &effects)
             .map(Reply::Head),
-        Request::Transfer {
-            chronicle,
-            new_holder,
-        } => coord.transfer(chronicle, new_holder).map(Reply::Epoch),
         Request::TransferIf {
             chronicle,
             new_holder,
@@ -1946,15 +1936,12 @@ impl Coord for RemoteCoord {
         }
     }
 
+    /// The ownership as read now, then a move on exactly it
+    /// (`transfer_if`): operation 3 is not served (D&D 9 (a)).  One moved
+    /// in between is refused `OwnershipChanged`, nothing changed.
     fn transfer(&self, chronicle: ChronicleId, new_holder: WardenId) -> Result<Epoch, CoordError> {
-        match self.call(Request::Transfer {
-            chronicle,
-            new_holder,
-        })? {
-            Reply::Epoch(e) => Ok(e),
-            Reply::Err(e) => Err(e),
-            r => Err(unexpected(r)),
-        }
+        let o = self.ownership(chronicle)?;
+        self.transfer_if(chronicle, new_holder, (o.holder, o.epoch))
     }
 
     fn ownership(&self, chronicle: ChronicleId) -> Result<Ownership, CoordError> {
@@ -2463,10 +2450,6 @@ mod tests {
                 warden: A,
                 envelope: record(&w, 1),
             },
-            Request::Transfer {
-                chronicle: chron(1),
-                new_holder: B,
-            },
             Request::TransferIf {
                 chronicle: chron(1),
                 new_holder: B,
@@ -2585,9 +2568,10 @@ mod tests {
 
         let mut s = UnixStream::connect(e.sock()).unwrap();
         // A transfer request with one byte missing.
-        let req = Request::Transfer {
+        let req = Request::TransferIf {
             chronicle: chron(1),
             new_holder: B,
+            expected: (before.holder, before.epoch),
         }
         .encode();
         write_frame(&mut s, &req[..req.len() - 1]).unwrap();
@@ -2607,6 +2591,37 @@ mod tests {
         assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
     }
 
+    /// The maturity review's finding 9 (D&D 9 (a), 2026-11-28): the
+    /// unconditional transfer moved a Vessel with no check of what its
+    /// caller read.  Operation 3 is malformed now: answered "bad" with why,
+    /// closed, nothing moved.  The client's `transfer` is a read and a
+    /// `transfer_if`, and still moves.
+    #[test]
+    fn the_unconditional_transfer_is_not_served() {
+        let e = Env::new();
+        let c = e.client();
+        c.register(chron(1), A).unwrap();
+        let before = c.ownership(chron(1)).unwrap();
+        let mut s = UnixStream::connect(e.sock()).unwrap();
+        let mut req = vec![WIRE_VERSION, OP_TRANSFER];
+        req.extend_from_slice(chron(1).as_bytes());
+        req.extend_from_slice(&B.get().to_be_bytes());
+        write_frame(&mut s, &req).unwrap();
+        let reply = read_frame(&mut s).unwrap().unwrap();
+        assert_eq!(reply[0], ST_BAD);
+        let text = String::from_utf8_lossy(&reply[1..]);
+        assert!(
+            text.contains("transfer (operation 3) is not served"),
+            "{text}"
+        );
+        assert_eq!(read_frame(&mut s).unwrap(), None, "closed");
+        let after = c.ownership(chron(1)).unwrap();
+        assert_eq!((before.epoch, before.holder), (after.epoch, after.holder));
+        // The client's transfer: read, then transfer_if.
+        assert_eq!(c.transfer(chron(1), B).unwrap(), before.epoch.next());
+        assert_eq!(c.ownership(chron(1)).unwrap().holder, B);
+    }
+
     /// Review fix N4a: a Warden from before the break (protocol version 1)
     /// is answered "bad", naming the version spoken, and closed at its
     /// first request; nothing is written.
@@ -2617,9 +2632,10 @@ mod tests {
         c.register(chron(1), A).unwrap();
         let before = c.ownership(chron(1)).unwrap();
         let mut s = UnixStream::connect(e.sock()).unwrap();
-        let mut req = Request::Transfer {
+        let mut req = Request::TransferIf {
             chronicle: chron(1),
             new_holder: B,
+            expected: (before.holder, before.epoch),
         }
         .encode();
         req[0] = 1;
@@ -2797,13 +2813,6 @@ mod tests {
                     warden: B,
                     envelopes: vec![],
                     effects: vec![],
-                },
-                Some(B),
-            ),
-            (
-                Request::Transfer {
-                    chronicle: chron(1),
-                    new_holder: B,
                 },
                 Some(B),
             ),
