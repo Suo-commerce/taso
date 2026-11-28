@@ -46,6 +46,12 @@
 //! # `status`
 //!
 //! Reads the config, asks the block log `stats`, and says what runs.
+//! Then every uid slot of the config (F-a (a)): each Vessel's own, each
+//! fork slot (a fork is `<subject>-fork-<slot>`), and the Templates', with
+//! its host uid range and whether the block log holds that Vessel's
+//! branch on this node ("on this node", "not made", or "?" when the block
+//! log does not answer), so a host that sees a process's uid can tell
+//! whose it is.
 //!
 //! # `demo`
 //!
@@ -721,7 +727,20 @@ fn status(config_path: Option<&str>) -> ExitCode {
     );
     println!("{}", agent_limits(&config));
     let socket = &config.storage.socket;
-    match taso_blk::client::Client::connect(socket).and_then(|mut c| c.stats()) {
+    let answer = taso_blk::client::Client::connect(socket).and_then(|mut c| {
+        let st = c.stats()?;
+        let names = c.names()?;
+        Ok((st, names))
+    });
+    let names = answer.as_ref().ok().map(|(_, n)| {
+        n.iter()
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::BTreeSet<String>>()
+    });
+    for line in uid_slots(&config, names.as_ref()) {
+        println!("{line}");
+    }
+    match answer.map(|(st, _)| st) {
         Ok(st) => {
             let get = |k: &str| st.get(k).cloned().unwrap_or_else(|| "?".into());
             let mib = get("log_bytes")
@@ -747,6 +766,65 @@ fn status(config_path: Option<&str>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The uid slots as `status` says them (F-a (a)): a heading, then one
+/// line per slot in slot order: its host uid range, whose it is (a
+/// Vessel, a fork of one, or the Templates), the Vessel's id, and whether
+/// `names` (the block log's branches; `None`: it did not answer) holds
+/// its dataset `<root>/v-<id>`.
+fn uid_slots(config: &Config, names: Option<&std::collections::BTreeSet<String>>) -> Vec<String> {
+    use taso_warden::daemon::ForksConf;
+    let rt = &config.runtime;
+    let range = |slot: u32| {
+        slot.checked_mul(taso_warden::runtime::ID_RANGE)
+            .and_then(|b| b.checked_add(rt.host_uid_base))
+            .and_then(|b| Some((b, b.checked_add(taso_warden::runtime::ID_RANGE - 1)?)))
+            .map_or("does not fit".to_string(), |(a, z)| {
+                format!("host uids {a}-{z}")
+            })
+    };
+    let here = |id: taso_core::envelope::ChronicleId| match names {
+        None => "?",
+        Some(n) if n.contains(&format!("{}/v-{}", config.root, hex(id.as_bytes()))) => {
+            "on this node"
+        }
+        Some(_) => "not made",
+    };
+    // (slot, name, id, what)
+    let mut rows: Vec<(u32, String, String, String)> = Vec::new();
+    for v in &config.vessels {
+        let id = v.id();
+        let what = match &v.fork {
+            Some(f) => format!("fork of {}, {}", f.parent, here(id)),
+            None => here(id).to_string(),
+        };
+        rows.push((v.uid_slot, v.subject.clone(), hex(id.as_bytes()), what));
+        for &slot in v.forks.iter().flat_map(|f| &f.slots) {
+            let name = ForksConf::child_name(&v.subject, slot);
+            let id = taso_core::record::vessel_id(v.namespace, name.as_bytes());
+            let what = format!("fork of {}, {}", v.subject, here(id));
+            rows.push((slot, name, hex(id.as_bytes()), what));
+        }
+    }
+    if let Some(t) = rt.template_slot {
+        rows.push((t, "Templates".into(), String::new(), String::new()));
+    }
+    rows.sort_by_key(|r| r.0);
+    let width = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
+    let mut out = vec![format!(
+        "uid slots (host_uid_base {}; {} host uids each):",
+        rt.host_uid_base,
+        taso_warden::runtime::ID_RANGE
+    )];
+    for (slot, name, id, what) in rows {
+        let line = format!(
+            "  slot {slot:<5} {:<29} {name:<width$}  {id}  {what}",
+            range(slot)
+        );
+        out.push(line.trim_end().to_string());
+    }
+    out
 }
 
 /// The agents' limits as `status` says them: the node's, then each Vessel
@@ -1511,6 +1589,63 @@ mod tests {
             agent_limits(&c),
             "agent limits: memory unlimited, processes 512 (runtime.memory_bytes, runtime.pids); demo: memory 256 MiB, processes 512"
         );
+    }
+
+    /// F-a (a): status lists every uid slot in slot order (the Vessel's,
+    /// its fork slots, the Templates') with its host uid range, and says
+    /// for each Vessel whether the block log holds its branch here, or
+    /// "?" when the block log does not answer.
+    #[test]
+    fn status_lists_every_uid_slot_and_whose_it_is() {
+        use taso_core::record::vessel_id;
+        let a = init_args(&["--rootfs".into(), "/srv/rootfs".into()]).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&add_demo(&init_config(&a, false)).unwrap().unwrap()).unwrap();
+        v["runtime"]["host_uid_base"] = json!(100000);
+        v["runtime"]["template_slot"] = json!(9);
+        v["vessels"][0]["forks"] = json!({"slots": [5, 2]});
+        let config = Config::parse(&v.to_string()).unwrap();
+        let ns = config.vessels[0].namespace;
+        let id = |s: &str| hex(vessel_id(ns, s.as_bytes()).as_bytes());
+        let names: std::collections::BTreeSet<String> = [
+            format!("{}/v-{}", config.root, id("demo")),
+            format!("{}/v-{}", config.root, id("demo-fork-2")),
+        ]
+        .into();
+        let lines = uid_slots(&config, Some(&names));
+        assert_eq!(
+            lines[0],
+            "uid slots (host_uid_base 100000; 65536 host uids each):"
+        );
+        assert_eq!(lines.len(), 5, "{lines:#?}");
+        let want = [
+            (1, "165536-231071", "demo", "on this node".to_string()),
+            (
+                2,
+                "231072-296607",
+                "demo-fork-2",
+                "fork of demo, on this node".into(),
+            ),
+            (
+                5,
+                "427680-493215",
+                "demo-fork-5",
+                "fork of demo, not made".into(),
+            ),
+        ];
+        for (line, (slot, range, name, what)) in lines[1..4].iter().zip(&want) {
+            assert!(line.starts_with(&format!("  slot {slot} ")), "{line}");
+            assert!(line.contains(&format!("host uids {range} ")), "{line}");
+            assert!(line.contains(&format!(" {name} ")), "{line}");
+            assert!(line.contains(&id(name)), "{line}");
+            assert!(line.ends_with(what.as_str()), "{line}");
+        }
+        assert!(lines[4].starts_with("  slot 9 "), "{}", lines[4]);
+        assert!(lines[4].contains("host uids 689824-755359"));
+        assert!(lines[4].ends_with("Templates"), "{}", lines[4]);
+        let blind = uid_slots(&config, None);
+        assert!(blind[1].ends_with("  ?"), "{}", blind[1]);
+        assert!(blind[2].ends_with("fork of demo, ?"), "{}", blind[2]);
     }
 
     /// 4a: a Vessel is named by its subject, a fork's name or its id;
