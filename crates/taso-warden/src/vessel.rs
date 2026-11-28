@@ -148,7 +148,7 @@ pub trait Pool {
     /// view is dropped.
     fn seal_view(&self, dataset: &Dataset, lsn: Lsn) -> Result<SealView, LayerError>;
     /// Before a Vessel is rebuilt on this node (design
-    /// `Taso_design_layers_lost`): put `dataset` back at the newest Seal
+    /// the layers lost design): put `dataset` back at the newest Seal
     /// layer it has that is one of `ends`, the Seals the bucket's file
     /// sections end at, and out of use.  The dataset is unmounted and its
     /// device detached; every Seal layer newer than that one is taken
@@ -638,7 +638,7 @@ impl ReadLog {
 
     /// The released effects in this log that have no terminal outcome
     /// yet, in op order: what its sender still has to answer.  A fork
-    /// with any is not promoted (design `Taso_design_proposals_inbox`
+    /// with any is not promoted (the proposals inbox design
     /// §1f): its result is not in, and the fork stays open for it.
     pub fn unanswered(&self) -> Result<Vec<OpId>, VesselError> {
         unanswered_in(&self.frames)
@@ -936,7 +936,7 @@ impl<P: Pool> Host<P> {
     /// its parent it was forked at.  `None`: no log of it on this node,
     /// or it is no fork.  What a Warden reads at a parent's start to
     /// open the sender's socket of such a fork again (design
-    /// `Taso_design_proposals_inbox` §1f).
+    /// the proposals inbox design §1f).
     pub fn waiting_fork(
         &self,
         chronicle: ChronicleId,

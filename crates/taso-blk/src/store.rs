@@ -44,7 +44,7 @@
 //!   for **the first group that closed over it** -- at once if done,
 //!   joining its sync if running.  Only a branch with records after the
 //!   last Flush appends one (P5 bite 4, rev. 2:
-//!   `claude/Taso_design_flush_join_2026-11-03.md`; rev. 1 waited for
+//!   the flush join design of 2026-11-03; rev. 1 waited for
 //!   the newest group, which under load is never durable yet).
 //! - [`Store::seal`] appends the Seal and flushes: a Seal is always
 //!   durable, and it stands for every record before it.
@@ -1337,7 +1337,7 @@ impl Store {
     /// the file.  What the plan reads is what the store held at planning.
     /// Measured before: `export` held the store 1.2 ms a Seal at P=64 on
     /// the test VM, 30 ms at the longest, the largest holder of the lock
-    /// (`claude/Taso_design_freeze_trace_2026-11-03.md`, row 3).
+    /// (the freeze trace design of 2026-11-03, row 3).
     pub fn export_plan(
         &self,
         to: LayerId,
@@ -4977,7 +4977,7 @@ mod tests {
         assert_eq!((rec.cut, read1(&s, b, 7)), (0, 66));
     }
 
-    /// Bite 4 (design claude/Taso_design_flush_join_2026-11-03.md, f-a): a
+    /// Bite 4 (the flush join design of 2026-11-03, f-a): a
     /// device's flush appends a Flush record only when its branch has
     /// records past the last group; otherwise it waits for that group.
     /// And a crash right after a joined flush keeps what it acknowledged:

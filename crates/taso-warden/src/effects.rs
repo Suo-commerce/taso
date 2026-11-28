@@ -29,7 +29,7 @@
 //! # Deciding from outside ([`Effects::approve`], [`Effects::deny`])
 //!
 //! A reviewer on the decider socket may release one held proposal or
-//! close it (design `Taso_design_proposals_inbox` §1b, §1c).  An approval
+//! close it (the proposals inbox design §1b, §1c).  An approval
 //! is refused unless the proposal is held and its Vessel's last Seal
 //! covers it (an unsealed one belongs to a turn that may be run again,
 //! and would then be declared and sent twice), and while effect authority

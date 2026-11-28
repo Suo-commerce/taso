@@ -1,5 +1,5 @@
 //! Vessel status in a Kubernetes cluster (K2; design:
-//! claude/Taso_design_k2_2026-10-17.md).
+//! the K2 design of 2026-10-17).
 //!
 //! The supervisor's events become the `status` of the Vessel resources
 //! they are about: `Running` when a run starts, `Exited` (how it started,

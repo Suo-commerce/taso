@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/c3-compose-test.sh: C3-d, the containers tested on one host
-# (deploy/docker/compose.yaml; plan claude/Taso_plan_v01_2026-11-15.md).
+# (deploy/docker/compose.yaml; the v0.1 plan of 2026-11-15).
 #
 #   sudo scripts/c3-compose-test.sh            from the repository root
 #

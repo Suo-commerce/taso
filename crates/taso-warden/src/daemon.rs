@@ -5564,7 +5564,7 @@ impl Node {
 
     /// The forks of `vc` that an earlier life of this Warden left
     /// waiting for their senders are run again, for their senders only
-    /// (design `Taso_design_proposals_inbox` §1f).
+    /// (the proposals inbox design §1f).
     ///
     /// A fork an agent asked for is run in the Warden's life that made
     /// it and never again ([`Requested`] starts empty).  If that life

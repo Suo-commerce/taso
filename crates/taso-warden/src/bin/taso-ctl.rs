@@ -1,6 +1,6 @@
 //! `taso-ctl`: the operator's view (P4 spec rev. 27 §5.8, D83; file 12),
 //! and the stranger's first commands (P5 §4, C1; design
-//! `Taso_design_c1_init_2026-11-04`, c-a…c-h).
+//! the C1 init design of 2026-11-04, c-a…c-h).
 //!
 //! ```text
 //! taso-ctl init [--data DIR] [--size-gib N] [--rootfs DIR] [--force]
@@ -80,7 +80,7 @@
 //!
 //! Asks the running Warden, on its decider socket (as root, or as the
 //! Warden's uid), what one Vessel holds: the actions its agent asked for
-//! that nothing has released (design `Taso_design_proposals_inbox`, 4a).
+//! that nothing has released (the proposals inbox design, 4a).
 //! A read: nothing is recorded, released or refused.  `<vessel>` is its
 //! `subject` in the config, a fork's name (`<subject>-fork-<n>`), or its
 //! id (32 hex).  Output: one JSON object a line for each held action, in

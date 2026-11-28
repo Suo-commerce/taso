@@ -102,7 +102,7 @@
 //!   durable; with them ext4 flushes at each journal commit and the store
 //!   commits a group there.  This is what makes the store's durability
 //!   rule (durable at flush) the disk's.
-//! - **`--durable-at seal`** (P5, `claude/Taso_design_syncs_2026-11-04.md`,
+//! - **`--durable-at seal`** (P5, the syncs design of 2026-11-04,
 //!   s-g) answers a device flush and a FUA write as soon as the records
 //!   are in the log, without a sync: only a Seal (and `flush`,
 //!   `checkpoint`, `export`, `quit`) waits for one.  It is right only
@@ -1177,7 +1177,7 @@ fn file_arg(w: Option<&&str>) -> Result<PathBuf, String> {
 }
 
 /// The answer to `recovered`: what this start found in the log, for the
-/// Warden to ask (design note Taso_design_blocklog_format_2026-11-25, 3.4).
+/// Warden to ask (the block log format design of 2026-11-25, 3.4).
 ///
 /// ```text
 ///   id=<32 hex>   the log's identity, from its header

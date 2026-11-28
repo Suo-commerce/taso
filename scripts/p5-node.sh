@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # p5-node.sh: set up one P5 measurement host from a fresh Ubuntu 26.04, the
-# same way every time, and print what it found (Taso_plan_p5, §2 A1).
+# same way every time, and print what it found (the P5 plan, §2 A1).
 #
 #   sudo scripts/p5-node.sh check                              read-only
 #   sudo scripts/p5-node.sh setup --disk /dev/nvmeXn1 --commit <sha>

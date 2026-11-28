@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# F6 step 3d (fencing review F6; plan in Taso_handoff_2026-10-21 §3): the
+# F6 step 3d (fencing review F6; planned in the notes of 2026-10-21, §3): the
 # daemon forks a Vessel into another uid slot on the Chronicle block log
 # and runs its agent over the parent's files through an idmapped /work.
 # The first time a forked Vessel runs under taso-wardend, end to end.

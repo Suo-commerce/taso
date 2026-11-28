@@ -1,5 +1,5 @@
 //! Vessels from a Kubernetes cluster (K2; design:
-//! claude/Taso_design_k2_2026-10-17.md).
+//! the K2 design of 2026-10-17).
 //!
 //! A [`KubeSource`] lists the `Vessel` resources whose `spec.node` is this
 //! node (the API server filters by the field the CRD declares selectable)

@@ -1,4 +1,4 @@
-//! A long-running Warden's loop (W1; plan: claude/Taso_plan_k8s_docker_2026-10-17.md).
+//! A long-running Warden's loop (W1; plan: the Kubernetes and Docker plan of 2026-10-17).
 //!
 //! The [`Supervisor`] keeps what runs equal to what a [`VesselSource`] says
 //! should run.  Each round it polls the source, passes the answer through the

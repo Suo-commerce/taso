@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bench/p5/bench.sh: the P5 harness, first piece (Taso_plan_p5 §3 B1, H0's
+# bench/p5/bench.sh: the P5 harness, first piece (the P5 plan §3 B1, H0's
 # first question: work per durable byte).  The same workload through
 # taso-wardend on the block log, one machine, one table.
 #
@@ -46,7 +46,7 @@
 # DURABLE_AT=flush|fua|seal (default fua, taso-blkd's own since 2026-11-06): taso-blkd's
 # --durable-at.  fua answers FUA writes without a sync; seal answers device
 # flushes and FUA writes without one, so only the Seal syncs
-# (claude/Taso_design_syncs_2026-11-04.md, s-g).  The
+# (the syncs design of 2026-11-04, s-g).  The
 # table's host line and the output folder's name say which was measured.
 # Both: an in-process coordinator (redb) and a local pack store under $DIR,
 # as gate-p1 had with HUB=0 — the coordinator and the store are not what is
@@ -366,7 +366,7 @@ if stalls:
 
 print()
 print(f"- host {host}, kernel {kernel}, taso {commit}; {note}; data at {where}")
-print(f"- durability contract: claude/Taso_finding_p5_a2_facts_2026-10-26.md §1 (this host's row)")
+print(f"- durability contract: the P5 A2 facts finding of 2026-10-26 §1 (this host's row)")
 print(f"- workload: gate-p1's taso-sim, {runs} run(s) x P={p}, {turns} turns of {txns} txns x {rows} rows x {row_bytes} B, synchronous={sync}, landlock={landlock}; in-process coordinator, local store")
 if noisy:
     print(f"- noisy neighbour: v0 of {p}, {turns} turns of {noisy_load} unsynced; the other {p - 1} as above (\"parent\" rows below are theirs)")
@@ -384,7 +384,7 @@ pb = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.pack
 pf = sum(int(open(f).read()) for f in glob.glob(os.path.join(out, "warden-*.packfiles")))
 seals = len(spans.get("seal.total", []))
 print(f"- packs shipped: {pb / 1024:.0f} KiB in {pf} files for {seals} Seals: {pb / 1024 / (seals or 1):.1f} KiB per Seal" + (f", {pb / 1024 / (forked or 1):.1f} KiB per branch" if forks else ""))
-# Design 2's measurement (Taso_design_round_2026-10-30, r-a): how many
+# Design 2's measurement (the round design of 2026-10-30, r-a): how many
 # of the block log's fdatasyncs a Seal costs once the Syncer has merged
 # what overlapped.  Alone a Seal pays 3 (the freeze's two barriers and
 # its own).  Every sync of the Warden's run is counted -- the births

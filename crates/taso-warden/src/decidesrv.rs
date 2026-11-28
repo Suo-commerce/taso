@@ -91,7 +91,7 @@ pub trait Decide: Send + Sync {
         Err("this Warden lists no proposals".into())
     }
     /// `peer`'s decision on the held proposal `op` of `vessel` (design
-    /// `Taso_design_proposals_inbox` §1b, §1c).  `Ok`: taken, or refused
+    /// the proposals inbox design §1b, §1c).  `Ok`: taken, or refused
     /// with why (the action is as it was unless that says it was closed).
     /// `Err`: this node could not answer for the Vessel now; the same
     /// request may be sent again (a decision asked twice is taken once).

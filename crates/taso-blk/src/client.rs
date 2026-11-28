@@ -1,5 +1,5 @@
 //! A client for `taso-blkd`'s control socket (adoption step 3 of the plan
-//! `Taso_plan_blk_adoption_2026-10-18`).
+//! the block log adoption plan of 2026-10-18).
 //!
 //! The Warden's block-log `Pool` and `Layers` talk to the daemon through
 //! this; it needs no ublk and builds anywhere.  One [`Client`] is one

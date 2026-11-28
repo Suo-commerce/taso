@@ -350,7 +350,7 @@ impl Ledger {
     }
 
     /// Release a held proposal of this Vessel (design
-    /// `Taso_design_proposals_inbox` §1b): `DispatchAuthorized` on its
+    /// the proposals inbox design §1b): `DispatchAuthorized` on its
     /// own op, one write.  The caller has checked that `op` is held and
     /// sealed, and ships the ledger before anyone may act on it
     /// ([`Ledger::ship_before_send`]), as for a release.

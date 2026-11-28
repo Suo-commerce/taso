@@ -54,7 +54,7 @@ Line 3 checks that a retained Seal is reachable (it exports), not its bytes:
 a Seal's export differs between runs (a fresh mkfs per round, inode times),
 so a healthy run's hash is no baseline (found writing E3-3b, 2026-10-27).
 
-E3-c2 (design claude/Taso_design_e3_c2_2026-10-30.md rev. 2): two Vessels,
+E3-c2 (the E3 C2 design of 2026-10-30 rev. 2): two Vessels,
 each with its own record and its own A.json, graded by these lines alone.
 The gather counts the Vessel's own write tag as plain turns and another
 Vessel's as "x<TAG>:<turn>"; such a key in any listed Seal is C1 (one

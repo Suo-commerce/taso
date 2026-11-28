@@ -9,7 +9,7 @@ handoffs of that week.
 The P2 gate on the block log (`scripts/gate-p2-blk.sh`): Vessels on
 `taso-blkd` (ext4 on ublk), packs in Scaleway Object Storage (Paris), the
 coordinator reached over ssh.  S2 passed in this layout, 85 rounds
-(`Taso_finding_s2_5_2026-10-20` in the Project).  No disk changes are
+(the S2.5 finding of 2026-10-20).  No disk changes are
 needed: the block log is a file on the root disk.
 
 | Name | Zone | Role |

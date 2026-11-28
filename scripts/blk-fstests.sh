@@ -552,7 +552,7 @@ note_stats "after xfstests"
 
 # ---- 4 recheck failures: ours again, and loop ------------------------------------
 # Tests whose result follows the rotational flag, not the device
-# (Taso_finding_fstests_2026-10-19, finding 4: ext4 allocates differently
+# (the xfstests finding of 2026-10-19, finding 4: ext4 allocates differently
 # on a non-rotational device; verified in all four directions).  Such a
 # test is not taken on trust: each run proves it again, failing on ours
 # with the flag as it is and passing with rotational=1, and passing on

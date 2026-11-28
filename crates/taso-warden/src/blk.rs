@@ -1,5 +1,5 @@
 //! The block log as the Warden's storage (adopted in step 4 of the plan
-//! `Taso_plan_blk_adoption_2026-10-18`; the only storage since V4b).
+//! the block log adoption plan of 2026-10-18; the only storage since V4b).
 //!
 //! [`BlkPool`] and [`BlkLayers`] implement [`Pool`] and [`Layers`] over
 //! `taso-blkd`.  A Vessel's dataset is a named branch, a Seal

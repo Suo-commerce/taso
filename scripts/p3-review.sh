@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # p3-review.sh: a reviewer sees, approves and denies what a held Vessel
 # asks for, end to end under taso-wardend (design
-# Taso_design_proposals_inbox §1, §1b, §1c, §1f; docs/relay.md "The
+# the proposals inbox design §1, §1b, §1c, §1f; docs/relay.md "The
 # reviewer").
 #
 #   scripts/p3-review.sh     (as root, from the repository root; needs

@@ -1,4 +1,4 @@
-//! A minimal Kubernetes API client (K2; plan: claude/Taso_plan_k8s_docker_2026-10-17.md).
+//! A minimal Kubernetes API client (K2; plan: the Kubernetes and Docker plan of 2026-10-17).
 //!
 //! The Warden needs three things from the API server: list the `Vessel`
 //! resources for its node, read one, and write their status.  This client

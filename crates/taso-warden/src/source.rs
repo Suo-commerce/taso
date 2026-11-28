@@ -1,5 +1,5 @@
 //! Where a long-running Warden learns which Vessels to run (W1; plan:
-//! claude/Taso_plan_k8s_docker_2026-10-17.md).
+//! the Kubernetes and Docker plan of 2026-10-17).
 //!
 //! A [`VesselSource`] reports the set of Vessels this Warden should run
 //! — the daemon config's list today ([`StaticSource`]), a Kubernetes watch

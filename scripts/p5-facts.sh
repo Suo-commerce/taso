@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # p5-facts.sh: the facts about a measurement host that every P5 number is
-# measured under (Taso_plan_p5 §2 A2): what the stack says about flushes,
+# measured under (the P5 plan §2 A2): what the stack says about flushes,
 # what a flush costs, and what the provider's "stop" actually cuts.
 #
 #   sudo scripts/p5-facts.sh report                 (a) what the stack reports
@@ -44,7 +44,7 @@
 #     The winner is what the log file becomes (lever 3b).
 #
 # (b3) appends: the fact the record layout revision rests on
-#     (Taso_design_layout_2026-10-30, L0).  The revision reserves a
+#     (the layout design of 2026-10-30, L0).  The revision reserves a
 #     record's place under the store's lock and writes it O_DIRECT after
 #     letting the lock go, so several queue threads' writes could be in
 #     flight at once -- if the kernel lets them.  ext4 takes the inode's

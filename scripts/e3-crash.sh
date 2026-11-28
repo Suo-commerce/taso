@@ -592,7 +592,7 @@ PY
 }
 
 # ── E3-c2: two Vessels, their Seals overlapping at the point ──────────
-# Design claude/Taso_design_e3_c2_2026-10-30.md rev. 2.  Each Vessel has
+# The E3 C2 design of 2026-10-30 rev. 2.  Each Vessel has
 # its own oracle record (r-a.json, r-b.json) and its own gather (a-a.json,
 # a-b.json), graded by the serial oracle's lines unchanged; the rows carry
 # the Vessel's write tag (a: 0, b: 2), and a Seal holding the other's rows

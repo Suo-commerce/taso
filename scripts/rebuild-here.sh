@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The rebuild on the same node, on a real block device (P4 spec rev. 38,
-# D99; design Taso_design_layers_lost, file 3): the Warden's start finds a
+# D99; the layers lost design, file 3): the Warden's start finds a
 # Vessel whose files on this node are behind its log, and rebuilds it here
 # from the store.
 #

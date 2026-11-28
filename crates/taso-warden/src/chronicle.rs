@@ -165,7 +165,7 @@ pub type LayerError = Box<dyn std::error::Error + Send + Sync>;
 /// the thaw of a frozen Vessel (the block log), or nothing (a store that
 /// freezes nothing, such as the records-only one or a test's).  The Chronicle runs it beside the Seal
 /// record's commit and answers the Seal only once both are done (P5, the
-/// 50 ms line, bite 2: `claude/Taso_design_seal_overlap_2026-11-02.md`).
+/// 50 ms line, bite 2: the seal overlap design of 2026-11-02).
 ///
 /// A thaw is never lost: one dropped without being run runs then, so no
 /// path out of a Seal leaves its Vessel frozen.
@@ -275,7 +275,7 @@ pub trait Layers {
         None
     }
     /// Fold the layer at `lsn` into the next layer, if the store can (S-c,
-    /// 2026-11-14: `claude/Taso_design_seal_retention_2026-11-14.md`).
+    /// the seal retention design of 2026-11-14).
     /// Nothing reads differently and the layer leaves [`Layers::list`];
     /// its Seal is then in the bucket only.  `Ok(false)` when the layer
     /// stays: the store never folds (the default: a records-only store
@@ -1213,7 +1213,7 @@ impl<L: Layers> Chronicle<L> {
     }
 
     /// Fold away the layers of old Seals this node no longer needs (S-c,
-    /// `claude/Taso_design_seal_retention_2026-11-14.md`), at most `max`
+    /// the seal retention design of 2026-11-14), at most `max`
     /// of them, oldest first.  A Seal's layer folds into the next one only
     /// when it is not among the newest `keep` layers, the next Seal is
     /// shipped (so both are in the bucket and the next one's pack is

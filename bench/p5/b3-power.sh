@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # bench/p5/b3-power.sh: B3 of P5, the power-loss test on the metal
-# (design claude/Taso_design_b3_2026-10-31.md rev. 1; plan rev. 18 §3 B3;
+# (the B3 design of 2026-10-31 rev. 1; plan rev. 18 §3 B3;
 # claim C2; spec D92, D93).
 #
 #   sudo bench/p5/b3-power.sh run [PORT]              the bare-metal node: the Warden and 8 Vessels at work, a witness port open
