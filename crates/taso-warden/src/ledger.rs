@@ -236,28 +236,9 @@ pub enum Answer {
     Unknown,
 }
 
-/// An operator's answer for an open effect ([`Ledger::resolve`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Resolution {
-    /// It happened: `ConfirmedApplied`.
-    Applied,
-    /// It did not happen: `ConfirmedNotApplied`.
-    NotApplied,
-    /// Nobody knows, and the operator closes it anyway:
-    /// `AcceptedUnknown` (P4 spec D34).  Never re-issued or probed.
-    AcceptedUnknown,
-}
-
-impl Resolution {
-    /// The outcome state it records.
-    pub fn state(self) -> OutcomeState {
-        match self {
-            Self::Applied => OutcomeState::ConfirmedApplied,
-            Self::NotApplied => OutcomeState::ConfirmedNotApplied,
-            Self::AcceptedUnknown => OutcomeState::AcceptedUnknown,
-        }
-    }
-}
+/// An operator's answer for an open effect ([`Ledger::resolve`]): the
+/// decider socket's, so the wire and the ledger name the same thing.
+pub use taso_core::decider::Resolution;
 
 /// Why an operator resolution was refused.
 #[derive(Debug)]
