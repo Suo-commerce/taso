@@ -702,6 +702,20 @@ impl VesselConf {
         Some(base)
     }
 
+    /// Its uid slot and host uid range as the Warden's log says them
+    /// (F-a (a)): `uid slot 2, host uids 231072-296607`.  A host that sees
+    /// a process's uid finds the Vessel, or the fork, it belongs to.
+    pub fn slot_text(&self, rt: &RuntimeConf) -> String {
+        match self.host_uid(rt) {
+            Some(b) => format!(
+                "uid slot {}, host uids {b}-{}",
+                self.uid_slot,
+                b + (ID_RANGE - 1)
+            ),
+            None => format!("uid slot {}, which does not fit", self.uid_slot),
+        }
+    }
+
     /// What it runs with: its own runtime over the node's `rt` and the
     /// config's `quiescence`, checked.  An error says what is missing or
     /// wrong; the Vessel is not started.
@@ -3182,6 +3196,7 @@ impl Branches<BlkLayers> for NodeBranches<'_> {
             ));
         };
         let name = ForksConf::child_name(&self.vc.subject, slot);
+        let rt = &self.node.config.runtime;
         // Only from a shipped Seal (C3): a child of a Seal only this node
         // holds could be reborn nowhere once the node is lost.  "last" is
         // fixed here to the Seal checked.
@@ -3200,13 +3215,13 @@ impl Branches<BlkLayers> for NodeBranches<'_> {
             .map(|p| p.seal)
             .ok_or_else(|| format!("the fork {name:?} has no parent in its Lineage"))?;
         drop(child);
-        self.node
-            .requested
-            .add(ForksConf::child(self.vc, slot, seal));
+        let entry = ForksConf::child(self.vc, slot, seal);
+        let slot_text = entry.slot_text(rt);
+        self.node.requested.add(entry);
         self.node.log(
             self.vc,
             format_args!(
-                "forked {name:?} (uid slot {slot}) at Seal lsn {} on its agent's request",
+                "forked {name:?} ({slot_text}) at Seal lsn {} on its agent's request",
                 seal.get()
             ),
         );
@@ -5615,7 +5630,11 @@ impl Node {
     pub fn run_vessel_until(&self, vc: &VesselConf, stop: &Stop) -> Result<Report, DaemonError> {
         loop {
             let promoted = Stop::new();
-            let report = self.run_once(vc, stop, &promoted)?;
+            let report = self.run_once(vc, stop, &promoted);
+            if vc.fork.is_some() {
+                self.log(vc, fork_ended(vc, &self.config.runtime, &report));
+            }
+            let report = report?;
             if promoted.requested() && !stop.requested() {
                 self.log(
                     vc,
@@ -6428,6 +6447,27 @@ impl Node {
             fenced: was_fenced,
         })
     }
+}
+
+/// The Warden's log line when a fork's run ends (F-a (a)): its slot and
+/// host uids, how the run ended, and that the slot stays taken (a fork
+/// slot is never given twice: [`ForksConf`]).
+fn fork_ended(vc: &VesselConf, rt: &RuntimeConf, report: &Result<Report, DaemonError>) -> String {
+    let how = match report {
+        Ok(r) if r.fenced => "fenced".to_string(),
+        Ok(r) if r.stopped => "stopped on request".to_string(),
+        Ok(r) => match &r.agent {
+            Some((true, _)) => "its agent exited ok".to_string(),
+            Some((false, e)) => format!("its agent failed: {}", e.trim()),
+            None => "its agent did not run".to_string(),
+        },
+        Err(e) => format!("the run failed: {e}"),
+    };
+    format!(
+        "fork {:?} ({}) ended: {how}; the slot stays taken",
+        vc.subject,
+        vc.slot_text(rt)
+    )
 }
 
 /// Review fix R (a): the operator's answer for the open effect `op` of
@@ -10004,6 +10044,52 @@ mod tests {
         assert_eq!(
             resolve_open(&mut fx, &mut v, 2, Resolution::Applied, " ", peer),
             Ok(Ruled::Refused("a resolution needs a reason".into()))
+        );
+    }
+
+    /// F-a (a): a fork's slot and host uids in the Warden's log, at its
+    /// birth (`slot_text`) and when its run ends, with how it ended.
+    #[test]
+    fn a_forks_log_lines_name_its_slot_and_host_uids() {
+        let config = Config::parse(GOOD).unwrap();
+        let rt = &config.runtime;
+        let parent = &config.vessels[1];
+        let child = ForksConf::child(parent, 3, Lsn::new(41));
+        assert_eq!(
+            child.slot_text(rt),
+            "uid slot 3, host uids 396608-462143",
+            "200000 + 3 x 65536, 65536 of them"
+        );
+        let report = |agent, stopped, fenced| Report {
+            subject: child.subject.clone(),
+            start: Start::Birth,
+            connections: 0,
+            published: 0,
+            publish_failures: 0,
+            pruned: 0,
+            prune_failures: (0, None),
+            agent,
+            settled: Settled::default(),
+            stopped,
+            fenced,
+        };
+        let line = |r: &Result<Report, DaemonError>| fork_ended(&child, rt, r);
+        assert_eq!(
+            line(&Ok(report(Some((true, String::new())), false, false))),
+            "fork \"b-fork-3\" (uid slot 3, host uids 396608-462143) ended: its agent exited ok; the slot stays taken"
+        );
+        assert!(
+            line(&Ok(report(Some((false, "boom\n".into())), false, false)))
+                .contains("ended: its agent failed: boom;")
+        );
+        assert!(line(&Ok(report(None, true, false))).contains("ended: stopped on request;"));
+        assert!(line(&Ok(report(None, true, true))).contains("ended: fenced;"));
+        assert!(line(&Err(DaemonError::Io("no disk".into()))).contains("ended: the run failed: "));
+        let mut huge = child.clone();
+        huge.uid_slot = u32::MAX;
+        assert_eq!(
+            huge.slot_text(rt),
+            format!("uid slot {}, which does not fit", u32::MAX)
         );
     }
 }
