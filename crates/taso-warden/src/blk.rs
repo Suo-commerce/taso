@@ -873,11 +873,15 @@ impl<D: Blkd, M: Mounts> BlkPool<D, M> {
     /// Copy `stream` into a new spool file; the file is removed when the
     /// returned guard drops.
     fn spool_in(&self, stream: &mut dyn io::Read) -> Result<SpoolFile, LayerError> {
+        use std::os::unix::fs::OpenOptionsExt;
         let f = SpoolFile::new(&self.spool, "recv")?;
+        // A Vessel's whole stream: its owner's only (0600; the maturity
+        // review, `blk.rs:707-719`), as taso-blkd's exports are.
         let mut out = std::io::BufWriter::new(
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&f.0)?,
         );
         io::copy(stream, &mut out)?;
@@ -1884,7 +1888,15 @@ impl SpoolFile {
     fn new(dir: &Path, kind: &str) -> io::Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        std::fs::create_dir_all(dir)?;
+        {
+            // 0700 if made here (`init` makes it so; a layout of one's own
+            // may not have).
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
         sweep_spool_once(dir);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
@@ -2996,6 +3008,22 @@ mod tests {
             mount_source(&mi, &p.mountpoint(&ds("tank/v-1"))),
             Some("/dev/ublkb3".into())
         );
+    }
+
+    /// The maturity review (`blk.rs:707-719`): a received stream was
+    /// spooled under the default umask.  Its file is 0600, and a spool
+    /// directory made here 0700.
+    #[test]
+    fn a_spooled_stream_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let spool = tmp.path().join("made/spool");
+        let p: TestPool =
+            BlkPool::with(StoreBlkd::new(), FakeMounts::default(), "/mnt/taso", &spool);
+        let f = p.spool_in(&mut &[7u8; 4096][..]).unwrap();
+        assert_eq!(mode(&f.0), 0o600);
+        assert_eq!(mode(&spool), 0o700);
     }
 
     fn pool() -> TestPool {
