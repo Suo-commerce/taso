@@ -9,8 +9,10 @@
 //!    **shipped**.  Not shipped yet: `Retry`, nothing recorded.
 //! 1. **The answer already in the log** (D61): a closed Candidate of this
 //!    id refuses `Closed`; an accepted one answers `Nominated` to the same
-//!    kind of request and refuses `Duplicate` to another; an accepted
-//!    refusal for this Seal and exclusion answers it again.
+//!    kind of request and refuses `Duplicate` to another; a walk
+//!    refusal accepted for this very Candidate id (the same Seal,
+//!    exclusion, class map, transform version and verifier requirement)
+//!    answers it again.
 //! 2. **The verifier Template** must be ready (review fix N2a), and
 //!    **Warden-local limits** (D62): open Candidates per Vessel, the
 //!    minimum interval, concurrent walks.  Otherwise: `Retry`.
